@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end test for ErnieImage text-to-image generation via online serving.
@@ -11,7 +11,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
@@ -45,7 +45,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_ernie_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_ernie_image(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test each diffusion feature with ERNIE-Image (text-to-image), one feature per case."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
@@ -60,4 +60,4 @@ def test_ernie_image(omni_server: OmniServer, openai_client: OpenAIClientHandler
             "seed": 42,
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

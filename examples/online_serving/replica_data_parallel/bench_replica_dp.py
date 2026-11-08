@@ -15,7 +15,7 @@ so an output is a deterministic function of its own input and nothing else.
 Measuring replica scaling
 -------------------------
 This client is replica-agnostic. Vary the *server's* replica count
-(`runtime.num_replicas` in the stage config; see run_server.sh) and keep the
+(`stages[].num_replicas` in the deploy config; see run_server.sh) and keep the
 client workload fixed, then compare throughput:
 
     N=1 -> baseline

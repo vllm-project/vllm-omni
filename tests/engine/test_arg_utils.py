@@ -1,32 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Omni config utils. For stability, these tests should largely be
 invariant to the specific attributes of vLLM config except in cases where we
 explicitly patch values that differ from vLLM.
 """
 
-import argparse
 import inspect
+import json
+import os
+import shutil
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.exceptions import VLLMValidationError
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
+from tests.helpers.mock import patch_hf_snapshot_download
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    load_omni_transfer_config,
+    resolve_omni_kv_config_for_stage,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Explicit so engine configs with connectors build on any platform.
+AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
+
+    # Upstream's process-wide preference must not override a stage's deploy choice.
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
+    config = VllmConfig()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.use_v2_model_runner = use_v2
+    model_config.runner_type = "generate"
+    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
+    config.model_config = model_config
+    assert config.use_v2_model_runner is use_v2
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config, processor.model_config = config, model_config
+    validator = processor._build_logits_processors_params_validator()
+    validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
+    if not use_v2:
+        with pytest.raises(VLLMValidationError, match="cfg_role"):
+            validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
+    assert VllmConfig().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():
     """Ensure create_model_config gives the right type."""
     cfg = OmniEngineArgs().create_model_config()
     assert isinstance(cfg, OmniModelConfig)
+
+
+def test_session_mode_reaches_omni_model_config():
+    assert OmniEngineArgs().create_model_config().session_mode == "turn"
+    assert OmniEngineArgs(session_mode="duplex").create_model_config().session_mode == "duplex"
 
 
 def test_default_stage_id_is_concrete_int():
@@ -41,7 +97,104 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_multimodal_kwarg_overrides(mocker):
+def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
+    """Keep pipeline-owned model fields intact through the engine adapter."""
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+    worker_module = types.ModuleType("test_connector_worker")
+
+    class ConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class ConnectorWorker:
+        model_runner_cls = ConnectorRunner
+
+    setattr(worker_module, "ConnectorWorker", ConnectorWorker)
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda _self: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+
+    def capture_omni_config(_cls, model_config, **omni_kwargs):
+        assert model_config is baseline_config
+        captured.update(omni_kwargs)
+        return baseline_config
+
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(capture_omni_config),
+    )
+
+    OmniEngineArgs(
+        stage_id=1,
+        requires_full_payload_input=True,
+        scheduling_metadata_adapter="pipeline.Adapter",
+        worker_cls="test_connector_worker.ConnectorWorker",
+    ).create_model_config()
+
+    assert captured["requires_full_payload_input"] is True
+    assert captured["scheduling_metadata_adapter"] == "pipeline.Adapter"
+
+
+def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
+    worker_module = types.ModuleType("test_async_scheduler_worker")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    args = OmniEngineArgs(
+        stage_id=1,
+        async_chunk=True,
+        worker_cls="test_async_scheduler_worker.WorkerWithoutConnector",
+    )
+
+    assert args.requires_full_payload_input is False
+
+
+def test_full_payload_capability_requires_selected_worker_connector(monkeypatch):
+    worker_module = types.ModuleType("test_worker_without_connector")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
+        OmniEngineArgs(
+            stage_id=1,
+            requires_full_payload_input=True,
+            worker_cls="test_worker_without_connector.WorkerWithoutConnector",
+        )
+
+
+def test_full_payload_capability_validates_platform_selected_worker(monkeypatch):
+    worker_module = types.ModuleType("test_platform_worker_without_connector")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector)
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_omni_ar_worker_cls",
+        lambda: "test_platform_worker_without_connector.WorkerWithoutConnector",
+    )
+
+    with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
+        OmniEngineArgs(
+            stage_id=1,
+            requires_full_payload_input=True,
+            worker_type="ar",
+        )
+
+
+def test_multimodal_kwarg_overrides(monkeypatch):
     """Ensure that overrides in the multimodal config are preserved."""
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
@@ -55,8 +208,8 @@ def test_multimodal_kwarg_overrides(mocker):
         assert self.mm_processor_cache_gb == override_val
         return fake_model_config
 
-    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
-    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+    monkeypatch.setattr(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    monkeypatch.setattr(OmniModelConfig, "from_vllm_model_config", lambda model_config, **_: model_config)
 
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
@@ -106,6 +259,42 @@ def test_default_all_values_are_initialized():
     str(cfg)
 
 
+@pytest.mark.parametrize("stage_id", [0, 1])
+def test_compute_hash_is_stable_across_launches(stage_id):
+    """Ensure relaunching the same deploy config gives a stage the same compile cache hash."""
+
+    def get_model_config_hash() -> str:
+        # Transfer config & kv connector config currently contain UUIDs, which should not affect the compile key
+        transfer_config = load_omni_transfer_config(get_deploy_config_path("qwen3_tts.yaml"))
+        kv_connector_config = resolve_omni_kv_config_for_stage(transfer_config, stage_id)[0]
+        vllm_config = OmniEngineArgs(
+            worker_cls=AR_WORKER_CLS,
+            stage_connector_spec=get_stage_connector_spec(transfer_config, stage_id, async_chunk=True),
+            omni_kv_config={"connector_config": kv_connector_config},
+        ).create_engine_config()
+        # vLLM keys its torch.compile and AOT caches on this hash.
+        return vllm_config.compute_hash()
+
+    first_hash = get_model_config_hash()
+    second_hash = get_model_config_hash()
+    assert first_hash == second_hash
+
+
+def test_compute_hash_keeps_stage_connector_settings():
+    """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
+
+    def get_model_config_hash(num_frames: int) -> str:
+        vllm_config = OmniEngineArgs(
+            worker_cls=AR_WORKER_CLS,
+            stage_connector_spec={"name": "SharedMemoryConnector", "extra": {"codec_chunk_frames": num_frames}},
+        ).create_engine_config()
+        return vllm_config.compute_hash()
+
+    first_hash = get_model_config_hash(num_frames=25)
+    second_hash = get_model_config_hash(num_frames=50)
+    assert first_hash != second_hash
+
+
 def test_qwen3_tts_codec_frame_rate_patching():
     """Ensure the patch for qwen3 tts is applied correctly when creating the omni config."""
     # Create a vLLM ModelConfig
@@ -128,17 +317,22 @@ def test_qwen3_tts_codec_frame_rate_patching():
     assert omni_config.codec_frame_rate_hz == 12.3
 
 
-def test_from_cli_args_picks_up_stage_configs_path():
-    """from_cli_args should pick up stage_configs_path from namespace."""
-    ns = argparse.Namespace(
-        model="facebook/opt-125m",
-        stage_configs_path="/some/path.yaml",
-        custom_pipeline_args=None,
-    )
+def test_qwen3_tts_startup_task_type_is_validated():
+    vllm_config = EngineArgs().create_model_config()
 
-    args = OmniEngineArgs.from_cli_args(ns)
-    assert args.stage_configs_path == "/some/path.yaml"
-    assert args.custom_pipeline_args is None
+    config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+        task_type="Base",
+    )
+    assert config.task_type == "Base"
+
+    with pytest.raises(ValueError, match="Qwen3-TTS --task-type must be one of"):
+        OmniModelConfig.from_vllm_model_config(
+            vllm_config,
+            model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
+            task_type="fl2va",
+        )
 
 
 def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
@@ -174,6 +368,178 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
             "max_position_embeddings": 65536,
         },
     }
+
+
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+    """A successful remote tokenizer download must not enter the error path."""
+    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir.mkdir()
+    baseline_config = Mock()
+    warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    patch_hf_snapshot_download(monkeypatch, lambda *args, **kwargs: str(tmp_path), hf_home=tmp_path)
+    monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    assert args.create_model_config() is baseline_config
+    assert args.tokenizer == str(tokenizer_dir)
+    warning.assert_not_called()
+
+
+def test_patch_missing_local_hf_config(tmp_path):
+    """Native model bundles may only contain a checkpoints/ directory."""
+    (tmp_path / "checkpoints").mkdir()
+    args = object.__new__(OmniEngineArgs)
+    args.model = str(tmp_path)
+    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.hf_config_path = None
+
+    try:
+        args._patch_empty_hf_config("indextts2_5")
+
+        assert args.hf_config_path is not None
+        config_path = args.hf_config_path + "/config.json"
+        with open(config_path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        assert config == {
+            "model_type": "indextts2_5",
+            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+        }
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "config_entry",
+    ["malformed", "directory", "broken_symlink", "permission_error"],
+)
+def test_non_missing_local_hf_config_error_reaches_parent_loader(tmp_path, monkeypatch, config_entry):
+    """Non-missing config errors must reach vLLM's normal loader."""
+    config_path = tmp_path / "config.json"
+    loader_error: Exception
+    if config_entry == "malformed":
+        config_path.write_text("{not valid json", encoding="utf-8")
+        loader_error = json.JSONDecodeError("invalid config", "{not valid json", 1)
+    elif config_entry == "directory":
+        config_path.mkdir()
+        loader_error = IsADirectoryError(str(config_path))
+    elif config_entry == "broken_symlink":
+        config_path.symlink_to(tmp_path / "missing-target.json")
+        loader_error = FileNotFoundError(str(config_path))
+    else:
+        config_path.write_text("{}", encoding="utf-8")
+        loader_error = PermissionError(str(config_path))
+
+    parent_inputs = {}
+
+    def controlled_get_config_dict(cls, model, **kwargs):
+        if model == str(tmp_path):
+            raise loader_error
+        with open(os.path.join(model, "config.json"), encoding="utf-8") as config_file:
+            return json.load(config_file), {}
+
+    def fake_parent_create_model_config(self):
+        parent_inputs["called"] = True
+        parent_inputs["model"] = self.model
+        parent_inputs["hf_config_path"] = self.hf_config_path
+        config_root = self.hf_config_path or self.model
+        parent_inputs["config_root"] = config_root
+        return PretrainedConfig.get_config_dict(config_root)[0]
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_parent_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(
+        model=str(tmp_path),
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+    )
+
+    with pytest.raises(type(loader_error)) as exc_info:
+        args.create_model_config()
+
+    assert str(exc_info.value) == str(loader_error)
+    assert parent_inputs["called"] is True
+    assert parent_inputs["model"] == str(tmp_path)
+    assert parent_inputs["config_root"] == str(tmp_path)
+    assert parent_inputs["hf_config_path"] is None
+    assert args.model == str(tmp_path)
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+
+
+def test_patch_valid_hf_config_without_model_type_preserves_keys(tmp_path):
+    """A valid partial config should be copied before required keys are added."""
+    original_config = {
+        "hidden_size": 1024,
+        "custom_key": {"nested": True},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(original_config), encoding="utf-8")
+    args = object.__new__(OmniEngineArgs)
+    args.model = str(tmp_path)
+    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.hf_config_path = None
+
+    try:
+        args._patch_empty_hf_config("indextts2_5")
+
+        assert args.hf_config_path is not None
+        with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+            patched_config = json.load(config_file)
+        assert patched_config["hidden_size"] == original_config["hidden_size"]
+        assert patched_config["custom_key"] == original_config["custom_key"]
+        assert patched_config["model_type"] == "indextts2_5"
+        assert patched_config["architectures"] == ["IndexTTS25TalkerForConditionalGeneration"]
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
+    """Remote resolution failures must stay on vLLM's normal error path."""
+    loader_error = OSError("remote config resolution failed")
+    parent_inputs = {}
+
+    def controlled_get_config_dict(cls, model, **kwargs):
+        raise loader_error
+
+    def fake_parent_create_model_config(self):
+        parent_inputs["called"] = True
+        parent_inputs["model"] = self.model
+        parent_inputs["hf_config_path"] = self.hf_config_path
+        return PretrainedConfig.get_config_dict(self.model)[0]
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_parent_create_model_config)
+
+    args = OmniEngineArgs(
+        model="remote/model",
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        args.create_model_config()
+
+    assert str(exc_info.value) == str(loader_error)
+    assert parent_inputs["called"] is True
+    assert parent_inputs["model"] == "remote/model"
+    assert parent_inputs["hf_config_path"] is None
+    assert args.model == "remote/model"
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
 
 
 def test_stage_specific_text_config_override():
@@ -226,78 +592,26 @@ def test_stage_specific_text_config_override():
     assert omni_config.get_head_size() == talker_head_dim
 
 
-def test_stage_configs_path_field():
-    """OmniEngineArgs with stage_configs_path should construct without error."""
-    args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
-    assert args.stage_configs_path == "/some/path.yaml"
+def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
+    """A stage without an embedding-size override keeps the default input width."""
+    vllm_config = EngineArgs().create_model_config()
+    vllm_config.hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
 
-
-def test_strip_single_engine_args():
-    """_strip_single_engine_args should remove EngineArgs fields but keep omni fields."""
-    kwargs = {
-        # Parent EngineArgs fields — stripped unless explicitly allowlisted
-        "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
-        "tensor_parallel_size": 4,
-        "gpu_memory_utilization": 0.9,
-        "model": "some/model",
-        # Parent field that should be kept (allowlisted)
-        "worker_extension_cls": "some.Extension",
-        # OmniEngineArgs-only / non-engine fields — should pass through
-        "stage_configs_path": "/path/to/yaml",
-        "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        "mode": "text-to-image",
-        "lora_path": "/some/lora",
-    }
-
-    filtered = AsyncOmniEngine._strip_single_engine_args(kwargs)
-
-    # Stripped — parent EngineArgs fields
-    assert "compilation_config" not in filtered
-    assert filtered["tensor_parallel_size"] == 4
-    assert "gpu_memory_utilization" not in filtered
-    assert "model" not in filtered
-
-    # Stripped — orchestrator-level OmniEngineArgs field
-    assert "stage_configs_path" not in filtered
-
-    # Kept
-    assert filtered["worker_extension_cls"] == "some.Extension"
-    assert filtered["custom_pipeline_args"] == {"pipeline_class": "my.Pipeline"}
-    assert filtered["mode"] == "text-to-image"
-    assert filtered["lora_path"] == "/some/lora"
-
-
-def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
-    """model is always in kwargs (callers set it via from_cli_args/asdict),
-    so it should not cause the override warning by itself or appear in it."""
-    mock_warn = mocker.patch("vllm_omni.engine.async_omni_engine.logger.warning")
-
-    # Typical caller kwargs: model is always present, no other parent
-    # EngineArgs fields are explicitly overridden.
-    AsyncOmniEngine._strip_single_engine_args(
-        {
-            "model": "some/model",
-            "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        }
+    omni_config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        model_stage="talker",
+        hf_config_name="talker_config",
     )
-    mock_warn.assert_not_called()
 
-    # When there *are* genuinely surprising overrides alongside model,
-    # the warning should mention them but not model. Keep-listed fields such as
-    # tensor_parallel_size are intentionally passed through and should not warn.
-    AsyncOmniEngine._strip_single_engine_args(
-        {
-            "model": "some/model",
-            "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
-            "tensor_parallel_size": 4,
-            "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        }
+    assert (
+        getattr(
+            omni_config.hf_config.talker_config,
+            "embedding_size",
+            None,
+        )
+        is None
     )
-    mock_warn.assert_called_once()
-    warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
-    assert "compilation_config" in warned_args
-    assert "tensor_parallel_size" not in warned_args
-    assert "model" not in warned_args
+    assert omni_config.get_inputs_embeds_size() == omni_config.hf_text_config.hidden_size
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/3293
@@ -306,7 +620,202 @@ def test_tensor_parallel_size_none_is_handled():
     engine_args = OmegaConf.create({"stage_id": 0, "engine_args": {"tensor_parallel_size": None}})
     args = build_engine_args_dict(
         engine_args,
-        model="snu-aidas/Dynin-Omni",
+        model="Qwen/Qwen2-VL-2B-Instruct",
     )
     assert isinstance(args, dict)
     assert "tensor_parallel_size" not in args
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_from_cli_args_preserves_text_encoder_tp_size():
+    """`--text-encoder-tp-size` must survive from_cli_args field filtering.
+
+    Library callers build engine args via ``OmniEngineArgs.from_cli_args``;
+    the dataclass field filter drops any namespace attribute the dataclass
+    does not declare, silently resetting the diffusion text-encoder TP to 1.
+    """
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    assert engine_args.text_encoder_tp_size == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
+    """The preserved CLI value must land in DiffusionParallelConfig.
+
+    Forward the preserved explicit override to the generic diffusion
+    fallback, which resolves it through
+    ``DiffusionParallelConfig.from_stage_overrides``. Serializing all engine
+    defaults would also forward unrelated LLM-only fields to strict diffusion
+    ingress, unlike the explicit-kwargs library entrypoint.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {"text_encoder_tp_size": engine_args.text_encoder_tp_size},
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+# The non-parallel diffusion engine args the serve CLI registers on
+# OrchestratorArgs and the stage engine consumes. Values differ from the
+# OmniDiffusionConfig defaults so a silently reset field fails the check.
+DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
+    ("num_gpus", 4),
+    ("model_class_name", "WanPipeline"),
+    ("hsdp_weight_load_strategy", "shard"),
+    ("diffusion_load_format", "dummy"),
+    ("lora_path", ["./lora.safetensors"]),
+    ("lora_backend", "distill"),
+    ("lora_scale", 0.5),
+    ("diffusers_load_kwargs", '{"local_files_only": true}'),
+    ("diffusers_call_kwargs", '{"num_inference_steps": 20}'),
+    ("diffusion_quantization_config", "fp8"),
+    ("diffusion_attention_backend", "SDPA"),
+    ("fastvideo_vsa_topk", 96),
+    ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    ("diffusion_compile_granularity", "whole"),
+    ("diffusion_compile_dynamic", False),
+    ("enable_cuda_graph_decode", False),
+    ("cache_backend", "tea_cache"),
+    ("cache_config", '{"steps": [1, 2]}'),
+    ("video_output_transport", {"backend": "zmq"}),
+    ("enable_cache_dit_summary", True),
+    ("step_execution", True),
+    ("vae_use_slicing", True),
+    ("vae_use_tiling", True),
+    ("vae_fast_path", "channels_last"),
+    ("vae_encode_fast_path", "off"),
+    ("enable_multithread_weight_load", False),
+    ("enable_broadcast_weight_load", True),
+    ("num_weight_load_threads", 8),
+    ("diffusion_offload_config", {"transformer": "cpu"}),
+    ("enable_cpu_offload", True),
+    ("enable_layerwise_offload", True),
+    ("enable_distributed_layerwise_offload", True),
+    ("dlo_use_allgather", False),
+    ("dlo_resident_layers", 2),
+    ("host_weight_runtime_mode", "preferred"),
+    ("host_weight_runtime_root", "/tmp/hwr"),
+    ("dlo_host_registration_limit_gib", 4.0),
+    ("boundary_ratio", 0.875),
+    ("flow_shift", 12.0),
+    ("diffusion_kv_cache_dtype", "fp8_e4m3"),
+    ("diffusion_kv_cache_skip_steps", "0-9"),
+    ("diffusion_kv_cache_skip_layers", "25-30"),
+    ("default_sampling_params", '{"0": {"guidance_scale": 5.0}}'),
+    ("max_generated_image_size", 1048576),
+    ("tts_max_instructions_length", 1000),
+    ("enable_diffusion_pipeline_profiler", True),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_from_cli_args_preserves_non_parallel_diffusion_engine_args():
+    """Every non-parallel diffusion engine arg must survive from_cli_args.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so an arg
+    the dataclass does not declare is silently dropped on the library path
+    (#7652 covered ``text_encoder_tp_size``; the parallel knobs of #8037 are
+    covered separately).
+    """
+    for knob, value in DIFFUSION_NON_PARALLEL_ENGINE_ARGS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
+    """The preserved values must land where the diffusion stage reads them.
+
+    Forward the explicit overrides to the generic diffusion fallback:
+    ``cache_backend``/``step_execution``/``flow_shift`` are direct
+    ``OmniDiffusionConfig`` fields and ``num_gpus`` resolves the
+    data-parallel degree.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    overrides = {
+        "cache_backend": "tea_cache",
+        "step_execution": True,
+        "flow_shift": 12.0,
+        "num_gpus": 2,
+        "enable_cuda_graph_decode": False,
+        "vae_encode_fast_path": "off",
+    }
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {name: getattr(engine_args, name) for name in overrides},
+    )[0]
+
+    resolved = stage_cfg["engine_args"]
+    assert resolved["cache_backend"] == "tea_cache"
+    assert resolved["step_execution"] is True
+    assert resolved["flow_shift"] == 12.0
+    assert resolved["parallel_config"]["data_parallel_size"] == 2
+    assert resolved["enable_cuda_graph_decode"] is False
+    assert resolved["vae_encode_fast_path"] == "off"
+
+
+def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
+    from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    class Worker:
+        model_runner_cls = OmniARModelRunner
+
+    validate_worker_omni_connector(Worker, required=True)
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+# The diffusion parallel knobs the serve CLI registers and the engine must keep
+# when engine args come from parsed CLI args. Values are not the
+# DiffusionParallelConfig defaults, so a silently reset knob fails the check.
+DIFFUSION_PARALLEL_KNBS = [
+    ("ulysses_degree", 4),
+    ("ulysses_mode", "advanced_uaa"),
+    ("ulysses_a2a_permute", True),
+    ("ring_degree", 2),
+    ("allgather_degree", 8),
+    ("use_hsdp", True),
+    ("hsdp_shard_size", 2048),
+    ("hsdp_replicate_size", 2),
+    ("cfg_parallel_size", 2),
+    ("vae_patch_parallel_size", 2),
+    ("vae_parallel_mode", "spatial_shard_height"),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+def test_from_cli_args_applies_diffusion_parallel_knobs():
+    """Every CLI-registered diffusion parallel knob must survive and be applied.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so a knob
+    that ``OmniEngineArgs`` does not declare was silently reset to its
+    ``DiffusionParallelConfig`` default (#7652 covered
+    ``text_encoder_tp_size`` alone). Every value in the table differs from that
+    default, so an ignored knob fails the second assertion too.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    for knob, value in DIFFUSION_PARALLEL_KNBS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+        # Forward the preserved value rather than the table literal, so the
+        # second assertion fails if ``from_cli_args`` dropped the knob.
+        factory_kwargs = {knob: getattr(engine_args, knob)}
+        if knob == "use_hsdp":
+            # Standalone HSDP (all other parallelism at 1) cannot
+            # auto-calculate its shard size; pass one explicitly.
+            factory_kwargs["hsdp_shard_size"] = 2048
+        stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
+        parallel_config = stage_cfg["engine_args"]["parallel_config"]
+        assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

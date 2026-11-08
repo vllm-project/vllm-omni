@@ -237,7 +237,7 @@ async def run_single_request(
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
         ):
-            output = omni_output.request_output
+            output = omni_output
             if omni_output.final_output_type == "text":
                 if stage_0_first_output_ts is None:
                     stage_0_first_output_ts = time.perf_counter()
@@ -386,8 +386,8 @@ async def run_all(args):
         # argparse defaults do not silently override deploy YAML values.
         async_omni = AsyncOmni.from_cli_args(args, model=args.model)
 
-        # Use default sampling params from stage config (they are pre-configured
-        # in the YAML for each stage).
+        # Use default sampling params from the resolved pipeline and deploy
+        # config.
         #
         # NOTE: Since we do not set the sampling params directly, .generate in
         # will automatically set the output kind to delta, since this is what

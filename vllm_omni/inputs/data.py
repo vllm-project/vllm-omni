@@ -1,8 +1,14 @@
-import copy
-import pprint
-from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
+import math
+import pprint
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Any, TypeAlias, TypeVar, cast
+
+import msgspec
 import torch
 from typing_extensions import NotRequired, TypedDict
 from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
@@ -10,6 +16,8 @@ from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
+
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
 class OmniTextPrompt(TextPrompt):
@@ -41,12 +49,16 @@ class OmniInteractionEvent(OmniTextPrompt, total=False):
     pass
 
 
-class OmniInteractionPrompt(TypedDict, total=False):
-    """Mid-stream interaction payload."""
+class OmniInteractionPrompt(TypedDict):
+    """Normalized mid-stream interaction payload passed to ``submit_interaction``.
 
-    event_id: NotRequired[str]
-    event: NotRequired[OmniInteractionEvent]
+    WebSocket clients payload may omit ``event_id``; the API layer assigns a fallback ID in this case.
+    """
+
+    event_id: str
+    event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
+    received_at: NotRequired[float]  # Internal engine-clock ingress stamp; never trusted from clients.
 
 
 class OmniTokensPrompt(TokensPrompt):
@@ -127,6 +139,12 @@ class OmniCustomPrompt(TypedDict, total=False):
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
 
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
+
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
         negative_prompt_ids: Pre-tokenized negative prompt token IDs
@@ -202,11 +220,18 @@ class OmniDiffusionSamplingParams:
     to manage numerous individual parameters.
     """
 
+    # Whether final outputs should be watermarked (when configured).
+    watermarking: bool | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
+
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -245,7 +270,7 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    fps: float | None = None  # Request/output-encoding FPS; fractional rates are supported.
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
@@ -337,6 +362,45 @@ class OmniDiffusionSamplingParams:
     # results
     output: torch.Tensor | None = None
 
+    # Internal control-plane event used by asynchronous APIs. When enabled,
+    # the diffusion engine emits a non-terminal output when the scheduler
+    # first admits this request for execution.
+    emit_request_lifecycle: bool = False
+
+    # Opt-in playback feedback for a single interactive video stream. The
+    # engine starts another chunk only while generated media is below this
+    # many seconds ahead of the client's reported playback position.
+    streaming_buffer_seconds: float | None = None
+    streaming_max_output_bytes: int = 64 * 1024 * 1024
+    streaming_idle_timeout_s: float = 30.0
+    # AsyncOmni releases each output only after its consumer resumes iteration.
+    streaming_output_ack: bool = False
+
+    def __post_init__(self) -> None:
+        buffer = self.streaming_buffer_seconds
+        if buffer is not None and (
+            isinstance(buffer, bool)
+            or not isinstance(buffer, (int, float))
+            or not math.isfinite(buffer)
+            or not 0 < buffer <= 10
+        ):
+            raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
+        if (
+            isinstance(self.streaming_max_output_bytes, bool)
+            or not isinstance(self.streaming_max_output_bytes, int)
+            or not 0 < self.streaming_max_output_bytes <= 2**63 - 1
+        ):
+            raise ValueError("streaming_max_output_bytes must be a positive integer")
+        if (
+            isinstance(self.streaming_idle_timeout_s, bool)
+            or not isinstance(self.streaming_idle_timeout_s, (int, float))
+            or not math.isfinite(self.streaming_idle_timeout_s)
+            or self.streaming_idle_timeout_s <= 0
+        ):
+            raise ValueError("streaming_idle_timeout_s must be finite and positive")
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+
     @property
     def batch_size(self):
         # This class is changed to only represent a single prompt request
@@ -391,11 +455,36 @@ class OmniDiffusionSamplingParams:
             seed = getattr(params, "seed", None)
             if seed is not None:
                 mapped.setdefault("seed", seed)
+            mapped["watermarking"] = params.watermarking
             return cls(**mapped)
         raise TypeError(
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
             f"got {type(params).__name__!r}."
         )
 
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Reconstruct params from a dict decoded after IPC, handling LoRA."""
+        lora_request = params.get("lora_request")
+        if lora_request is not None and not isinstance(lora_request, LoRARequest):
+            params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
+        return cls(**params)
+
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
+
+StageParamsT = TypeVar("StageParamsT")
+
+
+def disable_watermarking(params_list: Sequence[StageParamsT]) -> list[StageParamsT]:
+    """Copy each stage's sampling params with watermarking disabled."""
+    disabled_params_list: list[StageParamsT] = []
+    for params in params_list:
+        if isinstance(params, OmniSamplingParams):
+            disabled = copy.copy(params)
+            disabled.watermarking = False
+            # copy.copy preserves the concrete type, which mypy loses through the isinstance narrowing
+            disabled_params_list.append(cast(StageParamsT, disabled))
+        else:
+            disabled_params_list.append(params)
+    return disabled_params_list

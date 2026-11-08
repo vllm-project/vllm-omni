@@ -1,7 +1,7 @@
 # Custom Pipeline Extension Guide
 
 Transformer already support Custom Pipeline via
-https://github.com/huggingface/diffusers/blob/main/docs/source/en/using-diffusers/custom_pipeline_overview.md
+<https://github.com/huggingface/diffusers/blob/main/docs/source/en/using-diffusers/custom_pipeline_overview.md>
 
 This guide demonstrates how to use the newly added features for extending vLLM-Omni's diffusion pipeline with custom functionality.
 
@@ -20,8 +20,9 @@ Three main features enable custom pipeline extension:
 `WorkerWrapperBase` is a wrapper class that creates `DiffusionWorker` instances with optional extension support. It enables dynamic inheritance, allowing you to add custom methods and functionality to workers without modifying the base worker class.
 
 **Key capabilities:**
+
 - Dynamic worker class extension via `worker_extension_cls`
-- Support for custom pipeline initialization via `custom_pipeline_args`
+- Support for custom pipeline initialization via `custom_pipeline_args["pipeline_class"]`
 - Method delegation to underlying worker
 - Attribute access forwarding
 
@@ -42,6 +43,7 @@ The `diffusion_load_format` parameter controls the initial diffusion model load.
 `CustomPipelineWorkerExtension` is a mixin class that extends `DiffusionWorker` with the ability to re-initialize the pipeline with a custom implementation.
 
 **Key method:**
+
 - `re_init_pipeline(custom_pipeline_args)`: Re-initializes the pipeline with custom arguments, properly cleaning up the old pipeline first
 
 **Location:** `vllm_omni/diffusion/worker/diffusion_worker.py`
@@ -101,7 +103,7 @@ outputs = omni.generate(
 )
 
 # Access custom trajectory data
-output = outputs[0].request_output
+output = outputs[0]
 print(f"Trajectory timesteps shape: {output.metrics['trajectory_timesteps'].shape}")
 print(f"Trajectory latents shape: {output.latents.shape}")
 ```
@@ -150,6 +152,7 @@ omni = Omni(
     },
     worker_extension_cls=MyCustomExtension,
     # Note: worker_extension_cls is an internal parameter
-    # CustomPipelineWorkerExtension will automatically init pipeline when custom_pipeline_args is provided
+    # CustomPipelineWorkerExtension will automatically init pipeline when
+    # custom_pipeline_args includes "pipeline_class".
 )
 ```

@@ -6,7 +6,7 @@ Supports online (dynamic) NF4/FP4 weight-only quantization from BF16/FP16
 checkpoints on CUDA GPUs.
 """
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Module
@@ -20,7 +20,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -29,6 +28,9 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization._copy_missing_attrs import (
+    copy_missing_attrs as _copy_missing_attrs,
+)
 from vllm_omni.quantization.int8_config import LazyWeightMixin
 
 if TYPE_CHECKING:
@@ -94,7 +96,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,

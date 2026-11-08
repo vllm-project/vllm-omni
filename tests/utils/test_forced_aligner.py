@@ -105,9 +105,7 @@ forced_aligner:
 """,
         encoding="utf-8",
     )
-    args = type("Args", (), {"forced_aligner": None, "forced_aligner_config": str(cfg)})()
-
-    out = forced_aligner.build_forced_aligner_config(args)
+    out = forced_aligner.build_forced_aligner_config(None, str(cfg))
 
     assert out == forced_aligner.ForcedAlignerConfig(
         model="Qwen/Qwen3-ForcedAligner-0.6B",
@@ -127,16 +125,7 @@ def test_build_config_cli_model_overrides_yaml(tmp_path):
         "forced_aligner:\n  model: old\n  gpu_memory_utilization: 0.2\n  dtype: float16\n",
         encoding="utf-8",
     )
-    args = type(
-        "Args",
-        (),
-        {
-            "forced_aligner": "new",
-            "forced_aligner_config": str(cfg),
-        },
-    )()
-
-    out = forced_aligner.build_forced_aligner_config(args)
+    out = forced_aligner.build_forced_aligner_config("new", str(cfg))
 
     assert out is not None
     # --forced-aligner overrides the YAML model; gpu_memory_utilization/dtype
@@ -148,16 +137,7 @@ def test_build_config_cli_model_overrides_yaml(tmp_path):
 
 
 def test_build_config_from_cli_model_uses_default_yaml():
-    args = type(
-        "Args",
-        (),
-        {
-            "forced_aligner": "local-aligner",
-            "forced_aligner_config": None,
-        },
-    )()
-
-    out = forced_aligner.build_forced_aligner_config(args)
+    out = forced_aligner.build_forced_aligner_config("local-aligner", None)
 
     assert out is not None
     assert out.model == "local-aligner"

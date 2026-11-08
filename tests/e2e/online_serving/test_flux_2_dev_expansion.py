@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 End-to-end diffusion coverage for FLUX.2-dev in online serving mode.
 
@@ -19,7 +22,7 @@ image resolution.
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -116,7 +119,7 @@ def _get_flux_2_dev_feature_cases(model: str):
 )
 def test_flux_2_dev(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """Validate FLUX.2-dev online serving with CPU offload."""
 
@@ -135,4 +138,39 @@ def test_flux_2_dev(
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_flux_2_dev_feature_cases(MODEL),
+    indirect=True,
+)
+def test_flux_2_dev_batched_chat_completions(
+    omni_server: OmniServer,
+    online_client: OnlineOmniClient,
+):
+    """Validate batched chat completions for diffusion models."""
+    messages = [
+        [{"role": "user", "content": PROMPT}],
+        [{"role": "user", "content": "A sunset over the ocean."}],
+    ]
+    responses = online_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                "num_inference_steps": 2,
+                "height": 512,
+                "width": 512,
+                "seed": 42,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert resp.success
+    body = resp.json_body
+    assert isinstance(body, dict)
+    choices = body["choices"]
+    assert len(choices) == len(messages)

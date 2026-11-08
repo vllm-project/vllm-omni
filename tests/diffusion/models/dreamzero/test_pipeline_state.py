@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
+    DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
+    DreamZeroPipeline,
+)
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -30,6 +33,37 @@ def test_dreamzero_pipeline_state_is_session_keyed() -> None:
     assert pipeline._get_or_create_state("session-b") is session_b
     assert session_a.call_count == 7
     assert session_b.call_count == 3
+
+
+def test_dreamzero_kv_spec_accounts_for_model_owned_cuda_state(monkeypatch) -> None:
+    pipeline = DreamZeroPipeline.__new__(DreamZeroPipeline)
+    pipeline.transformer = SimpleNamespace(
+        frame_seqlen=16,
+        blocks=[
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    max_attention_size=96,
+                    tp_num_heads=4,
+                )
+            )
+        ],
+        text_len=8,
+        model_type="t2v",
+        num_layers=2,
+        num_heads=4,
+        dim=256,
+        num_frame_per_block=4,
+        num_action_per_block=2,
+        num_state_per_block=1,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero.get_classifier_free_guidance_world_size",
+        lambda: 1,
+    )
+
+    spec = pipeline.ar_diffusion_kv_cache_spec()
+
+    assert spec.model_owned_state_bytes_per_session == DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION
 
 
 def test_dreamzero_pipeline_state_follows_runner_lifecycle_notifications() -> None:

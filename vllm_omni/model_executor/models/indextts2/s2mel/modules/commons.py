@@ -68,6 +68,6 @@ class MyModel(nn.Module):
         x = self.models["gpt_layer"](x)
         return x
 
-    def enable_torch_compile(self):
+    def enable_torch_compile(self, mode: str = "default"):
         if "cfm" in self.models:
-            self.models["cfm"].enable_torch_compile()
+            self.models["cfm"].enable_torch_compile(mode=mode)

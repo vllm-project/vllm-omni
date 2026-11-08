@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """L4 online-serving tests for the Krea 2 text-to-image diffusion pipeline.
 
@@ -29,7 +29,7 @@ import requests
 from PIL import Image
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -76,7 +76,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_krea2(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_krea2(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Serve Krea 2 and validate the OpenAI-compatible image-generation route.
 
     guidance_scale resolution is checkpoint-aware inside the pipeline (distilled -> no-CFG,
@@ -96,7 +96,7 @@ def test_krea2(omni_server: OmniServer, openai_client: OpenAIClientHandler):
             "seed": 42,
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 def _basic_lora_payload(lora: dict | None = None) -> dict:

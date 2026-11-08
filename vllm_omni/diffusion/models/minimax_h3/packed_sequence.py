@@ -1,0 +1,753 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""MiniMax H3 packed-sequence materialization for FL2VA and Ref2VA tasks.
+
+Layout: [text L | imgvid_cond C | audio A(=t*2ch) | video_target V | pad P].
+Builder rules:
+- placeholder ids; block-derived pos infos/masks/cu_seqlens/document_id
+- img_position_ids fp64 grid: text rows (row_idx,0,0); video/cond t counter
+  continues text_len with temporal interp spans (frame_rescale 5/3 x
+  frame_per_token (1,4,4,4,4)); each spatial sqrt_area axis uses evenly spaced
+  coordinates excluding the right endpoint, then scales them by INTERP;
+  audio channel-major blocks pinned to the w-grid extremes.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+
+import numpy as np
+import torch
+
+from vllm_omni.errors import OmniClientError
+
+MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES: tuple[tuple[int, ...], ...] = (
+    (0,),
+    (-1,),
+    (0, -1),
+)
+
+MINIMAX_H3_TEXT_ID = -5
+MINIMAX_H3_IMGVID_COND_ID = -11
+MINIMAX_H3_AUDIO_REF_COND_ID = -17
+MINIMAX_H3_AUDIO_FIRST_ID = -15
+MINIMAX_H3_AUDIO_ID = -14
+MINIMAX_H3_VIDEO_FIRST_ID = -3
+MINIMAX_H3_VIDEO_ID = -2
+MINIMAX_H3_VIDEO_LAST_ID = -4
+MINIMAX_H3_PAD_ID = -1
+
+_INTERP = 32
+_T_GROUP = 5
+_FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+_FRAME_RESCALE = 5.0 / 3.0
+MINIMAX_H3_SEQ_ALIGN = 64
+"""Row alignment of the packed sequence.
+
+An explicit ``seq_len`` must be a multiple of this, so that pinning a length
+lands on a bucket the default rounding could also produce.
+"""
+
+MINIMAX_H3_MAX_PAD_SEQ_LEN = 1 << 20
+"""Ceiling for a request-pinned packed length.
+
+Every packed row costs a fixed number of bytes across the structural tensors
+built below, so an unbounded request value would size those allocations. The
+largest shape this pipeline is documented against -- 672x384 at 209 frames --
+packs about 16k rows, so this ceiling leaves roughly two orders of magnitude of
+headroom while keeping the structural tensors in the tens of megabytes.
+"""
+# MiniMax H3 packs video latents with a fixed [1, 2, 2] (t, h, w) patch.
+_PATCH_T = 1
+_PATCH_H = 2
+_PATCH_W = 2
+
+
+def _resolve_padded_seq_len(used: int, seq_len: int | None) -> int:
+    """Resolve the padded row count for a packed sequence.
+
+    Without an explicit ``seq_len`` the used rows are rounded up to the next
+    :data:`MINIMAX_H3_SEQ_ALIGN` boundary. An explicit value is honored as-is
+    and must cover the used rows.
+    """
+    if seq_len is None:
+        return ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
+    if seq_len < used:
+        raise OmniClientError(f"seq_len {seq_len} < used rows {used}")
+    return seq_len
+
+
+def _keyframe_cond_frame_indices(
+    *,
+    include_keyframe_cond: bool,
+    keyframe_frame_indices: list[int] | tuple[int, ...] | None,
+) -> list[int]:
+    if not include_keyframe_cond:
+        if keyframe_frame_indices is not None:
+            raise ValueError("keyframe_frame_indices must be omitted when keyframe cond is not included")
+        return []
+    if keyframe_frame_indices is None:
+        raise ValueError("strict fl2va packed layout requires keyframe_frame_indices")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in keyframe_frame_indices):
+        raise ValueError("strict fl2va packed layout requires integer keyframe_frame_indices")
+    out = list(keyframe_frame_indices)
+    if tuple(out) not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
+        raise ValueError(
+            "strict fl2va packed layout requires keyframe_frame_indices in "
+            f"{MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got {out!r}"
+        )
+    return out
+
+
+def _resolve_keyframe_frame_indices(
+    frame_indices: Sequence[int],
+    *,
+    frame_count: int | None,
+) -> list[int]:
+    if frame_indices and frame_count is None:
+        raise ValueError("frame_count is required when keyframe_frame_indices are provided")
+    if frame_count is None:
+        return []
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    seen: dict[int, int] = {}
+    resolved: list[int] = []
+    for block_index, semantic_index in enumerate(frame_indices):
+        if semantic_index == -1:
+            resolved_index = frame_count - 1
+        elif 0 <= semantic_index < frame_count:
+            resolved_index = semantic_index
+        else:
+            raise ValueError(f"keyframe frame index {semantic_index} must be -1 or in [0, {frame_count})")
+        previous = seen.get(resolved_index)
+        if previous is not None:
+            raise ValueError(
+                f"keyframe frame index at block {block_index} resolves to "
+                f"{resolved_index}, already bound by block {previous}"
+            )
+        seen[resolved_index] = block_index
+        resolved.append(resolved_index)
+    return resolved
+
+
+def _temporal_position_span(temporal_length: int) -> float:
+    """Temporal position span for patch_t=1, in fp64.
+
+    NOTE: intentionally NOT merged with ``_video_t_span``. This variant sums
+    via numpy (pairwise summation), matching the fl2va anchor computation,
+    while ``_video_t_span`` sums sequentially, matching the ref2va
+    t-origin accumulation. The two orders diverge in the last ulp
+    from n=16 onward, so each path must keep its own summation order.
+    """
+    spans = np.ones(int(temporal_length), dtype=np.float64) * _FRAME_RESCALE
+    for token_index in range(_T_GROUP):
+        spans[token_index::_T_GROUP] *= _FRAME_PER_TOKEN[token_index]
+    return float(spans.sum())
+
+
+def minimax_h3_packed_sequence(
+    *,
+    text_len: int,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    audio_t: int,
+    audio_channel: int = 2,
+    include_keyframe_cond: bool,
+    keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
+    frame_count: int | None = None,
+    seq_len: int | None = None,
+) -> dict[str, object]:
+    """Build the packed-sequence structural fields for one CFG branch.
+
+    The used length is padded up to a multiple of
+    :data:`MINIMAX_H3_SEQ_ALIGN`, or to an explicit ``seq_len`` that covers the
+    used rows -- the same contract
+    :func:`minimax_h3_packed_sequence_ref2va_blocks` already offers. Pinning
+    the length keeps requests of different prompt lengths on one packed shape.
+    """
+    ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
+    frame_rows = ph * pw
+    cond_frame_indices = _keyframe_cond_frame_indices(
+        include_keyframe_cond=include_keyframe_cond,
+        keyframe_frame_indices=keyframe_frame_indices,
+    )
+    resolved_cond_frame_indices = _resolve_keyframe_frame_indices(
+        cond_frame_indices,
+        frame_count=frame_count,
+    )
+    cond_rows = len(cond_frame_indices) * frame_rows
+    video_rows = latent_t * frame_rows
+    audio_rows = audio_t * audio_channel
+    used = text_len + cond_rows + audio_rows + video_rows
+    seq_len = _resolve_padded_seq_len(used, seq_len)
+
+    text_sl = slice(0, text_len)
+    cond_sl = slice(text_len, text_len + cond_rows)
+    audio_sl = slice(cond_sl.stop, cond_sl.stop + audio_rows)
+    video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
+    pad_sl = slice(video_sl.stop, seq_len)
+
+    input_ids = torch.full((seq_len,), MINIMAX_H3_PAD_ID, dtype=torch.int64)
+    input_ids[text_sl] = MINIMAX_H3_TEXT_ID
+    if cond_rows:
+        input_ids[cond_sl] = MINIMAX_H3_IMGVID_COND_ID
+    input_ids[audio_sl] = MINIMAX_H3_AUDIO_ID
+    input_ids[audio_sl.start] = MINIMAX_H3_AUDIO_FIRST_ID
+    input_ids[video_sl] = MINIMAX_H3_VIDEO_ID
+    input_ids[video_sl.start] = MINIMAX_H3_VIDEO_FIRST_ID
+    input_ids[video_sl.stop - 1] = MINIMAX_H3_VIDEO_LAST_ID
+
+    image_mask = torch.zeros(seq_len, dtype=torch.bool)
+    image_mask[cond_sl] = True
+    image_mask[video_sl] = True
+    audio_mask = torch.zeros(seq_len, dtype=torch.bool)
+    audio_mask[audio_sl] = True
+
+    img_pos = torch.cat(
+        [
+            torch.arange(cond_sl.start, cond_sl.stop),
+            torch.arange(video_sl.start, video_sl.stop),
+        ]
+    )
+    update_mask = torch.zeros(img_pos.shape[0], dtype=torch.bool)
+    update_mask[cond_rows:] = True
+    audio_pos = torch.arange(audio_sl.start, audio_sl.stop)
+    text_pos = torch.arange(0, text_len)
+
+    g = torch.zeros(seq_len, 3, dtype=torch.float64)
+    g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
+
+    t_grid = _video_t_grid(latent_t, float(text_len))
+    sqrt_area = np.sqrt(latent_h * latent_w)
+    h_grid = _axis_from_sqrt_area(latent_h, _PATCH_H, sqrt_area)
+    w_grid = _axis_from_sqrt_area(latent_w, _PATCH_W, sqrt_area)
+    hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
+    frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
+    video_g = torch.empty(latent_t, frame_rows, 3, dtype=torch.float64)
+    video_g[:, :, 0] = t_grid[:, None]
+    video_g[:, :, 1:] = frame[None]
+    for block_index, pixel_index in enumerate(resolved_cond_frame_indices):
+        sl = slice(
+            cond_sl.start + block_index * frame_rows,
+            cond_sl.start + (block_index + 1) * frame_rows,
+        )
+        if pixel_index == 0:
+            cond_t = float(text_len)
+        elif frame_count is not None and pixel_index == frame_count - 1:
+            cond_t = float(text_len) + _temporal_position_span(latent_t) - _FRAME_RESCALE
+        else:
+            raise ValueError(
+                f"fl2va packed layout only supports first/last keyframe anchors, got resolved frame index {pixel_index}"
+            )
+        g[sl, 0] = cond_t
+        g[sl, 1:] = frame
+    g[video_sl] = video_g.reshape(-1, 3)
+    audio_t_grid = float(text_len) + torch.arange(audio_t, dtype=torch.float64)
+    g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
+    g[audio_sl, 2] = torch.cat(
+        [
+            torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
+            torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64),
+        ]
+    )
+
+    token_tags = torch.full((seq_len,), -1, dtype=torch.long)  # PADDING
+    token_tags[text_sl] = 1  # TEXT (fl2va image-segment override happens upstream)
+    token_tags[audio_sl] = 2  # AUDIO
+    token_tags[img_pos] = 0  # VIDEO
+
+    cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    doc = torch.zeros(seq_len, dtype=torch.int32)
+    doc[pad_sl] = 1
+    return {
+        "seq_len": torch.tensor(seq_len),
+        "input_ids": input_ids,
+        "image_mask": image_mask,
+        "audio_mask": audio_mask,
+        "img_pos": img_pos,
+        "audio_pos": audio_pos,
+        "text_pos": text_pos,
+        "update_mask": update_mask,
+        "img_position_ids": g,
+        "token_tags": token_tags,
+        "cu_seqlens": cu,
+        "document_id": doc,
+        # Extent of the video segment within the packed sequence.
+        "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
+        "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
+        # The single target video uses the same span contract as Ref2VA.
+        "video_spans": (
+            {
+                "start": video_sl.start,
+                "latent_grid": (latent_t, ph, pw),
+                "role": "target",
+            },
+        ),
+    }
+
+
+def _positive_int(
+    block: Mapping[str, object],
+    key: str,
+    path: str,
+    *,
+    allow_zero: bool = False,
+) -> int:
+    value = block.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{path}.{key} must be an integer")
+    if value < 0 or (value == 0 and not allow_zero):
+        predicate = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{path}.{key} must be {predicate}")
+    return int(value)
+
+
+def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
+    ratio = dim / sqrt_area
+    left = (1.0 - ratio) * 1.0 / 2.0
+    right = left + ratio * 1.0
+    grid = np.linspace(left, right, dim // patch, endpoint=False) * _INTERP
+    return torch.from_numpy(grid).to(torch.float64)
+
+
+def _video_t_grid(n: int, origin: float) -> torch.Tensor:
+    if not n:
+        return torch.empty(0, dtype=torch.float64)
+    spans = torch.tensor(
+        [_FRAME_RESCALE * _FRAME_PER_TOKEN[k % _T_GROUP] for k in range(n)],
+        dtype=torch.float64,
+    )
+    return origin + torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
+
+
+def _video_t_span(n: int) -> float:
+    # Sequential fp64 summation on purpose — see _temporal_position_span for
+    # why the two span implementations must not be unified.
+    return sum(_FRAME_RESCALE * _FRAME_PER_TOKEN[k % _T_GROUP] for k in range(n))
+
+
+def _range_for_slice(sl: slice) -> torch.Tensor:
+    return torch.arange(sl.start, sl.stop, dtype=torch.long)
+
+
+def _cat_ranges(parts: list[torch.Tensor]) -> torch.Tensor:
+    if parts:
+        return torch.cat(parts)
+    return torch.empty(0, dtype=torch.long)
+
+
+def minimax_h3_packed_sequence_ref2va_blocks(
+    *,
+    text_len: int,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    audio_t: int,
+    ref_blocks: Sequence[Mapping[str, object]],
+    audio_channel: int = 2,
+    seq_len: int | None = None,
+    guide_blocks: Sequence[Mapping[str, object]] | None = None,
+    temporal_offset: float = 0.0,
+    media_time_origin: int | None = None,
+) -> dict[str, object]:
+    """General ref2va-family packed layout.
+
+    ``ref_blocks`` are consumed in request/plan order:
+    - ``{"kind": "image", "latent_h": H, "latent_w": W}``
+    - ``{"kind": "audio", "ref_audio_t": T}``
+    - ``{"kind": "video"|"video_audio", "ref_audio_t": T,
+       "latent_t": RT, "latent_h": RH, "latent_w": RW}``
+    - Internal ``latent_guide``: a final AV condition block on the target's
+      spatial grid and temporal origin, without advancing the reference clock.
+
+    Video-bearing blocks pack their audio rows immediately before their video
+    rows; both share the same temporal origin and advance by the longer of the
+    audio and video spans. Standalone audio advances the target origin by its
+    own T, and image blocks advance it by one integer slot.
+
+    Optional ``guide_blocks`` use the same shapes plus a resolved nonnegative
+    integer ``frame_index`` (in pixel frames). They pack before references, in
+    insertion order, with visual rows before audio for AV guides. A ``video``
+    guide requires ``ref_audio_t=0``; use ``video_audio`` for explicit audio.
+    Guides start at the reference-adjusted target origin plus 5/3 * frame_index
+    and never advance that origin. Guide and reference rows together form the
+    fixed prefix of each modality's rows. Output length/row admission limits
+    must be checked by the caller before materializing this layout.
+
+    ``latent_t=0`` packs an audio-only document without visual references.
+
+    ``temporal_offset`` is the window origin in 40-Hz RoPE units. It shifts
+    target AV, reference AV, timeline guides and latent guides together,
+    leaving text, static images, padding and all spatial coordinates unchanged.
+    """
+    dimensions = dict(
+        text_len=text_len,
+        latent_t=latent_t,
+        latent_h=latent_h,
+        latent_w=latent_w,
+        audio_t=audio_t,
+        audio_channel=audio_channel,
+    )
+    for key in dimensions:
+        _positive_int(dimensions, key, "target", allow_zero=key in ("text_len", "latent_t"))
+    if latent_h % _PATCH_H or latent_w % _PATCH_W:
+        raise ValueError("target latent_h and latent_w must be divisible by the spatial patch size (2)")
+    if seq_len is not None:
+        _positive_int({"seq_len": seq_len}, "seq_len", "target")
+    if not math.isfinite(temporal_offset) or temporal_offset < 0:
+        raise ValueError("temporal_offset must be finite and non-negative")
+    if media_time_origin is not None and media_time_origin < text_len:
+        raise ValueError("media_time_origin must follow the text prefix")
+    if not isinstance(ref_blocks, Sequence) or isinstance(ref_blocks, (str, bytes)):
+        raise ValueError("ref_blocks must be a sequence")
+    if guide_blocks is None:
+        guide_blocks = ()
+    if not isinstance(guide_blocks, Sequence) or isinstance(guide_blocks, (str, bytes)):
+        raise ValueError("guide_blocks must be a sequence")
+
+    parsed: list[dict[str, object]] = []
+    ref_visual_rows = 0
+    ref_audio_rows = 0
+    for block_index, raw in enumerate((*guide_blocks, *ref_blocks)):
+        is_guide = block_index < len(guide_blocks)
+        index = block_index if is_guide else block_index - len(guide_blocks)
+        path = f"{'guide_blocks' if is_guide else 'ref_blocks'}[{index}]"
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{path} must be an object")
+        if is_guide:
+            frame_index = _positive_int(raw, "frame_index", path, allow_zero=True)
+        kind = raw.get("kind", raw.get("type"))
+        if not isinstance(kind, str) or not kind:
+            raise ValueError(f"{path}.kind must be a non-empty string")
+        if is_guide and kind == "latent_guide":
+            raise ValueError(f"{path}.kind unsupported for timeline guides: {kind!r}")
+        if kind in ("image", "video", "video_audio", "latent_guide"):
+            for key, patch in (("latent_h", _PATCH_H), ("latent_w", _PATCH_W)):
+                if _positive_int(raw, key, path) % patch:
+                    raise ValueError(f"{path}.{key} must be divisible by the spatial patch size ({patch})")
+        if kind == "image":
+            rh = _positive_int(raw, "latent_h", path)
+            rw = _positive_int(raw, "latent_w", path)
+            rows = (rh // _PATCH_H) * (rw // _PATCH_W)
+            item = {"kind": kind, "latent_h": rh, "latent_w": rw, "rows": rows}
+            ref_visual_rows += rows
+        elif kind == "audio":
+            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=not is_guide)
+            rows = rt * audio_channel
+            item = {"kind": kind, "ref_audio_t": rt, "audio_rows": rows}
+            ref_audio_rows += rows
+        elif kind in ("video", "video_audio", "latent_guide"):
+            rt = _positive_int(raw, "ref_audio_t", path, allow_zero=not is_guide or kind == "video")
+            if is_guide and kind == "video" and rt:
+                raise ValueError(f"{path}.ref_audio_t must be zero for a video guide; use video_audio for AV")
+            vt = _positive_int(raw, "latent_t", path)
+            vh = _positive_int(raw, "latent_h", path)
+            vw = _positive_int(raw, "latent_w", path)
+            if kind == "latent_guide" and (
+                index != len(ref_blocks) - 1 or (vh, vw) != (latent_h, latent_w) or vt > latent_t or rt > audio_t
+            ):
+                raise ValueError("latent_guide must be last, match the target canvas, and fit its AV lengths")
+            frame_rows = (vh // _PATCH_H) * (vw // _PATCH_W)
+            audio_rows = rt * audio_channel
+            video_rows = vt * frame_rows
+            item = {
+                "kind": kind,
+                "ref_audio_t": rt,
+                "latent_t": vt,
+                "latent_h": vh,
+                "latent_w": vw,
+                "frame_rows": frame_rows,
+                "audio_rows": audio_rows,
+                "video_rows": video_rows,
+            }
+            ref_audio_rows += audio_rows
+            ref_visual_rows += video_rows
+        else:
+            raise ValueError(f"{path}.kind unsupported for ref2va: {kind!r}")
+        if is_guide:
+            item["frame_index"] = frame_index
+        parsed.append(item)
+    if not latent_t and ref_visual_rows:
+        raise ValueError("audio-only documents cannot include visual reference or guide blocks")
+
+    # Preserve reference accumulation order (including fp64 rounding), independent
+    # of physical row offsets and guide spans.
+    target_origin = float(text_len if media_time_origin is None else media_time_origin)
+    for item in parsed[len(guide_blocks) :]:
+        item["origin"] = target_origin
+        if item["kind"] == "latent_guide":
+            # Sits on the target origin and never advances the reference clock.
+            continue
+        if item["kind"] == "image":
+            target_origin += 1.0
+        elif item["kind"] == "audio":
+            target_origin += float(item["ref_audio_t"])
+        else:
+            target_origin += max(float(item["ref_audio_t"]), _video_t_span(int(item["latent_t"])))
+    for item in parsed[: len(guide_blocks)]:
+        item["origin"] = target_origin + _FRAME_RESCALE * int(item["frame_index"])
+
+    ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
+    frame_rows = ph * pw
+    video_rows = latent_t * frame_rows
+    audio_rows = audio_t * audio_channel
+    ref_rows = ref_visual_rows + ref_audio_rows
+    used = text_len + ref_rows + audio_rows + video_rows
+    seq_len = _resolve_padded_seq_len(used, seq_len)
+
+    text_sl = slice(0, text_len)
+    cursor = text_len
+    block_slices: list[dict[str, object]] = []
+    for item in parsed:
+        kind = str(item["kind"])
+        if kind == "image":
+            rows = int(item["rows"])
+            visual_sl = slice(cursor, cursor + rows)
+            cursor = visual_sl.stop
+            block_slices.append({**item, "visual_sl": visual_sl})
+        elif kind == "audio":
+            rows = int(item["audio_rows"])
+            audio_sl = slice(cursor, cursor + rows)
+            cursor = audio_sl.stop
+            block_slices.append({**item, "audio_sl": audio_sl})
+        else:
+            a_rows = int(item["audio_rows"])
+            v_rows = int(item["video_rows"])
+            if "frame_index" in item:
+                visual_sl = slice(cursor, cursor + v_rows)
+                audio_sl = slice(visual_sl.stop, visual_sl.stop + a_rows)
+                cursor = audio_sl.stop
+            else:
+                audio_sl = slice(cursor, cursor + a_rows)
+                visual_sl = slice(audio_sl.stop, audio_sl.stop + v_rows)
+                cursor = visual_sl.stop
+            block_slices.append({**item, "audio_sl": audio_sl, "visual_sl": visual_sl})
+
+    audio_sl = slice(cursor, cursor + audio_rows)
+    video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
+    pad_sl = slice(video_sl.stop, seq_len)
+
+    # Keep each reference (and each AV component) separate for VSA pooling.
+    # Modality tags alone cannot distinguish adjacent references of one kind.
+    prefix_slices = [text_sl]
+    for item in block_slices:
+        slices = [item[key] for key in ("audio_sl", "visual_sl") if key in item]
+        prefix_slices.extend(sorted(slices, key=lambda span: span.start))
+    prefix_slices.append(audio_sl)
+    prefix_segments = tuple(span.stop - span.start for span in prefix_slices if span.stop > span.start)
+
+    # This is deliberately tensor-free metadata. It is constructed once by
+    # the denoise branch and consumed by every attention layer without a
+    # device-to-host synchronization.
+    video_spans: list[dict[str, object]] = []
+    for item in block_slices:
+        if item["kind"] in ("video", "video_audio", "latent_guide"):
+            visual_sl = item["visual_sl"]
+            assert isinstance(visual_sl, slice)
+            video_spans.append(
+                {
+                    "start": visual_sl.start,
+                    "latent_grid": (
+                        int(item["latent_t"]),
+                        int(item["latent_h"]) // _PATCH_H,
+                        int(item["latent_w"]) // _PATCH_W,
+                    ),
+                    "role": "reference",
+                }
+            )
+    if latent_t:
+        video_spans.append(
+            {
+                "start": video_sl.start,
+                "latent_grid": (latent_t, ph, pw),
+                "role": "target",
+            }
+        )
+
+    input_ids = torch.full((seq_len,), MINIMAX_H3_PAD_ID, dtype=torch.int64)
+    input_ids[text_sl] = MINIMAX_H3_TEXT_ID
+    image_mask = torch.zeros(seq_len, dtype=torch.bool)
+    audio_mask = torch.zeros(seq_len, dtype=torch.bool)
+
+    ref_img_pos_parts: list[torch.Tensor] = []
+    ref_audio_pos_parts: list[torch.Tensor] = []
+    g = torch.zeros(seq_len, 3, dtype=torch.float64)
+    g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
+
+    target_area = np.sqrt(latent_h * latent_w)
+    h_grid = _axis_from_sqrt_area(latent_h, _PATCH_H, target_area)
+    w_grid = _axis_from_sqrt_area(latent_w, _PATCH_W, target_area)
+    hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
+    target_frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
+
+    for item in block_slices:
+        t_cursor = float(item["origin"])
+        kind = str(item["kind"])
+        if kind == "image":
+            visual_sl = item["visual_sl"]
+            assert isinstance(visual_sl, slice)
+            input_ids[visual_sl] = MINIMAX_H3_IMGVID_COND_ID
+            image_mask[visual_sl] = True
+            ref_img_pos_parts.append(_range_for_slice(visual_sl))
+            rh = int(item["latent_h"])
+            rw = int(item["latent_w"])
+            area = np.sqrt(rh * rw)
+            ref_hh, ref_ww = torch.meshgrid(
+                _axis_from_sqrt_area(rh, _PATCH_H, area),
+                _axis_from_sqrt_area(rw, _PATCH_W, area),
+                indexing="ij",
+            )
+            g[visual_sl, 0] = t_cursor
+            g[visual_sl, 1] = ref_hh.reshape(-1)
+            g[visual_sl, 2] = ref_ww.reshape(-1)
+        elif kind == "audio":
+            audio_ref_sl = item["audio_sl"]
+            assert isinstance(audio_ref_sl, slice)
+            ref_t = int(item["ref_audio_t"])
+            input_ids[audio_ref_sl] = MINIMAX_H3_AUDIO_REF_COND_ID
+            audio_mask[audio_ref_sl] = True
+            ref_audio_pos_parts.append(_range_for_slice(audio_ref_sl))
+            ref_t_grid = t_cursor + torch.arange(ref_t, dtype=torch.float64)
+            g[audio_ref_sl, 0] = ref_t_grid.repeat(audio_channel)
+            if ref_t:
+                g[audio_ref_sl, 2] = torch.cat(
+                    [
+                        torch.full((ref_t,), float(w_grid[0]), dtype=torch.float64),
+                        torch.full(
+                            (int(item["audio_rows"]) - ref_t,),
+                            float(w_grid[-1]),
+                            dtype=torch.float64,
+                        ),
+                    ]
+                )
+        else:
+            audio_ref_sl = item["audio_sl"]
+            visual_sl = item["visual_sl"]
+            assert isinstance(audio_ref_sl, slice)
+            assert isinstance(visual_sl, slice)
+            ref_t = int(item["ref_audio_t"])
+            vt = int(item["latent_t"])
+            vh = int(item["latent_h"])
+            vw = int(item["latent_w"])
+            input_ids[audio_ref_sl] = MINIMAX_H3_AUDIO_REF_COND_ID
+            input_ids[visual_sl] = MINIMAX_H3_IMGVID_COND_ID
+            audio_mask[audio_ref_sl] = True
+            image_mask[visual_sl] = True
+            ref_audio_pos_parts.append(_range_for_slice(audio_ref_sl))
+            ref_img_pos_parts.append(_range_for_slice(visual_sl))
+
+            ref_area = np.sqrt(vh * vw)
+            rv_h_grid = _axis_from_sqrt_area(vh, _PATCH_H, ref_area)
+            rv_w_grid = _axis_from_sqrt_area(vw, _PATCH_W, ref_area)
+            rv_hh, rv_ww = torch.meshgrid(rv_h_grid, rv_w_grid, indexing="ij")
+
+            ref_t_grid = t_cursor + torch.arange(ref_t, dtype=torch.float64)
+            g[audio_ref_sl, 0] = ref_t_grid.repeat(audio_channel)
+            if ref_t:
+                g[audio_ref_sl, 2] = torch.cat(
+                    [
+                        torch.full((ref_t,), float(rv_w_grid[0]), dtype=torch.float64),
+                        torch.full(
+                            (int(item["audio_rows"]) - ref_t,),
+                            float(rv_w_grid[-1]),
+                            dtype=torch.float64,
+                        ),
+                    ]
+                )
+
+            rv_frame = torch.stack([rv_hh.reshape(-1), rv_ww.reshape(-1)], dim=-1)
+            rv_g = torch.empty(vt, int(item["frame_rows"]), 3, dtype=torch.float64)
+            rv_g[:, :, 0] = _video_t_grid(vt, t_cursor)[:, None]
+            rv_g[:, :, 1:] = rv_frame[None]
+            g[visual_sl] = rv_g.reshape(-1, 3)
+
+    input_ids[audio_sl] = MINIMAX_H3_AUDIO_ID
+    input_ids[audio_sl.start] = MINIMAX_H3_AUDIO_FIRST_ID
+    input_ids[video_sl] = MINIMAX_H3_VIDEO_ID
+    if latent_t:
+        input_ids[video_sl.start] = MINIMAX_H3_VIDEO_FIRST_ID
+        input_ids[video_sl.stop - 1] = MINIMAX_H3_VIDEO_LAST_ID
+    audio_mask[audio_sl] = True
+    image_mask[video_sl] = True
+
+    audio_t_grid = target_origin + torch.arange(audio_t, dtype=torch.float64)
+    g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
+    g[audio_sl, 2] = torch.cat(
+        [
+            torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
+            torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64),
+        ]
+    )
+
+    video_g = torch.empty(latent_t, frame_rows, 3, dtype=torch.float64)
+    video_g[:, :, 0] = _video_t_grid(latent_t, target_origin)[:, None]
+    video_g[:, :, 1:] = target_frame[None]
+    g[video_sl] = video_g.reshape(-1, 3)
+
+    if temporal_offset:
+        g[audio_mask, 0] += temporal_offset
+        g[video_sl, 0] += temporal_offset
+        for item in block_slices:
+            # Image timeline guides sit at a frame of the window; only static
+            # image references keep their fixed position.
+            if item["kind"] in ("video", "video_audio", "latent_guide") or "frame_index" in item:
+                g[item["visual_sl"], 0] += temporal_offset
+
+    target_img_pos = _range_for_slice(video_sl)
+    target_audio_pos = _range_for_slice(audio_sl)
+    img_pos = _cat_ranges(ref_img_pos_parts + [target_img_pos])
+    audio_pos = _cat_ranges(ref_audio_pos_parts + [target_audio_pos])
+
+    update_mask = torch.zeros(img_pos.shape[0], dtype=torch.bool)
+    update_mask[ref_visual_rows:] = True
+    audio_update_mask = torch.zeros(audio_pos.shape[0], dtype=torch.bool)
+    audio_update_mask[ref_audio_rows:] = True
+    text_pos = torch.arange(0, text_len)
+
+    token_tags = torch.full((seq_len,), -1, dtype=torch.long)  # PADDING
+    token_tags[text_sl] = 1  # TEXT
+    if ref_audio_rows:
+        token_tags[_cat_ranges(ref_audio_pos_parts)] = 2  # AUDIO (reference)
+    token_tags[audio_sl] = 2  # AUDIO (target)
+    token_tags[img_pos] = 0  # VIDEO (refs + target)
+
+    cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    doc = torch.zeros(seq_len, dtype=torch.int32)
+    doc[pad_sl] = 1
+    return {
+        "seq_len": torch.tensor(seq_len),
+        "input_ids": input_ids,
+        "image_mask": image_mask,
+        "audio_mask": audio_mask,
+        "img_pos": img_pos,
+        "audio_pos": audio_pos,
+        "text_pos": text_pos,
+        "update_mask": update_mask,
+        "audio_update_mask": audio_update_mask,
+        "img_position_ids": g,
+        "token_tags": token_tags,
+        "cu_seqlens": cu,
+        "document_id": doc,
+        # Extent of the video segment within the packed sequence.
+        "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
+        "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
+        "video_spans": tuple(video_spans),
+        "vsa_prefix_segments": prefix_segments,
+    }
+
+
+__all__ = [
+    "MINIMAX_H3_AUDIO_FIRST_ID",
+    "MINIMAX_H3_AUDIO_ID",
+    "MINIMAX_H3_AUDIO_REF_COND_ID",
+    "MINIMAX_H3_IMGVID_COND_ID",
+    "MINIMAX_H3_PAD_ID",
+    "MINIMAX_H3_TEXT_ID",
+    "MINIMAX_H3_VIDEO_FIRST_ID",
+    "MINIMAX_H3_VIDEO_ID",
+    "MINIMAX_H3_VIDEO_LAST_ID",
+    "minimax_h3_packed_sequence",
+    "minimax_h3_packed_sequence_ref2va_blocks",
+]

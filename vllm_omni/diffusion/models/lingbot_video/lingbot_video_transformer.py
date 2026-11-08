@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 import math
@@ -71,7 +71,7 @@ class LingBotVideoRMSNorm(nn.Module):
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply complex RoPE to `(B, S, H, D)` attention tensors."""
-    with torch.amp.autocast("cuda", enabled=False):
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
         x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
         out = torch.view_as_real(x_c * freqs_cis.unsqueeze(2)).flatten(3)
         return out.type_as(x)

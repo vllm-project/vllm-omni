@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from collections.abc import Iterable
@@ -124,8 +124,8 @@ class GlmImageImageProjector(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, channel, height, width = hidden_states.shape
-        post_patch_height = torch.tensor(height // self.patch_size, device=hidden_states.device, dtype=torch.int64)
-        post_patch_width = torch.tensor(width // self.patch_size, device=hidden_states.device, dtype=torch.int64)
+        post_patch_height = height // self.patch_size
+        post_patch_width = width // self.patch_size
 
         # Reshape: [B, C, H, W] -> [B, H', W', C*p*p] -> [B, H'*W', C*p*p]
         hidden_states = hidden_states.reshape(
@@ -189,18 +189,16 @@ class GlmImagePrepare(nn.Module):
         self,
         image_projector: nn.Module,
         rope: GlmImageRotaryPosEmbed,
-        patch_size: int,
     ):
         super().__init__()
         self.image_projector = image_projector
         self.rope = rope
-        self.patch_size = patch_size
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         prior_hidden_states: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process hidden_states and compute RoPE embeddings.
 
         Args:
@@ -211,14 +209,7 @@ class GlmImagePrepare(nn.Module):
             hidden_states: Patched hidden states [B, seq_len, D]
             rope_cos: RoPE cos embeddings [seq_len, dim]
             rope_sin: RoPE sin embeddings [seq_len, dim]
-            post_patch_height: Scalar tensor for height after patching
-            post_patch_width: Scalar tensor for width after patching
         """
-        batch_size, num_channels, height, width = hidden_states.shape
-
-        post_patch_height = torch.tensor(height // self.patch_size, device=hidden_states.device, dtype=torch.int64)
-        post_patch_width = torch.tensor(width // self.patch_size, device=hidden_states.device, dtype=torch.int64)
-
         # Compute RoPE (uses original 4D hidden_states shape)
         image_rotary_emb = self.rope(hidden_states)
         rope_cos = image_rotary_emb[0].to(hidden_states.device)
@@ -231,7 +222,7 @@ class GlmImagePrepare(nn.Module):
         if prior_hidden_states is not None:
             hidden_states = hidden_states + prior_hidden_states
 
-        return hidden_states, rope_cos, rope_sin, post_patch_height, post_patch_width
+        return hidden_states, rope_cos, rope_sin
 
 
 class GlmImageAdaLayerNormZero(nn.Module):
@@ -961,7 +952,6 @@ class GlmImageTransformer2DModel(CachedTransformer):
             1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
             # RoPE sin: [seq_len, dim] - shard along sequence dimension
             2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
-            # post_patch_height and post_patch_width are scalars, not sharded
         },
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
@@ -1044,7 +1034,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
         )
 
         # Prepare module for SP (encapsulates patch embedding and RoPE for _sp_plan)
-        self.prepare = GlmImagePrepare(self.image_projector, self.rope, patch_size)
+        self.prepare = GlmImagePrepare(self.image_projector, self.rope)
 
         self.time_condition_embed = GlmImageCombinedTimestepSizeEmbeddings(
             embedding_dim=time_embed_dim,
@@ -1137,12 +1127,10 @@ class GlmImageTransformer2DModel(CachedTransformer):
 
         # 1. Prepare hidden_states and RoPE via GlmImagePrepare module
         # _sp_plan will shard hidden_states and RoPE together via split_output=True
-        hidden_states, rope_cos, rope_sin, post_patch_height_t, post_patch_width_t = self.prepare(
-            hidden_states, prior_hidden_states
-        )
+        hidden_states, rope_cos, rope_sin = self.prepare(hidden_states, prior_hidden_states)
         image_rotary_emb = (rope_cos, rope_sin)
-        post_patch_height = int(post_patch_height_t.item())
-        post_patch_width = int(post_patch_width_t.item())
+        post_patch_height = height // self.patch_size
+        post_patch_width = width // self.patch_size
 
         # Timestep conditioning
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
@@ -1163,8 +1151,6 @@ class GlmImageTransformer2DModel(CachedTransformer):
                         device=hidden_states.device,
                     )
                     hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-                    if hidden_states_mask.all():
-                        hidden_states_mask = None
 
         # 2. Transformer blocks
         for layer_idx, block in enumerate(self.transformer_blocks):

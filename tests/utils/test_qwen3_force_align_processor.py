@@ -10,7 +10,21 @@ def test_build_prompt_has_boundary_timestamp_markers():
 
     assert prompt.count("<timestamp>") == 4
     assert "hello<timestamp><timestamp>world" in prompt
-    assert prompt.endswith("<|im_start|>assistant\n")
+    # Official aligner format: audio placeholder + words, no chat template
+    # (a leading "<|im_start|>user\n" shifts the predicted markers one bin late).
+    assert prompt == f"{processor.AUDIO_PLACEHOLDER}hello<timestamp><timestamp>world<timestamp><timestamp>"
+    assert "<|im_start|>" not in prompt
+    assert processor.build_prompt([]) == f"{processor.AUDIO_PLACEHOLDER}<timestamp><timestamp>"
+
+
+def test_build_prompt_matches_official_encode_timestamp():
+    pytest.importorskip("qwen_asr")
+    from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForceAlignProcessor
+
+    text = "It's 3 o'clock, 你好 world."
+    word_list, official_prompt = Qwen3ForceAlignProcessor().encode_timestamp(text, "english")
+
+    assert processor.build_prompt(list(word_list)) == official_prompt
 
 
 @pytest.mark.parametrize(
@@ -46,20 +60,3 @@ def test_fix_timestamp_repairs_dip_onto_monotonic_sequence():
 
 def test_fix_timestamp_passes_through_monotonic():
     assert processor.fix_timestamp([0, 100, 100, 250]) == [0, 100, 100, 250]
-
-
-def test_resolve_timestamp_token_id_defaults_to_marker_token():
-    # Regression: the default must resolve the same <timestamp> marker that
-    # build_prompt inserts, not None (which would degrade every request).
-    seen = {}
-
-    class FakeTokenizer:
-        def convert_tokens_to_ids(self, token):
-            seen["token"] = token
-            return 151705
-
-    tid = processor.resolve_timestamp_token_id(FakeTokenizer())
-
-    assert tid == 151705
-    assert seen["token"] == processor.TIMESTAMP_TOKEN
-    assert processor.TIMESTAMP_TOKEN in processor.build_prompt(["hello", "world"])

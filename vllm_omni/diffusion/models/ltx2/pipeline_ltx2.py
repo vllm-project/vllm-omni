@@ -10,15 +10,12 @@ from typing import ClassVar
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 
-from .ltx2_components import LTX2_COMPONENT_PROFILE
+from .ltx2_components import LTX2_COMPONENT_PROFILE, LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE
 from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_recipes import (
-    LTX2_ONE_STAGE_RECIPE,
-    LTX_POSITIVE_ONLY_RECIPE,
-)
+from .ltx2_recipes import LTX2_DISTILLED_ONE_STAGE_RECIPE, LTX2_ONE_STAGE_RECIPE, LTX_POSITIVE_ONLY_RECIPE
 from .ltx2_runtime import LTXRuntime
 
 
@@ -34,6 +31,14 @@ class LTX2Pipeline(LTXI2VConditioningMixin, LTXRuntime):
     _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
     _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
     supports_request_batch = True
+
+
+class LTX2DistilledOneStagePipeline(LTX2Pipeline):
+    """Merged-distilled checkpoint at its native one-stage resolution."""
+
+    pipeline_kind = "distilled_one_stage"
+    component_profile = LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE
+    pipeline_recipe = LTX2_DISTILLED_ONE_STAGE_RECIPE
 
 
 class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):

@@ -1,21 +1,40 @@
 # Test Execution Guide
+
 ## Setting Up the Test Environment
+
 ### Creating a Container
+
 vLLM-Omni provides an official Docker image for deployment. These images are built upon vLLM Docker images and are available on [Docker Hub](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which vLLM release it is based on.
 For a local test environment, you can follow the steps below to create a container:
+
 ## Installing Dependencies
+
 ### vLLM & vLLM-Omni
+
 vLLM-Omni is built based on vLLM. You can follow [install guide](../../getting_started/installation/README.md) to build your local environment.
 
 ### Test Case Dependencies
-When running test cases, you may need to install the following dependencies:
+
+After installing the matching platform runtime, run from the repository root.
+The `[dev]` extra includes VoxCPM 2.0.3 and its Gradio dependency; use the
+[temporary source backport](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+in the same dependency install. These setup commands do not establish CI or
+native model acceptance.
 
 ```bash
-uv pip install ".[dev]"
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install ".[dev]" \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 apt-get install -y espeak-ng jq
 ```
 
+The CUDA CI image verifies the vLLM 0.33 runtime and imports the rebuilt
+`lmcache.cuda_ops` before model tests. See the installation guide for the
+base-image dependency repairs; metadata checks alone do not verify native ABI.
+
 ## Running Tests
+
 Our test scripts use the pytest framework. First, please use `git clone https://github.com/vllm-project/vllm-omni.git` to download the vllm-omni source code. Then, in the root directory of vllm-omni, you can run the following commands in your local test environment to execute the corresponding test cases.
 
 ### CI job runners (L2–L4): logs, timing, and timeouts
@@ -25,7 +44,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 **Log layout** (default under `logs/ready_jobs`, `logs/merge_jobs`, or `logs/nightly_jobs`; override with `--log-dir`):
 
 | Path | Description |
-|------|-------------|
+| ------ | ------------- |
 | `jobs/*.sh` | Generated per-step bash wrappers |
 | `jobs/.job_timeouts` | Job key → `timeout_in_minutes` from Buildkite YAML (when set) |
 | `<job_key>.log` | Tee output for each job |
@@ -33,7 +52,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 
 **Timing:** while each job runs, stderr prints `finished in …` or `failed after …`. When all jobs finish, a summary is printed and written to `timing_summary.log`, for example:
 
-```
+```text
 === Job timing summary ===
   TTS_VoxCPM2_Test  25m 40s  OK
   Omni_Qwen3-Omni_Test  8m 05s  TIMED OUT
@@ -80,7 +99,7 @@ Failed jobs: 1/2
     ```bash
     cd tests
     pytest -s -v test_xxxx.py --run-level=core_model
-    pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
+    pytest -s -v -m "core_model and L4 and not cards_1" --run-level=core_model
     ```
 
 === "L3 level"
@@ -88,12 +107,8 @@ Failed jobs: 1/2
     **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/cuda/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
-    # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
+    # All L3 jobs (default: every pytest step in test-merge.yml)
     bash tools/run_merge_jobs.sh
-
-    # Skip L1-style "Simple Test" steps in test-merge.yml (group or "Simple ·" labels)
-    bash tools/run_merge_jobs.sh --skip-simple
-    bash tools/run_merge_jobs.sh --skip-simple --model-type omni
 
     # Preview extracted commands without running
     bash tools/run_merge_jobs.sh --dry-run
@@ -111,9 +126,8 @@ Failed jobs: 1/2
 
     ```bash
     pytest -s -v test_xxxx.py --run-level=advanced_model
-    pytest -s -v -m "advanced_model and distributed_cuda and L4" --run-level=advanced_model
+    pytest -s -v -m "advanced_model and L4 and not cards_1" --run-level=advanced_model
     ```
-
 
 === "L4 level"
 
@@ -139,28 +153,28 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
 
-    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI.
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
 
     **Ad hoc:** run a single test file or marker expression manually:
 
     ```bash
     cd tests
     pytest -s -v test_xxxx.py --run-level=full_model
-    pytest -s -v -m "full_model and distributed_cuda and L4" --run-level=full_model
+    pytest -s -v -m "full_model and L4 and not cards_1" --run-level=full_model
     pytest -s -v -m "full_model and (omni or tts) and H100" --run-level=full_model
     ```
     If you only want to run specific test cases on a particular platform, you can use:
     ```bash
-    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
+    pytest -s -v -m "full_model and L4 and not cards_1"  --run-level=full_model
     ```
     Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` (omni/tts vs diffusion split by ``is_diffusion_perf_config``) and pytest ``-m`` filters by each case's JSON ``mark``:
     ```bash
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and tts and H100"
     pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
-    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
-    Nightly **Perf Test** jobs in ``test-nightly.yml`` use ``--test-config-file`` only (no ``-m``). E2e L4 function tests still use ``full_model`` + ``--run-level full_model`` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml)). Example:
+    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
 === "L5 level"
 
@@ -170,28 +184,32 @@ Failed jobs: 1/2
     cd tests
 
     # Stability: Qwen3-Omni
-    pytest -s -v dfx/stability/scripts/test_stability_qwen3_omni.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_qwen3_omni.py -m slow
 
     # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
-    pytest -s -v dfx/stability/scripts/test_stability_wan22.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
-    pytest -s -v dfx/reliability/test_reliability_qwen3_omni.py -m slow
+    pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
 
     # Reliability: Wan2.2 (H100)
-    pytest -s -v dfx/reliability/test_reliability_wan22.py -m slow
+    pytest -s -v dfx/reliability/test_wan22.py -m "slow and cards_1"
 
     # Reliability: HunyuanImage DiT (H100 × 4)
-    pytest -s -v dfx/reliability/test_reliability_hunyuan_image.py -m slow
+    pytest -s -v dfx/reliability/test_hunyuan_image.py -m "slow and cards_4"
 
-    # Reliability: VoxCPM2 (L4)
-    pytest -s -v dfx/reliability/test_reliability_voxcpm2.py -m slow
+    # Reliability: MiniCPM-o 4.5 (H100). SIGTERM serve-root only, plus partial isolation.
+    pytest -s -v dfx/reliability/test_minicpmo_4_5.py -m "slow and cards_1"
 
     ```
 
-    The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml).
+    The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
+
+    - **Reliability** (+ invalid-parameter) and **Perf Test** (Omni vLLM Text / Multi-Replica) → `WEEKLY=1` (or PR label `weekly-test`). Scheduled upload of those env-gated steps still requires `main`.
+    - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)
 
 You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).
 
 ## Adding New Test Cases
+
 Please refer to the [Test System Overview](./test_system_overview.md) and [Test Writing Guide](./test_writing_guide.md).

@@ -1,12 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for OmniServerStageCli process planning helpers."""
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-from tests.helpers.runtime import OmniServerStageCli
+from tests.helpers import runtime
+from tests.helpers.runtime import OmniServerParams, OmniServerStageCli
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,31 +38,120 @@ stages:
 def test_stage_cli_builds_headless_replica_cmd(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), ["--disable-log-stats"])
 
-    cmd = server._build_stage_cmd(1, headless=True, replica_id=2)
+    cmd = server._build_stage_cmd(1, headless=True)
 
     assert "--headless" in cmd
     assert cmd[cmd.index("--stage-id") + 1] == "1"
-    assert cmd[cmd.index("--replica-id") + 1] == "2"
-    assert cmd[cmd.index("--stage-configs-path") + 1] == server.stage_config_path
+    # ``--replica-id`` is ignored by serve; one process must own all local
+    # replicas so ``devices: "1,2,3"`` is split one card per replica.
+    assert "--replica-id" not in cmd
+    assert cmd[cmd.index("--omni-dp-size-local") + 1] == "3"
+    assert cmd[cmd.index("--deploy-config") + 1] == server.stage_config_path
 
 
-def test_stage_cli_splits_devices_per_replica(tmp_path: Path) -> None:
+def test_stage_cli_omits_dp_size_local_for_single_replica_stage(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
 
-    assert server._devices_for_replica(1, "1,2,3", 0) == "1"
-    assert server._devices_for_replica(1, "1,2,3", 1) == "2"
-    assert server._devices_for_replica(1, "1,2,3", 2) == "3"
+    cmd = server._build_stage_cmd(0, headless=False)
+
+    assert "--omni-dp-size-local" not in cmd
+    assert "--replica-id" not in cmd
 
 
-def test_stage_cli_maps_visible_devices_after_replica_split(tmp_path: Path) -> None:
-    server = OmniServerStageCli(
-        "fake-model",
-        _write_stage_config(tmp_path),
-        [],
-        env_dict={"CUDA_VISIBLE_DEVICES": "4,5,6,7"},
+def test_stage_cli_launches_one_process_per_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+    launched: list[tuple[int, bool]] = []
+
+    def _fake_launch(stage_id: int, *, headless: bool) -> None:
+        launched.append((stage_id, headless))
+
+    sock = MagicMock()
+    sock.__enter__.return_value = sock
+    sock.connect_ex.return_value = 0
+    monkeypatch.setattr(server, "_launch_stage", _fake_launch)
+    monkeypatch.setattr(server, "_ensure_stage_processes_alive", lambda: None)
+    monkeypatch.setattr("tests.helpers.runtime.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime.socket, "socket", lambda *args, **kwargs: sock)
+
+    server._start_server()
+
+    assert launched == [(0, False), (1, True)]
+
+
+def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+
+    assert server.stage_ids == [0, 1]
+    assert server.stage_replica_counts == {0: 1, 1: 3}
+
+
+def test_stage_cli_fixture_leaves_deploy_config_to_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stage_config_path = _write_stage_config(tmp_path)
+    captured_args: list[str] = []
+
+    def fake_stage_cli(model, config_path, serve_args, **kwargs):
+        del kwargs
+        assert config_path == stage_config_path
+        captured_args.extend(serve_args)
+        return nullcontext(SimpleNamespace(model=model))
+
+    monkeypatch.setattr(runtime, "OmniServerStageCli", fake_stage_cli)
+    monkeypatch.setattr(runtime, "_whisper_device_free_around", nullcontext)
+    monkeypatch.setattr(
+        "tests.helpers.stage_config.stage_config_path_for_run_level",
+        lambda config_path, _run_level: config_path,
     )
-    env: dict[str, str] = {}
+    request = SimpleNamespace(
+        param=OmniServerParams(
+            model="fake-model",
+            stage_config_path=stage_config_path,
+            use_stage_cli=True,
+        ),
+        node=SimpleNamespace(get_closest_marker=lambda _name: None),
+    )
 
-    server._set_stage_device_env(1, env, "1,2,3", replica_id=1)
+    server_fixture = runtime.iter_omni_server(request, "core_model", threading.Lock())
+    next(server_fixture)
+    with pytest.raises(StopIteration):
+        next(server_fixture)
 
-    assert env["CUDA_VISIBLE_DEVICES"] == "6"
+    assert "--deploy-config" not in captured_args
+
+
+def test_stage_cli_enter_rolls_back_launched_stages_on_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``__exit__`` is skipped when ``__enter__`` raises; rollback must still run."""
+    monkeypatch.setattr("tests.helpers.runtime.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tests.helpers.runtime.cleanup_test_environment", lambda: None)
+
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), ["--disable-log-stats"])
+    log_path = tmp_path / "stage0.log"
+    log_fh = open(log_path, "w", encoding="utf-8")
+    log_fh.write("partial launch\n")
+    log_fh.flush()
+
+    proc = SimpleNamespace(pid=4242, poll=lambda: None)
+    killed: list[int] = []
+    monkeypatch.setattr(server, "_kill_process_tree", lambda pid: killed.append(pid))
+
+    def _fake_launch(stage_id: int, *, headless: bool) -> None:
+        server.stage_procs[stage_id] = proc  # type: ignore[assignment]
+        server._stage_log_paths[stage_id] = log_path
+        server._stage_log_files[stage_id] = log_fh
+        if stage_id == 0:
+            server.proc = proc  # type: ignore[assignment]
+
+    def _fail_alive() -> None:
+        raise RuntimeError("Stage 0 exited with code 1")
+
+    monkeypatch.setattr(server, "_launch_stage", _fake_launch)
+    monkeypatch.setattr(server, "_ensure_stage_processes_alive", _fail_alive)
+
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        with server:
+            raise AssertionError("context body must not run after a failed enter")
+
+    assert killed == [4242]
+    assert log_fh.closed
+    assert not log_path.exists()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-component quantization routing for multi-stage models.
 
 Routes get_quant_method() to different configs based on longest-prefix match:
@@ -21,12 +21,31 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizeMethodBase,
     )
+    from vllm.model_executor.models.utils import (
+        WeightsMapper,
+    )
 
 
-# Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8/mixed) only quantize the
-# Thinker LM.  Vision and audio encoder weights remain in BF16 with no
-# corresponding scale tensors in the checkpoint.
-PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
+# These pre-quantized formats require serialized scale or correction tensors
+# that the vision and audio encoder checkpoints do not provide.
+PRE_QUANTIZED_METHODS: frozenset[str] = frozenset(
+    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed", "svdquant"}
+)
+
+
+def resolve_component_quant_config(
+    quant_config: QuantizationConfig | None,
+    component: str,
+) -> QuantizationConfig | None:
+    """Resolve one pipeline component from a global or component config.
+
+    A plain config is global and therefore applies unchanged to every
+    quantization-aware component. Only ``ComponentQuantizationConfig`` narrows
+    the scope through its explicit prefix map.
+    """
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        return quant_config.resolve(component)
+    return quant_config
 
 
 def resolve_encoder_quant_config(
@@ -96,6 +115,14 @@ class ComponentQuantizationConfig(QuantizationConfig):
             if prefix.startswith(comp_prefix):
                 return self._components[comp_prefix]
         return self._default
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        """Apply a weight mapper to every routed quantization config."""
+        for quant_config in self._components.values():
+            if quant_config is not None:
+                quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
+        if self._default is not None:
+            self._default.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_name(self) -> str:
         return "component"

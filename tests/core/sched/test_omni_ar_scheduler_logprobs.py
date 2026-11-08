@@ -1,19 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from types import SimpleNamespace
+from collections.abc import Callable
+from types import MethodType, SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
+import torch
 from vllm.v1.engine import FinishReason
 from vllm.v1.outputs import LogprobsLists
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _slice_sampled_logprobs
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniModelRunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Shared update_from_output helpers moved onto OmniSchedulerMixin; bind them on
+# the lightweight stub so direct method calls still exercise the real paths.
+_MIXIN_UPDATE_HELPERS = (
+    "_remove_stopped_requests_from_queues",
+    "_handle_failed_kv_load_outputs",
+    "_aggregate_kv_connector_stats",
+    "_publish_kv_cache_events",
+    "_attach_finished_request_sets",
+    "_attach_scheduler_stats",
+    "_capture_omni_connector_output",
+    "_maybe_decode_pooling_output",
+)
 
 
 def _logprobs(
@@ -78,12 +99,19 @@ class _Request:
         self.num_computed_tokens = 0
         self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
+        self.output_token_ids: list[int] = []
+        # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
+        # track in-flight outputs discarded at preemption/streaming-stop.
+        self.num_stale_output_tokens = 0
+        self.drop_stale_output = False
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.use_structured_output = False
+        self.pooling_params: Any = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None
         self.num_nans_in_logits = 0
+        self.additional_information = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
@@ -105,31 +133,88 @@ class _RequestQueue(list):
                 self.remove(request)
 
 
+def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
+    """Build a minimal stub for OmniARScheduler.update_from_output()."""
+    # update_from_output gates its K-step empty-row rollback on
+    # _talker_kstep_armed (omni_ar_scheduler.py); the stub models an
+    # un-armed scheduler so the rollback branch stays out of these
+    # generic logprob-behavior tests.
+    scheduler = SimpleNamespace(
+        _talker_kstep_armed=lambda: False,
+        perf_metrics=None,
+        connector=None,
+        aux_output_connector=None,
+        chunk_transfer_adapter=None,
+        requests={request.request_id: request for request in requests},
+        running=list(requests),
+        waiting=_RequestQueue(),
+        kv_holding_waiting=_RequestQueue(),
+        deferred_waiting=set(),
+        structured_output_manager=SimpleNamespace(accept_tokens=lambda _request, _token_ids: True),
+        transfer_triggered_requests=set(),
+        active_kv_transfers=set(),
+        pending_stop_after_extraction=set(),
+        waiting_for_transfer_free=set(),
+        _new_prompt_len_snapshot={},
+        _hold_payloadless_outputs=False,
+        _pooling_output_decoder=None,
+        _outputs_awaiting_stage_payload={},
+        finished_req_ids=set(),
+        finished_req_ids_dict=defaultdict(set),
+        kv_cache_manager=SimpleNamespace(take_events=lambda: None),
+        kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
+        recompute_kv_load_failures=False,
+        _native_data_plane=False,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_v2_model_runner=False,
+                async_chunk=False,
+                final_output=True,
+            )
+        ),
+    )
+    for name in _MIXIN_UPDATE_HELPERS:
+        setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
+    scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
+    scheduler._emit_streaming_context_overflow_outputs = MethodType(
+        OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler
+    )
+    scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
+    scheduler.make_stats = lambda *args, **kwargs: None
+    return scheduler
+
+
+def _bind_request_lifecycle(
+    scheduler: SimpleNamespace,
+    *,
+    update_request: Callable,
+    handle_stopped: Callable | None = None,
+) -> None:
+    def free_request(request):
+        scheduler.requests.pop(request.request_id, None)
+        scheduler.finished_req_ids.add(request.request_id)
+        scheduler.finished_req_ids_dict[request.client_index].add(request.request_id)
+        # Current vLLM contract: (kv_xfer_params, ec_xfer_params)
+        return None, None
+
+    def update_with_history(request, token_ids):
+        accepted, stopped = update_request(request, token_ids)
+        request.output_token_ids.extend(accepted)
+        return accepted, stopped
+
+    scheduler._update_request_with_output = update_with_history
+    scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
+    scheduler._handle_stopped_request = handle_stopped or (lambda _request: True)
+    scheduler._free_request = free_request
+
+
 def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     """Spec decode can sample tokens past a stop; the trailing tokens are
     trimmed by _update_request_with_output, and the emitted logprob rows must
     be trimmed with them (upstream slices logprobs after the trim)."""
     request = _Request("req")
     request.num_computed_tokens = 8
-    scheduler = SimpleNamespace(
-        perf_metrics=None,
-        connector=None,
-        chunk_transfer_adapter=None,
-        requests={request.request_id: request},
-        running=[request],
-        waiting=_RequestQueue(),
-        skipped_waiting=_RequestQueue(),
-        structured_output_manager=SimpleNamespace(should_advance=lambda _request: False),
-        transfer_triggered_requests=set(),
-        active_kv_transfers=set(),
-        pending_stop_after_extraction=set(),
-        waiting_for_transfer_free=set(),
-        _new_prompt_len_snapshot={},
-        finished_req_ids=set(),
-        finished_req_ids_dict=defaultdict(set),
-        kv_cache_manager=SimpleNamespace(take_events=lambda: None),
-        kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
-    )
+    scheduler = _make_scheduler_stub([request])
 
     def update_request_trimming(req, token_ids):
         # Mirror vllm Scheduler._update_request_with_output: the first sampled
@@ -139,19 +224,7 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
         req.status = RequestStatus.FINISHED_STOPPED
         return token_ids, True
 
-    def free_request(req):
-        scheduler.requests.pop(req.request_id, None)
-        scheduler.finished_req_ids.add(req.request_id)
-        scheduler.finished_req_ids_dict[req.client_index].add(req.request_id)
-        return None, None
-
-    scheduler._update_request_with_output = update_request_trimming
-    scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
-    scheduler._handle_stopped_request = lambda _request: True
-    scheduler._free_request = free_request
-    scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
-    scheduler.make_stats = lambda *args, **kwargs: None
-    scheduler._capture_omni_connector_output = lambda _output: None
+    _bind_request_lifecycle(scheduler, update_request=update_request_trimming)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"req": 3},
@@ -178,6 +251,7 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     (output,) = outputs[0].outputs
 
     assert output.new_token_ids == [7]
+    assert output.num_generation_tokens == 1
     assert output.finish_reason is FinishReason.STOP
     token_rows = np.asarray(output.new_logprobs.logprob_token_ids)
     value_rows = np.asarray(output.new_logprobs.logprobs)
@@ -186,49 +260,23 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     np.testing.assert_array_equal(token_rows[:, 0], [7])
 
 
-def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
+@pytest.mark.parametrize(
+    "failure,num_logprobs",
+    [("logprobs", 1), ("logits", 1), ("logits", None), ("model", None), ("model_and_logits", None)],
+)
+def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, num_logprobs) -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
     good = _Request("good")
-    scheduler = SimpleNamespace(
-        perf_metrics=None,
-        connector=None,
-        chunk_transfer_adapter=None,
-        requests={bad.request_id: bad, good.request_id: good},
-        running=[bad, good],
-        waiting=_RequestQueue(),
-        skipped_waiting=_RequestQueue(),
-        structured_output_manager=SimpleNamespace(should_advance=lambda _request: False),
-        transfer_triggered_requests=set(),
-        active_kv_transfers=set(),
-        pending_stop_after_extraction=set(),
-        waiting_for_transfer_free=set(),
-        _new_prompt_len_snapshot={},
-        finished_req_ids=set(),
-        finished_req_ids_dict=defaultdict(set),
-        kv_cache_manager=SimpleNamespace(take_events=lambda: None),
-        kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
-    )
+    bad.sampling_params.num_logprobs = good.sampling_params.num_logprobs = num_logprobs
+    scheduler = _make_scheduler_stub([bad, good])
     update_calls: list[str] = []
 
     def update_request(request, token_ids):
         update_calls.append(request.request_id)
         return token_ids, False
 
-    def free_request(request):
-        scheduler.requests.pop(request.request_id, None)
-        scheduler.finished_req_ids.add(request.request_id)
-        scheduler.finished_req_ids_dict[request.client_index].add(request.request_id)
-        # vLLM 0.26 contract: (kv_xfer_params, ec_xfer_params)
-        return None, None
-
-    scheduler._update_request_with_output = update_request
-    scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
-    scheduler._handle_stopped_request = lambda _request: True
-    scheduler._free_request = free_request
-    scheduler.make_spec_decoding_stats = lambda *args, **kwargs: None
-    scheduler.make_stats = lambda *args, **kwargs: None
-    scheduler._capture_omni_connector_output = lambda _output: None
+    _bind_request_lifecycle(scheduler, update_request=update_request)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"bad": 1, "good": 1},
@@ -237,6 +285,10 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[7], [8]],
+        invalid_logits_req_ids={"bad"} if failure in ("logits", "model_and_logits") else set(),
+        request_errors={"bad": "Non-finite Ming3 flow-head output in decode step."}
+        if failure in ("model", "model_and_logits")
+        else None,
         logprobs=_logprobs(
             [[9, 1], [8, 2]],
             [[-0.9, -1.0], [-0.8, -1.0]],
@@ -244,6 +296,8 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         ),
         prompt_logprobs_dict={},
         pooler_output=None,
+        multimodal_outputs=[{"audio": "bad"}, {"audio": "good"}],
+        inter_stage_outputs=[{"hidden": "bad"}, {"hidden": "good"}],
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
@@ -256,9 +310,119 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
 
     assert update_calls == ["good"]
     assert bad.status is RequestStatus.FINISHED_ERROR
-    assert bad.stop_reason is not None and "misaligned" in bad.stop_reason
+    assert bad.stop_reason is not None
+    expected_reason = (
+        "Non-finite Ming3"
+        if failure.startswith("model")
+        else ("no finite logits" if failure == "logits" else "misaligned")
+    )
+    assert expected_reason in bad.stop_reason
     assert "bad" not in scheduler.requests
     assert output_by_id["bad"].finish_reason is FinishReason.ERROR
     assert output_by_id["bad"].new_token_ids == []
+    assert output_by_id["bad"].multimodal_output is None
+    assert bad.output_token_ids == []
+    assert good.output_token_ids == [8]
     assert output_by_id["good"].new_token_ids == [8]
-    np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+    assert output_by_id["good"].multimodal_output == {"audio": "good"}
+    if num_logprobs is not None:
+        np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+@pytest.mark.parametrize("scored", [False, True])
+def test_fixed_token_scores_reach_engine_output(scored) -> None:
+    request = _Request("req")
+    request.sampling_params.num_logprobs = None
+    scheduler = _make_scheduler_stub([request])
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 3},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
+    model_runner_output = OmniModelRunnerOutput(
+        req_ids=["req"],
+        req_id_to_index={"req": 0},
+        sampled_token_ids=[[7]],
+        prompt_logprobs_dict={},
+        prompt_token_id_logprobs_dict={"req": scores} if scored else {},
+    )
+
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+    (output,) = outputs[0].outputs
+
+    assert output.new_token_ids == [7]
+    if scored:
+        torch.testing.assert_close(output.prompt_token_id_logprobs, scores)
+    else:
+        assert output.prompt_token_id_logprobs is None
+
+
+def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:
+    return SimpleNamespace(
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[pooler_tensor],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req": 0},
+        routed_experts=None,
+    )
+
+
+def _make_pooling_stub(decoder) -> tuple[_Request, SimpleNamespace]:
+    request = _Request("req")
+    request.sampling_params = SimpleNamespace(num_logprobs=None)
+    request.pooling_params = SimpleNamespace()
+    scheduler = _make_scheduler_stub([request])
+    scheduler._pooling_output_decoder = decoder
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=None))
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    return request, scheduler
+
+
+def test_pooling_decode_success_emits_decoded_payload() -> None:
+    import torch
+
+    decoded = torch.tensor([[1, 2]], dtype=torch.int32)
+    request, scheduler = _make_pooling_stub(lambda logits, req, hf: decoded)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    assert output.finish_reason is FinishReason.STOP
+    assert output.pooling_output is decoded
+
+
+def test_pooling_decode_failure_finishes_request_with_error() -> None:
+    import torch
+
+    def raising_decoder(logits, req, hf):
+        raise ValueError("boom")
+
+    request, scheduler = _make_pooling_stub(raising_decoder)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    # Decoder failure is a request error (500), not an empty success.
+    assert output.finish_reason is FinishReason.ERROR
+    assert output.pooling_output is None
+    assert "pooling output decode failed" in str(request.stop_reason)
