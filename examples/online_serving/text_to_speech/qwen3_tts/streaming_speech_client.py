@@ -24,6 +24,11 @@ Usage:
         --text "Hello world. How are you? I am fine." \
         --simulate-stt --stt-delay 0.1
 
+    # Opt into per-sentence synthesis (Indic danda, CJK, Latin)
+    python streaming_speech_client.py \
+        --text "नमस्ते। कैसे हो?" \
+        --split-granularity sentence
+
     # Receive JSON sidecar chunks with word-level timestamps
     python streaming_speech_client.py \
         --text "Hello world. How are you?" \
@@ -73,8 +78,9 @@ except ImportError:
 def frame_basename(msg: dict) -> str:
     """Name a file after the utterance and sentence a frame belongs to.
 
-    Every utterance is sentence 0, so the utterance index is what keeps the
-    files of one connection from overwriting each other.
+    Every utterance uses `sentence_index` for units inside that flush.
+    With default `split_granularity=none` that index stays 0; sentence mode
+    uses 0, 1, ... so files from one connection do not overwrite each other.
     """
     return f"utterance_{msg['utterance_index']:03d}_sentence_{msg['sentence_index']:03d}"
 
@@ -368,6 +374,13 @@ def main():
     )
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed (0.25-4.0)")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max tokens")
+    parser.add_argument("--seed", type=int, default=None, help="Sampling seed forwarded to the server")
+    parser.add_argument(
+        "--split-granularity",
+        default=None,
+        choices=["none", "sentence", "clause"],
+        help="Text split mode (default: server none = one request per input.done)",
+    )
 
     # Base task options
     parser.add_argument("--ref-audio", default=None, help="Reference audio")
@@ -409,6 +422,8 @@ def main():
         "max_new_tokens",
         "ref_audio",
         "ref_text",
+        "seed",
+        "split_granularity",
     ]:
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:

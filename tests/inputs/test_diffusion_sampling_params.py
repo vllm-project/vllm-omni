@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for diffusion sampling params coercion."""
 
@@ -25,6 +26,23 @@ def test_from_params_returns_existing_omni_params() -> None:
     assert converted is params
 
 
+@pytest.mark.parametrize("quality", ["lossless", "high"])
+def test_quality_accepts_supported_request_levels(quality: str) -> None:
+    params = OmniDiffusionSamplingParams(quality=quality)
+
+    assert params.quality == quality
+
+
+def test_quality_defaults_to_model_owned_policy() -> None:
+    params = OmniDiffusionSamplingParams()
+    assert params.quality is None
+
+
+def test_quality_rejects_unsupported_request_level() -> None:
+    with pytest.raises(ValueError, match="quality must be one of"):
+        OmniDiffusionSamplingParams(quality="medium")
+
+
 def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> None:
     params = _sampling_params(
         seed=1234,
@@ -33,6 +51,7 @@ def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> Non
             "height": 1024,
             "width": 768,
             "guidance_scale": 7.5,
+            "quality": "high",
         },
     )
 
@@ -43,6 +62,7 @@ def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> Non
     assert converted.height == 1024
     assert converted.width == 768
     assert converted.guidance_scale == 7.5
+    assert converted.quality == "high"
     assert converted.extra_args == {}
 
 
@@ -63,3 +83,20 @@ def test_from_params_preserves_unknown_extra_args() -> None:
 def test_from_params_rejects_unsupported_types() -> None:
     with pytest.raises(TypeError, match="Diffusion stage requires OmniDiffusionSamplingParams"):
         OmniDiffusionSamplingParams.from_params({"height": 512})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("streaming_max_output_bytes", 0),
+        ("streaming_max_output_bytes", True),
+        ("streaming_max_output_bytes", 1.5),
+        ("streaming_idle_timeout_s", 0),
+        ("streaming_idle_timeout_s", True),
+        ("streaming_idle_timeout_s", float("inf")),
+        ("streaming_idle_timeout_s", float("nan")),
+    ],
+)
+def test_streaming_resource_limits_reject_invalid_values(field, value):
+    with pytest.raises(ValueError, match=field):
+        OmniDiffusionSamplingParams(**{field: value})

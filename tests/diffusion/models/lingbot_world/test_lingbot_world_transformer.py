@@ -1,0 +1,1134 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import math
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tests.diffusion.models.lingbot_world import test_lingbot_world_attention as attention_tests
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_weight_index_names.json.fixture"
+_SHAPE_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_official_shapes.json.fixture"
+
+
+@pytest.fixture(autouse=True)
+def _inference_context():
+    with torch.inference_mode():
+        yield
+
+
+def _tiny_model(
+    module,
+    *,
+    num_layers: int = 2,
+    num_frames_per_block: int = 1,
+    sliding_window_num_frames: int = 3,
+    quant_config=None,
+    prefix: str = "",
+    attention_head_dim: int = 2,
+    rope_max_seq_len: int = 16,
+):
+    return module.CausalLingBotWorldTransformer3DModel(
+        patch_size=(1, 2, 2),
+        num_attention_heads=2,
+        attention_head_dim=attention_head_dim,
+        in_channels=36,
+        out_channels=2,
+        text_dim=6,
+        freq_dim=4,
+        ffn_dim=8,
+        num_layers=num_layers,
+        cross_attn_norm=True,
+        eps=1e-6,
+        rope_max_seq_len=rope_max_seq_len,
+        sink_size=1,
+        num_frames_per_block=num_frames_per_block,
+        sliding_window_num_frames=sliding_window_num_frames,
+        local_attn_size=-1,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
+
+
+def _cache(module, model, *, max_tokens: int | None = None):
+    if max_tokens is None:
+        window_frames = (
+            model.config.local_attn_size
+            if model.config.local_attn_size != -1
+            else model.config.sliding_window_num_frames
+        )
+        max_tokens = window_frames * 2 * 2
+    return module.allocate_lingbot_cache(
+        batch_size=1,
+        num_layers=len(model.blocks),
+        max_tokens=max_tokens,
+        num_local_heads=2,
+        head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+
+def _checkpoint_parameter_specs(model) -> dict[str, tuple[torch.Size, torch.dtype]]:
+    specs: dict[str, tuple[torch.Size, torch.dtype]] = {}
+    for name, parameter in model.named_parameters():
+        marker = ".self_attn.qkv."
+        if marker not in name:
+            specs[name] = (parameter.shape, parameter.dtype)
+            continue
+        shard_shape = torch.Size((parameter.shape[0] // 3, *parameter.shape[1:]))
+        for projection in ("q", "k", "v"):
+            specs[name.replace(marker, f".self_attn.{projection}.")] = (shard_shape, parameter.dtype)
+    return specs
+
+
+def _checkpoint_weights_for_model(model) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    checkpoint_weights: dict[str, torch.Tensor] = {}
+    expected_parameters: dict[str, torch.Tensor] = {}
+    next_value = 1
+    for name, parameter in model.named_parameters():
+        marker = ".self_attn.qkv."
+        if marker not in name:
+            value = torch.full_like(parameter, next_value)
+            checkpoint_weights[name] = value
+            expected_parameters[name] = value
+            next_value += 1
+            continue
+        shards = []
+        shard_shape = (parameter.shape[0] // 3, *parameter.shape[1:])
+        for projection in ("q", "k", "v"):
+            value = torch.full(shard_shape, next_value, dtype=parameter.dtype, device=parameter.device)
+            checkpoint_weights[name.replace(marker, f".self_attn.{projection}.")] = value
+            shards.append(value)
+            next_value += 1
+        expected_parameters[name] = torch.cat(shards)
+    return checkpoint_weights, expected_parameters
+
+
+def _self_cache_snapshot(cache) -> list[tuple[torch.Tensor, torch.Tensor, tuple[int, int, int | None, int]]]:
+    return [attention_tests._cache_snapshot(layer_cache) for layer_cache in cache.self_attention]
+
+
+def _assert_self_cache_unchanged(cache, snapshot) -> None:
+    for layer_cache, layer_snapshot in zip(cache.self_attention, snapshot, strict=True):
+        attention_tests._assert_cache_unchanged(layer_cache, layer_snapshot)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("num_chunks", [4, 18])
+def test_tiny_transformer_runs_contiguous_chunks_with_explicit_cache_commit_and_camera_path(num_chunks) -> None:
+    torch.manual_seed(7)
+    module = attention_tests._load_module()
+    model = _tiny_model(module).eval()
+    cache = _cache(module, model)
+    encoder_hidden_states = torch.randn(1, 3, 6)
+    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+    cross_key_outputs = [attention_tests._record_outputs(block.cross_attn.k) for block in model.blocks]
+    text_projection_outputs = attention_tests._record_outputs(model.text_embedding)
+    outputs = []
+
+    assert model.patch_embedding.in_channels == 36
+    assert model.patch_embedding_wancamctrl.in_features == 6 * 8 * 8 * 1 * 2 * 2
+
+    for start_frame in range(num_chunks):
+        hidden_states = torch.randn(1, 36, 1, 4, 4)
+        timestep = torch.tensor([float(start_frame + 1)])
+        snapshot = _self_cache_snapshot(cache)
+
+        transient_output = model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            camera_hidden_states,
+            cache=cache,
+            start_frame=start_frame,
+            update_cache=False,
+        )
+
+        assert transient_output.shape == (1, 2, 1, 4, 4)
+        _assert_self_cache_unchanged(cache, snapshot)
+        assert all(layer_cache is not None for layer_cache in cache.cross_attention)
+
+        committed_output = model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            camera_hidden_states,
+            cache=cache,
+            start_frame=start_frame,
+            update_cache=True,
+        )
+        torch.testing.assert_close(committed_output, transient_output)
+        outputs.append(committed_output)
+
+        expected_token_end = (start_frame + 1) * 2 * 2
+        assert all(layer_cache.absolute_end == expected_token_end for layer_cache in cache.self_attention)
+
+    assert len(outputs) == num_chunks
+    assert all(len(outputs) == 1 for outputs in cross_key_outputs)
+    assert len(text_projection_outputs) == 1
+
+    alternate_cache = _cache(module, model)
+    alternate_output = model(
+        torch.zeros(1, 36, 1, 4, 4),
+        torch.tensor([1.0]),
+        encoder_hidden_states,
+        torch.zeros_like(camera_hidden_states),
+        cache=alternate_cache,
+        start_frame=0,
+        update_cache=False,
+    )
+    camera_output = model(
+        torch.zeros(1, 36, 1, 4, 4),
+        torch.tensor([1.0]),
+        encoder_hidden_states,
+        torch.ones_like(camera_hidden_states),
+        cache=_cache(module, model),
+        start_frame=0,
+        update_cache=False,
+    )
+    assert not torch.equal(camera_output, alternate_output)
+
+
+@pytest.mark.cpu
+def test_partial_cross_attention_cache_projects_text_only_for_missing_layers() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=2).eval()
+    cache = _cache(module, model)
+    hidden_states = torch.randn(1, 36, 1, 4, 4)
+    timestep = torch.tensor([1.0])
+    encoder_hidden_states = torch.randn(1, 3, 6)
+    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+
+    model(
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        camera_hidden_states,
+        cache=cache,
+        start_frame=0,
+        update_cache=False,
+    )
+    cache.cross_attention[1] = None
+    text_projection_outputs = attention_tests._record_outputs(model.text_embedding)
+    cross_key_outputs = [attention_tests._record_outputs(block.cross_attn.k) for block in model.blocks]
+
+    model(
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        camera_hidden_states,
+        cache=cache,
+        start_frame=0,
+        update_cache=False,
+    )
+
+    assert len(text_projection_outputs) == 1
+    assert [len(outputs) for outputs in cross_key_outputs] == [0, 1]
+    assert all(layer_cache is not None for layer_cache in cache.cross_attention)
+
+
+@pytest.mark.parametrize("frames", [1, 6], ids=("partial", "multiple_blocks"))
+@pytest.mark.cpu
+def test_forward_rejects_chunks_that_do_not_equal_configured_block_size(frames: int) -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=1,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+    cache = _cache(module, model)
+    snapshot = _self_cache_snapshot(cache)
+    patch_inputs = attention_tests._record_inputs(model.patch_embedding)
+
+    with pytest.raises(ValueError, match="exactly 3 post-patch frames"):
+        model(
+            torch.randn(1, 36, frames, 4, 4),
+            torch.tensor([1.0]),
+            torch.randn(1, 3, 6),
+            torch.randn(1, 6 * 8 * 8, frames, 4, 4),
+            cache=cache,
+            start_frame=0,
+            update_cache=True,
+        )
+
+    assert patch_inputs == []
+    _assert_self_cache_unchanged(cache, snapshot)
+    assert cache.cross_attention == [None]
+
+
+@pytest.mark.cpu
+def test_forward_accepts_exactly_one_configured_frame_block() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=1,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+
+    output = model(
+        torch.randn(1, 36, 3, 4, 4),
+        torch.tensor([1.0]),
+        torch.randn(1, 3, 6),
+        torch.randn(1, 6 * 8 * 8, 3, 4, 4),
+        cache=_cache(module, model),
+        start_frame=0,
+        update_cache=False,
+    )
+
+    assert output.shape == (1, 2, 3, 4, 4)
+
+
+@pytest.mark.cpu
+def test_transformer_allocates_request_cache_from_its_configured_geometry() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=2,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+
+    cache = model.allocate_cache(
+        batch_size=2,
+        latent_height=8,
+        latent_width=12,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert len(cache.self_attention) == 2
+    assert len(cache.cross_attention) == 2
+    assert cache.cross_attention == [None, None]
+    assert all(layer.key.shape == (2, 6 * 4 * 6, 2, 2) for layer in cache.self_attention)
+    assert all(layer.value.shape == (2, 6 * 4 * 6, 2, 2) for layer in cache.self_attention)
+
+
+@pytest.mark.cpu
+def test_video_patch_embedding_uses_temporal_height_width_token_order() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    hidden_states = torch.zeros(1, 36, 2, 2, 4)
+    hidden_states[0, 0] = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            [[9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]],
+        ]
+    )
+    with torch.no_grad():
+        model.patch_embedding.weight.zero_()
+        model.patch_embedding.bias.zero_()
+        model.patch_embedding.weight[0, 0, 0, 0, 0] = 1
+
+    tokens = model.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+
+    torch.testing.assert_close(tokens[0, :, 0], torch.tensor([1.0, 3.0, 9.0, 11.0]))
+
+
+@pytest.mark.cpu
+def test_unpatchify_restores_two_frame_channel_and_spatial_order() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    hidden_states = (
+        torch.stack(
+            (
+                torch.arange(0, 8),
+                torch.arange(10, 18),
+                torch.arange(20, 28),
+                torch.arange(30, 38),
+            )
+        )
+        .unsqueeze(0)
+        .float()
+    )
+    expected = torch.tensor(
+        [
+            [
+                [[0, 2, 10, 12], [4, 6, 14, 16]],
+                [[20, 22, 30, 32], [24, 26, 34, 36]],
+            ],
+            [
+                [[1, 3, 11, 13], [5, 7, 15, 17]],
+                [[21, 23, 31, 33], [25, 27, 35, 37]],
+            ],
+        ],
+        dtype=torch.float32,
+    ).unsqueeze(0)
+
+    output = model._unpatchify(
+        hidden_states,
+        batch_size=1,
+        frames=2,
+        height=1,
+        width=2,
+    )
+
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu
+def test_head_modulation_broadcasts_distinct_condition_per_frame() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    model.head.norm = torch.nn.Identity()
+    with torch.no_grad():
+        model.head.modulation.zero_()
+        model.head.head.weight.zero_()
+        model.head.head.bias.zero_()
+        model.head.head.weight[:, 0] = 1
+    hidden_states = torch.ones(1, 4, model.dim)
+    timestep_embedding = torch.tensor([[[10.0, 0.0, 0.0, 0.0], [20.0, 0.0, 0.0, 0.0]]])
+    expected = torch.tensor([21.0, 21.0, 41.0, 41.0]).view(1, 4, 1).expand(1, 4, 8)
+
+    output = model.head(hidden_states, timestep_embedding)
+
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.cpu
+def test_constructor_defaults_match_official_checkpoint_config() -> None:
+    module = attention_tests._load_module()
+    parameters = inspect.signature(module.CausalLingBotWorldTransformer3DModel.__init__).parameters
+    expected = {
+        "in_channels": 36,
+        "out_channels": 16,
+        "num_layers": 40,
+        "num_attention_heads": 40,
+        "attention_head_dim": 128,
+        "patch_size": (1, 2, 2),
+        "text_dim": 4096,
+        "ffn_dim": 13824,
+        "freq_dim": 256,
+        "rope_max_seq_len": 1024,
+        "eps": 1e-6,
+        "cross_attn_norm": True,
+        "sink_size": 9,
+        "num_frames_per_block": 3,
+        "sliding_window_num_frames": 18,
+        "local_attn_size": -1,
+    }
+
+    assert {name: parameters[name].default for name in expected} == expected
+
+
+@pytest.mark.cpu
+def test_transformer_exposes_parameter_dtype_for_pipeline_runtime() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module)
+
+    assert model.dtype == next(model.parameters()).dtype
+
+
+@pytest.mark.cpu
+def test_transformer_declares_regional_compile_block() -> None:
+    module = attention_tests._load_module()
+
+    assert module.CausalLingBotWorldTransformer3DModel._repeated_blocks == ["LingBotAttentionBlock"]
+
+
+@pytest.mark.cpu
+def test_lingbot_rms_norm_uses_global_tp_square_mean(monkeypatch) -> None:
+    module = attention_tests._load_module()
+    reduced_values: list[torch.Tensor] = []
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    def all_reduce(value: torch.Tensor) -> torch.Tensor:
+        reduced_values.append(value.detach().clone())
+        return value * 2
+
+    monkeypatch.setattr(module, "tensor_model_parallel_all_reduce", all_reduce)
+    norm = module._LingBotRMSNorm(hidden_size=2, eps=0.0)
+    value = torch.tensor([[3.0, 4.0]])
+
+    output = norm(value)
+
+    torch.testing.assert_close(output, value / math.sqrt(12.5))
+    assert len(reduced_values) == 1
+    torch.testing.assert_close(reduced_values[0], torch.tensor([[25.0]]))
+
+
+@pytest.mark.cpu
+def test_attention_rejects_heads_not_divisible_by_tp_size(monkeypatch) -> None:
+    module = attention_tests._load_module()
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
+
+    with pytest.raises(ValueError, match="num_heads=2.*tp_size=3"):
+        module.LingBotSelfAttention(dim=4, num_heads=2)
+
+
+@pytest.mark.cpu
+def test_constructor_rejects_unsupported_qk_norm_with_config_error() -> None:
+    module = attention_tests._load_module()
+
+    with pytest.raises(ValueError, match="qk_norm.*rms_norm_across_heads"):
+        module.CausalLingBotWorldTransformer3DModel(qk_norm="layer_norm")
+
+
+@pytest.mark.parametrize("field", ["image_dim", "added_kv_proj_dim", "pos_embed_seq_len"])
+@pytest.mark.cpu
+def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None:
+    module = attention_tests._load_module()
+
+    with pytest.raises(ValueError, match=field):
+        module.CausalLingBotWorldTransformer3DModel(**{field: 4})
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("prefix", ["", "transformer"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_constructor_propagates_quantization_to_parallel_linears(prefix: str, quantized: bool) -> None:
+    module = attention_tests._load_module()
+    quant_config = object() if quantized else None
+    model = _tiny_model(module, num_layers=1, quant_config=quant_config, prefix=prefix)
+    block = model.blocks[0]
+    quantized_linears = [
+        model.c2ws_hidden_states_layer1,
+        model.c2ws_hidden_states_layer2,
+        block.self_attn.qkv,
+        block.self_attn.o,
+        block.cross_attn.q,
+        block.cross_attn.k,
+        block.cross_attn.v,
+        block.cross_attn.o,
+        block.ffn[0],
+        block.ffn[2],
+        block.cam_injector_layer1,
+        block.cam_injector_layer2,
+    ]
+
+    assert len(quantized_linears) == 12
+    assert all(layer.quant_config is quant_config for layer in quantized_linears)
+    expected_names = {
+        "c2ws_hidden_states_layer1",
+        "c2ws_hidden_states_layer2",
+        *(
+            f"blocks.0.{name}"
+            for name in (
+                "self_attn.qkv",
+                "self_attn.o",
+                "cross_attn.q",
+                "cross_attn.k",
+                "cross_attn.v",
+                "cross_attn.o",
+                "ffn.0",
+                "ffn.2",
+                "cam_injector_layer1",
+                "cam_injector_layer2",
+            )
+        ),
+    }
+    assert {layer.prefix for layer in quantized_linears} == {
+        f"{prefix}.{name}" if prefix else name for name in expected_names
+    }
+
+
+@pytest.mark.cpu
+def test_from_config_accepts_diffusers_metadata_and_normalizes_patch_size() -> None:
+    module = attention_tests._load_module()
+
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "_diffusers_version": "0.35.0.dev0",
+        "patch_size": [1, 2, 2],
+        "num_attention_heads": 40,
+        "attention_head_dim": 128,
+        "in_channels": 36,
+        "out_channels": 16,
+        "text_dim": 4096,
+        "freq_dim": 256,
+        "ffn_dim": 13824,
+        "num_layers": 40,
+        "cross_attn_norm": True,
+        "eps": 1e-6,
+        "image_dim": None,
+        "added_kv_proj_dim": None,
+        "rope_max_seq_len": 1024,
+        "pos_embed_seq_len": None,
+        "qk_norm": "rms_norm_across_heads",
+        "sink_size": 9,
+        "num_frames_per_block": 3,
+        "sliding_window_num_frames": 18,
+        "local_attn_size": -1,
+    }
+
+    model = ConfigProbe.from_config(config, prefix="transformer")
+
+    assert model.received_kwargs["patch_size"] == (1, 2, 2)
+    assert model.received_kwargs["num_layers"] == 40
+    assert model.received_kwargs["prefix"] == "transformer"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("in_channels", 35),
+        ("num_layers", 39),
+        ("num_attention_heads", 32),
+        ("attention_head_dim", 64),
+        ("ffn_dim", 10240),
+        ("num_frames_per_block", 4),
+        ("sliding_window_num_frames", 24),
+        ("sink_size", 0),
+    ],
+)
+@pytest.mark.cpu
+def test_from_config_rejects_checkpoint_topology_drift(field: str, value: object) -> None:
+    module = attention_tests._load_module()
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "_diffusers_version": "0.35.0.dev0",
+        "patch_size": [1, 2, 2],
+        "num_attention_heads": 40,
+        "attention_head_dim": 128,
+        "in_channels": 36,
+        "out_channels": 16,
+        "text_dim": 4096,
+        "freq_dim": 256,
+        "ffn_dim": 13824,
+        "num_layers": 40,
+        "cross_attn_norm": True,
+        "eps": 1e-6,
+        "image_dim": None,
+        "added_kv_proj_dim": None,
+        "rope_max_seq_len": 1024,
+        "pos_embed_seq_len": None,
+        "qk_norm": "rms_norm_across_heads",
+        "sink_size": 9,
+        "num_frames_per_block": 3,
+        "sliding_window_num_frames": 18,
+        "local_attn_size": -1,
+    }
+    config[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        module.CausalLingBotWorldTransformer3DModel.from_config(config)
+
+
+@pytest.mark.cpu
+def test_from_config_ignores_non_semantic_checkpoint_metadata() -> None:
+    module = attention_tests._load_module()
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "architectures": ["CausalLingBotWorldTransformer3DModel"],
+        "future_diffusers_metadata": {"version": 1},
+    }
+
+    with torch.device("meta"):
+        model = module.CausalLingBotWorldTransformer3DModel.from_config(config)
+
+    assert model.config.in_channels == 36
+    assert model.config.num_layers == 40
+
+
+@pytest.mark.cpu
+def test_load_weights_uses_parameter_loaders_and_rejects_unknown_model_keys() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+    checkpoint_weights, expected_parameters = _checkpoint_weights_for_model(model)
+    loader_calls: list[str] = []
+    qkv_weight = model.blocks[0].self_attn.qkv.weight
+
+    def record_loader(param: torch.Tensor, loaded_weight: torch.Tensor, shard_id: str) -> None:
+        loader_calls.append(shard_id)
+        shard_index = {"q": 0, "k": 1, "v": 2}[shard_id]
+        shard_size = param.shape[0] // 3
+        param.data.narrow(0, shard_index * shard_size, shard_size).copy_(loaded_weight)
+
+    qkv_weight.weight_loader = record_loader
+    loaded = model.load_weights(iter(checkpoint_weights.items()))
+
+    assert set(checkpoint_weights) <= loaded
+    assert set(dict(model.named_parameters())) <= loaded
+    assert loader_calls == ["q", "k", "v"]
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, expected_parameters[name])
+
+    first_name = next(iter(checkpoint_weights))
+    partial = _tiny_model(module, num_layers=1)
+    partial_loaded = partial.load_weights([(first_name, checkpoint_weights[first_name])])
+    expected_partial = {first_name}
+    for projection in ("q", "k", "v"):
+        marker = f".self_attn.{projection}."
+        if marker in first_name:
+            expected_partial.add(first_name.replace(marker, ".self_attn.qkv."))
+            break
+    assert partial_loaded == expected_partial
+
+    with pytest.raises(KeyError, match="unexpected_model.weight"):
+        model.load_weights([("unexpected_model.weight", torch.ones(1))])
+
+
+@pytest.mark.cpu
+def test_load_weights_consumes_checkpoint_iterator_incrementally() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+    first_name, first_param = next(iter(model.named_parameters()))
+    loaded_weight = torch.full_like(first_param, 17)
+
+    def weights():
+        yield first_name, loaded_weight
+        torch.testing.assert_close(first_param, loaded_weight)
+
+    assert model.load_weights(weights()) == {first_name}
+
+
+@pytest.mark.cpu
+def test_real_auto_weights_loader_covers_fused_model_parameter_namespace() -> None:
+    utils = pytest.importorskip("vllm.model_executor.models.utils")
+    module = attention_tests._load_module()
+    transformer = _tiny_model(module, num_layers=1)
+    checkpoint_weights, _ = _checkpoint_weights_for_model(transformer)
+
+    class Pipeline(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer = transformer
+
+    pipeline = Pipeline()
+    loaded = utils.AutoWeightsLoader(pipeline).load_weights(
+        (f"transformer.{name}", value) for name, value in checkpoint_weights.items()
+    )
+
+    assert set(dict(pipeline.named_parameters())) <= loaded
+
+
+@pytest.mark.cpu
+def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:
+    module = attention_tests._load_module()
+    fixture = json.loads(_FIXTURE_PATH.read_text())
+    model = _tiny_model(module, num_layers=1)
+    parameter_names = set(_checkpoint_parameter_specs(model))
+
+    assert {name.split(".", 1)[0] for name in parameter_names} == set(fixture["top_level_modules"])
+    assert {name for name in parameter_names if not name.startswith("blocks.")} == set(fixture["non_block_parameters"])
+    assert {name.removeprefix("blocks.0.") for name in parameter_names if name.startswith("blocks.0.")} == set(
+        fixture["block_parameter_suffixes"]
+    )
+    expanded_names = set(fixture["non_block_parameters"])
+    expanded_names.update(
+        f"blocks.{layer}.{suffix}" for layer in range(40) for suffix in fixture["block_parameter_suffixes"]
+    )
+    canonical_names = "\n".join(sorted(expanded_names))
+
+    assert len(expanded_names) == fixture["index_parameter_count"] == 1421
+    assert hashlib.sha256(canonical_names.encode()).hexdigest() == fixture["canonical_name_set_sha256"]
+    assert fixture["canonical_name_to_shard_sha256"] == (
+        "e1addc27d2b1fad6f10226a23a265ee3e3c61e74dce4d5859727bdf180a67992"
+    )
+    assert list(fixture["shards"]) == [
+        f"diffusion_pytorch_model-{index:05}-of-00008.safetensors" for index in range(1, 9)
+    ]
+    assert sum(shard["parameter_count"] for shard in fixture["shards"].values()) == 1421
+    assert all(len(shard["parameter_names_sha256"]) == 64 for shard in fixture["shards"].values())
+
+
+@pytest.mark.cpu
+def test_official_default_shapes_match_public_safetensors_header_fixture() -> None:
+    module = attention_tests._load_module()
+    fixture = json.loads(_SHAPE_FIXTURE_PATH.read_text())
+
+    with torch.device("meta"):
+        model = module.CausalLingBotWorldTransformer3DModel()
+    parameter_specs = _checkpoint_parameter_specs(model)
+    expected_dtype = {"F32": torch.float32}[fixture["dtype"]]
+
+    assert len(fixture["shard_representatives"]) == 8
+    assert set(fixture["shard_representatives"].values()) <= set(fixture["parameter_shapes"])
+
+    for name, expected_shape in fixture["parameter_shapes"].items():
+        shape, dtype = parameter_specs[name]
+        assert tuple(shape) == tuple(expected_shape), name
+        assert dtype == expected_dtype
+
+
+@pytest.mark.cpu
+def test_timestep_expansion_only_runs_with_ulysses(monkeypatch):
+    dtype = torch.bfloat16
+    module = attention_tests._load_module()
+    hidden = torch.randn(2, 12, 4).to(dtype)
+    camera = torch.randn_like(hidden)
+    table = torch.randn(2, 3, 6, 4).to(dtype)
+    rotary = (torch.randn(12, 2), torch.randn(12, 2))
+    prepare = module._LingBotSPPrepare()
+    assert prepare(hidden, camera, table, rotary)[2] is table
+    monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
+    expanded = prepare(hidden, camera, table, rotary)[2]
+    assert expanded.shape == (2, 12, 6, 4)
+    torch.testing.assert_close(expanded, table.repeat_interleave(4, dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("unsharded", [None, 3], ids=["missing-hook", "unsharded-rope"])
+@pytest.mark.cpu
+def test_missing_or_partial_sp_split_fails_before_attention(monkeypatch, unsharded):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_frames_per_block=3, sliding_window_num_frames=6)
+    cache = _cache(module, model)
+    for block in model.blocks:
+        block.self_attn.ulysses_world_size = 2
+    monkeypatch.setattr(module, "get_sp_group", lambda: SimpleNamespace(ulysses_world_size=2))
+    original = model.sp_prepare.forward
+
+    def partial_split(*args):
+        values = original(*args)
+        if unsharded is None:
+            return values
+        return tuple(
+            value if i == unsharded else value.chunk(2, dim=1 if i < 3 else 0)[0] for i, value in enumerate(values)
+        )
+
+    monkeypatch.setattr(model.sp_prepare, "forward", partial_split)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("attention/collectives must not run before shard validation")
+
+    monkeypatch.setattr(model.blocks[0], "forward", forbidden)
+    with pytest.raises(RuntimeError, match="SP input hooks"):
+        model(
+            torch.randn(1, 36, 3, 4, 4),
+            torch.tensor([1.0]),
+            torch.randn(1, 3, 6),
+            torch.randn(1, 384, 3, 4, 4),
+            cache=cache,
+            start_frame=0,
+            update_cache=False,
+        )
+
+
+# Real multi-rank regression: synthetic weights, native SP/TP and attention.
+_HEADS, _HEAD_DIM, _LAYERS = 8, 32, 2
+_FRAMES, _SIDE, _TOKENS_PER_FRAME = 3, 32, 256
+
+
+def _model(dtype):
+    from vllm_omni.diffusion.models.lingbot_world.transformer import CausalLingBotWorldTransformer3DModel
+
+    model = CausalLingBotWorldTransformer3DModel(
+        num_attention_heads=_HEADS,
+        attention_head_dim=_HEAD_DIM,
+        num_layers=_LAYERS,
+        in_channels=4,
+        out_channels=4,
+        text_dim=8,
+        freq_dim=16,
+        ffn_dim=512,
+        patch_size=(1, 2, 2),
+        sink_size=1,
+        num_frames_per_block=_FRAMES,
+        sliding_window_num_frames=6,
+        rope_max_seq_len=32,
+    ).eval()
+    return model.to(device=torch.device("cuda", torch.accelerator.current_device_index()), dtype=dtype)
+
+
+def _checkpoint(model):
+    weights = {}
+    generator = torch.Generator().manual_seed(17)
+    for name, param in sorted(model.named_parameters()):
+        data = torch.randn(param.shape, generator=generator) * 0.02
+        if "norm" in name and name.endswith("weight"):
+            data.fill_(1)
+        if name.endswith("modulation") and data.shape[-2] == 6:
+            data[..., 2, :] = 1
+            data[..., 5, :] = 1
+        data = data.to(param.dtype)
+        param.copy_(data)
+        if ".self_attn.qkv." in name:
+            for component, chunk in zip(("q", "k", "v"), data.chunk(3), strict=True):
+                weights[name.replace(".self_attn.qkv.", f".self_attn.{component}.")] = chunk
+        else:
+            weights[name] = data
+    return weights
+
+
+def _rollout(model, mode, dtype, batch):
+    from vllm_omni.diffusion.models.lingbot_world.transformer import LingBotTransformerCache
+    from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
+    from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
+    from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+
+    device = next(model.parameters()).device
+    state = None
+    if mode == "paged":
+        kv = ARDiffusionKVCache(
+            ARDiffusionKVConfig(enable=True, chunk_size=_TOKENS_PER_FRAME, window_chunks=5, sink_chunks=1),
+            num_layers=_LAYERS,
+            num_kv_heads=model.blocks[0].self_attn.num_sp_heads,
+            head_size=_HEAD_DIM,
+            dtype=dtype,
+            block_size=_TOKENS_PER_FRAME,
+            max_model_len=4096,
+            available_bytes=1 << 27,
+            kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+            session_capacity=1,
+            frames_per_block=_FRAMES,
+            max_scratch_tokens_per_branch=_FRAMES * _TOKENS_PER_FRAME,
+            cross_attention_lengths={"text": 5},
+            # Cross-attention keeps every local head on every SP rank, so its pool is wider than the
+            # self-attention share above.
+            cross_attention_kv_heads={"text": model.blocks[0].cross_attn.num_local_heads},
+            device=device,
+        )
+        state = ARDiffusionKVState(kv, "numeric", {"main": kv.begin_request("numeric")}, num_layers=_LAYERS)
+        cache = LingBotTransformerCache(self_attention=[], cross_attention=[None] * _LAYERS)
+    else:
+        cache = model.allocate_cache(
+            batch_size=batch, latent_height=_SIDE, latent_width=_SIDE, device=device, dtype=dtype
+        )
+    generator = torch.Generator().manual_seed(123)
+    text = torch.randn(batch, 5, 8, generator=generator).to(device, dtype)
+    outputs = []
+    try:
+        for start in range(0, 12, _FRAMES):
+            latent = torch.randn(batch, 4, _FRAMES, _SIDE, _SIDE, generator=generator).to(device, dtype)
+            camera = torch.randn(batch, 384, _FRAMES, _SIDE, _SIDE, generator=generator).to(device, dtype)
+            for commit in (False, False, True):
+                if state is not None:
+                    cache.self_attention = state.get_kv_caches(
+                        "main", seq_len=_FRAMES * _TOKENS_PER_FRAME, commit_current=commit
+                    )
+                output = model(
+                    latent,
+                    torch.tensor([100.0, 400.0, 900.0], device=device).expand(batch, -1),
+                    text,
+                    camera,
+                    cache=cache,
+                    start_frame=start,
+                    update_cache=commit,
+                )
+                outputs.append(output.float().cpu())
+                if state is not None:
+                    if not state.is_cross_attention_populated("main", "text"):
+                        state.populate_cross_attention(
+                            "main", "text", [(layer.key, layer.value) for layer in cache.cross_attention]
+                        )
+                        for layer, pool in zip(
+                            cache.cross_attention, state.get_cross_attention_kv("main", "text"), strict=True
+                        ):
+                            layer.key, layer.value = pool["k"], pool["v"]
+                    state.commit_paged_context("main")
+        cross = [
+            (layer.key.detach().float().cpu(), layer.value.detach().float().cpu()) for layer in cache.cross_attention
+        ]
+        return torch.stack(outputs), cross
+    finally:
+        if state is not None:
+            state.close()
+
+
+def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
+    from vllm.config import VllmConfig
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionParallelConfig, OmniDiffusionConfig
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_distributed_env,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled
+    from vllm_omni.platforms import current_omni_platform
+
+    current_omni_platform.set_device(torch.device("cuda", rank))
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.distributed.init_process_group(
+        "nccl", init_method=f"file://{rendezvous}", world_size=world_size, rank=rank, timeout=timedelta(seconds=90)
+    )
+    init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank, backend="nccl")
+    try:
+        with torch.inference_mode(), set_current_vllm_config(VllmConfig()):
+            for baseline in (True, False):
+                sp, tp = (1, 1) if baseline else (sp_size, tp_size)
+                initialize_model_parallel(
+                    data_parallel_size=world_size // (sp * tp),
+                    sequence_parallel_size=sp,
+                    ulysses_degree=sp,
+                    tensor_parallel_size=tp,
+                )
+                config = OmniDiffusionConfig(
+                    model=str(Path(rendezvous).parent),
+                    dtype=dtype,
+                    enforce_eager=True,
+                    parallel_config=DiffusionParallelConfig(
+                        data_parallel_size=world_size // (sp * tp),
+                        sequence_parallel_size=sp,
+                        ulysses_degree=sp,
+                        tensor_parallel_size=tp,
+                    ),
+                    diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+                )
+                with set_current_diffusion_config(config), set_forward_context(omni_diffusion_config=config):
+                    model = _model(dtype)
+                    if baseline:
+                        weights = _checkpoint(model)
+                    else:
+                        model.load_weights(iter(weights.items()))
+                    _apply_sequence_parallel_if_enabled(SimpleNamespace(transformer=model), config)
+                    result, cross = _rollout(model, mode, dtype, batch)
+                    if baseline:
+                        expected, expected_cross = result, cross
+                    else:
+                        assert expected.abs().max() > 1e-3
+                        bound = 1e-5 if dtype == torch.float32 else 1e-2
+                        error = (result - expected).double().norm() / expected.double().norm()
+                        assert error <= bound, f"rank={rank}, TP{tp} SP{sp}: relative L2 {error.item():.3g} > {bound}"
+                        # Cross-attention K/V is replicated across the Ulysses group, not split over it, so
+                        # every SP rank holds its whole TP shard of heads. Only TP slices the cache now.
+                        local_heads = _HEADS // tp
+                        first = get_tensor_model_parallel_rank() * local_heads
+                        for (k, v), (ek, ev) in zip(cross, expected_cross, strict=True):
+                            tolerance = 1e-5 if dtype == torch.float32 else 2e-2
+                            torch.testing.assert_close(
+                                k, ek[:, :, first : first + local_heads], rtol=tolerance, atol=tolerance
+                            )
+                            torch.testing.assert_close(
+                                v, ev[:, :, first : first + local_heads], rtol=tolerance, atol=tolerance
+                            )
+                        if rank == 0:
+                            print(f"{mode} {dtype} TP{tp} SP{sp}: relative L2={error.item():.3g}", flush=True)
+                    del model
+                torch.distributed.barrier()
+                destroy_model_parallel()
+    finally:
+        destroy_distributed_env()
+
+
+def _run(tmp_path: Path, sp, tp, mode, dtype, batch):
+    if torch.accelerator.device_count() < sp * tp:
+        pytest.skip(f"requires {sp * tp} GPUs")
+    torch.multiprocessing.spawn(
+        _worker, args=(sp * tp, sp, tp, mode, dtype, batch, str(tmp_path / "rendezvous")), nprocs=sp * tp
+    )
+
+
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_sp2_direct_matches_sp1_fp32(tmp_path):
+    _run(tmp_path, 2, 1, "direct", torch.float32, 2)
+
+
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
+def test_sp4_direct_matches_sp1_bf16(tmp_path):
+    _run(tmp_path, 4, 1, "direct", torch.bfloat16, 1)
+
+
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
+def test_tp2_sp2_paged_matches_sp1_bf16(tmp_path):
+    _run(tmp_path, 2, 2, "paged", torch.bfloat16, 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("start_frame", [0, 1021, 1023, 1024, 21600])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_temporal_rope_matches_absolute_positions_without_growing_cache(start_frame, dtype):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, attention_head_dim=128, rope_max_seq_len=1024).to(dtype)
+    buffers = {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()}
+    cosine, sine = model._rotary_embedding(
+        frames=3, height=2, width=3, start_frame=start_frame, dtype=dtype, device=torch.device("cpu")
+    )
+    # Independent complex-valued reference uses absolute (time, height, width)
+    # coordinates, including blocks crossing the original precomputed table.
+    grids = torch.meshgrid(
+        torch.arange(start_frame, start_frame + 3, dtype=torch.float64),
+        torch.arange(2, dtype=torch.float64),
+        torch.arange(3, dtype=torch.float64),
+        indexing="ij",
+    )
+    reference = []
+    for positions, dim in zip(grids, (44, 42, 42), strict=True):
+        frequencies = 1.0 / 10000 ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+        phase = positions.flatten()[:, None] * frequencies[None, :]
+        reference.append(torch.polar(torch.ones_like(phase), phase))
+    expected = torch.cat(reference, dim=-1)
+    torch.testing.assert_close(cosine, expected.real.float().to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(sine, expected.imag.float().to(dtype), rtol=0, atol=0)
+    assert {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()} == buffers
+
+
+@pytest.mark.cpu
+def test_temporal_rope_extension_keeps_spatial_limit():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+    with pytest.raises(ValueError, match="Spatial RoPE"):
+        model._rotary_embedding(
+            frames=3, height=17, width=1, start_frame=16, dtype=torch.float32, device=torch.device("cpu")
+        )
+
+
+@pytest.mark.cpu
+def test_the_camera_injector_runs_once_per_held_cache_and_gives_the_same_output() -> None:
+    """Two forwards sharing one caller-held cache: the injector runs once per block, outputs unchanged."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=2).eval()
+    hidden_states = torch.randn(1, 36, 1, 4, 4)
+    timestep = torch.tensor([1.0])
+    encoder_hidden_states = torch.randn(1, 3, 6)
+    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+
+    def run(cache, camera_cache=None):
+        return model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            camera_hidden_states,
+            cache=cache,
+            start_frame=0,
+            update_cache=False,
+            camera_modulation_cache=camera_cache,
+        )
+
+    # Baseline: no cache, so every forward rebuilds the injector in every block.
+    uncached_first = run(_cache(module, model))
+    uncached_second = run(_cache(module, model))
+    injector_calls = [attention_tests._record_outputs(block.cam_injector_layer1) for block in model.blocks]
+    held = module.CameraModulationCache()
+    cached_first = run(_cache(module, model), held)
+    cached_second = run(_cache(module, model), held)
+
+    # One build per block for both forwards, instead of one per block per forward.
+    assert [len(calls) for calls in injector_calls] == [1, 1]
+    torch.testing.assert_close(cached_first, uncached_first, rtol=0, atol=0)
+    torch.testing.assert_close(cached_second, uncached_second, rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_timestep_projection_is_staged_into_one_static_buffer_per_shape() -> None:
+    """Two forwards' projections land in the same buffer; the blocks never see the fresh per-forward tensor."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    first = torch.randn(1, 8, 6, model.dim)
+    second = torch.randn(1, 8, 6, model.dim)
+
+    staged_first = model._stage_timestep_projection(first)
+    assert staged_first is not first and torch.equal(staged_first, first)
+    staged_second = model._stage_timestep_projection(second)
+    assert staged_second is staged_first and torch.equal(staged_second, second)
+    # A different shape gets its own buffer; the first one is kept.
+    other = model._stage_timestep_projection(torch.randn(1, 4, 6, model.dim))
+    assert other is not staged_first and len(model._timestep_projection_buffers) == 2

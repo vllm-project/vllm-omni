@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E expansion tests for Ming-omni-tts online serving (nightly CI).
 
@@ -18,7 +18,6 @@ from tests.helpers.stage_config import get_deploy_config_path
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
 ]
 
 MODEL = "inclusionAI/Ming-omni-tts-0.5B"
@@ -57,7 +56,7 @@ def get_prompt(prompt_type="zh"):
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", no_async_chunk_params, indirect=True)
-def test_text_to_audio_non_streaming_001(omni_server, openai_client) -> None:
+def test_text_to_audio_non_streaming_001(omni_server, online_client) -> None:
     """
     Deploy Setting: ming_tts.yaml with --no-async-chunk
     Input Modal: text
@@ -72,12 +71,12 @@ def test_text_to_audio_non_streaming_001(omni_server, openai_client) -> None:
         "response_format": "wav",
         "timeout": 300.0,
     }
-    openai_client.send_audio_speech_request(request_config, request_num=2)
+    online_client.send_audio_speech_request(request_config, request_num=2)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", async_chunk_params, indirect=True)
-def test_text_to_audio_streaming_001(omni_server, openai_client) -> None:
+def test_text_to_audio_streaming_001(omni_server, online_client) -> None:
     """
     Deploy Setting: ming_tts.yaml (async_chunk=true)
     Input Modal: text + voice
@@ -94,4 +93,4 @@ def test_text_to_audio_streaming_001(omni_server, openai_client) -> None:
         "response_format": "wav",
         "timeout": 300.0,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

@@ -25,7 +25,7 @@ from vllm_omni import Omni
 MODEL_NAME = "OpenMOSS-Team/MOSS-TTS-Nano"
 STAGE_CONFIG = get_deploy_config_path("moss_tts_nano.yaml")
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,
@@ -108,7 +108,7 @@ def _build_request(
 def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     """Run a single request and return (waveform, sample_rate)."""
     for stage_outputs in omni.generate(request, DEFAULT_SAMPLING):
-        req_output = stage_outputs.request_output
+        req_output = stage_outputs
         if req_output is not None:
             mm = req_output.outputs[0].multimodal_output
             assert mm is not None, "Expected multimodal_output to be non-None"
@@ -121,7 +121,7 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
     """English TTS produces non-empty 48 kHz stereo audio."""
     req = _build_request("Hello, this is a short voice cloning demo for testing.", ref_audio_path)
@@ -133,7 +133,7 @@ def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese TTS produces non-empty audio."""
     req = _build_request("你好，这是语音合成测试。", ref_audio_path)
@@ -145,7 +145,7 @@ def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Same seed produces identical waveforms."""
     req = _build_request("Reproducible output test.", ref_audio_path, seed=123)
@@ -157,7 +157,7 @@ def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) ->
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Batch of two requests returns audio for each."""
     requests = [
@@ -167,7 +167,7 @@ def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     results = []
     # Single-stage model (num_stages=1): one sampling param for all requests.
     for stage_outputs in omni_runner.omni.generate(requests, [DEFAULT_SAMPLING]):
-        req_output = stage_outputs.request_output
+        req_output = stage_outputs
         if req_output is not None:
             mm = req_output.outputs[0].multimodal_output
             assert mm is not None

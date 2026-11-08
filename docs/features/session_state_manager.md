@@ -20,11 +20,12 @@ extracts it into a shared, typed contract:
   (matching the bespoke caches it replaces), and reports per-device byte usage
   via `stats()` for observability.
 
-Attention KV is *not* managed here: for DreamZero it is owned by the
-AR-Diffusion engine's paged KV pool (PR
-[#4534](https://github.com/vllm-project/vllm-omni/pull/4534)). The manager
-covers the model's non-KV session state; integrating the engine's per-session
-KV handle into the same byte accounting is RFC #4480 Phase 1.
+Autoregressive generation KV is *not* managed here: for DreamZero it is owned
+by the AR-Diffusion engine's paged KV pool (PR
+[#4534](https://github.com/vllm-project/vllm-omni/pull/4534)). Cosmos3's fixed,
+encode-once UND conditioning K/V is different and is covered by the dense
+Cosmos3 adapter described below. Integrating the engine's per-session paged KV
+handle into the same byte accounting is RFC #4480 Phase 1.
 
 ## Enabling
 
@@ -158,3 +159,62 @@ of `num_frame_per_block` frames instead: identical output, bounded memory, and
 the per-step quantisation no longer scales with session length. Asking for more
 frames than the ring retains raises rather than silently returning a shorter
 window. The bespoke path is unchanged.
+
+### Cosmos3
+
+When `enable_session_state_manager` is enabled, the Cosmos3 adapter stores the
+dense, encode-once UND text K/V for every transformer layer and active CFG
+branch, together with that branch's GEN M-RoPE cosine/sine tensors. These are
+GPU-resident tensors and can contribute to CUDA OOM. A useful description of
+the retained storage on one rank is:
+
+```text
+sum_over_branches(
+  sum_over_layers(storage_bytes(K) + storage_bytes(V))
+  + storage_bytes(freqs_gen_cos) + storage_bytes(freqs_gen_sin)
+)
+```
+
+This is not a peak-memory upper bound: construction of the next branch can
+temporarily overlap the already retained branch with UND activations, the new
+full K/V result, RoPE tensors, and generator activations. K/V slices also keep
+their underlying allocation alive, so physical storage can follow the padded
+text length rather than only the exposed trimmed length. The manager's byte
+accounting deliberately measures storage for this reason.
+
+Branch placement changes the per-rank cost:
+
+- no CFG retains one conditional branch;
+- sequential CFG can retain both conditional and unconditional branches on the
+  same GPU;
+- CFG-parallel retains one branch on each CFG rank;
+- UND K/V is replicated across sequence-parallel ranks rather than divided by
+  the SP degree.
+
+Consequently, risk increases with text batch/sequence length, media token count
+(which sizes `freqs_gen`), sequential CFG, dtype width, and concurrent live
+requests. Phase 0 records `nbytes:cuda:*` but does not enforce `byte_budget`, so
+the manager cannot prevent an allocation from exhausting the device. The
+count-based session limit is not an OOM guarantee.
+
+The adapter transfers ownership by tensor reference; it does not clone K/V or
+RoPE tensors. For a normal serial request this should not materially increase
+tensor storage relative to Cosmos3's existing bespoke cond/uncond cache, which
+retains the same branch values. It does add small CPU-side session/object
+metadata. This claim is based on the reference flow in the implementation;
+there is not yet a current-head GPU peak-memory A/B result for this PR.
+
+Request-finally cleanup drops the manager-owned session, so branches do not
+accumulate with completed request IDs. The transformer handoff field still
+references the last loaded branch until `reset_cache()` runs at the start of
+the next generation (or the pipeline is destroyed). Thus this is bounded
+post-request residency, not growth per completed request, but manager
+`stats()` after `drop_session()` no longer includes that last transformer-held
+alias. A profiler that only reads manager statistics can therefore under-report
+live process memory.
+
+For OOM validation, measure complete cache-off and true flag-on generations in
+otherwise identical fresh processes. Synchronize CUDA and report process-level
+peak memory plus PyTorch peak allocated and peak reserved memory. Include the
+period between requests when checking cleanup; do not infer safety from the
+manager byte total, a single denoising step, or an operator-only profile.

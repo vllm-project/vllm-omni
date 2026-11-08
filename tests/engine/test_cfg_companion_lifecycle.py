@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic tests for the CFG-companion output lifecycle.
 
 Regression suite for the companion-output race behind the nightly Bagel
@@ -83,10 +83,18 @@ class _FakePool:
         self.stage_client = SimpleNamespace(requires_multimodal_data=False, custom_process_input_func=None)
         self.aborted: list[list[str]] = []
 
+    def live_replica_ids(self) -> list[int]:
+        # Single always-live replica: these tests cover CFG bundling, not
+        # replica death, and the forward path fast-fails on an empty pool.
+        return [0]
+
     async def abort_requests(self, request_ids):
         self.aborted.append(list(request_ids))
 
     def release_bindings(self, request_ids):
+        pass
+
+    def schedule_release_request_resources(self, request_ids):
         pass
 
 
@@ -108,12 +116,14 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
 def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         final_stage_id=final_stage_id,
+        yield_stage_id=None,
         stage_submit_ts={},
         sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
         streaming=SimpleNamespace(enabled=False, segment_finished=False),
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
+        trace=None,
     )
 
 

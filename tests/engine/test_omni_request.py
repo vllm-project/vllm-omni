@@ -13,13 +13,16 @@ substitutable with the base class — including base-style calls that pass
 
 import inspect
 
+import msgspec
 import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.kv_hints import KvHintAction, KvHintsEnvelope
 from vllm.v1.request import Request
 
-from vllm_omni.engine import PromptEmbedsPayload
+from vllm_omni.engine import OmniEngineCoreRequest, PromptEmbedsPayload
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -52,6 +55,7 @@ def test_positional_construction_matches_base_request():
     assert req.external_req_id is None
     assert req.additional_information is None
     assert req.prompt_embeds_payload is None
+    assert req.num_stale_output_tokens == 0
 
 
 def test_positional_prompt_embeds_does_not_collide():
@@ -110,3 +114,26 @@ def test_model_intermediate_buffer_round_trips_to_streaming_update():
     assert update is not None
     assert request.model_intermediate_buffer is buffer
     assert update.model_intermediate_buffer is buffer
+
+
+def test_kv_hints_survive_omni_upgrade_wire_transport_and_scheduler_conversion():
+    hints = KvHintsEnvelope("1", "hint-message", [KvHintAction("a", "prefetch", "1", {"blocks": [7]})])
+    core = EngineCoreRequest(
+        request_id="hint-request",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        session_id="session",
+        kv_hints=hints,
+    )
+    upgraded = OmniEngineCoreRequest.from_request(core)
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(upgraded), type=OmniEngineCoreRequest)
+    scheduled = OmniRequest.from_engine_core_request(decoded, block_hasher=None)
+    assert decoded.session_id == "session"
+    assert scheduled.kv_hints == hints
+    assert scheduled.session_id == "session"

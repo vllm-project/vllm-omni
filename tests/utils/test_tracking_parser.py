@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for TrackingArgumentParser and related utilities."""
 
 import argparse
@@ -35,7 +38,7 @@ _TEST_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(stage_id=0, model_stage="stage0"),
         StagePipelineConfig(stage_id=1, model_stage="stage1"),
-        StagePipelineConfig(stage_id=2, model_stage="stage2"),
+        StagePipelineConfig(stage_id=2, model_stage="stage2", final_output=True),
     ),
 )
 

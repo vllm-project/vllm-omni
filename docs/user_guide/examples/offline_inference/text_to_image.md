@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
-
 Generate images from text prompts using vLLM-Omni's diffusion pipeline entrypoints.
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
@@ -22,15 +21,15 @@ This folder provides several entrypoints for experimenting with text-to-image di
 
 ### Supported Models
 
-| Model | Image Shape  | Peak VRAM (GiB) * | Model Weights (GiB) |
+| Model | Image Shape | Peak VRAM (GiB) * | Model Weights (GiB) |
 | ----- | ----------- | ----------- | ----------------- |
 | `Qwen/Qwen-Image` | 1024 x 1024 | 60.0 | 53.7 |
-| `Qwen/Qwen-Image-2512` |1024 x 1024 | 60.0 | 53.7 |
+| `Qwen/Qwen-Image-2512` | 1024 x 1024 | 60.0 | 53.7 |
 | `Tongyi-MAI/Z-Image-Turbo` | 1024 x 1024 | 24.8 | 19.2 |
 | `stepfun-ai/NextStep-1.1` | 512 x 512 | 71.8 | 28.1 |
 | `meituan-longcat/LongCat-Image` | 1024 x 1024 | 71.2 | 27.3 |
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
-| `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
+| `OmniGen2/OmniGen2` | 1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |
 | `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 77.6 | 31.4 |
 | `black-forest-labs/FLUX.2-klein-4B` | 1024 x 1024 | 72.7 | 14.9 |
@@ -55,7 +54,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -88,8 +87,9 @@ python text_to_image.py \
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
+| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--lora-backend` | str | `"peft"` | LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 
 **NextStep-1.1 specific arguments:**
 
@@ -101,7 +101,7 @@ python text_to_image.py \
 | `--use-norm` | flag | off | Apply layer normalization to sampled tokens |
 
 > If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
-
+>
 > Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 
 ## More CLI Examples
@@ -178,13 +178,13 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
 
     For diffusion request-level batching controls such as `max_num_seqs`, see
-    [Request-Level Batching](../../diffusion/request_batching.md).
+    [Diffusion Execution Modes](../../diffusion/execution_modes.md).
 
 ### Negative Prompts
 
@@ -206,7 +206,7 @@ if __name__ == "__main__":
         }
     ])
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 You can also pass a negative prompt via the CLI argument `--negative-prompt`:
@@ -241,7 +241,7 @@ python text_to_image.py \
 
 LoRA adapters must be in PEFT format. A typical adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
@@ -256,7 +256,10 @@ lora_adapter/
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 Launch the Gradio demo:
 

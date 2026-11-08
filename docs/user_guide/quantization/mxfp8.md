@@ -167,7 +167,7 @@ omni = Omni(model="/path/to/Wan2.2-TI2V-5B-MXFP8")
 
 ### Offline Mode (AutoRound)
 
-AutoRound MXFP8 checkpoints declare `quant_method="auto-round"` with `data_type="mx_fp"` in their `config.json`. These are automatically detected and use the `IncMxfp8OfflineLinearMethod` backend.
+AutoRound MXFP8 checkpoints declare `quant_method="auto-round"` with `data_type="mx_fp"` in their `config.json`. These are automatically detected and served by vLLM's INC MXFP8 scheme through `OmniINCConfig` (`vllm_omni/quantization/inc_config.py`).
 
 To use an AutoRound MXFP8 checkpoint:
 

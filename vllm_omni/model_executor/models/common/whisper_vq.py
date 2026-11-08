@@ -1,6 +1,7 @@
 # Copyright 2022 The OpenAI Authors and The HuggingFace Inc. team. All rights reserved.
 #               2025 Zhipu AI Inc (authors: CogAudio Group Members)
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WhisperVQEncoder: HF WhisperEncoder + VQ codebook + inter-layer pooling.
 
 Built on standard ``WhisperConfig``.  VQ-specific parameters are patched onto

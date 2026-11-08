@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="460" viewBox="0 0 760 460" role="img" aria-labelledby="title desc">
+  <title id="title">MAGI-2 DLO one-step Pareto frontier</title>
+  <desc id="desc">Warm user latency in seconds versus throughput per device. DP1SP4 is 5.735 seconds and 0.0436 outputs per second per device, DP2SP2 is 6.785 and 0.0737, and DP4 is 9.997 and 0.1000.</desc>
+  <rect width="760" height="460" fill="#ffffff"/>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+    .title { font-size: 20px; font-weight: 600; }
+    .axis-label { font-size: 14px; font-weight: 500; }
+    .tick { font-size: 12px; fill: #4b5563; }
+    .point-label { font-size: 13px; font-weight: 600; }
+    .value-label { font-size: 11px; fill: #4b5563; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .axis { stroke: #6b7280; stroke-width: 1.5; }
+    .frontier { fill: none; stroke: #2563eb; stroke-width: 3; }
+    .point { fill: #2563eb; stroke: #ffffff; stroke-width: 2; }
+  </style>
+
+  <text x="380" y="28" text-anchor="middle" class="title">One diffusion step</text>
+
+  <g aria-hidden="true">
+    <line x1="85" y1="309" x2="700" y2="309" class="grid"/>
+    <line x1="85" y1="226" x2="700" y2="226" class="grid"/>
+    <line x1="85" y1="143" x2="700" y2="143" class="grid"/>
+    <line x1="85" y1="61" x2="700" y2="61" class="grid"/>
+    <line x1="85" y1="40" x2="85" y2="350" class="axis"/>
+    <line x1="85" y1="350" x2="700" y2="350" class="axis"/>
+
+    <text x="73" y="313" text-anchor="end" class="tick">0.04</text>
+    <text x="73" y="230" text-anchor="end" class="tick">0.06</text>
+    <text x="73" y="147" text-anchor="end" class="tick">0.08</text>
+    <text x="73" y="65" text-anchor="end" class="tick">0.10</text>
+
+    <text x="85" y="370" text-anchor="middle" class="tick">5</text>
+    <text x="197" y="370" text-anchor="middle" class="tick">6</text>
+    <text x="309" y="370" text-anchor="middle" class="tick">7</text>
+    <text x="421" y="370" text-anchor="middle" class="tick">8</text>
+    <text x="532" y="370" text-anchor="middle" class="tick">9</text>
+    <text x="644" y="370" text-anchor="middle" class="tick">10</text>
+  </g>
+
+  <text x="392" y="414" text-anchor="middle" class="axis-label">Warm user latency (seconds) — lower is better</text>
+  <text x="20" y="195" transform="rotate(-90 20 195)" text-anchor="middle" class="axis-label">Throughput/device (outputs/s) — higher is better</text>
+
+  <polyline points="167,294 285,169 644,61" class="frontier"/>
+
+  <circle cx="167" cy="294" r="7" class="point"/>
+  <text x="179" y="288" class="point-label">DP1SP4</text>
+  <text x="179" y="305" class="value-label">5.735 s, 0.0436</text>
+
+  <circle cx="285" cy="169" r="7" class="point"/>
+  <text x="297" y="163" class="point-label">DP2SP2</text>
+  <text x="297" y="180" class="value-label">6.785 s, 0.0737</text>
+
+  <circle cx="644" cy="61" r="7" class="point"/>
+  <text x="632" y="84" text-anchor="end" class="point-label">DP4</text>
+  <text x="632" y="101" text-anchor="end" class="value-label">9.997 s, 0.1000</text>
+
+  <text x="700" y="444" text-anchor="end" class="tick">4x NVIDIA L20X · warm qualification run</text>
+</svg>

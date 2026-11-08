@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,3 +44,11 @@ def test_model_display_names_require_string_mapping(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="MODEL_DISPLAY_NAMES_FILE"):
         generate_examples.load_model_display_names()
+
+
+def test_only_general_serving_examples_get_generated_pages():
+    general_example = SimpleNamespace(category="offline_inference", path=Path("text_to_image"))
+    model_example = SimpleNamespace(category="offline_inference", path=Path("qwen3_omni"))
+
+    assert generate_examples.is_general_example(general_example)
+    assert not generate_examples.is_general_example(model_example)

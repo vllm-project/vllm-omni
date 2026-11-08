@@ -3,16 +3,13 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/spkemb_extractor.py
 from __future__ import annotations
 
-import os
 import threading
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torchaudio
 from vllm.logger import init_logger
-from vllm.multimodal.media.audio import load_audio
 
-from vllm_omni.model_executor.models.ming_flash_omni.spk_embedding import SpkembExtractor
+from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
 
 from .audio_prep import coerce_prompt_waveform, coerce_speaker_embeddings
 from .constants import (
@@ -29,48 +26,9 @@ logger = init_logger(__name__)
 _EXTRACTOR_LOAD_LOCK = threading.Lock()
 
 
-def resolve_model_to_local_path(model):
-    if os.path.isdir(model):
-        return model
-
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(model)
-
-
-class MingSpeakerEmbeddingExtractor:
-    def __init__(self, model, target_sr=16000):
-        local_model_path = resolve_model_to_local_path(model)
-        campplus_path = os.path.join(local_model_path, "campplus.onnx")
-        if not os.path.exists(campplus_path):
-            raise RuntimeError(f"Missing Ming speaker extractor model: {campplus_path}")
-
-        self.target_sr = int(target_sr)
-        self._core = SpkembExtractor(campplus_path, target_sr=self.target_sr)
-
-    def extract_from_waveform(self, waveform, sample_rate):
-        if not isinstance(waveform, torch.Tensor):
-            waveform = torch.as_tensor(waveform)
-
-        tensor = waveform.detach().to(torch.float32)
-        if tensor.ndim == 1:
-            tensor = tensor.unsqueeze(0)
-        if int(sample_rate) != self.target_sr:
-            tensor = torchaudio.transforms.Resample(orig_freq=int(sample_rate), new_freq=self.target_sr)(tensor)
-
-        embedding = self._core._extract_spk_embedding(tensor)
-        return embedding.squeeze(0).to(dtype=torch.float32)
-
-    def extract_from_file(self, audio_path):
-        audio, sample_rate = load_audio(audio_path, sr=None, mono=False)
-        waveform = torch.from_numpy(audio).contiguous()
-        return self.extract_from_waveform(waveform, sample_rate)
-
-    def extract_many(self, audio_paths):
-        return [self.extract_from_file(path) for path in audio_paths]
-
-
-def _load_speaker_extractor(wrapper: MingTTSForConditionalGeneration) -> MingSpeakerEmbeddingExtractor:
+# Ming's bundle ships the CAM++ artifact as `campplus.onnx` in the model
+# directory, which is the shared extractor's default.
+def _load_speaker_extractor(wrapper: MingTTSForConditionalGeneration) -> SpeakerEmbeddingExtractor:
     extractor = getattr(wrapper, "_speaker_extractor", None)
     if extractor is not None:
         return extractor
@@ -79,7 +37,7 @@ def _load_speaker_extractor(wrapper: MingTTSForConditionalGeneration) -> MingSpe
         extractor = getattr(wrapper, "_speaker_extractor", None)
         if extractor is None:
             model_path = wrapper.vllm_config.model_config.model
-            extractor = MingSpeakerEmbeddingExtractor(model_path, target_sr=16000)
+            extractor = SpeakerEmbeddingExtractor(model_path, target_sr=16000)
             wrapper._speaker_extractor = extractor
     return extractor
 
@@ -174,8 +132,6 @@ def _resolve_speaker_embeddings(
 
 
 __all__ = [
-    "MingSpeakerEmbeddingExtractor",
     "_load_speaker_extractor",
     "_resolve_speaker_embeddings",
-    "resolve_model_to_local_path",
 ]
