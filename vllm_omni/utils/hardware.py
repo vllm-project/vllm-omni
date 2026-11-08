@@ -41,8 +41,6 @@ def _nvidia_smi() -> tuple[str, float] | None:
         return None
     if not output:
         return None
-    else:
-        pass
     name, _, memory = output.partition(",")
     try:
         return name.strip(), float(memory.strip()) / 1024
@@ -83,8 +81,6 @@ def detect_hardware() -> HardwareInfo:
             os_name=platform.platform(),
             detail=f"CUDA capability {properties.major}.{properties.minor}",
         )
-    else:
-        pass
 
     nvidia = _nvidia_smi()
     if nvidia is not None:
@@ -96,8 +92,6 @@ def detect_hardware() -> HardwareInfo:
             os_name=platform.platform(),
             detail="nvidia-smi only; torch CUDA is unavailable",
         )
-    else:
-        pass
 
     is_apple = sys.platform == "darwin" and platform.machine() == "arm64"
     if is_apple:
@@ -108,8 +102,6 @@ def detect_hardware() -> HardwareInfo:
             os_name=platform.platform(),
             detail="unified memory",
         )
-    else:
-        pass
 
     return HardwareInfo(
         backend="cpu",
