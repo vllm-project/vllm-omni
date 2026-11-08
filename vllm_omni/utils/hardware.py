@@ -61,6 +61,19 @@ def _apple_memory_gb() -> float | None:
         return None
 
 
+def _apple_chip() -> str:
+    try:
+        chip = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        ).strip()
+        return chip or "Apple Silicon"
+    except (OSError, subprocess.SubprocessError):
+        return "Apple Silicon"
+
+
 def _mps_available() -> bool:
     mps = getattr(torch.backends, "mps", None)
     return mps is not None and bool(mps.is_available())
@@ -102,7 +115,7 @@ def detect_hardware() -> HardwareInfo:
     if is_apple and _mps_available():
         return HardwareInfo(
             backend="mps",
-            device=platform.processor() or "Apple Silicon",
+            device=_apple_chip(),
             memory_gb=_apple_memory_gb(),
             os_name=platform.platform(),
             detail="unified memory",

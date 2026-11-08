@@ -50,11 +50,13 @@ def test_detect_hardware_apple_silicon(monkeypatch):
     monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware.platform, "processor", lambda: "arm")
     monkeypatch.setattr(hardware, "_mps_available", lambda: True)
+    monkeypatch.setattr(hardware, "_apple_chip", lambda: "Apple M2")
     monkeypatch.setattr(hardware, "_apple_memory_gb", lambda: 16.0)
 
     info = hardware.detect_hardware()
 
     assert info.backend == "mps"
+    assert info.device == "Apple M2"
     assert info.memory_gb == 16.0
     assert info.detail == "unified memory"
 
