@@ -58,6 +58,12 @@ _PROMPT_LOGGING_CONFIG["loggers"]["vllm_omni.model_executor.models.minicpmo_4_5.
     "level": "DEBUG",
     "propagate": True,
 }
+# The Talker logs once when it verifies draft codes.
+_PROMPT_LOGGING_CONFIG["loggers"]["vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts"] = {
+    "handlers": ["minicpmo_prompt_selection"],
+    "level": "DEBUG",
+    "propagate": True,
+}
 _PROMPT_LOGGING_CONFIG_PATH.write_text(json.dumps(_PROMPT_LOGGING_CONFIG), encoding="utf-8")
 
 test_params = [
@@ -145,6 +151,10 @@ talker_dspark_params = [
                 "--chat-template-content-format",
                 "openai",
             ],
+            env_dict={
+                "VLLM_CONFIGURE_LOGGING": "1",
+                "VLLM_LOGGING_CONFIG_PATH": str(_PROMPT_LOGGING_CONFIG_PATH),
+            },
         ),
         id="turn_mrv2_talker_dspark",
     ),
@@ -375,6 +385,8 @@ def test_text_to_audio_talker_dspark(omni_server, openai_client) -> None:
     responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
     assert all(response.success and response.audio_bytes for response in responses)
+    # Only stage 1 with a loaded draft verifies codes. Read from the start: the line is logged once.
+    assert "MiniCPM-o 4.5 Talker is verifying draft codes" in _read_prompt_selection_log(0)
 
 
 @pytest.mark.full_model

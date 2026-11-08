@@ -854,8 +854,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
 
-    def get_language_model(self) -> torch.nn.Module:
-        """The stage's decoder; drafters share its embedding and lm_head."""
+    def get_language_model(self) -> Any:
+        """The stage's decoder: drafters share the Thinker's embedding and lm_head, or the Talker's codec table."""
         if self.thinker is not None:
             return self.thinker.get_language_model()
         if self.talker is not None and hasattr(self.talker, "get_language_model"):
@@ -1064,7 +1064,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
         return self.model_stage == "tts" and self._use_v2_model_runner
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         if self.model_stage == "tts":
             return self.talker.mrv2_custom_sampler(sampler)
         if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":

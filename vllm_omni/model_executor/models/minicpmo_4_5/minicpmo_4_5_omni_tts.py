@@ -1051,12 +1051,10 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
         draft_logits: torch.Tensor | None = None,
         invalid_drafts: torch.Tensor | None = None,
     ) -> Any:
+        # The runner calls this only for steps that carry draft codes.
+        logger.debug_once("MiniCPM-o 4.5 Talker is verifying draft codes")
         num_logits = logits.shape[0]
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.sampler.req_states, num_logits)
-        masked = getattr(self.talker, "_mrv2_masked_eos", None)
-        self.talker._mrv2_masked_eos = None
-        if masked is not None and masked.shape[0] == num_logits:
-            logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
         table = self.sampler.forced
         table.zero_()
         if forced is not None:
@@ -1861,7 +1859,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Any draft method, not only drafters that read Talker layers.
             raise NotImplementedError(
                 "MiniCPM-o 4.5 Talker on model_runner: v2 verifies draft codes in turn sessions only; "
-                "remove the stage-1 speculative_config for duplex or K-step"
+                "remove the stage-1 speculative_config for duplex"
             )
         # Verification reuses the stock sampler, whose penalty stage is the codec window.
         return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
