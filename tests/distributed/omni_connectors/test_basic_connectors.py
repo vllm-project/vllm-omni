@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
@@ -302,4 +302,3 @@ def test_tensor_serialize_into_edge_shapes():
         assert decoded.dtype == tensor.dtype
         assert decoded.shape == tensor.shape
         assert torch.equal(decoded, tensor)
-
