@@ -614,8 +614,21 @@ class PixelUMMDecoder(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         parameters = dict(self.named_parameters())
+        # A stacked parameter is complete only once every checkpoint shard has loaded,
+        # so completeness is checked by checkpoint name.
+        expected = set()
+        for name in parameters:
+            stacked = False
+            for parameter_name, checkpoint_name, _ in stacked_params_mapping:
+                if parameter_name in name:
+                    expected.add(name.replace(parameter_name, checkpoint_name))
+                    stacked = True
+            if not stacked:
+                expected.add(name)
         loaded = set()
-        for name, tensor in weights:
+        loaded_checkpoint = set()
+        for checkpoint_key, tensor in weights:
+            name = checkpoint_key
             for parameter_name, checkpoint_name, shard_id in stacked_params_mapping:
                 if checkpoint_name not in name:
                     continue
@@ -628,7 +641,8 @@ class PixelUMMDecoder(nn.Module):
                 weight_loader = getattr(parameter, "weight_loader", default_weight_loader)
                 weight_loader(parameter, tensor)
             loaded.add(name)
-        missing = parameters.keys() - loaded
+            loaded_checkpoint.add(checkpoint_key)
+        missing = expected - loaded_checkpoint
         if missing:
             raise ValueError(f"PixelUMM decoder checkpoint is missing {len(missing)} tensors: {sorted(missing)[:10]}")
         return loaded

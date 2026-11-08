@@ -17,6 +17,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import decoder as d
 from vllm_omni.diffusion.models.hy_nomas import decoder_attention as a
 from vllm_omni.diffusion.models.hy_nomas import decoder_kernels as k
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
@@ -96,7 +97,7 @@ def test_decoder_split_qk_norm_rope_exact(tier, batch, heads, dim, dtype, stacke
 def _free_gib():
     if not torch.cuda.is_available():
         return 0
-    return torch.cuda.mem_get_info()[0] / 2**30
+    return current_omni_platform.get_device_memory()[0] / 2**30
 
 
 @requires_cuda

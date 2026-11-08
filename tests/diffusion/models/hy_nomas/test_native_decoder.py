@@ -273,6 +273,11 @@ def test_native_load_weights_stacks_qkv_and_mlp_projections():
     del checkpoint["decoder.head.norm.weight"]
     with pytest.raises(ValueError, match="missing 1 tensors"):
         tiny_decoder().load_weights(checkpoint.items())
+    # One missing shard leaves its stacked parameter partly uninitialized.
+    del checkpoint[f"{prefix}.attn.k_proj.weight"]
+    del checkpoint[f"{prefix}.mlp.up_proj.weight"]
+    with pytest.raises(ValueError, match="missing 3 tensors.*k_proj"):
+        tiny_decoder().load_weights(checkpoint.items())
 
 
 @torch.inference_mode()
