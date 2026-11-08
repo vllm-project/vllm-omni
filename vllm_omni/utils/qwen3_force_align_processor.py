@@ -65,18 +65,18 @@ _LANG_ALIASES = {
 
 
 def build_prompt(words: list[str]) -> str:
-    """Wrap segmented words in the Qwen3 aligner prompt template.
+    """Build the Qwen3 aligner prompt exactly as qwen_asr's
+    ``Qwen3ForceAlignProcessor.encode_timestamp`` does: the audio placeholder
+    followed by the words, each with two trailing ``<timestamp>`` markers
+    (start + end) that the model classifies into audio time bins.
 
-    Each word gets two trailing ``<timestamp>`` markers (start + end); the
-    model classifies each marker into an audio time bin.
+    No chat template. The official aligner feeds this string straight to the
+    tokenizer; wrapping it in ``<|im_start|>user ... <|im_start|>assistant``
+    puts three tokens in front of the audio and shifts almost every predicted
+    marker one 80 ms bin later than the official output.
     """
-    if not words:
-        # Pad with one timestamp so the decoder always has something to
-        # read; an empty result still surfaces as "[]" upstream.
-        body = TIMESTAMP_TOKEN
-    else:
-        body = f"{TIMESTAMP_TOKEN}{TIMESTAMP_TOKEN}".join(words) + f"{TIMESTAMP_TOKEN}{TIMESTAMP_TOKEN}"
-    return f"<|im_start|>user\n{AUDIO_PLACEHOLDER}{body}<|im_end|>\n<|im_start|>assistant\n"
+    body = f"{TIMESTAMP_TOKEN}{TIMESTAMP_TOKEN}".join(words) + f"{TIMESTAMP_TOKEN}{TIMESTAMP_TOKEN}"
+    return f"{AUDIO_PLACEHOLDER}{body}"
 
 
 # --- word segmentation (port of Qwen3ForceAlignProcessor) ----------------

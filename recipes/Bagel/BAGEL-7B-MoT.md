@@ -120,12 +120,19 @@ python examples/offline_inference/image_to_image/image_edit.py \
 The `--extra-args` JSON forwards BAGEL-specific parameters (e.g. `cfg_text_scale`,
 `cfg_img_scale`, `cfg_interval`, `cfg_renorm_type`) into
 `OmniDiffusionSamplingParams.extra_args` via the model-extras registry.
-For BAGEL img2img, the pipeline derives the generated image size from the input
-image: it preserves the input aspect ratio, aligns dimensions to the latent
-stride, and applies the checkpoint size limit. Explicit `--height` and
-`--width` values do not override that BAGEL-specific resize policy. Step-mode
-admission resolves this effective size before batching so differently shaped
-requests are scheduled separately.
+For BAGEL img2img, an explicit `--height`/`--width` (or `size` on
+`/v1/images/edits`) sets the output canvas, in both the single-stage and the
+two-stage deployment; the input image is still resized to a stride-aligned size
+for the VAE/ViT prefill. The latent grid needs multiples of 16, so a requested
+side that is not one is floored to the next multiple (1000x700 generates
+992x688) with a server-side warning, and the response reports the generated
+size. A side above the checkpoint limit is rejected with HTTP 400. When no size
+is requested
+(`size=auto`, or no `height`/`width`), the pipeline derives the canvas from the
+input image: it preserves the input aspect ratio, aligns dimensions to the
+latent stride, and applies the checkpoint size limit. Step-mode admission
+resolves this effective size before batching so differently shaped requests are
+scheduled separately.
 
 Run text-to-text with the shared understanding example. BAGEL's default
 `bagel.yaml` deploy config is discovered from the checkpoint, so no model-specific

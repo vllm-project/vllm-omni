@@ -79,6 +79,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 classifier-free guidance; the default `4.0` applies guidance twice and produces a
 blown-out, posterised image.
 
+Online FP8 does not support the 8-step distilled LoRA.
+Use BF16 without `--quantization fp8` for this LoRA.
+
 ##### Online serving
 
 ```bash
@@ -90,7 +93,39 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 `-s` takes the base URL; the client appends `/v1` itself.
 
-#### Measured latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
+##### Online FP8 quantization
+
+`--quantization fp8` quantizes only eligible attention and MLP linears in the
+`language_model` understanding and generation branches at load time. Other layers
+retain their existing precision.
+
+On the tested A800 (SM80) setup with vLLM 0.29.0,
+`VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel` is **required** for online
+FP8 to start successfully. Without it, the selected CUTLASS kernel fails during
+the startup dummy run with `RuntimeError: cutlass_scaled_mm_sm80_epilogue`.
+Disabling this kernel selects Marlin W8A16 (FP8 weights with BF16 activations).
+
+```bash
+VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
+vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni \
+    --quantization fp8 --port 8091
+```
+
+#### Measured BF16 vs FP8 performance (1x A800 80GB, 28 steps, P95 over 10 prompts)
+
+vLLM 0.29.0, BF16 base dtype, seed 42, TORCH_SDPA, eager execution, TP=1, batch size 1,
+paged decode off, no LoRA. Each resolution uses the same 10 prompts for BF16 and FP8.
+Both runs set `VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel`.
+
+| Resolution | Peak reserved memory (BF16 → FP8) | Step latency (BF16 → FP8) |
+| --- | --- | --- |
+| 512x512 | 33.166 → 18.697 GiB | 63.674 → 81.136 ms |
+| 1024x1024 | 33.555 → 18.561 GiB | 187.867 → 229.115 ms |
+
+Step latency is the P95 of per-request mean step times, excluding warmup requests; FP8 reduced
+memory usage but increased step latency.
+
+#### Measured BF16 latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
 
 | Resolution | Step latency | Total |
 | --- | --- | --- |

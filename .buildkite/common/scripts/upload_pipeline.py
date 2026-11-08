@@ -10,10 +10,20 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
-Test pipeline mode (e.g. test-merge.yml):
-  - Drop steps whose ``source_file_dependencies`` do not match changed files.
+Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
+  - Drop steps whose ``source_file_dependencies`` do not match changed files
+    (string/list keys from ci_source_file_dependencies.yml, or inline path
+    prefixes). Filtering applies on **PR label** uploads and on post-merge
+    release-line L3 uploads (``main`` or a ``release/vX.Y.Z`` branch). Scheduled
+    release-line uploads that pass ``--all`` (NIGHTLY/WEEKLY) or ``--e2e``
+    keep every selected job and still strip
+    the field. A diff limited to the pipeline YAML being uploaded or to paths
+    under ``source_filter_fallback`` keeps every job, even if a job lists a
+    shared path. For mixed diffs, narrow coverage only when a non-fallback file
+    matches a job-key prefix; unrelated files must not reduce fallback coverage.
+    List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -53,10 +63,28 @@ except ModuleNotFoundError:
     )
     import yaml
 
-from skip_ci import (
+from ci_conditions import (
+    BOOTSTRAP_DISABLED_IF,
+    BOOTSTRAP_ENABLED_IF,
+    BOOTSTRAP_IMAGE_BUILD_KEYS,
+    BOOTSTRAP_STEPS_FILENAME,
+    BOOTSTRAP_UPLOAD_IF_KEYS,
+    CI_MIRROR_HARDWARES_PATH,
+    CI_SOURCE_FILE_DEPENDENCIES_PATH,
+    CUDA_HF_TOKEN_EXPORT,
+    E2E_GROUP_MARKER,
+    MERGE_UPLOAD_IF,
+    NIGHTLY_LABEL_IF,
+    NIGHTLY_MAIN_IF,
+    READY_LABEL_IF,
+    READY_UPLOAD_IF,
     ROOT,
-    resolve_ci_context_from_git,
+    SOURCE_FILTER_FALLBACK_KEY,
+    WEEKLY_E2E_IF,
+    WEEKLY_LABEL_IF,
+    WEEKLY_MAIN_IF,
 )
+from skip_ci import resolve_ci_context_from_git
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -69,45 +97,7 @@ from tests.helpers.mark import (  # noqa: E402
 # --- Constants ---
 
 LOG = "upload_pipeline"
-BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
-BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
-BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-ready-pipeline": "ready",
-    "upload-merge-pipeline": "merge",
-    "upload-nightly-pipeline": "nightly",
-    "upload-weekly-pipeline": "weekly",
-}
-E2E_GROUP_MARKER = "E2E Test"
-CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
-
-# Bootstrap Buildkite ``if`` expressions.
-# ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
-# ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
-NIGHTLY_LABEL_IF = (
-    f"({NIGHTLY_MAIN_IF}) || "
-    '(build.branch != "main" && ('
-    'build.pull_request.labels includes "nightly-test" || '
-    'build.pull_request.labels includes "omni-test" || '
-    'build.pull_request.labels includes "tts-test" || '
-    'build.pull_request.labels includes "diffusion-x2iat-test" || '
-    'build.pull_request.labels includes "diffusion-x2v-test"'
-    "))"
-)
-WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
-WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
-WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-MERGE_MAIN_IF = (
-    'build.branch == "main" && build.env("NIGHTLY") != "1" && '
-    'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
-)
-READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
-MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
-BOOTSTRAP_DISABLED_IF = "false"
-BOOTSTRAP_ENABLED_IF = "true"
-
+CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
 
 # --- Logging ---
 
@@ -235,10 +225,10 @@ def _render_bootstrap_pipeline(
     platform = _get_bootstrap_platform(path)
     if_exprs = _compute_bootstrap_if_exprs(decision=decision, platform=platform)
     doc["steps"] = _apply_bootstrap_if(steps, if_exprs)
-    return yaml.safe_dump(doc, sort_keys=False)
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
-# --- Test pipeline (test-ready.yml, test-merge.yml) ---
+# --- Test pipeline (test-ready.yml, test-merge.yml, test-nightly.yml) ---
 
 
 @lru_cache(maxsize=1)
@@ -255,6 +245,117 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
+def _load_source_file_dependencies() -> dict[str, list[str]]:
+    def flatten(value: Any, *, key: str) -> list[str]:
+        """Flatten YAML-anchor nested lists into a de-duplicated prefix list."""
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError(f"empty path in source_file_dependencies[{key!r}]")
+            return [value]
+        if isinstance(value, list):
+            flattened: list[str] = []
+            seen: set[str] = set()
+            for item in value:
+                for path in flatten(item, key=key):
+                    if path not in seen:
+                        seen.add(path)
+                        flattened.append(path)
+            return flattened
+        raise ValueError(
+            f"source_file_dependencies[{key!r}] must be a list of path prefixes, got {type(value).__name__}",
+        )
+
+    if not CI_SOURCE_FILE_DEPENDENCIES_PATH.is_file():
+        raise FileNotFoundError(
+            f"missing CI source_file_dependencies registry: {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+        )
+    doc = yaml.safe_load(CI_SOURCE_FILE_DEPENDENCIES_PATH.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"invalid CI source_file_dependencies registry: {CI_SOURCE_FILE_DEPENDENCIES_PATH}")
+    presets = doc.get("source_file_dependencies")
+    if not isinstance(presets, dict):
+        raise ValueError(f"source_file_dependencies must be a mapping in {CI_SOURCE_FILE_DEPENDENCIES_PATH}")
+    loaded: dict[str, list[str]] = {}
+    for key, value in presets.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(
+                f"source_file_dependencies keys must be non-empty strings in {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+            )
+        loaded[key] = flatten(value, key=key)
+    return loaded
+
+
+_REGISTRY_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _parse_command_text(step: dict[str, Any]) -> str:
+    """Parse step ``commands`` / ``command`` into a single string."""
+    raw = step.get("commands", step.get("command"))
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return "\n".join(str(item) for item in raw if item is not None)
+    return str(raw)
+
+
+def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
+    """Expand a registry key (or list of keys / inline path prefixes)."""
+    deps = step.get("source_file_dependencies")
+    if deps is None:
+        return None
+
+    def dedupe(*groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for path in group:
+                if path not in seen:
+                    seen.add(path)
+                    merged.append(path)
+        return merged
+
+    def lookup(key: str) -> list[str]:
+        if key == SOURCE_FILTER_FALLBACK_KEY:
+            raise ValueError(
+                f"source_file_dependencies {key!r} bypasses filtering and cannot be attached to a step "
+                f"({_get_step_label(step)!r})",
+            )
+        registry = _load_source_file_dependencies()
+        paths = registry.get(key)
+        if paths is None:
+            known = ", ".join(sorted(registry))
+            raise ValueError(
+                f"unknown source_file_dependencies {key!r} in step {_get_step_label(step)!r}; known: {known}",
+            )
+        return list(paths)
+
+    prefixes: list[str]
+    if isinstance(deps, str):
+        prefixes = lookup(deps) if _REGISTRY_KEY_RE.fullmatch(deps) else [deps]
+    elif isinstance(deps, list):
+        if not all(isinstance(item, str) for item in deps):
+            raise ValueError(
+                f"source_file_dependencies must be a string key or list of strings in step {_get_step_label(step)!r}",
+            )
+        keyish = [bool(_REGISTRY_KEY_RE.fullmatch(item)) for item in deps]
+        if deps and all(keyish):
+            prefixes = dedupe(*(lookup(key) for key in deps))
+        elif any(keyish):
+            raise ValueError(
+                f"source_file_dependencies in step {_get_step_label(step)!r} mixes registry keys and path prefixes",
+            )
+        else:
+            prefixes = list(deps)
+    else:
+        raise ValueError(
+            f"source_file_dependencies must be a string key or list in step {_get_step_label(step)!r}",
+        )
+    return prefixes
+
+
+@lru_cache(maxsize=1)
 def _cuda_mirror_chips() -> tuple[str, ...]:
     """Lowercase CUDA SKUs that have at least one ``{chip}_{n}`` preset.
 
@@ -268,7 +369,7 @@ def _cuda_mirror_chips() -> tuple[str, ...]:
     return tuple(sorted(chips, key=lambda chip: (-len(chip), chip)))
 
 
-def _read_cards_marks(expr: str) -> tuple[set[int], bool]:
+def _parse_cards_marks(expr: str) -> tuple[set[int], bool]:
     """Parse registered ``cards_n`` / ``not cards_n`` from a pytest ``-m`` expr.
 
     Returns positive card counts and whether any ``not cards_*`` is present.
@@ -285,8 +386,8 @@ def _read_cards_marks(expr: str) -> tuple[set[int], bool]:
     return positives, has_not_cards
 
 
-def _read_hardware_marks(expr: str) -> set[str]:
-    """Return lowercase positive CUDA SKUs that have a mirror preset.
+def _parse_hardware_marks(expr: str) -> set[str]:
+    """Parse lowercase positive CUDA SKUs that have a mirror preset.
 
     ``not H100`` is ignored. SKUs with no ``{chip}_*`` preset (e.g. H200) are dropped.
     """
@@ -328,36 +429,22 @@ def _get_mirror_hw_selector() -> str:
     return selector
 
 
-def _read_pytest_marks(commands: Any) -> tuple[set[str], int | Literal["max"] | None]:
-    """Read pytest ``-m`` from step commands: CUDA SKU chips and cards count.
+def _parse_pytest_marks(step: dict[str, Any]) -> tuple[set[str], int | Literal["max"] | None]:
+    """Parse pytest ``-m`` from step commands: CUDA SKU chips and cards count.
 
     *chips* are lowercase SKUs from positive markers (``not H100`` is ignored).
     *cards* is the max positive ``cards_n``, ``"max"`` when only ``not cards_*``
     is present, or ``None``.
     """
-    chunks: list[str] = []
-
-    def _collect(value: Any) -> None:
-        if value is None:
-            return
-        if isinstance(value, str):
-            chunks.append(value)
-        elif isinstance(value, list):
-            for part in value:
-                _collect(part)
-        else:
-            chunks.append(str(value))
-
-    _collect(commands)
-    text = "\n".join(chunks)
+    text = _parse_command_text(step)
 
     chips: set[str] = set()
     positives: set[int] = set()
     has_not_cards = False
     for match in _PYTEST_MARKER_ARG.finditer(text):
         expr = match.group(1) or match.group(2) or match.group(3) or ""
-        chips |= _read_hardware_marks(expr)
-        card_counts, not_cards = _read_cards_marks(expr)
+        chips |= _parse_hardware_marks(expr)
+        card_counts, not_cards = _parse_cards_marks(expr)
         positives.update(card_counts)
         has_not_cards = has_not_cards or not_cards
 
@@ -474,7 +561,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
     if "mirror_hardwares" not in step:
         if has_pool:
             return step
-        chips, cards = _read_pytest_marks(step.get("commands"))
+        chips, cards = _parse_pytest_marks(step)
         if not chips and cards is None:
             return step
         preset_name = _compose_mirror_hardware_name(chips, cards, step_label=step_label)
@@ -501,7 +588,19 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
 
     expanded = copy.deepcopy(preset)
     merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
-    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    # A scheduled build's HF_TOKEN may override a pod env entry with the same
+    # name. The preset injects the Kubernetes secret under a collision-proof
+    # alias; restore the conventional name after Buildkite has merged env.
+    if any(preset_name == chip or preset_name.startswith(f"{chip}_") for chip in _cuda_mirror_chips()):
+        commands = merged.get("commands")
+        if isinstance(commands, list):
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, *commands]
+        elif commands is None:
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
+        else:
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged
@@ -523,6 +622,8 @@ def _get_step_label(step: dict[str, Any]) -> str:
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
+    *,
+    expand_mirror_hardwares: bool = True,
 ) -> list[Any]:
     """Drop steps by ``source_file_dependencies`` when *changed_files* is set; always strip that field."""
     processed: list[Any] = []
@@ -531,18 +632,18 @@ def _process_test_steps(
             processed.append(step)
             continue
 
-        deps = step.get("source_file_dependencies")
-        if deps is not None and not isinstance(deps, list):
-            raise ValueError(
-                f"source_file_dependencies must be a list in step {_get_step_label(step)!r}",
-            )
+        deps = _resolve_source_file_dependencies(step)
         if changed_files is not None and deps is not None and not _match_source_file(changed_files, deps):
             _log(f"skip {_get_step_label(step)!r} (no changes under {deps})")
             continue
 
         nested = step.get("steps")
         if nested is not None:
-            kept_nested = _process_test_steps(nested, changed_files)
+            kept_nested = _process_test_steps(
+                nested,
+                changed_files,
+                expand_mirror_hardwares=expand_mirror_hardwares,
+            )
             if not kept_nested:
                 _log(f"omit empty group {_get_step_label(step)!r}")
                 continue
@@ -552,6 +653,9 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
+        if not expand_mirror_hardwares:
+            processed.append(leaf)
+            continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
@@ -574,10 +678,25 @@ def _select_e2e_group_steps(steps: list[Any]) -> list[Any]:
     return selected
 
 
+def _any_source_dependency_match(steps: list[Any], changed_files: list[str]) -> bool:
+    """True when any step with ``source_file_dependencies`` matches *changed_files*."""
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        deps = _resolve_source_file_dependencies(step)
+        if deps is not None and _match_source_file(changed_files, deps):
+            return True
+        nested = step.get("steps")
+        if isinstance(nested, list) and _any_source_dependency_match(nested, changed_files):
+            return True
+    return False
+
+
 def _render_test_pipeline(
     doc: dict[str, Any],
     changed_files: list[str] | None,
     *,
+    pipeline_path: Path | None = None,
     e2e_only: bool = False,
 ) -> dict[str, Any]:
     """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata."""
@@ -590,11 +709,134 @@ def _render_test_pipeline(
         return doc
     if e2e_only:
         steps = _select_e2e_group_steps(steps)
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+    )
     steps = _process_test_steps(steps, changed_files)
     return {**doc, "steps": steps}
 
 
 # --- Entry (read file → bootstrap or test render → YAML string) ---
+
+
+def _repo_relative_posix(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix().replace("\\", "/")
+
+
+def _source_filter_fallback_prefixes() -> list[str]:
+    """Shared uploader/registry prefixes from ``source_filter_fallback``. Not a job key."""
+    registry = _load_source_file_dependencies()
+    prefixes = registry.get(SOURCE_FILTER_FALLBACK_KEY)
+    if not prefixes:
+        raise ValueError(
+            f"source_file_dependencies[{SOURCE_FILTER_FALLBACK_KEY!r}] must list shared uploader paths "
+            f"in {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+        )
+    return prefixes
+
+
+def _source_filter_fallback_reason(
+    changed_files: list[str] | None,
+    pipeline_path: Path,
+    *,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> str | None:
+    """Return the changed path that should disable source filtering, if any."""
+    if not changed_files:
+        return None
+    changed = set(changed_files)
+    pipeline_rel = _repo_relative_posix(pipeline_path)
+    if pipeline_rel in changed:
+        return pipeline_rel
+    prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
+    for path in changed_files:
+        if _match_source_file([path], prefixes):
+            return path
+    return None
+
+
+def _apply_source_filter_fallback(
+    steps: list[Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> list[str] | None:
+    """Keep all jobs for routing-only diffs unless another changed path selects a job."""
+    if changed_files is None or pipeline_path is None:
+        return changed_files
+
+    bypass = _source_filter_fallback_reason(
+        changed_files,
+        pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    if bypass is None:
+        return changed_files
+
+    pipeline_rel = _repo_relative_posix(pipeline_path)
+    fallback_prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
+    non_fallback_files = [
+        path for path in changed_files if path != pipeline_rel and not _match_source_file([path], fallback_prefixes)
+    ]
+    if _any_source_dependency_match(steps, non_fallback_files):
+        return changed_files
+
+    _log(f"keep all jobs (no non-fallback source_file_dependencies match; bypassed by {bypass})")
+    return None
+
+
+def filter_pipeline_by_source_dependencies(
+    doc: dict[str, Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None = None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Filter and strip source dependency metadata without expanding hardware presets."""
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        return doc
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    return {
+        **doc,
+        "steps": _process_test_steps(
+            steps,
+            changed_files,
+            expand_mirror_hardwares=False,
+        ),
+    }
+
+
+def _changed_files_for_source_filter(
+    ctx,
+    *,
+    force_all: bool,
+    e2e_only: bool,
+) -> list[str] | None:
+    """Return the diff to filter against, or None to keep every step.
+
+    ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
+    uploads and weekly E2E sweeps). Post-merge release-line L3 (``main`` or
+    ``release/vX.Y.Z``) and PR-label uploads filter against the commit/PR diff. Pipeline YAML /
+    ``source_filter_fallback`` matches are applied later in
+    ``_render_test_pipeline`` when no non-fallback file matches a job-key prefix.
+    Otherwise, normal filtering uses all changed files, including shared helpers.
+    """
+    if force_all or e2e_only:
+        return None
+    return ctx.changed_files
 
 
 def _render_pipeline(
@@ -614,14 +856,19 @@ def _render_pipeline(
 
     text = path.read_text(encoding="utf-8")
     ctx = resolve_ci_context_from_git()
-    changed_files = None if force_all or e2e_only else ctx.changed_files
+    changed_files = _changed_files_for_source_filter(ctx, force_all=force_all, e2e_only=e2e_only)
 
     doc = yaml.safe_load(text)
     if not isinstance(doc, dict):
         raise ValueError(f"invalid pipeline YAML: {path}")
 
-    doc = _render_test_pipeline(doc, changed_files, e2e_only=e2e_only)
-    return yaml.safe_dump(doc, sort_keys=False)
+    doc = _render_test_pipeline(
+        doc,
+        changed_files,
+        pipeline_path=path,
+        e2e_only=e2e_only,
+    )
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
 def _upload_to_buildkite(content: str) -> None:

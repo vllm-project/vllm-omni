@@ -23,9 +23,9 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _png_bytes() -> bytes:
+def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     buffer = BytesIO()
-    Image.new("RGB", (2, 1), color=(12, 34, 56)).save(buffer, format="PNG")
+    Image.new("RGB", size, color=(12, 34, 56)).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -120,6 +120,52 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
     assert image.size == (2, 1)
     assert image.mode == "RGB"
+
+
+def test_decode_image_bytes_rejects_image_over_pixel_limit_before_conversion(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    def _unexpected_convert(*args, **kwargs):
+        pytest.fail("over-limit images must be rejected before conversion")
+
+    monkeypatch.setattr(Image.Image, "convert", _unexpected_convert)
+
+    with pytest.raises(
+        InvalidInputReferenceError,
+        match=r"Image dimensions 20x20 \(400 pixels\) exceed the maximum of 100 pixels",
+    ):
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+
+def test_decode_image_bytes_maps_pillow_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="decoder pixel limit") as exc_info:
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
+
+
+@pytest.mark.parametrize("max_pixels", [0, 400])
+def test_decode_image_bytes_allows_disabled_or_inclusive_pixel_limit(monkeypatch, max_pixels):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", max_pixels)
+
+    image = video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert image.size == (20, 20)
+    assert image.mode == "RGB"
+
+
+@pytest.mark.asyncio
+async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="VLLM_MAX_IMAGE_PIXELS"):
+        await video_api_utils.decode_input_reference(
+            image_reference=None,
+            video_reference=None,
+            input_reference_bytes=_png_bytes((20, 20)),
+        )
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
@@ -903,48 +949,23 @@ def test_mux_closes_container_and_preserves_generator_error(monkeypatch):
     assert container.closed
 
 
-def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
-    muxers = []
-
-    class FakeFragmentedMP4Muxer:
-        def __init__(self, *, width, height, fps, video_codec_options=None):
-            self.calls = []
-            muxers.append(
-                {
-                    "width": width,
-                    "height": height,
-                    "fps": fps,
-                    "video_codec_options": video_codec_options,
-                    "instance": self,
-                }
-            )
-
-        def mux_video_frames(self, frames):
-            self.calls.append(frames)
-            return f"fragment-{len(self.calls)}".encode()
-
-        def close(self):
-            return b"trailer"
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.FragmentedMP4Muxer",
-        FakeFragmentedMP4Muxer,
-    )
-
+def test_fragmented_mp4_video_encoder_reuses_single_muxer():
     encoder = video_api_utils.FragmentedMP4VideoEncoder(
         fps=12,
         video_codec_options={"preset": "ultrafast"},
     )
-    assert encoder.encode([np.zeros((4, 6, 3), dtype=np.float32)]) == b"fragment-1"
-    assert encoder.encode([np.ones((4, 6, 3), dtype=np.float32)]) == b"fragment-2"
-    assert encoder.close() == b"trailer"
-
-    assert len(muxers) == 1
-    assert muxers[0]["width"] == 6
-    assert muxers[0]["height"] == 4
-    assert muxers[0]["fps"] == 12.0
-    assert muxers[0]["video_codec_options"] == {"preset": "ultrafast"}
-    assert len(muxers[0]["instance"].calls) == 2
+    streamed = encoder.encode([np.zeros((4, 6, 3), dtype=np.float32)])
+    muxer = encoder._muxer
+    streamed += encoder.encode([np.ones((4, 6, 3), dtype=np.float32)])
+    assert encoder._muxer is muxer
+    streamed += encoder.close()
+    with av.open(BytesIO(streamed)) as container:
+        stream = container.streams.video[0]
+        assert (stream.width, stream.height) == (6, 4)
+        assert float(stream.average_rate) == 12.0
+        decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(decoded) == 2
+    assert decoded[0].mean() < decoded[1].mean()
 
 
 def test_create_streaming_video_encoder_selects_requested_format():

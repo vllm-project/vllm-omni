@@ -63,7 +63,15 @@ def test_gate_passes_on_current_tree():
     assert main([]) == 0
 
 
-def test_budgets_are_the_real_counts():
+def test_budgets_are_not_exceeded():
+    """Budgets are a ceiling, not a target.
+
+    This used to assert equality, which re-imposed through pytest exactly what
+    #6008 removed from the checker: a PR that deleted branches failed CI unless
+    it also hand-edited the constant. That is what broke `main` for 5h19m in
+    #5746. The checker reports an under-budget count as a passing notice
+    (check_tts_adapter.py:140); the test must agree.
+    """
     root = Path(__file__).resolve().parents[2]
     serving = root / "vllm_omni" / "entrypoints" / "openai" / "serving_speech.py"
-    assert len(_model_type_branches(ast.parse(serving.read_text()))) == MAX_MODEL_TYPE_BRANCHES
+    assert len(_model_type_branches(ast.parse(serving.read_text()))) <= MAX_MODEL_TYPE_BRANCHES

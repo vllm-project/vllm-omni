@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-import os
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -22,14 +21,19 @@ def _init_distributed(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29501")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+    )
+    try:
+        initialize_model_parallel()
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
 
 
 _TINY_CONFIG = {

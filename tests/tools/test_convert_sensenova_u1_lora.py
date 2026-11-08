@@ -33,10 +33,11 @@ def _write_source(path, tensors: dict[str, torch.Tensor] | None = None) -> dict[
     return tensors
 
 
-def test_convert_sensenova_lora_writes_peft_adapter(tmp_path):
+@pytest.mark.parametrize("alpha", [1, 2, 4])
+def test_convert_sensenova_lora_writes_peft_adapter(tmp_path, alpha):
     source_path = tmp_path / "official.safetensors"
     output_dir = tmp_path / "peft"
-    source_tensors = _write_source(source_path)
+    source_tensors = _write_source(source_path, _source_tensors(alpha=alpha))
 
     convert_sensenova_lora(source_path, output_dir)
 
@@ -59,7 +60,7 @@ def test_convert_sensenova_lora_writes_peft_adapter(tmp_path):
     config = json.loads((output_dir / "adapter_config.json").read_text(encoding="utf-8"))
     assert config == {
         "bias": "none",
-        "lora_alpha": 2,
+        "lora_alpha": alpha,
         "peft_type": "LORA",
         "r": 2,
         "target_modules": [

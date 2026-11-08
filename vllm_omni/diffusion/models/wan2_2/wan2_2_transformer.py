@@ -16,10 +16,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -29,7 +31,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
@@ -45,6 +47,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
 
@@ -416,6 +419,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            qkv_layout="BSND",
             prefix=prefix,
         )
 
@@ -605,11 +609,13 @@ class WanCrossAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="cross",
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,
-            # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
-            # FP8 quant offers no perf win and degrades quality. Opt out until a
+            # Wan2.2 cross-attn operates on short text-encoder sequences; runtime
+            # Q/K/V quantization offers no perf win and degrades quality. Opt out until a
             # dedicated quant backend handles this case.
             disable_kv_quant=True,
         )
@@ -763,7 +769,15 @@ class WanTransformerBlock(nn.Module):
             self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
         if preserve_vsa_all_blocks:
             self_attn_extra["preserve_vsa_all_blocks"] = True
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask, extra=self_attn_extra)
+        video_layout = None
+        if vsa_dit_seq_shape is not None:
+            grid = tuple(int(dim) for dim in vsa_dit_seq_shape)
+            # Publish geometry independently of backend selection. Do not add
+            # partial cu_seqlens/max_seqlen metadata to dense CUDA attention.
+            video_layout = VideoTokenLayout(prefix_len=0, latent_grid=grid, used_len=math.prod(grid))
+        self_attn_metadata = AttentionMetadata(
+            attn_mask=hidden_states_mask, extra=self_attn_extra, video_layout=video_layout
+        )
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
@@ -888,6 +902,8 @@ class WanTransformer3DModel(nn.Module):
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_pp_rank: int | None = None,
+        layer_pp_world: int | None = None,
     ):
         super().__init__()
         # Store config for compatibility
@@ -916,15 +932,31 @@ class WanTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        if get_pipeline_parallel_world_size() == 0 and not is_pipeline_first_stage():
-            raise RuntimeError(
-                "`initialize_model_parallel()` must be called before constructing `WanTransformer3DModel`"
-            )
+        # Optional Cell / Noisy KV layer split by (rank, world) without mocking
+        # Omni's S·G process group. When unset, use the live pipeline-parallel group.
+        if layer_pp_world is not None:
+            if layer_pp_world < 1:
+                raise ValueError(f"layer_pp_world must be positive, got {layer_pp_world}")
+            pp_rank = 0 if layer_pp_rank is None else int(layer_pp_rank)
+            if not 0 <= pp_rank < layer_pp_world:
+                raise ValueError(f"layer_pp_rank {pp_rank} out of range for world {layer_pp_world}")
+            pp_world = int(layer_pp_world)
+            is_first = pp_rank == 0
+            is_last = pp_rank == pp_world - 1
+        else:
+            if get_pipeline_parallel_world_size() == 0 and not is_pipeline_first_stage():
+                raise RuntimeError(
+                    "`initialize_model_parallel()` must be called before constructing `WanTransformer3DModel`"
+                )
+            pp_rank = None
+            pp_world = None
+            is_first = is_pipeline_first_stage()
+            is_last = is_pipeline_last_stage()
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
-        if is_pipeline_first_stage():
+        if is_first:
             self.patch_embedding = Conv3dLayer(
                 in_channels=in_channels,
                 out_channels=inner_dim,
@@ -947,12 +979,15 @@ class WanTransformer3DModel(nn.Module):
         # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
         self.preserve_vsa_all_blocks = False
 
-        # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
-        # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
-        # with PPMissingLayer so that weight names stay globally consistent.
-        self.start_layer, self.end_layer, self.blocks = make_layers(
-            num_layers,
-            lambda prefix: WanTransformerBlock(
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
+
+        # 3. Transformer blocks — partitioned across PP stages.
+        def _make_block(prefix: str) -> WanTransformerBlock:
+            return WanTransformerBlock(
                 inner_dim,
                 ffn_dim,
                 num_attention_heads,
@@ -961,12 +996,30 @@ class WanTransformer3DModel(nn.Module):
                 cross_attn_norm,
                 quant_config=quant_config,
                 prefix=prefix,
-            ),
-            prefix="blocks",
-        )
+            )
+
+        if pp_world is not None:
+            # Explicit (rank, world) slice — used by Cell / Noisy KV layer groups.
+            start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_world)
+            blocks: list[nn.Module] = []
+            for idx in range(num_layers):
+                if start_layer <= idx < end_layer:
+                    blocks.append(_make_block(f"blocks.{idx}"))
+                else:
+                    blocks.append(PPMissingLayer())
+            self.start_layer = start_layer
+            self.end_layer = end_layer
+            self.blocks = nn.ModuleList(blocks)
+        else:
+            # Production Omni PP: make_layers follows the live PP group.
+            self.start_layer, self.end_layer, self.blocks = make_layers(
+                num_layers,
+                _make_block,
+                prefix="blocks",
+            )
 
         # 4. Output norm & projection — only on the last PP stage
-        if is_pipeline_last_stage():
+        if is_last:
             self.norm_out = AdaLayerNorm(inner_dim, elementwise_affine=False, eps=eps)
             self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         else:
@@ -975,7 +1028,7 @@ class WanTransformer3DModel(nn.Module):
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
         self._sp_shard_point = nn.Identity()
-        if is_pipeline_last_stage():
+        if is_last:
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
             self.output_scale_shift_prepare = PPMissingLayer()
@@ -985,6 +1038,68 @@ class WanTransformer3DModel(nn.Module):
         # ROPE helper
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
+        self._validate_w4a8_fallback_layers(quant_config)
+
+    def _validate_w4a8_fallback_layers(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject checkpoint aliases/typos before loading weights or running inference."""
+        requested = tuple(getattr(quant_config, "w4a8_fallback_layers", []))
+        self._w4a8_fallback_layers = requested
+        self._local_w4a8_fallback_layers: tuple[str, ...] = ()
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        missing_pp_prefixes = [name for name, module in modules.items() if isinstance(module, PPMissingLayer)]
+        local_layers = [
+            name for name in requested if not any(name.startswith(prefix + ".") for prefix in missing_pp_prefixes)
+        ]
+        self._local_w4a8_fallback_layers = tuple(local_layers)
+        invalid = [name for name in local_layers if not isinstance(modules.get(name), LinearBase)]
+        if invalid:
+            raise ValueError(
+                "w4a8_fallback_layers requires exact runtime Linear paths relative to each Wan transformer; "
+                f"unknown/non-Linear paths: {invalid}. Use attn1.to_qkv for fused self-attention, "
+                "not checkpoint attn1.to_q/to_k/to_v names."
+            )
+
+    def _log_w4a8_fallback_load_summary(self, component_name: str) -> None:
+        """Log post-load transforms/cache readiness, not numerical acceptance."""
+        requested = self._w4a8_fallback_layers
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        local_layers = self._local_w4a8_fallback_layers
+        selected_layers = [
+            name for name in local_layers if getattr(modules[name].quant_method, "is_w4a8_fallback_layer", False)
+        ]
+        bf16_overrides = [name for name in local_layers if name not in selected_layers]
+        processed = [
+            name
+            for name in selected_layers
+            if getattr(modules[name], "_already_called_process_weights_after_loading", False)
+        ]
+        if not selected_layers:
+            processing_state = "not-required"
+        elif len(processed) == len(selected_layers):
+            processing_state = "ready"
+        else:
+            processing_state = "not-ready"
+
+        def qualified(names: Iterable[str]) -> list[str]:
+            return [f"{component_name}.{name}" for name in names]
+
+        logger.info(
+            "Wan W4A8 post-load summary: component=%s; selected=%d %s; BF16 overrides=%d %s; "
+            "weight/A8 processing state=%s (%d/%d selected layers processed); other PP ranks=%d",
+            component_name,
+            len(selected_layers),
+            qualified(selected_layers),
+            len(bf16_overrides),
+            qualified(bf16_overrides),
+            processing_state,
+            len(processed),
+            len(selected_layers),
+            len(requested) - len(local_layers),
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1155,7 +1270,22 @@ class WanTransformer3DModel(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
+        single_scale_prefixes = {
+            name
+            for name, module in self.named_modules()
+            if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
+        }
+
+        def reject_dualscale_tensor(name: str) -> None:
+            if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
+                raise ValueError(
+                    f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
+                    "changing quant_method does not convert a checkpoint."
+                )
+
         loaded_params: set[str] = set()
+        loaded_qkv_shards: dict[str, set[str]] = {}
+        qkv_smooth_scales: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
@@ -1166,15 +1296,32 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
+                lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
+                reject_dualscale_tensor(lookup_name)
                 # Skip weights that belong to PP stages other than this one
                 if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
                     break
                 param = params_dict[lookup_name]
+                if lookup_name.endswith(".mul_scale"):
+                    previous_scale = qkv_smooth_scales.get(lookup_name)
+                    if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
+                        raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
+                    if previous_scale is None:
+                        qkv_smooth_scales[lookup_name] = loaded_weight.clone()
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(original_name)
+                if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
+                    # Shared input-channel Smooth is a complete tensor even
+                    # when supplied under a single Q/K/V source name.
+                    loaded_params.add(lookup_name)
+                else:
+                    shards = loaded_qkv_shards.setdefault(lookup_name, set())
+                    shards.add(shard_id)
+                    if shards == {"q", "k", "v"}:
+                        loaded_params.add(lookup_name)
                 break
             else:
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
@@ -1198,6 +1345,7 @@ class WanTransformer3DModel(nn.Module):
                 if is_pp_missing_parameter(lookup_name, self):
                     continue
 
+                reject_dualscale_tensor(lookup_name)
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                     continue
@@ -1222,8 +1370,6 @@ class WanTransformer3DModel(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+                loaded_params.update((original_name, lookup_name))
 
         return loaded_params

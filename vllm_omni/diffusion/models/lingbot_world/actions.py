@@ -25,6 +25,7 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 
 LINGBOT_CAMERA_ACTION_SCHEMA = "lingbot.camera_actions.v1"
 LINGBOT_CAMERA_TRAJECTORY_SCHEMA = "lingbot.camera_trajectory.v1"
+LINGBOT_CONTROLLER_TRANSLATION_UNIT = 0.05
 _ACTION_ORDER = ("w", "a", "s", "d", "i", "j", "k", "l")
 _VALID_ACTIONS = frozenset(_ACTION_ORDER)
 _REFERENCE_HEIGHT = 480
@@ -282,7 +283,7 @@ def integrate_lingbot_camera_actions(
     """Convert latent-frame WASD/IJKL controls to cumulative C2W poses.
 
     Calibration and motion constants intentionally match SGLang's LingBot
-    adapter: movement 0.05, pitch 4 degrees, yaw 6 degrees, pitch clamp 85
+    adapter: movement 0.05 (LINGBOT_CONTROLLER_TRANSLATION_UNIT), pitch 4 degrees, yaw 6 degrees, pitch clamp 85
     degrees, and target-resolution focal lengths of 500 pixels.
     """
 
@@ -325,13 +326,31 @@ def integrate_lingbot_camera_actions(
             right /= right_norm + 1e-6
 
         movement = np.zeros(3, dtype=np.float64)
-        movement += forward * 0.05 * (("w" in actions) - ("s" in actions))
-        movement += right * 0.05 * (("d" in actions) - ("a" in actions))
+        movement += forward * LINGBOT_CONTROLLER_TRANSLATION_UNIT * (("w" in actions) - ("s" in actions))
+        movement += right * LINGBOT_CONTROLLER_TRANSLATION_UNIT * (("d" in actions) - ("a" in actions))
+        # Keep the cumulative controller pose in FP64 between chunks, matching
+        # SGLang's NumPy integration and avoiding long-session drift.
         current_pose = np.eye(4, dtype=np.float64)
         current_pose[:3, :3] = new_rotation
         current_pose[:3, 3] = translation + movement
         poses.append(current_pose)
 
+    trajectory = camera_trajectory_from_absolute_pose(torch.from_numpy(np.stack(poses)), width=width, height=height)
+    return trajectory, current_pitch
+
+
+def camera_trajectory_from_absolute_pose(
+    poses: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> CameraTrajectory:
+    if width <= 0 or height <= 0:
+        raise ValueError("camera action resolution must be positive.")
+    if poses.ndim != 3 or poses.shape[-2:] != (4, 4):
+        raise ValueError(f"absolute camera poses must have shape [frames, 4, 4], got {tuple(poses.shape)}.")
+    if poses.shape[0] == 0:
+        raise ValueError("absolute camera poses must not be empty.")
     # build_plucker_embedding expects intrinsics in the 832x480 reference
     # coordinate system. These values become SGLang's [500, 500, W/2, H/2]
     # after that function scales them to the requested resolution.
@@ -342,9 +361,7 @@ def integrate_lingbot_camera_actions(
         _REFERENCE_HEIGHT / 2,
     )
     trajectory = CameraTrajectory(
-        # Keep the cumulative controller pose in FP64 between chunks, matching
-        # SGLang's NumPy integration and avoiding long-session drift.
-        poses=torch.from_numpy(np.stack(poses)),
+        poses=poses,
         intrinsics=torch.tensor(reference_intrinsics, dtype=torch.float32).repeat(len(poses), 1),
     )
-    return trajectory, current_pitch
+    return trajectory
