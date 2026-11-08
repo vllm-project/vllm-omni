@@ -65,7 +65,10 @@
       "height": 768,
       "frames": 209,
       "fps": 24,
-      "require_audio": true
+      "require_audio": true,
+      "audio_sample_rate": 32000,
+      "audio_channels": 2,
+      "audio_video_tolerance_s": 0.25
     }
   }
 ]

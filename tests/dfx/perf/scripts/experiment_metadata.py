@@ -72,11 +72,20 @@ def comparison_provenance(
                     "vllm_omni/benchmarks/data_modules/random_multi_modal_dataset.py",
                 ]
             )
+        if os.environ.get("COMPARISON_DIFFUSERS_PATCHES") == "1":
+            runner_paths.append("tests/dfx/perf/scripts/audit_diffusers_snapshot.py")
     server_patches = []
     if server_type == "sglang-omni":
         server_patches.append(file_fingerprint("docker/patches/sglang-omni-ignore-eos.patch"))
     elif server_type == "sglang-diffusion" and os.environ.get("COMPARISON_VIDEO_PATCH") == "1":
         server_patches.append(file_fingerprint("docker/patches/sglang-video-image-reference.patch"))
+        if os.environ.get("COMPARISON_DIFFUSERS_PATCHES") == "1":
+            server_patches.extend(
+                [
+                    file_fingerprint("docker/patches/sglang-diffusion-config-only-guider.patch"),
+                    file_fingerprint("docker/patches/sglang-diffusers-revision.patch"),
+                ]
+            )
     return {
         "schema_version": 1,
         "runner_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, text=True).strip(),

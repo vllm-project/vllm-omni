@@ -15,7 +15,11 @@ def validate_videos(directory: Path, config_path: Path) -> dict:
 
     (config,) = json.loads(config_path.read_text())
     (workload,) = config["benchmark_params"]
-    expected = workload["extra_body"]
+    if "media_expectations" in config:
+        expected = config["media_expectations"]
+    else:
+        body = workload["extra_body"]
+        expected = {"width": body["width"], "height": body["height"], "frames": body["num_frames"], "fps": body["fps"]}
     count = workload["num_prompts"] + workload["num_warmups"]
     paths = sorted(directory.rglob("*.mp4"))
     if len(paths) != count:
@@ -30,9 +34,38 @@ def validate_videos(directory: Path, config_path: Path) -> dict:
                 "fps": float(stream.average_rate),
                 "frames": sum(1 for _ in container.decode(stream)),
             }
-        wanted = {key: expected["num_frames" if key == "frames" else key] for key in actual}
+        wanted = {key: expected[key] for key in actual}
         if actual != wanted:
             raise ValueError(f"Unexpected media in {path.name}: {actual}")
+        if expected.get("require_audio"):
+            import numpy as np
+
+            with av.open(str(path)) as container:
+                if not container.streams.audio:
+                    raise ValueError(f"Missing audio in {path.name}")
+                stream = container.streams.audio[0]
+                samples = 0
+                peak = 0.0
+                sample_rate = stream.codec_context.sample_rate
+                channels = stream.codec_context.channels
+                for frame in container.decode(stream):
+                    data = frame.to_ndarray().astype(float)
+                    if not np.isfinite(data).all() or frame.sample_rate != sample_rate:
+                        raise ValueError(f"Invalid audio in {path.name}")
+                    peak = max(peak, float(np.abs(data).max()))
+                    samples += frame.samples
+            if samples <= 0 or sample_rate <= 0 or peak <= 0:
+                raise ValueError(f"Empty or silent audio in {path.name}")
+            duration = samples / sample_rate
+            if (
+                sample_rate != expected["audio_sample_rate"]
+                or channels != expected["audio_channels"]
+                or abs(duration - actual["frames"] / actual["fps"]) > expected["audio_video_tolerance_s"]
+            ):
+                raise ValueError(f"Unexpected audio rate, channels or duration in {path.name}")
+            actual.update(
+                audio_samples=samples, audio_sample_rate=sample_rate, audio_channels=channels, audio_duration_s=duration
+            )
         videos.append(
             {
                 "path": str(path.relative_to(directory)),

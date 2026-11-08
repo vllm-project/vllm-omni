@@ -49,6 +49,27 @@ def test_fingerprint_detects_changed_bytes(tmp_path, monkeypatch):
     assert before["sha256"] != after["sha256"]
 
 
+def test_diffusers_provenance_records_applied_patches_and_audit(monkeypatch):
+    monkeypatch.setenv("COMPARISON_VIDEO_PATCH", "1")
+    monkeypatch.setenv("COMPARISON_DIFFUSERS_PATCHES", "1")
+    monkeypatch.setattr(experiment_metadata.subprocess, "check_output", lambda *args, **kwargs: "a" * 40 + "\n")
+    metadata = experiment_metadata.comparison_provenance(
+        test_config="tests/dfx/perf/tests/test_hunyuanvideo15_sglang.json",
+        server_config=None,
+        server_revision="0.5.22",
+        server_type="sglang-diffusion",
+    )
+    patches = metadata["server_patches"]
+    runners = metadata["runner_files"]
+    assert isinstance(patches, list) and isinstance(runners, list)
+    assert [item["path"] for item in patches] == [
+        "docker/patches/sglang-video-image-reference.patch",
+        "docker/patches/sglang-diffusion-config-only-guider.patch",
+        "docker/patches/sglang-diffusers-revision.patch",
+    ]
+    assert "tests/dfx/perf/scripts/audit_diffusers_snapshot.py" in {item["path"] for item in runners}
+
+
 @pytest.mark.parametrize("direct_url", [{"vcs_info": {"commit_id": "c" * 40}}, {}])
 def test_revision_comes_from_server_python(monkeypatch, direct_url):
     calls = []

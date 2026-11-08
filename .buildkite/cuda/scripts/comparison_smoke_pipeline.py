@@ -61,66 +61,118 @@ def qwen_image_performance_job(benchmark: dict) -> dict:
     return job
 
 
-def wan_performance_job(benchmark: dict) -> dict:
-    # The immutable image also passed the Wan I2V smoke in #18852.
+def video_performance_job(benchmark: dict, case: str) -> dict:
+    filenames = {
+        "wan22-i2v": ("test_wan22_i2v_sglang.json", "wan", "wan22_i2v"),
+        "hunyuanvideo15": ("test_hunyuanvideo15_sglang.json", "hunyuanvideo", "hunyuanvideo15"),
+        "minimax-h3": ("test_minimax_h3_sglang.json", "minimax-h3", "minimax_h3"),
+    }
+    filename, stem, audit_name = filenames[case]
+    config = f"tests/dfx/perf/tests/{filename}"
+    (spec,) = json.loads((PIPELINE.parents[2] / config).read_text())
+    (workload,) = spec["benchmark_params"]
+    prompts = workload["num_prompts"]
+    test_name = spec["test_name"]
     job = qwen_image_performance_job(benchmark)
-    config = "tests/dfx/perf/tests/test_wan22_i2v_sglang.json"
+    container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+    cards = spec["mark"][0]["hardware_marks"]["num_cards"]
+    container["resources"]["limits"]["nvidia.com/gpu"] = cards
+    commands = [
+        "set -eu",
+        'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
+        'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
+        'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"',
+        "export BENCHMARK_DIR=tests/dfx/perf/results",
+        f'test ! -e "$${{BENCHMARK_DIR}}/{stem}-videos"',
+        f'mkdir -p "$${{BENCHMARK_DIR}}/{stem}-videos"',
+        "sglang_source_root=\"$$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; "
+        "print(Path(sglang.__file__).resolve().parent.parent)')\"",
+    ]
+    patches = ["sglang-video-image-reference.patch"]
+    checks = ["test_sglang_video_api.py"]
+    if case == "hunyuanvideo15":
+        patches.extend(["sglang-diffusion-config-only-guider.patch", "sglang-diffusers-revision.patch"])
+        checks.extend(["test_sglang_diffusion_loader.py", "test_sglang_diffusers_revision.py"])
+    for patch in patches:
+        commands.extend(
+            [
+                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" --check '
+                f'"$$PWD/docker/patches/{patch}"',
+                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" '
+                f'"$$PWD/docker/patches/{patch}"',
+            ]
+        )
+    commands.extend(
+        [
+            'CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest '
+            "--noconftest -o addopts='' -q " + " ".join(f"tests/dfx/perf/tests/{test}" for test in checks),
+            "export COMPARISON_VIDEO_PATCH=1",
+            "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+        ]
+    )
+    if case == "hunyuanvideo15":
+        commands.append("export COMPARISON_DIFFUSERS_PATCHES=1")
+    commands.extend(
+        [
+            f"export BENCHMARK_DIR=tests/dfx/perf/results/{stem}-smoke",
+            'test ! -e "$${BENCHMARK_DIR}"',
+            'jq \'.[0].server_params.serve_args["output-path"] = '
+            f'"tests/dfx/perf/results/{stem}-smoke/videos" | '
+            ".[0].benchmark_params[0] += {num_prompts:1,num_warmups:0}' "
+            f'"$${{COMPARISON_CONFIG}}" > /tmp/{stem}-smoke.json',
+            "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+            f"--test-config-file /tmp/{stem}-smoke.json --run-level full_model",
+            "jq -se 'length == 1 and (.[0] | .completed == 1 and .failed == 0)' "
+            f'"$${{BENCHMARK_DIR}}"/result_{test_name}_*.json',
+            "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
+            f'"$${{BENCHMARK_DIR}}/videos" --config /tmp/{stem}-smoke.json '
+            '--output "$${BENCHMARK_DIR}/validated_media.json"',
+            "export BENCHMARK_DIR=tests/dfx/perf/results",
+        ]
+    )
+    artifacts = [
+        f"tests/dfx/perf/results/{stem}-smoke/*.json",
+        f"tests/dfx/perf/results/result_{test_name}_*.json",
+        f"tests/dfx/perf/results/validated_{audit_name}_media.json",
+    ]
+    if case == "hunyuanvideo15":
+        # The online smoke resolves the pinned snapshot, including on a cold node.
+        # Audit its effective settings before measuring the formal requests.
+        commands.append(
+            'CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 '
+            "tests/dfx/perf/scripts/audit_diffusers_snapshot.py "
+            '--config "$${COMPARISON_CONFIG}" '
+            '--output "$${BENCHMARK_DIR}/validated_hunyuanvideo15_config.json"'
+        )
+        artifacts.append("tests/dfx/perf/results/validated_hunyuanvideo15_config.json")
+    video_metrics = ""
+    if case != "minimax-h3":
+        media = workload["extra_body"]
+        frames = prompts * media["num_frames"]
+        video_metrics = f"and .total_video_frames == {frames} and .total_video_duration_s == {frames / media['fps']} "
+    commands.extend(
+        [
+            "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
+            '--test-config-file "$${COMPARISON_CONFIG}" --run-level full_model',
+            f"jq -se 'length == 1 and (.[0] | .completed == {prompts} and .failed == 0 "
+            + video_metrics
+            + "and .request_throughput > 0 and .mean_e2el_ms > 0 "
+            'and .Hardware == "H100" and .experiment_metadata.server_revision == "0.5.22")\' '
+            f'"$${{BENCHMARK_DIR}}"/result_{test_name}_*.json',
+            "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
+            f'"$${{BENCHMARK_DIR}}/{stem}-videos" --config "$${{COMPARISON_CONFIG}}" '
+            f'--output "$${{BENCHMARK_DIR}}/validated_{audit_name}_media.json"',
+        ]
+    )
+    backend = "SGLang (Diffusers fallback)" if case == "hunyuanvideo15" else "SGLang"
     job.update(
-        key="perf-sglang-wan22-i2v",
-        label=":movie_camera: SGLang · Wan2.2 I2V · 832x480 · 81 frames · 4 steps · C1/10",
+        key=f"perf-sglang-{case}",
+        label=f":movie_camera: {backend} · {case} · {cards} H100 · smoke then C1/{prompts}",
         concurrency=2,
         concurrency_group="vllm-omni/pr1994/sglang-smoke",
         env={"COMPARISON_CONFIG": config, "COMPARISON_IMAGE_DIGEST": QWEN_IMAGE_DIGEST},
-        artifact_paths=[
-            "tests/dfx/perf/results/wan-smoke/*.json",
-            "tests/dfx/perf/results/result_test_sglang_wan22_i2v_single_device_*.json",
-            "tests/dfx/perf/results/validated_wan22_i2v_media.json",
-        ],
-        command="\n".join(
-            [
-                "set -eu",
-                'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
-                'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
-                'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"',
-                "export BENCHMARK_DIR=tests/dfx/perf/results",
-                'test ! -e "$${BENCHMARK_DIR}/wan-videos"',
-                'mkdir -p "$${BENCHMARK_DIR}/wan-videos"',
-                "sglang_source_root=\"$$(/opt/sglang/bin/python3 -c 'import sglang; from pathlib import Path; "
-                "print(Path(sglang.__file__).resolve().parent.parent)')\"",
-                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" --check '
-                '"$$PWD/docker/patches/sglang-video-image-reference.patch"',
-                'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" '
-                '"$$PWD/docker/patches/sglang-video-image-reference.patch"',
-                "CUDA_VISIBLE_DEVICES=\"\" /opt/sglang/bin/python3 -m pytest --noconftest -o addopts='' "
-                "-q tests/dfx/perf/tests/test_sglang_video_api.py",
-                "export COMPARISON_VIDEO_PATCH=1",
-                "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
-                "export BENCHMARK_DIR=tests/dfx/perf/results/wan-smoke",
-                'test ! -e "$${BENCHMARK_DIR}"',
-                'jq \'.[0].server_params.serve_args["output-path"] = '
-                '"tests/dfx/perf/results/wan-smoke/videos" | '
-                ".[0].benchmark_params[0] += {num_prompts:1,num_warmups:0}' "
-                '"$${COMPARISON_CONFIG}" > /tmp/wan-smoke.json',
-                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
-                "--test-config-file /tmp/wan-smoke.json --run-level full_model",
-                "jq -se 'length == 1 and (.[0] | .completed == 1 and .failed == 0)' "
-                '"$${BENCHMARK_DIR}"/result_test_sglang_wan22_i2v_single_device_*.json',
-                "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
-                '"$${BENCHMARK_DIR}/videos" --config /tmp/wan-smoke.json '
-                '--output "$${BENCHMARK_DIR}/validated_media.json"',
-                "export BENCHMARK_DIR=tests/dfx/perf/results",
-                "python3 -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py "
-                '--test-config-file "$${COMPARISON_CONFIG}" --run-level full_model',
-                "jq -se 'length == 1 and (.[0] | .completed == 10 and .failed == 0 "
-                "and .total_video_frames == 810 and .total_video_duration_s == 50.625 "
-                "and .request_throughput > 0 and .mean_e2el_ms > 0 "
-                'and .Hardware == "H100" and .experiment_metadata.server_revision == "0.5.22")\' '
-                '"$${BENCHMARK_DIR}"/result_test_sglang_wan22_i2v_single_device_*.json',
-                "python3 tests/dfx/perf/scripts/validate_sglang_videos.py "
-                '"$${BENCHMARK_DIR}/wan-videos" --config "$${COMPARISON_CONFIG}" '
-                '--output "$${BENCHMARK_DIR}/validated_wan22_i2v_media.json"',
-            ]
-        ),
+        artifact_paths=artifacts,
+        command="\n".join(commands),
     )
     return job
 
@@ -173,9 +225,10 @@ def cosmos_performance_job(benchmark: dict) -> dict:
 
 def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     qwen_performance = cases == ["qwen-image-21-perf"]
-    wan_performance = cases == ["wan22-i2v-perf"]
+    video_cases = {"wan22-i2v-perf", "hunyuanvideo15-perf", "minimax-h3-perf"}
+    video_performance = len(cases) == 1 and cases[0] in video_cases
     cosmos_performance = cases == ["cosmos3-t2i-perf"]
-    if not (qwen_performance or wan_performance or cosmos_performance) and (
+    if not (qwen_performance or video_performance or cosmos_performance) and (
         not cases or len(cases) != len(set(cases)) or set(cases) - GPU_COUNTS.keys()
     ):
         raise ValueError(f"Select distinct model keys from: {', '.join(GPU_COUNTS)}")
@@ -191,8 +244,8 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     if qwen_performance:
         pipeline["steps"] = [qwen_image_performance_job(benchmark)]
         return pipeline
-    if wan_performance:
-        pipeline["steps"] = [wan_performance_job(benchmark)]
+    if video_performance:
+        pipeline["steps"] = [video_performance_job(benchmark, cases[0].removesuffix("-perf"))]
         return pipeline
     if cosmos_performance:
         pipeline["steps"] = [cosmos_performance_job(benchmark)]

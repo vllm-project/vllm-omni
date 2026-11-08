@@ -342,3 +342,49 @@ def test_video_diagnostics_reuse_image_and_apply_loader_fix_before_gpu(compariso
     assert jobs[0]["command"].index("test_sglang_diffusion_loader.py") < jobs[0]["command"].index(
         "run_sglang_diffusion_smoke.py"
     )
+
+
+@pytest.mark.parametrize(("case", "cards", "prompts"), [("hunyuanvideo15", 1, 10), ("minimax-h3", 4, 3)])
+def test_formal_video_jobs_validate_smoke_before_measuring(comparison_runner, tmp_path, case, cards, prompts):
+    result, _ = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "smoke", "BUILDKITE_SOURCE": "api", "BACKEND_COMPARISON_CASES": f"{case}-perf"}
+    )
+    assert result.returncode == 0, result.stderr
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == f"perf-sglang-{case}"
+    assert "depends_on" not in job
+    (container,) = next(iter(job["plugins"][0].values()))["podSpec"]["containers"]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == cards
+    assert job["concurrency"] == 2
+    command = job["command"]
+    assert command.startswith("set -eu")
+    assert command.index(".completed == 1") < command.index("validate_sglang_videos.py")
+    assert command.index("validate_sglang_videos.py") < command.index(
+        f".completed == {prompts}", command.index("validate_sglang_videos.py")
+    )
+    if case == "hunyuanvideo15":
+        assert command.index("validate_sglang_videos.py") < command.index("audit_diffusers_snapshot.py")
+        assert command.index("audit_diffusers_snapshot.py") < command.index(
+            ".completed == 10", command.index("audit_diffusers_snapshot.py")
+        )
+        assert "sglang-diffusers-revision.patch" in command
+        assert "test_sglang_diffusers_revision.py" in command
+        assert "COMPARISON_DIFFUSERS_PATCHES=1" in command
+        assert "tests/dfx/perf/results/validated_hunyuanvideo15_config.json" in job["artifact_paths"]
+    else:
+        # Native MiniMax reports neither frame count nor fps in VideoResponse.
+        # Validate the saved media, retaining only reported performance metrics.
+        assert ".total_video_frames" not in command
+        assert ".total_video_duration_s" not in command
+        (config,) = json.loads((ROOT / job["env"]["COMPARISON_CONFIG"]).read_text())
+        assert config["media_expectations"] == {
+            "width": 1344,
+            "height": 768,
+            "frames": 209,
+            "fps": 24,
+            "require_audio": True,
+            "audio_sample_rate": 32000,
+            "audio_channels": 2,
+            "audio_video_tolerance_s": 0.25,
+        }
+        assert "num_frames" not in config["benchmark_params"][0]["extra_body"]
