@@ -576,9 +576,7 @@ class StagePool:
             return
         input_addr = self._client_input_addr(self.clients[replica_id])
         if input_addr is not None and self._serviceable_replica_id_for_addr(input_addr) != replica_id:
-            raise StageUnavailableError(
-                f"stage {self.stage_id} pinned replica {replica_id} is not UP in the hub"
-            )
+            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is not UP in the hub")
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
         """Bind a real request to a required replica, without selecting a fallback.
