@@ -23,6 +23,10 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 OVERFLOW = "The decoder prompt (length 93016) is longer than the maximum model length of 65536"
+CONTEXT_OVERFLOWS = [
+    "This model's maximum context length is 65536 tokens. However, you requested 93016 tokens",
+    "Context length 70000 exceeds maximum 65536",
+]
 
 
 @pytest.mark.parametrize("error_type", [OSError, ValueError])
@@ -51,8 +55,9 @@ def _http_error(status: int, body: str) -> requests.HTTPError:
 
 
 @pytest.mark.parametrize("status", [401, 403, 413, 429, 502, 503])
-def test_classifier_rejects_unrelated_http_status(status: int) -> None:
-    assert not eval_mod._is_prompt_too_long_error(_http_error(status, OVERFLOW))
+@pytest.mark.parametrize("message", [OVERFLOW, *CONTEXT_OVERFLOWS])
+def test_classifier_rejects_unrelated_http_status(status: int, message: str) -> None:
+    assert not eval_mod._is_prompt_too_long_error(_http_error(status, message))
 
 
 @pytest.mark.parametrize("status", [400, 500])
@@ -74,8 +79,25 @@ def test_classifier_accepts_current_judge_input_length_error(status: int, json_e
     assert eval_mod._is_prompt_too_long_error(_http_error(status, body))
 
 
-def test_classifier_does_not_reduce_unrelated_context_length_error() -> None:
-    assert not eval_mod._is_prompt_too_long_error(_http_error(400, "Invalid maximum context length configuration"))
+@pytest.mark.parametrize("status", [400, 500])
+@pytest.mark.parametrize("json_error", [False, True])
+@pytest.mark.parametrize("message", CONTEXT_OVERFLOWS)
+def test_classifier_accepts_explicit_context_length_message(status: int, json_error: bool, message: str) -> None:
+    body = json.dumps({"error": {"message": message}}) if json_error else message
+    assert eval_mod._is_prompt_too_long_error(_http_error(status, body))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid maximum context length configuration",
+        "Requested maximum context length exceeds allowed configuration",
+        "The maximum context length you requested is not supported",
+        "Context length configuration is missing for the requested model",
+    ],
+)
+def test_classifier_does_not_reduce_unrelated_context_length_error(message: str) -> None:
+    assert not eval_mod._is_prompt_too_long_error(_http_error(400, message))
 
 
 def test_classifier_does_not_match_unrelated_json_fields() -> None:
@@ -175,7 +197,7 @@ def test_unrelated_http_errors_are_not_retried(status: int) -> None:
 
 
 @contextmanager
-def _http_judge(limit: int = 4) -> Iterator[tuple[DuplexJudge, list[int]]]:
+def _http_judge(limit: int = 4, *, overflow_message: str = OVERFLOW) -> Iterator[tuple[DuplexJudge, list[int]]]:
     """Real HTTP and production judge client; deterministic fixture, not a model."""
     counts: list[int] = []
 
@@ -196,7 +218,7 @@ def _http_judge(limit: int = 4) -> Iterator[tuple[DuplexJudge, list[int]]]:
             response: dict[str, object]
             if len(images) > limit:
                 status = 500
-                response = {"error": {"message": OVERFLOW}}
+                response = {"error": {"message": overflow_message}}
             else:
                 status = 200
                 score = json.dumps({"content_score": 1, "temporal_score": 1, "is_relevant": 1})
@@ -248,9 +270,12 @@ def _sample_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, with_sent
     return sample, response_path, score_path
 
 
-def test_real_http_temporal_and_content_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("message", [OVERFLOW, *CONTEXT_OVERFLOWS])
+def test_real_http_temporal_and_content_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, message: str
+) -> None:
     sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch)
-    with _http_judge() as (judge, counts):
+    with _http_judge(overflow_message=message) as (judge, counts):
         result = eval_mod.evaluate_sample(
             sample, response_path, score_path, judge, judge_video_mode="frame-sample", judge_frame_overflow="reduce"
         )
@@ -264,11 +289,28 @@ def test_real_http_temporal_and_content_recovery(tmp_path: Path, monkeypatch: py
     summary = eval_mod.summarize_scores(tmp_path / "scores")
     assert summary["rtd"]["frame_reduction_samples"] == 1
     assert summary["rtd"]["judge_frame_overflow_policies"] == ["reduce"]
+    warnings = [record for record in caplog.records if record.name == eval_mod.__name__]
+    assert [record.getMessage() for record in warnings] == [
+        f"Judge context overflow for sample; retrying with {count} of 16 uniformly selected frames"
+        for count in [8, 4, 8, 4]
+    ]
+    assert [
+        (record.__dict__["initial_frame_count"], record.__dict__["frame_count"], record.__dict__["retry"])
+        for record in warnings
+    ] == [
+        (16, 8, 1),
+        (16, 4, 2),
+        (16, 8, 1),
+        (16, 4, 2),
+    ]
 
 
-def test_default_policy_fails_without_changing_frames(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("message", [OVERFLOW, *CONTEXT_OVERFLOWS])
+def test_default_policy_fails_without_changing_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
     sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch)
-    with _http_judge() as (judge, counts), pytest.raises(requests.HTTPError):
+    with _http_judge(overflow_message=message) as (judge, counts), pytest.raises(requests.HTTPError):
         eval_mod.evaluate_sample(sample, response_path, score_path, judge, judge_video_mode="frame-sample")
     assert counts == [16]
     assert not score_path.exists()
@@ -295,8 +337,9 @@ def test_success_keeps_frames_and_reports_zero_retries(tmp_path: Path, monkeypat
 
 
 @pytest.mark.parametrize("policy", ["error", "reduce"])
+@pytest.mark.parametrize("message", [OVERFLOW, *CONTEXT_OVERFLOWS])
 def test_upstream_video_fallback_keeps_frame_reduction_opt_in(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str, message: str
 ) -> None:
     sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=False)
     calls: list[tuple[str, int]] = []
@@ -307,7 +350,7 @@ def test_upstream_video_fallback_keeps_frame_reduction_opt_in(
             if mode == "video_url":
                 raise _http_error(400, "Input length exceeds model's maximum context length")
             if len(frames) > 4:
-                raise _http_error(400, OVERFLOW)
+                raise _http_error(400, message)
             return '{"content_score": 1}'
 
     if policy == "error":

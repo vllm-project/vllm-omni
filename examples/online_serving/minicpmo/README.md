@@ -336,8 +336,12 @@ rejected request fails without reducing its frames. To opt into reduced-frame re
 `--judge-video-mode frame-sample`.
 
 The policy applies to both temporal image-frame calls and frame-sample content
-calls. It retries only explicit context-length errors returned as HTTP 400 or
-500. Each retry uses approximately half as many frames, sampled uniformly from
+calls. It retries recognized context-length errors returned as HTTP 400 or 500:
+the `context_length_exceeded` error code, or explicit messages such as
+"prompt ... longer than the maximum model length", "input length ... exceeds ...
+maximum context length", "maximum context length ... however, you requested ...", and
+"context length ... exceeds maximum ...". Each retry uses approximately half
+as many frames, sampled uniformly from
 the original timeline. Multiple retained frames preserve the endpoints; a
 single retained frame uses the original middle frame. Ordinary HTTP failures,
 rate limits, transport timeouts, and an overflow with only one frame remaining
@@ -346,6 +350,10 @@ frames is preserved. If that fallback's frame request also overflows, it only
 reduces frames with `--judge-frame-overflow reduce`; `error` propagates the
 frame-request failure. Temporal judging always uses image frames and follows
 the same explicit policy.
+
+This CLI option is available only in the standalone `evaluate` command.
+`vllm bench serve --duplex-eval-evaluate` keeps the default `error` policy for
+image-frame requests; use standalone evaluation for opt-in frame reduction.
 
 This is failure recovery, **not proactive token budgeting**. It does not resize
 images, estimate the judge's tokenizer, guarantee that one image fits, or recover

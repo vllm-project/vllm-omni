@@ -95,8 +95,11 @@ def _is_prompt_too_long_error(exc: requests.HTTPError) -> bool:
         if not isinstance(message, str):
             return False
     normalized = message.lower()
-    return ("prompt" in normalized and "longer than the maximum model length" in normalized) or (
-        "input length" in normalized and "exceeds" in normalized and "maximum context length" in normalized
+    return (
+        ("prompt" in normalized and "longer than the maximum model length" in normalized)
+        or ("input length" in normalized and "exceeds" in normalized and "maximum context length" in normalized)
+        or ("maximum context length" in normalized and "however, you requested" in normalized)
+        or ("context length" in normalized and "exceeds maximum" in normalized)
     )
 
 
@@ -106,6 +109,7 @@ def _judge_frames_with_overflow_retry(
     *,
     allow_reduction: bool,
     initial_count: int | None = None,
+    sample_id: str = "<unknown>",
 ) -> tuple[str, list[bytes], int]:
     """Optionally retry an explicit context overflow with fewer original frames.
 
@@ -125,7 +129,10 @@ def _judge_frames_with_overflow_retry(
             used_frames = _uniform_subsample(original_frames, next_count)
             retries += 1
             logger.warning(
-                "Judge context overflow; retrying with fewer uniformly selected frames",
+                "Judge context overflow for %s; retrying with %d of %d uniformly selected frames",
+                sample_id,
+                next_count,
+                len(original_frames),
                 extra={"initial_frame_count": len(original_frames), "frame_count": next_count, "retry": retries},
             )
 
@@ -226,6 +233,7 @@ def evaluate_sample(
                 frames,
                 allow_reduction=judge_frame_overflow == "reduce",
                 initial_count=len(used_frames),
+                sample_id=sample.id,
             )
             retries += reductions
             return raw_response

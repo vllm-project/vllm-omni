@@ -464,6 +464,15 @@ Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable jud
 this changes content evaluation to the existing sampled-frame variant, not full-video judging.
 
 Scoring reuses the standalone evaluator and runs **after performance timing**.
+This serving surface keeps the default image-frame overflow policy, `error`,
+and does not expose `--judge-frame-overflow`. The existing `video_url` fallback
+to sampled frames is retained, but an overflowing image-frame request fails
+that sample rather than reducing its frame count. To opt into reduced-frame
+RTD scoring, use standalone `evaluate` with `--judge-frame-overflow reduce`,
+the matching dataset selection and the run's published response directory.
+Use a separate `--score-root`: fewer frames can change scores, so reduced-frame
+results are not protocol-equivalent.
+
 The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
 and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
 sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
