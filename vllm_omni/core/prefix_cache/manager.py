@@ -792,8 +792,13 @@ class OmniPrefixCacheManager:
                     # hits to (hit_upto, blocks, read_start), and this
                     # branch must keep working on both shapes.
                     hit_upto = hit[0]
+                    read_start = hit[2] if len(hit) > 2 else 0
                     for key in self._policy.get_hit_keys(cached_keys):
-                        parts = self._session_store.snapshot(session_id, key, hit_upto)
+                        # Serve exactly the requested range: a replay
+                        # span [read_start, hit_upto) must not prepend
+                        # the [0, read_start) rows the downstream stage
+                        # already has (A5/B1).
+                        parts = self._session_store.snapshot_range(session_id, key, read_start, hit_upto)
                         if parts is None:
                             continue
                         session_parts[(req_id, key)] = parts
@@ -1632,6 +1637,7 @@ class OmniPrefixCacheManager:
             # Index read, not a 2-tuple unpack: upstream extended hits
             # to (hit_upto, blocks, read_start); this works on both.
             hit_upto = hit[0]
+            read_start = hit[2] if len(hit) > 2 else 0
             if hit_upto <= 0:
                 continue
             merged_by_key: dict[str, torch.Tensor] = {}
@@ -1649,13 +1655,23 @@ class OmniPrefixCacheManager:
                     continue
                 if self._session_store.covers(session_id, key, hit_upto):
                     continue
-                if merged.shape[0] < hit_upto:
+                # The merged tensor's layout is [replay span | new
+                # rows]: merged[0] is session position read_start, not
+                # 0. Session position p maps to merged[p - read_start];
+                # positions below read_start are not in this tensor, so
+                # a stream behind read_start cannot be seeded from it
+                # (it stalls until a full-prefix turn).
+                if merged.shape[0] < hit_upto - read_start:
                     continue
                 stored = self._session_store.stored_tokens(session_id, key)
                 if stored >= hit_upto:
                     continue
+                if stored < read_start:
+                    continue
                 try:
-                    self._session_store.append_if_length(session_id, key, stored, merged[stored:hit_upto])
+                    self._session_store.append_if_length(
+                        session_id, key, stored, merged[stored - read_start : hit_upto - read_start]
+                    )
                 except ValueError:
                     continue
 

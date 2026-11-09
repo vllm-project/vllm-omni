@@ -61,6 +61,7 @@ from vllm_omni.core.prefix_cache.manager import (
     OmniPrefixCacheManager,
     _is_step_token_tensor,
     _snapshot_leftover_mm_cpu,
+    _StepContext,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -2404,6 +2405,37 @@ def test_session_overlap_appends_only_tail():
                 ]
             ),
         )
+    finally:
+        mgr.shutdown()
+
+
+def test_session_seed_slices_replay_span_by_read_start():
+    """A5/B1: seeding a replay hit maps merged positions via read_start.
+
+    A replay hit [16, 32) merges as [replay span | new rows]: merged[0]
+    is session position 16, not 0. Seeding must fill [stored, hit_upto)
+    from merged[stored - read_start : hit_upto - read_start]. Slicing
+    merged[stored : hit_upto] instead pulls the step's new rows into
+    the prefix positions (here the new span is long enough that the old
+    slice lands entirely inside it).
+    """
+    mgr, view = make_manager()
+    try:
+        view.req_blocks["a"] = list(range(12))
+        store = mgr._session_store
+        store.bind("a", "S")
+        assert store.append("S", HIDDEN_KEY, expected_rows(view.slots_for("a", 0, 16)))
+        # Merged output for the replay step: pool rows [16, 32), then
+        # the step's own rows [32, 48).
+        merged = torch.cat([expected_rows(view.slots_for("a", 16, 32)), expected_rows(view.slots_for("a", 32, 48))])
+        ctx = _StepContext(
+            spans={"a": (0, 16)},
+            hits={"a": (32, [0, 1, 2, 3, 4, 5, 6, 7], 16)},
+            cached_keys=set(),
+        )
+        mgr._seed_session_rows(ctx, ["a"], {"a": "S"}, {"a": merged}, {})
+        assert store.stored_tokens("S", HIDDEN_KEY) == 32
+        assert torch.equal(store.fetch("S", HIDDEN_KEY, 32), expected_rows(view.slots_for("a", 0, 32)))
     finally:
         mgr.shutdown()
 

@@ -10,7 +10,7 @@ import torch
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheDelivery, PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.group_view import MRv2FullAttentionGroupView, check_mrv2_prefix_cache_layout
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -22,9 +22,16 @@ DTYPE = torch.float32
 
 
 def sched_output(*, new=(), cached=(), resumed=(), finished=(), preempted=(), scheduled=None):
-    """new: (req_id, num_computed, blocks); cached: (req_id, num_computed, new_blocks | None)."""
+    """new: (req_id, num_computed, blocks[, session_id]); cached: (req_id, num_computed, new_blocks | None)."""
+    new_reqs = []
+    for entry in new:
+        r, c, b = entry[0], entry[1], entry[2]
+        ns = SimpleNamespace(req_id=r, num_computed_tokens=c, block_ids=[list(b)])
+        if len(entry) > 3 and entry[3] is not None:
+            ns.session_id = entry[3]
+        new_reqs.append(ns)
     return SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id=r, num_computed_tokens=c, block_ids=[list(b)]) for r, c, b in new],
+        scheduled_new_reqs=new_reqs,
         scheduled_cached_reqs=SimpleNamespace(
             resumed_req_ids=set(resumed),
             req_ids=[r for r, _, _ in cached],
@@ -214,3 +221,27 @@ def test_resume_above_watermark_replays_gap(harness):
     assert harness.mgr.step_rewrite_req_ids(s5) == {"a"}
     out = harness.mgr.materialize(s5, ["a"], include_uncached=False)
     assert torch.equal(out.hidden_states["a"], rows_for(range(4, 10)))
+
+
+def test_session_replay_hit_serves_only_requested_range(harness):
+    """A5/B1: a session-served replay [16, 32) serves exactly its span.
+
+    The session store covers [0, 32), but the downstream stage already
+    has [0, 16) (the delivered watermark): the merged output must be
+    the 16 replay rows plus this step's 4 rows — not the 32-row head
+    prepended again. Decode steps do not advance the adapter's
+    delivered watermark, which is what leaves the replay gap.
+    """
+    harness.mgr.discard_step(harness.step([("a", 0, 16)], new=[("a", 0, [0, 1, 2, 3, 4, 5, 6, 7], "S")])[1])
+    harness.mgr.discard_step(harness.step([("a", 16, 16)])[1])
+    assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 32
+    harness.mgr.discard_step(harness.step(preempted=["a"])[1])
+
+    step, s4 = harness.step([("a", 32, 4)], new=[("a", 32, [0, 1, 2, 3, 4, 5, 6, 7, 8])])
+    assert step.deliveries == (
+        PrefixCacheDelivery("a", read_start=16, read_end=32, block_ids=((0, 1, 2, 3, 4, 5, 6, 7, 8),)),
+    )
+    out = harness.mgr.materialize(s4, ["a"], include_uncached=False)
+    assert torch.equal(out.hidden_states["a"], rows_for(range(16, 36)))
+    # The step's own rows still append at their true position.
+    assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 36

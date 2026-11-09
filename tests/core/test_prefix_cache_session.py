@@ -73,6 +73,23 @@ def test_fetch_returns_none_when_not_covered():
     assert store.fetch("sess-B", "hidden", 1) is None
 
 
+def test_snapshot_range_returns_window_and_none_when_uncovered():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 8))
+    store.append("sess-A", "hidden", _rows(8, 8))
+    # A middle window spanning both segments.
+    parts = store.snapshot_range("sess-A", "hidden", 4, 12)
+    assert parts is not None
+    assert torch.equal(torch.cat(parts, dim=0), _rows(4, 8))
+    # Full prefix and a prefix window are windows too.
+    assert store.snapshot_range("sess-A", "hidden", 0, 16) is not None
+    assert torch.equal(torch.cat(store.snapshot_range("sess-A", "hidden", 0, 4), dim=0), _rows(0, 4))
+    # Past the end, and an empty window, are not covered.
+    assert store.snapshot_range("sess-A", "hidden", 12, 20) is None
+    assert store.snapshot_range("sess-A", "hidden", 8, 8) is None
+    assert store.snapshot_range("sess-A", "hidden", 0, 0) is None
+
+
 def test_sessions_are_isolated():
     store = SessionPrefixStore()
     store.append("sess-A", "hidden", _rows(0, 3))

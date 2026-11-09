@@ -360,6 +360,38 @@ class SessionPrefixStore:
                 return None
             return parts
 
+    def snapshot_range(self, session_id: SessionId, key: TensorName, start: int, end: int) -> list[torch.Tensor] | None:
+        """Segment views covering [start, end), or None when not fully covered.
+
+        Like :meth:`snapshot` but for an arbitrary window, not just a
+        prefix: a replay hit [read_start, hit_upto) must serve exactly
+        its span, not the [0, hit_upto) head (A5/B1). The store is
+        append-only and contiguous from 0, so covering [start, end)
+        is the same length check as the prefix case (``length >= end``);
+        the window only changes which segment views are returned.
+        """
+        if end <= start or start < 0:
+            return None
+        with self._lock:
+            segments = self._segments.get((session_id, key))
+            if segments is None or self._lengths.get((session_id, key), 0) < end:
+                return None
+            parts: list[torch.Tensor] = []
+            pos = 0
+            for seg in segments:
+                seg_len = int(seg.shape[0])
+                seg_end = pos + seg_len
+                if seg_end <= start:
+                    pos = seg_end
+                    continue
+                if pos >= end:
+                    break
+                parts.append(seg[max(start - pos, 0) : min(end - pos, seg_len)])
+                pos = seg_end
+            if sum(int(p.shape[0]) for p in parts) != end - start:
+                return None
+            return parts
+
     # -------------------------------------------------------- lifecycle
 
     def invalidate(self, session_id: SessionId) -> int:
