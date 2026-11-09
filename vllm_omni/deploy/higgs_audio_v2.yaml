@@ -5,9 +5,9 @@
 # transport. Under v2 the talker delegates LM token sampling to the native
 # staged sampler, so the full request surface — penalties included — keeps
 # working. Non-CUDA platforms fall back to v1 through the platforms section
-# below. To run the talker on v1 on CUDA, copy this file and remove the
-# stage-0 model_runner key; higgs_audio_v2_mrv2.yaml pins the same selection
-# explicitly.
+# below. To run the talker on v1 on CUDA, use higgs_audio_v2_v1.yaml (or copy
+# this file and remove the stage-0 model_runner key); higgs_audio_v2_mrv2.yaml
+# pins the v2 selection explicitly.
 #
 # Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
 # ChatML rich messages, and music/sound-event prompts are rejected by the

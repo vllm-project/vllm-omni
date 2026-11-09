@@ -39,10 +39,13 @@ SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
 # The default profile runs the talker on model_runner v2 with the codec
 # stage on v1; non-CUDA platforms fall back to the v1 runner through the
-# deploy file's platforms section, so this one param guards both runners.
-# Under v2 the talker delegates LM token sampling to the native staged
-# sampler, so penalties and logprobs stay in the request surface — unlike
-# Higgs v3, whose owned sampler narrows it.
+# deploy file's platforms section, so the plain-text param guards the shipped
+# selection. The v1 opt-out param keeps the documented CUDA escape hatch
+# (higgs_audio_v2_v1.yaml) alive: the owner-row feedback walk and the bias
+# walks differ per runner, and both are shipped paths. Under v2 the talker
+# delegates LM token sampling to the native staged sampler, so penalties and
+# logprobs stay in the request surface — unlike Higgs v3, whose owned sampler
+# narrows it.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -52,6 +55,15 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v2_plain_text",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("higgs_audio_v2_v1.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id="higgs_audio_v2_v1_optout",
     ),
 ]
 

@@ -1,0 +1,11 @@
+# Higgs-audio v2 explicit V1 opt-out profile: an alias that pins the talker
+# (stage 0) to model_runner v1 — the runner this family shipped on before the
+# MRV2 flip, kept as the documented escape hatch for the v2 path. The codec
+# stage (stage 1) has no MRV2 path and is on v1 in every profile. Everything
+# is inherited from the shipped default via base_config so the two files
+# cannot drift; unlike the default, this file keeps stage 0 on v1 even if the
+# default's selection ever changes again.
+base_config: higgs_audio_v2.yaml
+stages:
+  - stage_id: 0
+    model_runner: v1

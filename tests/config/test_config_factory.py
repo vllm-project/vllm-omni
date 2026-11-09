@@ -3380,6 +3380,36 @@ class TestPlatformOverrides:
             load_deploy_config(Path(get_deploy_config_path("higgs_audio_v2.yaml")))
         )
 
+    def test_higgs_audio_v2_v1_optout_pins_talker_on_v1(self):
+        """The V1 opt-out profile flips only the stage-0 runner, inheriting the rest.
+
+        The thin ``stages:`` overlay must override the default's stage-0
+        ``model_runner: v2`` without dropping any inherited stage field
+        (shape, capacities, sampling defaults), and the inherited
+        ``platforms:`` section must leave it on v1 everywhere — including
+        CUDA, where nothing re-clears it.
+        """
+        deploy_path = Path(get_deploy_config_path("higgs_audio_v2_v1.yaml"))
+        pipeline = resolve_pipeline_config("higgs_audio_v2")
+        default_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
+
+        for platform in ("cuda", "rocm", "npu", "xpu", "musa"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            assert deploy.stages[0].model_runner == "v1", platform
+            assert deploy.stages[1].model_runner is None, platform
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [False, False], platform
+
+        # The overlay changes only the runner: every other stage-0 field the
+        # default ships must survive the merge untouched.
+        optout = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda").stages[0]
+        default = _apply_platform_overrides(load_deploy_config(default_path), platform="cuda").stages[0]
+        assert optout.enforce_eager is True
+        assert optout.max_num_seqs == default.max_num_seqs
+        assert optout.max_model_len == default.max_model_len
+        assert optout.default_sampling_params == default.default_sampling_params
+        assert optout.engine_extras == default.engine_extras
+
     def test_higgs_audio_v2_v2_default_does_not_warn_unvalidated(self, caplog):
         """The flipped default declares its legacy-transport v2 path validated.
 

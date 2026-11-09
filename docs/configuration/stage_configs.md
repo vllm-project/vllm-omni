@@ -95,7 +95,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 
 | Field | Type | Required | Default | Description |
 | ------- | ------ | ---------- | --------- | ------------- |
-| `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
+| `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays and shipped alias profiles that pin a parent's selection (e.g. `higgs_audio_v2_mrv2.yaml` / `_v1.yaml`). |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
 | `session_mode` | str | optional | `"turn"` | Session behavior. For pipelines with a `duplex_plugin`, explicitly select `"duplex"` for the duplex engine or `"turn"` for the ordinary online serving stack. The shipped MiniCPM-o 4.5 default remains `"duplex"`. See [Full Duplex](../serving/full_duplex_api.md#enable-full-duplex). |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
@@ -103,7 +103,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults, an optional `model_runner` fallback, and optional `connectors:` overrides deep-merged into the matching top-level connectors by name. |
+| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu` / `musa`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults, an optional `model_runner` fallback, and optional `connectors:` overrides deep-merged into the matching top-level connectors by name. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -617,11 +617,13 @@ Select one of these deployment profiles:
 | --- | --- | --- |
 | `higgs_audio_v2.yaml` | V2 talker (default) | Shipped default; v1 codec stage |
 | `higgs_audio_v2_mrv2.yaml` | V2 talker | Explicit alias of the default selection |
+| `higgs_audio_v2_v1.yaml` | V1 talker | Explicit V1 opt-out on CUDA |
 
 The default's `platforms:` section keeps both stages on V1 for NPU, XPU,
 ROCm and MUSA (XPU rejects v2 stages at deploy load; NPU generation workers
-reject v2 at init). To run the talker on v1 on CUDA, copy the deploy file
-and remove the stage-0 `model_runner` key.
+reject v2 at init). To run the talker on v1 on CUDA, use
+`higgs_audio_v2_v1.yaml` (or copy the default deploy file and remove the
+stage-0 `model_runner` key).
 
 ## Qwen3-TTS with Model Runner V2
 
