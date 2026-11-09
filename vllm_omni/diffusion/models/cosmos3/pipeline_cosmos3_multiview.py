@@ -842,10 +842,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
             or COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
         )
-        if max_sequence_length > COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
+        if not 1 <= max_sequence_length <= COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
             raise ValueError(
-                "Cosmos3 multiview max_sequence_length cannot exceed the variant ceiling the sparse "
-                f"attention is sized for: requested={max_sequence_length}, "
+                "Cosmos3 multiview max_sequence_length must be positive and within the variant ceiling the "
+                f"sparse attention is sized for: requested={max_sequence_length}, "
                 f"ceiling={COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH}."
             )
         patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latents.shape[3], latents.shape[4])

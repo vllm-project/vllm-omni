@@ -4168,6 +4168,24 @@ def test_multiview_output_reports_generated_rate_as_video_fps(
     assert OmniOpenAIServingVideo._resolve_fps(result) == expected_fps
 
 
+@pytest.mark.parametrize("above_ceiling", [False, True], ids=["negative", "above_ceiling"])
+def test_multiview_forward_rejects_out_of_range_max_sequence_length(make_cosmos3_pipeline, above_ceiling: bool) -> None:
+    """A negative length would otherwise slice tokens off the end of every caption."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
+
+    length = COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH + 1 if above_ceiling else -5
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+    sp = make_sampling_params(
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": _t2v_multiview_views()}, "max_sequence_length": length},
+    )
+
+    with pytest.raises(ValueError, match=rf"max_sequence_length must be positive.*requested={length},"):
+        pipeline.forward(make_request_batch({"prompt": "Driving."}, sp))
+
+
 def _generate_multiview_mp4(
     make_cosmos3_pipeline,
     monkeypatch: pytest.MonkeyPatch,
