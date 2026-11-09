@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -94,15 +93,14 @@ def test_local_cancel_stops_consumer_without_join(monkeypatch):
     decoder = _FakeDecoder()
     job = _start_local(vae=vae, decoder=decoder, session_id="req-cancel")
     assert job.on_finished is not None
-    assert started and started[0].is_alive()
+    consumers = [t for t in started if t.name == "causvid-local-stream-decode"]
+    assert len(consumers) == 1 and consumers[0].is_alive()
     job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
-    t0 = time.perf_counter()
     job.cancel()
     # Second cancel is a no-op.
     job.cancel()
-    # Well under the 5s join timeout means the stop sentinel was consumed.
-    assert time.perf_counter() - t0 < 1.0
-    assert not started[0].is_alive()
+    # A missed stop sentinel would leave the consumer blocked past cancel's 5s join.
+    assert not consumers[0].is_alive()
     assert decoder.chunks <= 1
 
 
