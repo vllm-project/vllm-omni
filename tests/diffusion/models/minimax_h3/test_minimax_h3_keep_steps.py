@@ -793,14 +793,24 @@ def test_local_attention_schedule_fails_before_any_encoder_pass(monkeypatch: pyt
 
 
 def test_local_turbo_and_native_lora_fail_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
-    """keep_steps plus an active turbo or native LoRA adapter rejects with zero Qwen passes."""
+    """keep_steps plus an active turbo or native LoRA adapter rejects with zero Qwen passes.
+
+    The artifact validators run before the keep_steps helper on this path, so
+    they are stubbed too: the turbo case's empty spec would otherwise crash
+    _validate_turbo_sampling on its attributes, and the native case would hit
+    the validator's task-mismatch error before the rejection under test.
+    """
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_validate_turbo_sampling", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_validate_native_sampling", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_active_turbo_spec", lambda sampling: SimpleNamespace())
     with pytest.raises(OmniClientError, match="turbo or native LoRA"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
     assert encode_prompt.call_count == 0
 
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_validate_turbo_sampling", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_validate_native_sampling", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_has_active_native_lora", lambda sampling: True)
     with pytest.raises(OmniClientError, match="turbo or native LoRA"):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
