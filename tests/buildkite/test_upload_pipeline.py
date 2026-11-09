@@ -1216,6 +1216,43 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
 
 
+@pytest.mark.parametrize(
+    "platform,level", [("cuda", "nightly"), ("npu", "nightly"), ("cuda", "weekly"), ("npu", "weekly")]
+)
+@pytest.mark.parametrize(
+    "changed_path,selected",
+    [
+        ("vllm_omni/benchmarks/realtime_video/client.py", True),
+        ("vllm_omni/benchmarks/serve.py", True),
+        ("vllm_omni/benchmarks/patch/patch.py", True),
+        ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", True),
+        ("vllm_omni/entrypoints/cli/benchmark/serve.py", True),
+        ("tests/benchmarks/test_realtime_video_serve.py", True),
+        ("tests/benchmarks/test_serve_cli.py", True),
+        ("vllm_omni/benchmarks/audio_continuity.py", False),
+    ],
+)
+def test_lingbot_shared_benchmark_source_changes_select_regressions(
+    monkeypatch, platform, level, changed_path, selected
+):
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(f".buildkite/{platform}/test-{'npu-' if platform == 'npu' else ''}{level}.yml")
+    # A known unrelated model match prevents the no-match fallback from
+    # disguising missing direct dependencies in the new packaged backend.
+    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files, pipeline_path=path)
+    keys = {step.get("key", "") for step in _iter_steps(rendered)}
+    selected_keys = {key for key in keys if key.startswith(f"lingbot-{platform}-{level}-")}
+    if level == "weekly":
+        roles = {"stability"}
+    else:
+        roles = {"generation", "precision", "performance", "wbench", "vbench"}
+        if platform == "npu":
+            roles.update({"ci-image", "data"})
+    expected_keys = {f"lingbot-{platform}-{level}-{role}" for role in roles}
+    assert selected_keys == (expected_keys if selected else set())
+
+
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 def test_lingbot_semantic_cases_have_independent_data_dependencies(monkeypatch, platform: str) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)

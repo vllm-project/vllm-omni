@@ -105,6 +105,13 @@ from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
 from vllm_omni.benchmarks.omniinteract_eval import evaluate_batch as evaluate_omniinteract_batch
+from vllm_omni.benchmarks.realtime_video.serving import (
+    async_request_realtime_video,
+    bind_realtime_video,
+    finalize_realtime_video,
+    get_realtime_video_samples,
+    make_realtime_video_warmup,
+)
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
@@ -680,6 +687,8 @@ def get_samples(args, tokenizer, **kwargs):
     any upstream caller reaching this patched replacement keeps working; they are
     forwarded to the original implementation on every delegate path.
     """
+    if args.dataset_name == "realtime-video":
+        return get_realtime_video_samples(args)
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -3641,6 +3650,7 @@ async def async_request_openai_realtime_chat(
 
 
 ASYNC_REQUEST_FUNCS["openai-realtime-chat"] = async_request_openai_realtime_chat
+ASYNC_REQUEST_FUNCS["realtime-video"] = async_request_realtime_video
 if "openai-realtime-chat" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-chat")
 
@@ -3886,6 +3896,7 @@ async def benchmark(
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
     attach_duplex_eval(input_requests[0], test_input)
+    test_input = bind_realtime_video(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -3905,6 +3916,7 @@ async def benchmark(
     else:
         print("Skipping endpoint ready check.")
 
+    warmup_outputs: list[RequestFuncOutput] = []
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
@@ -3917,13 +3929,26 @@ async def benchmark(
 
         for i in range(num_warmups):
             warmup_input = _salted_copy(test_input, warmup_scope and f"{warmup_scope}-{i}")
+            warmup_input = make_realtime_video_warmup(warmup_input)
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
             warmup_pbar.close()
         print("Warmup run completed.")
+
+    if endpoint_type == "realtime-video" and any(not output.success for output in warmup_outputs):
+        await session.close()
+        return await asyncio.to_thread(
+            finalize_realtime_video,
+            input_requests,
+            [],
+            warmup_outputs,
+            duration=0.0,
+            endpoint=api_url,
+            model=model_id,
+        )
 
     print("Starting main benchmark run...")
 
@@ -4055,6 +4080,7 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        request_func_input = bind_realtime_video(request, request_func_input)
         request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
@@ -4078,6 +4104,18 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    if endpoint_type == "realtime-video":
+        await session.close()
+        return await asyncio.to_thread(
+            finalize_realtime_video,
+            input_requests,
+            outputs,
+            warmup_outputs,
+            duration=benchmark_duration,
+            endpoint=api_url,
+            model=model_id,
+        )
 
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
     if duplex_eval_summary is not None:

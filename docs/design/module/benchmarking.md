@@ -49,14 +49,21 @@ not compare materially different workloads or runtime settings.
 
 ## LingBot CI measurements
 
-The source-local LingBot benchmark records real streamed chunk arrivals and
-explicit warmup/frame/playback policies. CI collects current-run paired
+The packaged `realtime-video` backend uses the existing `vllm bench serve
+--omni` lifecycle and records real streamed chunk arrivals with explicit
+warmup/frame/playback policies. It supplies typed video workload and result
+records instead of treating frames as tokens. The standard benchmark saves the
+domain report under `realtime_video`; the legacy script only translates flags
+and projects that report after the shared lifecycle. CI collects current-run paired
 reference/candidate inputs without composing semantic acceptance. Numerical
 precision, WBench, VBench and relative performance are independent pytest cases
 and reports; a failure in one does not block the others through a semantic
 prerequisite. Each case fails on its own missing, invalid or incomplete inputs.
 
-Three independent paired starts own the per-run reference spread and 5%
+Each case uses a distinct excluded eight-chunk warmup; the attention-window
+warmup and terminal-chunk policy define the steady interval population.
+Readiness does not inject an unrecorded full rollout. Three independent paired
+server starts remain pytest-owned and define the per-run reference spread and 5%
 relative performance limits. The 12 FPS playback target is a measurement basis,
 not a new absolute pass threshold. Numerical checks retain VAE samples and
 full-video/window/content checks. Native semantic evaluators retain their own
