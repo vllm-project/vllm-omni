@@ -942,7 +942,19 @@ class OmniPrefixCacheManager:
                     # Whole-step device→host was launched at save; usually
                     # already complete by the time the output path consumes
                     # the step (a coalesced flush pays one wait per block).
-                    current = ctx.d2h_snapshot.copy_to_cpu()
+                    # Read host_rows() views instead of copy_to_cpu()'s
+                    # full-step clone: the store clones on append, and
+                    # the views are safe here because the append is
+                    # synchronous within this call and the staging slot
+                    # is released only in the finally below (B2). Queued
+                    # rows (B4) are cloned by _append_session_rows, so no
+                    # view escapes this call. The wait itself is
+                    # unchanged (and CUDA-only: on CPU the event is None
+                    # and wait() is a no-op); quantifying the engine-
+                    # thread stall it costs needs a GPU run, so no perf
+                    # number is claimed here.
+                    ctx.d2h_snapshot.wait()
+                    current = ctx.d2h_snapshot.host_rows(0, ctx.num_tokens_unpadded)
                 self._append_session_rows(ctx, list(ctx.spans), session_for_req, current)
         finally:
             self._release_step_staging(ctx)

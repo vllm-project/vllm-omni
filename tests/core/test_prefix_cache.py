@@ -2356,6 +2356,83 @@ def test_session_out_of_order_append_is_thread_safe():
             mgr.shutdown()
 
 
+class _FakeD2HEvent:
+    """torch.cuda.Event stub: records synchronize() calls."""
+
+    def __init__(self):
+        self.synchronizes = 0
+
+    def synchronize(self):
+        self.synchronizes += 1
+
+
+class _FakeD2HSnapshot:
+    """StepSnapshot stub: records wait/copy/release; serves host rows."""
+
+    def __init__(self, mgr, rows, event=None):
+        self._mgr = mgr
+        self._rows = rows
+        self.event = event
+        self.waits = 0
+        self.copies = 0
+        self.releases = 0
+        self.locked_during_wait: list[bool] = []
+
+    def wait(self):
+        self.waits += 1
+        self.locked_during_wait.append(self._mgr._state_lock.locked())
+        if self.event is not None:
+            self.event.synchronize()
+
+    def host_rows(self, start, end):
+        return {HIDDEN_KEY: self._rows[start:end]}
+
+    def copy_to_cpu(self):
+        self.copies += 1
+        return {HIDDEN_KEY: self._rows.clone()}
+
+    def release(self):
+        self.releases += 1
+
+
+def test_session_discard_uses_host_views_not_full_clone():
+    """B2: discard_step reads host_rows() views, not a copy_to_cpu() clone.
+
+    A stubbed d2h_snapshot records waits/copies: the append must land
+    with exactly one wait (and one event synchronize), no clone, and
+    the wait must not run under _state_lock — the engine thread must
+    not wait on a device→host copy while holding the lock.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1, 2], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        fake = _FakeD2HSnapshot(mgr, expected_rows(view.slots_for("a", 8, 12)), event=_FakeD2HEvent())
+        ctx = _StepContext(
+            spans={"a": (0, 4)},
+            num_tokens_unpadded=4,
+            hits={},
+            positions={"a": 8},
+            session_offsets={"a": 0},
+            d2h_snapshot=fake,
+        )
+        mgr._step_ctxs[999] = ctx
+        mgr.discard_step(999)
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+        assert fake.waits == 1
+        assert fake.event.synchronizes == 1
+        assert fake.copies == 0
+        assert fake.locked_during_wait == [False]
+        assert fake.releases == 1
+    finally:
+        mgr.shutdown()
+
+
 def test_session_warm_pool_start_seeds_store_and_next_turn_hits():
     mgr, view = make_manager()
     try:
