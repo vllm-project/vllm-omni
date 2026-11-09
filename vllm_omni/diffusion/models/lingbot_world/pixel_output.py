@@ -55,8 +55,9 @@ class PixelOutputPolicy:
 
     def __post_init__(self):
         validate_mode(self.mode)
-        if self.mode == "native" or self.world_size != 8 or not 0 <= self.rank < 8:
-            raise ValueError("Pixel output policy requires a non-native eight-rank mode")
+        supported = self.world_size == 8 or (self.world_size in (2, 4) and self.mode == "root_uint8_p2p")
+        if self.mode == "native" or not supported or not 0 <= self.rank < self.world_size:
+            raise ValueError("Pixel output policy requires SP8 or root_uint8_p2p with SP2/SP4")
 
     @property
     def planar_uint8(self):

@@ -1946,7 +1946,7 @@ class LingBotWorldCausalDMDPipeline(
             from vllm_omni.diffusion.models.lingbot_world.pixel_output import PixelOutputPolicy
 
             group, degree = self._vae_shard_group()
-            if degree == 8:
+            if degree == 8 or (degree in (2, 4) and mode == "root_uint8_p2p"):
                 pixel_policy = PixelOutputPolicy(mode, group, dist.get_rank(group), degree)
         if decoder is None:
             video = self.vae.decode(vae_latents, return_dict=False)[0]
