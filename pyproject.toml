@@ -216,11 +216,6 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
-"vllm_omni.diffusion.distributed" = [
-    "csrc/ulysses_symmetric_memory_fused/*.cpp",
-    "csrc/ulysses_symmetric_memory_fused/*.h",
-    "csrc/ulysses_symmetric_memory_fused/CMakeLists.txt",
-]
 "vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]

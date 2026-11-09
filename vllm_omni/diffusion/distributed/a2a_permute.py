@@ -102,7 +102,7 @@ def _ensure_built() -> None:
 
 
 def ensure_a2a_permute_available() -> None:
-    """Build the extension during worker/model initialization, not a request."""
+    """Check/build the platform backend during worker initialization."""
     if current_omni_platform.is_npu():
         from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import (
             ensure_a2a_permute_available as ensure_npu,

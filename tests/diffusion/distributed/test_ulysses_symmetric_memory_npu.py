@@ -1,8 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Run inside npu run with torchrun --nproc-per-node=<allocated> -m pytest -q <this file>."""
+"""Run inside npu run with torchrun --nproc-per-node=<allocated> -m pytest -q <this file>.
 
+Opt-in exchange benchmark (requires the production symmetric-memory dependencies)::
+
+    npu run --gpus 2 --timeout 20m -- env VLLM_RUN_NPU_BENCHMARK=1 \
+        NPU_SHMEM_SYMMETRIC_SIZE=4294967296 \
+        torchrun --standalone --nproc-per-node=2 -m pytest -s -q \
+        tests/diffusion/distributed/test_ulysses_symmetric_memory_npu.py -k benchmark
+
+Use the same card count for npu run and torchrun; 2/4/8 ranks divide every shape.
+Pytest -k can also select dtype/layout IDs, for example 'benchmark and bfloat16
+and packed'. Times include fresh output allocation, staging, communication and
+layout conversion, without projection/attention. Positive reduction means faster.
+S is the local input length; reverse input is [B, WORLD*S, H/WORLD, D].
+JUnit properties retain raw samples; when exporting, use a distinct XML path in
+each torchrun worker to avoid overwrites, with -o junit_family=legacy.
+"""
+
+import json
+import math
 import os
+import statistics
 import time
 from datetime import timedelta
 from types import SimpleNamespace
@@ -15,11 +34,31 @@ from tests.helpers.mark import hardware_marks
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A2"}, num_cards=2)]
 
+_BENCHMARK_SHAPES = [
+    (1, 1024, 16, 64),
+    (2, 1024, 16, 64),
+    (1, 4096, 32, 128),
+    (2, 4096, 32, 128),
+    (1, 16384, 32, 128),
+    (2, 16384, 32, 128),
+]
 
-@pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
-def test_production_symmetric_memory_matches_hccl():
+
+@pytest.fixture(scope="module")
+def npu_world():
     import torch_npu  # noqa: F401
 
+    assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), "Submit device work through npu run"
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(minutes=5))
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
+def test_production_symmetric_memory_matches_hccl(npu_world):
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
     from vllm_omni.diffusion.distributed.a2a_permute import (
@@ -29,10 +68,7 @@ def test_production_symmetric_memory_matches_hccl():
     )
     from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 
-    assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), "Submit device work through npu run"
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(local_rank)
-    dist.init_process_group("hccl", timeout=timedelta(minutes=5))
     world = dist.get_world_size()
     assert world > 1
     group = SimpleNamespace(
@@ -64,6 +100,8 @@ def test_production_symmetric_memory_matches_hccl():
                 (1, 0, divisible_heads(32), divisible_heads(8), 128),  # Hunyuan CFG prefill: joint text only.
                 (2, 17, divisible_heads(8), divisible_heads(8), 32),
                 (1, 48, divisible_heads(16), divisible_heads(8), 64),
+                (1, 513, divisible_heads(30), divisible_heads(30), 128),  # Z-Image's non-power-of-two heads.
+                (2, 513, divisible_heads(24), divisible_heads(24), 128),  # Qwen-Image, including a tail tile.
                 (1, 9440, divisible_heads(56), divisible_heads(56), 128),
                 (1, 0, divisible_heads(32), divisible_heads(8), 128),
                 (2, 17, divisible_heads(8), divisible_heads(8), 32),
@@ -101,6 +139,144 @@ def test_production_symmetric_memory_matches_hccl():
                 actual_reverse = ulysses_o_rev(attention_output, dist.group.WORLD.group_name, world)
                 for actual, expected in zip((*actual_qkv, actual_reverse), (*expected_qkv, expected_reverse)):
                     assert_bitwise(actual, expected)
+
+            other_stream = torch.npu.Stream(device=device)
+            with torch.npu.stream(other_stream):
+                with pytest.raises(RuntimeError, match="single NPU stream"):
+                    ulysses_qkv_fwd_group(query, key, value, dist.group.WORLD.group_name, world)
+            try:
+                torch.npu.set_device((local_rank + 1) % world)
+                with pytest.raises(RuntimeError, match="original NPU device"):
+                    ulysses_qkv_fwd_group(query, key, value, dist.group.WORLD.group_name, world)
+            finally:
+                torch.npu.set_device(local_rank)
     finally:
         clear_a2a_permute_workspaces()
-        dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def symmetric_memory_benchmark_workspace(npu_world):
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import NPUUlyssesSymmetricMemory
+
+    workspace = None
+    try:
+        world = dist.get_world_size()
+        if world < 2 or any(heads % world for _, _, heads, _ in _BENCHMARK_SHAPES):
+            pytest.skip("WORLD size must divide every benchmark head count and be greater than one")
+        # Reserve for the largest grouped QKV case, including FP32.
+        workspace = NPUUlyssesSymmetricMemory(3 * max(math.prod(shape) for shape in _BENCHMARK_SHAPES) * 4)
+        if dist.get_rank() == 0:
+            print(
+                "\nExchange latency: ms, mean ± sample SD of 6 segment means per backend; "
+                "5 warmups, 3 ABBA blocks, 10 exchanges per segment, slowest rank. "
+                "Profiler disabled; positive reduction means faster.\n"
+                "| WORLD | dtype | layout | local [B,S,H,D] | operation | HCCL ms | symmetric memory ms | reduction |\n"
+                "| ---: | --- | --- | --- | --- | ---: | ---: | ---: |",
+                flush=True,
+            )
+        yield workspace
+    finally:
+        if workspace is not None:
+            workspace.close()
+
+
+def _benchmark_exchange_pair(hccl, symmetric_memory, device):
+    operations = (hccl, symmetric_memory)
+    for operation in operations:
+        for _ in range(5):
+            operation()
+        torch.npu.synchronize()
+    samples: tuple[list[float], list[float]] = ([], [])
+    for _ in range(3):
+        for index in (0, 1, 1, 0):
+            dist.barrier()
+            torch.npu.synchronize()
+            started = time.perf_counter()
+            for _ in range(10):
+                operation_result = operations[index]()
+                # Both backends allocate owned outputs; release them equally.
+                del operation_result
+            torch.npu.synchronize()
+            elapsed = torch.tensor((time.perf_counter() - started) * 1000 / 10, device=device, dtype=torch.float32)
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            samples[index].append(elapsed.item())
+    return samples
+
+
+@pytest.mark.benchmark
+@pytest.mark.skipif(
+    "LOCAL_RANK" not in os.environ or os.environ.get("VLLM_RUN_NPU_BENCHMARK") != "1",
+    reason="Opt-in: VLLM_RUN_NPU_BENCHMARK=1 in a scheduled multi-NPU torchrun job",
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.float32], ids=lambda dtype: str(dtype).split(".")[-1]
+)
+@pytest.mark.parametrize("layout", ["contiguous", "packed"])
+@pytest.mark.parametrize("shape", _BENCHMARK_SHAPES, ids=lambda shape: "x".join(map(str, shape)))
+def test_symmetric_memory_benchmark(shape, dtype, layout, symmetric_memory_benchmark_workspace, record_property):
+    from vllm_omni.diffusion.distributed.comm import all_to_all_4D
+
+    workspace = symmetric_memory_benchmark_workspace
+    world, rank = dist.get_world_size(), dist.get_rank()
+    device = torch.device("npu", torch.npu.current_device())
+    batch, seq, heads, dim = shape
+    with torch.inference_mode():
+        torch.manual_seed(6340 + rank)
+        packed = torch.randn(batch, seq, 3, heads, dim, device=device, dtype=dtype)
+        qkv = tuple(tensor.contiguous() if layout == "contiguous" else tensor for tensor in packed.unbind(2))
+        attention_output = torch.randn(batch, seq * world, heads // world, dim, device=device, dtype=dtype)
+
+        def hccl_qkv():
+            return tuple(all_to_all_4D(tensor, 2, 1) for tensor in qkv)
+
+        def fused_qkv():
+            return workspace.qkv(*qkv)
+
+        def hccl_o():
+            return all_to_all_4D(attention_output, 1, 2)
+
+        def fused_o():
+            return workspace(attention_output, reverse=True)
+
+        operations = {
+            "q_forward": (lambda: all_to_all_4D(qkv[0], 2, 1), lambda: workspace(qkv[0])),
+            "qkv_forward": (hccl_qkv, fused_qkv),
+            "o_reverse": (hccl_o, fused_o),
+            "qkv_and_o": (lambda: (*hccl_qkv(), hccl_o()), lambda: (*fused_qkv(), fused_o())),
+        }
+        for name, (hccl, fused) in operations.items():
+            expected, actual = hccl(), fused()
+            expected = (expected,) if isinstance(expected, torch.Tensor) else expected
+            actual = (actual,) if isinstance(actual, torch.Tensor) else actual
+            equal = all(torch.equal(a.view(torch.uint8), e.view(torch.uint8)) for a, e in zip(actual, expected))
+            failed = torch.tensor(int(not equal), device=device)
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            assert failed.item() == 0, f"{name}: symmetric memory/HCCL outputs differ"
+            del expected, actual
+            hccl_samples, fused_samples = _benchmark_exchange_pair(hccl, fused, device)
+            hccl_ms, fused_ms = statistics.mean(hccl_samples), statistics.mean(fused_samples)
+            reduction = (hccl_ms - fused_ms) / hccl_ms * 100
+            if rank == 0:
+                print(
+                    f"| {world} | {dtype} | {layout} | {list(shape)} | {name} | "
+                    f"{hccl_ms:.4f} ± {statistics.stdev(hccl_samples):.4f} | "
+                    f"{fused_ms:.4f} ± {statistics.stdev(fused_samples):.4f} | {reduction:+.1f}% |",
+                    flush=True,
+                )
+                record_property(
+                    name,
+                    json.dumps(
+                        dict(
+                            world=world,
+                            shape=shape,
+                            dtype=str(dtype),
+                            layout=layout,
+                            qkv_stride=qkv[0].stride(),
+                            soc=torch.npu.get_device_name(device),
+                            torch_version=str(torch.__version__),
+                            hccl_segment_ms=hccl_samples,
+                            symmetric_memory_segment_ms=fused_samples,
+                            reduction_percent=reduction,
+                        )
+                    ),
+                )
