@@ -8,7 +8,7 @@
 - Vendor: NVIDIA
 - Model: `nvidia/Alpamayo2-Super`
 - Task: Ego trajectory prediction with chain-of-thought reasoning
-- Mode: Offline inference (`Omni`)
+- Mode: Offline inference (`Omni`) and online serving (OpenPI WebSocket)
 - Hardware: 1x NVIDIA H200 141 GB
 - Maintainer: Community
 
@@ -162,6 +162,57 @@ trajectory:
 Sample i uses seed `seed + i` on both stages, like six separate requests with
 seeds 42 to 47.
 
+### Online serving
+
+Serve the policy over the [OpenPI API](../../docs/serving/openpi_api.md)
+WebSocket:
+
+```bash
+vllm serve nvidia/Alpamayo2-Super --omni --port 8091
+```
+
+A client sends the same observation as the offline script. A message is
+limited to 64 MiB, so the frames are sent at the model's resolution;
+`"sampling_params": {"n": 6}` returns six trajectories (omit it for one):
+
+```python
+import torch
+from alpamayo2_super.load_physical_aiavdataset import load_physical_aiavdataset
+from openpi_client.websocket_client_policy import WebsocketClientPolicy
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+from vllm_omni.model_executor.models.alpamayo2_super import Alpamayo2SuperConfig
+
+scene = load_physical_aiavdataset("030c760c-ae38-49aa-9ad8-f5650a545d26", t0_us=5_100_000)
+frames = scene["image_frames"]  # (cameras, 4, 3, H, W) uint8
+config = Alpamayo2SuperConfig.from_pretrained("nvidia/Alpamayo2-Super")
+height, width = smart_resize(
+    *frames.shape[-2:], factor=32, min_pixels=config.min_pixels, max_pixels=config.max_pixels
+)
+frames = (
+    torch.nn.functional.interpolate(frames.flatten(0, 1).float(), size=(height, width), mode="bicubic", antialias=True)
+    .round()
+    .clamp(0, 255)
+    .to(torch.uint8)
+    .unflatten(0, frames.shape[:2])
+)
+
+policy = WebsocketClientPolicy(host="ws://localhost:8091/v1/realtime/robot/openpi")
+trajectories = policy.infer(
+    {
+        "image_frames": frames.numpy(),
+        "camera_indices": scene["camera_indices"].numpy(),
+        "ego_history_xyz": scene["ego_history_xyz"].reshape(16, 3).numpy(),
+        "ego_history_rot": scene["ego_history_rot"].reshape(16, 3, 3).numpy(),
+        "seed": 42,
+        "sampling_params": {"n": 6},
+    }
+)
+assert trajectories.shape == (6, 64, 3)
+```
+
+The client needs `pip install openpi-client`.
+
 ## Verification
 
 The script ends with its check: one `(64, 3)` trajectory of finite positions.
@@ -221,7 +272,7 @@ One bounded run, not a benchmark:
 | Feature | Status | Guide |
 | --- | --- | --- |
 | Offline inference | Supported | This recipe |
-| Online serving | Not supported | [OpenPI API](../../docs/serving/openpi_api.md) |
+| Online serving | Supported (OpenPI WebSocket) | This recipe, [OpenPI API](../../docs/serving/openpi_api.md) |
 | Tensor parallelism | Not supported (TP=1) | [Stage configs](../../docs/configuration/stage_configs.md) |
 | CUDA graphs | Not supported (eager) | [Stage configs](../../docs/configuration/stage_configs.md) |
 | Quantization | Not supported (BF16) | [Quantization](../../docs/user_guide/quantization/overview.md) |

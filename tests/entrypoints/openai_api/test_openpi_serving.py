@@ -569,6 +569,42 @@ def test_multi_stage_policy_gets_prompt_and_params_for_every_stage(monkeypatch):
     assert engine.default_sampling_params_list[0].seed is None
 
 
+def test_multi_stage_policy_samples_n_on_the_first_stage(monkeypatch):
+    monkeypatch.setattr(openpi_serving, "resolve_obj_by_qualname", lambda path: FakePromptBuilder)
+    engine = MultiStageEngine()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    asyncio.run(
+        serving.infer({"state": np.zeros(2), "seed": 7, "sampling_params": {"n": 3}}, session_id="s", reset=False)
+    )
+
+    (call,) = engine.generate_calls
+    reasoning, diffusion = call["sampling_params_list"]
+    assert reasoning.n == 3 and reasoning.seed == 7 and diffusion.seed == 7
+    assert sorted(diffusion.extra_args["robot_obs"]) == ["state"]
+    assert engine.default_sampling_params_list[0].n == 1  # stage defaults are not mutated
+
+
+@pytest.mark.parametrize("n", [0, -1, 1.5, "2", True])
+def test_infer_rejects_an_invalid_n(n):
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    with pytest.raises(ValueError, match="sampling_params.n"):
+        asyncio.run(serving.infer({"sampling_params": {"n": n}}, session_id="s", reset=False))
+    assert not engine.generate_calls
+
+
+def test_single_stage_policy_rejects_n():
+    engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+    engine.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    with pytest.raises(ValueError, match="multi-stage"):
+        asyncio.run(serving.infer({"sampling_params": {"n": 2}}, session_id="s", reset=False))
+    assert not engine.generate_calls
+
+
 def test_multi_stage_policy_without_prompt_builder_keeps_observation_prompt():
     engine = MultiStageEngine(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
