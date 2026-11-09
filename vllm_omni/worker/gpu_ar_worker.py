@@ -26,6 +26,17 @@ from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 logger = init_logger(__name__)
 
 
+def _is_mammoth_moda2_vllm_config(vllm_config) -> bool:
+    """True when this stage loads a MammothModa2 AR / multimodal checkpoint."""
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str) and model_type.startswith("mammoth_moda2"):
+        return True
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any("MammothModa2" in str(arch) for arch in architectures)
+
+
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU worker for autoregressive omni model stages.
 
@@ -134,7 +145,16 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
-            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            runner_cls = self.model_runner_cls
+            # MammothModa2 MoE specialty capture/replay lives on a dedicated
+            # subclass so shared OmniGPUModelRunner stays a thin hook (#9865).
+            if runner_cls is GPUARModelRunner and _is_mammoth_moda2_vllm_config(self.vllm_config):
+                from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import (
+                    MammothGPUARModelRunner,
+                )
+
+                runner_cls = MammothGPUARModelRunner
+            self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

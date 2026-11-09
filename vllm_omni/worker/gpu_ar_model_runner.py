@@ -1341,8 +1341,8 @@ class GPUARModelRunner(
                 use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
-            # #9865: dispatch defaults moe_routing_key to BLEND. Retarget from
-            # the unpadded scheduled ids so ALL_UND / ALL_GEN replay on decode.
+            # #9865: thin hook — MammothGPUARModelRunner retargets specialty
+            # graphs; default Omni/AR implementation is a no-op.
             batch_desc = self._select_moe_replay_batch_descriptor(
                 cudagraph_mode,
                 batch_desc,

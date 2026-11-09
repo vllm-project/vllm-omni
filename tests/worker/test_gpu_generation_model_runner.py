@@ -451,11 +451,9 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
 
 @pytest.mark.parametrize("num_warmups", [0, 3], ids=["zero", "nonzero"])
 def test_generation_runner_warmup_capture_drops_moe_kwarg(monkeypatch, num_warmups):
-    """#9911 P1: the shared ``_warmup_and_capture`` must not pass
-    ``force_moe_routing_key`` to ``GPUGenerationModelRunner._dummy_run``, which
-    accepts neither that keyword nor ``**kwargs``. MoE routing specialization is
-    disabled on this runner, so the kwarg is dropped instead of raising an
-    unexpected-keyword TypeError on a non-eager V1 generation stage.
+    """#9911 P1: generation ``_warmup_and_capture`` (upstream / non-Mammoth)
+    must not pass ``force_moe_routing_key`` to ``GPUGenerationModelRunner._dummy_run``,
+    which accepts neither that keyword nor ``**kwargs``.
     """
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     runner = object.__new__(GPUGenerationModelRunner)

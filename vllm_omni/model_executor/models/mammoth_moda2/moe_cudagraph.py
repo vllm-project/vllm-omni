@@ -150,3 +150,194 @@ def capture_mask_for_routing_key(
     if num_tokens > 2:
         mask[2:] = True
     return mask
+
+
+# ---------------------------------------------------------------------------
+# Runner-facing helpers (used by MammothGPUARModelRunner only)
+# ---------------------------------------------------------------------------
+
+def moe_routing_specialize_enabled(runner: object) -> bool:
+    return bool(getattr(getattr(runner, "compilation_config", None), "cudagraph_specialize_moe_routing", False))
+
+
+def find_gen_vocab_start_index(runner: object) -> int | None:
+    cursor = getattr(runner, "model", None)
+    # Mammoth pipeline wraps AR as ``model.ar.language_model``.
+    for _ in range(4):
+        if cursor is None:
+            return None
+        gen_start = getattr(cursor, "gen_vocab_start_index", None)
+        if gen_start is not None:
+            return int(gen_start)
+        cursor = getattr(cursor, "language_model", None) or getattr(cursor, "ar", None)
+    return None
+
+
+def _warn_missing_gen_vocab_start_index_once(runner: object) -> None:
+    if getattr(runner, "_warned_missing_gen_vocab_start_index", False):
+        return
+    runner._warned_missing_gen_vocab_start_index = True  # type: ignore[attr-defined]
+    from vllm.logger import init_logger
+
+    init_logger(__name__).warning(
+        "cudagraph_specialize_moe_routing is enabled but no gen_vocab_start_index "
+        "was found on the model; MoE CUDA-graph replay will stay on the BLEND "
+        "graph and the ALL_UND / ALL_GEN graphs will never be selected. Check "
+        "the model wrapper path used by this stage."
+    )
+
+
+def resolve_moe_routing_key(
+    runner: object,
+    *,
+    force_moe_routing_key: int | None = None,
+    num_tokens: int | None = None,
+    token_ids: torch.Tensor | None = None,
+    token_ids_provided: bool = False,
+) -> MoERoutingKey:
+    if force_moe_routing_key is not None:
+        return MoERoutingKey(int(force_moe_routing_key))
+    if not moe_routing_specialize_enabled(runner):
+        return MoERoutingKey.BLEND
+    gen_start = find_gen_vocab_start_index(runner)
+    if gen_start is None:
+        # Specialize is on, so ALL_UND / ALL_GEN graphs are being captured
+        # for a model we cannot classify. Warning once here keeps the
+        # pre-fix failure mode (capture then never select) visible instead
+        # of silent.
+        _warn_missing_gen_vocab_start_index_once(runner)
+        return MoERoutingKey.BLEND
+    if token_ids_provided:
+        return moe_routing_key_from_input_ids(token_ids, int(gen_start))
+    if num_tokens is None:
+        return MoERoutingKey.BLEND
+    input_ids = runner.input_ids.gpu[:num_tokens]  # type: ignore[attr-defined]
+    return moe_routing_key_from_input_ids(input_ids, int(gen_start))
+
+
+def annotate_moe_routing_batch_descriptor(
+    runner: object,
+    batch_desc,
+    *,
+    num_tokens: int,
+    force_moe_routing_key: int | None = None,
+):
+    """Pin the MoE specialty on the graph key used for capture."""
+    from vllm_omni.cudagraph.moe_routing_dispatcher import with_moe_routing_key
+
+    moe_key = resolve_moe_routing_key(
+        runner,
+        force_moe_routing_key=force_moe_routing_key,
+        num_tokens=num_tokens,
+    )
+    return with_moe_routing_key(batch_desc, moe_key)
+
+
+def select_moe_replay_batch_descriptor(runner: object, mode, batch_desc, num_tokens: int):
+    """Choose the FULL specialty graph for this step's scheduled tokens.
+
+    Capture records BLEND / ALL_UND / ALL_GEN. ``CudagraphDispatcher.dispatch``
+    is invoked by upstream padding logic without a routing key, so the
+    descriptor it returns is BLEND. Replay has to retarget that descriptor
+    before ``set_forward_context`` or the specialized graphs never run.
+    """
+    from vllm.logger import init_logger
+
+    from vllm_omni.cudagraph.moe_routing_dispatcher import apply_moe_routing_key
+
+    if not moe_routing_specialize_enabled(runner):
+        return batch_desc
+    input_ids = getattr(runner, "input_ids", None)
+    prev_sampled = getattr(getattr(runner, "input_batch", None), "prev_sampled_token_ids", None)
+    token_ids = routing_ids_for_replay(
+        None if input_ids is None else getattr(input_ids, "cpu", None),
+        None if input_ids is None else getattr(input_ids, "gpu", None),
+        num_tokens=num_tokens,
+        prev_sampled_token_ids=prev_sampled,
+    )
+    requested = resolve_moe_routing_key(runner, token_ids=token_ids, token_ids_provided=True)
+    dispatcher = getattr(runner, "cudagraph_dispatcher", None)
+    captured = () if dispatcher is None else dispatcher.cudagraph_keys.get(mode, ())
+    selected = apply_moe_routing_key(mode, batch_desc, requested, captured, enabled=True)
+    selected_key = int(getattr(selected, "moe_routing_key", int(MoERoutingKey.BLEND)))
+    logger = init_logger(__name__)
+    # Mixed und/gen traffic flips this every few steps, so only the first
+    # selection is worth INFO. Later flips stay at DEBUG to keep the worker
+    # log readable.
+    if getattr(runner, "_last_moe_routing_replay_key", None) is not None:
+        logger.debug(
+            "Mammoth MoE CUDA-graph replay specialty %s (requested %s, num_tokens=%s, mode=%s)",
+            MoERoutingKey(selected_key).name,
+            requested.name,
+            num_tokens,
+            getattr(mode, "name", mode),
+        )
+    else:
+        logger.info(
+            "Mammoth MoE CUDA-graph replay specialty is %s (requested %s, num_tokens=%s, mode=%s); "
+            "further changes log at DEBUG",
+            MoERoutingKey(selected_key).name,
+            requested.name,
+            num_tokens,
+            getattr(mode, "name", mode),
+        )
+    runner._last_moe_routing_replay_key = selected_key  # type: ignore[attr-defined]
+    return selected
+
+
+def warmup_and_capture_with_moe_routing(
+    runner: object,
+    desc,
+    cudagraph_runtime_mode,
+    profile_seq_lens: int | None = None,
+    allow_microbatching: bool = False,
+    num_warmups: int | None = None,
+    profiler=None,
+) -> None:
+    """Capture one graph; honour ``desc.moe_routing_key`` when specializing (#9865)."""
+    from contextlib import nullcontext
+
+    import torch
+    from vllm.config import CUDAGraphMode
+
+    if profiler is None:
+        profiler = nullcontext()
+    if num_warmups is None:
+        num_warmups = runner.compilation_config.cudagraph_num_of_warmups  # type: ignore[attr-defined]
+    force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+    moe_key = int(getattr(desc, "moe_routing_key", MoERoutingKey.BLEND))
+    # Always force the capture key on the Mammoth runner — BLEND included —
+    # so the resolver cannot reclassify a uniform dummy buffer as ALL_UND/ALL_GEN.
+    moe_kwargs = {"force_moe_routing_key": moe_key} if moe_routing_specialize_enabled(runner) else {}
+    for _ in range(num_warmups):
+        runner._dummy_run(  # type: ignore[attr-defined]
+            desc.num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            force_attention=force_attention,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            profile_seq_lens=profile_seq_lens,
+            **moe_kwargs,
+        )
+    if num_warmups > 0:
+        torch.accelerator.synchronize()
+    with (
+        profiler,
+        torch.profiler.record_function(f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}_moe{moe_key}"),
+        moe_routing_key_scope(MoERoutingKey(moe_key)),
+    ):
+        runner._dummy_run(  # type: ignore[attr-defined]
+            desc.num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            is_graph_capturing=True,
+            profile_seq_lens=profile_seq_lens,
+            **moe_kwargs,
+        )

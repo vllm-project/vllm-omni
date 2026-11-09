@@ -121,11 +121,12 @@ def test_routing_ids_ignore_padding_and_stale_cpu_under_async() -> None:
 
 
 def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
+    from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import MammothGPUARModelRunner
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
     base = BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True)
     captured = {replace(base, moe_routing_key=int(key)) for key in MoERoutingKey}
-    runner = object.__new__(OmniGPUModelRunner)
+    runner = object.__new__(MammothGPUARModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
     runner.model = SimpleNamespace(gen_vocab_start_index=100)
     # Real decode token is gen; the padded tail and the GPU buffer are not.
@@ -136,7 +137,7 @@ def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
     runner.input_batch = SimpleNamespace(prev_sampled_token_ids=None)
     runner.cudagraph_dispatcher = SimpleNamespace(cudagraph_keys={CUDAGraphMode.FULL: captured})
 
-    selected = OmniGPUModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
+    selected = MammothGPUARModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
     assert selected.moe_routing_key == int(MoERoutingKey.ALL_GEN)
     assert runner._last_moe_routing_replay_key == int(MoERoutingKey.ALL_GEN)
 
@@ -144,12 +145,16 @@ def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
     runner.input_ids.cpu = torch.tensor([3, 0, 0, 0, 0, 0, 0, 0])
     runner.input_ids.gpu = torch.zeros(8, dtype=torch.int64)
     runner.input_ids.gpu[0] = 180
-    selected = OmniGPUModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
+    selected = MammothGPUARModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
     assert selected.moe_routing_key == int(MoERoutingKey.ALL_GEN)
 
     runner.compilation_config.cudagraph_specialize_moe_routing = False
-    unchanged = OmniGPUModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
+    unchanged = MammothGPUARModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
     assert unchanged == base
+
+    # Shared base hook stays a no-op for non-Mammoth runners.
+    shared = object.__new__(OmniGPUModelRunner)
+    assert OmniGPUModelRunner._select_moe_replay_batch_descriptor(shared, CUDAGraphMode.FULL, base, 1) is base
 
 
 def test_ar_execute_model_retargets_replay_descriptor() -> None:
