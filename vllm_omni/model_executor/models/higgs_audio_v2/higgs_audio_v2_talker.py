@@ -1545,30 +1545,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         req_ids = input_batch.req_ids
         return [req_ids[j] for j in range(n) for _ in range(int(cu[j + 1]) - int(cu[j]))]
 
-    def _split_codes_by_request(self, codes: torch.Tensor | None, input_batch: Any) -> dict[Any, torch.Tensor]:
-        """Split the sampled code rows into a req_id-keyed map for postprocess.
-
-        The MRV2 runner's postprocess runs before the step's sampling, so it
-        serves each request the previous step's entry. Row ownership follows
-        the ``cu_num_logits`` prefix, as in :meth:`_row_req_ids`.
-        """
-        from vllm_omni.worker_v2.warmup import is_warmup_request
-
-        if codes is None:
-            return {}
-        # Prefer the host copy: reading the device prefix here would add a
-        # synchronization to every MRV2 sampling step.
-        cu_np = getattr(input_batch, "cu_num_logits_np", None)
-        cu = cu_np if cu_np is not None else input_batch.cu_num_logits
-        ends = cu[1 : input_batch.num_reqs + 1].tolist()
-        starts = cu[: input_batch.num_reqs].tolist()
-        pending: dict[Any, torch.Tensor] = {}
-        for i, req_id in enumerate(input_batch.req_ids):
-            lo, hi = int(starts[i]), int(ends[i])
-            if hi > lo and not is_warmup_request(req_id):
-                pending[req_id] = codes[lo:hi]
-        return pending
-
     def _current_codes_by_request(self, input_batch: Any) -> dict[str, Any]:
         """Own and publish this sampling step's codes in current batch order.
 
@@ -1585,14 +1561,23 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         cu_np = getattr(input_batch, "cu_num_logits_np", None)
         cu = cu_np if cu_np is not None else input_batch.cu_num_logits
         num_codebooks = int(codes.shape[-1])
-        rows: list[torch.Tensor] = []
-        for i in range(input_batch.num_reqs):
-            lo = int(cu[i])
-            hi = int(cu[i + 1])
-            slice_codes = codes[lo:hi]
-            valid = slice_codes[:, 0] >= 0
-            rows.append(slice_codes[valid].to(dtype=torch.int32).clone())
-            if rows[-1].ndim != 2 or rows[-1].shape[1] != num_codebooks:
+        starts = [int(value) for value in cu[: input_batch.num_reqs]]
+        ends = [int(value) for value in cu[1 : input_batch.num_reqs + 1]]
+
+        # Ignore padding rows outside the request-owned cu_num_logits prefix.
+        if ends:
+            codes = codes[: ends[-1]]
+        # Apply one mask for the whole batch. Per-request boolean indexing asks
+        # CUDA for each slice's result size and synchronizes once per request;
+        # transferring the mask once lets the request rows be split as views.
+        valid = codes[:, 0] >= 0
+        valid_host = valid.tolist()
+        counts = [sum(valid_host[lo:hi]) for lo, hi in zip(starts, ends, strict=True)]
+        # Own the payload because the reusable source buffer is overwritten by the next sampling step.
+        packed = codes[valid].to(dtype=torch.int32).clone()
+        rows = list(torch.split(packed, counts)) if counts else []
+        for row in rows:
+            if row.ndim != 2 or row.shape[1] != num_codebooks:
                 raise RuntimeError("Higgs Audio v2 MRV2 code payload lost its codebook dimension")
         return {"codes": {"audio": rows}}
 
@@ -1623,23 +1608,21 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         repeats, so finished entries would otherwise retain their
         ``audio_out_ids`` GPU tensors for the process lifetime. Under V1 the
         batch-row keys are bounded by slot reuse, so the hook is a no-op
-        there. Aborted requests may also leave an unconsumed entry in
-        Preempted requests keep their state: a recomputed request must resume
-        its delay-pattern history.
+        there. Aborted requests may also leave state behind. Preempted requests
+        keep their state: a recomputed request must resume its delay-pattern
+        history.
         """
         state = getattr(self, "_audio_state", None)
         lens = getattr(self, "_slot_output_len", None)
-        pending = getattr(self, "_pending_codes_by_req", None)
         for req_id in finished_req_ids:
             if isinstance(state, dict):
                 state.pop(req_id, None)
             if isinstance(lens, dict):
                 lens.pop(req_id, None)
-            if isinstance(pending, dict):
-                pending.pop(req_id, None)
 
     def create_omni_model_state(self, vllm_config, encoder_cache, device):
         """MRV2 model state with per-forward audio-state view realignment."""
+        self._mrv2_active = True
         from .model_state import HiggsAudioV2ModelState
 
         return HiggsAudioV2ModelState(vllm_config, self, encoder_cache, device)
@@ -1850,20 +1833,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """Publish per-request audio codes into model_intermediate_buffer.
 
         The V1 runner calls postprocess in batch order right after sampling,
-        so the positional cursor over ``_last_audio_codes`` remains the
-        fallback there. MRV2 publishes current codes from its sampling hook
-        before the runner snapshots the output.
+        so the positional cursor over ``_last_audio_codes`` remains valid
+        there. MRV2 publishes current codes from its sampling hook before the
+        runner snapshots the output, so this forward-time hook must be a no-op
+        under MRV2 rather than replaying the previous step's rows.
         """
+        if getattr(self, "_mrv2_active", False):
+            return {}
         _ = multimodal_outputs  # consumed by the runner directly
-        # Keep the explicit legacy map contract for V1 callers and older
-        # adapters. The MRV2 sampler never populates this map; it publishes
-        # current-step rows through ``OmniSamplingOutput`` instead.
-        pending = getattr(self, "_pending_codes_by_req", None)
-        if pending is not None:
-            slice_codes = pending.pop(req_infos.get("req_id"), None)
-            if slice_codes is None:
-                return {}
-            return self._emit_code_rows(slice_codes)
         codes_full = getattr(self, "_last_audio_codes", None)
         if codes_full is None:
             return {}

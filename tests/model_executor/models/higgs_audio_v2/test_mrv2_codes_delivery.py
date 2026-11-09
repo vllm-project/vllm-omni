@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MRV2 codes-delivery mechanics for the Higgs Audio v2 talker.
 
-Drives the real split/postprocess pair with synthetic batches: cu_num_logits
-is an inclusive prefix of length num_reqs + 1 and stays the authority for
-row-to-request ownership. Wrong slicing shifts every request's audio codes
-onto its neighbor. Also locks the req_id keying for bias state lookup and
-delay-pattern attribution, the mixed-step audio-feedback owner walk, the V1
-bias walks, and the finished-request state cleanup.
+Drives the real sampler/postprocess pair with synthetic batches:
+cu_num_logits is an inclusive prefix of length num_reqs + 1 and stays the
+authority for row-to-request ownership. Wrong slicing shifts every request's
+audio codes onto its neighbor. Also locks the req_id keying for bias state
+lookup and delay-pattern attribution, the mixed-step audio-feedback owner
+walk, the V1 bias walks, and the finished-request state cleanup.
 """
 
 from types import SimpleNamespace
@@ -38,34 +38,34 @@ def _batch(req_ids, cu, with_np=False):
     return ns
 
 
-def test_decode_step_maps_each_request_to_its_own_row():
-    t = _talker()
-    # Three decode rows; row content is unique per request.
-    codes = torch.tensor([[11, 11], [22, 22], [33, 33]], dtype=torch.long)
-    pending = t._split_codes_by_request(codes, _batch(["a", "b", "c"], [0, 1, 2, 3]))
-    assert set(pending) == {"a", "b", "c"}
-    assert pending["a"][0, 0].item() == 11
-    assert pending["b"][0, 0].item() == 22
-    assert pending["c"][0, 0].item() == 33
-
-
 def test_mrv2_current_codes_keep_request_slots_and_own_storage():
     t = _talker()
     batch = _batch(["a", "b", "c"], [0, 2, 2, 4], with_np=True)
-    current = torch.tensor([[11, 12], [13, 14], [21, 22], [23, 24]], dtype=torch.long)
+    current = torch.tensor([[11, 12], [13, 14], [-1, -1], [23, 24]], dtype=torch.long)
     t._last_audio_codes = current
 
     payload = t._current_codes_by_request(batch)
     rows = payload["codes"]["audio"]
-    assert [tuple(row.shape) for row in rows] == [(2, 2), (0, 2), (2, 2)]
+    assert [tuple(row.shape) for row in rows] == [(2, 2), (0, 2), (1, 2)]
     torch.testing.assert_close(rows[0], current[:2].to(torch.int32))
-    torch.testing.assert_close(rows[2], current[2:].to(torch.int32))
+    torch.testing.assert_close(rows[2], current[3:].to(torch.int32))
 
     # The runner can safely consume the payload after the model's reusable
     # current-step buffer is changed by the next sampling step.
     current.fill_(99)
     torch.testing.assert_close(rows[0], torch.tensor([[11, 12], [13, 14]], dtype=torch.int32))
-    torch.testing.assert_close(rows[2], torch.tensor([[21, 22], [23, 24]], dtype=torch.int32))
+    torch.testing.assert_close(rows[2], torch.tensor([[23, 24]], dtype=torch.int32))
+
+
+def test_mrv2_current_codes_ignore_trailing_rows():
+    t = _talker()
+    batch = _batch(["a", "b"], [0, 1, 2], with_np=True)
+    t._last_audio_codes = torch.tensor([[11, 12], [23, 24], [99, 99]], dtype=torch.long)
+
+    rows = t._current_codes_by_request(batch)["codes"]["audio"]
+
+    torch.testing.assert_close(rows[0], torch.tensor([[11, 12]], dtype=torch.int32))
+    torch.testing.assert_close(rows[1], torch.tensor([[23, 24]], dtype=torch.int32))
 
 
 def test_mrv2_sampler_publishes_current_codes_before_batch_reordering():
@@ -104,49 +104,40 @@ def test_mrv2_sampler_publishes_current_codes_before_batch_reordering():
     assert result.owns_multimodal_outputs
 
 
-def test_mixed_prefill_step_skips_request_without_logits_rows():
+def test_mixed_prefill_step_keeps_request_rows_aligned():
     t = _talker()
     # Layout where prefilling "a" owns no row while "b" and "c" own rows 0
-    # and 1: the cu prefix stays the authority, and a positional-cursor
-    # consumer would hand row 0 to "a".
-    codes = torch.tensor([[22, 22], [33, 33]], dtype=torch.long)
-    pending = t._split_codes_by_request(codes, _batch(["a", "b", "c"], [0, 0, 1, 2]))
-    assert set(pending) == {"b", "c"}
-    assert pending["b"][0, 0].item() == 22
-    assert pending["c"][0, 0].item() == 33
-
-
-def test_warmup_requests_are_excluded():
-    t = _talker()
-    codes = torch.tensor([[11, 11], [22, 22]], dtype=torch.long)
-    pending = t._split_codes_by_request(codes, _batch(["_warmup_abc", "real"], [0, 1, 2]))
-    assert set(pending) == {"real"}
-    assert pending["real"][0, 0].item() == 22
+    # and 1: the cu prefix stays the authority, and a positional consumer
+    # would hand row 0 to "a".
+    t._last_audio_codes = torch.tensor([[22, 22], [33, 33]], dtype=torch.long)
+    rows = t._current_codes_by_request(_batch(["a", "b", "c"], [0, 0, 1, 2]))["codes"]["audio"]
+    assert [tuple(row.shape) for row in rows] == [(0, 2), (1, 2), (1, 2)]
+    assert rows[1][0, 0].item() == 22
+    assert rows[2][0, 0].item() == 33
 
 
 def _audio_row(update):
     return update["codes"]["audio"][0].tolist()
 
 
-def test_postprocess_serves_pending_map_and_falls_back_to_cursor():
+def test_v1_postprocess_falls_back_to_cursor():
     t = _talker()
-    t._pending_codes_by_req = {
-        "a": torch.tensor([[11, 11]], dtype=torch.long),
-        "b": torch.tensor([[-1, -1]], dtype=torch.long),
-    }
-    # Hit: real codes for "a"; placeholder row for "b" emits nothing; "c" has no entry.
-    assert _audio_row(t.postprocess(torch.zeros(1, 4), req_id="a")) == [11, 11]
-    assert t.postprocess(torch.zeros(1, 4), req_id="b") == {}
-    assert t.postprocess(torch.zeros(1, 4), req_id="c") == {}
-
-    # V1 fallback: without the pending map, the positional cursor walks rows.
-    t._pending_codes_by_req = None
     t._last_audio_codes = torch.tensor([[11, 11], [22, 22]], dtype=torch.long)
     t._postprocess_cursor = 0
     first = t.postprocess(torch.zeros(1, 4), req_id="a")
     second = t.postprocess(torch.zeros(1, 4), req_id="b")
     assert _audio_row(first) == [11, 11]
     assert _audio_row(second) == [22, 22]
+
+
+def test_mrv2_postprocess_does_not_replay_previous_codes():
+    t = _talker()
+    t._mrv2_active = True
+    t._last_audio_codes = torch.tensor([[11, 11]], dtype=torch.long)
+    t._postprocess_cursor = 0
+
+    assert t.postprocess(torch.zeros(1, 4), req_id="a") == {}
+    assert t._postprocess_cursor == 0
 
 
 def test_audio_state_survives_batch_row_shift():
@@ -366,29 +357,21 @@ def test_dispatch_keys_state_by_row_owner_in_mixed_step():
     assert t._audio_state["c"]["audio_out_ids"].shape == (8, 1)
 
 
-def test_on_requests_finished_drops_only_finished_state():
+def test_on_requests_finished_drops_finished_state():
     t = _talker()
     t._audio_state = {
         "a": {"num_delay": 3, "num_remaining_delays": None, "audio_out_ids": torch.zeros(8, 2, dtype=torch.long)},
         "b": {"num_delay": 0, "num_remaining_delays": None, "audio_out_ids": torch.zeros(8, 4, dtype=torch.long)},
     }
     t._slot_output_len = {"a": 5, "b": 6}
-    # "a" was aborted after its last sampling step: its codes row waits in
-    # the pending map for a postprocess walk that will never come.
-    t._pending_codes_by_req = {
-        "a": torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
-        "b": torch.tensor([[2, 2, 2, 2, 2, 2, 2, 2]], dtype=torch.long),
-    }
 
     t.on_requests_finished({"a"})
     assert set(t._audio_state) == {"b"}
     assert set(t._slot_output_len) == {"b"}
-    assert set(t._pending_codes_by_req) == {"b"}
 
     # Unknown ids are no-ops; a preempted (not finished) id keeps its state.
     t.on_requests_finished({"nope"})
     assert set(t._audio_state) == {"b"}
-    assert set(t._pending_codes_by_req) == {"b"}
     assert t._audio_state["b"]["audio_out_ids"].shape == (8, 4)
 
 

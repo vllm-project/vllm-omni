@@ -1279,8 +1279,6 @@ def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
     assert output.inter_stage_outputs is not None
     torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)
     engine_output = _rehydrated_output(pooling_output=(output.pooler_output or [None])[0])
-    if output.multimodal_outputs is not None:
-        engine_output.multimodal_output = output.multimodal_outputs[0]
     processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
     processed = processor.process_outputs([engine_output])
     payload = processed.request_outputs[0].outputs[0].multimodal_output
@@ -1312,3 +1310,34 @@ def test_full_payload_fallback_codes_have_explicit_inter_stage_ownership(monkeyp
     assert output.pooler_output is output.inter_stage_outputs
     assert output.inter_stage_outputs is not None
     torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)
+
+
+@pytest.mark.cpu
+def test_full_payload_fallback_splits_client_root_keys(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    codes = torch.full((1, 8), 7, dtype=torch.int32)
+    audio = torch.arange(4, dtype=torch.float32)
+    sample_rate = torch.tensor(24000, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": codes.clone()}, "audio": audio, "sr": sample_rate},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    assert output.multimodal_outputs is not None
+    assert "codes.audio" in output.inter_stage_outputs[0]
+    assert "audio" not in output.inter_stage_outputs[0]
+    assert "sr" not in output.inter_stage_outputs[0]
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], codes)
+    torch.testing.assert_close(output.multimodal_outputs[0]["audio"], audio)
+    torch.testing.assert_close(output.multimodal_outputs[0]["sr"], sample_rate)
