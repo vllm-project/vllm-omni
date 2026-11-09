@@ -4,7 +4,6 @@
 - Admission overlay
 - Cell commands
 - Per-stage GPU attribution
-- Envelope sweep
 - Device peaks
 - Pitfalls
 
@@ -269,22 +268,6 @@ Choose the cheapest method that the hardware allows.
 `--print-stage` `stage_gen_time` is per-request wall time inside a stage.
 Under batching it overlaps across requests and is not GPU time; use it for
 the low-concurrency bound and for spotting the slowest stage, not for `g_i`.
-
-## Envelope sweep
-
-One configuration lever per column, same commit and workload:
-
-| Lever | Typical knob |
-|-------|-------------|
-| Admission | stage `max_num_seqs`, `max_sessions` |
-| Runner | `model_runner: v2` per stage, or the model's MRv2 profile |
-| Graph coverage | graph batch limits, graph budgets, capture sizes |
-| Micro-batching | per-stage micro-batch or chunk scheduling knobs |
-| Co-location | `cuda_mps` (CUDA only), `gpu_memory_utilization`, placement |
-| Replicas | replica profiles for the binding stage |
-
-Keep the best value per cell. Numerics-changing levers go in a separate
-column with their quality delta.
 
 ## Device peaks
 

@@ -1,26 +1,20 @@
 ---
 name: omni-perf-ceiling
-description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF, TTFT or first-audio latency (AUDIO_TTFP) at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured, configuration-envelope, and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
+description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF, TTFT or first-audio latency (AUDIO_TTFP) at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
 ---
 
 # Omni Performance Ceiling
 
-Answer "how fast can this get, and where is the remaining gap" with three
+Answer "how fast can this get, and where is the remaining gap" with two
 numbers per target, not one:
 
 1. **Measured**: the shipped configuration on the target hardware.
-2. **Envelope**: the best value over configuration-only changes (capacity,
-   graph budgets, batch knobs, MRv2/V1, MPS, placement), plus any existence
-   proof (another engine or the reference implementation on the same
-   hardware, workload, and output mode). This is a deployment envelope, not
-   the fastest kernel per op across libraries.
-3. **Bound**: a physical floor derived from per-stage work and measured
+2. **Bound**: a physical floor derived from per-stage work and measured
    device peaks. Work is counted on the checkpoint's reference (transformers)
    implementation, so the bound belongs to the model, not to the engine
    being measured.
 
-`envelope - bound` is code headroom; `measured - envelope` is configuration
-headroom. Report both, per stage.
+`measured - bound` is the headroom. Report it per stage.
 
 ## First questions
 
@@ -35,10 +29,8 @@ In addition, fix:
   first-chunk work; compare engines only within one mode.
 - Device budget: one shared device, or one device per stage.
 - Accelerator: CUDA GPU or Ascend NPU. On Ascend read
-  [references/npu-ceiling.md](references/npu-ceiling.md) first; the MPS lever
-  and per-process SM attribution are not available there.
-- Whether numerics-changing levers (TF32, FP16 CFM, quantization) are inside
-  the envelope. Default: report them in a separate column.
+  [references/npu-ceiling.md](references/npu-ceiling.md) first; MPS and
+  per-process SM attribution are not available there.
 
 ## Two regimes
 
@@ -116,13 +108,7 @@ has no queueing term, so judge it at concurrency 1.
    Experiment recipes:
    [references/ceiling-experiments.md](references/ceiling-experiments.md).
 
-6. **Explore the envelope.** Change one configuration lever per column
-   (capacity, graph batch limits, micro-batch size, runner, MPS, replicas,
-   placement). Keep the best column per cell. Quality must stay within
-   run-to-run variance (`omni-perf-opt` quality gate) for the envelope to
-   count.
-
-7. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
+6. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
    memory bandwidth, dense matmul throughput and per-kernel launch latency
    (eager and graph replay). Run `scripts/count_reference_work.py` on the
    checkpoint for work counts: it builds the reference transformers model on
@@ -146,7 +132,7 @@ has no queueing term, so judge it at concurrency 1.
    the form `a / d + b`, a TTFT floor (terms gating stage 0) and a TTFP floor
    (all terms).
 
-8. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
+7. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
    flags so `ceiling_report.py` joins each term to that stage's measured
    `g_i` and reports its % of SOL (bound / measured, at most 100%). A stage
    far below SOL with a compute or memory bound needs kernel or batching
@@ -164,7 +150,7 @@ has no queueing term, so judge it at concurrency 1.
    readings beside the bound: the projection is not a floor, and the profiled
    floor constrains only the implementation that was profiled.
 
-9. **Report.** Fill the template below. Hand the largest gap to
+8. **Report.** Fill the template below. Hand the largest gap to
    `omni-perf-opt` as its first candidate.
 
 ## Rules
@@ -172,8 +158,6 @@ has no queueing term, so judge it at concurrency 1.
 - Do not quote a ceiling without the measured cell beside it on the same
   commit and hardware.
 - Historical numbers are context, not evidence for the current revision.
-- An existence proof must match output mode, reference audio policy,
-  dataset subset, and RTF definition. Otherwise list it as context.
 - Physical bounds are lower limits on time, not predictions. Name the
   dominant term and the assumptions it hides (perfect batching, no host
   overhead, peak bandwidth). A target-efficiency projection and a profiled
@@ -210,25 +194,19 @@ has no queueing term, so judge it at concurrency 1.
 - A cell whose throughput is still rising with concurrency is not saturated;
   its aggregate RTF floor is the next cell's, not this one's.
 - A ceiling belongs to one accelerator. Bounds scale with that device's
-  measured peaks and the envelope with the levers it actually has, so never
-  carry a CUDA ceiling, or a CUDA lever's delta, to Ascend or back.
-- The best configuration can differ per cell (a latency-optimized stage at
-  concurrency 1 can saturate first at high concurrency). Report the envelope
-  configuration next to each cell instead of one "best" profile.
-- A lever that changes nothing is a free repeat; use it to state run-to-run
-  noise when repeats were not budgeted.
+  measured peaks, so never carry a CUDA ceiling to Ascend or back.
 
 ## Report template
 
 ```markdown
 ## Ceiling summary
-| Cell | Measured | Envelope (config) | Bound | % of SOL | Binding term |
-|------|----------|-------------------|-------|----------|--------------|
-| RTF C1 (mean / aggregate) | | | | | |
-| RTF C64 (mean / aggregate) | | | | | |
-| Audio throughput C64 (audio-s/s) | | | | | |
-| TTFT C1 (ms, mean) | | | | | |
-| AUDIO_TTFP C1 (ms, mean) | | | | | |
+| Cell | Measured | Bound | % of SOL | Binding term |
+|------|----------|-------|----------|--------------|
+| RTF C1 (mean / aggregate) | | | | |
+| RTF C64 (mean / aggregate) | | | | |
+| Audio throughput C64 (audio-s/s) | | | | |
+| TTFT C1 (ms, mean) | | | | |
+| AUDIO_TTFP C1 (ms, mean) | | | | |
 
 ## Setup
 - vllm-omni <sha>, vllm <ver>, <GPU>, driver
@@ -279,8 +257,7 @@ term left "not bounded: <reason>"]
   capacity models, Little's law, roofline bounds for decode and compute
   stages
 - [references/ceiling-experiments.md](references/ceiling-experiments.md):
-  admission overlays, per-stage device attribution, envelope sweeps, peak
-  measurement
+  admission overlays, per-stage device attribution, peak measurement
 - [references/npu-ceiling.md](references/npu-ceiling.md): what the method keeps
   on Ascend NPU, what MPS and pmon are replaced by, reservation and
   `npu-smi` sampling, and how the bound terms shift

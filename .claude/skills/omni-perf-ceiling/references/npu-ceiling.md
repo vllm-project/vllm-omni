@@ -9,7 +9,6 @@ What the skill's method keeps on Ascend, what it loses, and the replacements.
 - Utilisation sampling
 - Per-stage attribution
 - Device peaks and bound terms
-- Envelope levers
 - Pitfalls
 
 ## What carries over unchanged
@@ -35,16 +34,11 @@ mechanics below are CUDA-specific.
 
 | CUDA mechanism | Ascend status | Replacement |
 |---|---|---|
-| `cuda_mps` co-location lever | Not available. `OmniStageRuntime._mps_environment` requires `current_omni_platform.is_cuda()` and logs `cuda_mps disabled` otherwise | Drop the column. Stages time-share the device through the driver; there is no MPS-equivalent to toggle |
+| `cuda_mps` co-location | Not available. `OmniStageRuntime._mps_environment` requires `current_omni_platform.is_cuda()` and logs `cuda_mps disabled` otherwise | None. Stages time-share the device through the driver; there is no MPS-equivalent to toggle |
 | `nvidia-smi pmon -s u` per-process SM share | No per-process AI Core counter. `npu-smi info -t proc-mem` reports memory only | `--stage-util` with one device per stage, or `msprof` per stage |
 | `nvidia-smi --query-gpu` CSV | Different tool and format | `npu-smi info watch`, parsed by `ceiling_report.py` |
-| CUDA graph capture budgets | ACL graph (`ACLGraphWrapper`) or torchair graph mode | Same lever, different keys and log lines; read startup logs for the Ascend fallback message |
+| CUDA graph capture budgets | ACL graph (`ACLGraphWrapper`) or torchair graph mode | Same knob, different keys and log lines; read startup logs for the Ascend fallback message |
 | TF32 matmul | HF32 | `measure_peaks.py` reports `hf32` in place of `tf32`; pass `--compute-bound NAME=TFLOP,hf32` |
-
-Because the MPS lever is gone, do not carry the CUDA envelope's MPS delta into
-an Ascend estimate. On L20X it was worth about 10% at C64; on Ascend that
-number is neither available nor refutable, so it is not part of the envelope.
-
 ## Device reservation
 
 Every cell of one comparison must run inside a single reservation on fixed
@@ -150,28 +144,16 @@ the model, not the device, so they carry over from a CUDA ledger unmodified.
 Only the peaks, the launch latency, the kernel counts and the measured `g_i`
 need re-measuring.
 
-## Envelope levers
-
-| Lever | Ascend form |
-|-------|-------------|
-| Admission | unchanged: stage `max_num_seqs`, `max_sessions` |
-| Runner | unchanged: `model_runner: v2` per stage |
-| Graph coverage | ACL graph capture sizes and torchair mode, not CUDA graph budgets |
-| Micro-batching | unchanged |
-| Co-location | `cuda_mps` has no effect; only placement and `gpu_memory_utilization` remain |
-| Replicas | unchanged |
-| Precision | HF32 on or off is an Ascend-specific numerics-changing lever; report it in the separate column |
-
 ## Pitfalls
 
 - Reading a CUDA ceiling as an Ascend one. Bounds scale with the measured peaks
-  of the card in hand; a bound is not portable, and neither is the envelope.
+  of the card in hand; a bound is not portable.
 - Sampling a card that another tenant is using. Check `npu status` first.
 - Treating `AI Core(%)` as total device busy time. It is cube occupancy.
 - Summing a fused kernel's cube work and vector work as two rows. The two
   pipes overlap, so the kernel is one row at `max(cube, vector)`; two rows
   overstate the floor and can push a stage past 100% of SOL.
-- Keeping `cuda_mps: true` in an overlay and reporting it as a lever. It is
-  accepted and ignored.
+- Keeping `cuda_mps: true` in an overlay and reporting the run as MPS on. It
+  is accepted and ignored.
 - Profiling and timing in one run: `msprof` perturbs the numbers like any other
   profiler.
