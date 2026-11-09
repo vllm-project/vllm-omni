@@ -22,14 +22,16 @@ Per-stage attribution, in order of preference:
   trimmed to the span between the first and last non-idle sample. Ascend has no
   per-process AI Core counter, so use ``--stage-util`` there.
 
-Optional physical bounds need ``--peaks`` (``measure_peaks.py`` output). All
+Optional physical bounds need ``--peaks`` (``measure_peaks.py`` output) and
+work counts, which ``count_reference_work.py`` takes from the checkpoint's
+reference implementation and prints as the flags below. All
 terms are at batch = cell concurrency. ``@STAGE`` joins a term to that stage's
 measured g (``--stage-util`` or ``--pmon``) to report its % of SOL; terms
 sharing a NAME add up within each class:
 
-- ``--decode-bound NAME[@STAGE]=WEIGHT_GIB,TOKENS_PER_AUDIO_S[,KV_GIB_PER_SEQ]``:
-  bandwidth floor for an autoregressive stage, reading weights once per step
-  plus each sequence's KV cache.
+- ``--decode-bound NAME[@STAGE]=WEIGHT_GIB,TOKENS_PER_AUDIO_S[,KV_GIB_PER_SEQ[,GFLOP_PER_TOKEN,DTYPE]]``:
+  roofline of an autoregressive stage, reading weights once per step plus each
+  sequence's KV cache, against each token's FLOPs.
 - ``--compute-bound NAME[@STAGE]=TFLOP_PER_AUDIO_S,DTYPE[,GIB_PER_AUDIO_S]``:
   FLOP floor at the measured peak of DTYPE (bf16, fp16, tf32, hf32, fp32), and
   optionally the bytes the stage must move.
@@ -375,9 +377,15 @@ def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int)
     for raw in specs["decode"]:
         name, stage, values = parse_bound(raw)
         weight_gib, tokens_per_s = float(values[0]), float(values[1])
-        kv_gib_per_seq = float(values[2]) if len(values) > 2 else 0.0
+        kv_gib_per_seq = float(values[2]) if len(values) > 2 and values[2] else 0.0
         step_s = (weight_gib + batch * kv_gib_per_seq) * 2**30 / bw
-        row(name, stage, 0.0, step_s / batch * tokens_per_s)
+        # Each sequence's token FLOPs are paid whatever the batch.
+        flops_s = (
+            float(values[3]) * 1e-3 / float(peaks["matmul_tflops"][values[4]]) * tokens_per_s
+            if len(values) > 4
+            else 0.0
+        )
+        row(name, stage, flops_s, step_s / batch * tokens_per_s)
     for raw in specs["compute"]:
         name, stage, values = parse_bound(raw)
         flops_s = float(values[0]) / float(peaks["matmul_tflops"][values[1]])
@@ -751,7 +759,7 @@ def main() -> int:
         "--decode-bound",
         action="append",
         default=[],
-        help="NAME[@STAGE]=WEIGHT_GIB,TOKENS_PER_AUDIO_S[,KV_GIB_PER_SEQ]",
+        help="NAME[@STAGE]=WEIGHT_GIB,TOKENS_PER_AUDIO_S[,KV_GIB_PER_SEQ[,GFLOP_PER_TOKEN,DTYPE]]",
     )
     parser.add_argument(
         "--compute-bound", action="append", default=[], help="NAME[@STAGE]=TFLOP_PER_AUDIO_S,DTYPE[,GIB_PER_AUDIO_S]"

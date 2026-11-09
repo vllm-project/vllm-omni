@@ -95,7 +95,12 @@ g_decode(B) >= step_time / B * tokens_per_audio_second
 ```
 
 `tokens_per_audio_second` is the codec rate for a talker (codec tokens per
-second of audio) and text tokens per audio second for a thinker.
+second of audio) and text tokens per audio second for a thinker. `weight_bytes`
+is what one step streams: every parameter except embedding tables, which are
+gathered by row. A parameter sum overstates it; MiniCPM-o's Talker carries a
+0.22 GiB text embedding table next to 0.36 GiB of streamed weights. Each token
+also costs `flops_per_token / peak_flops(dtype)` whatever the batch, which
+becomes the decode row's compute term at large batch.
 
 Compute-bound stages (flow matching, vocoder, encoders):
 
@@ -103,10 +108,16 @@ Compute-bound stages (flow matching, vocoder, encoders):
 g_compute >= flops_per_audio_second / peak_flops(dtype)
 ```
 
-Count FLOPs with the torch profiler (`with_flops`) on that stage only, or
-analytically from layer shapes, sampling steps and CFG duplication. Use the
-peak for the dtype that actually runs; reduced-precision float32 (TF32 on
-CUDA, HF32 on Ascend) is a different peak from IEEE FP32.
+Count work on the checkpoint's reference implementation
+(`scripts/count_reference_work.py`), not on the engine being measured. The
+reference defines the model's algorithm: its decode step, its streaming chunk,
+its caches and overlaps. The engine's code path may add padding, recomputed
+overlap or extra CFG rows, and a bound counted on it would call that waste
+necessary. Take FLOPs, streamed weight bytes and KV bytes from the reference.
+Do not take its activation bytes: it does not fuse, so they overstate what an
+implementation must move. Use the peak for the dtype that actually runs;
+reduced-precision float32 (TF32 on CUDA, HF32 on Ascend) is a different peak
+from IEEE FP32.
 
 That spread is device-specific: bf16 is about 15x IEEE fp32 on an L20X and
 about 3.4x on a 910B1. A stage a CUDA ledger flags as precision bound can

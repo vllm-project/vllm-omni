@@ -15,7 +15,9 @@ numbers per target, not one:
    hardware, workload, and output mode). This is a deployment envelope, not
    the fastest kernel per op across libraries.
 3. **Bound**: a physical floor derived from per-stage work and measured
-   device peaks.
+   device peaks. Work is counted on the checkpoint's reference (transformers)
+   implementation, so the bound belongs to the model, not to the engine
+   being measured.
 
 `envelope - bound` is code headroom; `measured - envelope` is configuration
 headroom. Report both, per stage.
@@ -122,8 +124,12 @@ has no queueing term, so judge it at concurrency 1.
 
 7. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
    memory bandwidth, dense matmul throughput and per-kernel launch latency
-   (eager and graph replay). Give each stage three terms: compute (FLOPs per
-   audio second from `FlopCounterMode` or analytic counts), memory (weights
+   (eager and graph replay). Run `scripts/count_reference_work.py` on the
+   checkpoint for work counts: it builds the reference transformers model on
+   the meta device and counts each decoder's prefill and decode FLOPs per
+   token, streamed weight bytes and KV bytes per token, plus Code2Wav FLOPs per
+   chunk from the reference streaming path, and prints the bound flags. Give
+   each stage three terms: compute (FLOPs per audio second), memory (weights
    plus KV read per decode step, or bytes moved), and launch (kernels per step
    times steps per audio second, at the stage's eager or graph mode). Split a
    stage into kernel groups with different bound classes, one flag each; the
@@ -166,8 +172,18 @@ has no queueing term, so judge it at concurrency 1.
   dominant term and the assumptions it hides (perfect batching, no host
   overhead, peak bandwidth).
 - Peaks and launch latency come from `measure_peaks.py` on the device in
-  hand, never from memory or a data sheet. Structural inputs (weight bytes,
-  KV bytes, codec rate, FLOPs) come from the checkpoint and the result JSON.
+  hand, never from memory or a data sheet.
+- Work counts (FLOPs, streamed weight bytes, KV bytes) come from the
+  checkpoint's reference implementation, never from the vLLM-Omni code path
+  being measured: counting the engine's own path folds its waste (padding,
+  recomputed overlap, extra CFG rows) into the bound and hides the headroom.
+  Take only FLOPs, weights and KV from the reference, not activation bytes;
+  the reference does not fuse. Workload (tokens per audio second, context,
+  uncached tokens) comes from the result JSON.
+- Numerics and algorithm constants follow the reference unless the measured
+  deployment differs. Then price the deployment's dtype in the bound, and its
+  chunk size and steps as an algorithm lever, with the reference's setting
+  reported beside it.
   A term that cannot be grounded is written as "not bounded: <reason>",
   never estimated to fill the column.
 - A stage measured below its own bound (% of SOL above 100%) means the work

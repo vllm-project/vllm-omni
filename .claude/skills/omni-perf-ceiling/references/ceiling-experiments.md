@@ -70,66 +70,112 @@ python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py \
   --json $OUT/ledger.json
 ```
 
-Add physical bounds once peaks and per-stage work are known. Weight bytes
-come from the checkpoint (sum tensor sizes per component prefix in the
-safetensors headers); tokens per audio second from `request_stage_metrics`
-in the result JSON (stage `num_tokens_out` over stage-2 `audio_duration_s`):
+Add physical bounds once peaks and per-stage work are known. Work counts come
+from the checkpoint's reference implementation, the transformers modeling code
+the checkpoint ships (`trust_remote_code`), not from the vLLM-Omni code path
+under test. `scripts/count_reference_work.py` builds the reference model on the
+meta device (no weights, no GPU) and counts with `FlopCounterMode`; audio
+decoders that are not `nn.Module` children of the reference model are counted
+by a recipe that runs the reference streaming path on CPU. The workload
+(tokens per audio second, mean context, uncached prompt tokens) comes from the
+result JSON:
 
 ```bash
-  --peaks $OUT/peaks.json \
-  --decode-bound thinker@0=<weight_gib>,<text_tokens_per_audio_s>,<kv_gib_per_seq> \
-  --decode-bound talker@1=<weight_gib>,<codec_tokens_per_audio_s>,<kv_gib_per_seq> \
-  --compute-bound code2wav@2=<cfm_tflop_per_audio_s>,tf32 \
-  --compute-bound code2wav@2=<vocoder_tflop_per_audio_s>,fp32 \
-  --launch-bound talker@1=<kernels_per_step>,<codec_tokens_per_audio_s>,graph \
-  --launch-bound code2wav@2=<kernels_per_chunk>,<chunks_per_audio_s>,eager
+python .claude/skills/omni-perf-ceiling/scripts/count_reference_work.py \
+  --model $CKPT --config-override init_vision=false --config-override init_audio=false \
+  --decoder thinker@0=llm --decoder talker@1=tts.model+tts.head_code \
+  --prompt-tokens <mean input tokens> --context thinker=<mean context> --context talker=<mean context> \
+  --code2wav minicpmo-token2wav@2=$CKPT/assets/token2wav --prompt-audio-s <reference audio s> \
+  --tokens-per-audio-s thinker=<text tokens per audio-s> --tokens-per-audio-s talker=<codec tokens per audio-s> \
+  --mean-context thinker=<tokens> --mean-context talker=<tokens> \
+  --uncached-tokens thinker=<uncached prompt tokens> \
+  --fill-steps thinker@1=<Thinker steps before the Talker> --fill-steps talker@2=<first codec chunk> \
+  --dtype code2wav.flow=tf32 --dtype code2wav.vocoder=fp32 --json $OUT/reference_work.json
 ```
+
+It prints the JSON and the `ceiling_report.py` flags:
+
+- `--decode-bound NAME@STAGE=STREAMED_GIB,TOKENS_PER_AUDIO_S,KV_GIB_PER_SEQ,GFLOP_PER_TOKEN,DTYPE`
+  per decoder. Streamed GiB is every parameter a step reads, leaving out
+  embedding tables, which are gathered by row. KV GiB per sequence is the
+  reference `DynamicCache` bytes per token times the mean context. GFLOP per
+  token is one decode step at that context, with logits for the last position
+  only, as `generate()` does.
+- `--fixed-bound NAME_prefill@STAGE`: prefill FLOPs per token, averaged over
+  `--prompt-tokens` and attention included, times the uncached tokens.
+- `--fill-bound NAME_first_K@GATE`: `K` decode steps, which read the weights
+  `K` times.
+- `--compute-bound code2wav@STAGE` rows per audio second and
+  `--fill-bound code2wav_<row>_first@out` for the first chunk, from the
+  recipe's steady and first chunks.
+
+Inputs that are not work counts:
+
+- **Numerics.** Decoders default to the checkpoint dtype and Token2wav to the
+  reference's fp32. `--dtype` sets what the measured deployment runs (TF32 flow
+  model above); report the reference dtype's bound in the numerics column.
+- **Algorithm constants.** Chunk size, sampling steps, look-ahead, attention
+  cache window and vocoder overlap come from the reference (MiniCPM-o:
+  `s3_stream_chunk_size: 25`, `s3_stream_n_timesteps: 10`, prelook 3, cache
+  prompt + 100 frames, 8 mel frames of HiFT overlap). When the deployment
+  differs, that difference is an algorithm lever: bound both settings and say
+  which the deployment uses.
+- **Workload.** Prefix caching: `mean(input_lens) - floor(min(input_lens) /
+  block_size) * block_size` from the result JSON is a safe floor for uncached
+  tokens. Encoders count only when the prompt carries audio or images; add
+  them as `--decoder` or recipe rows when it does.
+
+Other checkpoints:
+
+- Name the reference model's own attribute paths (`--decoder NAME=ATTR[+HEADS]`;
+  ATTR must take `inputs_embeds` and `past_key_values`).
+- Add a recipe to `CODE2WAV_RECIPES` for an audio decoder outside the model
+  tree.
+- `--block-import` skips an optional dependency that fails to import (a
+  torchaudio built for another CUDA).
+
+Hand counts (`2 * params * tokens`, safetensors prefix sums) are a fallback
+only when no reference implementation can be built; say so in the report.
 
 `@STAGE` is the stage id used by `--stage-util` or `--pmon`; with it the
 report prints each stage's measured `g_i` beside its bound and the % of SOL.
 Each flag is one row, a group of kernels; the stage's device floor is the sum
-of each row's `max(compute, memory)` (CFM and vocoder above are two rows), so
-rows of one stage must not cover the same kernels. KV GiB per
-sequence is the KV cache at the mean context length of the workload (layers x
-2 x KV heads x head dim x bytes x tokens); omit it for short contexts. Use
-`graph` launch latency for steps that replay a captured graph at the cell's
-batch and `eager` for steps that fall back (check the startup log for the
-graph batch limit).
-
-Add the per-request terms for the end-to-end floor
-([bound-models.md](bound-models.md#end-to-end-rtf-fixed-and-per-audio-second-cost)).
-Each is `TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]` per request, gating `@STAGE`:
+of each row's `max(compute, memory)` (flow model and vocoder are two rows), so
+rows of one stage must not cover the same kernels. Add launch rows when kernel
+counts are known (below): `graph` latency for steps that replay a captured
+graph at the cell's batch, `eager` for steps that fall back (check the startup
+log for the graph batch limit):
 
 ```bash
-  --fixed-bound thinker_prefill@0=<2 * thinker_params * uncached_tokens / 1e12>,bf16,<thinker_weight_gib> \
-  --fill-bound thinker_first_token@1=0,bf16,<thinker_weight_gib> \
-  --fill-bound talker_first_chunk@2=0,bf16,<codec_chunk_frames * talker_weight_gib> \
-  --fill-bound code2wav_cfm_first@out=<cfm_tflop_per_audio_s * chunk_audio_s>,tf32 \
-  --fill-bound code2wav_vocoder_first@out=<vocoder_tflop_per_audio_s * chunk_audio_s>,fp32
+  --launch-bound talker@1=<kernels_per_step>,<codec_tokens_per_audio_s>,graph \
+  --launch-bound code2wav@2=<kernels_per_chunk>,<chunks_per_audio_s>,eager
 ```
 
-The same terms give the TTFT bound (terms gating `@0`) and the TTFP bound (all
-terms); `@out` marks Code2Wav's work on the first chunk, which only the first
-packet waits for. `chunk_audio_s` is `codec_chunk_frames / codec_tokens_per_audio_s`.
+The per-request terms give the end-to-end floor
+([bound-models.md](bound-models.md#end-to-end-rtf-fixed-and-per-audio-second-cost)),
+the TTFT bound (terms gating `@0`) and the TTFP bound (all terms); `@out` marks
+Code2Wav's work on the first chunk, which only the first packet waits for.
+Append `,<kernels>,eager|graph` to a per-request term when the kernel count of
+that path is known.
 
-- Prefill FLOPs are `2 * params * tokens` for the dense part; add attention
-  and encoder FLOPs when the prompt carries audio or images. Use uncached
-  tokens only when prefix caching is on: `mean(input_lens) - floor(min(input_lens)
-  / block_size) * block_size` from the result JSON is a safe floor.
-- A fill term over `k` sequential decode steps reads the weights `k` times,
-  so its `WEIGHT_GIB` is `k * weight_gib`. The first codec chunk is the
-  deploy's `codec_chunk_frames` (or the request's `initial_codec_chunk_frames`
-  when it is set).
-- Append `,<kernels>,eager|graph` when the kernel count of that path is known.
+MiniCPM-o 4.5 turn on L20X, as a worked example:
 
-MiniCPM-o 4.5 turn on L20X, as a worked example: Thinker 14.1 GiB bf16
-(`7.57e9` params), mean input 137.9 tokens with the shortest at 130 and block
-size 16, so at least 9.9 uncached tokens, `2 * 7.57e9 * 9.9 = 0.149 TFLOP`;
-`codec_chunk_frames: 25` with a 0.648 GiB Talker gives `16.2` GiB for the
-first chunk. At 24.6 codec tokens per audio second that chunk is 1.016 audio
-seconds, so Code2Wav's first-chunk work is `0.1653 * 1.016 = 0.168` TFLOP TF32
-(flow model) and `0.0306 * 1.016 = 0.0311` TFLOP FP32 (vocoder). The TTFP
-bound is `3.5 + 3.5 + 4.0 + 0.4 + 0.6 = 12.1` ms against 186 ms measured at C1.
+- **Workload.** Mean input 137.9 tokens, Thinker output 14.1 and Talker output
+  111.3 tokens, so mean contexts are 145 and 70. At least 9.9 tokens per
+  request miss the prefix cache. The 6 s reference audio gives a 400-frame
+  flow cache.
+- **Thinker.** The reference gives 14.1 GiB streamed, 15.2 GFLOP per token
+  and 147456 KV bytes per token.
+- **Talker.** It streams 0.361 GiB per step: the Llama backbone plus
+  `head_code`, without the 0.22 GiB `emb_text` table that a parameter sum
+  counts.
+- **Code2Wav.** The flow model does 0.159 TFLOP per audio second (0.158 on
+  the first chunk). The vocoder does 0.0355, including its 8-frame overlap
+  (0.0306 on the first chunk). Setting up the prompt cache costs 0.93 TFLOP
+  once per reference audio.
+- **TTFP bound.** `3.5 + 3.5 + 2.3 + 0.4 + 0.6 = 10.3` ms (prefill, one
+  Thinker step, 25 Talker steps, flow model and vocoder on the first chunk)
+  against 186 ms measured at C1.
 
 Audit the sweep and admission alongside:
 
@@ -145,11 +191,10 @@ stage's `GPU KV cache size` startup line; output tokens per stage from
 `num_tokens_out` in `request_stage_metrics`.
 
 An analytical per-op planner for LLMs (for example
-[HuggingArch](https://github.com/shenh10/HuggingArch)) can supply the
-Thinker's per-op FLOPs and bytes for prefill and decode rows. Take its counts,
-not its times: it prices them with data-sheet peaks and a fixed launch
-constant, while this ledger uses the measured peaks. It does not cover audio
-stages.
+[HuggingArch](https://github.com/shenh10/HuggingArch)) is a cross-check for the
+Thinker's counts. Take its counts, not its times: it prices them with
+data-sheet peaks and a fixed launch constant, while this ledger uses the
+measured peaks. It does not cover audio stages.
 
 Count kernels per step from one short nsys capture of the stage, in a run
 that produces no timing numbers:
@@ -164,11 +209,11 @@ Divide the stage process's kernel count by the number of steps it ran in the
 window. `--cuda-graph-trace node` is needed to see kernels inside replayed
 graphs.
 
-Count compute-stage FLOPs on CPU with `torch.utils.flop_counter.FlopCounterMode`
-around one forward of the stage's module at a representative chunk shape,
-then scale by frames per audio second, sampling steps and CFG rows. Remove
-weight-norm parametrizations first (`torch.nn.utils.parametrize`); the
-counter cannot see through them.
+For a compute stage without a recipe, count FLOPs on CPU with
+`torch.utils.flop_counter.FlopCounterMode` around the reference module's
+streaming call at the reference chunk shape, including its caches and
+overlaps. Remove weight-norm parametrizations first
+(`torch.nn.utils.parametrize`); the counter cannot see through them.
 
 Model-specific `--extra-body` fields (chat template switches, reference
 audio) belong to the workload freeze; copy them from the model profile.
