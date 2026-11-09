@@ -140,6 +140,16 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
+Qwen-Image 2.1's explicit NPU Flex specialization remains inside `FLASH_ATTN`.
+Its request metadata describes logical block-causal spans and token validity.
+Omni's parallel strategy still owns Ulysses input/output resharding. Only the
+explicit NPU Flex Ring branch delegates the remaining Ring group to MindIE-SD,
+which executes Flex blocks with global coordinates and merges LSE. This narrow
+branch is necessary because the generic Ring runner bypasses the selected local
+backend. Other Ring providers and the CUDA/ROCm dispatch remain unchanged.
+Missing MindIE Flex APIs fail explicitly; no fallback or global backend/default
+change is introduced. Execution capability remains unverified until NPU validation.
+
 ## Adding or changing a backend
 
 An implementation change is complete only when it:
