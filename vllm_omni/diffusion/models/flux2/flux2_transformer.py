@@ -424,6 +424,7 @@ class Flux2ParallelSelfAttention(nn.Module):
                 joint_key=text_key,
                 joint_value=text_value,
                 joint_strategy="front",
+                combine_qkv_a2a=True,
             )
             hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
             encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
@@ -436,11 +437,11 @@ class Flux2ParallelSelfAttention(nn.Module):
         else:
             query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
 
-            attn_metadata = None
+            attn_metadata = AttentionMetadata(combine_qkv_a2a=True)
             if attention_mask is not None:
                 if attention_mask.dim() == 3:
                     attention_mask = attention_mask.unsqueeze(1)
-                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+                attn_metadata.attn_mask = attention_mask
 
             attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
