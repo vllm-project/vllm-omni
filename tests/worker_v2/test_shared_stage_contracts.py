@@ -77,8 +77,15 @@ def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatc
     sentinel = object()
     monkeypatch.setattr(module, "init_omni_model_state", lambda *args: sentinel)
 
+    runner.vllm_config = runner.encoder_cache = runner.device = None
+
     def load(parent):
-        assert upstream.init_model_state(None, model, None, None) is sentinel
+        parent.model = model
+        if module._UPSTREAM_HAS_MODEL_STATE_HOOK:
+            state = parent._init_model_state()
+        else:
+            state = upstream.init_model_state(None, model, None, None)
+        assert state is sentinel
         assert parent.vocab_size == parent.req_states.vocab_size == 32
         assert parent.model_config.model_arch_config.vocab_size == 32
         raise RuntimeError("stop before sampler allocation")

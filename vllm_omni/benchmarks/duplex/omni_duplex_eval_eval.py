@@ -109,14 +109,23 @@ def evaluate_sample(
         except JudgeResponseError as exc:
             _trace({"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)})
             raise
-        _trace({"raw_response": raw_response})
+        parse_error: str | None = None
+        parsed: dict[str, Any] | None = None
         try:
-            return parse_judge_json(raw_response, required=required)
-        except ValueError:
-            pass
-        # The judge can answer in prose instead of the required score JSON; echo
-        # the offending reply back once so only the format is corrected.
-        followup = (raw_response, _JUDGE_FORMAT_FOLLOWUP.format(fields=", ".join(required)))
+            parsed = parse_judge_json(raw_response, required=required)
+        except ValueError as exc:
+            parse_error = str(exc)
+        _trace({"raw_response": raw_response, "error": parse_error})
+        if parse_error is None:
+            return parsed
+        # The judge can answer in prose instead of the required score JSON, or
+        # with a malformed value in a field that is present; echo the offending
+        # reply back once so only the format is corrected, naming what failed
+        # to parse so the retry can address it.
+        followup = (
+            raw_response,
+            _JUDGE_FORMAT_FOLLOWUP.format(fields=", ".join(required)) + f"\n{parse_error}",
+        )
         try:
             retry_response = call(followup=followup)
         except JudgeResponseError as exc:
