@@ -4,14 +4,21 @@
 
 Exercise the real connector poll and scheduler update methods with simulated
 transfer results. These CPU tests do not read external caches or run a model.
+
+Recovery tests explicitly use ``kv_load_failure_policy="recompute"``, as did
+the M0 native Qwen/Mooncake recomputation validation. The upstream default is
+``"fail"``: failed loads terminate the request instead of recomputing its prefix.
 """
 
 from types import MethodType, SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
+from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata, KVConnectorTransferResults
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker.gpu import kv_connector as runner_connector
 
@@ -29,6 +36,7 @@ def pending_load(mocker, monkeypatch):
     scheduler = _make_scheduler_stub([request])
     scheduler.running = []
     scheduler.kv_holding_waiting.append(request)
+    # Opt in to kv_load_failure_policy="recompute" for the recovery cases.
     scheduler.recompute_kv_load_failures = True
     scheduler.finished_recving_kv_req_ids = set()
     scheduler.failed_recving_kv_req_ids = set()
@@ -131,3 +139,36 @@ def test_failure_without_completion_does_not_release_buffers(pending_load):
     _poll(load, KVConnectorTransferResults(finished_recving={"remote-load"}))
     assert load.scheduler._handle_blocked_waiting_request(load.request)
     load.scheduler.kv_cache_manager.free.assert_called_once_with(load.request)
+
+
+def test_default_fail_policy_emits_error_without_readmission(pending_load, mocker):
+    """A failed receive reaches Omni's terminal-output path under the default policy."""
+    load = pending_load
+    policy = KVTransferConfig().kv_load_failure_policy
+    assert policy == "fail"
+    load.scheduler.recompute_kv_load_failures = policy == "recompute"
+    load.scheduler.deferred_loads = {}
+    # Keep terminal status and queue removal real; mock only resource cleanup.
+    load.scheduler.finish_requests = MethodType(Scheduler.finish_requests, load.scheduler)
+    load.scheduler._free_request = mocker.Mock(return_value=(None, None))
+    load.transfer.get_transfer_results.return_value = KVConnectorTransferResults(failed_recving={"remote-load"})
+
+    worker_output = load.worker.no_forward(load.step)
+    assert worker_output.kv_connector_output.failed_recving == {"remote-load"}
+    assert worker_output.sampled_token_ids == []
+    outputs = OmniARScheduler.update_from_output(load.scheduler, load.step, worker_output)
+
+    assert set(outputs) == {load.request.client_index}
+    (terminal,) = outputs[load.request.client_index].outputs
+    assert terminal.request_id == load.request.request_id
+    assert terminal.finish_reason == FinishReason.ERROR
+    assert terminal.new_token_ids == []
+    assert load.request.status == RequestStatus.FINISHED_ERROR
+    assert load.request.num_computed_tokens == 64
+    assert list(load.request.output_token_ids) == []
+    assert load.request not in load.scheduler.running
+    assert load.request not in load.scheduler.waiting
+    assert load.request not in load.scheduler.kv_holding_waiting
+    assert load.request not in load.scheduler.deferred_waiting
+    load.scheduler._free_request.assert_called_once_with(load.request, delay_free_blocks=True)
+    load.scheduler.kv_cache_manager.cache_blocks.assert_not_called()
