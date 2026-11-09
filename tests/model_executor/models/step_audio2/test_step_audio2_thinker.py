@@ -242,3 +242,30 @@ def test_text_only_audio_fields(audio_processor):
     inputs = hf_processor(text="")
     fields = processor._get_mm_fields_config(inputs, {})
     assert not MultiModalKwargsItems.from_hf_inputs(inputs, fields)
+
+
+@pytest.mark.usefixtures("single_threaded_cpu")
+@pytest.mark.parametrize("num_samples", [959999, 960000, 960001])
+def test_audio_duration_limit_and_budget(audio_processor, num_samples):
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2DummyInputsBuilder,
+        StepAudio2ProcessingInfo,
+        calculate_audio_feature_length,
+    )
+
+    hf_processor, processor = audio_processor
+    audio = np.zeros(num_samples, dtype=np.float32)
+    if num_samples > 960000:
+        with pytest.raises(ValueError, match="60"):
+            hf_processor(text="", audio=[audio])
+        return
+    inputs = hf_processor(text="", audio=[audio, audio])
+    assert inputs["audio_num_chunks"].tolist() == [3, 3]
+    info = StepAudio2ProcessingInfo.__new__(StepAudio2ProcessingInfo)
+    info.get_hf_processor = lambda **kwargs: hf_processor
+    dummy = StepAudio2DummyInputsBuilder(info).get_dummy_mm_data(8192, {"audio": 1})
+    assert len(dummy["audio"][0]) == 960000
+    dummy_inputs = hf_processor(text="", audio=dummy["audio"])
+    count = sum(calculate_audio_feature_length(int(n)) for n in dummy_inputs["audio_lens"])
+    assert info.get_mm_max_tokens_per_item(8192, {"audio": 1}) == {"audio": count}
+    assert count == 751

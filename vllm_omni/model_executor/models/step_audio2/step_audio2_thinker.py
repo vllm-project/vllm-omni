@@ -367,6 +367,7 @@ class StepAudio2Processor(ProcessorMixin):
         self.audio_token = "<audio_patch>"
         self.sampling_rate = 16000
         self.max_chunk_size = 25
+        self.max_audio_seconds = 60
 
     def __call__(self, text=None, audio=None, **kwargs):
         """Process text and audio inputs."""
@@ -407,6 +408,8 @@ class StepAudio2Processor(ProcessorMixin):
         audio_num_chunks = []
         for item in audio_list:
             waveform = _normalize_audio(item)
+            if waveform.numel() > self.sampling_rate * self.max_audio_seconds:
+                raise ValueError(f"Audio exceeds the maximum duration of {self.max_audio_seconds} seconds.")
             chunks = waveform.split(self.sampling_rate * self.max_chunk_size)
             audio_num_chunks.append(len(chunks))
             mels.extend(log_mel_spectrogram(chunk) for chunk in chunks)
@@ -461,7 +464,13 @@ class StepAudio2ProcessingInfo(BaseProcessingInfo):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        max_audio_tokens = 250
+        processor = self.get_hf_processor()
+        max_samples = processor.sampling_rate * processor.max_audio_seconds
+        chunk_samples = processor.sampling_rate * processor.max_chunk_size
+        max_audio_tokens = sum(
+            calculate_audio_feature_length((min(chunk_samples, max_samples - start) + 479) // 160 - 2)
+            for start in range(0, max_samples, chunk_samples)
+        )
         return {"audio": max_audio_tokens}
 
 
@@ -479,7 +488,7 @@ class StepAudio2DummyInputsBuilder(BaseDummyInputsBuilder[StepAudio2ProcessingIn
         mm_options: Mapping[str, object] | None = None,
     ) -> MultiModalDataDict:
         processor = self.info.get_hf_processor()
-        audio_len = int(processor.sampling_rate * processor.max_chunk_size)
+        audio_len = int(processor.sampling_rate * processor.max_audio_seconds)
         num_audios = mm_counts.get("audio", 0)
         return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)}
 

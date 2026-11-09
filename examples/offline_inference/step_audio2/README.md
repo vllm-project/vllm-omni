@@ -17,6 +17,8 @@ Step-Audio2 is a two-stage audio model:
 Long audio inputs are automatically split into chunks of up to 25 seconds before encoding,
 following the [official implementation](https://github.com/stepfun-ai/Step-Audio2/issues/65#issuecomment-3349733269).
 Pass the full audio as a single input item; no caller-side splitting is needed.
+Each audio item is limited to 60 seconds, based on the upstream guidance about quality
+beyond one minute. Longer inputs raise `ValueError` instead of being truncated.
 
 ## Hardware Requirements
 
