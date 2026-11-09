@@ -14,8 +14,16 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    TEXT_TO_VIDEO,
+    declare_capabilities,
+)
 
 TAOMATE_H3_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        sources=("vllm_omni/model_executor/models/taomate_h3/pipeline.py",),
+    ),
     model_type="taomate_h3",
     model_arch="TaoMateH3Pipeline",
     stages=(

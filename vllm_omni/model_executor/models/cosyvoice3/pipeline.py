@@ -26,11 +26,22 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.cosyvoice3"
 
 COSYVOICE3_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        sources=(
+            "vllm_omni/model_executor/models/cosyvoice3/pipeline.py",
+            "vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py",
+        ),
+    ),
     model_type="cosyvoice3",
     default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",

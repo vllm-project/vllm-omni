@@ -14,18 +14,31 @@ Two delivery modes are wired here:
   trims the overlap on both ends so the client sees a coherent PCM stream.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
 from vllm_omni.outputs.output_modality import TensorAccumulationStrategy, register_key_accumulation_strategy
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 register_key_accumulation_strategy("codes.audio", TensorAccumulationStrategy.CONCAT_DIM0)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.higgs_audio_v3"
 
 HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/higgs_audio_v3/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="higgs_multimodal_qwen3",
     default_deploy_config_name="higgs_multimodal_qwen3.yaml",
     model_arch="HiggsAudioV3TalkerForConditionalGeneration",

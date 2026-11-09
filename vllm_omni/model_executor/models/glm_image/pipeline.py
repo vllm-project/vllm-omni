@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-Image pipeline topologies (frozen).
 Two-stage (default):
   Stage 0: AR — multimodal understanding + token_ids generation
@@ -11,8 +11,20 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    IMAGE_RESPONSE,
+    IMAGE_TO_IMAGE,
+    TEXT_TO_IMAGE,
+    declare_capabilities,
+)
 
 GLM_IMAGE_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/glm_image/pipeline.py",),
+    ),
     model_type="glm_image",
     default_deploy_config_name="glm_image.yaml",
     model_arch="GlmImageForConditionalGeneration",

@@ -10,15 +10,28 @@ OmniConfig that bundles slow-AR and fast-AR sub-configs), which is why the
 registry key follows the HF name rather than the human-readable "fish_speech".
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.fish_speech"
 
 FISH_SPEECH_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/fish_speech/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="fish_qwen3_omni",
     default_deploy_config_name="fish_qwen3_omni.yaml",
     model_arch="FishSpeechSlowARForConditionalGeneration",

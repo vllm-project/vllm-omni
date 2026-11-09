@@ -17,15 +17,28 @@ request-local sampling preset, and must be present in the stage's
 per-request args reach the model's forward.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    LYRICS_TO_MUSIC,
+    declare_capabilities,
+)
 
 from .yue2 import STOP_TOKEN_IDS
 
 YUE2_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        LYRICS_TO_MUSIC,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/yue2/pipeline.py",),
+    ),
     model_type="yue2",
     default_deploy_config_name="yue2.yaml",
     model_arch="Yue2ForCausalLM",

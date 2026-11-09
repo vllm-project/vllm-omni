@@ -1,7 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from vllm_omni.diffusion.capability_resolvers import (
+    COSMOS3_CAPABILITIES,
+    MINIMAX_H3_CAPABILITIES,
+    MINIMAX_H3_CAPABILITIES_RESOLVER,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    IMAGE_RESPONSE,
+    IMAGE_TO_IMAGE,
+    IMAGE_TO_VIDEO,
+    OPERATIONS,
+    TEXT_RESPONSE,
+    TEXT_TO_AUDIO,
+    TEXT_TO_IMAGE,
+    TEXT_TO_SPEECH,
+    TEXT_TO_VIDEO,
+    VIDEO_TO_VIDEO,
+    ServingCapabilities,
+    declare_capabilities,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +58,8 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
+    serving_capabilities: ServingCapabilities | None = None
+    serving_capabilities_resolver: str | None = None
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -59,33 +82,85 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
-    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
+    "HyNomasPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/hy_nomas/pipeline_hy_nomas.py",),
+        ),
+    ),
+    "HyNomasModularPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/hy_nomas/pipeline_hy_nomas.py",),
+        ),
+    ),
+    "SeedVR2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            VIDEO_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py",),
+        ),
+    ),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         supports_segmentation=True,
         supports_video_segmentation=True,
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/sam3/pipeline_sam3.py",),
+        ),
     ),
-    "VideoDepthAnythingPipeline": DiffusionModelMetadata(supports_video_depth=True),
+    "VideoDepthAnythingPipeline": DiffusionModelMetadata(
+        supports_video_depth=True,
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/video_depth_anything/pipeline_video_depth_anything.py",),
+        ),
+    ),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/flux2_klein/pipeline_flux2_klein.py",),
+        ),
     ),
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit_plus.py",),
+        ),
     ),
     # Qwen-Image 2.1 handles both text-to-image (no image) and
     # image-conditioned requests through the same pipeline class.
     "QwenImage21Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py",),
+        ),
     ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py",),
+        ),
     ),
     # Shared by the Base (text-to-image) and Edit (TI2I) checkpoints, which use
     # the same ``BooguImagePipeline`` class. Text-to-image requests simply carry
@@ -93,10 +168,21 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "BooguImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/boogu_image/pipeline_boogu_image.py",),
+        ),
     ),
     "JoyImageEditPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/joy_image/pipeline_joy_image_edit.py",),
+        ),
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -110,6 +196,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
         attention_mask_free=True,
+        serving_capabilities=MINIMAX_H3_CAPABILITIES,
+        serving_capabilities_resolver=MINIMAX_H3_CAPABILITIES_RESOLVER,
     ),
     # The modular alias is served by MiniMaxH3Pipeline and has the same
     # Ref2VA request contract and packed-sequence layout. Every field must stay
@@ -126,17 +214,28 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_latent_continuation=True,
         final_output_type="video",
         attention_mask_free=True,
+        serving_capabilities=MINIMAX_H3_CAPABILITIES,
+        serving_capabilities_resolver=MINIMAX_H3_CAPABILITIES_RESOLVER,
     ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
     "TaoMateH3Pipeline": DiffusionModelMetadata(
         final_output_type="video",
         attention_mask_free=True,
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/taomate_h3/pipeline.py",),
+        ),
     ),
     "Magi2Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/magi2/pipeline_magi2.py",),
+        ),
     ),
     # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
     # above (an MP4 with both tracks) — declared "video" for the same reason:
@@ -146,10 +245,20 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio"), constraints=(("audio_can_be_disabled", True),)),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio"), constraints=(("audio_can_be_disabled", True),)),
+            sources=("vllm_omni/diffusion/models/kandinsky6/pipeline_kandinsky6.py",),
+        ),
     ),
     "WanPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            replace(IMAGE_TO_VIDEO, support="unknown", reason_code="checkpoint_requires_expand_timesteps"),
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",),
+        ),
     ),
     "Flux3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -159,43 +268,548 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
+        ),
     ),
     "WanVACEPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            VIDEO_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py",),
+        ),
     ),
     "WanS2VPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_TO_VIDEO, required_inputs=("text", "image", "audio"), outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_s2v.py",),
+        ),
     ),
-    "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LTX2DistilledPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LTX2T2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LTX2I2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "HeliosPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
-    "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "WanT2VDMD2Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",),
+        ),
+    ),
+    "WanI2VDMD2Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
+        ),
+    ),
+    "LTX2Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py",),
+        ),
+    ),
+    "LTX2DistilledPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2_two_stage.py",),
+        ),
+    ),
+    "LTX2T2VDMD2Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py",),
+        ),
+    ),
+    "LTX2I2VDMD2Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py",),
+        ),
+    ),
+    "HeliosPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            VIDEO_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/helios/pipeline_helios.py",),
+        ),
+    ),
+    "HeliosPyramidPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            VIDEO_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/helios/pipeline_helios.py",),
+        ),
+    ),
+    "HunyuanVideo15Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5.py",),
+        ),
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5_i2v.py",),
+        ),
+    ),
+    "LingBotVideoPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/lingbot_video/pipeline_lingbot_video.py",),
+        ),
+    ),
+    "LongCatVideoAvatarPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, required_inputs=("text", "audio")),
+            replace(IMAGE_TO_VIDEO, required_inputs=("text", "image", "audio"), outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/longcat_video/pipeline_longcat_video_avatar.py",),
+        ),
+    ),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        serving_capabilities=COSMOS3_CAPABILITIES,
     ),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        serving_capabilities=COSMOS3_CAPABILITIES,
     ),
-    "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "SanaVideoPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/sana_video/pipeline_sana_video.py",),
+        ),
+    ),
+    "SanaImageToVideoPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/sana_video/pipeline_sana_video_i2v.py",),
+        ),
+    ),
     "SanaWmPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_TO_VIDEO, required_inputs=("image", "camera_or_action")),
+            sources=("vllm_omni/diffusion/models/sana_wm/pipeline_sana_wm.py",),
+        ),
+    ),
+    "ABotWorldCausalPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/abot_world/pipeline_abot_world.py",),
+        ),
+    ),
+    "Alpamayo2SuperPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/alpamayo2_super/pipeline_alpamayo2_super.py",),
+        ),
+    ),
+    "AnimaPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/anima/pipeline_anima.py",),
+        ),
+    ),
+    "AuKPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/auk/pipeline_auk.py",),
+        ),
+    ),
+    "BagelPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_RESPONSE,
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/bagel/pipeline_bagel.py",),
+        ),
+    ),
+    "BooguImageTurboPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/boogu_image/pipeline_boogu_image.py",),
+        ),
+    ),
+    "CausVidWanPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/causvid_wan/pipeline_causvid_wan.py",),
+        ),
+    ),
+    "DiffusersAdapterPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unknown_operations=OPERATIONS,
+            unknown_reason="external_pipeline_declaration_missing",
+            sources=("vllm_omni/diffusion/models/diffusers_adapter/pipeline_diffusers_adapter.py",),
+        ),
+    ),
+    "DreamZeroPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/dreamzero/pipeline_dreamzero.py",),
+        ),
+    ),
+    "ErnieImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/ernie_image/pipeline_ernie_image.py",),
+        ),
+    ),
+    "Flux2Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/flux2/pipeline_flux2.py",),
+        ),
+    ),
+    "FluxDMD2Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/flux/pipeline_flux.py",),
+        ),
+    ),
+    "FluxKontextPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/flux/pipeline_flux_kontext.py",),
+        ),
+    ),
+    "FluxPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/flux/pipeline_flux.py",),
+        ),
+    ),
+    "GlmImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/glm_image/pipeline_glm_image.py",),
+        ),
+    ),
+    "Gr00tN1d7Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/gr00t/pipeline_gr00t.py",),
+        ),
+    ),
+    "HiDreamO1ImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/hidream_o1_image/pipeline_hidream_o1_image.py",),
+        ),
+    ),
+    "InternVLAA1Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/internvla_a1/pipeline_internvla_a1.py",),
+        ),
+    ),
+    "Krea2Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/krea2/pipeline_krea2.py",),
+        ),
+    ),
+    "LTX2DistilledOneStagePipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2.py",),
+        ),
+    ),
+    "LTX2DistilledTwoStagePipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2_two_stage.py",),
+        ),
+    ),
+    "LTX2TextToAudioPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            AUDIO_RESPONSE,
+            TEXT_TO_AUDIO,
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2_audio.py",),
+        ),
+    ),
+    "LTX2TwoStagePipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(TEXT_TO_VIDEO, outputs=("video", "audio")),
+            replace(IMAGE_TO_VIDEO, outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/ltx2/pipeline_ltx2_two_stage.py",),
+        ),
+    ),
+    "LancePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_RESPONSE,
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            unknown_operations=("video_generation",),
+            unknown_reason="checkpoint_specific_video_contract",
+            sources=("vllm_omni/diffusion/models/lance/pipeline_lance.py",),
+        ),
+    ),
+    "LingBotWorldCausalDMDPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/lingbot_world/pipeline.py",),
+        ),
+    ),
+    "LongCatImageEditPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/longcat_image/pipeline_longcat_image_edit.py",),
+        ),
+    ),
+    "LongCatImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/longcat_image/pipeline_longcat_image.py",),
+        ),
+    ),
+    "MOSSImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/mossimage/pipeline_mossimage.py",),
+        ),
+    ),
+    "MammothModa2DiTPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py",),
+        ),
+    ),
+    "MingImageDiffusionPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/ming_image/pipeline.py",),
+        ),
+    ),
+    "MingImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py",),
+        ),
+    ),
+    "MiniMaxH3DecoderPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="internal_stage_requires_parent",
+            sources=("vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_decoder.py",),
+        ),
+    ),
+    "NextStep11Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/nextstep_1_1/pipeline_nextstep_1_1.py",),
+        ),
+    ),
+    "OmniGen2Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/omnigen2/pipeline_omnigen2.py",),
+        ),
+    ),
+    "OmniVoicePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_SPEECH,
+            sources=("vllm_omni/diffusion/models/omnivoice/pipeline_omnivoice.py",),
+        ),
+    ),
+    "OvisImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/ovis_image/pipeline_ovis_image.py",),
+        ),
+    ),
+    "PhysisH3Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/physis/h3/pipeline_physis_h3.py",),
+        ),
+    ),
+    "PhysisLTXPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/physis/ltx/pipeline_physis_ltx.py",),
+        ),
+    ),
+    "PhysisWanPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/physis/wan/pipeline_physis_wan.py",),
+        ),
+    ),
+    "Pi05Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/pi05/pipeline_pi05.py",),
+        ),
+    ),
+    "Pi0Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/pi0/pipeline_pi0.py",),
+        ),
+    ),
+    "QwenImageDMD2Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",),
+        ),
+    ),
+    "QwenImageEditPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit.py",),
+        ),
+    ),
+    "QwenImageLayeredPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_layered.py",),
+        ),
+    ),
+    "QwenImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",),
+        ),
+    ),
+    "SenseNovaU1Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_RESPONSE,
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py",),
+        ),
+    ),
+    "StableAudio3Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            AUDIO_RESPONSE,
+            TEXT_TO_AUDIO,
+            sources=("vllm_omni/diffusion/models/stable_audio_3/pipeline_stable_audio_3.py",),
+        ),
+    ),
+    "StableAudioPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            AUDIO_RESPONSE,
+            TEXT_TO_AUDIO,
+            sources=("vllm_omni/diffusion/models/stable_audio/pipeline_stable_audio.py",),
+        ),
+    ),
+    "StableDiffusion3Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/sd3/pipeline_sd3.py",),
+        ),
+    ),
+    "StableDiffusionXLPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/sdxl/pipeline_sdxl.py",),
+        ),
+    ),
+    "ZImagePipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_RESPONSE,
+            TEXT_TO_IMAGE,
+            IMAGE_TO_IMAGE,
+            sources=("vllm_omni/diffusion/models/z_image/pipeline_z_image.py",),
+        ),
+    ),
+    "HunyuanVideo15I2VPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5_i2v.py",),
+        ),
+    ),
+    "Wan22I2VPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            IMAGE_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
+        ),
+    ),
+    "Wan22Pipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            replace(IMAGE_TO_VIDEO, support="unknown", reason_code="checkpoint_requires_expand_timesteps"),
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",),
+        ),
+    ),
+    "Wan22S2VPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            replace(IMAGE_TO_VIDEO, required_inputs=("text", "image", "audio"), outputs=("video", "audio")),
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_s2v.py",),
+        ),
+    ),
+    "Wan22VACEPipeline": DiffusionModelMetadata(
+        serving_capabilities=declare_capabilities(
+            TEXT_TO_VIDEO,
+            IMAGE_TO_VIDEO,
+            VIDEO_TO_VIDEO,
+            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py",),
+        ),
     ),
 }
 
@@ -231,7 +845,7 @@ def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModel
         _, _, pipeline_cls_name = entry
         # Note: the registry ``cls_name`` and the metadata keys are two separate
         # key spaces. Aliases whose pipeline class has no metadata entry (e.g.
-        # Wan22VACEPipeline, OmniVoicePipeline) still fall back to the defaults;
+        # external plugin classes) still fall back to the defaults;
         # that is not a regression, it just means no capability override.
         canonical_name = _DIFFUSION_MODEL_METADATA_ALIASES.get(pipeline_cls_name, pipeline_cls_name)
         return _DIFFUSION_MODEL_METADATA.get(canonical_name, DiffusionModelMetadata())

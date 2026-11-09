@@ -9,6 +9,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.diffusion.capability_resolvers import MINIMAX_H3_CAPABILITIES, MINIMAX_H3_CAPABILITIES_RESOLVER
 
 _PROCESSOR = "vllm_omni.model_executor.stage_input_processors.minimax_h3"
 _CHECKPOINT = "vllm_omni.model_executor.models.minimax_h3.checkpoint"
@@ -16,6 +17,8 @@ _DIFFUSION_PIPELINE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3
 _DECODER_PIPELINE = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder"
 
 MINIMAX_H3_PIPELINE = PipelineConfig(
+    serving_capabilities=MINIMAX_H3_CAPABILITIES,
+    serving_capabilities_resolver=MINIMAX_H3_CAPABILITIES_RESOLVER,
     model_type="minimax_h3_disaggregated",
     default_deploy_config_name="minimax_h3_disaggregated.yaml",
     stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
@@ -59,6 +62,8 @@ MINIMAX_H3_PIPELINE = PipelineConfig(
 
 
 MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
+    serving_capabilities=MINIMAX_H3_CAPABILITIES,
+    serving_capabilities_resolver=MINIMAX_H3_CAPABILITIES_RESOLVER,
     model_type="minimax_h3_disaggregated_decode",
     default_deploy_config_name="minimax_h3_disaggregated_decode.yaml",
     stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},

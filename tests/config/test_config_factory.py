@@ -1194,6 +1194,10 @@ class TestPipelineRegistration:
         assert legacy_configs[0].final_output_type == expected_output_type
         assert is_video_generation_pipeline(omni_config.stage_configs) is (expected_output_type == "video")
         assert OMNI_PIPELINES["lance"].stages[0].final_output_type == "image"
+        declaration = omni_config.pipeline_config.serving_capabilities
+        expected_video = "supported" if expected_output_type == "video" else "unsupported"
+        assert declaration.get("video_generation").support == expected_video
+        assert OMNI_PIPELINES["lance"].serving_capabilities.get("image_generation").support == "supported"
 
     def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
         snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)

@@ -24,6 +24,7 @@ from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.serving_capabilities import ServingCapabilities
 
 logger = init_logger(__name__)
 
@@ -490,6 +491,12 @@ class PipelineConfig:
     default_deploy_config_name: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # Complete public request contracts belong to the model topology. Missing
+    # declarations (including older out-of-tree plugins) remain unknown.
+    serving_capabilities: ServingCapabilities | None = None
+    # Optional pure startup refinement over the final, in-memory stage config.
+    # A dotted import keeps model modules lazy and configuration serializable.
+    serving_capabilities_resolver: str | None = None
 
     def __post_init__(self) -> None:
         errors = self.get_validation_errors()

@@ -7,15 +7,28 @@ Stage 0: fish_omni   — text + voice references → one sampled 10-codebook fra
 Stage 1: dac_decoder — frames → 44.1 kHz audio; the same Fish DAC codec as S2 Pro.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.fish_omni"
 
 FISH_OMNI_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/fish_omni/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="fish_omni",
     default_deploy_config_name="fish_omni.yaml",
     model_arch="FishOmniForConditionalGeneration",

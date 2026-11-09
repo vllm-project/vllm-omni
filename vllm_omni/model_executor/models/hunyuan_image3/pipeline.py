@@ -7,6 +7,13 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    IMAGE_RESPONSE,
+    IMAGE_TO_IMAGE,
+    TEXT_RESPONSE,
+    TEXT_TO_IMAGE,
+    declare_capabilities,
+)
 
 _HUNYUAN_IMAGE3_HF_ARCHS = (
     "HunyuanImage3ForConditionalGeneration",
@@ -17,6 +24,13 @@ _HUNYUAN_IMAGE3_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processo
 
 
 HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/hunyuan_image3/pipeline.py",),
+    ),
     model_type="hunyuan_image_3_moe",
     default_deploy_config_name="hunyuan_image_3_moe.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
@@ -50,6 +64,10 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
 
 
 HUNYUAN_IMAGE3_AR_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/hunyuan_image3/pipeline.py",),
+    ),
     model_type="hunyuan_image3_ar",
     default_deploy_config_name="hunyuan_image3_ar.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
@@ -72,6 +90,12 @@ HUNYUAN_IMAGE3_AR_PIPELINE = PipelineConfig(
 
 
 HUNYUAN_IMAGE3_DIT_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        IMAGE_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/hunyuan_image3/pipeline.py",),
+    ),
     model_type="hunyuan_image3_dit",
     default_deploy_config_name="hunyuan_image3_dit.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,

@@ -262,20 +262,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         OpenMOSS-Team/MOSS-TTSD-v1.0 vs --deploy-config moss_ttsd.yaml).
         """
         try:
-            name = (self.engine_client.model_config.model or "").lower().replace("-", "").replace("_", "")
+            model = self.engine_client.model_config.model or ""
         except Exception:
-            name = ""
-        if "realtime" in name:
-            return "realtime"
-        if "local" in name:
-            return "local"
-        if "ttsd" in name:
-            return "ttsd"
-        if "soundeffect" in name:
-            return "sound_effect"
-        if "voicegenerator" in name:
-            return "voice_generator"
-        return "tts"
+            model = ""
+        from vllm_omni.model_executor.models.moss_tts.model_variant import detect_moss_variant
+
+        return detect_moss_variant(model)
 
     def _codec_stage_devices(self) -> str | None:
         """Read the runtime ``devices`` entry of this pipeline's codec stage.
