@@ -1512,8 +1512,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
-        request_id = info_dict.get("request_id")
-        request_id = str(info_dict.get("req_id", "0") if request_id is None else request_id)
+        request_id = info_dict.get("req_id")
+        if request_id is None:
+            request_id = info_dict.get("request_id")
+        request_id = str(request_id if request_id is not None else "0")
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
@@ -2644,8 +2646,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # While min_tokens censors the stop id, latch the stop request and
             # honour it on the first frame that lifts the floor. The latch stays
             # on device, so padding never buys a new sentence.
-            # it is forced into says nothing about whether it still wants to
-            # speak.
             latch = self._codec_stop_latch(request_id, frame_logits)
             if step == 0:
                 # A fresh codec segment must not inherit the stop request of
@@ -3588,7 +3588,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     getattr(getattr(self, "vllm_config", None), "scheduler_config", None), "max_num_seqs", 4096
                 )
                 codec_state = self._device_codec_state = CodecState(device, self._num_audio_tokens, capacity=capacity)
-            rows = [(str(infos[index].get("request_id", index)), state, code) for index, state, code in gpu_rows]
+            rows = [(_request_key(infos[index], index), state, code) for index, state, code in gpu_rows]
             if (
                 len(gpu_groups) == len(gpu_rows)
                 and all(group is gpu_groups[0][0] for group, _ in gpu_groups)
