@@ -190,6 +190,42 @@ def test_expired_deadline_never_allocates_or_submits(connectors):
     assert not hasattr(receiver._req_local, "deadline")
 
 
+def test_tcp_requires_explicit_acknowledged_native_capability(connectors):
+    with pytest.raises(ValueError, match="native_tcp_proto_version=2"):
+        connectors(protocol="tcp")
+    connector = connectors(protocol="tcp", native_tcp_proto_version=2)
+    assert connector.native_tcp_proto_version == 2
+
+
+def test_tcp_capability_mismatch_rejects_before_native_submission(connectors):
+    sender = connectors("sender", protocol="tcp", native_tcp_proto_version=2)
+    receiver = connectors(protocol="tcp", native_tcp_proto_version=2)
+    metadata = publish(sender)
+    metadata["native_tcp_proto_version"] = 1
+    with pytest.raises(RuntimeError, match="acknowledged completion"):
+        receive(receiver, metadata)
+    assert not sender.engine.calls
+
+
+def test_tcp_sender_rejects_unsupported_peer_before_native_submission(connectors):
+    sender = connectors("sender", protocol="tcp", native_tcp_proto_version=2)
+    publish(sender)
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 2000)
+    try:
+        sock.connect(f"tcp://127.0.0.1:{sender.zmq_port}")
+        request = module.MooncakeAgentMetadata(
+            "127.0.0.1", 1, "key@0_1", [123], [8], protocol_version=2, native_tcp_proto_version=1
+        )
+        sock.send(msgspec.msgpack.encode(request))
+        assert sock.recv() == module.TRANS_NOT_SUBMITTED
+        assert not sender.engine.calls
+    finally:
+        sock.close(linger=0)
+        ctx.term()
+
+
 def test_legacy_metadata_fails_before_write(connectors):
     sender, receiver = connectors("sender"), connectors()
     metadata = publish(sender)

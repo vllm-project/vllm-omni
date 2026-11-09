@@ -721,6 +721,12 @@ responses and transfer requests carry `protocol_version=2`. Old metadata is
 rejected before publishing a destination; unversioned requests are rejected
 before a write. Upgrade both endpoints together. Successful TCP writes require
 acknowledged SDK completion; legacy `MC_TCP_PROTO=1` is rejected.
+Because the Python binding does not expose the native peer's negotiated TCP
+capability, TCP deployments must also set `native_tcp_proto_version: 2` on
+both connectors after verifying the installed SDK/build supports Mooncake's
+acknowledged TCP framing. The value is exchanged in control metadata and a
+mismatch is rejected before publishing a destination or invoking native
+WRITE. RDMA deployments do not require this TCP-only setting.
 
 #### 11.3 Connector Shutdown
 
