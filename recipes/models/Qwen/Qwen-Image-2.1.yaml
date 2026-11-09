@@ -156,18 +156,18 @@ guide: |
 
   ## Prerequisites
 
-  Support is not in a tagged release and, as of this writing, not yet merged
-  (vllm-project/vllm-omni#7759).
+  This source checkout includes the pipeline and targets final vLLM 0.33.0.
+  Full image-quality qualification remains pending; successful generation alone
+  does not establish reference parity.
 
-  The pipeline itself is known-good: brought up from PR #7759 on one NVIDIA
-  GB300, it generated a 1024x1024 PNG in **4.5 s** over 40 steps at **34.0 GB**
-  peak.
+  Historical bring-up from PR #7759 on one NVIDIA GB300 generated a 1024x1024
+  PNG in **4.5 s** over 40 steps at **34.0 GB** peak. Those measurements do not
+  qualify the current source/runtime.
 
   ```bash
   git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni
-  git fetch origin pull/7759/head:qwen-image-2.1 && git checkout qwen-image-2.1
   uv venv --python 3.12 --seed && source .venv/bin/activate
-  uv pip install vllm==0.29.0 --torch-backend=auto && uv pip install -e .
+  uv pip install vllm==0.33.0 --torch-backend=cu130 && uv pip install -e .
   ```
 
   ## Offline inference

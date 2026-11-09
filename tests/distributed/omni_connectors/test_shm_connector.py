@@ -458,18 +458,21 @@ def test_wakeups_can_be_disabled_and_close_unlinks_fifo(monkeypatch):
         receiver.close()
 
 
-def _sibling_receiver(stage_id, ready, result):
+def _sibling_receiver(stage_id, ready, start, result):
     receiver = _stage_connector(stage_id)
     generation = receiver.get_wakeup_generation()
     ready.set()
-    start = time.monotonic()
+    assert start.wait(5)
+    started = time.monotonic()
     woke = receiver.wait_for_change(generation, timeout=5)
-    result.put((woke, time.monotonic() - start))
+    result.put((woke, time.monotonic() - started))
     receiver.close()
 
 
-def _sibling_sender(stage_id, key):
+def _sibling_sender(stage_id, key, ready, start):
     sender = _stage_connector(stage_id - 1)
+    ready.set()
+    assert start.wait(5)
     sender.put(str(stage_id - 1), str(stage_id), key, {"value": 3})
 
 
@@ -478,20 +481,30 @@ def test_sibling_stage_processes_share_wakeups():
     import multiprocessing
 
     ctx = multiprocessing.get_context("fork")
-    ready, result = ctx.Event(), ctx.Queue()
+    ready, sender_ready, start, result = ctx.Event(), ctx.Event(), ctx.Event(), ctx.Queue()
     key = f"wake_{uuid.uuid4().hex}"
-    receiver = ctx.Process(target=_sibling_receiver, args=(78, ready, result))
-    receiver.start()
-    assert ready.wait(5)
-    time.sleep(0.05)
-    sender = ctx.Process(target=_sibling_sender, args=(78, key))
-    sender.start()
-    sender.join(5)
-    woke, waited = result.get(timeout=5)
-    receiver.join(5)
-    assert woke and waited < 1.0
-    cleanup = make_connector({})
-    cleanup.cleanup(key)
+    receiver = ctx.Process(target=_sibling_receiver, args=(78, ready, start, result))
+    sender = ctx.Process(target=_sibling_sender, args=(78, key, sender_ready, start))
+    try:
+        receiver.start()
+        assert ready.wait(5)
+        sender.start()
+        assert sender_ready.wait(5)
+        start.set()
+        sender.join(5)
+        woke, waited = result.get(timeout=5)
+        receiver.join(5)
+        assert woke and waited < 1.0
+    finally:
+        start.set()
+        for process in (receiver, sender):
+            if process.pid is not None:
+                if process.is_alive():
+                    process.kill()
+                process.join(5)
+            process.close()
+        cleanup = make_connector({})
+        cleanup.cleanup(key)
 
 
 def test_same_stage_receivers_are_independent_across_close_and_restart():

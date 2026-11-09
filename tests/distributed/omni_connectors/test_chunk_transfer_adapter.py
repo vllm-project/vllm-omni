@@ -2859,6 +2859,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler._first_chunk_express = False
     scheduler.aux_output_connector = None
     scheduler._express_min_slack_s = 0.0
@@ -2943,6 +2944,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.aux_output_connector = None
     scheduler.chunk_transfer_adapter = adapter_mock
     bind_omits_transfer_helpers(scheduler)
@@ -3457,6 +3459,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.chunk_transfer_adapter = adapter_mock
     scheduler.connector = None
     scheduler.ec_connector = None

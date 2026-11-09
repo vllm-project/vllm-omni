@@ -778,7 +778,7 @@ def thinker2talker_full_payload(
 
 def thinker2talker_token_only(
     source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    prompt: OmniTokensPrompt | TextPrompt | str | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[OmniTokensPrompt]:

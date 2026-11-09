@@ -34,6 +34,15 @@ steps:
           - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
+      # AMD READY R2-01 is non-blocking, so fail the change that moves its
+      # pinned collection here. Some parametrizations need a visible GPU.
+      - label: "Simple · ROCm R2-01 Collection Count"
+        timeout_in_minutes: 10
+        source_file_dependencies: amd_ready_r2_01_collection
+        commands:
+          - "python3 .buildkite/amd/scripts/run_collection_guard.py .buildkite/amd/test-amd-ready.yml 'ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t'"
+        mirror_hardwares: l4_1
+
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
     steps:
@@ -179,10 +188,11 @@ steps:
 
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function
+        timeout_in_minutes: 40
         commands:
           - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py -m 'core_model' --run-level 'core_model'
+            timeout 35m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_2
 
@@ -204,12 +214,13 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      # The live client waits for a learned turn terminator; use real weights.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         commands:
           - |
             timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
 
@@ -270,11 +281,12 @@ steps:
 
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
+        timeout_in_minutes: 55
         commands:
           - |
-            timeout 40m bash -c "
+            timeout 50m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_qwen_image.py tests/e2e/features/rlhf_test/test_qwen_image_merged_lora.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
 

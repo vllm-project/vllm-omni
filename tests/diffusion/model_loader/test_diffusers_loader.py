@@ -285,11 +285,16 @@ def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
     assert getattr(model, "lora_is_fused", False) is False
 
 
-def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
+@pytest.mark.parametrize(
+    ("lora_scale", "should_warn"),
+    [(1.0, False), ([1.0, 1.5], True)],
+)
+def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, should_warn, mocker):
+    warning = mocker.patch.object(loader_module.logger, "warning")
     cfg = SimpleNamespace(
         lora_backend=LoRABackend.DISTILL,
         lora_path="/path/to/lora.safetensors",
-        lora_scale=1.0,
+        lora_scale=lora_scale,
         dtype=torch.bfloat16,
         quantization_config=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -304,6 +309,10 @@ def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
 
     model.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
     assert getattr(model, "lora_is_fused", False) is True
+    if should_warn:
+        warning.assert_called_once_with("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+    else:
+        warning.assert_not_called()
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -2181,6 +2190,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
