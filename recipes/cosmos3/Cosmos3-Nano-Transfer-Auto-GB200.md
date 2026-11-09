@@ -395,6 +395,7 @@ count, parallel topology, steps, cold/warm latency and peak memory.
     - Other accelerators, including Hopper, are not qualified by this recipe.
       Hopper resolves to the `maskless` backend when bundled FlashAttention is
       available; its parity and latency against Triton are pending a GPU benchmark.
+      The weekly H100 CI smoke test only checks that a 2-step request is served.
     - LiDAR CUDA parity, memory and latency have not been qualified.
     - Joint checkpoints load the LiDAR decoder even when a request does not ask
     for LiDAR output; such requests skip decoder execution.

@@ -139,7 +139,7 @@ def test_video_generation_modes_001(omni_server: OmniServer, online_client: Onli
         online_client.send_video_diffusion_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
