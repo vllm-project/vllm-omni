@@ -11,6 +11,7 @@ import pytest
 import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequest
@@ -155,6 +156,40 @@ async def test_downstream_stage_call_rejects_sampling_params():
     engine_client.run_downstream_stage.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_call_forwards_requested_replica_to_current_stage():
+    engine_client = _engine_client()
+    serving = ServingRun(engine_client)
+
+    await serving.run(RunRequest(stage_input=_PROMPT, replica_id=1), request_id="run-entry")
+    assert engine_client.run_entry_stage.call_args.kwargs["requested_replica_id"] == 1
+
+    await serving.run(
+        RunRequest(stage_id=1, stage_input=encode_payload(_next_stage_input()), replica_id=0),
+        request_id="run-downstream",
+    )
+    assert engine_client.run_downstream_stage.call_args.kwargs["requested_replica_id"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replica_id", [None, 0, 1])
+async def test_entry_stage_forwards_none_and_nonnegative_replica_ids(replica_id: int | None):
+    engine_client = _engine_client()
+
+    await ServingRun(engine_client).run(
+        RunRequest(stage_input=_PROMPT, replica_id=replica_id),
+        request_id="run-entry",
+    )
+
+    assert engine_client.run_entry_stage.call_args.kwargs["requested_replica_id"] == replica_id
+
+
+@pytest.mark.parametrize("replica_id", ["abc", "1", 1.5, True, -1])
+def test_run_request_rejects_non_strict_or_negative_replica_id(replica_id):
+    with pytest.raises(ValidationError):
+        RunRequest(stage_input=_PROMPT, replica_id=replica_id)
+
+
 def test_run_route_returns_400_for_malformed_stage_input():
     """Ensure a stage_input that isn't a valid payload is a client error, not a server error."""
     response = _run_client().post("/v1/run", json={"stage_id": 1, "stage_input": "not a payload"})
@@ -180,6 +215,26 @@ def test_run_route_keeps_client_error_status():
     engine_client.run_entry_stage.side_effect = OmniClientError("bad prompt", status_code=status_code)
     response = _run_client(engine_client).post("/v1/run", json={"stage_input": _PROMPT})
     assert response.status_code == status_code
+
+
+def test_invalid_requested_replica_only_fails_that_http_request():
+    engine_client = _engine_client()
+
+    async def route_entry(*_args, requested_replica_id, **_kwargs):
+        if requested_replica_id == 99:
+            raise OmniClientError("replica_id 99 does not exist")
+        return _next_stage_input()
+
+    engine_client.run_entry_stage.side_effect = route_entry
+    client = _run_client(engine_client)
+
+    invalid = client.post("/v1/run", json={"stage_input": _PROMPT, "replica_id": 99})
+    valid = client.post("/v1/run", json={"stage_input": _PROMPT, "replica_id": 0})
+
+    assert invalid.status_code == 400
+    assert "replica_id 99 does not exist" in invalid.json()["detail"]
+    assert valid.status_code == 200
+    assert engine_client.run_entry_stage.await_count == 2
 
 
 @pytest.mark.parametrize("value", ["", "0"])

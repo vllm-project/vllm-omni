@@ -29,12 +29,14 @@ from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+from vllm_omni.utils.mm_prefix import apply_img2img_mm_prefix_patch
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
 # Decoder rounding is visible to audio encoders and can change mixed-media
 # answers. Preserve Omni's existing default while retaining explicit choices.
 apply_soundfile_first_audio_decode_patch()
+apply_img2img_mm_prefix_patch()
 
 # Omni's deploy config selects a runner per stage. vLLM 0.31's config property
 # otherwise defaults to v2 independently of the runner selected by our workers,
@@ -730,7 +732,7 @@ def _patch_xpumem_free_callback_xpu() -> None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
             device, size, d_mem, _ = data.handle
-            result = (device, size, d_mem, [])
+            result: tuple = (device, size, d_mem, [])
             _PATCH_LOGGER.debug(
                 "[xpumem] Free callback: asleep entry %s -> empty handle",
                 ptr,
