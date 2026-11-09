@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 
 
 @dataclass(frozen=True)

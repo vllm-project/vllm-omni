@@ -157,6 +157,15 @@ class HybridNoisyKVState:
         self.current = None
         self._chunk_tokens.pop(req, None)
 
+    def chunk_tokens(self, req: str) -> int:
+        # Public read for the mainline SupportsNoisyPPKV protocol; the
+        # executor no longer reads the private dict directly.
+        return self._chunk_tokens[req]
+
+    def wait_sends(self) -> None:
+        """The hybrid ring publishes through IPC-mapped pointers inline;
+        there are no deferred outbound handles to wait on."""
+
     def reset_all(self):
         if self.pages is not None:
             self.pages.close(abort=True)

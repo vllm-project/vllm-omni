@@ -12,7 +12,11 @@ from benchmarks.ar_diffusion import hybrid_transport
 from benchmarks.ar_diffusion.block_plan import BlockPlan, KVKey
 from benchmarks.ar_diffusion.hybrid_kv import HybridNoisyKVState
 from benchmarks.ar_diffusion.hybrid_transport import LayerMajorPages
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    CellSchedule,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -89,8 +93,8 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
     # ordinary requests.
     state.begin_request("req", native, chunk_tokens=chunk_tokens, t0=0, retain=frozenset())
     assert state._chunk_tokens["req"] == chunk_tokens
-    # The pre-forward prior-handoff hook (cell_executor line 402) must exist
-    # and be callable after admission.
+    # The pre-forward prior-handoff hook in the noisy PP executor must
+    # exist and be callable after admission.
     state.exchange_and_await_prior_handoffs(0)
     # Executor drop (cell_executor.drop) passes retain=() and expects the
     # per-request state gone.

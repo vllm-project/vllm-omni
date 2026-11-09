@@ -59,8 +59,8 @@ def main():
             "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
             "vllm_omni/diffusion/layers/adalayernorm.py",
             "vllm_omni/diffusion/layers/norm.py",
-            "vllm_omni/experimental/ar_diffusion/cell_executor.py",
-            "vllm_omni/experimental/ar_diffusion/cell_schedule.py",
+            "vllm_omni/diffusion/distributed/noisy_pipeline_parallel/noisy_pp_executor.py",
+            "vllm_omni/diffusion/distributed/noisy_pipeline_parallel/noisy_pp_plan.py",
             "vllm_omni/experimental/ar_diffusion/flow_euler.py",
             "vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py",
             "vllm_omni/experimental/ar_diffusion/kv_cache/paged_attention.py",
@@ -94,6 +94,17 @@ def main():
 
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+        ARDiffusionCellContext,
+        CellRunSpec,
+        CellTopology,
+        run_cell_pipeline,
+    )
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+        CellSchedule,
+        Ordering,
+        build_cell_plan,
+    )
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_model_parallel,
         get_pp_group,
@@ -105,13 +116,6 @@ def main():
     from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
     from vllm_omni.diffusion.models.causvid_wan.weights import causvid_pt_to_diffusers_state
     from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
-    from vllm_omni.experimental.ar_diffusion.cell_executor import (
-        ARDiffusionCellContext,
-        CellRunSpec,
-        CellTopology,
-        run_cell_pipeline,
-    )
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
     from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 
