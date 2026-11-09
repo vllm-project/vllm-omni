@@ -660,6 +660,17 @@ class OmniBase(PDDisaggregationMixin):
             if consumed is not None and msg_id not in consumed:
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+                diffusion_metrics = _m.diffusion_metrics or {}
+                admission_wait_s = diffusion_metrics.get("scheduler_queue_wait_s")
+                if admission_wait_s is not None:
+                    admission_wait_ms = admission_wait_s * 1000.0
+                    _m.stage_gen_time_ms = max(_m.stage_gen_time_ms - admission_wait_ms, 0.0)
+                    stage_durations[f"stage_{stage_id}_gen_ms"] = _m.stage_gen_time_ms
+                    if _m.pipeline_timings is None:
+                        _m.pipeline_timings = {}
+                    queue_wait_ms = float(_m.pipeline_timings.get("queue_wait_ms") or 0.0) + admission_wait_ms
+                    _m.pipeline_timings["queue_wait_ms"] = queue_wait_ms
+                    stage_durations["queue_wait_ms"] = queue_wait_ms
                 consumed.add(msg_id)
                 if peak_memory_mb > 0:
                     self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
