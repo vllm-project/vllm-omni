@@ -323,10 +323,10 @@ def _sink_pipeline_worker(
         cell_executor._post_activations_ws = original_post
 
 
-# Ready-lane budget: Simple · Engine&Entrypoints&Diffusion is 25 minutes and
-# each Gloo spawn re-imports the stack (~30–60s wall). One scalar + one
-# fixed-shape case here; the CUDA harness only varies chunks×history at
-# fixed S=2,G=2 fixed-shape (no scalar NCCL twin).
+# Ready Simple CPU is one xdist job (Simple · CPU Test). Each Gloo spawn
+# re-imports the stack (~30–60s wall). One scalar + one fixed-shape case
+# here; the CUDA harness only varies chunks×history at fixed S=2,G=2
+# fixed-shape (no scalar NCCL twin).
 @pytest.mark.parametrize("steps,groups,chunks", [(2, 1, 6)])
 def test_same_step_sink_distributed_pipeline_matches_serial(steps, groups, chunks):
     torch.multiprocessing.spawn(

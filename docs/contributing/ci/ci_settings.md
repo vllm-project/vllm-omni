@@ -492,7 +492,7 @@ Test". Coverage + artifact upload run only when bootstrap uploaded that job with
 the same job runs plain pytest without `--cov`. It runs on a single GPU so the
 pilot is cheap to reproduce.
 
-**L1 package coverage (CPU):** ready Simple Test jobs run without `--cov`. Scheduled nightly on a release line (`main` or `release/vX.Y.Z`) with `NIGHTLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-nightly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
+**L1 package coverage (CPU):** Ready **Simple · CPU Test** runs `pytest -m 'core_model and cpu' -n 4` on `tests/` with no `--cov`. Scheduled nightly on a release line (`main` or `release/vX.Y.Z`) with `NIGHTLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-nightly.yml` (the same selector plus Cobertura XML).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under

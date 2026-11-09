@@ -10,32 +10,16 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "Simple · Model Executor Test"
-        timeout_in_minutes: 20
+      # One L4 for the whole L1 CPU suite. Same selector and -n 4 / loadgroup
+      # as nightly Simple · CPU Coverage Test, without --cov. cpu tests are
+      # already one xdist group per file. Do not use -n auto (mp children
+      # scale with vCPU) or --cpu-shard-profile (timing shards reject xdist).
+      # 90 minutes matches that nightly job: this replaces four parallel
+      # 20–25 minute leaves, and the suite duration is not remeasured here.
+      - label: "Simple · CPU Test"
+        timeout_in_minutes: 90
         commands:
-          - "pytest -sv tests/model_executor -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Diffusion Models Test"
-        timeout_in_minutes: 20
-        commands:
-          - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Engine&Entrypoints&Diffusion Test"
-        timeout_in_minutes: 25
-        commands:
-          # cpu tests are one loadgroup per module file. -n 4 matches
-          # Tiny Model Tests · Diffusion (base) on L4_1. Do not use -n auto
-          # (mp children scale with vCPU) or --cpu-shard-profile (timing
-          # shards reject xdist).
-          - "pytest -sv -n 4 tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Other Test"
-        timeout_in_minutes: 20
-        commands:
-          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
+          - "pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup"
         mirror_hardwares: l4_1
 
       # AMD READY R2-01 is non-blocking, so fail the change that moves its

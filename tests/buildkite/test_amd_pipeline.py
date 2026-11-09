@@ -611,42 +611,52 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
 
 
 def test_cuda_ready_retains_full_model_executor_coverage() -> None:
-    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
+    step = _find_step("Simple · CPU Test", CUDA_READY_PIPELINE)
     assert "source_file_dependencies" not in step
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
     argv = split(pytest_command)
     marker_expression = argv[argv.index("-m") + 1]
 
-    assert "tests/model_executor" in argv
+    # The merged suite is tests/ with no ignore, so model_executor stays in
+    # the collection. AMD shards exclude omni; this job must not.
+    assert "tests/" in argv
     assert marker_expression == "core_model and cpu"
     assert "not omni" not in marker_expression
     assert all(not arg.startswith("--ignore") for arg in argv)
     assert all(not arg.startswith("--deselect") for arg in argv)
+    assert "--cov" not in pytest_command
 
     test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
     assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
     assert "@pytest.mark.slow" not in test_source
 
 
-def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
-    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
-    assert step["timeout_in_minutes"] == 25
+def test_cuda_ready_simple_cpu_is_one_xdist_job() -> None:
+    group = _find_group(":card_index_dividers: Simple Test", CUDA_READY_PIPELINE)
+    assert [step.get("label") for step in group["steps"]] == [
+        "Simple · CPU Test",
+        "Simple · ROCm R2-01 Collection Count",
+    ]
+
+    step = _find_step("Simple · CPU Test", CUDA_READY_PIPELINE)
+    assert step["timeout_in_minutes"] == 90
+    assert step["mirror_hardwares"] == "l4_1"
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
     argv = split(pytest_command)
     assert argv == [
         "pytest",
         "-sv",
-        "-n",
-        "4",
-        "tests/entrypoints",
-        "tests/engine",
-        "tests/diffusion",
-        "--ignore=tests/diffusion/models",
+        "tests/",
         "-m",
         "core_model and cpu",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
     ]
+    assert "--cpu-shard-profile" not in argv
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
