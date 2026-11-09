@@ -123,6 +123,15 @@ materialized: the FP32 arithmetic probe is mechanism evidence, not a capture of
 those internal values or an automatic explanation of the historical failures.
 Convolution replays compare original policies, matched NVIDIA policy, and a
 native-only policy change. TF32 settings are recorded but not changed for BF16.
+The fusion-boundary replays also compare the actual native and fused outputs
+against FP64 arithmetic on the same already-quantized inputs, weights and
+conditioning values. `whole_block_fp64_reference` runs a private FP64 copy of
+the native block on the input device, reporting native/default, native with
+matched NVIDIA policy, and NVIDIA errors separately. This adds FP64 parameter
+storage and slow untimed convolutions; budget resources accordingly.
+FP64 absolute/RMS errors and tolerance counts describe reference error, not
+the original-dtype compatibility gate or checkpoint-level quality. Being
+closer to FP64 does not waive a failing native/NVIDIA comparison.
 CPU copies and hooks make these runs unsuitable for timing; bitwise comparison
 against uninstrumented forwards exposes capture/repeatability differences.
 Use a dedicated process because cuDNN policies are process-global, although

@@ -13,6 +13,7 @@ import platform
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from importlib.metadata import version
 from pathlib import Path
 
@@ -50,6 +51,70 @@ def compare(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, objec
         "max_abs_diff": finite_difference.max().item() if finite_difference.numel() else None,
         "mean_abs_diff": finite_difference.mean().item() if finite_difference.numel() else None,
     }
+
+
+def reference_error(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, object]:
+    """Measure promoted-output error, separately from the original-dtype gate."""
+    if candidate.shape != reference.shape or reference.dtype != torch.float64:
+        raise ValueError("Expected an FP64 reference with the candidate shape")
+    rtol, atol = _TOLERANCES[candidate.dtype]
+    candidate_float = candidate.detach().double().cpu()
+    reference_float = reference.detach().cpu()
+    finite = torch.isfinite(candidate_float) & torch.isfinite(reference_float)
+    difference = (candidate_float - reference_float).abs()
+    finite_difference = difference[finite]
+    matches = finite & torch.isclose(candidate_float, reference_float, rtol=rtol, atol=atol)
+    return {
+        "candidate_dtype": str(candidate.dtype),
+        "reference_dtype": str(reference.dtype),
+        "numel": reference.numel(),
+        "finite_pairs": finite.sum().item(),
+        "nonfinite": (~finite).sum().item(),
+        "rtol": rtol,
+        "atol": atol,
+        "outside_tolerance": (~matches).sum().item(),
+        "tolerance_scope": "FP64 arithmetic, informational only; not the original-dtype compatibility gate",
+        "max_abs_error": finite_difference.max().item() if finite_difference.numel() else None,
+        "mean_abs_error": finite_difference.mean().item() if finite_difference.numel() else None,
+        "rms_error": (
+            (torch.linalg.vector_norm(finite_difference) / finite_difference.numel() ** 0.5).item()
+            if finite_difference.numel()
+            else None
+        ),
+        "qualification_gate": False,
+    }
+
+
+def group_norm_reference(
+    inputs: torch.Tensor,
+    norm: torch.nn.GroupNorm,
+    *,
+    scale: torch.Tensor | None = None,
+    shift: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Promote existing quantized operands before every reference operation."""
+    if (scale is None) != (shift is None):
+        raise ValueError("Adaptive references require both scale and shift")
+    with torch.inference_mode(), torch.autocast(inputs.device.type, enabled=False):
+        normalized = functional.group_norm(
+            inputs.double(),
+            norm.num_groups,
+            norm.weight.double() if norm.weight is not None else None,
+            norm.bias.double() if norm.bias is not None else None,
+            norm.eps,
+        )
+        if scale is not None and shift is not None:
+            normalized = normalized * (1 + scale.double()) + shift.double()
+        return functional.silu(normalized)
+
+
+def block_precision_reference(native: torch.nn.Module, inputs: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+    """Run the native equation in FP64 using a private copy of its existing state."""
+    if native.updown or native.training or native.dropout != 0:
+        raise ValueError("FP64 block references require plain eval blocks with dropout=0")
+    with torch.inference_mode(), torch.autocast(inputs.device.type, enabled=False):
+        reference = deepcopy(native).double()
+        return reference(inputs.double(), embedding.double())
 
 
 def backend_policy() -> dict[str, object]:
@@ -166,7 +231,14 @@ def replay(
             inputs, in_norm.weight, in_norm.bias, num_groups=in_norm.num_groups, eps=in_norm.eps
         )
         results["gn_silu"] = compare(fused_gn, reference["gn_silu"])
-        del fused_gn
+        high_precision = group_norm_reference(inputs, in_norm)
+        results["gn_silu"]["fp64_reference"] = {
+            "scope": "Same quantized block input and affine parameters; FP64 GN and SiLU",
+            "reference_device": str(high_precision.device),
+            "native": reference_error(reference["gn_silu"], high_precision),
+            "fused": reference_error(fused_gn, high_precision),
+        }
+        del fused_gn, high_precision
         for name, source, native_layer, nvidia_layer in (
             ("conv1", reference["gn_silu"], native.in_layers[2], nvidia.in_layers[2]),
             ("embedding", embedding, native.emb_layers, nvidia.emb_layers),
@@ -193,7 +265,14 @@ def replay(
             hidden, out_norm.weight, out_norm.bias, scale, shift, num_groups=out_norm.num_groups, eps=out_norm.eps
         )
         results["adaptive_gn_silu"] = compare(adaptive, reference["adaptive_gn_silu"])
-        del adaptive, hidden
+        high_precision = group_norm_reference(hidden, out_norm, scale=scale, shift=shift)
+        results["adaptive_gn_silu"]["fp64_reference"] = {
+            "scope": "Same captured native conv1 and embedding outputs; FP64 GN, modulation and SiLU",
+            "reference_device": str(high_precision.device),
+            "native": reference_error(reference["adaptive_gn_silu"], high_precision),
+            "fused": reference_error(adaptive, high_precision),
+        }
+        del adaptive, hidden, high_precision
         normalized = reference["adaptive_gn"].to(device)
         stepwise_modulation = normalized * (1 + scale) + shift
         fp32_modulation = normalized.float() * (1 + scale.float()) + shift.float()
@@ -257,6 +336,26 @@ def diagnose(
         candidate, nvidia_policies = capture(nvidia, inputs, embedding, fused=True)
         stages = {name: compare(candidate[name], reference[name]) for name in candidate}
         local = replay(native, nvidia, inputs, embedding, reference, native_policies["conv1"], nvidia_policies["conv1"])
+        with convolution_policy(native_policies["conv1"]):
+            precision_policy = backend_policy()
+            high_precision = block_precision_reference(native, inputs, embedding)
+        with convolution_policy(nvidia_policies["conv1"]):
+            matched_policy = backend_policy()
+            native_matched = native(inputs, embedding).cpu()
+        whole_block_precision = {
+            "scope": "Native equation in FP64 from quantized fixture inputs and copied weights; not model quality",
+            "reference_dtype": str(high_precision.dtype),
+            "reference_device": str(high_precision.device),
+            "reference_policy": precision_policy,
+            "native_default_policy": native_policies["conv1"],
+            "native_matched_policy_settings": matched_policy,
+            "native_default": reference_error(native_output, high_precision),
+            "native_matched_policy": reference_error(native_matched, high_precision),
+            "nvidia": reference_error(nvidia_output, high_precision),
+            "nvidia_vs_native_matched_policy": compare(nvidia_output, native_matched),
+            "native_policy_only": compare(native_matched, native_output),
+        }
+        del high_precision, native_matched
         reference["scale"], reference["shift"] = reference["embedding"].chunk(2, dim=1)
     if backend_policy() != before:
         raise RuntimeError("Diagnostic did not restore backend policy")
@@ -283,6 +382,7 @@ def diagnose(
         },
         "fused_internal_values": "GN and modulation are not separately materialized by fused kernels",
         "same_native_input_replay": local,
+        "whole_block_fp64_reference": whole_block_precision,
         "policies": {"before": before, "native": native_policies, "nvidia": nvidia_policies, "after": backend_policy()},
         "rounding_mechanism_probe": rounding_probe(),
         "failure_cause": (
