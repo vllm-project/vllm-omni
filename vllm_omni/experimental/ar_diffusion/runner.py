@@ -283,7 +283,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         block_size = paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame)
         visibility_block_size = block_size
         if config.superpage_tokens:
-            from .kv_cache.paged_attention import _resolve_fa_version
+            from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _resolve_fa_version
 
             page = config.superpage_tokens
             if (

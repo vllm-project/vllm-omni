@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import contiguous_kv_gather_enabled
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping, visible_window_blocks
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
+    chunk_window_skipped_tokens,
+    compute_slot_mapping,
+    visible_window_blocks,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
@@ -330,9 +334,7 @@ class ARDiffusionPagedForwardContext:
             first_position.setdefault(int(block), current_start + index * block_size)
 
         if self.kv_cache.superpage_size:
-            from .superpage import pack_visible_rows
-
-            return pack_visible_rows(self, first_position, device)
+            return self._superpage_video_blocks(first_position, device)
 
         visible_video_blocks: list[int] = []
         video_len = 0
@@ -347,6 +349,57 @@ class ARDiffusionPagedForwardContext:
             visible_video_blocks.append(block)
             video_len += min(block_size, end - first)
         return visible_video_blocks, video_len
+
+    def _superpage_video_blocks(self, first_position: dict[int, int], device: torch.device) -> tuple[list[int], int]:
+        """Pack baseline-visible boundary rows of manager-owned superpages."""
+        cache = self.kv_cache
+        page, unit = self.block_size, cache.visibility_block_size
+        history = self.adapter.absolute_num_computed_tokens
+        end = history + self.seq_len
+        sink_end = -(-self.sink_tokens // unit) * unit
+        skipped = chunk_window_skipped_tokens(
+            history,
+            chunk_size=self.chunk_size,
+            sliding_window=cache.spec.sliding_window,
+            sink_chunks=cache.spec.sink_chunks,
+            reset_at_boundary=cache.spec.reset_at_boundary,
+        )
+        recent = max(
+            sink_end, max(0, end - self.window_tokens) // unit * unit, (self.sink_tokens + skipped) // unit * unit
+        )
+        ranges = ((0, min(sink_end, end)), (recent, end))
+        signature = (tuple(first_position.items()), ranges, self.adapter.compacted_tokens)
+        previous = cache.superpage_plan
+        if previous is not None and previous[0] == signature:
+            _, pages, length, self.private_slots, self.superpage_fragment_tokens = previous
+            return pages, length
+
+        pages, fragments = [], []
+        sink_page_end = -(-self.sink_tokens // page) * page
+        length = 0
+        for block, first in sorted(first_position.items(), key=lambda item: item[1]):
+            absolute = first + (self.adapter.compacted_tokens if first >= sink_page_end else 0)
+            spans = [(max(lo, absolute), min(hi, absolute + page)) for lo, hi in ranges]
+            spans = [(lo, hi) for lo, hi in spans if hi > lo]
+            count = sum(hi - lo for lo, hi in spans)
+            length += count
+            if count == page:
+                pages.append(block)
+            else:
+                for lo, hi in spans:
+                    fragments.extend(range(block * page + lo - absolute, block * page + hi - absolute))
+        capacity = cache.superpage_private_pages * page
+        if len(fragments) > capacity:
+            raise RuntimeError(f"superpage boundary bound violated: {len(fragments)} > {capacity}")
+        private_base = cache.num_blocks_total - cache.superpage_private_pages
+        pages += list(range(private_base, private_base + -(-len(fragments) // page)))
+        self.private_slots = _to_device_async(
+            torch.tensor(fragments + [cache.null_block_id * page] * (capacity - len(fragments)), dtype=torch.long),
+            device,
+        )
+        self.superpage_fragment_tokens = len(fragments)
+        cache.superpage_plan = (signature, pages, length, self.private_slots, len(fragments))
+        return pages, length
 
     def build_block_table(
         self,
