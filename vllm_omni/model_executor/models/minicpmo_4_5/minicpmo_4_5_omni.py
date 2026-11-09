@@ -1667,17 +1667,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_control_ids_cache = control_ids
         return control_ids
 
-    def _minicpmo45_decode_duplex_token(self, token_id: int) -> str:
+    def _minicpmo45_decode_duplex_tokens(self, token_ids: list[int]) -> str:
+        """Decode ``token_ids`` as one span.
+
+        A byte-level BPE piece is ``\\ufffd`` on its own and a real character
+        only when the ids that form it are decoded together.
+        """
+        if not token_ids:
+            return ""
         decode = getattr(self._minicpmo45_tokenizer(), "decode", None)
         if not callable(decode):
             return ""
         try:
-            text = decode([token_id], skip_special_tokens=True)
+            text = decode(token_ids, skip_special_tokens=True)
         except TypeError:
-            text = decode([token_id])
+            text = decode(token_ids)
         except Exception:
             return ""
         return text if isinstance(text, str) else ""
+
+    def _minicpmo45_extend_open_turn_tail(self, state: Any, sampled: int) -> None:
+        """Append one text token and refresh the tail from the whole id window."""
+        if getattr(state, "current_turn_ended", True):
+            state.open_turn_token_ids = []
+        token_ids = getattr(state, "open_turn_token_ids", None)
+        if not isinstance(token_ids, list):
+            token_ids = []
+            state.open_turn_token_ids = token_ids
+        token_ids.append(int(sampled))
+        del token_ids[: -MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS]
+        text = self._minicpmo45_decode_duplex_tokens(token_ids)
+        state.open_turn_tail = text[-MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS :]
+        if state.open_turn_tail:
+            state.turn_unit_has_text = True
 
     def _minicpmo45_unfinished_turn_chunk_eos(self, row_idx: int, token_ids: dict[str, int]) -> int | None:
         """chunk_eos when turn_eos would close an unfinished sentence, else None.
@@ -1765,14 +1787,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         del generated_tokens[:-history_size]
         if int(sampled) in self._minicpmo45_duplex_control_ids():
             return
-        if getattr(state, "current_turn_ended", True):
-            state.open_turn_tail = ""
-        piece = self._minicpmo45_decode_duplex_token(int(sampled))
-        if not piece:
-            return
-        tail = (getattr(state, "open_turn_tail", "") or "") + piece
-        state.open_turn_tail = tail[-MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS :]
-        state.turn_unit_has_text = True
+        self._minicpmo45_extend_open_turn_tail(state, int(sampled))
 
     def _record_minicpmo45_duplex_terminator(self, row_idx: int, sampled: int, token_ids: dict[str, int]) -> None:
         """Remember sampled unit state for the next append.
@@ -1798,6 +1813,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if sampled == listen_id and force_listen:
                 state.current_turn_ended = True
                 state.open_turn_tail = ""
+                state.open_turn_token_ids = []
                 state.held_turn_ends = 0
                 state.textless_turn_end_units = 0
                 with suppress(Exception):
@@ -1813,6 +1829,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             state.current_turn_ended = True
             state.turn_unit_has_text = False
             state.open_turn_tail = ""
+            state.open_turn_token_ids = []
             state.held_turn_ends = 0
             state.textless_turn_end_units = 0
             with suppress(Exception):

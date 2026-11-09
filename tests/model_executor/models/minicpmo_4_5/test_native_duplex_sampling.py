@@ -294,6 +294,75 @@ def test_hold_cap_accepts_turn_eos_on_an_unfinished_sentence(deferred, monkeypat
     assert state.current_turn_ended is True
 
 
+class _SplitMarkTokenizer(_SentenceTokenizer):
+    """Ids 30 and 31 are ``\\ufffd`` alone and ``。`` only when decoded together."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        del skip_special_tokens
+        ids = [int(token_id) for token_id in ids]
+        if ids == [30, 31]:
+            return "正。"
+        if ids in ([30], [31]):
+            return "\ufffd"
+        return super().decode(ids)
+
+
+def _record_model(tokenizer):
+    state = SimpleNamespace(
+        generated_tokens=[],
+        current_turn_ended=False,
+        turn_unit_has_text=False,
+        textless_turn_end_units=0,
+        open_turn_tail="",
+        open_turn_token_ids=[],
+        held_turn_ends=0,
+        pending_speech_context=False,
+    )
+    model = Model.__new__(Model)
+    model._minicpmo45_native_duplex_token_ids_cache = dict(TOKEN_IDS)
+    model._minicpmo45_tokenizer_cache = tokenizer
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid": state})
+    model._minicpmo45_duplex_row_sessions = {0: "sid"}
+    model._minicpmo45_duplex_row_payloads = {0: {}}
+    return model, state
+
+
+def test_recorded_tokens_update_the_open_turn_tail():
+    model, state = _record_model(_SentenceTokenizer())
+    model._record_minicpmo45_duplex_generation_token(0, TOKEN_IDS["turn_eos_token_id"])
+    assert state.turn_unit_has_text is False
+    assert state.open_turn_tail == ""
+
+    model._record_minicpmo45_duplex_generation_token(0, 20)
+    assert state.open_turn_tail == "正"
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) == CHUNK_EOS
+
+    model._record_minicpmo45_duplex_generation_token(0, 21)
+    assert state.open_turn_tail == "正。"
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) is None
+
+    state.current_turn_ended = True
+    model._record_minicpmo45_duplex_generation_token(0, 20)
+    assert state.open_turn_token_ids == [20]
+    assert state.open_turn_tail == "正"
+
+    state.current_turn_ended = False
+    for _ in range(MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS + 4):
+        model._record_minicpmo45_duplex_generation_token(0, 20)
+    assert len(state.open_turn_token_ids) == MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS
+    assert len(state.open_turn_tail) == MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS
+
+
+def test_split_sentence_mark_is_decoded_with_its_token_span():
+    model, state = _record_model(_SplitMarkTokenizer())
+    model._record_minicpmo45_duplex_generation_token(0, 30)
+    assert state.open_turn_tail == "\ufffd"
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) == CHUNK_EOS
+    model._record_minicpmo45_duplex_generation_token(0, 31)
+    assert state.open_turn_tail == "正。"
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) is None
+
+
 class _NoHostReads(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func in (torch.ops.aten._local_scalar_dense.default, torch.ops.aten.is_nonzero.default):
