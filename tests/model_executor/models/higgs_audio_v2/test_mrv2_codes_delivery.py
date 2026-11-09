@@ -324,14 +324,22 @@ def test_on_requests_finished_drops_only_finished_state():
         "b": {"num_delay": 0, "num_remaining_delays": None, "audio_out_ids": torch.zeros(8, 4, dtype=torch.long)},
     }
     t._slot_output_len = {"a": 5, "b": 6}
+    # "a" was aborted after its last sampling step: its codes row waits in
+    # the pending map for a postprocess walk that will never come.
+    t._pending_codes_by_req = {
+        "a": torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
+        "b": torch.tensor([[2, 2, 2, 2, 2, 2, 2, 2]], dtype=torch.long),
+    }
 
     t.on_requests_finished({"a"})
     assert set(t._audio_state) == {"b"}
     assert set(t._slot_output_len) == {"b"}
+    assert set(t._pending_codes_by_req) == {"b"}
 
     # Unknown ids are no-ops; a preempted (not finished) id keeps its state.
     t.on_requests_finished({"nope"})
     assert set(t._audio_state) == {"b"}
+    assert set(t._pending_codes_by_req) == {"b"}
     assert t._audio_state["b"]["audio_out_ids"].shape == (8, 4)
 
 

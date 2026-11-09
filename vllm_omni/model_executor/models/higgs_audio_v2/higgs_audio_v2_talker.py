@@ -1638,17 +1638,28 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         req_id and a key never repeats, so without this cleanup every
         finished request would retain its ``audio_out_ids`` GPU tensor for
         the process lifetime (V1's batch-row keys were self-bounded by slot
-        reuse). Preempted requests keep their state: the MRV2 runner only
-        invokes this hook for ``finished_req_ids``, and a recomputed
-        request must resume its delay-pattern history.
+        reuse). ``_pending_codes_by_req`` needs the same drop: an aborted
+        request (or one cut at max_tokens mid-audio) leaves its last
+        sampled codes row unconsumed — postprocess only walks the current
+        batch, so the entry would otherwise sit in the map forever. A
+        normally finished request has no entry left to pop: its final frame
+        is served by the postprocess walk that precedes the finishing
+        sampling step, and the finishing step samples audio_eos (not an
+        audio token), which appends nothing. Preempted requests keep their
+        state: the MRV2 runner only invokes this hook for
+        ``finished_req_ids``, and a recomputed request must resume its
+        delay-pattern history.
         """
         state = getattr(self, "_audio_state", None)
         lens = getattr(self, "_slot_output_len", None)
+        pending = getattr(self, "_pending_codes_by_req", None)
         for req_id in finished_req_ids:
             if isinstance(state, dict):
                 state.pop(req_id, None)
             if isinstance(lens, dict):
                 lens.pop(req_id, None)
+            if isinstance(pending, dict):
+                pending.pop(req_id, None)
 
     def create_omni_model_state(self, vllm_config, encoder_cache, device):
         """MRV2 model state with per-forward audio-state view realignment."""
