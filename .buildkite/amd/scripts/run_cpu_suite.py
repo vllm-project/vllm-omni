@@ -63,6 +63,7 @@ class CpuSuiteArtifacts:
         self.phases: dict[str, float] = defaultdict(float)
         self.outcomes: dict[str, dict[str, str]] = {}
         self.started_nodes: set[str] = set()
+        self.failed_subtests: set[str] = set()
         self.collection_seconds: float | None = None
         self.collection_finished = False
         self.artifact_errors: set[str] = set()
@@ -155,6 +156,13 @@ class CpuSuiteArtifacts:
         self.event("test_start", nodeid=nodeid)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        # A subtest report shares its parent's node ID and duration is already
+        # included in the parent call. Keep diagnostics without double counting.
+        if hasattr(report, "context"):
+            self.event("subtest_report", nodeid=report.nodeid, outcome=report.outcome)
+            if report.failed:
+                self.failed_subtests.add(report.nodeid)
+            return
         self.phases[report.when] += report.duration
         self.outcomes.setdefault(report.nodeid, {})[report.when] = report.outcome
         self.event(
@@ -185,7 +193,7 @@ class CpuSuiteArtifacts:
         counts = Counter()
         for nodeid in self.started_nodes | self.outcomes.keys():
             phases = self.outcomes.get(nodeid, {})
-            if "failed" in phases.values():
+            if "failed" in phases.values() or nodeid in self.failed_subtests:
                 counts["failed"] += 1
             elif "skipped" in phases.values():
                 counts["skipped"] += 1

@@ -303,8 +303,35 @@ def test_ready_merge_timing_jobs_stay_identical() -> None:
     for step in jobs[0]:
         assert step["grade"] == "Blocking"
         assert step["artifact_paths"] == ["artifacts/amd-cpu-suites/**/*"]
-    other = next(step for step in jobs[0] if step["label"] == "Simple · Other Test")
+    other = next(step for step in jobs[0] if step["label"] == "Simple · Other Test · Shard %N/%t")
+    assert other["parallelism"] == 2
+    assert "--timing-profile=.buildkite/amd/cpu-timings/other-v1.json" in other["commands"][-1]
+    for path in ("diffusion", "model_executor", "entrypoints", "engine", "diffusion/cache/test_teacache_extractors.py"):
+        assert f"--ignore=tests/{path}" in other["commands"][-1]
+    assert "-m 'core_model and cpu'" in other["commands"][-1]
+    assert "--deselect" not in other["commands"][-1]
     assert "--ignore=tests/model_executor" in other["commands"][-1]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_unittest_subtests_do_not_duplicate_parent_timing(suite: Path, fails: bool) -> None:
+    result, directory = run_suite(
+        suite,
+        f"""
+import unittest
+class TestSubtests(unittest.TestCase):
+    def test_cases(self):
+        for number in range(3):
+            with self.subTest(number=number):
+                self.assertFalse({fails!r} and number == 1)
+""",
+    )
+    assert result.returncode == int(fails), result.stdout + result.stderr
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    assert len([e for e in events if e["event"] == "subtest_report"]) == 3
+    assert [e["phase"] for e in events if e["event"] == "test_report"] == ["setup", "call", "teardown"]
+    summary = read_json(directory, "summary.json")
+    assert summary["counts"]["failed" if fails else "passed"] == 1
 
 
 @pytest.mark.parametrize("suite_name", ["other", "diffusion"])

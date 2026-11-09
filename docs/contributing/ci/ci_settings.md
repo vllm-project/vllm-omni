@@ -373,6 +373,43 @@ Use the CI image and its quota; the script interleaves 1/2/4 threads, with one
 warmup and three measured fresh processes per count. Logs, JUnit results and
 software versions are retained. A failure or skip invalidates the benchmark.
 
+### Other CPU: two-shard trial
+
+READY/MERGE split Other into two duration-weighted shards using
+`.buildkite/amd/cpu-timings/other-v1.json`, generated from all 8,954 selected
+nodes in the successful two-way target READY trial in
+[build #15655](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15655), merge
+commit `ae8a431e3e53b102b77b2e7ebdd2ad3dea31fe5f`. The first trial selected
+every live node exactly once with no test, collection, or artifact failures;
+both workers launched with seven-second queue delays and finished in 12m04s and
+14m50s. Repacking those measured setup + call + teardown totals estimates
+12m17s per shard before collection and job overhead. This remains a planning
+estimate until the refreshed profile completes target CI. A third shard should
+be considered only after measuring the two-shard p95 and queue/agent cost.
+
+The existing `core_model and cpu` expression and all five `--ignore` arguments
+are retained. Whole modules stay together, including expensive subprocess and
+import fixtures. Fixture scopes, mutation isolation and pass criteria do not
+change. New tests are assigned from live collection even without timing history.
+
+The historical artifact contains three zero-duration `unittest.subTest` call
+reports before one parent call. The importer accepts this passed zero-duration
+prefix only while requiring exactly one test start per selected node; repeated
+nonzero phase reports still fail. New artifacts record `subtest_report` separately,
+preserve subtest failures, and avoid double-counting parent call duration.
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py downloaded/other-job \
+  --suite other --output other-v2.json
+python .buildkite/amd/scripts/verify_cpu_shards.py --suite other \
+  --baseline downloaded/other-baseline --candidate downloaded/other-candidate-*
+```
+
+Before rollout, require the unchanged executed node union and skip outcomes,
+per-shard p95 below 18 minutes, and measured summed agent-minutes, build wall
+time and queue latency. Other retains its existing thread environment. Rollback
+removes `parallelism: 2` and `--timing-profile`, and restores the unsharded label.
+
 ## Cross-cutting conventions
 
 ### Diff-aware CI {#diff-aware-ci}

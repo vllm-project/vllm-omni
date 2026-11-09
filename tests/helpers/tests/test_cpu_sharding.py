@@ -325,7 +325,7 @@ def write_artifact(directory: Path, index: int, cost: float, *, build: int = 1) 
     }
     for filename, document in documents.items():
         (directory / filename).write_text(json.dumps(document), encoding="utf-8")
-    reports = [
+    reports = [{"event": "test_start", "nodeid": selected}] + [
         {"event": "test_report", "nodeid": selected, "phase": phase, "outcome": "passed", "seconds": cost / 3}
         for phase in ("setup", "call", "teardown")
     ]
@@ -355,7 +355,9 @@ def test_profile_builder_uses_complete_runs_and_median_phase_totals(tmp_path: Pa
     assert len(profile.sources) == 3
 
 
-@pytest.mark.parametrize("problem", ["missing-shard", "duplicate-shard", "failed", "partial", "missing-call"])
+@pytest.mark.parametrize(
+    "problem", ["missing-shard", "duplicate-shard", "failed", "partial", "missing-call", "missing-start-node"]
+)
 def test_profile_builder_rejects_unusable_evidence(tmp_path: Path, problem: str) -> None:
     directories = [tmp_path / str(index) for index in range(3)]
     for index, directory in enumerate(directories):
@@ -369,10 +371,15 @@ def test_profile_builder_rejects_unusable_evidence(tmp_path: Path, problem: str)
         summary = json.loads(path.read_text())
         summary["pytest_exit_code"] = 1
         path.write_text(json.dumps(summary))
+    elif problem == "missing-start-node":
+        path = directories[0] / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        events[0].pop("nodeid")
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
     else:
         path = directories[0] / "events.jsonl"
         lines = path.read_text().splitlines()
-        lines.pop(-1 if problem == "partial" else 1)
+        lines.pop(-1 if problem == "partial" else 2)
         path.write_text("\n".join(lines) + "\n")
     result = run_builder(tmp_path, directories)
     assert result.returncode == 2, result.stdout + result.stderr
@@ -433,3 +440,24 @@ def test_execution_verifier_checks_union_outcomes_and_plans(tmp_path: Path, prob
         timeout=30,
     )
     assert result.returncode == (2 if problem else 0), result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["subtests", "duplicate-start", "duplicate-call"])
+def test_legacy_subtests_require_one_parent_execution(tmp_path: Path, kind: str) -> None:
+    directories = [tmp_path / str(index) for index in range(3)]
+    for index, directory in enumerate(directories):
+        write_artifact(directory, index, 6)
+    path = directories[0] / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    if kind == "duplicate-start":
+        events.insert(0, events[0])
+    else:
+        extra = dict(events[2])
+        if kind == "subtests":
+            extra["seconds"] = 0
+        events.insert(2, extra)
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    result = run_builder(tmp_path, directories)
+    assert result.returncode == (0 if kind == "subtests" else 2), result.stdout + result.stderr
+    if kind == "subtests":
+        assert load_profile(tmp_path / "profile.json").node_seconds[node("a")] == 6
