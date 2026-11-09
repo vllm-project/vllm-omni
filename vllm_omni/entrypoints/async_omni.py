@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anyio
 import msgspec
@@ -1207,6 +1207,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Check if frontend admission is paused."""
         async with self._pause_cond:
             return self._paused
+
+    async def get_execution_state(self) -> Literal["unpaused", "paused"]:
+        """Observe the same local gate used by generate(), without backend RPC.
+
+        Partial wakes still block execution while any sleeping tag remains.
+        This says nothing about other frontend processes or worker health.
+        """
+        async with self._pause_cond:
+            return "paused" if self._paused or self._sleeping_tags else "unpaused"
 
     # EngineClient exposes async operations; OmniBase implements the sync API.
     async def start_profile(  # type: ignore[override]

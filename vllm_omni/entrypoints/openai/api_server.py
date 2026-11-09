@@ -159,6 +159,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.capabilities import OmniCapabilitiesResponse
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -187,6 +188,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionNotFoundError,
 )
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
+from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
@@ -511,6 +513,13 @@ async def omni_run_server_worker(
                 '"torch_profiler_dir": "..."}\' or add a profiler_config block to a '
                 "stage in your deploy YAML. See docs/contributing/profiling.md."
             )
+
+        app.state.omni_serving_capabilities = OmniServingCapabilities(
+            app,
+            engine_client,
+            restrictions=tuple(getattr(engine_client, "endpoint_restrictions", ())) + run_endpoint_restrictions(),
+            single_api_dependencies=(_require_single_api_video_store,),
+        )
 
         vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
@@ -2178,6 +2187,15 @@ async def health(raw_request: Request) -> JSONResponse:
 # Remove existing models endpoint if present (from vllm imports)
 # to ensure our handler takes precedence
 _remove_route_from_router(router, "/v1/models")
+
+
+@router.get("/v1/omni/capabilities", response_model=OmniCapabilitiesResponse)
+async def show_capabilities(raw_request: Request) -> OmniCapabilitiesResponse:
+    """Describe initialized model contracts, routes, and the local execution gate."""
+    service = getattr(raw_request.app.state, "omni_serving_capabilities", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Omni capability discovery is not initialized.")
+    return await service.get_capabilities()
 
 
 @router.get("/v1/models")

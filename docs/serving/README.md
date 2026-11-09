@@ -35,11 +35,16 @@ export VLLM_OMNI_BASE_URL=http://localhost:8091
 
 curl "$VLLM_OMNI_BASE_URL/health"
 curl "$VLLM_OMNI_BASE_URL/v1/models" | jq .
+curl "$VLLM_OMNI_BASE_URL/v1/omni/capabilities" | jq .
 ```
 
 Use `http://localhost:8091/v1` as the `base_url` for an OpenAI SDK client. If
 the server was started with `--api-key`, include an `Authorization` header with
 `Bearer <api-key>` in requests.
+
+[Capability discovery](capabilities.md) describes model request profiles,
+endpoint exposure, and the observed execution gate. Clients can use it to
+select a supported operation and input mode for each served model name.
 
 ### Served model aliases
 
