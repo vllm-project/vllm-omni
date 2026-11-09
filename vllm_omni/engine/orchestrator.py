@@ -80,7 +80,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageRequestMetrics, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
@@ -1611,13 +1611,12 @@ class OrchestratorBase:
         replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
-    ) -> Any:
+    ) -> StageRequestMetrics:
         """Build finished-stage metrics and fold scheduler wait into queue wait.
 
-        ``pipeline_timings`` is updated before the per-stage copy, so every
-        later stage publishes the sum of the orchestrator hop and all diffusion
-        scheduler waits seen so far. ``extract_queue_wait_s`` then reads that
-        one key.
+        The pool returns the measured wait. This method, which owns the request
+        timings, adds it before the per-stage copy. ``extract_queue_wait_s``
+        later reads that one key.
         """
         pool = self.stage_pools[stage_id]
         stage_metrics = pool.build_stage_metrics(
@@ -1626,8 +1625,12 @@ class OrchestratorBase:
             request_timestamp=req_state.request_timestamp,
             replica_id=replica_id,
             sampling_params=req_state.sampling_params_list[stage_id],
-            pipeline_timings=req_state.pipeline_timings,
         )
+        if (wait_ms := stage_metrics.scheduler_queue_wait_ms) is not None:
+            # A missing orchestrator hop still records the scheduler wait.
+            req_state.pipeline_timings["queue_wait_ms"] = (
+                float(req_state.pipeline_timings.get("queue_wait_ms", 0.0)) + wait_ms
+            )
         if self.collect_stage_metrics:
             stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
         return stage_metrics

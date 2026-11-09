@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def diffusion_output_metrics(engine_output: Any) -> dict[str, Any]:
+    """Return the metrics dict on one engine output, or an empty dict."""
+    raw = getattr(engine_output, "metrics", None)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
 @dataclass
 class StageStats:
     total_token: int = 0
@@ -77,6 +87,9 @@ class StageRequestStats:
     vllm_prefill_ms: float | None = None
     vllm_decode_ms: float | None = None
     vllm_num_preemptions: int | None = None
+    # Diffusion scheduler admission wait for this stage, in milliseconds.
+    # None means the output did not carry scheduler_queue_wait_ms.
+    scheduler_queue_wait_ms: float | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -139,6 +152,7 @@ STAGE_EXCLUDE = {
     "final_output_type",
     "finish_reason",
     "pipeline_timings",
+    "scheduler_queue_wait_ms",
 }
 # Duplex logs one StageRequestStats table per response. Chunk submits refresh
 # ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
@@ -815,9 +829,7 @@ class OrchestratorAggregator:
         if stage_type != "diffusion":
             return
         engine_output = engine_outputs[0] if isinstance(engine_outputs, list) and engine_outputs else engine_outputs
-        diffusion_metrics: dict = getattr(engine_output, "metrics", {})
-        if isinstance(diffusion_metrics, list):
-            diffusion_metrics = diffusion_metrics[0]
+        diffusion_metrics = diffusion_output_metrics(engine_output)
         if not diffusion_metrics:
             return
         bucket = self.diffusion_metrics[req_id]
