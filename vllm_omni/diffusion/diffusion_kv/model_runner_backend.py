@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -12,10 +11,14 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
+
+try:
+    from vllm.v1.kv_cache_interface import get_block_table_width
+except ImportError:  # vLLM before vllm-project/vllm#63373 moved it out of the MRv1 block_table
+    from vllm.v1.worker.block_table import get_block_table_width
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
@@ -35,18 +38,6 @@ from vllm_omni.platforms import current_omni_platform
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
 DiffusionKVSnapshot = tuple[object, ...]
-
-
-def _get_block_table_width(max_num_blocks: int, block_size: int, *, token_alignment: int = 128) -> int:
-    """Row width of a block table, padded so each row spans a multiple of
-    ``token_alignment`` tokens.
-
-    Mirrors ``vllm.v1.worker.block_table.get_block_table_width``, which went
-    away with Model Runner V1 (vllm-project/vllm#63373); the MRv2
-    ``BlockTables`` does not pad rows itself.
-    """
-    block_alignment = token_alignment // math.gcd(token_alignment, block_size)
-    return cdiv(max_num_blocks, block_alignment) * block_alignment
 
 
 @dataclass(frozen=True)
@@ -259,7 +250,7 @@ class DiffusionKVModelRunnerBackend:
         if any(type(capacity) is not int or capacity <= 0 for capacity in unaligned_max_num_blocks_per_group):
             raise ValueError("native diffusion KV cache groups must have positive row capacities")
         max_num_blocks_per_group = [
-            _get_block_table_width(capacity, block_size)
+            get_block_table_width(capacity, block_size)
             for capacity, block_size in zip(unaligned_max_num_blocks_per_group, block_sizes, strict=True)
         ]
 

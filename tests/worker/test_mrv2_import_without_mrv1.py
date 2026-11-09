@@ -12,6 +12,7 @@ import sys
 import textwrap
 
 import pytest
+import vllm.v1.kv_cache_interface as kv_cache_interface
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -94,7 +95,13 @@ def _run_blocked(body: str) -> None:
         "vllm_omni.worker.gpu_ar_worker",
         "vllm_omni.worker.gpu_generation_worker",
         "vllm_omni.worker.omni_connector_validation",
-        "vllm_omni.diffusion.diffusion_kv.model_runner_backend",
+        pytest.param(
+            "vllm_omni.diffusion.diffusion_kv.model_runner_backend",
+            marks=pytest.mark.skipif(
+                not hasattr(kv_cache_interface, "get_block_table_width"),
+                reason="this vLLM still keeps get_block_table_width in the MRv1 block_table",
+            ),
+        ),
     ],
 )
 def test_mrv2_path_imports_without_mrv1(module: str) -> None:
@@ -132,14 +139,3 @@ def test_workers_keep_mrv1_runner_classes() -> None:
     assert GPUGenerationWorker.model_runner_cls is GPUGenerationModelRunner
     validate_worker_omni_connector(GPUARWorker, True)
     validate_worker_omni_connector(GPUGenerationWorker, True)
-
-
-def test_diffusion_block_table_width_matches_mrv1() -> None:
-    mrv1_block_table = pytest.importorskip("vllm.v1.worker.block_table")
-    from vllm_omni.diffusion.diffusion_kv.model_runner_backend import _get_block_table_width
-
-    for block_size in (1, 16, 48, 64, 96, 128, 256, 528):
-        for capacity in (1, 7, 8, 63, 64, 65, 1000, 4097):
-            assert _get_block_table_width(capacity, block_size) == mrv1_block_table.get_block_table_width(
-                capacity, block_size
-            )
