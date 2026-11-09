@@ -213,6 +213,8 @@ class _ModelEngineOverrides(TypedDict, total=False):
     generation_config: str
     override_generation_config: dict[str, Any]
     enable_prompt_embeds: bool
+    dit_load_aware: bool | None
+    dit_load_threshold: int | None
 
 
 class _PoolingEngineOverrides(TypedDict, total=False):
@@ -539,6 +541,8 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     generation_config: str | None = None
     override_generation_config: dict[str, Any] | None = None
     enable_prompt_embeds: bool | None = None
+    dit_load_aware: bool | None = None
+    dit_load_threshold: int | None = None
 
     def __post_init__(self) -> None:
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)

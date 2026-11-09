@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
@@ -22,6 +23,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -1656,6 +1658,69 @@ class StagePool:
         for watermarker in self._watermarkers.values():
             for request_id in request_ids:
                 watermarker.discard_request_state(request_id)
+
+    async def poll_dit_load(self, replica_id: int) -> tuple[int, int, list[str], list[str]] | None:
+        """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        try:
+            return await cast(StagePoolDiffusionClient, raw_client).get_dit_load_async()
+        except Exception:
+            logger.debug(
+                "[StagePool] poll_dit_load failed for stage-%s replica-%s",
+                self.stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return None
+
+    def check_dit_health(self, replica_id: int) -> bool:
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return False
+        try:
+            cast(StagePoolDiffusionClient, raw_client).check_health()
+            return True
+        except EngineDeadError:
+            return False
+        except Exception:
+            logger.debug(
+                "[StagePool] check_dit_health failed for stage-%s replica-%s",
+                self.stage_id,
+                replica_id,
+                exc_info=True,
+            )
+            return False
+
+    async def push_dit_load(self, snapshot: DitLoadSnapshot) -> None:
+        """Push DiT load snapshot to all live AR replicas via UTILITY ZMQ.
+
+        Called by ``Orchestrator._push_dit_load_to_ar`` after each
+        ``DitLoadState.update()`` / ``DitLoadState.remove()``. Uses the same
+        ZMQ UTILITY channel (``call_utility_async``) as other control-plane
+        RPCs, so it inherits the channel's transport (``ipc://`` colocated
+        or ``tcp://`` distributed) without extra socket management.
+        """
+        payload = dict(snapshot)
+        for replica_id in self.live_replica_ids():
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            call_utility = getattr(client, "call_utility_async", None)
+            if call_utility is None:
+                continue
+            try:
+                await call_utility("omni_update_dit_load", payload)
+            except Exception:
+                logger.warning(
+                    "[StagePool] push_dit_load failed for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
+
+ 
 
     # ---- Stage-local control plane ----
 
