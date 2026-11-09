@@ -44,6 +44,7 @@ _STUBBED_MODULE_NAMES = (
     "vllm_omni.experimental.ar_diffusion",
     "vllm_omni.experimental.ar_diffusion.kv_cache",
     "vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention",
+    "vllm_omni.experimental.ar_diffusion.kv_cache.paging",
 )
 
 
@@ -270,6 +271,11 @@ def _install_vllm_stubs() -> None:
     )
     paged_attention.paged_write_attn = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("paged path was not expected in this direct-cache test")
+    )
+    setattr(
+        sys.modules["vllm_omni.experimental.ar_diffusion.kv_cache.paging"],
+        "paging_block_size",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("CUDA paging was not expected in this CPU test")),
     )
 
 
