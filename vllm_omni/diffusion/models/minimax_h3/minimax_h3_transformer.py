@@ -1286,9 +1286,7 @@ class MiniMaxH3DiTModel(nn.Module):
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 
         state_cls = (
-            MiniMaxH3ReferenceKVDeviceState
-            if config.kv_cache_location == "device"
-            else MiniMaxH3ReferenceKVTier2State
+            MiniMaxH3ReferenceKVDeviceState if config.kv_cache_location == "device" else MiniMaxH3ReferenceKVTier2State
         )
         return state_cls.from_config(
             config=config,
