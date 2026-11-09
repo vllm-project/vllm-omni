@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -141,17 +142,11 @@ def _default_ascend_decode_graph_flag() -> None:
         return
 
     def wrapped(self, *args: Any, **kwargs: Any) -> None:
-        kwargs.setdefault("decode_graph_eligible", __import__("os").environ.get("VLLM_NPU_V2_DECODE_GRAPH", "0") == "1")
+        kwargs.setdefault("decode_graph_eligible", False)
         init(self, *args, **kwargs)
 
     wrapped._omni_default_graph_flag = True  # type: ignore[attr-defined]
     AscendInputBatch.__init__ = wrapped  # type: ignore[method-assign]
-
-
-def _kstep_timing_enabled() -> bool:
-    import os
-
-    return os.environ.get("VLLM_OMNI_KSTEP_TIMING", "0") == "1"
 
 
 # One K-step decode row is one codec frame of that request, so the frame loop
@@ -250,9 +245,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         super().__init__(*args, **kwargs)
 
     def _kstep_active(self) -> bool:
-        """Stage-1 talker has the ngram/K-step block armed."""
-        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
-        return int(getattr(spec, "num_speculative_tokens", 0) or 0) > 0
+        """Talker K-step block armed, per the shared contract."""
+        cfg = getattr(self, "vllm_config", None)
+        stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
+        return talker_kstep_frames(stage, getattr(cfg, "speculative_config", None)) > 0
 
     def _dummy_sampler_run(self, hidden_states: Any) -> None:
         # K-step control rows are two-wide (continue/stop). The upstream
@@ -272,21 +268,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         return super()._call_model(model_inputs, input_batch=input_batch, batch_desc=batch_desc)
 
     def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
-        """Drive the K-step frame loop on top of FULL graph replays.
-
-        ``cudagraph_mode=FULL_DECODE_ONLY`` sends decode batches down the plain
-        replay branch, which never calls :meth:`_call_model`; without this hook
-        the K-row batch would be forwarded once and one frame sampled from K
-        draft rows. Each frame here re-enters the captured graph after writing
-        its own codec embedding into the captured ``inputs_embeds`` buffer.
-        """
-        if not getattr(self, "_kstep_graph_probe_logged", False):
-            self._kstep_graph_probe_logged = True
-            logger.info(
-                "[kstep-graph] _full_graph_step_output entered kstep_active=%s manager=%s",
-                self._kstep_active(),
-                type(getattr(self, "cudagraph_manager", None)).__name__,
-            )
+        """Drive the K-step frame loop on top of FULL graph replays."""
         if not self._kstep_active() or getattr(self, "cudagraph_manager", None) is None:
             return None
 
@@ -317,63 +299,24 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         from vllm_omni.model_executor.models.output_templates import OmniOutput
         from vllm_omni.platforms.npu.worker import talker_multiframe as multiframe
 
-        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
-        frames = int(getattr(spec, "num_speculative_tokens", 0) or 0) + 1
+        cfg = getattr(self, "vllm_config", None)
+        stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
+        frames = talker_kstep_frames(stage, getattr(cfg, "speculative_config", None))
         if frames <= 1 or getattr(self, "model_state", None) is None:
             return None
         spans = self.model_state._request_token_spans(input_batch)
         infos = model_inputs.get("model_intermediate_buffer") or []
-        # Every booked row is one codec frame of its request: the scheduler
-        # advances that many positions, the connector takes one frame per row,
-        # and ``merge_frame_outputs`` lays this step's stop rows out one per row
-        # in request-major order. Replaying the configured K while the step
-        # booked a different width leaves the tail rows without a frame and
-        # shifts every later request's stop rows onto another request, which is
-        # truncated or repeated audio. So replay the booked width.
+        # Each booked row is one codec frame; replay the booked width to keep
+        # stop rows in request-major order.
         widths = [int(e) - int(s) for s, e in spans]
         uniform = bool(widths) and len(set(widths)) == 1
         width = widths[0] if uniform else 0
         prefill = bool(getattr(input_batch, "has_prefill", False))
         if prefill or not uniform or len(infos) != len(spans) or width < 2 or width > _KSTEP_MAX_FRAMES:
-            self._kstep_fallback_logs = getattr(self, "_kstep_fallback_logs", 0) + 1
-            if self._kstep_fallback_logs <= 5:
-                logger.info(
-                    "[kstep-replay] fallback frames=%d spans=%s infos=%d prefill=%s",
-                    frames,
-                    str(spans[:3]),
-                    len(infos),
-                    prefill,
-                )
             return None
         # One replay per booked row. A width below the configured K would leave
         # rows unsampled; a width above it would write past the request's span.
         frames = width
-        self._kstep_engaged_logs = getattr(self, "_kstep_engaged_logs", 0) + 1
-        if self._kstep_engaged_logs <= 5:
-            logger.info("[kstep-replay] engaged frames=%d spans=%s", frames, str(spans[:3]))
-            rows = getattr(input_batch, "logits_indices", None)
-            expected = len(spans) * frames
-            if rows is not None and int(rows.shape[0]) != expected:
-                logger.warning(
-                    "[kstep-replay] stop-row mismatch rows=%d expected=%d spans=%s",
-                    int(rows.shape[0]),
-                    expected,
-                    str(spans[:3]),
-                )
-        if self._kstep_engaged_logs <= 2:
-            import os as _os_probe
-
-            if _os_probe.environ.get("VLLM_OMNI_KSTEP_PROBE", "0") == "1":
-                _pos = model_inputs.get("positions")
-                _ids = model_inputs.get("input_ids")
-                _emb = model_inputs.get("inputs_embeds")
-                logger.info(
-                    "[kstep-probe] inputs keys=%s pos=%s ids=%s embeds=%s",
-                    sorted(model_inputs.keys()),
-                    _pos.flatten()[:16].tolist() if hasattr(_pos, "flatten") else _pos,
-                    _ids.flatten()[:16].tolist() if hasattr(_ids, "flatten") else _ids,
-                    None if _emb is None else tuple(_emb.shape),
-                )
         # The K-step control head is two-wide (continue/stop). Keep the input
         # batch's vocab in sync so the rejection sampler and any top-k
         # bookkeeping do not address non-existent token ids.
@@ -406,22 +349,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
         # live on the inner talker, which the wrapper only partially forwards.
         codec_model = getattr(self.model, "talker", self.model)
-        import time as _time
-
-        _timing = _kstep_timing_enabled()
-        _run_seconds = [0.0]
-        if _timing:
-            _base_run_model = run_model
-
-            def _timed_run_model():
-                _start = _time.perf_counter()
-                _out = _base_run_model()
-                _run_seconds[0] += _time.perf_counter() - _start
-                return _out
-
-            run_model = _timed_run_model
-        _step_start = _time.perf_counter()
-        _step_output = multiframe.run(
+        return multiframe.run(
             model=codec_model,
             run_model=run_model,
             after_forward=lambda: None,
@@ -432,22 +360,6 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             model_kwargs_extra=model_kwargs_extra,
             narrow=None,
         )
-        if _timing:
-            _acc = getattr(self, "_kstep_timing_acc", None)
-            if _acc is None:
-                _acc = self._kstep_timing_acc = [0, 0.0, 0.0]
-            _acc[0] += 1
-            _acc[1] += _time.perf_counter() - _step_start
-            _acc[2] += _run_seconds[0]
-            if _acc[0] % 40 == 0:
-                logger.info(
-                    "[kstep-timing] steps=%d step_ms=%.3f run_model_ms=%.3f other_ms=%.3f",
-                    _acc[0],
-                    1000.0 * _acc[1] / _acc[0],
-                    1000.0 * _acc[2] / _acc[0],
-                    1000.0 * (_acc[1] - _acc[2]) / _acc[0],
-                )
-        return _step_output
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
         # K-step drafts are not predictions: they reserve the K-1 extra KV
@@ -456,7 +368,6 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         if not self._kstep_active():
             return super()._propose_draft_tokens(input_batch, draft, num_sampled, num_rejected, mm_inputs)
         n = int(draft.num_spec_tokens or 0)
-        logger.info_once("[kstep-draft] constant drafts n=%d", n)
         if n > 0:
             self.req_states.draft_tokens[input_batch.idx_mapping, :n] = 0
         self.draft_tokens_handler.set_draft_tokens(

@@ -295,27 +295,6 @@ def tts2code2wav_async_chunk(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     internal_id = str(internal_id if internal_id is not None else request_id)
-    import os as _os_fa
-
-    if _os_fa.environ.get("VLLM_OMNI_FRAME_AUDIT", "0") == "1":
-        _shape = type(multimodal_output).__name__
-        if isinstance(multimodal_output, Mapping):
-            _keys = sorted(str(k) for k in multimodal_output.keys())
-            _codes_obj = multimodal_output.get("codes")
-            if isinstance(_codes_obj, Mapping):
-                _audio = _codes_obj.get("audio")
-                if isinstance(_audio, (list, tuple)):
-                    _sizes: list[int] | str | None = [int(x.numel()) if hasattr(x, "numel") else len(x) for x in _audio]
-                elif _audio is not None and hasattr(_audio, "shape"):
-                    _sizes = list(_audio.shape)
-                else:
-                    _sizes = type(_audio).__name__
-            else:
-                _sizes = type(_codes_obj).__name__
-        else:
-            _keys, _sizes = [], None
-        with open("/tmp/frame_audit.log", "a") as _audit_fh:
-            _audit_fh.write(f"async_chunk rid={request_id} keys={_keys} sizes={_sizes} finished={is_finished}\n")
     output_meta = multimodal_output.get("meta") if isinstance(multimodal_output, Mapping) else None
     output_meta = output_meta if isinstance(output_meta, Mapping) else {}
     native_duplex = bool(_coerce_int(output_meta.get("native_duplex")))
@@ -531,11 +510,6 @@ def tts2code2wav_full_payload(
     request: Any,
 ) -> OmniPayloadStruct:
     """Build one terminal Code2Wav payload when async chunks are disabled."""
-    import os as _os_fa2
-
-    if _os_fa2.environ.get("VLLM_OMNI_FRAME_AUDIT", "0") == "1":
-        with open("/tmp/frame_audit.log", "a") as _audit_fh:
-            _audit_fh.write("tts2code2wav_full_payload called\n")
     external_id = getattr(request, "external_req_id", None)
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
@@ -590,11 +564,6 @@ def tts2code2wav_token_only(
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Build the sync Code2Wav placeholder; codec data arrives by connector."""
-    import os as _os_fa2
-
-    if _os_fa2.environ.get("VLLM_OMNI_FRAME_AUDIT", "0") == "1":
-        with open("/tmp/frame_audit.log", "a") as _audit_fh:
-            _audit_fh.write("tts2code2wav_token_only called\n")
     code2wav_inputs: list[OmniTokensPrompt] = []
     for talker_output in source_outputs:
         if not talker_output.finished:

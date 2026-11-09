@@ -70,25 +70,10 @@ from vllm_omni.utils.seeded_exponential import fill_exponential_rows
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
-# Env-gated probe for the K-step frame loop (default off).
-_KSTEP_PROBE_ENV = "VLLM_OMNI_KSTEP_PROBE"
-
-
-def _kstep_probe() -> bool:
-    import os
-
-    return os.environ.get(_KSTEP_PROBE_ENV, "0") == "1"
 
 
 def _request_key(info: Any, index: int) -> str:
-    """Per-request key for the audio-state caches.
-
-    V1 runners put ``request_id`` in the intermediate buffer, MRv2's
-    ``OmniIntermediateBuffer`` stores the same identifier under ``req_id``. Reading
-    only one of the two silently keys every request by its batch slot, so a
-    finished request's state (including ``finished``) is inherited by whoever
-    lands on that slot next.
-    """
+    """Stable request key across V1 and MRv2 buffer layouts."""
     identifier = None
     if isinstance(info, dict):
         identifier = info.get("req_id")
@@ -993,11 +978,8 @@ class MiniCPMO45TalkerSampler(OmniSampler):
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         if logits.shape[-1] <= 2:
-            # K-step hands the sampler two-wide continue/stop control rows.
-            # Codec sampling (including EOS and penalties) already ran inside
-            # the model's per-frame output loop; these rows are deterministic
-            # one-hot logits, so greedily take the set bit and skip the
-            # top-k/top-p pipeline (whose p vector assumes one row per req).
+            # K-step control rows are two-wide; sampling already ran per frame,
+            # so take the set bit and skip the codec-vocab pipeline.
             sampled = logits.argmax(dim=-1)
             sampled, num_sampled, num_rejected = self._control_rows_output(sampled, input_batch)
             output_kwargs: dict[str, Any] = {
@@ -1355,16 +1337,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
         audio_bos = self.emb_text(index_to_device([self._tts_bos_id], device))
         condition = text_embeds + hidden_embeds
-        if _kstep_probe() and getattr(self, "_cond_probe_logs", 0) < 16:
-            self._cond_probe_logs = getattr(self, "_cond_probe_logs", 0) + 1
-            logger.info(
-                "[kstep-probe] condition tok=%d hidden=%d text_norm=%.4f semantic_norm=%.4f cond_norm=%.4f",
-                int(token_ids.shape[0]),
-                int(hidden.shape[0]),
-                float(text_embeds.float().norm(dim=-1).mean()),
-                float(hidden_embeds.float().norm(dim=-1).mean()),
-                float(condition.float().norm(dim=-1).mean()),
-            )
         if native_duplex and not close_text:
             # Match MiniCPMTTS.generate_chunk's streaming condition.
             return torch.cat([condition, audio_bos], dim=0)
@@ -2594,13 +2566,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
-                if _kstep_probe():
-                    logger.info(
-                        "[kstep-probe] fresh-state rid=%s info_keys=%s has_audio_state=%s",
-                        request_id,
-                        sorted(str(k) for k in info.keys()),
-                        bool(info.get("audio_state")),
-                    )
             self._merge_request_codec_params(
                 state,
                 request_sampling_params[index] if request_sampling_params is not None else None,
@@ -2634,18 +2599,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = _codec_int_param(state, "step", 0)
-            if _kstep_probe() and step == 0:
-                _reply = info_dict.get("llm_output_text") or ""
-                _ids_info = info_dict.get("ids")
-                _tts_ids = _ids_info.get("tts") if isinstance(_ids_info, dict) else None
-                logger.info(
-                    "[kstep-req] rid=%s reply_len=%d reply_head=%r tts_ids=%s prompt_len=%d",
-                    request_id,
-                    len(_reply),
-                    _reply[:48],
-                    None if _tts_ids is None else len(_tts_ids),
-                    len(info_dict.get("prompt_token_ids") or []),
-                )
             # Note: a turn-end chunk drains the way state["turn_end_drain"]
             # says (see _DRAIN_*), with the same criteria the single-frame
             # path's mask_eos_rows / force_eos_rows apply. _DRAIN_BOUNDARY_MASK
@@ -2688,35 +2641,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             assert head_logits_all is not None
             projection_index = projection_indices[index]
             frame_logits = head_logits_all[projection_index : projection_index + 1]
-            if _kstep_probe() and ((24 <= step <= 52) or (step % 25 == 0 and step < 2000)):
-                _probs = torch.softmax(frame_logits.float(), dim=-1)
-                _top_value, _top_index = _probs.max(dim=-1)
-                logger.info(
-                    "[kstep-traj] rid=%s step=%d min=%d max=%d hist=%d eos_p=%.6f top_p=%.4f top_id=%d mask=%s",
-                    request_id,
-                    step,
-                    min_tokens,
-                    max_tokens,
-                    int(codes.numel()),
-                    float(_probs[0, int(self._codec_eos_id)]),
-                    float(_top_value[0]),
-                    int(_top_index[0]),
-                    eos_window_masked,
-                )
-            # The sampler floor (min_tokens) censors the codec stop ids, so a
-            # Talker that already finished its sentence is forced to keep
-            # emitting and its request to stop is dropped.  The moment the floor
-            # lifts the choice is free again and the sentence can start over
-            # from its first code (measured on a 1.16 s utterance: speech
-            # through frame 27, censored silence 28-49, the whole sentence
-            # repeated from frame 50).  Record the stop request while the floor
-            # holds and honour it on the frame that releases the floor, so the
-            # floor only ever pads and never buys a new sentence.
-            #
-            # The record is a device scalar updated in place: a censored frame
-            # costs one argmax and no host sync, and the single host read
-            # happens on the release frame.  Later censored frames must not
-            # overwrite it -- once the model asked to stop, the padded silence
+            # While min_tokens censors the stop id, latch the stop request and
+            # honour it on the first frame that lifts the floor. The latch stays
+            # on device, so padding never buys a new sentence.
             # it is forced into says nothing about whether it still wants to
             # speak.
             latch = self._codec_stop_latch(request_id, frame_logits)
@@ -2732,12 +2659,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 latch.bitwise_or_(_stop_hit)
             if step == min_tokens and not eos_window_masked:
                 if bool(latch):
-                    if _kstep_probe():
-                        logger.info(
-                            "[kstep-stop-latch] rid=%s step=%d floor released, forcing stop id",
-                            request_id,
-                            step,
-                        )
                     # Lift the stop id above every other code this frame rather
                     # than flattening the rest: if something still censors the
                     # stop id below, the lift goes with it and this frame
@@ -2914,14 +2835,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 meta_outputs[key] = per_frame[-1]
 
         self.set_batch_stop_logits(torch.stack(frame_stop_logits, dim=1).reshape(-1, 2))
-        import os as _os_audit
-
-        if _os_audit.environ.get("VLLM_OMNI_FRAME_AUDIT", "0") == "1":
-            logger.info(
-                "[frame-audit] produced=%s frames=%d",
-                [int(item.numel()) for item in codec_deltas],
-                len(frame_stop_logits),
-            )
         return OmniOutput(
             text_hidden_states=frame_outputs[-1].text_hidden_states,
             multimodal_outputs={"codes": {"audio": codec_deltas}, "meta": meta_outputs},
@@ -3445,25 +3358,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not pending:
             return
         self._kstep_pending_packed = []
-        import os as _os_d2h
-        import time as _time
-
-        _timed = _os_d2h.environ.get("VLLM_OMNI_KSTEP_TIMING", "0") == "1"
-        _t0 = _time.perf_counter() if _timed else 0.0
         packed_host = torch.stack([item.packed for item in pending]).cpu().tolist()
-        if _timed:
-            _stat = getattr(self, "_kstep_d2h_stat", None)
-            if _stat is None:
-                _stat = self._kstep_d2h_stat = [0, 0.0]
-            _stat[0] += 1
-            _stat[1] += _time.perf_counter() - _t0
-            if _stat[0] % 160 == 0:
-                logger.info(
-                    "[kstep-d2h] calls=%d total=%.3fs avg=%.3fms",
-                    _stat[0],
-                    _stat[1],
-                    1000.0 * _stat[1] / _stat[0],
-                )
         for item, (sampled_id, finished, emit) in zip(pending, packed_host):
             request_id = item.request_id
             state = item.state
@@ -3481,18 +3376,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ):
                 continue
             sampled_id = int(sampled_id)
-            if _kstep_probe():
-                _probe_hist = getattr(self, "_request_codec_history", {}).get(request_id) or []
-                if len(_probe_hist) < 40:
-                    logger.info(
-                        "[kstep-probe] rid=%s frame=%d sampled=%d finished=%s emit=%s hist=%d",
-                        request_id,
-                        len(_probe_hist),
-                        sampled_id,
-                        bool(finished),
-                        bool(emit),
-                        len(_probe_hist),
-                    )
             full_ids = state.get("codec_full_ids")
             if isinstance(full_ids, list):
                 full_ids.append(sampled_id)

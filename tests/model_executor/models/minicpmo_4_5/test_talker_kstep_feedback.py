@@ -306,10 +306,7 @@ def test_multi_frame_decode_arms_under_both_model_runners():
             speculative_config={"method": "ngram", "num_speculative_tokens": 7},
         )
 
-    # The same config arms eight frames on either runner: Model Runner V2 enters
-    # the loop through _run_kstep_frames, which replays one forward per frame and
-    # re-embeds the previous codec frame. Refusing the config here would leave the
-    # runner's K reserved positions without a K-row report.
+    # Both runners arm K=8; MRv2 replays one forward per frame.
     assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
     assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True)) == 8
 

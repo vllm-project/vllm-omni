@@ -1008,12 +1008,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         assert isinstance(hidden_states, torch.Tensor)
         return None
 
-    def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
-        """Invoke the model once.
+    def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
+        """Platform hook for FULL-graph replay; None keeps the stock replay."""
+        return None
 
-        Platform runners override this to run a per-frame loop (e.g. NPU
-        talker K-step). The default keeps the single-forward contract.
-        """
+    def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
+        """Invoke the model once; platform runners may override for frame loops."""
         return self.model(**model_inputs)
 
     # ------------------------------------------------------------------

@@ -2005,10 +2005,7 @@ class BatchedToken2Wav(nn.Module):
         lookahead = self._pre_lookahead_len()
         num_frames = int(tokens.shape[1])
         if last_chunk and lookahead is not None and num_frames <= int(lookahead):
-            # Nothing new to synthesise: the flush only has to hand over the tail
-            # that the previous solve withheld (``speech[-source_cache_len:]``).
-            # Re-running encode/CFM/HiFT for it costs a full solve and re-emits
-            # the overlap that was already delivered.
+            # Flush only has to hand over the tail withheld by the last solve.
             tails = [state.hift_cache.get("speech") for state in states]
             if all(tail is not None and int(tail.numel()) > 0 for tail in tails):
                 audios = [tail.reshape(-1).to(dtype=torch.float32) for tail in tails]

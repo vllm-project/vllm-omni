@@ -4,29 +4,21 @@
 
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 
 class NPUOmniModelState(OmniModelState, AscendModelState):
-    """Omni state whose attention metadata is the Ascend V2 one.
-
-    Request buffers and the Omni lifecycle stay on ``OmniModelState``;
-    ``AscendModelState`` builds attention metadata from ``attn_state`` and
-    ``seq_lens_np``. When the talker has the K-step block armed, the output
-    postprocess is routed to the model's V1 frame loop (one forward produces
-    K rows per request; the loop samples each codec frame in order) instead of
-    the one-frame-per-step ``make_omni_output_mrv2`` hook.
-    """
+    """Ascend attention metadata with K-step frame-loop output routing."""
 
     uses_ascend_attn_metadata = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         cfg = getattr(self, "vllm_config", None) or (args[0] if args else None)
-        spec = getattr(cfg, "speculative_config", None)
-        n = int(getattr(spec, "num_speculative_tokens", 0) or 0) if spec is not None else 0
-        self._npu_kstep_frames = n + 1 if n > 0 else 0
+        stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
+        self._npu_kstep_frames = talker_kstep_frames(stage, getattr(cfg, "speculative_config", None))
 
     def postprocess_model_output(self, model_output, input_batch, req_states):
         if self._npu_kstep_frames > 1 and not isinstance(model_output, OmniOutput):
