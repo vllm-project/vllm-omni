@@ -19,7 +19,10 @@ from typing import Any
 MINICPMO_TALKER_FRAMES_MAX = 16
 
 
-def talker_kstep_frames(model_stage: Any, speculative_config: Any) -> int:
+def talker_kstep_frames(
+    model_stage: Any,
+    speculative_config: Any,
+) -> int:
     """K codec frames per Talker step, or 0 when the loop must not engage.
 
     ``method`` must be present and equal to ``"ngram"``: the engine injects it
@@ -28,6 +31,15 @@ def talker_kstep_frames(model_stage: Any, speculative_config: Any) -> int:
     degenerates to the ordinary single-frame path and reads as 0. A ``K`` above
     the ceiling raises -- it cannot be served, and must fail loudly at
     configuration time instead of being silently clamped.
+
+    Both model runners serve K > 1. V1's ``talker_multiframe.run`` is called from
+    its batched decode path; Model Runner V2 enters the same loop through
+    ``npu_omni_v2_model_runner._run_kstep_frames``. Neither path may report one
+    sampled token per request on a K-row step: the runner reserves K positions
+    per request from ``speculative_config`` itself, so a single-row report
+    advances the request by one position per step while the model runs K frames,
+    and the stop row never reaches ``check_stop``. The K-step sampler therefore
+    reports one padded row per request with ``num_sampled == K``.
     """
     if model_stage != "tts":
         return 0

@@ -67,6 +67,12 @@ def init_omni_model_state(
             if not isinstance(state, ModelState):
                 raise TypeError("create_mrv2_model_state must return a ModelState")
             return state
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.omni_model_state import (
+                NPUOmniModelState,
+            )
+
+            return NPUOmniModelState(vllm_config, model, encoder_cache, device)
         from vllm_omni.worker_v2.model_states.omni_model_state import (
             OmniModelState,
         )
@@ -77,6 +83,12 @@ def init_omni_model_state(
         # Auxiliary stages such as the forced aligner have no model-owned
         # hooks, but Omni's runner still needs its request/output lifecycle.
         # Keep specialized upstream states and plain vLLM configs intact.
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.omni_model_state import (
+                NPUOmniModelState,
+            )
+
+            return NPUOmniModelState(vllm_config, model, encoder_cache, device)
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
         return OmniModelState(vllm_config, model, encoder_cache, device)

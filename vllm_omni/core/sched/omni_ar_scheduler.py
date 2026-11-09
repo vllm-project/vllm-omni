@@ -576,7 +576,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
             model_cfg = getattr(vllm_cfg, "model_config", None)
             cache = self._omni_talker_kstep_cache = (
-                talker_kstep_frames(getattr(model_cfg, "model_stage", None), spec) > 0
+                talker_kstep_frames(
+                    getattr(model_cfg, "model_stage", None),
+                    spec,
+                )
+                > 0
             )
         return cache
 

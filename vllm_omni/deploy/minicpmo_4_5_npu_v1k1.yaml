@@ -1,0 +1,10 @@
+# Control: all stages on V1 with the talker K-step block removed (K=1),
+# to separate runner-version cost from the multi-frame optimization.
+base_config: minicpmo_4_5.yaml
+
+platforms:
+  npu:
+    model_runner: v1
+    stages:
+      - stage_id: 1
+        speculative_config: null

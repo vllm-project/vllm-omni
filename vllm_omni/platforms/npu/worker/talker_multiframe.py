@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Several codec frames inside one stage-1 ``execute_model``.
 
 One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
@@ -350,7 +353,7 @@ def begin_narrow_step(
     try:
         from vllm_omni.platforms.npu.attention import static_shape_decode
     except Exception:
-        static_shape_decode = None
+        static_shape_decode = None  # type: ignore[assignment]
 
     if static_shape_decode is None:
         return _decline("the static-shape decode backend is not present in this build")
@@ -430,7 +433,7 @@ def end_narrow_step(forward_context: Any, narrow: NarrowStep | None) -> None:
         forward_context.cudagraph_runtime_mode = narrow.saved_runtime_mode
 
 
-def _decline(reason: str) -> None:
+def _decline(reason: str) -> NarrowStep | None:
     """Say each distinct decline reason once; silence is the worse failure.
 
     A set, not a single slot: the narrow path is re-decided every step, and one
@@ -476,7 +479,7 @@ def run(
         from vllm_omni.worker.talker_cuda_graph import run_cuda_fused_step
 
         fused = run_cuda_fused_step(
-            narrow,
+            narrow,  # type: ignore[arg-type]
             model=model,
             model_kwargs={**model_kwargs, **model_kwargs_extra},
             intermediate_tensors=model_kwargs.get("intermediate_tensors"),
@@ -490,7 +493,7 @@ def run(
         # every frame eagerly under CUDAGraphMode.NONE (2.2x slower than the
         # dispatcher graph the plain path replays). Restore the original
         # context and fall through to the plain frame loop.
-        narrow.restore()
+        narrow.restore()  # type: ignore[attr-defined]
         narrow = None
 
     frame_outputs = []
@@ -527,7 +530,20 @@ def run(
             # it, so this frame's hidden state has to be kept before the replay
             # that follows.
             frame_hidden.append(hidden.clone())
+        import time as _t_frame
+
+        _frame_t0 = _t_frame.perf_counter()
         output = model.make_omni_output(hidden, **model_kwargs, **frame_kwargs)
+        if os.environ.get("VLLM_OMNI_KSTEP_TIMING", "0") == "1":
+            _bd = globals().setdefault("_KSTEP_FRAME_BD", [0, 0.0])
+            _bd[0] += 1
+            _bd[1] += _t_frame.perf_counter() - _frame_t0
+            if _bd[0] % 160 == 0:
+                logger.info(
+                    "[frame-bd] calls=%d make_omni_ms=%.3f",
+                    _bd[0],
+                    1000.0 * _bd[1] / _bd[0],
+                )
         stop_logits = model.take_batch_stop_logits()
         if stop_logits is None:
             raise RuntimeError("MiniCPM-o multi-frame decode expects stop rows from every frame")
@@ -584,6 +600,15 @@ def _write_frame_embeddings(
         row_ids = input_ids[source : source + 1] if input_ids is not None else None
         if row_ids is None:
             raise RuntimeError("MiniCPM-o multi-frame decode requires input_ids for preprocess")
+        if frame <= 6 and os.environ.get("VLLM_OMNI_KSTEP_PROBE", "0") == "1":
+            _probe_cur = (info.get("audio_codes") or {}).get("current")
+            logger.info(
+                "[kstep-embed] frame=%d rid=%s row=%d cur=%s",
+                frame,
+                info.get("req_id"),
+                row,
+                _probe_cur.detach().reshape(-1).tolist() if isinstance(_probe_cur, torch.Tensor) else _probe_cur,
+            )
         _, embeds, _ = model.preprocess(input_ids=row_ids, input_embeds=None, **info)
         inputs_embeds[row : row + 1].copy_(embeds[:1])
 
