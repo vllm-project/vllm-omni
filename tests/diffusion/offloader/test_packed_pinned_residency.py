@@ -138,9 +138,11 @@ def test_packed_offload_preserves_values_aliases_and_layouts() -> None:
 def test_packed_offload_uses_less_live_allocator_backing() -> None:
     device = current_omni_platform.get_torch_device(0)
     host_memory_stats = getattr(torch.get_device_module(device), "host_memory_stats", None)
-    if not callable(host_memory_stats):
-        pytest.skip("Torch does not expose pinned-host allocation counters")
+    host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+    if not callable(host_memory_stats) or not callable(host_empty_cache):
+        pytest.skip("Torch does not expose pinned-host allocator accounting")
     stats = cast(Callable[[], dict[str, int]], host_memory_stats)
+    empty_host_cache = cast(Callable[[], None], host_empty_cache)
 
     module = nn.Module()
     size = 1_100_000
@@ -150,6 +152,8 @@ def test_packed_offload_uses_less_live_allocator_backing() -> None:
     plan = residency_module._plan_pinned_slabs(source_sizes)
     assert plan.packed_backing_bytes < plan.separate_backing_bytes
 
+    gc.collect()
+    empty_host_cache()
     initial = stats()
     assert SequentialOffloadHook._move_params(
         module,
@@ -167,6 +171,7 @@ def test_packed_offload_uses_less_live_allocator_backing() -> None:
 
     del buffer, module
     gc.collect()
+    empty_host_cache()
     final = stats()
     assert final["allocated_bytes.current"] == initial["allocated_bytes.current"]
     assert final["allocations.current"] == initial["allocations.current"]
