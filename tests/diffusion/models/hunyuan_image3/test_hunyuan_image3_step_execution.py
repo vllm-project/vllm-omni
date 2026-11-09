@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.configuration_utils import FrozenDict
 
 import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module

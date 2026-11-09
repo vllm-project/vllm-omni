@@ -2164,9 +2164,7 @@ class HunyuanImage3Pipeline(
             self.scheduler,
             len(timesteps),
             sigma_scheduled=bool(
-                resolve_request_attention_sigma_schedule(
-                    state.sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
-                )
+                resolve_request_attention_sigma_schedule(state.sampling, self.od_config.diffusion_attention_schedule)
             ),
         )
         pipe._num_timesteps = len(timesteps)
@@ -2482,8 +2480,14 @@ class HunyuanImage3Pipeline(
         _denoise_step_group republishes the same step and clears it after its forward; the returned
         context manager restores the step, timestep, total and sigma on any exit.
         """
-        scheduler = cast(FlowMatchEulerDiscreteScheduler, state.scheduler)
-        timestep = float(cast(torch.Tensor, state.current_timestep)) / scheduler.config.num_train_timesteps
+        current_timestep = state.current_timestep
+        scheduler = state.scheduler
+        if current_timestep is None or not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
+            raise RuntimeError(
+                f"scheduled HunyuanImage-3.0 request {state.request_id} needs a current timestep and a "
+                f"flow-matching scheduler; got {type(current_timestep).__name__} and {type(scheduler).__name__}"
+            )
+        timestep = float(current_timestep) / scheduler.config.num_train_timesteps
         sigma = None
         if get_forward_context().attention_sigma_schedule:
             sigma = DenoiseProgressMixin._denoise_sigma(state.step_index, scheduler, None)
