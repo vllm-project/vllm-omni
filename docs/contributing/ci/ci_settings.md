@@ -280,12 +280,17 @@ pytest 9.1.1; image digest
 
 ### Diffusion CPU: five-shard rebalance and bounded threads
 
-The five regular Diffusion shards use `diffusion-v1.json`, with 11,521 node
-timings from all five successful JUnit artifacts in build #15582. These legacy
-artifacts report total setup + call + teardown time. Their weights estimate
-17m58s per shard before collection/overhead; six shards would estimate 14m58s.
-Neither estimate establishes a measured speedup or p95. Start with five and
-trial six only if measured p95 remains above 20 minutes and queue capacity allows it.
+The five regular Diffusion shards use `diffusion-v1.json`, with 11,609 node
+timings from all five successful instrumented artifacts in
+[build #15658](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15658), merge
+commit `fb25dd4336fb2098e5a4de1d3fc90cf1b72ad4f4`. The first bounded-thread
+trial selected every live node exactly once, with no failures, incomplete tests,
+collection errors or artifact errors. Its legacy profile had 204 unknown and
+116 stale nodes; the regular job walls ranged from 4m42s to 7m42s. Repacking
+the measured setup + call + teardown totals estimates 255.19 seconds per shard
+before collection/overhead, with zero unknown or stale nodes. Exact refreshed-
+profile CI remains the qualification gate. Keep five shards; trial six only if
+future measured p95 rises above 20 minutes and queue capacity allows it.
 
 Regular and Slow CPU jobs bound OMP/MKL/OpenBLAS/NumExpr to two threads per
 process, allowing two gloo ranks to fit the observed four-CPU quota. Four unchanged
@@ -351,14 +356,14 @@ python tests/helpers/benchmark_cpu_threads.py --output /tmp/diffusion-thread-tri
   'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
 ```
 
-Before rollout, refresh the historical profile from successful target-hardware
-runs with the bounded thread setting. Compare the exact executed node union and
-skip outcomes, and retain the original numerical checks. Measure concurrent
-five-shard plus Slow CPU memory peaks, CPU throttling, queue latency, summed
-agent-minutes and paired READY/MERGE wall time. The planning target remains
-p95 below 18 minutes for every regular shard and Slow CPU. Revert the pipeline
-thread export and timing-profile option to roll back; do not move Slow CPU cases
-or weaken their assertions to meet the target.
+The refreshed profile must pass exact-head target CI with the bounded thread
+setting. Compare the exact executed node union and skip outcomes, and retain the
+original numerical checks. Measure concurrent five-shard plus Slow CPU memory
+peaks, CPU throttling, queue latency, summed agent-minutes and paired READY/MERGE
+wall time. The planning target remains p95 below 18 minutes for every regular
+shard and Slow CPU. Revert the pipeline thread export and timing-profile option
+to roll back; do not move Slow CPU cases or weaken their assertions to meet the
+target.
 
 ### Prepare a shared profile
 
