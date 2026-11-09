@@ -635,6 +635,10 @@ def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
     assert runner_a is not False and runner_b is not False
     assert len(constructed) == 2, "one runner per instance, not one shared singleton"
     assert all(kwargs["use_shared_pool"] is False for kwargs in constructed)
+    # Pin the shipped budget: without this assert the 8 -> 32 bump (4bb2eefe)
+    # could silently regress back to 8 through merges and push most traffic
+    # to eager decode.
+    assert all(kwargs["max_graphs"] == 32 for kwargs in constructed), constructed
 
     out_a = runner_a.run("decode", (torch.zeros(1),), (), lambda z, sr=None: (vae_a.decode(z),))[0]
     out_b = runner_b.run("decode", (torch.zeros(1),), (), lambda z, sr=None: (vae_b.decode(z),))[0]

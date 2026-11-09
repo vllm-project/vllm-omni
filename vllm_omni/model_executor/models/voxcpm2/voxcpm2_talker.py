@@ -85,6 +85,11 @@ def _disable_npu_internal_format_once() -> None:
         if not _NPU_INTERNAL_FORMAT_MUTATED:
             torch.npu.config.allow_internal_format = False
             _NPU_INTERNAL_FORMAT_MUTATED = True
+            logger.info(
+                "Set torch.npu.config.allow_internal_format=False (process-wide; "
+                "required before AudioVAE NPUGraph capture and visible to every "
+                "module in this stage process)"
+            )
 
 
 def _vae_npu_graph_runner_for(audio_vae: torch.nn.Module):
@@ -129,7 +134,12 @@ def _vae_npu_graph_runner_for(audio_vae: torch.nn.Module):
         # Prevents cross-graph memory reuse corruption when many graphs are
         # cached.
         runner = NPUExactGraphRunner(
-            max_graphs=8,
+            # Production serving sees 13-17 distinct AudioVAE decode shapes per
+            # instance-day (streaming chunks plus tails), so 8 entries would
+            # push most traffic to eager. 32 = the runner default, already
+            # exercised end-to-end by daily NPU serving; overflow shapes still
+            # fall back to eager decode with a warning.
+            max_graphs=32,
             component_name="VoxCPM2 AudioVAE",
             disable_config_hint="disable the AudioVAE NPUGraph (set VLLM_OMNI_DISABLE_VAE_NPU_GRAPH=1)",
             use_shared_pool=False,
@@ -1893,7 +1903,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 (),
                 lambda z, sr: (audio_vae.decode(z, sr_cond=sr),),
             )
-            return result[0]
+            # fp32 PCM boundary: same contract as the eager path below —
+            # decode_ready_slots / make_audio_output copy_ this waveform into
+            # the fp32 audio_buffer, and a bf16 waveform raises there under a
+            # bf16 deployment. The graph path must honor the same boundary.
+            return result[0].float()
 
         if not self._enable_vae_cuda_graph:
             # fp32 PCM boundary: decode_ready_slots / make_audio_output copy_
