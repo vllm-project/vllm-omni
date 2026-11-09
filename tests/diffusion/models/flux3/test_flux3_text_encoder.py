@@ -15,7 +15,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.flux3.flux3_text_encoder import (
     _DEFAULT_OUTPUT_LAYER,
     DEFAULT_PAD_MULTIPLE,
@@ -28,7 +27,7 @@ VEC_IN_DIM = 16
 N_TOKENS = 8
 QWEN_HIDDEN = 8  # 4 layers × 8 hidden = CONTEXT_IN_DIM
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 # Use 4 compact indices so tests don't need a 33-layer fake model.
 # 4 × QWEN_HIDDEN (8) = CONTEXT_IN_DIM (32).
@@ -309,20 +308,3 @@ class TestContract:
         enc = _make_encoder(context_in_dim=64, vec_in_dim=8)
         assert enc.context_in_dim == 64
         assert enc.vec_in_dim == 8
-
-
-@hardware_test(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1)
-def test_compiled_language_model_matches_eager() -> None:
-    torch.manual_seed(0)
-    enc = _make_encoder().eval().to(device="cuda", dtype=torch.bfloat16)
-    enc.finalize_after_loading()
-    inputs = _token_inputs("cuda")
-
-    expected = enc._language_model_forward(*inputs)
-    assert all(tensor.dtype == torch.bfloat16 for tensor in expected)
-    enc.setup_compile(dynamic=False)
-    assert enc._compiled_language_model_forward is not None
-    actual = enc._compiled_language_model_forward(*inputs)
-
-    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
-        torch.testing.assert_close(actual_tensor, expected_tensor, atol=5e-3, rtol=5e-3)

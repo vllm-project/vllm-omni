@@ -12,6 +12,8 @@ from vllm_omni.diffusion.models.flux3.flux3_conditioning import (
 )
 from vllm_omni.diffusion.models.flux3.flux3_positional import batched_prc_img, scatter_ids
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 @pytest.mark.core_model
 @pytest.mark.cpu

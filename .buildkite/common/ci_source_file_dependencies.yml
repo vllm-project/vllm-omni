@@ -824,7 +824,7 @@ source_file_dependencies:
 
   diffusion_flux3_function:
     - *flux3
-    - tests/unit/flux3/
+    - tests/diffusion/models/flux3/
     - tests/e2e/offline_inference/test_flux3.py
     - tests/e2e/online_serving/test_flux3.py
     - tests/e2e/online_serving/test_flux3_expansion.py

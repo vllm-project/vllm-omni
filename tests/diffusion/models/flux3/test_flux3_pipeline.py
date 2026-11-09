@@ -13,7 +13,7 @@ The image VAE encode/decode maths are covered by ``test_flux3_image_vae.py``.
 
 Checkpoint/CUDA-gated tests skip automatically when unavailable. Set
 FLUX3_MODEL_PATH to point at a checkpoint:
-    FLUX3_MODEL_PATH=/path/to/checkpoint pytest tests/unit/flux3/test_flux3_pipeline.py
+    FLUX3_MODEL_PATH=/path/to/checkpoint pytest tests/diffusion/models/flux3/test_flux3_pipeline.py
 """
 
 import json
@@ -66,6 +66,8 @@ class _FakeRequest:
 
 
 MODEL_PATH = os.getenv("FLUX3_MODEL_PATH", "")
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 requires_checkpoint = pytest.mark.skipif(
     not os.path.isdir(MODEL_PATH),
