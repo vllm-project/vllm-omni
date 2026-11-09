@@ -49,9 +49,23 @@ class RotaryPositionalEmbeddings(nn.Module):
         cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
         self.register_buffer("cache", cache, persistent=False)
 
-    def forward(self, x: torch.Tensor, *, input_pos: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        input_pos: torch.Tensor | None = None,
+        needed_len: int | None = None,
+    ) -> torch.Tensor:
         seq_len = x.size(1)
-        needed_seq_len = seq_len if input_pos is None else int(input_pos.max().item()) + 1
+        if input_pos is None:
+            needed_seq_len = seq_len
+        elif needed_len is not None:
+            # The caller knows the absolute position on the host, so read it from
+            # there: ``input_pos.max().item()`` is a device-to-host sync, and the
+            # backbone calls RoPE once per layer per chunk.
+            needed_seq_len = int(needed_len)
+        else:
+            needed_seq_len = int(input_pos.max().item()) + 1
         if (
             not getattr(self, "_rope_ready", False)
             or self.theta.device != x.device
@@ -76,20 +90,49 @@ class RotaryPositionalEmbeddings(nn.Module):
 
 
 class CausalCodecDecoderCache:
-    def __init__(self) -> None:
-        self.key_values: dict[int, tuple[Tensor, Tensor]] = {}
+    """Per-request KV cache whose buffers grow geometrically.
+
+    Appending with ``torch.cat`` copies the whole history on every chunk, so the
+    cumulative copy traffic grew quadratically with the decoded length. Each
+    layer now owns a buffer that only copies when capacity is exhausted, and the
+    buffer is allocated per request rather than at the worst-case length, so
+    short or concurrent requests do not reserve long-sequence memory.
+    """
+
+    def __init__(self, growth_factor: float = 2.0) -> None:
+        # layer -> (key buffer, value buffer, used slots)
+        self.key_values: dict[int, tuple[Tensor, Tensor, int]] = {}
         self.position = 0
+        self._growth_factor = max(1.25, float(growth_factor))
 
     def input_positions(self, length: int, device: torch.device) -> Tensor:
         return torch.arange(self.position, self.position + length, device=device).unsqueeze(0)
 
     def update(self, layer_idx: int, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
-        if layer_idx in self.key_values:
-            prev_key, prev_value = self.key_values[layer_idx]
-            key = torch.cat([prev_key, key], dim=2)
-            value = torch.cat([prev_value, value], dim=2)
-        self.key_values[layer_idx] = (key, value)
-        return key, value
+        chunk = key.size(2)
+        entry = self.key_values.get(layer_idx)
+        if entry is None:
+            # First chunk for this layer: no copy needed.
+            self.key_values[layer_idx] = (key, value, chunk)
+            return key, value
+
+        buf_key, buf_value, used = entry
+        needed = used + chunk
+        if needed > buf_key.size(2):
+            capacity = max(needed, int(buf_key.size(2) * self._growth_factor) + 1)
+            grown_key = buf_key.new_empty(buf_key.size(0), buf_key.size(1), capacity, buf_key.size(3))
+            grown_value = buf_value.new_empty(buf_value.size(0), buf_value.size(1), capacity, buf_value.size(3))
+            grown_key[:, :, :used] = buf_key[:, :, :used]
+            grown_value[:, :, :used] = buf_value[:, :, :used]
+            buf_key, buf_value = grown_key, grown_value
+
+        buf_key[:, :, used:needed] = key
+        buf_value[:, :, used:needed] = value
+        self.key_values[layer_idx] = (buf_key, buf_value, needed)
+        # Views into the live buffer: attention consumes them before the next
+        # append, and an append past capacity swaps the buffer rather than
+        # mutating this one.
+        return buf_key[:, :, :needed], buf_value[:, :, :needed]
 
     def advance(self, length: int) -> None:
         self.position += length
@@ -137,6 +180,8 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+        needed_len: int | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         qkv = self.c_attn(x)
@@ -144,16 +189,19 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        q = self.rotary_embed(q.transpose(1, 2), input_pos=input_pos).transpose(1, 2)
-        k = self.rotary_embed(k.transpose(1, 2), input_pos=input_pos).transpose(1, 2)
+        q = self.rotary_embed(q.transpose(1, 2), input_pos=input_pos, needed_len=needed_len).transpose(1, 2)
+        k = self.rotary_embed(k.transpose(1, 2), input_pos=input_pos, needed_len=needed_len).transpose(1, 2)
         if cache is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             if input_pos is None:
                 raise ValueError("input_pos is required when cache is set")
             k, v = cache.update(self.layer_idx, k, v)
-            key_pos = torch.arange(k.size(2), device=x.device).view(1, 1, 1, -1)
-            attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
+            if attn_mask is None:
+                # Fallback for direct callers; the backbone builds this once per
+                # chunk and shares it across layers.
+                key_pos = torch.arange(k.size(2), device=x.device).view(1, 1, 1, -1)
+                attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.c_proj(y.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
 
@@ -171,8 +219,16 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         cache: CausalCodecDecoderCache | None = None,
         input_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+        needed_len: int | None = None,
     ) -> torch.Tensor:
-        x = x + self.att(self.att_norm(x), cache=cache, input_pos=input_pos)
+        x = x + self.att(
+            self.att_norm(x),
+            cache=cache,
+            input_pos=input_pos,
+            attn_mask=attn_mask,
+            needed_len=needed_len,
+        )
         return x + self.mlp(self.ffn_norm(x))
 
 
@@ -206,10 +262,18 @@ class CausalVocosBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor, cache: CausalCodecDecoderCache | None = None) -> torch.Tensor:
         input_pos = None
+        attn_mask = None
+        needed_len = None
         if cache is not None:
             input_pos = cache.input_positions(x.size(1), x.device).expand(x.size(0), -1)
+            # Absolute position of the last token plus one, known on the host:
+            # passing it down keeps RoPE from reading it back per layer.
+            needed_len = cache.position + x.size(1)
+            # The causal mask is identical for every layer in a chunk.
+            key_pos = torch.arange(needed_len, device=x.device).view(1, 1, 1, -1)
+            attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
         for block in self.transformers:
-            x = block(x, cache=cache, input_pos=input_pos)
+            x = block(x, cache=cache, input_pos=input_pos, attn_mask=attn_mask, needed_len=needed_len)
         if cache is not None:
             cache.advance(x.size(1))
         return self.final_layer_norm(x)
