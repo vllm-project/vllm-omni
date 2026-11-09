@@ -78,7 +78,7 @@ class AsyncStreamDecodeJob:
             cancel()
 
 
-def start_async_stream_decode(
+def start_async_chunk_decode(
     *,
     vae: Any | None,
     decoder: WanStreamingDecoder | None,
@@ -100,17 +100,22 @@ def start_async_stream_decode(
     * ``on_chunk`` is client streaming: each decoded chunk is handed off and
       not accumulated. ``join()`` then returns ``None``.
     * Without ``on_chunk``, ``join()`` waits and returns concatenated pixels
-      on the owner, else ``None``. ``stream_decode`` overlap does not by
+      on the owner, else ``None``. ``async_chunk_decode`` overlap does not by
       itself stream to the client.
     """
     if source_rank is None:
         return _start_local(vae=vae, decoder=decoder, session_id=session_id, on_chunk=on_chunk)
     if pp_group is None or source_rank == 0:
-        raise ValueError("remote stream_decode needs vertical S (D or D+1) with source_rank != 0")
+        raise ValueError("remote async_chunk_decode needs vertical S (D or D+1) with source_rank != 0")
     if stream_group is None:
-        raise ValueError("remote stream_decode requires a gloo stream process group")
+        raise ValueError("remote async_chunk_decode requires a gloo stream process group")
     if vae is not None and (vae.use_tiling or vae.is_distributed_enabled()):
-        raise ValueError("stream_decode requires non-tiled single-owner VAE")
+        # Intentional hard fail under streaming too: mid-request CHUNK_READY
+        # rides async_chunk_decode and has no tiled/distributed VAE fallback.
+        raise ValueError(
+            "async_chunk_decode requires non-tiled single-owner VAE "
+            "(streaming_output has no sync mid-request decode fallback)"
+        )
 
     source = pp_group.ranks[source_rank]
     owner = pp_group.ranks[0]
@@ -153,7 +158,7 @@ def start_async_stream_decode(
 
     if pp_rank == 0:
         if vae is None or decoder is None:
-            raise ValueError("VAE owner requires VAE + WanStreamingDecoder for stream_decode")
+            raise ValueError("VAE owner requires VAE + WanStreamingDecoder for async_chunk_decode")
         buffers = [torch.empty(latent_shape, device="cpu", dtype=dtype, pin_memory=True) for _ in range(n_chunks)]
         recv_works = [dist.irecv(buf, src=source, group=stream_group) for buf in buffers]
         pixels_out: list[torch.Tensor] = []
@@ -202,11 +207,11 @@ def start_async_stream_decode(
         def cancel() -> None:
             cancelled.set()
             # Posted irecvs cannot be aborted; daemon thread may still block.
-            # Prefer not combining stream_decode with mid-request Engine abort.
+            # Prefer not combining async_chunk_decode with mid-request Engine abort.
             thread.join(timeout=0.1)
             if thread.is_alive():
                 logger.warning(
-                    "stream_decode cancel: consumer still alive after 0.1s join "
+                    "async_chunk_decode cancel: consumer still alive after 0.1s join "
                     "(posted irecv may be stuck); session_id=%s",
                     session_id,
                 )
@@ -251,9 +256,12 @@ def _start_local(
 ) -> AsyncStreamDecodeJob:
     """Same-rank path: queue latents to a decode thread (S=1)."""
     if vae is None or decoder is None:
-        raise ValueError("local stream_decode requires VAE + WanStreamingDecoder on this rank")
+        raise ValueError("local async_chunk_decode requires VAE + WanStreamingDecoder on this rank")
     if vae.use_tiling or vae.is_distributed_enabled():
-        raise ValueError("stream_decode requires non-tiled single-owner VAE")
+        raise ValueError(
+            "async_chunk_decode requires non-tiled single-owner VAE "
+            "(streaming_output has no sync mid-request decode fallback)"
+        )
 
     latent_q: queue.Queue = queue.Queue()
     stop = object()

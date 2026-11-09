@@ -77,7 +77,7 @@ from vllm_omni.diffusion.ipc import (
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_chunk_emit import bind_emit_chunk, reset_emit_chunk
+from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     KVPrefetchJob,
@@ -128,7 +128,6 @@ class _AsyncOutputJob:
     gpu_event: Any = None
     kind: AsyncOutputKind = AsyncOutputKind.OUTPUT_READY
     request_id: str | None = None
-    execution_id: str | None = None
     chunk_index: int | None = None
 
 
@@ -138,20 +137,6 @@ def _coerce_async_output_job(item: Any) -> _AsyncOutputJob:
         return item
     output, async_output_id, gpu_event = item
     return _AsyncOutputJob(output=output, async_output_id=async_output_id, gpu_event=gpu_event)
-
-
-def _request_id_from_execute_args(method: str, args: tuple[Any, ...]) -> str | None:
-    """Single-request execute_model carries ``OmniDiffusionRequest.request_id``.
-
-    Fused batches are left unidentified here; each output would need its own
-    request id before CHUNK_READY can be routed per request.
-    """
-    if method != "execute_model" or not args:
-        return None
-    request_id = getattr(args[0], "request_id", None)
-    if isinstance(request_id, str):
-        return request_id
-    return None
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -1502,17 +1487,6 @@ class WorkerProc:
         # CHUNK_READY packs already queued for this forward must hit result_mq
         # first so the result pump delivers them before the RPC future resolves.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
-            if not self._wait_chunk_outputs():
-                # Do not send COMPUTE_DONE: the engine would mark success and drop
-                # any CHUNK_READY that lands later, truncating streamed video.
-                raise TimeoutError(
-                    f"Worker {self.gpu_id}: CHUNK_READY packs still pending after "
-                    f"{_ASYNC_OUTPUT_DRAIN_TIMEOUT_S:.1f}s; refusing COMPUTE_DONE"
-                )
-            # Optional e2e gate: prove CHUNK_READY reached the client before this.
-            from vllm_omni.diffusion.worker.e2e_forward_hold import maybe_hold_before_compute_done
-
-            maybe_hold_before_compute_done()
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:
@@ -1613,9 +1587,7 @@ class WorkerProc:
             error=error,
         )
         if job.kind == AsyncOutputKind.CHUNK_READY:
-            message.rpc_id = job.execution_id
             message.request_id = job.request_id
-            message.execution_id = job.execution_id
             message.chunk_index = job.chunk_index
         return message
 
@@ -1633,7 +1605,7 @@ class WorkerProc:
                 )
             )
 
-    def _make_emit_chunk(self, request_id: str | None, execution_id: str | None) -> Callable[[DiffusionOutput], None]:
+    def _make_emit_chunk(self, request_id: str) -> Callable[[DiffusionOutput], None]:
         """Return the media-rank emitter. It never sends ``COMPUTE_DONE``."""
 
         def emit_chunk(output: DiffusionOutput) -> None:
@@ -1656,34 +1628,42 @@ class WorkerProc:
                     gpu_event=gpu_event,
                     kind=AsyncOutputKind.CHUNK_READY,
                     request_id=request_id,
-                    execution_id=execution_id,
                     chunk_index=output.chunk_index,
                 )
             )
 
         return emit_chunk
 
-    def _bind_request_chunk_emitter(self, rpc_request: dict[str, Any], should_reply: bool) -> Any | None:
-        """Bind the chunk emitter for one request forward.
-
-        Only the rank that replies with media gets a live emitter. Other ranks
-        bind ``None`` so a pipeline cannot emit duplicate chunks. Batch /
-        unidentified executes also bind ``None`` so models fall back to a full
-        accumulated output instead of emitting unroutable CHUNK_READY packs.
-        Returns the context token to reset, or ``None`` when this RPC is not a
-        request forward.
-        """
-        method = rpc_request.get("method")
-        if getattr(self.od_config, "step_execution", False) or method not in _REQUEST_CHUNK_EXECUTE_METHODS:
-            return None
-        if not should_reply or self.result_mq is None or self._async_output_queue is None:
-            return bind_emit_chunk(None)
-        request_id = _request_id_from_execute_args(method, tuple(rpc_request.get("args") or ()))
-        if request_id is None:
-            # execute_model_batch (and any execute without a request id) cannot
-            # label CHUNK_READY for the engine; keep accumulation / final media.
-            return bind_emit_chunk(None)
-        return bind_emit_chunk(self._make_emit_chunk(request_id, rpc_request.get("rpc_id")))
+    @contextmanager
+    def _request_chunk_transport(self, method: str, should_reply: bool) -> Iterator[None]:
+        """Close emits and drain chunks before either success or error RPC return."""
+        if self.od_config.step_execution or method not in _REQUEST_CHUNK_EXECUTE_METHODS:
+            yield
+            return
+        factory = self._make_emit_chunk if should_reply and self.result_mq is not None else None
+        forward_error: BaseException | None = None
+        try:
+            with request_chunk_transport(factory):
+                yield
+        except BaseException as exc:
+            forward_error = exc
+            raise
+        finally:
+            if not self._wait_chunk_outputs():
+                # Returning an error while old chunks remain queued would allow
+                # the same request id to be reused before its output retires.
+                # Stop this Worker; the failure monitor tears down the group.
+                pending = int(getattr(self, "_chunk_output_pending", 0) or 0)
+                logger.error(
+                    "Worker %s: request CHUNK_READY drain timed out with %s pack(s) still "
+                    "pending (method=%s); shutting down Worker to avoid request-id reuse. "
+                    "forward_error=%r",
+                    self.gpu_id,
+                    pending,
+                    method,
+                    forward_error,
+                )
+                raise SystemExit("Request chunk outputs did not drain; refusing to reuse the Worker") from forward_error
 
     def drain_async_outputs(self, timeout: float | None = None) -> bool:
         """Block until background D2H/SHM packing has no work left.
@@ -1797,7 +1777,6 @@ class WorkerProc:
             return None, False
 
         result = None
-        chunk_emit_token = None
         status: dict[str, Any] = {
             "rank": self.gpu_id,
             "ok": True,
@@ -1812,9 +1791,8 @@ class WorkerProc:
                 raise TimeoutError("Diffusion async outputs did not drain before pause")
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
-            chunk_emit_token = self._bind_request_chunk_emitter(rpc_request, should_reply)
-            # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            with self._request_chunk_transport(method, should_reply):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(
@@ -1828,9 +1806,6 @@ class WorkerProc:
             if not collect_rank_status:
                 raise
             _cleanup_after_execution_error(e)
-        finally:
-            if chunk_emit_token is not None:
-                reset_emit_chunk(chunk_emit_token)
 
         if isinstance(result, bool):
             status["bool_result"] = result

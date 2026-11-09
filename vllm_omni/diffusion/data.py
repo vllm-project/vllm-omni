@@ -2055,8 +2055,8 @@ class AsyncDiffusionOutput:
     messages use this envelope.  The ``kind`` field routes the message
     to the correct consumer.
 
-    ``CHUNK_READY`` carries the request and the worker RPC id
-    (``execution_id``) plus ``chunk_index``. The executor caches the
+    ``CHUNK_READY`` carries the active request id
+    plus ``chunk_index``. The executor caches the
     unpacked payload under ``async_output_id`` and notifies the engine.
     It must not resolve ``_rpc_futures``.
     """
@@ -2068,7 +2068,6 @@ class AsyncDiffusionOutput:
     output: DiffusionOutput | None = None
     error: str | None = None
     request_id: str | None = None
-    execution_id: str | None = None
     chunk_index: int | None = None
 
 

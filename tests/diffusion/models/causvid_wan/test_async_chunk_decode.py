@@ -10,15 +10,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.causvid_wan import async_stream_decode as asd_mod
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
+from vllm_omni.diffusion.models.causvid_wan import async_chunk_decode as asd_mod
+from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import (
     _async_host_copy,
     _start_local,
 )
-from vllm_omni.diffusion.worker.request_chunk_emit import bind_emit_chunk, reset_emit_chunk
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import bind_emit_chunk, reset_emit_chunk
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -150,19 +150,19 @@ def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="stream-fail",
-        sampling_params=OmniDiffusionSamplingParams(extra_args={"stream_decode": True}),
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"async_chunk_decode": True}),
     )
     with pytest.raises(RuntimeError, match="compute boom"):
         pipeline.forward(req)
     assert cancelled == [True]
 
 
-def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
+def test_chunk_decode_cancelled_if_wancell_fails(monkeypatch):
     """Narrow seam: stream start + WanCell build; construction failure cancels the job."""
     cancelled: list[bool] = []
     fake_job = SimpleNamespace(on_finished=None, cancel=lambda: cancelled.append(True))
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_stream_decode",
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_chunk_decode",
         lambda **_kwargs: fake_job,
     )
     monkeypatch.setattr(
@@ -174,7 +174,7 @@ def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
     pipeline.vae = None
     pipeline.transformer = SimpleNamespace()
     with pytest.raises(RuntimeError, match="wancell boom"):
-        pipeline._start_stream_decode_and_wan_cell(
+        pipeline._start_chunk_decode_and_wan_cell(
             kv_id="kv-admit",
             n_chunks=1,
             latent_shape=(1, 4, 1, 1, 1),
@@ -183,7 +183,7 @@ def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
             seed=0,
             prompt_embeds=torch.zeros(1, 1, 1),
             sampler=SimpleNamespace(),
-            stream_decode=True,
+            async_chunk_decode=True,
             finish_rank=0,
             source_rank=None,
             pp_rank=0,
@@ -193,7 +193,7 @@ def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
     assert cancelled == [True]
 
 
-def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
+def test_chunk_decode_on_chunk_when_request_streaming_bound(monkeypatch):
     captured: dict[str, object] = {}
     emitted: list[DiffusionOutput] = []
 
@@ -202,7 +202,7 @@ def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
         return SimpleNamespace(on_finished=None, cancel=lambda: None)
 
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_stream_decode",
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_chunk_decode",
         _fake_start,
     )
     monkeypatch.setattr(
@@ -215,7 +215,7 @@ def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
     pipeline.od_config = SimpleNamespace(streaming_output=True)
     token = bind_emit_chunk(emitted.append)
     try:
-        pipeline._start_stream_decode_and_wan_cell(
+        pipeline._start_chunk_decode_and_wan_cell(
             kv_id="kv-stream",
             n_chunks=3,
             latent_shape=(1, 4, 1, 1, 1),
@@ -224,7 +224,7 @@ def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
             seed=0,
             prompt_embeds=torch.zeros(1, 1, 1),
             sampler=SimpleNamespace(),
-            stream_decode=True,
+            async_chunk_decode=True,
             finish_rank=0,
             source_rank=None,
             pp_rank=0,
@@ -241,7 +241,6 @@ def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
     assert emitted[0].finished is False
     assert emitted[0].chunk_index == 1
     assert emitted[0].total_chunks == 3
-    assert CausVidWanPipeline.supports_request_streaming_output is True
 
 
 def test_local_on_chunk_does_not_accumulate():

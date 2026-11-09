@@ -191,8 +191,13 @@ delegate to Pipeline `forward`, which admits via `admit_cell_request`, runs
 schedule two requests on the same session id (batch-wide reset would otherwise
 run before per-request execution). Admit / drop / fail-closed cleanup prevent
 mid-request leaks of `VersionPool` slots.
-`extra_args.stream_decode` remains available on this path; abort/fail-closed
-calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
+`streaming_output=True` automatically enables chunk decoding via
+`async_chunk_decode` (no sync mid-request decode fallback). That path needs a
+vertical topology or single-rank layer PP (`S=1`, `G=1`) and a non-tiled
+single-owner VAE; `S=1` with `G>1` or tiled/distributed VAE hard-fails.
+`extra_args.async_chunk_decode=True` opts into decode overlap for non-streaming
+requests. Abort/fail-closed calls `AsyncStreamDecodeJob.cancel()` when a side
+job is present.
 
 ## NoisyKV
 
@@ -239,9 +244,9 @@ requires separate validation.
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
-(used for `chunk_timeline_file`). Remote `stream_decode` `source_rank` is
+(used for `chunk_timeline_file`). Remote `async_chunk_decode` `source_rank` is
 that finish rank only when `S > 1`. `S=1` decodes locally: `G=1` (single
-rank, which owns the VAE) keeps local `stream_decode`; `G>1` rejects it
+rank, which owns the VAE) keeps local `async_chunk_decode`; `G>1` rejects it
 (fail fast — the finish rank `G-1` has no VAE).
 
 ## Compatibility
@@ -284,20 +289,20 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 
 ## Streaming
 
-Request-mode CausVid (`supports_request_streaming_output=True`) emits in-order
+Request-mode CausVid emits in-order
 `CHUNK_READY` video chunks during one forward when `streaming_output=True`,
 without forcing `step_execution`. The engine owns the client stream. Intermediate
 chunks do not update the request scheduler, and a success final does not resend
-the full video. `stream_decode` only overlaps VAE decode; without
+the full video. `async_chunk_decode` only overlaps VAE decode; without
 `streaming_output` it still accumulates the clip. A gap or out-of-order chunk is
 a protocol error. An error after any delivered chunk finishes as an error.
 
 CausVid also sets `supports_request_cancellation=True`. The engine registers a
 cooperative cancellation signal; each Noisy PP cell tick calls
 `check_request_cancellation()` so a disconnect can stop the wave at a PP-safe
-boundary and cancel any in-flight `stream_decode` job. Expected `execution_id`
-is bound to the stream state before the execute RPC is enqueued; late
-`CHUNK_READY` packs from a reused request id are reclaimed and not delivered.
+boundary and cancel any in-flight `async_chunk_decode` job. Captured chunk callbacks
+close before the execution reply, and submitted messages drain first. Request
+state is retired only after this ordering is established.
 
 ## Open issues
 
@@ -319,3 +324,12 @@ is bound to the stream state before the execute RPC is enqueued; late
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
 - Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{noisy_pp_plan,noisy_pp_executor}.py`;
   NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
+
+Request chunks route by the active `request_id`; `rpc_id` remains an internal
+RPC/Future correlation id. No separate execution identity is registered.
+Before a forward returns or raises, its captured emit callbacks are closed and
+already submitted chunk messages are drained to the same result queue. The
+result pump processes these messages before the execution reply can retire the
+request. This ordering covers cancellation and errors as well as success.
+If draining times out, the Worker stops and the failure monitor tears down the
+group; it must not return a reusable Worker with old chunks still pending.
