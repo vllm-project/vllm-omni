@@ -60,7 +60,7 @@ async def test_frontend_profile_controls_reach_diffusion_profiler(route, control
         assert method == "profile"
         return DiffusionWorker.profile(worker, *args, **(kwargs or {}))
 
-    engine = SimpleNamespace(collective_rpc=worker_rpc)
+    engine = SimpleNamespace(collective_rpc=worker_rpc, _check_and_start_background_loop=mocker.AsyncMock())
     engine.profile = partial(DiffusionEngine.profile, engine)
     with ThreadPoolExecutor(max_workers=1) as executor:
         client = SimpleNamespace(_engine=engine, _executor=executor, stage_id=1, replica_id=0)

@@ -255,6 +255,10 @@ class InlineStageDiffusionClient(StageClientBase):
             profile_prefix = args[1] if len(args) > 1 else None
             if is_start and profile_prefix is None:
                 profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
+            if is_start:
+                # Keep profiler lifecycle and inference on one worker thread,
+                # including sessions started before the first request.
+                await self._engine._check_and_start_background_loop()
             return await loop.run_in_executor(
                 self._executor,
                 partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})),

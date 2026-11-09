@@ -23,6 +23,7 @@ import asyncio
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields as _dc_fields
 from types import SimpleNamespace
 from typing import Any
@@ -31,8 +32,10 @@ import pytest
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode, _RpcTask
+from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
+from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 # Default values for every batch-key field, so SimpleNamespace-based
@@ -219,6 +222,28 @@ def _stop_engine(engine: DiffusionEngine) -> None:
             task.future.set_exception(RuntimeError("DiffusionEngine is shutting down."))
     engine.worker_thread.join(timeout=5)
     assert not engine.worker_thread.is_alive(), "Busy loop thread did not stop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True])
+async def test_profile_before_first_request_preserves_worker_thread(inline):
+    engine = _make_engine_with_loop(asyncio.get_running_loop(), start_loop=False)
+    engine._init_lock = asyncio.Lock()
+    proc = object.__new__(InlineStageDiffusionClient if inline else StageDiffusionProc)
+    proc._engine = engine
+    proc._executor = ThreadPoolExecutor(max_workers=1)
+    rpc = proc.collective_rpc_async if inline else proc._handle_collective_rpc
+    try:
+        await rpc("profile", None, (True, "cold_start"), {})
+        await engine.async_collective_rpc("execute_model", args=(_make_request("profiled"),))
+        await rpc("profile", None, (False, None), {})
+
+        calls = engine.executor.calls
+        assert [call["method"] for call in calls] == ["profile", "execute_model", "profile"]
+        assert engine.executor.thread_ids == {engine.worker_thread.ident}
+    finally:
+        _stop_engine(engine)
+        proc._executor.shutdown(wait=True, cancel_futures=True)
 
 
 async def _consume_final_output(generator):
