@@ -1119,12 +1119,13 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             # search window to 147-735 Hz and misses the fundamental entirely,
             # scoring clean speech ~1.9 dB lower than it is.
             sample_rate = _speech_pcm_sample_rate(request_config)
+            channels = _speech_pcm_channels(request_config)
             try:
                 _assert_pcm_int16_speech_hnr(
                     response.audio_bytes,
                     min_hnr_db=min_hnr_db,
                     sr=sample_rate,
-                    channels=_speech_pcm_channels(request_config),
+                    channels=channels,
                 )
             except AssertionError as exc:
                 _retain_failed_speech_audio(
