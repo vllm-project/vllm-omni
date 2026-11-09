@@ -20,6 +20,7 @@ from benchmarks.lingbot_world.regression import (
 )
 from benchmarks.lingbot_world.video_quality import evaluate_video_quality, verify_video_coverage
 from tests.dfx.lingbot_world.runner import ROOT, checked_artifact, git_revision
+from vllm_omni.benchmarks.realtime_video.workload import num_frames_for_chunks
 
 
 def evaluate_quality(settings, data, suite, monkeypatch):
@@ -59,7 +60,7 @@ def evaluate_quality(settings, data, suite, monkeypatch):
         report["video_inputs"] = {
             label: verify_video_coverage(
                 path,
-                frames=(settings["num_chunks"] * 3 - 1) * 4 + 1,
+                frames=num_frames_for_chunks(settings["num_chunks"]),
                 width=settings["width"],
                 height=settings["height"],
                 fps=settings["mux_fps"],
@@ -91,7 +92,7 @@ def evaluate_quality(settings, data, suite, monkeypatch):
                             native["native_provenance"]
                             .get(f"case{index}_{role}{repeat}", {})
                             .get("background_clip_inference", {}),
-                            (settings["num_chunks"] * 3 - 1) * 4 + 1,
+                            num_frames_for_chunks(settings["num_chunks"]),
                         )
             continuous = {k: v for k, v in tolerances.items() if k not in policy["binary_activity_dimensions"]}
             checks = [

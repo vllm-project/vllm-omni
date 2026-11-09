@@ -12,13 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from benchmarks.lingbot_world.benchmark_lingbot_world_realtime import (
-    parse_args,
-    resolve_image_reference,
-    run_benchmark,
-    run_session,
-)
-from benchmarks.lingbot_world.regression import RegressionError, performance_metrics, read_json, sha256, write_json
+from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
+from vllm_omni.benchmarks.realtime_video.client import resolve_image_reference, run_session
 
 ROOT = Path(__file__).resolve().parents[3]
 ENGINE_ENVIRONMENT = {"VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0", "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0"}
@@ -159,45 +154,6 @@ def _capture(source: Path, model: Path, destination: Path, settings: dict[str, A
     )
 
 
-def _measured_metrics(document: dict, settings: dict) -> dict[str, float]:
-    sessions = document.get("sessions", [])
-    count = settings.get("measured_sessions", 1)
-    ids = [session.get("request_id") for session in sessions]
-    if (
-        len(sessions) != count
-        or [session.get("session_index") for session in sessions] != list(range(count))
-        or any(not isinstance(identity, str) or not identity for identity in ids)
-        or len(set(ids)) != count
-    ):
-        raise RegressionError("Missing or duplicated measured sessions in an independent start")
-    if any(document["config"].get(key) != settings[key] for key in ("warmup_chunks", "target_fps")):
-        raise RegressionError("Benchmark measurement policy differs from the profile")
-    if document["config"].get("playback_buffer_chunks") != 1:
-        raise RegressionError("LingBot regression requires the pinned one-chunk playback buffer")
-    warmups = document.get("warmups", [])
-    if (
-        document["config"].get("warmup_sessions") != 1
-        or document["config"].get("warmup_num_chunks") != settings["warmup_num_chunks"]
-        or len(warmups) != 1
-        or warmups[0].get("measured") is not False
-        or not isinstance(warmups[0].get("request_id"), str)
-        or not warmups[0]["request_id"]
-        or warmups[0]["request_id"] in ids
-    ):
-        raise RegressionError("Missing or mixed warmup session")
-    chunks = warmups[0].get("chunks", [])
-    if (
-        len(chunks) != settings["warmup_num_chunks"]
-        or [row.get("index") for row in chunks] != list(range(settings["warmup_num_chunks"]))
-        or any(
-            row.get("byte_length", 0) <= 0 or row.get("num_frames") != (9 if i == 0 else 12)
-            for i, row in enumerate(chunks)
-        )
-    ):
-        raise RegressionError("Incomplete warmup chunk population")
-    return performance_metrics(document, num_chunks=settings["num_chunks"], min_steady=settings["min_steady_samples"])
-
-
 def hardware_contract(settings):
     from vllm_omni.platforms import current_omni_platform as platform
 
@@ -218,49 +174,52 @@ def hardware_contract(settings):
 
 
 def benchmark_args(server, settings, case, destination):
-    return parse_args(
+    from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
+    from vllm_omni.benchmarks.realtime_video.workload import default_workload
+
+    workload = default_workload(
+        image_reference=resolve_image_reference(str(case["path"])),
+        num_chunks=settings["num_chunks"],
+        camera_pattern=case["camera_pattern"],
+        prompt=case["prompt"],
+        seed=case["seed"],
+        height=settings["height"],
+        width=settings["width"],
+        fps=settings["mux_fps"],
+    )
+    return build_serve_args(
         [
             "--port",
             str(server.port),
             "--model",
             str(server.model),
-            "--image",
-            str(case["path"]),
-            "--prompt",
-            case["prompt"],
-            "--camera-pattern",
-            case["camera_pattern"],
-            "--seed",
-            str(case["seed"]),
-            "--height",
-            str(settings["height"]),
-            "--width",
-            str(settings["width"]),
-            "--fps",
-            str(settings["mux_fps"]),
-            "--target-fps",
-            str(settings["target_fps"]),
-            "--playback-buffer-chunks",
-            "1",
-            "--num-chunks",
-            str(settings["num_chunks"]),
-            "--sessions",
+            "--num-prompts",
             str(settings.get("measured_sessions", 1)),
-            "--warmup-sessions",
+            "--num-warmups",
             "1",
-            "--warmup-num-chunks",
+            "--realtime-video-camera-pattern",
+            case["camera_pattern"],
+            "--realtime-video-warmup-num-chunks",
             str(settings["warmup_num_chunks"]),
-            "--warmup-chunks",
+            "--realtime-video-warmup-chunks",
             str(settings["warmup_chunks"]),
-            "--first-chunk-timeout",
+            "--realtime-video-target-fps",
+            str(settings["target_fps"]),
+            "--realtime-video-playback-buffer-chunks",
+            "1",
+            "--realtime-video-first-chunk-timeout",
             str(settings["first_chunk_timeout_s"]),
-            "--chunk-timeout",
+            "--realtime-video-chunk-timeout",
             str(settings["chunk_timeout_s"]),
-            "--output-json",
-            str(destination / "benchmark.json"),
-            "--save-video",
+            "--realtime-video-save-video",
             str(destination / "rollout.mp4"),
-        ]
+            "--save-result",
+            "--result-dir",
+            str(destination),
+            "--result-filename",
+            "serve-result.json",
+        ],
+        workload=workload,
     )
 
 
@@ -271,7 +230,11 @@ def generation_paths(settings, repeats=range(3)):
         for repeat in repeats
         for name in [
             "precision.npz",
-            *[f"{case['id']}/{file}" for case in settings["cases"] for file in ("benchmark.json", "rollout.mp4")],
+            *[
+                f"{case['id']}/{file}"
+                for case in settings["cases"]
+                for file in ("serve-result.json", "benchmark.json", "rollout.mp4")
+            ],
         ]
     }
 
@@ -326,15 +289,16 @@ def collect_measurements(settings, measurement_repeat=None):
                         destination = arm / case["id"]
                         destination.mkdir()
                         try:
-                            document = asyncio.run(
-                                run_benchmark(
-                                    benchmark_args(
-                                        server, settings, {**case, "path": images[case["image"]]}, destination
-                                    )
-                                )
+                            from vllm_omni.benchmarks.serve import main as bench_serve
+
+                            result = bench_serve(
+                                benchmark_args(server, settings, {**case, "path": images[case["image"]]}, destination)
                             )
+                            document = result["realtime_video"]
                             record_benchmark_revisions(document, source)
                             write_json(destination / "benchmark.json", document)
+                            if not document["passed"]:
+                                raise RegressionError(f"Incomplete realtime-video measurement: {document['errors']}")
                         except Exception as error:
                             report["errors"].append(
                                 {
@@ -456,7 +420,7 @@ def stability_session(server, settings: dict[str, Any], image: Path, destination
     """Separate instrumented rollout for control updates and bounded memory."""
     from dataclasses import replace
 
-    from benchmarks.lingbot_world.workload import default_workload
+    from vllm_omni.benchmarks.realtime_video.workload import default_workload
     from vllm_omni.platforms import current_omni_platform as platform
 
     memory = []

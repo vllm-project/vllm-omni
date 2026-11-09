@@ -6,9 +6,9 @@ import subprocess
 
 import pytest
 
-from benchmarks.lingbot_world import benchmark_lingbot_world_realtime as realtime
 from benchmarks.lingbot_world.regression import RegressionError
 from tests.dfx.lingbot_world import runner
+from vllm_omni.benchmarks.realtime_video import client as realtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -42,7 +42,7 @@ def source_image(tmp_path, monkeypatch):
     monkeypatch.setenv("BUILDKITE_COMMIT", "b" * 40)
     assert not (image / ".git").exists()
     # Standalone installed clients must still refuse to claim a caller's SHA.
-    assert realtime._git_revision() is None
+    assert realtime.git_revision() is None
     return image, reference, reference_revision
 
 

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from vllm.benchmarks.serve import main_async
+from vllm.benchmarks.serve import main_async as vllm_main_async
 
 # Import patch to register daily-omni dataset and omni backends
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
@@ -72,7 +72,8 @@ def _validate_fail_fast_on_timeout(args: argparse.Namespace) -> None:
         )
 
 
-def main(args: argparse.Namespace) -> dict[str, Any]:
+async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the common serving lifecycle from async protocol/CI callers too."""
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):
@@ -98,4 +99,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         else contextlib.nullcontext()
     )
     with lock:
-        return asyncio.run(main_async(args))
+        return await vllm_main_async(args)
+
+
+def main(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(main_async(args))

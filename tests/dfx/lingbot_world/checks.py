@@ -18,7 +18,9 @@ from benchmarks.lingbot_world.regression import (
     write_json,
 )
 from benchmarks.lingbot_world.video_quality import compare_video_pair
-from tests.dfx.lingbot_world.runner import ROOT, _measured_metrics, checked_artifact
+from tests.dfx.lingbot_world.runner import ROOT, checked_artifact
+from vllm_omni.benchmarks.realtime_video.metrics import measured_metrics
+from vllm_omni.benchmarks.realtime_video.workload import num_frames_for_chunks
 
 
 def performance_report(settings, data):
@@ -43,7 +45,7 @@ def performance_report(settings, data):
                             or raw.get("git_revision") != manifest["candidate_revision"]
                         ):
                             raise RegressionError("Wrong benchmark client/server source")
-                        measured = _measured_metrics(raw, settings)
+                        measured = measured_metrics(raw, settings)
                         ids = {session["request_id"] for session in [*raw["sessions"], *raw["warmups"]]}
                         if ids & request_ids:
                             raise RegressionError("Requests reused across independent measurements")
@@ -120,7 +122,7 @@ def numeric_report(settings, data):
                         first, second, window_seconds=policy["pixel_window_seconds"], ssim_stride=24
                     )
                     expected = (
-                        (settings["num_chunks"] * 3 - 1) * 4 + 1,
+                        num_frames_for_chunks(settings["num_chunks"]),
                         settings["width"],
                         settings["height"],
                         settings["mux_fps"],

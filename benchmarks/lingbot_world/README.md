@@ -1,176 +1,64 @@
-# LingBot-World Benchmarks — Realtime Streaming Cadence
+# LingBot-World realtime-video benchmarks
 
-`benchmark_lingbot_world_realtime.py` measures LingBot-World 2.0 as it is
-actually deployed: one `WS /v1/realtime/video` session that streams one video
-chunk per AR block, for as long as the world keeps running.
+Use the existing serving benchmark for LingBot's `WS /v1/realtime/video`
+protocol. One benchmark request is one complete rollout. The shared
+`vllm bench serve --omni` lifecycle owns request scheduling, warmup execution,
+result saving and failures; the `realtime-video` backend records video chunks
+and computes their cadence and playback metrics.
 
-## Why this is not the diffusion serving benchmark
+## Run
 
-[`benchmarks/diffusion`](../diffusion/README.md) measures "one request, one
-finished video" and reports request throughput. LingBot-World has neither shape:
-
-- **One request is the whole rollout.** `prepare_encode` runs once, then every AR
-  block is four DMD steps plus one clean-KV commit forward, and each block
-  streams out as a chunk. Throughput in requests per second is meaningless.
-- **There is exactly one session.** The stepwise deploy config pins
-  `max_num_seqs: 1`, and the AR-Diffusion consumer rejects a stage with more than
-  one replica, because session-affine routing does not exist yet. There is no
-  concurrency to sweep.
-- **What matters is cadence.** A deployment is healthy when chunk *N + 1* arrives
-  before a viewer finishes watching chunk *N*. That is a latency distribution
-  against a wall clock, not a throughput number.
-
-## Quick start
-
-Serve the model, then point the benchmark at it. The benchmark never starts a
-server.
+Start the model separately with a supported deployment, for example:
 
 ```bash
-# Terminal 1 — one GPU, eager (portable smoke configuration)
 vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
-  --omni \
-  --deploy-config benchmarks/lingbot_world/configs/single_gpu_eager.yaml \
+  --omni --deploy-config benchmarks/lingbot_world/configs/usp4_compiled.yaml \
   --port 8000
 
-# Terminal 2
-pip install websockets
-python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
+vllm bench serve --omni \
+  --backend realtime-video --dataset-name realtime-video \
+  --model robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
   --host 127.0.0.1 --port 8000 \
-  --num-chunks 16 \
-  --output-json /tmp/lingbot_world_realtime.json
+  --realtime-video-image /path/to/frame.png \
+  --realtime-video-num-chunks 40 \
+  --num-warmups 1 --realtime-video-warmup-num-chunks 8 \
+  --num-prompts 3 --realtime-video-target-fps 12 \
+  --realtime-video-save-video /tmp/rollout.mp4 \
+  --save-result --result-dir /tmp --result-filename lingbot.json
 ```
 
-With no `--image`, the first frame comes from the shared vLLM image asset, so the
-default workload needs no setup and this repository carries no benchmark binary.
-Pass `--image /path/to/frame.png` to condition the rollout on your own frame.
+An implicit `--num-prompts` means one measured rollout for this backend.
+Rollouts are sequential (`--max-concurrency 1`, `--request-rate inf`): the
+current deployment supports one session. Traffic ramps, background probes and
+concurrent requests are rejected rather than changing the measurement.
+There is no hidden full-rollout readiness request or tokenizer initialization.
+Use explicit warmups after the server is ready. Without an image override, the
+built-in workload uses the shared vLLM image asset; a local image/workload lets
+an installed client run without fetching that default asset.
 
-### Realtime topology
+`single_gpu_eager.yaml` is also available for a single-GPU deployment. That
+configuration and the four-GPU compiled configuration have different costs;
+compare only matching deployment, runtime, input and hardware settings. The
+compiled configuration uses Ulysses over four ranks and may pay compilation or
+capture costs in the first rollout. A warmup does not prove compilation has
+finished; retain its observed records.
 
-The single-GPU config is a smoke configuration, not a realtime one: one card runs
-all five forwards of every block serially and nothing is compiled. Use the
-four-GPU config for numbers that mean anything about realtime behavior.
+NPU uses the same `realtime-video` backend against a server started with
+`benchmarks/lingbot_world/configs/npu_usp4_eager.yaml` in the supported NPU
+runtime. Its CI measurement count is `--num-prompts 7`, with one excluded
+eight-chunk warmup per case. The client does not choose CUDA/NPU device APIs;
+the server deployment and outer CI job own that allocation.
 
-```bash
-vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
-  --omni \
-  --deploy-config benchmarks/lingbot_world/configs/usp4_compiled.yaml \
-  --port 8000
+## Workload and warmup
 
-python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
-  --port 8000 --num-chunks 40 --warmup-sessions 1 --sessions 3 \
-  --target-fps 12 --output-json /tmp/lingbot_world_repeated.json
-```
-
-`usp4_compiled.yaml` sets pure Ulysses sequence parallelism over four ranks and
-`enforce_eager: false`. The pipeline validates the parallel shape itself:
-`sequence_parallel_size` must equal `ulysses_degree`, `ring_degree` and
-`allgather_degree` must be 1, `ulysses_mode` must be `strict`, and pipeline,
-CFG, and VAE parallel sizes above 1 are rejected. This benchmark config sets
-`tensor_parallel_size: 1`; the pipeline validator does not reject larger TP sizes.
-
-Compiled mode can pay compilation and capture costs on the first rollout.
-Use `--warmup-sessions 1` before measured repetitions. Excluding the first six
-chunks addresses the attention-window ramp; it does not guarantee that
-compilation and capture have finished.
-
-## Metrics
-
-| Metric | Meaning |
-| --- | --- |
-| `ttfc_ms` | **Time to first chunk**: `session.start` sent until the first chunk's bytes arrive. Pays for prompt encode, first-frame VAE encode, and any compile or capture. |
-| `interval_all` | Inter-arrival latency across every chunk: mean, median, std, min, p90, p95, p99, max. |
-| `interval_steady` | The same summary over steady-state chunks only. |
-| `video_rtf` | Wall seconds spent per second of video, matching vLLM-Omni's own RTF (`generation_s / video_duration`). **Lower is better; below 1.0 is real time.** |
-| `video_rtfx` | The reciprocal, under the name this repo uses for it: video seconds per wall second, where higher is better. |
-| `steady_video_rtf` | `video_rtf` restricted to steady-state chunks. |
-| `chunk_deadline_ms` | Wall-clock budget one steady chunk must meet to hold real time: 12 frames ÷ `--target-fps`. Override directly with `--chunk-slo-ms`. |
-| `slo_attainment` | Fraction of steady chunks that met the deadline. |
-| `playback` | Underrun count, total stall, and stall ratio from a simulated viewer. |
-
-### Which frame rate counts as real time
-
-**The checkpoint declares no frame rate.** There is none in `model_index.json`, the
-scheduler config, or the transformer config, and the pipeline never reads one. The
-first chunk is nine pixel frames and following chunks are twelve; how long those
-frames *last* is a property of how the output is played, not of the model.
-
-That choice moves the verdict without moving anything measured:
-
-| basis | video per chunk | deadline | RTF at a measured 1357 ms/chunk |
-| --- | --- | --- | --- |
-| 16 fps | 0.750 s | 750 ms | 1.809 |
-| 12 fps | 1.000 s | 1000 ms | 1.357 |
-
-So `--fps` (sent to the server, which uses it to label the muxed MP4) and
-`--target-fps` (the real-time basis for RTF, the deadline, and the playback
-simulation) are separate flags. `--target-fps` defaults to `--fps`; set it when the
-two differ, and the report prints both. State the basis whenever you quote a number
-— an RTF without its fps is not a measurement. (RTF is a cost here, so a bigger number is a
-worse result; a steady chunk's RTF is simply its interval divided by its video duration.)
-An RTF above 1 means the measured deployment is slower than real time at the
-stated target frame rate. The benchmark measures this failure as well as success.
-
-### Why warmup chunks are not optional
-
-The DiT attends over a sliding window of `sliding_window_num_frames = 18` latent
-frames with `sink_size = 9`, so the key count a block attends over keeps growing
-until eighteen latent frames of history exist — six chunks at three frames per
-block. **Chunk cost is not stationary before chunk six.** A mean over a short
-rollout is therefore lower than anything a running session will sustain, which is
-why `--warmup-chunks` defaults to 6 and steady-state metrics are reported
-separately. Keep `--num-chunks` comfortably above the warmup, or the benchmark
-tells you no chunk reached steady state. The terminal chunk skips next-chunk
-preparation, so it is excluded from steady metrics too; it remains in overall
-RTF, all-chunk intervals, and playback simulation.
-
-The default 16-chunk rollout provides only nine steady intervals. Percentiles
-are interpolated sample summaries; the report warns when fewer than 100
-intervals contribute, and even 100 samples do not guarantee a stable p99.
-Use longer rollouts for tail analysis and at least `--sessions 3` after
-`--warmup-sessions 1` for reported comparisons. Session warmup pays compilation
-cost; chunk warmup separately excludes the attention-window ramp. The command
-above yields 33 steady intervals per session (indices 6 through 38), or 99 across
-three sessions. Report each session's mean and the spread across sessions; this
-sample still does not establish a reliable p99.
-
-### Why playback is simulated
-
-A p99 interval alone cannot say whether a viewer saw a stall: the same p99 is
-invisible behind a three-chunk buffer and a visible freeze behind none. The
-benchmark replays chunk arrivals against a wall clock — playback starts once
-`--playback-buffer-chunks` chunks have landed and then consumes video at `--target-fps`
-— and reports every moment the player ran dry.
-
-### What the client-side number is worth
-
-On a four-GPU Ulysses run the client's mean inter-arrival over all fifteen
-post-first-chunk intervals was **1326.743 ms**, against the server's own
-`StageRequestStats.inter_output_latency_ms` of **1327.479 ms** for the same
-request — a difference of **0.74 ms**. This cross-check shows agreement in
-average output cadence for that run, including warmup and the terminal chunk.
-It does not measure encoding or transport latency: a fixed delivery delay can
-cancel out of inter-arrival differences. Attributing that latency requires
-per-chunk timestamps at both boundaries or server-side profiling.
-
-Compare matching interval populations when investigating discrepancies; both
-measurement bugs and delivery buffering can change the observed cadence.
-
-### What this benchmark cannot see
-
-Chunk metadata carries no server-side timestamps, so the benchmark cannot split
-DiT time from VAE decode time; use `--enable-diffusion-pipeline-profiler` on the
-server for that. It also reports no GPU memory, which is a server-side quantity.
-
-## Custom rollouts
-
-`--workload rollout.json` replaces the built-in workload, including mid-rollout
-prompt changes, which the CLI flags cannot express:
+Use `--dataset-path rollout.json` for camera scripts and mid-rollout prompt
+updates:
 
 ```json
 {
   "prompt": "The camera moves slowly forward through the scene.",
   "image": "/path/to/first_frame.png",
-  "num_chunks": 24,
+  "num_chunks": 40,
   "camera_pattern": "orbit",
   "fps": 16,
   "seed": 42,
@@ -180,59 +68,93 @@ prompt changes, which the CLI flags cannot express:
 }
 ```
 
-Supply `camera_action_script` directly instead of `num_chunks` to control every
-frame's action. It must hold exactly one three-entry action list per chunk; one
-AR block is three latent frames, and the server rejects any other shape.
-Explicit `--image`, `--prompt`, `--negative-prompt`, `--width`, `--height`,
-`--fps`, `--seed`, and `--flow-shift` flags override the matching workload-file
-values. `--num-chunks` and `--camera-pattern` apply only to the built-in
-workload; when using `--workload`, set those fields in the file instead.
-An explicit `camera_action_script` takes precedence over the file's
-`num_chunks` and `camera_pattern`. Each prompt update must use a distinct
-`after_chunk` boundary so its interaction event ID is unique.
+An explicit `camera_action_script` takes precedence over `num_chunks` and
+`camera_pattern`; each chunk has exactly three action entries. Prompt updates
+must use distinct chunk boundaries. The namespaced image, prompt,
+negative-prompt, width, height, fps, seed and flow-shift flags override matching
+workload-file values. `--realtime-video-num-chunks` and camera-pattern apply to
+the built-in workload, so specify their file equivalents with `--dataset-path`.
 
-Camera actions change what the world does, not what it costs, so `--camera-pattern`
-(`forward`, `orbit`, `hold`) keeps a rollout representative rather than sweeping a
-cost dimension.
+Session warmup and chunk warmup address different costs:
 
-## Options worth knowing
+- `--num-warmups 1 --realtime-video-warmup-num-chunks 8` runs a distinct,
+  excluded eight-chunk session. Without the optional shortening flag, warmup
+  uses the full workload. Warmup raw records remain in the result.
+- `--realtime-video-warmup-chunks 6` excludes the attention-window ramp from
+  steady cadence. The terminal chunk also stays out of steady metrics because
+  it skips next-chunk preparation. All chunks remain in end-to-end and playback
+  calculations.
 
-| Flag | Purpose |
+Forty chunks give 33 steady intervals per measured session, indices 6–38.
+Three such sessions give 99 intervals, which still do not establish a reliable
+p99. Percentiles are descriptive summaries; the CI p99 gate requires at least
+1000 steady observations. Independent server starts are a separate CI concern,
+not the same as multiple sessions on one already-running server.
+
+## Video metrics
+
+The domain report is `realtime_video` in the ordinary saved benchmark JSON.
+It retains `workload`, `config`, measured `sessions`, excluded `warmups`, raw
+chunk indices/arrival times/byte lengths/frame counts, errors and aggregate
+metrics. Failed or partial requests remain failed, with their available raw
+observations; they are not successful measurements or zero-valued timings.
+Frames are not output tokens and chunk intervals are not token ITL.
+
+| Field | Meaning |
 | --- | --- |
-| `--target-fps` | Playback rate the real-time verdict is measured against, independent of the mux label. |
-| `--sessions N` | N sequential measured rollouts; the report adds spread across them. |
-| `--warmup-sessions N` | Unmeasured rollouts first, to pay compile and capture cost. |
-| `--warmup-num-chunks N` | Optional shorter warmup rollout; measured rollout length is unchanged. |
-| `--print-chunks` | One line per chunk as it arrives. |
-| `--save-video PATH` | Losslessly remux the last measured session for eyeballing (needs PyAV); preserve received pixels and timestamps. |
-| `--ping-interval` | `session.ping` cadence keeping the server's stall clock fresh during a slow first chunk. `0` disables. |
-| `--first-chunk-timeout` | Raise it when the server is still compiling or capturing graphs. |
+| `ttfc_ms` | `session.start` sent to the first media chunk's bytes received. |
+| `interval_all` | Inter-arrival summary over all post-first chunks. |
+| `interval_steady` | Inter-arrival summary excluding the warmup and terminal chunks. |
+| `video_rtf` | Wall seconds / generated video seconds; lower is better. |
+| `video_rtfx` | Reciprocal of RTF; higher is better. |
+| `frames_per_second` | Actual generated frames / session wall time. |
+| `chunk_deadline_ms` | Twelve steady frames / target playback FPS. |
+| `slo_attainment` | Fraction of steady intervals meeting that deadline. |
+| `playback` | Simulated buffered playback underruns and startup/steady stalls. |
 
-## Output
+The opening chunk contains nine frames and later chunks contain twelve.
+`--realtime-video-fps` labels the media sent by the server;
+`--realtime-video-target-fps` states the playback rate used for deadlines,
+RTF and playback simulation. It defaults to the workload's FPS. For example,
+a twelve-frame chunk has a 750 ms budget at 16 FPS and 1000 ms at 12 FPS.
+Neither choice changes the observed bytes or their arrival timestamps.
+`--realtime-video-chunk-slo-ms` can set an explicit deadline.
 
-`--output-json` writes the run's configuration, every chunk's arrival time and
-size, per-session metrics, and the aggregate, along with the git revision and
-hostname so a number can be traced back to what produced it.
+The client timestamps received media, so it cannot split DiT, VAE, encoding or
+transport costs. Server profiling is needed for that attribution. A slow
+interval alone cannot establish a visible freeze: playback simulation also
+uses the configured start buffer. Media saving occurs after measurement and
+losslessly remuxes received packets, preserving pixels and presentation
+timestamps.
 
-## Tests
+## Legacy script
 
-`tests/benchmarks/test_lingbot_world_realtime.py` covers the chunk and frame
-arithmetic against the server's own formula, the metric math, and the protocol
-handling against a scripted WebSocket server. It needs no GPU:
+The existing script remains a compatibility entrypoint:
 
 ```bash
-pytest tests/benchmarks/test_lingbot_world_realtime.py
+python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
+  --port 8000 --image /path/to/frame.png --num-chunks 40 \
+  --warmup-sessions 1 --warmup-num-chunks 8 --sessions 3 \
+  --target-fps 12 --output-json /tmp/lingbot-legacy.json
 ```
 
-## CI regression cases
+Its existing host/port, workload, session, warmup, video and output flags are
+translated to the same serving benchmark. It has no separate request loop or
+metric implementation. `--output-json` retains the old top-level domain JSON;
+the common saved result is kept beside it as `*-serve-result.json`. Prefer the
+normal `vllm bench serve --omni` command for new uses.
 
-The [LingBot CI cases](../../tests/dfx/lingbot_world/README.md) define separate
-numeric precision, WBench, VBench, performance and long-session stability tests
-for CUDA and NPU. Shared generation records real reference/candidate data;
-each semantic case validates its own artifacts and writes its own report.
-The performance gate retains the 5% relative threshold, while 12 FPS remains
-the SLO measurement basis. Long stability uses two candidate-only 600-chunk
-sessions with memory, camera, lifecycle and cleanup checks.
+## CI cases and local checks
 
-CI maintainers own execution and scheduling. No reference-only calibration
-campaign or stored historical population is required to define these cases.
+The [LingBot CI cases](../../tests/dfx/lingbot_world/README.md) keep numerical
+precision, WBench, VBench, performance and long stability independent. Shared
+collection uses this backend for three current-run reference/candidate starts;
+pytest owns source selection, server restarts, cleanup, CV and 5% relative
+performance checks. Twelve FPS remains a reported SLO basis, not a new absolute
+acceptance gate. Long stability retains two instrumented candidate-only
+600-chunk sessions and does not enter the speed samples.
+
+CPU tests under `tests/benchmarks/test_lingbot_world_*.py` exercise metric math,
+real scripted WebSocket transport, argument compatibility, incomplete data and
+consumer independence. These checks do not establish real-model accuracy,
+speed or stability; matching-source native execution remains necessary.

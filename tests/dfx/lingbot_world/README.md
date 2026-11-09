@@ -31,13 +31,21 @@ candidate on the same runtime, deployment and locked inputs. The reference is
 versions. Three independent starts alternate reference/candidate ordering.
 The profiles retain the existing 40-chunk cases, warmup exclusions, frame size,
 seeds, camera trajectories and measured-session counts. NPU pairs may be split
-across three jobs to respect existing job deadlines; the aggregate only checks
-and assembles the recorded inputs. It never judges semantic acceptance.
+across three jobs to respect existing job deadlines; each uses the same
+realtime-video backend with seven measured sessions per case and one
+eight-chunk warmup. The aggregate only checks and assembles the recorded inputs.
+It never judges semantic acceptance. Selected-source CWD and PYTHONPATH retain
+the NPU compiler paths, and the profile's one CPU thread per worker remains in
+the server environment.
 
-Each arm writes `precision.npz` and, per case, `benchmark.json` and
-`rollout.mp4`. The manifest records source, profile, deployment, runtime and
-artifact hashes. Lossless benchmark-local remuxing preserves encoded packets
-and timestamps; it does not modify the product media implementation.
+Collection calls the same `vllm bench serve --omni` realtime-video lifecycle
+for each case. Each arm writes `precision.npz` and, per case, canonical
+`serve-result.json`, its source-bound `benchmark.json` domain projection, and
+`rollout.mp4`. The projection preserves the existing independent-judgment
+contract; it does not schedule requests or recompute a second benchmark. The
+manifest records source, profile, deployment, runtime and artifact hashes.
+Lossless packaged realtime-video remuxing preserves encoded packets and
+timestamps; it does not modify the product media implementation.
 
 Performance recomputes metrics from raw chunk arrivals. The first six chunks
 and the terminal chunk do not enter steady cadence metrics; warmup sessions do

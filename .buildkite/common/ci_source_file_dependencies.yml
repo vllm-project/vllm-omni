@@ -237,6 +237,13 @@ x-lingbot-world: &lingbot_world
 source_file_dependencies:
   lingbot_world_regression:
     - benchmarks/lingbot_world/
+    - vllm_omni/benchmarks/realtime_video/
+    - vllm_omni/benchmarks/serve.py
+    - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/entrypoints/cli/benchmark/cli_args.py
+    - vllm_omni/entrypoints/cli/benchmark/serve.py
+    - tests/benchmarks/test_realtime_video_serve.py
+    - tests/benchmarks/test_serve_cli.py
     - tests/diffusion/models/lingbot_world/
     - tests/dfx/lingbot_world/
     - tests/benchmarks/test_lingbot_world_

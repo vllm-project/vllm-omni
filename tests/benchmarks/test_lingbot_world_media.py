@@ -9,7 +9,7 @@ import av
 import numpy as np
 import pytest
 
-from benchmarks.lingbot_world.media import finalize_streaming_video_bytes
+from vllm_omni.benchmarks.realtime_video.media import finalize_streaming_video_bytes
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

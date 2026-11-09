@@ -497,6 +497,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 _OMNI_BENCH_DATASET_CHOICES = (
+    "realtime-video",
     "daily-omni",
     "omniinteract",
     "omni-duplex-eval",
@@ -525,7 +526,7 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
             if action.dest == "backend" and action.choices is not None:
                 extra = [
                     choice
-                    for choice in ("openai-image-edits-omni", "openai-realtime-chat")
+                    for choice in ("openai-image-edits-omni", "openai-realtime-chat", "realtime-video")
                     if choice not in action.choices
                 ]
                 if extra:
@@ -580,6 +581,84 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
             )
 
 
+def add_realtime_video_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Protocol options; rollout count and output files use the shared CLI."""
+    from vllm_omni.benchmarks.realtime_video.workload import CAMERA_PATTERNS
+
+    group = parser.add_argument_group("Realtime Video Benchmark Options")
+    group.add_argument("--realtime-video-image", help="First frame: local path, HTTP URL or data URL.")
+    group.add_argument("--realtime-video-prompt")
+    group.add_argument("--realtime-video-negative-prompt")
+    group.add_argument("--realtime-video-num-chunks", type=_positive_int, default=16)
+    group.add_argument("--realtime-video-camera-pattern", choices=CAMERA_PATTERNS, default="forward")
+    for name in ("width", "height", "fps"):
+        group.add_argument(f"--realtime-video-{name}", type=_positive_int)
+    group.add_argument("--realtime-video-seed", type=int)
+    group.add_argument("--realtime-video-flow-shift", type=float)
+    group.add_argument("--realtime-video-warmup-num-chunks", type=_positive_int)
+    group.add_argument("--realtime-video-warmup-chunks", type=int, default=6)
+    group.add_argument("--realtime-video-chunk-slo-ms", type=_positive_finite_float)
+    group.add_argument("--realtime-video-target-fps", type=_positive_finite_float)
+    group.add_argument("--realtime-video-playback-buffer-chunks", type=_positive_int, default=1)
+    group.add_argument("--realtime-video-first-chunk-timeout", type=_positive_finite_float, default=900.0)
+    group.add_argument("--realtime-video-chunk-timeout", type=_positive_finite_float, default=300.0)
+    group.add_argument("--realtime-video-ping-interval", type=float, default=20.0)
+    group.add_argument("--realtime-video-save-video", help="Save the last measured rollout without re-encoding.")
+    group.add_argument("--realtime-video-print-chunks", action="store_true")
+
+
+def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
+    from vllm_omni.benchmarks.realtime_video.workload import DEFAULT_MODEL
+
+    explicit = getattr(args, "explicit_keys", ())
+    for name, expected in (
+        ("backend", "realtime-video"),
+        ("dataset_name", "realtime-video"),
+        ("endpoint", "/v1/realtime/video"),
+    ):
+        if name in explicit and getattr(args, name) != expected:
+            raise ValueError(f"realtime-video requires --{name.replace('_', '-')} {expected}")
+        setattr(args, name, expected)
+    if "num_prompts" not in explicit:
+        args.num_prompts = 1
+    if args.num_prompts < 1 or args.num_warmups < 0:
+        raise ValueError("realtime-video requires positive --num-prompts and non-negative --num-warmups")
+    if args.max_concurrency is None:
+        args.max_concurrency = 1
+    if args.max_concurrency != 1 or args.request_rate != math.inf or args.burstiness != 1.0:
+        raise ValueError("realtime-video requires --max-concurrency 1 --request-rate inf --burstiness 1")
+    if args.self_timed is not None or args.ramp_up_strategy is not None or args.probe_request_rate != 0:
+        raise ValueError("realtime-video does not support self-timed, ramp-up or probe traffic")
+    for name in (
+        "profile",
+        "plot_timeline",
+        "plot_dataset_stats",
+        "ignore_eos",
+        "lora_modules",
+        "goodput",
+        "logprobs",
+        "tokenizer",
+        "extra_body",
+    ):
+        if getattr(args, name, None):
+            raise ValueError(f"realtime-video does not support --{name.replace('_', '-')}")
+    if "ready_check_timeout_sec" in explicit and args.ready_check_timeout_sec != 0:
+        raise ValueError("realtime-video requires --ready-check-timeout-sec 0; use explicit warmups")
+    if args.realtime_video_warmup_chunks < 0:
+        raise ValueError("--realtime-video-warmup-chunks must be non-negative")
+    if not math.isfinite(args.realtime_video_ping_interval) or args.realtime_video_ping_interval < 0:
+        raise ValueError("--realtime-video-ping-interval must be finite and non-negative")
+    args.skip_tokenizer_init = True
+    args.ready_check_timeout_sec = 0
+    if args.model is None:
+        args.model = DEFAULT_MODEL
+    if args.base_url is not None:
+        base_url = args.base_url.rstrip("/")
+        if base_url.endswith(args.endpoint):
+            base_url = base_url[: -len(args.endpoint)]
+        args.base_url = base_url.replace("wss://", "https://", 1).replace("ws://", "http://", 1)
+
+
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
@@ -589,10 +668,13 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
+    add_realtime_video_cli_args(parser)
 
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "backend", None) == "realtime-video" or getattr(args, "dataset_name", None) == "realtime-video":
+        _preprocess_realtime_video_args(args)
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
         if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
             raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")

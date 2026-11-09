@@ -21,7 +21,7 @@ from benchmarks.lingbot_world.regression import (
     read_json,
     verify_environment,
 )
-from benchmarks.lingbot_world.workload import ChunkRecord, compute_metrics
+from vllm_omni.benchmarks.realtime_video.workload import ChunkRecord, compute_metrics
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -175,14 +175,14 @@ def test_transient_noise_multiplier_is_finite_nonnegative_and_bounded(sigma):
 
 
 def test_regression_rejects_a_changed_playback_buffer():
-    from tests.dfx.lingbot_world.runner import _measured_metrics
+    from vllm_omni.benchmarks.realtime_video.metrics import measured_metrics
 
     doc = document()
     doc["sessions"][0]["request_id"] = "test-session"
     doc["sessions"][0]["session_index"] = 0
     doc["config"]["playback_buffer_chunks"] = 2
     with pytest.raises(RegressionError, match="one-chunk playback buffer"):
-        _measured_metrics(doc, {"num_chunks": 40, "min_steady_samples": 30, "target_fps": 12, "warmup_chunks": 6})
+        measured_metrics(doc, {"num_chunks": 40, "min_steady_samples": 30, "target_fps": 12, "warmup_chunks": 6})
 
 
 @pytest.mark.parametrize(

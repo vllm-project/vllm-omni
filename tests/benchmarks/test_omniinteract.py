@@ -1439,7 +1439,7 @@ def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, mo
             await asyncio.to_thread(release.wait)
         return {"total": 1}
 
-    monkeypatch.setattr(benchmark_serve, "main_async", fake_main_async)
+    monkeypatch.setattr(benchmark_serve, "vllm_main_async", fake_main_async)
     args = argparse.Namespace(dataset_name="omniinteract", omniinteract_output_dir=tmp_path, extra_body=None)
     with ThreadPoolExecutor(2) as executor:
         first = executor.submit(benchmark_serve.main, args)

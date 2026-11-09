@@ -27,17 +27,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarks.lingbot_world.benchmark_lingbot_world_realtime import (
+from vllm_omni.benchmarks.realtime_video.client import (
     BenchmarkError,
-    build_workload,
-    print_report,
-    endpoint_url,
-    parse_args,
     resolve_image_reference,
     run_session,
+)
+from vllm_omni.benchmarks.realtime_video.compat import (
+    build_workload,
+    endpoint_url,
+    parse_args,
     run_benchmark,
 )
-from benchmarks.lingbot_world.workload import (
+from vllm_omni.benchmarks.realtime_video.workload import (
     DEFAULT_WARMUP_CHUNKS,
     FRAMES_PER_BLOCK,
     ChunkRecord,
@@ -407,7 +408,7 @@ def test_the_real_time_basis_is_independent_of_the_mux_label() -> None:
     assert at_16["video_rtf"] > at_12["video_rtf"]
     # Same wall clock, same bytes: only the basis moved.
     assert at_16["video_rtf"] / at_12["video_rtf"] == pytest.approx(16 / 12)
-    assert parse_args([]).target_fps is None, "default defers to the workload fps"
+    assert parse_args([]).realtime_video_target_fps is None, "default defers to the workload fps"
 
 
 # --------------------------------------------------------------------------- #
@@ -564,6 +565,8 @@ def test_short_warmup_does_not_shorten_measured_rollout(tmp_path: Path, warmup_s
         assert result["metrics"]["total_frames"] == 117
         assert result["metrics"]["ttfc_ms"] == result["sessions"][0]["metrics"]["ttfc_ms"]
         assert json.loads((tmp_path / "benchmark.json").read_text())["warmups"] == result["warmups"]
+        common = json.loads((tmp_path / "benchmark-serve-result.json").read_text())
+        assert common["realtime_video"] == result
 
     _run(scenario())
 
@@ -664,14 +667,17 @@ def test_failed_benchmark_retains_received_chunks(tmp_path: Path, phase: str, fa
                 "short": "Expected 4 chunks",
                 "server_error": "injected engine failure",
             }[failure]
-            with pytest.raises(BenchmarkError, match=message) as raised:
+            with pytest.raises(BenchmarkError, match=message):
                 await run_benchmark(args)
         assert not output.exists(), "an incomplete run must not produce a successful benchmark"
-        trace = json.loads((tmp_path / f"benchmark-{phase}-0-failure.json").read_text())
-        assert trace["complete"] is False
-        assert trace["error"] == {"type": "BenchmarkError", "message": str(raised.value)}
+        # The common writer retains failed raw observations; compatibility
+        # must not publish that document as a successful legacy measurement.
+        shared = json.loads((tmp_path / "benchmark-serve-result.json").read_text())["realtime_video"]
+        assert shared["passed"] is False
+        trace = shared["warmups" if phase == "warmup" else "sessions"][0]
+        assert trace["success"] is False and message in trace["error"]
         assert trace["request_id"] == "req-1"
-        assert trace["expected_chunks"] == 4
+        assert shared["workload"]["num_chunks"] == 4
         assert len(trace["chunks"]) == 1
         assert trace["chunks"][0]["index"] == 0
         assert trace["chunks"][0]["byte_length"] == 100
@@ -1005,12 +1011,6 @@ def test_builtin_workload_keeps_default_flow_shift() -> None:
     assert build_workload(parse_args(["--image", _IMAGE])).flow_shift == 5.0
 
 
-def test_short_sample_report_qualifies_tail_percentiles(capsys) -> None:
-    metrics = compute_metrics(_records([1.0] * 16), fps=12)
-    print_report(metrics, workload=_workload(num_chunks=16), endpoint="ws://test", sessions=1, target_fps=12)
-    assert "not reliable tail estimates" in capsys.readouterr().out
-
-
 @pytest.fixture
 def benchmark_git_checkout(tmp_path) -> tuple[Path, str]:
     root = tmp_path / "benchmark-source"
@@ -1051,9 +1051,9 @@ def benchmark_git_checkout(tmp_path) -> tuple[Path, str]:
 
 
 def test_source_benchmark_records_its_own_git_revision(benchmark_git_checkout, tmp_path, monkeypatch) -> None:
-    from benchmarks.lingbot_world import benchmark_lingbot_world_realtime as realtime
+    from vllm_omni.benchmarks.realtime_video import client as realtime
 
     root, revision = benchmark_git_checkout
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(realtime, "REPO_ROOT", root)
-    assert realtime._git_revision() == revision
+    assert realtime.git_revision() == revision
