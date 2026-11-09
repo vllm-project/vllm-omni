@@ -74,6 +74,11 @@ def test_pinned_plan_rejects_invalid_storage(sizes: list[int], capacity: int) ->
 @pytest.mark.cpu
 def test_source_synchronization_targets_each_device(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
+
+    class TrackingStream:
+        def synchronize(self) -> None:
+            events.append("sync")
+
     monkeypatch.setattr(residency_module.current_omni_platform, "current_device", staticmethod(lambda: 7))
     monkeypatch.setattr(
         residency_module.current_omni_platform,
@@ -82,8 +87,8 @@ def test_source_synchronization_targets_each_device(monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setattr(
         residency_module.current_omni_platform,
-        "synchronize",
-        staticmethod(lambda: events.append("sync")),
+        "current_stream",
+        staticmethod(TrackingStream),
     )
 
     residency_module._synchronize_source_devices({torch.device("cuda:1"), torch.device("cuda:0")})
@@ -173,8 +178,16 @@ def test_packed_copy_failure_synchronizes_without_rebinding(monkeypatch: pytest.
     module = _aliased_module(device)
     expected = {name: tensor.detach().clone() for name, tensor in module.named_parameters()}
     original_copy = torch.Tensor.copy_
-    original_synchronize = current_omni_platform.synchronize
+    original_current_stream = current_omni_platform.current_stream
     events: list[str] = []
+
+    class TrackingStream:
+        def __init__(self):
+            self._stream = original_current_stream()
+
+        def synchronize(self) -> None:
+            self._stream.synchronize()
+            events.append("synchronized")
 
     def fail_second_copy(target, source, *args, **kwargs):
         if target.device.type == "cpu" and target.is_pinned() and source.device.type == "cuda":
@@ -183,12 +196,8 @@ def test_packed_copy_failure_synchronizes_without_rebinding(monkeypatch: pytest.
                 raise RuntimeError("injected second pinned copy failure")
         return original_copy(target, source, *args, **kwargs)
 
-    def track_synchronize() -> None:
-        original_synchronize()
-        events.append("synchronized")
-
     monkeypatch.setattr(torch.Tensor, "copy_", fail_second_copy)
-    monkeypatch.setattr(current_omni_platform, "synchronize", staticmethod(track_synchronize))
+    monkeypatch.setattr(current_omni_platform, "current_stream", staticmethod(TrackingStream))
     with pytest.raises(RuntimeError, match="injected second pinned copy failure"):
         residency_module._move_module_to_packed_pinned_cpu(module, non_blocking=True)
 

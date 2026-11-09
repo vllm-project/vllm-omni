@@ -246,7 +246,7 @@ def _synchronize_source_devices(source_devices: Iterable[torch.device]) -> None:
     try:
         for source_device in devices:
             current_omni_platform.set_device(source_device)
-            current_omni_platform.synchronize()
+            current_omni_platform.current_stream().synchronize()
     finally:
         current_omni_platform.set_device(torch.device(devices[0].type, previous_device))
 
