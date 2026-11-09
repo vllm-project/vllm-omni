@@ -1249,6 +1249,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         batch_size: int,
         frames: int,
         dtype: torch.dtype,
+        frequency_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if timestep.ndim == 0:
             if batch_size != 1:
@@ -1264,7 +1265,14 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         else:
             raise ValueError("timestep must be scalar, rank 1 [batch], or rank 2 [batch, frames].")
 
-        frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
+        if frequency_embedding is None:
+            frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
+        elif (
+            frequency_embedding.shape != (batch_size * frames, self.config.freq_dim)
+            or frequency_embedding.device != timestep.device
+            or frequency_embedding.dtype != dtype
+        ):
+            raise ValueError("Prepared timestep frequencies must match batch/frames, freq_dim, device and dtype")
         timestep_embedding = self.time_embedding(frequency_embedding).unflatten(0, (batch_size, frames))
         timestep_projection = self.time_projection(timestep_embedding).unflatten(2, (6, self.dim))
         return timestep_embedding, timestep_projection
@@ -1303,6 +1311,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         start_frame: int,
         update_cache: bool,
         camera_modulation_cache: CameraModulationCache | None = None,
+        timestep_frequency_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
@@ -1365,6 +1374,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             batch_size=batch_size,
             frames=patched_frames,
             dtype=hidden_states.dtype,
+            frequency_embedding=timestep_frequency_embedding,
         )
         projected_text = (
             self.text_embedding(encoder_hidden_states)

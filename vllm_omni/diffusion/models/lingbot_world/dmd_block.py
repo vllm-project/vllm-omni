@@ -27,6 +27,7 @@ from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CameraModulationCache,
     LingBotAttentionCache,
     LingBotTransformerCache,
+    _sinusoidal_embedding,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.first_block import (
     FirstBlockKVKey,
@@ -67,10 +68,20 @@ class LingBotDMDBlockRunner:
         enforce_eager: bool,
         reuse_last_step_kv: bool = False,
         first_block_kv_cpu_limit_bytes: int = 0,
+        npu_host_timestep: bool = False,
     ) -> None:
         self.transformer = transformer
         self.device = device
         self.enforce_eager = enforce_eager
+        if type(npu_host_timestep) is not bool:
+            raise ValueError("npu_host_timestep must be boolean")
+        if npu_host_timestep and (not enforce_eager or device.type not in ("npu", "privateuseone")):
+            raise ValueError("NPU host timestep frequencies require eager NPU execution")
+        self._host_timestep_cache = None
+        if npu_host_timestep:
+            from .npu_timestep import HostTimestepFrequencyCache
+
+            self._host_timestep_cache = HostTimestepFrequencyCache(_sinusoidal_embedding)
         # Experimental approximation: cache x_t/t_last features instead of x0/t=0.
         self.reuse_last_step_kv = reuse_last_step_kv
         self.first_block_kv = (
@@ -83,6 +94,19 @@ class LingBotDMDBlockRunner:
         self.first_block_projection_revision += 1
         if self.first_block_kv is not None:
             self.first_block_kv.invalidate()
+
+    def _timestep_frequency_kwargs(self, value: float, condition: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self._host_timestep_cache is None:
+            return {}
+        frequency = self._host_timestep_cache.get(
+            value,
+            dim=self.transformer.config.freq_dim,
+            batch_size=condition.shape[0],
+            frames=condition.shape[2] // self.transformer.config.patch_size[0],
+            device=self.device,
+            dtype=condition.dtype,
+        )
+        return {"timestep_frequency_embedding": frequency}
 
     # ── cache selection ──────────────────────────────────────────────────
 
@@ -162,6 +186,7 @@ class LingBotDMDBlockRunner:
             start_frame=start_frame,
             update_cache=commit_probe,
             camera_modulation_cache=camera_cache,
+            **self._timestep_frequency_kwargs(timestep_value, condition),
         )
         if flow_prediction.shape != current_latents.shape:
             raise RuntimeError(
@@ -267,6 +292,7 @@ class LingBotDMDBlockRunner:
             start_frame=start_frame,
             update_cache=True,
             camera_modulation_cache=camera_cache,
+            **self._timestep_frequency_kwargs(0.0, condition),
         )
         if ar is not None:
             ar.state.commit_paged_context(ar.branch)

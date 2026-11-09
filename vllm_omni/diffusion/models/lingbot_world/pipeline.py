@@ -617,6 +617,9 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("lingbot_cache_block_conditions must be a boolean")
         npu_host_lengths = model_config.get("lingbot_npu_host_lengths", False)
         npu_fused_rmsnorm = model_config.get("lingbot_npu_fused_rmsnorm", False)
+        self._lingbot_npu_host_timestep = model_config.get("lingbot_npu_host_timestep", False)
+        if type(self._lingbot_npu_host_timestep) is not bool:
+            raise ValueError("lingbot_npu_host_timestep must be boolean")
         if type(npu_host_lengths) is not bool or type(npu_fused_rmsnorm) is not bool:
             raise ValueError("lingbot_npu_host_lengths and lingbot_npu_fused_rmsnorm must be booleans")
         from vllm_omni.diffusion.models.lingbot_world.pixel_output import validate_mode
@@ -639,6 +642,10 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
         self.device = get_local_device()
+        if self._lingbot_npu_host_timestep and (
+            not od_config.enforce_eager or self.device.type not in ("npu", "privateuseone")
+        ):
+            raise ValueError("lingbot_npu_host_timestep requires eager NPU execution")
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -1481,6 +1488,7 @@ class LingBotWorldCausalDMDPipeline(
                 enforce_eager=bool(self.od_config.enforce_eager),
                 reuse_last_step_kv=self._reuse_last_step_kv,
                 first_block_kv_cpu_limit_bytes=self._first_block_kv_cpu_limit_bytes,
+                npu_host_timestep=getattr(self, "_lingbot_npu_host_timestep", False),
             )
             self._dmd_block_runner = runner
         return runner
