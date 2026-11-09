@@ -376,11 +376,16 @@ software versions are retained. A failure or skip invalidates the benchmark.
 ### Other CPU: two-shard trial
 
 READY/MERGE split Other into two duration-weighted shards using
-`.buildkite/amd/cpu-timings/other-v1.json`, generated from all 8,910 selected
-nodes in the successful Other job in build #15582. Setup + call + teardown
-weights estimate 10m08s per shard before collection and job overhead.
-This is a planning estimate, not a measured speedup. A third shard should be
-considered only after measuring the two-shard p95 and queue/agent cost.
+`.buildkite/amd/cpu-timings/other-v1.json`, generated from all 8,954 selected
+nodes in the successful two-way target READY trial in
+[build #15655](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15655), merge
+commit `ae8a431e3e53b102b77b2e7ebdd2ad3dea31fe5f`. The first trial selected
+every live node exactly once with no test, collection, or artifact failures;
+both workers launched with seven-second queue delays and finished in 12m04s and
+14m50s. Repacking those measured setup + call + teardown totals estimates
+12m17s per shard before collection and job overhead. This remains a planning
+estimate until the refreshed profile completes target CI. A third shard should
+be considered only after measuring the two-shard p95 and queue/agent cost.
 
 The existing `core_model and cpu` expression and all five `--ignore` arguments
 are retained. Whole modules stay together, including expensive subprocess and
