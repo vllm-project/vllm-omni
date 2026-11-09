@@ -28,7 +28,6 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConf
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     ToolCallAbandonReason,
-    abandoned_tool_call_notice,
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
@@ -362,6 +361,15 @@ class QwenDataPlane(DuplexDataPlane):
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
+    #: A suppressed repeat follows a call that already got its notice here.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.EPOCH_CANCELLED,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+        }
+    )
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
 
@@ -877,34 +885,20 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         *,
         history_len: int,
     ) -> dict[str, object] | None:
-        """Show the model that a call ended, until one response stores its text.
+        """Mark the notice pair, so it waits for the next user turn.
 
-        The notice is shaped like an accepted pair, so it shares that pair's
-        window and response bookkeeping. A suppressed repeat has no anchor, and
-        every abandoned call already produced a notice here.
+        The pair otherwise matches an accepted result, so it shares that
+        result's window and response bookkeeping and is dropped once one
+        response stores its text. The mark is set here, never from a client item.
         """
-        del config
-        origin = abandonment.origin
-        reason = abandonment.reason
-        if reason is ToolCallAbandonReason.SUPPRESSED or origin.name is None or origin.arguments is None:
+        updated = super().runtime_config_for_abandoned_tool_call(config, current, abandonment, history_len=history_len)
+        if updated is None:
             return None
-        expired_ids = current.get("qwen_expired_call_ids")
-        if isinstance(expired_ids, list) and origin.call_id in expired_ids:
-            return None
-        updated = dict(current)
-        turn = _tool_turn(
-            _anchored_history_len(current, {"call_id": origin.call_id}, history_len),
-            origin.call_id,
-            origin.name,
-            origin.arguments,
-            abandoned_tool_call_notice(reason),
-        )
-        updated["qwen_tool_turns"] = [*_tool_turns(current, "qwen_tool_turns"), {**turn, "notice": True}]
-        anchors = updated.pop("qwen_call_anchors", None)
-        if isinstance(anchors, Mapping):
-            kept = {key: value for key, value in anchors.items() if key != origin.call_id}
-            if kept:
-                updated["qwen_call_anchors"] = kept
+        call_id = abandonment.origin.call_id
+        updated["qwen_tool_turns"] = [
+            {**turn, "notice": True} if _tool_call_id(turn) == call_id else turn
+            for turn in _tool_turns(updated, "qwen_tool_turns")
+        ]
         return updated
 
     def configure_sampling_params(self, *, runtime_config, defaults):

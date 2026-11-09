@@ -894,14 +894,32 @@ they settle as `cancelled`. With `keep`, they stay pending and can still be
 answered, so only the deadline, `function_call.cancel` or close ends them. A result
 already accepted follows the model's existing retirement rules either way.
 
-**Discovering what a model supports.** `capabilities` reports these fields:
+**Discovering what a model supports.** `capabilities` reports these fields. The
+model sets them; a client only reads them.
 
-| Field | Values |
-| --- | --- |
-| `tool_mode` | `none`, `declared` (client-defined tools) or `delegate_only` (only the model's `delegate` function) |
-| `function_call_output_continuation` | What turns an accepted result into output: `client_response_create`, `automatic`, `next_observation`, or `none` |
-| `max_tools` | Most tools one session may declare, or `null` for no model limit. More is refused with `too_many_tools`. |
-| `clears_function_call_block_on_user_commit` | Whether `function_call_retry_policy: user_turn` can lift a block |
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `tool_mode` | string | `none` | Which tools a session may declare |
+| `function_call_output_continuation` | string | `none` | What the client does after `function_call_output` for the model to use the result |
+| `max_tools` | integer or `null` | `0` | Most tools one session may declare, or `null` for no model limit. More is refused with `too_many_tools`. |
+| `clears_function_call_block_on_user_commit` | boolean | `false` | Whether a committed input is a user turn, so `function_call_retry_policy: user_turn` can lift a block. When it is `false`, the session applies `never` and reports that as `function_call_retry_policy`. |
+
+`tool_mode` values:
+
+| Value | Meaning | Models |
+| --- | --- | --- |
+| `none` | The model has no tool support. Non-empty `tools` is refused with `tools_unsupported`. | MiniCPM-o, PersonaPlex, Aura |
+| `declared` | The client defines the tools. The model reads their name, description and parameters in its prompt and calls them by name. | Qwen3-Omni, Nemotron VoiceChat |
+| `delegate_only` | The model has one built-in function, `delegate`, which hands a plain-language question to the application. Other tools are refused. | JoyAI-VL-Interaction |
+
+`function_call_output_continuation` values:
+
+| Value | What the client does after `function_call_output` | Models |
+| --- | --- | --- |
+| `client_response_create` | Send `response.create`. The model is turn-based, and the result is used in the response that event opens. Without it, the result waits for the next user turn. | Qwen3-Omni |
+| `automatic` | Nothing more. The result is fed into a later frame of the running request, and the model continues by itself. | Nemotron VoiceChat |
+| `next_observation` | Nothing more. The next camera commit carries the result. To have it spoken, send a short user turn such as "Answer now with the result you received." | JoyAI-VL-Interaction |
+| `none` | Not applicable: the model has no tool support. | MiniCPM-o, PersonaPlex, Aura |
 
 Non-empty `tools` on a `none` model is refused with `tools_unsupported`.
 `tool_choice` other than `auto` is refused with `unsupported_tool_choice`, because

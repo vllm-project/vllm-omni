@@ -22,12 +22,15 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
+from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
     DuplexOutputDecision,
+    ToolCallAbandonReason,
+    abandoned_tool_call_notice,
 )
 
 if TYPE_CHECKING:
@@ -36,6 +39,9 @@ if TYPE_CHECKING:
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment, ToolCallOrigin, ToolCallSettlement
+
+
+logger = init_logger(__name__)
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -465,6 +471,9 @@ class DuplexModelPlugin(ABC):
     supports_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: Reasons this model can show a notice for. The notice goes through the
+    #: model's own ``runtime_config_for_function_output``.
+    abandoned_tool_call_reasons: frozenset[ToolCallAbandonReason] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -900,20 +909,36 @@ class DuplexModelPlugin(ABC):
 
         Called for a timed-out or cancelled call still in the current epoch,
         and for a repeat the session refused to expose (``suppressed``, which
-        has no ledger record). Show ``abandoned_tool_call_notice``, never client
-        text. A plugin may skip a reason it cannot deliver, so a suppressed
-        repeat can be the first notice the model gets for an epoch-cancelled
-        call. Cached metadata cleanup belongs in ``on_tool_call_settled`` and
-        runs even if an epoch changed. Returning ``None`` requests no change; it
-        is not an acknowledgement that the worker consumed anything. The notice
-        must not reset the session or retire another call's queued result.
+        has no ledger record). For a reason in ``abandoned_tool_call_reasons``,
+        the fixed ``abandoned_tool_call_notice`` goes through the model's own
+        result path, as if the client had returned it; it never carries client
+        text. A refusal on that path skips the notice, because the session
+        already refuses a repeat of the call. So a suppressed repeat can be the
+        first notice the model gets for an epoch-cancelled call.
 
-        Raising closes the session: the owner cannot safely retry partial
-        model/bookkeeping effects. Closed or superseded decisions are skipped.
-        Accepted calls never enter this hook.
+        Cached metadata cleanup belongs in ``on_tool_call_settled`` and runs
+        even if an epoch changed. Returning ``None`` requests no change; it is
+        not an acknowledgement that the worker consumed anything. Any other
+        exception closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Accepted calls never enter this hook.
         """
-        del config, current, abandonment, history_len
-        return None
+        if abandonment.reason not in self.abandoned_tool_call_reasons:
+            return None
+        origin = abandonment.origin
+        item: dict[str, object] = {
+            "type": "function_call_output",
+            "call_id": origin.call_id,
+            "output": abandoned_tool_call_notice(abandonment.reason),
+        }
+        if origin.name is not None:
+            item["name"] = origin.name
+        if origin.arguments is not None:
+            item["arguments"] = origin.arguments
+        try:
+            return self.runtime_config_for_function_output(config, current, item, history_len=history_len)
+        except DuplexRuntimeConfigError as exc:
+            logger.warning("Skipping the notice for abandoned function call %s: %s", origin.call_id, exc)
+            return None
 
     def runtime_config_after_model_output(
         self,

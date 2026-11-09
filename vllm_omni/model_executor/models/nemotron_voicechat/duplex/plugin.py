@@ -34,7 +34,6 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
     ToolCallAbandonReason,
-    abandoned_tool_call_notice,
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
@@ -62,7 +61,6 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
 
-    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are an AI voice assistant developed by NVIDIA. "
@@ -239,6 +237,16 @@ def _positive_int(value: object, *, name: str) -> int:
 
 class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
     """Nemotron-owned sampling policy, append planning, session state and output projection."""
+
+    #: A batch belongs to one request, and an epoch cancellation replaced it.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
 
     plugin_id = "nemotron_voicechat"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
@@ -493,29 +501,6 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
                 code="invalid_function_call_output",
             )
         return self._queue_function_response(current, output)
-
-    def runtime_config_for_abandoned_tool_call(
-        self,
-        config: DuplexSessionConfig,
-        current: Mapping[str, object],
-        abandonment: ToolCallAbandonment,
-        *,
-        history_len: int,
-    ) -> dict[str, object] | None:
-        """Close the call on the function channel of the open request.
-
-        A batch belongs to one request, and an epoch cancellation replaced that
-        request. A full queue skips the notice: raising here closes the session,
-        and the session still refuses a repeat of this call.
-        """
-        del config, history_len
-        if abandonment.reason is ToolCallAbandonReason.EPOCH_CANCELLED:
-            return None
-        try:
-            return self._queue_function_response(current, abandoned_tool_call_notice(abandonment.reason))
-        except NemotronVoiceChatClientRuntimeConfigError as exc:
-            logger.warning("Skipping notice for abandoned tool call %s: %s", abandonment.origin.call_id, exc)
-            return None
 
     def _queue_function_response(self, current: Mapping[str, object], output: str) -> dict[str, object]:
         """Tokenize one function-channel response and queue it for a later frame."""

@@ -28,7 +28,6 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
     ToolCallAbandonReason,
-    abandoned_tool_call_notice,
 )
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
@@ -93,10 +92,18 @@ from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
-    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment
-
 
 class JoyAIDuplexPlugin(DuplexModelPlugin):
+    #: A cancelled turn's question must not resurface on its own. If the model
+    #: asks it again, that repeat is current, and the refusal is the notice.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
     plugin_id = "joyai-vl-interaction"
     supports_auxiliary_requests = True
     joyai_stage_id = 0
@@ -1549,36 +1556,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return accept_result(current, item, accepted_at=history_len if isinstance(history_len, int) else 0)
         except ValueError as exc:
             raise DuplexRuntimeConfigError(str(exc), code="invalid_function_call_output") from exc
-
-    def runtime_config_for_abandoned_tool_call(
-        self,
-        config: DuplexSessionConfig,
-        current: Mapping[str, object],
-        abandonment: ToolCallAbandonment,
-        *,
-        history_len: int,
-    ) -> dict[str, object] | None:
-        """Carry a fixed notice to the next observation, like a delegated result.
-
-        A cancelled turn's question must not resurface on its own. If the model
-        asks it again, that repeat is current, and the refusal is the notice.
-        """
-        del config
-        reason = abandonment.reason
-        if reason is ToolCallAbandonReason.EPOCH_CANCELLED:
-            return None
-        origin = abandonment.origin
-        item = {
-            "call_id": origin.call_id,
-            "name": origin.name,
-            "arguments": origin.arguments,
-            "output": abandoned_tool_call_notice(reason),
-        }
-        try:
-            return accept_result(current, item, accepted_at=history_len)
-        except ValueError:
-            # A call without a usable question has nothing to show the model.
-            return None
 
     def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
         """Book the results this accepted prompt displays."""

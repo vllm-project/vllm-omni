@@ -134,6 +134,7 @@ async def test_missing_context_refusals_preserve_the_original_deadline(monkeypat
             assert "name" not in prepared and "arguments" not in prepared
             raise DuplexRuntimeConfigError("session-owned metadata is required", code="missing_call_context")
 
+        real_convert = h.runner.plugin.runtime_config_for_function_output
         monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", require_context)
         for index in range(2):
             h.clock.advance(1.0)
@@ -146,6 +147,8 @@ async def test_missing_context_refusals_preserve_the_original_deadline(monkeypat
             assert errors(events)[0].related_event_id == f"missing-context-{index}"
             assert call.state is ToolCallState.PENDING and call.deadline == original_deadline
             assert generation(h) == 0
+        # Timeout notices use the plugin's own result path, so give it back.
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", real_convert)
         h.clock.advance(TIMEOUT_S - 2.0)
         h.scheduler.fire_all()
         await h.settle()
