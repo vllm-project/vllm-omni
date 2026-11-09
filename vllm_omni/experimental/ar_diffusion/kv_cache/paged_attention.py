@@ -810,9 +810,9 @@ def _npu_paged_attention(
             raise ValueError("FP8 FIA mode must be C8V16_TILING512")
         from vllm_omni.diffusion.models.lingbot_world.npu_fp8_fia import eagle_fp8_fia
 
-        return eagle_fp8_fia(
-            query_flat, gathered_k[:kv_len], gathered_v[:kv_len], scale=softmax_scale
-        ).reshape(query.shape)
+        return eagle_fp8_fia(query_flat, gathered_k[:kv_len], gathered_v[:kv_len], scale=softmax_scale).reshape(
+            query.shape
+        )
     out = torch_npu.npu_fusion_attention(
         query_flat.contiguous(),
         gathered_k[:kv_len].contiguous(),

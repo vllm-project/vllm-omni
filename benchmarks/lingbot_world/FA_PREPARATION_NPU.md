@@ -1,5 +1,9 @@
 # LingBot FA preparation: NPU investigation
 
+This note preserves the original local-operator investigation. For subsequent
+whole-model measurements and the curated implementation scope, see
+[NPU_OPTIMIZATIONS.md](NPU_OPTIMIZATIONS.md).
+
 The small operators before FA are not VAE normalization. Self-attention does
 QKV projection, across-head Q/K RMSNorm (5120 dimensions, not each 128-wide
 head), adjacent-pair Wan RoPE, QKV stacking, sequence/head all-to-all, KV slot
@@ -43,8 +47,8 @@ additional allocations. Concurrent inference was not requested.
   QKV projections/weights, not model-quality acceptance. This capability already
   exists behind `lingbot_npu_fused_rmsnorm`; do not duplicate it or call it exact.
 
-Raw scripts, JSON and independent write profiling are under
-`/mnt/share/y00958577/experiments/lingbot-fa-preparation-20261104/`.
+Raw scripts, JSON and independent write profiling were retained with the
+2026-11-04 operator experiment artifacts; they are not deployment dependencies.
 Preserve the 5120-wide norm, epsilon, FP32 gamma multiplication and BF16 boundary
 when attempting a larger norm/RoPE/pack fusion. HCCL communication itself cannot
 be removed by an elementwise kernel; specialize only the surrounding layouts.

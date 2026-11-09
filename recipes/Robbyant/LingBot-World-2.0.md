@@ -393,7 +393,10 @@ tested commit.
   latent chunks.
 - SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization methods other than online FP8,
   Cache-DiT, TeaCache, causal-pretrain, and the 1.3B checkpoint are not claimed.
-- No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
+- No AMD GPU or Intel GPU support is claimed. This branch includes opt-in
+  Ascend NPU optimizations with separate accuracy and validation limits; see
+  [the NPU optimization series](../../benchmarks/lingbot_world/NPU_OPTIMIZATIONS.md).
+  This does not establish upstream NPU production acceptance.
 
 ## References
 

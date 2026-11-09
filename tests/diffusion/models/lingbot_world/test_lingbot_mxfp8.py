@@ -41,5 +41,3 @@ def test_online_mxfp8_selects_only_attention_and_ffn(monkeypatch):
 def test_online_quant_rejects_non_mxfp8(mode):
     with pytest.raises(ValueError, match="mxfp8"):
         load("npu_quantization").online_mxfp8_config(mode, None, num_layers=40)
-
-

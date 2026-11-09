@@ -58,5 +58,3 @@ def test_vae_padding_mismatch_returns_reference_and_remembers_fallback(monkeypat
     for _ in range(2):
         torch.testing.assert_close(module.verified_spatial_forward(conv, x), conv(x), atol=0, rtol=0)
     assert len(calls) == 1
-
-
