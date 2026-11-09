@@ -63,10 +63,12 @@ def test_model_sampler_hook_returning_none_keeps_runner_samplers():
 
 def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatch):
     import vllm.v1.worker.gpu.model_runner as upstream
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     from vllm_omni.worker_v2 import omni_model_runner as module
 
     runner = object.__new__(module.OmniGPUModelRunner)
+    runner.jit_warmup_registry = JitWarmupRegistry(None)
     runner.vocab_size = 100
     runner.req_states = SimpleNamespace(vocab_size=100)
     runner.model_config = SimpleNamespace(model_arch_config=SimpleNamespace(vocab_size=100))

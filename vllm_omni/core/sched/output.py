@@ -93,8 +93,8 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]]
-    additional_information: dict[str, dict | None]
+    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
+    additional_information: dict[str, dict | None] = field(default_factory=dict)
 
 
 @dataclass

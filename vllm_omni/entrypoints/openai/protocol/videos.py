@@ -577,3 +577,26 @@ class VideoSegmentationResponse(BaseModel):
     fps: float | None = Field(None, description="Input frame rate, when the container reports one")
     objects: list[VideoSegmentationObject]
     frames: list[VideoSegmentationFrame]
+
+
+class VideoDepthResponse(BaseModel):
+    """Per-frame depth of a video, as a video and optionally as raw values."""
+
+    created: int = Field(..., description="Unix timestamp of when depth estimation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Depth map width in pixels (the input after the max_res bound)")
+    height: int = Field(..., description="Depth map height in pixels (the input after the max_res bound)")
+    num_frames: int
+    fps: float | None = Field(None, description="Input frame rate, when the container reports one")
+    metric: bool = Field(
+        ..., description="True: depth in meters. False: relative inverse depth (larger is nearer), unitless"
+    )
+    depth_min: float = Field(..., description="Smallest depth value over the whole video")
+    depth_max: float = Field(..., description="Largest depth value over the whole video")
+    video: str = Field(
+        ...,
+        description="Base64 H.264 MP4 of the depth, normalized by depth_min and depth_max over the whole video",
+    )
+    depth: str | None = Field(
+        None, description="Base64 NPZ with a float16 'depth' array [num_frames, height, width], if requested"
+    )
