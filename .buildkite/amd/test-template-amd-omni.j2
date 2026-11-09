@@ -77,6 +77,8 @@ steps:
         commands:
           - "bash .buildkite/amd/scripts/build-ci-image.sh"
         key: "amd-build"
+        concurrency: 1
+        concurrency_group: "vllm-omni-amd-image-publish"
         env:
           DOCKER_BUILDKIT: "1"
           PYTORCH_ROCM_ARCH: "gfx942"
