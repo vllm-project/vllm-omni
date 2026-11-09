@@ -8,9 +8,9 @@ import json
 import math
 import statistics
 import sys
-import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 

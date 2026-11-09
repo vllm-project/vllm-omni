@@ -43,6 +43,11 @@ def cpu_context() -> dict[str, object]:
         "v1_cpuset": "/sys/fs/cgroup/cpuset/cpuset.cpus",
         "v1_quota": "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
         "v1_period": "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+        "v1_memory_limit": "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "v1_memory_current": "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        "v1_memory_peak": "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+        "v1_memory_failcnt": "/sys/fs/cgroup/memory/memory.failcnt",
+        "v1_memory_oom_control": "/sys/fs/cgroup/memory/memory.oom_control",
         "load": "/proc/loadavg",
         "cpu_pressure": "/proc/pressure/cpu",
     }.items():

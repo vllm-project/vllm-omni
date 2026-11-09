@@ -304,6 +304,22 @@ fixture locality. Both jobs now emit phase, selection, CPU pressure and cgroup
 memory current/peak/limit/events artifacts under `artifacts/amd-cpu-suites/`.
 JUnit lives in each fresh run directory as `pytest.xml`.
 
+The π0 remapping fixture constructs the real full model hierarchy on `meta`,
+then allocates only the original vision/embedding target parameters on CPU,
+preserving tied aliases. The three remapping tests retain their original tensor
+shapes, payloads and assertions. They do not execute the unused backbone; the
+separate checkpoint/inference parity coverage is unchanged. Their shared mutable
+targets remain order-independent because each test loads a distinct constant.
+This avoids initializing unrelated full-network weights without shrinking the
+property under test. Reproduce the fixture check with the same dependencies as
+the reference benchmark:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
+  python -m pytest -q tests/diffusion/models/pi0/test_pi0_units.py \
+  -k 'remap' --durations=10
+```
+
 Reproduce the initial profile from the original artifact filenames:
 
 ```bash
