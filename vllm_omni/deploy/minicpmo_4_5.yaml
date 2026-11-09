@@ -1,7 +1,5 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# Keep MRv1 on other platforms; CUDA selects MRv2 below.
-model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -232,6 +230,9 @@ platforms:
           stop_token_ids: [1]
 
   npu:
+    # Run the three NPU stages on Model Runner v2 (see
+    # minicpmo_4_5_npu_mrv2_kstep.yaml for the K-step variant).
+    model_runner: v2
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is
