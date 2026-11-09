@@ -909,3 +909,60 @@ def test_encoder_stage_passes_degenerate_keep_steps(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(processor, "prepare_encoder_inputs", lambda *args, **kwargs: prepared)
     transformed = processor.prepare_encoder_prompt({"prompt": "p"}, [_local_sampling(keep_steps=4)])
     assert transformed["prompt"] == "p"
+
+
+def test_pinned_schedule_step_counts_diverge_between_intake_and_diffusion(monkeypatch: pytest.MonkeyPatch):
+    """The documented split-stage divergence, pinned as behaviour.
+
+    On a checkpoint whose distilled schedule pins 4 steps, ``keep_steps=4``
+    with ``num_inference_steps`` unspecified is a no-op for the diffusion
+    stage — the schedule resolver returns the pinned count and the degenerate
+    value normalizes away — while the split-stage intake, which only sees the
+    default step count of 50, conservatively rejects the same request before
+    the encoder stage runs. An explicit matching step count passes intake.
+    """
+    from vllm_omni.model_executor.stage_input_processors import minimax_h3 as processor
+    from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
+
+    # Diffusion side: the pinned schedule's own count (4) normalizes
+    # keep_steps=4 away before the pinned-schedule rejection is reached.
+    pipeline = _validation_pipeline()
+    pipeline._base_schedule_by_partition["ref2va"] = SimpleNamespace(
+        num_inference_steps=4, base_schedule=(1.0, 0.6, 0.3, 0.0)
+    )
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless", fps=24, extra_args={"task": "ref2va", "keep_steps": 4}
+    )
+    context = pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), sampling)
+    assert context["keep_steps"] is None
+    assert context["base_text_embeddings"] is None
+
+    # Intake side: only the default step count (50) is visible, so the same
+    # request looks like a switcher and is rejected at intake.
+    prepared = SimpleNamespace(
+        prompt="p",
+        images=[],
+        qwen_videos=[],
+        video_timestamps=[],
+        condition_labels=[],
+        media=SimpleNamespace(task="ref2va", to_mm_tensors=lambda: [], to_metadata=lambda: {}),
+    )
+    prepare_encoder_inputs = Mock(return_value=prepared)
+    monkeypatch.setattr(processor, "prepare_encoder_inputs", prepare_encoder_inputs)
+    intake_sampling = OmniDiffusionSamplingParams(
+        quality="lossless", fps=24, extra_args={"task": "ref2va", "keep_steps": 4}
+    )
+    with pytest.raises(OmniClientError, match="separate encoder stage"):
+        prepare_encoder_prompt({"prompt": "p"}, [intake_sampling])
+    prepare_encoder_inputs.assert_not_called()
+
+    # Contrast: an explicit matching step count passes the intake gate.
+    explicit = OmniDiffusionSamplingParams(
+        quality="lossless",
+        fps=24,
+        num_inference_steps=4,
+        extra_args={"task": "ref2va", "keep_steps": 4},
+    )
+    transformed = prepare_encoder_prompt({"prompt": "p"}, [explicit])
+    prepare_encoder_inputs.assert_called_once()
+    assert transformed["prompt"] == "p"
