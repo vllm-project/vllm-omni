@@ -1067,13 +1067,17 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
 
 
 @pytest.mark.parametrize("metadata_kind", ["dict", "serialized", "none"])
-def test_processed_stage_request_preserves_metadata_forms(metadata_kind):
+@pytest.mark.parametrize("buffer", [None, {"duplex": {"perf_chunk": [0, 1]}}])
+def test_processed_stage_request_preserves_metadata_forms(metadata_kind, buffer):
     orchestrator = object.__new__(Orchestrator)
     info = {"tts_language": "English"} if metadata_kind != "none" else None
     raw_info = serialize_additional_information(info) if metadata_kind == "serialized" else info
     request = _processed_request("metadata-forms", _sampling_params())
-    upgraded = orchestrator._upgrade_processed_stage_request(request, {"additional_information": raw_info})
+    upgraded = orchestrator._upgrade_processed_stage_request(
+        request, {"additional_information": raw_info, "model_intermediate_buffer": buffer}
+    )
     assert deserialize_additional_information(getattr(upgraded, "additional_information", None)) == (info or {})
+    assert getattr(upgraded, "model_intermediate_buffer", None) == buffer
 
 
 @pytest.mark.asyncio

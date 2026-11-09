@@ -292,11 +292,15 @@ def test_retention_evicts_the_oldest_finished_turn_first() -> None:
     ledger.record_stage_work([(0, 0, 1, 0, MS)])
 
 
-def test_with_perf_chunk_copies_the_envelope_and_skips_prompts_without_one() -> None:
+def test_with_perf_chunk_copies_existing_envelopes_and_creates_missing_ones() -> None:
     duplex = {"epoch": 0, "seq": 3}
     prompt = {"prompt_token_ids": [1], "model_intermediate_buffer": {"duplex": duplex}}
     stamped = with_perf_chunk(prompt, (0, 3))
     assert stamped["model_intermediate_buffer"]["duplex"]["perf_chunk"] == [0, 3]
     assert "perf_chunk" not in duplex
     plain = {"prompt_token_ids": [1]}
-    assert with_perf_chunk(plain, (0, 3)) is plain
+    assert with_perf_chunk(plain, (0, 3)) == {
+        "prompt_token_ids": [1],
+        "model_intermediate_buffer": {"duplex": {"perf_chunk": [0, 3]}},
+    }
+    assert "model_intermediate_buffer" not in plain
