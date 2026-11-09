@@ -1,0 +1,95 @@
+# MiniMax-H3 on 16 dies: encoder stage + Ulysses x AllGather-KV DiT +
+# independent VAE decoder stage.
+#
+# Topology rationale:
+#   * Stage 0 runs the Qwen3-VL text encoder with tensor parallelism.  The model
+#     has 64 query heads and 8 KV heads, so text_encoder_tp_size must divide
+#     both and 8 is the ceiling.
+#   * Stage 1 runs the DiT on all 16 dies as Ulysses(8) x AllGather-KV(2):
+#     sequence_parallel_size = 8 * 1 * 2 = 16.  Every rank owns 56 / 8 = 7
+#     attention heads and gathers the global K/V over the AllGather group, so
+#     the 56-head count divides evenly and no head padding (advanced_uaa) is
+#     required.  The kernel always runs a local-Q/global-KV problem.
+#     This topology is dense-only: RAINFUSION_ATTN needs the whole key
+#     sequence to select blocks and rejects allgather_degree > 1.  Use
+#     minimax_h3_disaggregated_16card_uaa.yaml (and its sparse variant) when
+#     block-sparse attention is required.
+#     Packed Ref2VA requests on this topology require the local-Q/global-KV
+#     packed contract in ``_resolve_packed_seq_npu``.
+#   * Stage 2 decodes on 8 dies with tile (patch) parallelism.  The native VAE
+#     only supports a patch parallel size of 1 or the full group size, so it
+#     must equal the stage world size.
+#
+# Tuning notes:
+#   * stage-0 gpu_memory_utilization sizes the encoder's KV pool.  It is
+#     checked against the free device memory at startup; lower it when the
+#     dies are shared with another workload.
+#   * stage-0 max_model_len must cover the whole Qwen presentation.  A
+#     7-reference-image Ref2VA request is ~53.8k tokens; the model default of
+#     262144 would reserve 6.25 GiB of KV, so pin it explicitly.
+#   * Each tp=1 rank holds the full DiT weights, so
+#     enable_distributed_layerwise_offload is effectively required on 64 GB
+#     dies.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0 # encoder: text TP8 + video VAE patch8 + audio VAE leader
+    devices: "0,1,2,3,4,5,6,7"
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.2
+    max_model_len: 65536
+    max_num_seqs: 1
+    enforce_eager: true
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+
+  - stage_id: 1 # DiT on all 16 dies; sp = 8 x 1 x 2 = 16, no VAE loaded here
+    devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    enable_distributed_layerwise_offload: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      ring_degree: 1
+      allgather_degree: 2
+      vae_patch_parallel_size: 1
+    engine_extras:
+      diffusion_quantization_config:
+        transformer:
+          method: int8
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+
+  - stage_id: 2 # independent VAE decoder on the 8 dies the encoder does not use
+    devices: "8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    vae_parallel_mode: tile
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      ring_degree: 1
+      allgather_degree: 1
+      vae_patch_parallel_size: 8
+    default_sampling_params:
+      seed: 42
