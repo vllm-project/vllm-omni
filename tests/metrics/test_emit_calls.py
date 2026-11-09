@@ -323,6 +323,72 @@ class TestStageWorkloadMetricScope:
         obj.mod_metrics.observe_image_ttfp.assert_called_once_with("1", "0", 0.25)
 
 
+class TestStageGenExcludesQueueWait:
+    def test_diffusion_scheduler_wait_is_queue_wait_not_stage_gen(self, mocker) -> None:
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        obj = object.__new__(OmniBase)
+        obj._enable_ar_profiler = False
+        obj.collect_stage_metrics = True
+        obj.request_states = {"req-queue": SimpleNamespace(consumed_metric_message_ids=set())}
+        obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
+        obj.mod_metrics = mocker.Mock()
+        obj.engine = SimpleNamespace(
+            get_stage_metadata=lambda _stage_id: SimpleNamespace(
+                stage_type="diffusion",
+                final_output=True,
+                final_output_type="image",
+                model_stage="diffusion",
+            )
+        )
+        obj._publish_request_gauges = mocker.Mock()
+        mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+        mocker.patch(
+            "vllm_omni.entrypoints.omni_base.OmniRequestOutput.from_stage_output",
+            return_value=SimpleNamespace(),
+        )
+        stage_metrics = SimpleNamespace(
+            stage_gen_time_ms=1000.0,
+            diffusion_metrics={"scheduler_queue_wait_s": 0.25},
+            num_inference_steps=20,
+            output_unit_type="image",
+            image_pixels=1,
+            output_unit_count=1,
+            serving_time_to_first_output_ms=0.0,
+            image_time_to_first_output_ms=0.0,
+            pipeline_timings={"queue_wait_ms": 0.4},
+        )
+        engine_outputs = SimpleNamespace(
+            stage_durations={},
+            peak_memory_mb=0.0,
+            finished=True,
+            final_output_type="image",
+            outputs=[],
+        )
+        result = SimpleNamespace(
+            request_id="req-queue",
+            stage_id=0,
+            replica_id=0,
+            stage_submit_ts=10.0,
+            metrics=stage_metrics,
+            engine_outputs=engine_outputs,
+        )
+        aggregator = mocker.Mock()
+        aggregator.stage_events = {"req-queue": []}
+        aggregator.stage_first_ts = [None]
+        aggregator.stage_last_ts = [None]
+        aggregator.e2e_done = set()
+
+        obj._process_single_result(result, 0, aggregator, {"req-queue": 10.0}, 10.0, 0)
+
+        durations = engine_outputs.stage_durations
+        assert durations["stage_0_gen_ms"] == pytest.approx(750.0)
+        assert durations["queue_wait_ms"] == pytest.approx(250.4)
+        assert obj.prom_metrics.observe_stage_gen_time.call_args.args[2] == pytest.approx(0.75)
+        assert obj.prom_metrics.observe_queue_wait.call_args.args[0] == pytest.approx(0.2504)
+        assert obj.prom_metrics.observe_stage_in_queue.call_args.args[1] == pytest.approx(0.25)
+
+
 class TestStageWaitingAggregation:
     @staticmethod
     def _make_orchestrator(mocker):
