@@ -46,6 +46,39 @@ def ensure_a2a_permute_available() -> None:
 
 
 @triton.jit
+def _tile_offsets(
+    rank,
+    world: tl.constexpr,
+    seq: tl.constexpr,
+    channels: tl.constexpr,
+    reverse: tl.constexpr,
+    rows: tl.constexpr,
+    columns: tl.constexpr,
+    batch,
+    peer,
+    tile,
+    offset: tl.constexpr,
+    interleave: tl.constexpr = 1,
+):
+    # Widen operands before multiplication: valid staging/output offsets can
+    # exceed 2**31 elements even though each head-shard row is at most 32 KiB.
+    rank = tl.cast(rank, tl.int64)
+    batch = tl.cast(batch, tl.int64)
+    peer = tl.cast(peer, tl.int64)
+    s = tl.cast(tile, tl.int64) * rows + tl.arange(0, rows).to(tl.int64)[:, None]
+    c = tl.arange(0, columns).to(tl.int64)[None, :]
+    if reverse:
+        base = offset + (batch * world + rank) * seq * channels
+        src = s * channels + c
+        dst = ((batch * seq + s) * world + peer) * channels + c
+    else:
+        base = offset + (batch * seq * world * interleave + rank) * channels
+        src = s * world * interleave * channels + c
+        dst = ((batch * world + peer) * seq + s) * channels + c
+    return base, src, dst, (s < seq) & (c < channels)
+
+
+@triton.jit
 def _pull_tile(
     peers,
     output,
@@ -62,23 +95,15 @@ def _pull_tile(
     offset: tl.constexpr,
     interleave: tl.constexpr = 1,
 ):
-    s = tile * rows + tl.arange(0, rows)[:, None]
-    c = tl.arange(0, columns)[None, :]
+    base, src, dst, mask = _tile_offsets(
+        rank, world, seq, channels, reverse, rows, columns, batch, peer, tile, offset, interleave
+    )
     address = tl.load(peers + peer)
-    if reverse:
-        base = offset + (batch * world + rank) * seq * channels
-        src = s * channels + c
-        dst = ((batch * seq + s) * world + peer) * channels + c
-    else:
-        base = offset + (batch * seq * world * interleave + rank) * channels
-        src = s * world * interleave * channels + c
-        dst = ((batch * world + peer) * seq + s) * channels + c
     # Form the row base in integer address space before creating the pointer.
     # This also handles 128-byte GQA rank offsets that the Ascend compiler
     # otherwise folds into an incompatible nonzero memref offset.
     element_bytes: tl.constexpr = 4 if output.dtype.element_ty == tl.float32 else 2
     source = (address + base.to(tl.uint64) * element_bytes).to(tl.pointer_type(output.dtype.element_ty))
-    mask = (s < seq) & (c < channels)
     values = tl.load(source + src, mask, other=0)
     tl.store(output + dst, values, mask)
 
@@ -107,7 +132,7 @@ def _pull(
     tiles: tl.constexpr = triton.cdiv(seq, rows)
     # Tile-major order spreads adjacent jobs across peers. A persistent grid
     # bounds concurrent remote readers instead of launching one core per tile.
-    for job in range(tl.program_id(0), batch * world * tiles * count, tl.num_programs(0)):
+    for job in range(tl.program_id(0).to(tl.int64), batch * world * tiles * count, tl.num_programs(0).to(tl.int64)):
         peer = job % world
         tile = (job // world) % tiles
         b = (job // (world * tiles)) % batch

@@ -29,8 +29,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from vllm.triton_utils import tl, triton
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import _tile_offsets
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A2"}, num_cards=2)]
 
@@ -44,6 +46,23 @@ _BENCHMARK_SHAPES = [
 ]
 
 
+@triton.jit
+def _probe_tile_offsets(indices, result, seq: tl.constexpr, reverse: tl.constexpr, interleave: tl.constexpr):
+    # Runtime int32 inputs reproduce program_id/arange's initial width.
+    rank = tl.load(indices)
+    batch = tl.load(indices + 1)
+    peer = tl.load(indices + 2)
+    tile = tl.load(indices + 3)
+    base, src, dst, mask = _tile_offsets(
+        rank, 2, seq, 16384, reverse, 1, 32, batch, peer, tile, 32768 if interleave == 3 else 0, interleave
+    )
+    c = tl.arange(0, 32)[None, :]
+    tl.store(result + c, base)
+    tl.store(result + 32 + c, src)
+    tl.store(result + 64 + c, dst)
+    tl.store(result + 96 + c, mask.to(tl.int64))
+
+
 @pytest.fixture(scope="module")
 def npu_world():
     import torch_npu  # noqa: F401
@@ -54,6 +73,34 @@ def npu_world():
         yield
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
+@pytest.mark.parametrize(
+    "seq, reverse, interleave, coords, expected",
+    [
+        (65537, False, 1, (1, 0, 1, 65535), (16384, 2147450880, 2147483648)),
+        (65537, False, 1, (1, 0, 1, 65536), (16384, 2147483648, 2147500032)),
+        (65537, False, 1, (1, 1, 1, 0), (2147532800, 0, 3221274624)),
+        (32769, False, 3, (1, 0, 1, 21846), (49152, 2147549184, 894812160)),
+        (32769, False, 3, (1, 1, 1, 0), (3221372928, 0, 1610661888)),
+        (65537, True, 1, (1, 0, 1, 65536), (1073758208, 1073741824, 2147500032)),
+        (65537, True, 1, (1, 1, 1, 0), (3221274624, 0, 2147532800)),
+    ],
+)
+def test_production_tile_offsets_above_int32(npu_world, seq, reverse, interleave, coords, expected):
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    indices = torch.tensor(coords, device=device, dtype=torch.int32)
+    result = torch.empty((4, 32), device=device, dtype=torch.int64)
+    # Exercise the production address calculation without allocating multi-GiB
+    # buffers or dereferencing the old kernel's wrapped negative addresses.
+    _probe_tile_offsets[(1,)](indices, result, seq, reverse, interleave)
+    actual = result.cpu()
+    base, src, dst = expected
+    assert torch.equal(actual[0], torch.full((32,), base, dtype=torch.int64))
+    assert torch.equal(actual[1], torch.arange(src, src + 32))
+    assert torch.equal(actual[2], torch.arange(dst, dst + 32))
+    assert actual[3].eq(1).all(), "The overflowing row is valid, so masking cannot prevent the invalid access"
 
 
 @pytest.mark.skipif("LOCAL_RANK" not in os.environ, reason="Requires a scheduled multi-NPU torchrun job")
