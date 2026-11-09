@@ -4,7 +4,7 @@ meta:
   provider: "Adventists AI"
   description: "Open full-duplex voice model that hears your tone and speaks with one: listens while you talk, takes interruptions, and laughs, sighs or stresses words when the conversation calls for it. One vLLM-Omni model (thinker -> expressive talker -> vocoder) on a single 80 GB GPU, with an OpenAI-Realtime-style full-duplex WebSocket and /v1/chat/completions (audio in, text + audio out)."
   date_added: 2026-11-09
-  date_updated: 2026-11-09
+  date_updated: 2026-11-10
   difficulty: intermediate
   tasks:
     - omni
@@ -68,7 +68,12 @@ guide: |
   Sophon-Realtime v1, an open full-duplex voice model. A 32B thinker listens to the user's audio, decides when it is its
   turn and writes the reply with inline sound tags (`[laughter]`, `[sigh]`, `<strong>…</strong>`); a streaming talker
   performs those tags while the reply is still being written. The whole pipeline is one vLLM-Omni model.
-  VoiceBench 82.8 and Big Bench Audio 81.8% (#1 among open full-duplex models), NVV-SuperBench 0.86 (zh) / 0.80 (en).
+  VoiceBench 82.8, Big Bench Audio 81.8%, NVV-SuperBench 0.86 (zh) / 0.80 (en).
+
+  **Out-of-tree model.** Sophon-Realtime is not built into vLLM-Omni. It is served through its own plugin package,
+  `sophon-realtime`, which pins vLLM 0.30.0 and vLLM-Omni 0.30.0 and registers the model architecture. A plain
+  `vllm serve ... --omni` on a stock vLLM-Omni install will not load it: install the plugin and start with
+  `sophon-realtime serve` as shown below.
 
   ## Prerequisites
 
