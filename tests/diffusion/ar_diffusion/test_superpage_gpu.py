@@ -22,7 +22,10 @@ def same_bits(left, right):
 
 
 def make_cache(enabled, *, frame=1560, layers=2, heads=10, dim=128, sink=9, **overrides):
-    page = 128 if _resolve_fa_version(dim) == 4 else 160
+    version = _resolve_fa_version(dim)
+    if version not in (3, 4):
+        pytest.skip("superpage needs FA3/FA4")
+    page = 128 if version == 4 else 160
     config = ARDiffusionKVConfig(
         enable=True,
         chunk_size=frame,
@@ -196,11 +199,13 @@ def test_superpage_action_and_capacity_errors(monkeypatch):
     "page,version,expected", [(160, 3, 160), (128, 4, 128), (161, 3, 16), (160, 2, 16), (0, 3, 16)]
 )
 def test_runner_superpage_selection(monkeypatch, page, version, expected):
+    import importlib
     from dataclasses import replace
 
     from tests.diffusion.ar_diffusion.test_capability_runner import CapablePipeline, lingbot_like_spec, make_runner
-    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
 
+    # Patch the sys.modules entry the runner imports from; a re-import test can leave the package attribute stale.
+    paged_attention = importlib.import_module("vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention")
     monkeypatch.setattr(paged_attention, "_resolve_fa_version", lambda _: version)
     pipeline = CapablePipeline(replace(lingbot_like_spec(), tokens_per_frame=1560))
     runner = make_runner(pipeline, preallocate=False)
