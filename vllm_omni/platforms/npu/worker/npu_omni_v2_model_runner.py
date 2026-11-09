@@ -310,16 +310,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         width = widths[0] if uniform else 0
         prefill = bool(getattr(input_batch, "has_prefill", False))
         if prefill or not uniform or len(infos) != len(spans) or width < 2 or width > MINICPMO_TALKER_FRAMES_MAX:
-            extra = {"request_token_spans": spans, "model_intermediate_buffer": infos}
-            multi_decode = (
-                multiframe.is_multi_token_decode(self.model, extra) and multiframe.applies(self.model, extra) <= 1
-            )
             self._kstep_decline_logs = getattr(self, "_kstep_decline_logs", 0) + 1
             if self._kstep_decline_logs <= 5:
-                log = logger.error if multi_decode else logger.warning
-                log(
-                    "[kstep] frame loop declined (multi_decode=%s): prefill=%s uniform=%s infos=%d spans=%d width=%d",
-                    multi_decode,
+                logger.warning(
+                    "[kstep] frame loop declined: prefill=%s uniform=%s infos=%d spans=%d width=%d",
                     prefill,
                     uniform,
                     len(infos),
@@ -333,7 +327,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # The K-step control head is two-wide (continue/stop). Keep the input
         # batch's vocab in sync so the rejection sampler and any top-k
         # bookkeeping do not address non-existent token ids.
-        multiframe.ensure_stop_token_vocab(self, model_inputs.get("inputs_embeds") or model_inputs.get("input_ids"))
+        try:
+            input_batch.vocab_size = 2
+        except Exception:
+            pass
 
         if run_model is None:
 
