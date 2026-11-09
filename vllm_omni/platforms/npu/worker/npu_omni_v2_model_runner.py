@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Omni autoregressive runner on Ascend Model Runner V2.
+"""Omni autoregressive and generation runners on Ascend Model Runner V2.
 
 ``OmniARModelRunner`` owns the speech lifecycle (frame outputs, connectors).
 ``NPUModelRunner`` owns Ascend input state (``AscendRequestState``,
@@ -14,16 +14,16 @@ the same step.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
-from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 
 logger = init_logger(__name__)
 
@@ -160,8 +160,82 @@ def _kstep_timing_enabled() -> bool:
 _KSTEP_MAX_FRAMES = 32
 
 
-class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
-    """Drama 3 (and any other NPU-ready AR model) on Model Runner V2."""
+class NPUOmniV2RunnerMixin:
+    """Ascend input buffers, batches and forward context for Omni V2 runners."""
+
+    input_buffers: AscendInputBuffers
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        _default_ascend_decode_graph_flag()
+        _install_pcp_partition_stub()
+        _install_v2_moe_comm_context()
+        super().__init__(*args, **kwargs)
+
+    def prepare_inputs(
+        self,
+        scheduler_output: Any,
+        batch_req_state: Any,
+        batch_desc: Any,
+        num_active_loras: int = 0,
+    ) -> Any:
+        # vLLM 0.32's Ascend batch builder takes the LoRA count itself.
+        return NPUModelRunner.prepare_inputs(
+            self,
+            scheduler_output,
+            batch_req_state,
+            batch_desc,
+            num_active_loras,
+        )
+
+    def _make_dummy_input_batch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        *,
+        max_query_len: int | None,
+        is_padding: bool,
+    ) -> Any:
+        del is_padding  # Ascend's dummy batch marks itself and fills seq_lens_np.
+        from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+
+        return AscendInputBatch.make_dummy(
+            num_reqs,
+            num_tokens,
+            self.input_buffers,
+            max_query_len=max_query_len,
+        )
+
+    def _forward_context(self, attn_metadata: Any, vllm_config: Any, **kwargs: Any):
+        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+
+        if "cudagraph_runtime_mode" in kwargs:
+            kwargs["aclgraph_runtime_mode"] = kwargs.pop("cudagraph_runtime_mode")
+        # Slot maps live in the Ascend attention metadata, not this context.
+        kwargs.pop("slot_mapping", None)
+        kwargs.pop("is_padding", None)
+        kwargs.setdefault("model_instance", getattr(self, "model", None))
+        return set_ascend_forward_context(attn_metadata, vllm_config, **kwargs)
+
+    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
+        import vllm.v1.worker.gpu.model_runner as model_runner
+
+        original = model_runner.maybe_create_adaptive_verification_manager
+
+        def _compatible(*call_args: Any, **call_kwargs: Any) -> Any:
+            return _call_without_unknown_kwargs(original, *call_args, **call_kwargs)
+
+        model_runner.maybe_create_adaptive_verification_manager = _compatible
+        try:
+            NPUModelRunner.initialize_kv_cache(self, kv_cache_config, *args, **kwargs)
+        finally:
+            model_runner.maybe_create_adaptive_verification_manager = original
+
+    def _close_omni_aux_output(self) -> None:
+        """V1 aux-output streams are not used by this runner."""
+
+
+class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunner):
+    """NPU autoregressive models with Ascend attention metadata."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         import os
@@ -173,9 +247,6 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
                 static_shape_decode.install_into_ascend_backend()
             except Exception:
                 logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
-        _default_ascend_decode_graph_flag()
-        _install_pcp_partition_stub()
-        _install_v2_moe_comm_context()
         super().__init__(*args, **kwargs)
 
     def _kstep_active(self) -> bool:
@@ -393,67 +464,14 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
             self.req_states.draft_tokens[input_batch.idx_mapping, :n],
         )
 
-    def prepare_inputs(
-        self,
-        scheduler_output: Any,
-        batch_req_state: Any,
-        batch_desc: Any,
-        num_active_loras: int = 0,
-    ) -> Any:
-        # vLLM 0.32's Ascend batch builder takes the LoRA count itself.
-        return NPUModelRunner.prepare_inputs(
-            self,
-            scheduler_output,
-            batch_req_state,
-            batch_desc,
-            num_active_loras,
-        )
-
-    def _make_dummy_input_batch(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        *,
-        max_query_len: int | None,
-        is_padding: bool,
-    ) -> Any:
-        del is_padding  # Ascend's dummy batch marks itself and fills seq_lens_np.
-        from vllm_ascend.worker.v2.input_batch import AscendInputBatch
-
-        return AscendInputBatch.make_dummy(
-            num_reqs,
-            num_tokens,
-            self.input_buffers,
-            max_query_len=max_query_len,
-        )
-
-    def _forward_context(self, attn_metadata: Any, vllm_config: Any, **kwargs: Any):
-        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-
-        if "cudagraph_runtime_mode" in kwargs:
-            kwargs["aclgraph_runtime_mode"] = kwargs.pop("cudagraph_runtime_mode")
-        # Slot maps live in the Ascend attention metadata, not this context.
-        kwargs.pop("slot_mapping", None)
-        kwargs.pop("is_padding", None)
-        kwargs.setdefault("model_instance", getattr(self, "model", None))
-        return set_ascend_forward_context(attn_metadata, vllm_config, **kwargs)
-
     def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
-        import vllm.v1.worker.gpu.model_runner as model_runner
-
-        original = model_runner.maybe_create_adaptive_verification_manager
-
-        def _compatible(*call_args: Any, **call_kwargs: Any) -> Any:
-            return _call_without_unknown_kwargs(original, *call_args, **call_kwargs)
-
-        model_runner.maybe_create_adaptive_verification_manager = _compatible
-        try:
-            NPUModelRunner.initialize_kv_cache(self, kv_cache_config, *args, **kwargs)
-        finally:
-            model_runner.maybe_create_adaptive_verification_manager = original
-
-    def _close_omni_aux_output(self) -> None:
-        """V1 aux-output streams are not used by this runner."""
+        super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        # The Ascend override initializes native KV directly, bypassing the
+        # shared MRv2 mixin. Thinker hits also need cached stage-output rows.
+        is_profiling = bool(kwargs.get("is_profiling", args[0] if args else False))
+        self._init_omni_prefix_cache(is_profiling=is_profiling)
+        if self.omni_prefix_cache is not None:
+            logger.info("NPU MRv2 stage-output prefix cache initialized.")
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         OmniGPUModelRunner.load_model(self, *args, **kwargs)
@@ -467,26 +485,3 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
             "NPU Model Runner V2 loaded %s with Ascend attention metadata.",
             type(self.model).__name__,
         )
-
-
-class NPUOmniGenerationModelRunner(OmniGenerationModelRunner):
-    """Non-autoregressive generation stage on Ascend Model Runner V2.
-
-    Code2Wav-style stages have no KV cache, sampler or attention metadata, so
-    the generic OmniGenerationModelRunner contract applies unchanged. The
-    model's own NPU graph capture (minicpmo_4_5_code2wav.py) owns the
-    Ascend forward context; this runner only adds the NPU-side entry point so
-    the generation worker can honor model_runner: v2 instead of refusing
-    the stage.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # The generic V2 base calls torch.cuda.Stream and friends in __init__;
-        # Ascend's wrapper maps them onto torch.npu (same pattern as
-        # vllm_ascend.worker.v2.model_runner.NPUModelRunner).
-        with torch_cuda_wrapper():
-            super().__init__(*args, **kwargs)
-        # The V1 NPU worker's sample_tokens reads this after the runner call
-        # (vllm_ascend/worker/worker.py). AR runners get it from NPUModelRunner;
-        # the generic generation base does not initialize it.
-        self.ascend_config = get_ascend_config()

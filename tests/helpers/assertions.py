@@ -1019,9 +1019,15 @@ def _assert_transcript_matches(
 
 
 def _retain_failed_speech_audio(
-    audio_bytes: bytes | None, transcript: str, expected_text: Any, error: AssertionError
+    audio_bytes: bytes | None,
+    transcript: str,
+    expected_text: Any,
+    error: AssertionError,
+    *,
+    audio_format: Literal["wav", "pcm"] = "wav",
+    sample_rate: int | None = None,
 ) -> None:
-    """Retain the exact ASR input when a CI speech-content assertion fails."""
+    """Retain exact ASR input or raw PCM when a CI speech-quality assertion fails."""
     directory = os.environ.get("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR")
     if not directory or not audio_bytes:
         return
@@ -1029,18 +1035,24 @@ def _retain_failed_speech_audio(
     root = Path(directory)
     try:
         root.mkdir(parents=True, exist_ok=True)
-        (root / f"{stem}.wav").write_bytes(audio_bytes)
+        (root / f"{stem}.{audio_format}").write_bytes(audio_bytes)
         (root / f"{stem}.json").write_text(
             json.dumps(
-                {"transcript": transcript, "expected_text": str(expected_text), "assertion": str(error)},
+                {
+                    "transcript": transcript,
+                    "expected_text": str(expected_text),
+                    "assertion": str(error),
+                    "audio_format": audio_format,
+                    "sample_rate": sample_rate,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        print(f"Retained failed speech ASR input: {root / f'{stem}.wav'}")
+        print(f"Retained failed speech audio: {root / f'{stem}.{audio_format}'}")
     except OSError as exc:
         # Diagnostic I/O must never replace or suppress the content failure.
-        print(f"Could not retain failed speech ASR input: {exc}")
+        print(f"Could not retain failed speech audio: {exc}")
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str | None = None) -> None:
@@ -1095,11 +1107,19 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             # the rate. Defaulting to 24 kHz for a 44.1 kHz model shifts the
             # search window to 147-735 Hz and misses the fundamental entirely,
             # scoring clean speech ~1.9 dB lower than it is.
-            _assert_pcm_int16_speech_hnr(
-                response.audio_bytes,
-                min_hnr_db=min_hnr_db,
-                sr=_speech_pcm_sample_rate(request_config),
-            )
+            sample_rate = _speech_pcm_sample_rate(request_config)
+            try:
+                _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db, sr=sample_rate)
+            except AssertionError as exc:
+                _retain_failed_speech_audio(
+                    response.audio_bytes,
+                    "",
+                    request_config.get("input", ""),
+                    exc,
+                    audio_format="pcm",
+                    sample_rate=sample_rate,
+                )
+                raise
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:

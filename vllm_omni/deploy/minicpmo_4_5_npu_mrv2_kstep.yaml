@@ -1,9 +1,0 @@
-# Unified MRv2 on Ascend with the stage-1 K-step multi-frame block restored.
-# All three stages run MRv2; stage 1 inherits the base NPU profile's
-# speculative_config (ngram, K=8), FULL_DECODE_ONLY, async_scheduling: false
-# and stop_token_ids: [1] -- the same contract the V1 K-step loop consumes.
-base_config: minicpmo_4_5.yaml
-
-platforms:
-  npu:
-    model_runner: v2

@@ -230,8 +230,6 @@ platforms:
           stop_token_ids: [1]
 
   npu:
-    # Run the three NPU stages on Model Runner v2 (see
-    # minicpmo_4_5_npu_mrv2_kstep.yaml for the K-step variant).
     model_runner: v2
     stages:
       - stage_id: 0

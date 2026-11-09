@@ -12,11 +12,10 @@ from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_generation_model_runner import NPUGenerationModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
-logger = init_logger(__name__)
-
 # See npu_ar_worker: install before the worker is used, so the guard is in
 # place when the ascend Triton kernel warmup runs later in this process.
 apply_ascend_warmup_patch()
+logger = init_logger(__name__)
 
 
 class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):
@@ -29,22 +28,16 @@ class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 
-        # model_config.use_v2_model_runner carries the stage deploy field
-        # (patch.py writes it for OmniModelConfig). Generation stages on
-        # Ascend V2 run the generic OmniGenerationModelRunner contract: no
-        # KV cache and no sampler, the model owns its NPU graph capture.
         if self.use_v2_model_runner:
-            from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import (
-                NPUOmniGenerationModelRunner,
-            )
+            from vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 import NPUGenerationModelRunnerV2
 
-            logger.info("Using MR v2 NPUOmniGenerationModelRunner on NPU.")
-            self.model_runner = NPUOmniGenerationModelRunner(self.vllm_config, self.device)
+            logger.info("Using MR v2 NPUGenerationModelRunnerV2 for generation stage.")
+            self.model_runner = NPUGenerationModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
-    def compile_or_warm_up_model(self):
-        """Generation stages have no KV cache or sampler -- skip warmup_kernels."""
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Skip language-model warmup for codec IDs and retain inner graphs."""
         if not self.use_v2_model_runner:
             return super().compile_or_warm_up_model()
         start = time.perf_counter()
