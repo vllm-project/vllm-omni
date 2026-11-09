@@ -57,6 +57,25 @@ def read_json(directory: Path, name: str) -> dict:
     return json.loads((directory / name).read_text(encoding="utf-8"))
 
 
+def test_recorder_does_not_consume_the_application_clock(suite: Path) -> None:
+    source = """
+import time
+def test_clock(monkeypatch):
+    ticks = iter([10.0, 12.0])
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+    assert time.perf_counter() == 10.0
+    assert time.perf_counter() == 12.0
+"""
+    result, directory = run_suite(suite, source)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = read_json(directory, "summary.json")
+    assert summary["counts"]["passed"] == 1
+    assert summary["counts"]["incomplete"] == 0
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    elapsed = [event["elapsed_seconds"] for event in events]
+    assert elapsed == sorted(elapsed)
+
+
 def test_phase_totals_outcomes_and_context(suite: Path) -> None:
     source = """
 import pytest
@@ -286,3 +305,55 @@ def test_ready_merge_timing_jobs_stay_identical() -> None:
         assert step["artifact_paths"] == ["artifacts/amd-cpu-suites/**/*"]
     other = next(step for step in jobs[0] if step["label"] == "Simple · Other Test")
     assert "--ignore=tests/model_executor" in other["commands"][-1]
+
+
+@pytest.mark.parametrize("suite_name", ["other", "diffusion"])
+def test_weighted_runner_records_buildkite_partitions(
+    suite: Path, monkeypatch: pytest.MonkeyPatch, suite_name: str
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", str(ROOT))
+    monkeypatch.setenv("BUILDKITE_PARALLEL_JOB_COUNT", "2")
+    test_root = suite / "tests" / ("utils" if suite_name == "other" else "diffusion")
+    test_root.mkdir(parents=True)
+    for name in "ab":
+        (test_root / f"test_{name}.py").write_text(
+            "import pytest\npytestmark=[pytest.mark.core_model,pytest.mark.cpu]\ndef test_case(): pass\n"
+        )
+    profile = suite / "profile.json"
+    profile.write_text(json.dumps({"schema_version": 1, "suite": suite_name, "sources": [], "node_seconds": {}}))
+    completed: set[str] = set()
+    plans = []
+    for index in range(2):
+        monkeypatch.setenv("BUILDKITE_PARALLEL_JOB", str(index))
+        before = set((suite / "artifacts/amd-cpu-suites").glob("*"))
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--timing-profile",
+                str(profile),
+                suite_name,
+                "-q",
+                "tests",
+                "-m",
+                "core_model and cpu",
+                "-p",
+                "tests.helpers.fixtures.pytest_collection",
+            ],
+            cwd=suite,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        directory = (set((suite / "artifacts/amd-cpu-suites").glob("*")) - before).pop()
+        invocation = read_json(directory, "invocation.json")
+        assert invocation["num_shards"] == 2
+        assert invocation["shard_id"] == index
+        assert invocation["suite"] == suite_name
+        nodes = set(read_json(directory, "selection.json")["selected"])
+        assert not completed & nodes
+        completed.update(nodes)
+        plans.append(read_json(directory, "plan.json"))
+    assert len(completed) == 2
+    assert plans[0] == plans[1]
