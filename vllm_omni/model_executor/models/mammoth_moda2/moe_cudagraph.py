@@ -156,6 +156,7 @@ def capture_mask_for_routing_key(
 # Runner-facing helpers (used by MammothGPUARModelRunner only)
 # ---------------------------------------------------------------------------
 
+
 def moe_routing_specialize_enabled(runner: object) -> bool:
     return bool(getattr(getattr(runner, "compilation_config", None), "cudagraph_specialize_moe_routing", False))
 
