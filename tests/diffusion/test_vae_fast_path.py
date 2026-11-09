@@ -105,8 +105,13 @@ def test_off_components_are_not_installed(toy_fast_path, decode, encode, expecte
 def test_unsupported_platform_and_failures_keep_the_reference(toy_fast_path) -> None:
     config = SimpleNamespace(vae_fast_path="lossless", vae_encode_fast_path="lossless")
     toy_fast_path.platform_ok = False
+    matched = []
+    toy_fast_path.matches = lambda vae: matched.append(vae) or True  # type: ignore[method-assign]
     vfp.apply_vae_fast_paths(_pipeline(_ToyVae()), config, platform=None)
     assert toy_fast_path.calls == []
+    # Platform support is checked before matching, which may load a fast path's families (imports).
+    assert matched == []
+    del toy_fast_path.matches
 
     toy_fast_path.platform_ok = True
     toy_fast_path.fail = "decoder"

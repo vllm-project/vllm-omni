@@ -20,9 +20,11 @@ the spatially sharded convolutions) are never bound by accident.
 from __future__ import annotations
 
 import importlib
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import cache
+from types import ModuleType
 
 from diffusers.models.autoencoders import autoencoder_kl_wan as wan
 from torch import nn
@@ -91,11 +93,9 @@ WAN = WanVaeFamily(
 )
 
 _FAMILIES: list[WanVaeFamily] = [WAN]
-_LAZY_LOADED = False
 
 
-def _qwen_image() -> WanVaeFamily:
-    q = importlib.import_module("diffusers.models.autoencoders.autoencoder_kl_qwenimage")
+def _qwen_image(q: ModuleType) -> WanVaeFamily:
     return WanVaeFamily(
         name="qwen_image",
         vaes=(q.AutoencoderKLQwenImage,),
@@ -112,10 +112,9 @@ def _qwen_image() -> WanVaeFamily:
     )
 
 
-def _qwen_image_layered() -> WanVaeFamily:
+def _qwen_image_layered(q: ModuleType) -> WanVaeFamily:
     # vLLM-Omni's copy of the Qwen-Image VAE. Its RMS norm normalizes without the fp32 upcast, so it keeps its own
     # forward (``rms_norm=None``); every other role matches diffusers' Qwen-Image VAE.
-    q = importlib.import_module("vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage")
     return WanVaeFamily(
         name="qwen_image_layered",
         vaes=(q.AutoencoderKLQwenImage,),
@@ -131,8 +130,7 @@ def _qwen_image_layered() -> WanVaeFamily:
     )
 
 
-def _qwen_image_21() -> WanVaeFamily:
-    q = importlib.import_module("vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21")
+def _qwen_image_21(q: ModuleType) -> WanVaeFamily:
     return WanVaeFamily(
         name="qwen_image_21",
         vaes=(q.AutoencoderKLQwenImage21,),
@@ -151,25 +149,38 @@ def _qwen_image_21() -> WanVaeFamily:
     )
 
 
-_LAZY_FAMILIES = (_qwen_image, _qwen_image_layered, _qwen_image_21)
+# (module, builder, importable). Looking up a family never imports a model package: the vLLM-Omni VAE modules are
+# only read from ``sys.modules`` (an instance of their classes implies the module is imported), and stay pending
+# until they are; only diffusers' module is imported here.
+_LAZY_FAMILIES: tuple[tuple[str, Callable[[ModuleType], WanVaeFamily], bool], ...] = (
+    ("diffusers.models.autoencoders.autoencoder_kl_qwenimage", _qwen_image, True),
+    ("vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage", _qwen_image_layered, False),
+    ("vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21", _qwen_image_21, False),
+)
+_PENDING_FAMILIES = list(_LAZY_FAMILIES)
 
 
 def _load_lazy_families() -> None:
-    # Imported on first use: the Qwen-Image-2.1 VAE lives under ``models/`` and must not be imported at package
-    # import time. A family whose module is unavailable (older diffusers) is skipped.
-    global _LAZY_LOADED
-    if _LAZY_LOADED:
-        return
-    _LAZY_LOADED = True
-    for build in _LAZY_FAMILIES:
+    """Register the built-in families whose modules are available now; the rest are retried on a later lookup."""
+    for entry in list(_PENDING_FAMILIES):
+        module_name, build, importable = entry
+        module = sys.modules.get(module_name)
+        if module is None and not importable:
+            continue
+        _PENDING_FAMILIES.remove(entry)
         try:
-            family = build()
-        except (ImportError, AttributeError) as exc:
+            family = build(module if module is not None else importlib.import_module(module_name))
+        except Exception as exc:  # an unavailable or incompatible module (e.g. older diffusers) only drops the family
             logger.debug("Wan VAE fast path: family %s unavailable: %s", build.__name__, exc)
             continue
         if any(f.name == family.name for f in _FAMILIES):
             continue  # registered earlier (by the user): keep it
-        register_family(family)
+        _add_family(family)
+
+
+def _add_family(family: WanVaeFamily) -> None:
+    _FAMILIES[:] = [f for f in _FAMILIES if f.name != family.name] + [family]
+    _role_types.cache_clear()
 
 
 def register_family(family: WanVaeFamily) -> None:
@@ -179,8 +190,7 @@ def register_family(family: WanVaeFamily) -> None:
     its classes (and replaces a built-in of the same name).
     """
     _load_lazy_families()
-    _FAMILIES[:] = [f for f in _FAMILIES if f.name != family.name] + [family]
-    _role_types.cache_clear()
+    _add_family(family)
 
 
 def families() -> tuple[WanVaeFamily, ...]:

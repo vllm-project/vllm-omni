@@ -316,14 +316,14 @@ def test_most_specific_family_wins_and_lazy_families_keep_earlier_registrations(
     # A family registered before the lazy built-ins load is not replaced by the built-in of the same name.
     users = replace(builtin, vaes=(MyQwenVae,))
     monkeypatch.setattr(fam, "_FAMILIES", [f for f in fam._FAMILIES if f.name in ("wan",)])
-    monkeypatch.setattr(fam, "_LAZY_LOADED", False)
+    monkeypatch.setattr(fam, "_PENDING_FAMILIES", list(fam._LAZY_FAMILIES))
     register_family(users)
     assert [f for f in fam.families() if f.name == "qwen_image"] == [users]
 
     # A differently named family for a built-in's class, registered before first use, is not shadowed by it.
     other = replace(builtin, name="my_other_qwen")
     monkeypatch.setattr(fam, "_FAMILIES", [f for f in fam._FAMILIES if f.name in ("wan",)])
-    monkeypatch.setattr(fam, "_LAZY_LOADED", False)
+    monkeypatch.setattr(fam, "_PENDING_FAMILIES", list(fam._LAZY_FAMILIES))
     register_family(other)
     assert fam.find_family(AutoencoderKLQwenImage(**TINY_QWEN_IMAGE)) is other
     fam._role_types.cache_clear()
@@ -366,3 +366,22 @@ def test_fp32_channel_norm_traces_under_fullgraph_compile(monkeypatch) -> None:
     out = compiled(x)
     assert torch.equal(out.view(torch.int32), x.float().norm(2, 1, keepdim=True).view(torch.int32))
     assert not vrn._FP32_NORM_VERDICTS  # nothing probed while tracing
+
+
+def test_family_lookup_never_imports_a_model_package() -> None:
+    """Built-in vLLM-Omni families come from already imported modules; a lookup does not import them."""
+    import subprocess
+    import sys
+
+    code = """
+import sys
+from diffusers.models.autoencoders import AutoencoderKLWan
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import families as fam
+names = lambda: sorted(f.name for f in fam.families())
+assert names() == ["qwen_image", "wan"], names()
+assert not any(m.startswith("vllm_omni.diffusion.models.") for m in sys.modules), "a model package was imported"
+import vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21  # what owning such a VAE implies
+assert names() == ["qwen_image", "qwen_image_21", "wan"], names()
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]

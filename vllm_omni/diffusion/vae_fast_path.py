@@ -163,12 +163,14 @@ def apply_vae_fast_paths(model: nn.Module, od_config: Any, *, platform: Any) -> 
     ctx = VaeFastPathContext.from_config(od_config, platform)
     if ctx.decode_level == "off" and ctx.encode_level == "off":
         return
+    # Platform support first: matching a VAE may load a fast path's families, which unsupported platforms skip.
+    usable = [fast_path for fast_path in reversed(vae_fast_paths()) if fast_path.supported(ctx)]
+    if not usable:
+        logger.debug("No VAE fast path is supported on this platform")
+        return
     for name, vae in _pipeline_vaes(model):
-        fast_path = find_vae_fast_path(vae)
+        fast_path = next((fast_path for fast_path in usable if fast_path.matches(vae)), None)
         if fast_path is None:
-            continue
-        if not fast_path.supported(ctx):
-            logger.debug("VAE fast path %s is not supported on this platform; skipping %s", fast_path.name, name)
             continue
         for component in COMPONENTS:
             level = ctx.level(component)
