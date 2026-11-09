@@ -36,6 +36,8 @@ class OmniWorkerMixin:
             list_metadata = getattr(manager, "list_adapter_metadata", None)
             if callable(list_metadata):
                 return list_metadata()
+        if getattr(getattr(self, "vllm_config", None), "lora_config", None) is None:
+            return []
         list_loras = getattr(self, "list_loras", None)
         if not callable(list_loras):
             return []
