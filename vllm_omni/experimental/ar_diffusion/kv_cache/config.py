@@ -50,8 +50,9 @@ class ARDiffusionKVConfig:
     # Off by default: it costs two max-sequence buffers per layer, per rank. See
     # ARDiffusionPagedForwardContext.history_staging.
     reuse_history_staging: bool = False
-    # Manager page size; boundary rows preserve the default paging visibility.
-    # FA3 TMA needs a multiple of its KV tile; FA4 TMA needs exactly that tile.
+    # Page size in tokens for superpage KV; 0 = off. Set it to the FlashAttention
+    # key tile so each tile is one page and loads with TMA: 160 for FA3 at head
+    # dim 128 (H100/H200), 128 for FA4 (B200).
     superpage_tokens: int = 0
     # Also capture the post-window-boundary (reset-cycle) forward during warm-up.
     warmup_capture_reset: bool = False
