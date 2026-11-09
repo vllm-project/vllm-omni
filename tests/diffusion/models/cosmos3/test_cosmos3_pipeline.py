@@ -4786,7 +4786,11 @@ def test_admit_multiview_contains_client_named_paths(
     async def persist(index: int, numeric_lidar: bool) -> str:
         raise AssertionError("nothing to persist")
 
-    view = {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_path": str(tmp_path / view_path)}
+    view = {
+        "camera_key": "camera_front_wide_120fov",
+        "prompt": "A car drives.",
+        "control_path": str(tmp_path / view_path),
+    }
     extra: dict[str, Any] = {"multiview": {"views": [view]}, "wsm": {}}
     if lidar_path is not None:
         extra["lidar"] = {"control_path": str(tmp_path / lidar_path)}
