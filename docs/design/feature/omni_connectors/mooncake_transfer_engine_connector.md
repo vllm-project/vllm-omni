@@ -714,7 +714,11 @@ receiver allocations. There is no bounded reclamation guarantee after every fail
 
 `max_inflight_receives` and `max_inflight_sends` default to 64. The sender limit
 bounds queued/active handlers and ambiguous writes. Capacity exhaustion rejects
-new requests before native submission.
+new requests before native submission. A receive-side capacity rejection is a
+retryable backpressure result: `get_with_deadline()` returns `None`, and the
+caller retries until its shared deadline so an in-flight slot can be released.
+The `receive_capacity_rejections` health metric and rate-limited warning make
+capacity pressure distinguishable from a payload that has not been published.
 
 Both peers must use connector protocol v2: `put()` metadata, metadata-query
 responses and transfer requests carry `protocol_version=2`. Old metadata is

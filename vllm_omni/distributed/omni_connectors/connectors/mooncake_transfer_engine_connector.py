@@ -33,6 +33,7 @@ _BUFFER_TTL_SECONDS = 300  # 5 minutes
 _BASE_TRANSFER_TIMEOUT_MS = 30_000
 _TRANSFER_TIMEOUT_STEP_BYTES = 100 * 1024 * 1024
 _TRANSFER_TIMEOUT_PER_STEP_MS = 5_000
+_CAPACITY_WARNING_INTERVAL_SECONDS = 1.0
 
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
@@ -148,6 +149,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._last_ttl_check: float = _time_mod.monotonic()
         self._sender_endpoints: dict[int, tuple[str, int]] = {}
         self._in_flight_buffers: set[str] = set()
+        self._last_capacity_warning = 0.0
 
         self._metrics = {
             "puts": 0,
@@ -155,6 +157,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "bytes_transferred": 0,
             "errors": 0,
             "timeouts": 0,
+            "receive_capacity_rejections": 0,
         }
 
         self.config = config
@@ -695,6 +698,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         A timeout cannot cancel the remote write. Its destination stays allocated
         and registered until a terminal response arrives, including during close.
+
+        ``None`` is a retryable result for an unavailable payload, an expired
+        deadline, or a receiver at ``max_inflight_receives``. The latter is
+        intentional backpressure: no destination buffer is allocated until an
+        in-flight receive completes. Capacity rejections are counted and logged
+        at a bounded rate so they remain distinguishable operationally without
+        changing the connector return type.
         """
         previous_deadline = getattr(self._req_local, "deadline", None)
         self._req_local.deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
@@ -719,14 +729,33 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         key = self._make_key(get_key, from_stage, to_stage)
+        capacity_rejected = False
+        capacity_warning = False
+        inflight_receives = 0
         with self._state_lock:
             if self._closed or self._closing:
                 raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closing or closed")
             if key in self._pending_receives or key in self._receiving_keys:
                 return None
             if len(self._receiving_keys) + len(self._pending_receives) >= self.max_inflight_receives:
-                return None
-            self._receiving_keys.add(key)
+                self._metrics["receive_capacity_rejections"] += 1
+                capacity_rejected = True
+                inflight_receives = len(self._receiving_keys) + len(self._pending_receives)
+                now = _time_mod.monotonic()
+                if now - self._last_capacity_warning >= _CAPACITY_WARNING_INTERVAL_SECONDS:
+                    self._last_capacity_warning = now
+                    capacity_warning = True
+            else:
+                self._receiving_keys.add(key)
+        if capacity_rejected and capacity_warning:
+            logger.warning(
+                "Mooncake receive capacity exhausted; retrying until the deadline "
+                "(inflight=%d, limit=%d)",
+                inflight_receives,
+                self.max_inflight_receives,
+            )
+        if capacity_rejected:
+            return None
         try:
             return self._get_impl(from_stage, to_stage, get_key, metadata)
         finally:
