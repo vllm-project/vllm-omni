@@ -254,7 +254,7 @@ Which stages may set `enable_prefix_caching: true`:
 | Stage | `enable_prefix_caching` | Why |
 | --- | --- | --- |
 | AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker; on Model Runner V2 the thinker only) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
-| Model Runner V2 stage whose model does not set `supports_mrv2_prefix_cache_outputs = True` (Qwen3-Omni talker / MTP, MOSS-TTS local) | native cache only | MTP stages complete their frames after sampling and model-owned output snapshots are not mergeable, so the runner reuses native KV and never builds the stage-output cache. |
+| Model Runner V2 stage whose model does not set `supports_mrv2_prefix_cache_outputs = True` (Qwen3-Omni talker / MTP, MOSS-TTS local, MiniCPM-o 4.5 turn thinker with a `speculative_config`) | native cache only | MTP stages complete their frames after sampling and model-owned output snapshots are not mergeable, so the runner reuses native KV and never builds the stage-output cache. The MiniCPM-o Talker conditions only on reply rows, which a hit forwards or, after a preemption, already holds in the row ledger, so with a draft its Thinker reuses native KV instead of being refused. |
 | AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
 | AR stage that appends its mm outputs in `sample()` and sets `mm_outputs_written_in_sample = True` together with `requires_full_prefix_cached_hidden_states = False` (YuE2) | supported | The step snapshot is taken before `sample()` and cannot hold those outputs, so the runner discards the step context and builds the payload from the live outputs. KV blocks are still reused on a hit. Setting the flag without the hidden-state opt-out is refused when the policy is built. |
 | Token-only AR stage with `uses_native_kv_cache_only = True` and `requires_full_prefix_cached_hidden_states = False` (Ming3 Thinker) | native cache only | Bypasses the Omni stage-output tensor cache; native vLLM KV and aligned recurrent-state caching retain their own validation. No prefix hidden states or deferred multimodal outputs may be requested by this policy. |
@@ -378,8 +378,19 @@ chain. The runners only call `_prefix_cache_step_begin` before retiring
 finished requests, `_prefix_cache_save_mrv2` after postprocess, and
 `_prefix_cache_output_finalizer` when building the async output.
 
-Duplex sessions on MRv2 commit each utterance as a fresh request, so they
-use this path unchanged. The NPU MRv2 runner does not build the cache.
+MiniCPM-o's turn-mode Thinker opts into this output cache. Its `latent`,
+`latent_input_ids` and `latent_positions` are all token-aligned outputs from
+the same forward and must be restored together before the llm2tts bridge
+selects the reply's hidden rows. CUDA turn profiles enable this on both V1
+and MRv2. With a stage-0 `speculative_config` the MRv2 Thinker does not opt
+in and reuses native KV only, since `llm2tts` takes the reply rows from the
+row ledger. MiniCPM-o duplex keeps prefix caching disabled because its mutable
+KV window cannot share cached blocks; the Talker does not opt into output
+replay.
+
+Duplex models that commit each utterance as a fresh request can use this path
+when their KV and model-state contracts permit reuse. The NPU MRv2 runner does
+not build the cache.
 
 Fish Omni retains the default `allow` policy: its MRv2 model state saves the
 generated codebooks before a slot is reused and restores full frame rows on
