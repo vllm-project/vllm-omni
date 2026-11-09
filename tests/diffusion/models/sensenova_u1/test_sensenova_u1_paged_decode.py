@@ -893,6 +893,7 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
     assert getattr(host, "_paged_decode", None) is None, "an adapted capture was left on the pipeline"
 
 
+@pytest.mark.cpu
 def test_sequential_offload_takes_the_eager_path(monkeypatch):
     """Model-level CPU offload hooks ``language_model`` as its DiT component,
     and the hook moves parameters and synchronizes the platform inside every
@@ -1068,6 +1069,7 @@ class _CountingRunner:
             self.captures += 1
 
 
+@pytest.mark.cpu
 def test_readiness_warm_grows_the_stash_to_the_decode_warm_bucket(monkeypatch):
     """One capture per bucket at startup has to replace the ones the first
     requests paid.
@@ -1092,6 +1094,7 @@ def test_readiness_warm_grows_the_stash_to_the_decode_warm_bucket(monkeypatch):
     assert runner.captures == 3, "readiness left the graph to the first request"
 
 
+@pytest.mark.cpu
 def test_serving_below_the_warm_bucket_takes_the_stash_without_rebuilding(monkeypatch):
     """The warm stash is only worth what ``_decode_context`` does with it.
 
@@ -1113,6 +1116,7 @@ def test_serving_below_the_warm_bucket_takes_the_stash_without_rebuilding(monkey
     assert stash[1].captures == 3, "reuse must not re-capture"
 
 
+@pytest.mark.cpu
 def test_serving_below_the_warm_bucket_switches_buckets_without_capturing(monkeypatch):
     """Crossing a bucket inside the warm stash must switch graphs, not capture.
 
@@ -1152,6 +1156,7 @@ def test_serving_below_the_warm_bucket_switches_buckets_without_capturing(monkey
     assert runner.captures == 4, "a later step in the new bucket re-captured"
 
 
+@pytest.mark.cpu
 def test_warm_leaves_no_stash_when_it_cannot_be_reused(monkeypatch):
     """Whatever warmup captures has to obey the same rules serving does: the
     kill switch, the device probe, dynamic LoRA and a missing prefill cache
@@ -1184,6 +1189,7 @@ def test_warm_leaves_no_stash_when_it_cannot_be_reused(monkeypatch):
     assert getattr(host, "_paged_decode", None) is None, "warm captured without a prefill cache"
 
 
+@pytest.mark.cpu
 def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
     """The eager fallback path and the paged one fail independently, so a warmup
     prefill that raises must not stop the graph capture from being attempted."""
@@ -1200,6 +1206,7 @@ def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
     assert seen == [None], "a failed prefill warmup skipped the graph warmup"
 
 
+@pytest.mark.cpu
 def test_a_working_prefill_warmup_builds_the_readiness_stash(monkeypatch):
     """The hand-off from the eager warmup to the graph warm is the one path no
     other test drives: the dummy-warmup test stubs ``_warm_ar_decode`` out, the
