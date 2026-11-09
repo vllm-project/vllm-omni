@@ -1348,8 +1348,15 @@ class ModelChannel:
             return close_reason, emitted_response
         emitted_response = True
         response_created = False
+        # Draining output keeps its request's existing response ownership;
+        # it does not reserve a future response or advance the append fence.
         response_id = draining_response_id or session.active_response_id
         if response_id is None:
+            if model_turn_id is not None and model_turn_id > session.turn_id:
+                # Appends fence on the active response turn, so the session
+                # turn must not trail it, even with auto_response disabled.
+                # Close superseded turns' timing before binding the new one.
+                session.complete_model_turn(model_turn_id - 1)
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
         response_request_metrics = session.mark_response_first_outputs(
