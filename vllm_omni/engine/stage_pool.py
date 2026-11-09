@@ -1711,7 +1711,16 @@ class StagePool:
             if call_utility is None:
                 continue
             try:
-                await call_utility("omni_update_dit_load", payload)
+                await asyncio.wait_for(
+                    call_utility("omni_update_dit_load", payload),
+                    timeout=0.5,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[StagePool] push_dit_load timed out (0.5s) for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                )
             except Exception:
                 logger.warning(
                     "[StagePool] push_dit_load failed for stage=%s replica=%s",

@@ -1302,6 +1302,12 @@ class OrchestratorBase:
 
         load = await pool.poll_dit_load(replica_id)
         if load is None:
+            # Poll failed — evict this replica's stale data so the snapshot
+            # only reflects live replicas. If all replicas fail, snapshot()
+            # returns fresh=False → DTPS falls back to FCFS.
+            removed = state.remove(stage_id, replica_id)
+            if removed:
+                await self._push_dit_load_to_ar(state)
             return
         waiting, running, waiting_ids, running_ids = load
         try:
@@ -1446,6 +1452,10 @@ class OrchestratorBase:
                         except EngineDeadError as e:
                             await ready_q.put(("error", stage_id, replica_id, e))
                             continue
+                        # [OmniDTPS] Poll DiT load alongside diffusion output,
+                        # mirroring the legacy loop's _poll_dit_load_throttled call.
+                        if self._dit_load_aware:
+                            await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                         if output is None:
                             continue
                         await ready_q.put(("diffusion", stage_id, replica_id, output))

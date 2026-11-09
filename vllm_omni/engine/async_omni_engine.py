@@ -55,8 +55,8 @@ class AsyncOmniEngine(OmniEngineBase):
     def _detect_dit_load_aware(self) -> bool:
         """Return True if any AR stage has dit_load_aware enabled."""
         for cfg in self.stage_configs:
-            ea = getattr(cfg, "engine_args", None)
-            if getattr(ea, "dit_load_aware", False):
+            mc = getattr(cfg, "model_config", None)
+            if getattr(mc, "dit_load_aware", False):
                 return True
         return False
 

@@ -75,10 +75,13 @@ class DitLoadState:
             self._per_replica[key] = new_entry
             return True
 
-    def remove(self, stage_id: int, replica_id: int) -> None:
+    def remove(self, stage_id: int, replica_id: int) -> bool:
+        """Remove a replica's load data. Returns True if data was present."""
         key = (int(stage_id), int(replica_id))
         with self._lock:
+            existed = key in self._per_replica
             self._per_replica.pop(key, None)
+            return existed
 
     def snapshot(self) -> DitLoadSnapshot:
         with self._lock:
