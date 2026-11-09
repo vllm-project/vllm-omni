@@ -70,6 +70,7 @@ class QueryResponse:
     data_size: int
     is_fast_path: bool
     protocol_version: int = 0
+    native_tcp_proto_version: int = 0
 
 
 @dataclass
@@ -84,6 +85,7 @@ class MooncakeAgentMetadata:
     dst_addrs: list[int]
     lengths: list[int]
     protocol_version: int = 0
+    native_tcp_proto_version: int = 0
 
 
 class MooncakeTransferEngineConnector(OmniConnectorBase):
@@ -175,6 +177,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.protocol = config.get("protocol", "rdma")
         if os.environ.get("MC_TCP_PROTO") == "1":
             raise ValueError("Mooncake protocol v2 requires acknowledged TCP completion; unset MC_TCP_PROTO=1")
+        try:
+            self.native_tcp_proto_version = int(config.get("native_tcp_proto_version", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("native_tcp_proto_version must be an integer") from exc
+        if self.protocol.lower() == "tcp" and self.native_tcp_proto_version < 2:
+            raise ValueError(
+                "Mooncake TCP requires native_tcp_proto_version=2; "
+                "the installed SDK capability must be verified explicitly"
+            )
 
         # --- RDMA Device Configuration ---
         # Specify device names to filter (comma-separated), or empty for all devices.
@@ -581,6 +592,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             metadata = {
                 "source_host": self.host,
                 "protocol_version": _PROTOCOL_VERSION,
+                "native_tcp_proto_version": self.native_tcp_proto_version,
                 "source_port": self.zmq_port,
                 "data_size": size,
                 "is_fast_path": is_fast_path,  # Hint: True = return ManagedBuffer, False = deserialize
@@ -632,6 +644,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return {
                 "source_host": host,
                 "protocol_version": query_resp.protocol_version,
+                "native_tcp_proto_version": query_resp.native_tcp_proto_version,
                 "source_port": port,
                 "data_size": query_resp.data_size,
                 "is_fast_path": query_resp.is_fast_path,
@@ -759,6 +772,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         if metadata.get("protocol_version") != _PROTOCOL_VERSION:
             raise RuntimeError("Mooncake deadline receive requires protocol v2 on both peers")
+        if self.protocol.lower() == "tcp" and (
+            metadata.get("native_tcp_proto_version") != 2 or self.native_tcp_proto_version != 2
+        ):
+            raise RuntimeError("Mooncake TCP acknowledged completion is not available on both peers")
 
         _t1 = _time_mod.perf_counter()
         query_ms = (_t1 - _t0) * 1000
@@ -913,6 +930,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             dst_addrs=[dst_ptr],
             lengths=[data_size],
             protocol_version=_PROTOCOL_VERSION,
+            native_tcp_proto_version=self.native_tcp_proto_version,
         )
         size_timeout_ms = (data_size // _TRANSFER_TIMEOUT_STEP_BYTES) * _TRANSFER_TIMEOUT_PER_STEP_MS
         timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
@@ -1359,6 +1377,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if meta.protocol_version != _PROTOCOL_VERSION:
                 response = TRANS_ERROR
                 return
+            if self.protocol.lower() == "tcp" and (
+                meta.native_tcp_proto_version != 2 or self.native_tcp_proto_version != 2
+            ):
+                response = TRANS_NOT_SUBMITTED
+                return
             with self._state_lock:
                 item = self._local_buffers.get(meta.request_id)
                 if self._closing or item is None or meta.request_id in self._in_flight_buffers:
@@ -1423,6 +1446,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     data_size=src_lengths[0] if src_lengths else 0,
                     is_fast_path=is_fast_path,
                     protocol_version=_PROTOCOL_VERSION,
+                    native_tcp_proto_version=self.native_tcp_proto_version,
                 )
                 response_queue.put((identity, msgspec.msgpack.encode(resp)))
 
