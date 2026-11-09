@@ -92,6 +92,8 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
     runner.model_state.prepare_inputs.return_value = {}
     runner._omni_data_plane = object()
     runner.supports_mm_inputs = False
+    runner.encoder_cache = None
+    runner.pcp_manager = None
     runner.lora_config = None
     runner.is_encoder_decoder = False
     runner.aux_output_connector = None
@@ -118,7 +120,8 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
         num_tokens_after_padding=1,
         is_padding=None,
     )
-    runner.gather_batch_req_state = MagicMock(return_value=(None if dummy_run else SimpleNamespace(num_tokens=1), 1))
+    batch_req_state = None if dummy_run else SimpleNamespace(num_tokens=1, has_prefill=False)
+    runner.gather_batch_req_state = MagicMock(return_value=(batch_req_state, 1))
     runner.prepare_inputs = MagicMock(return_value=input_batch)
     runner.prepare_attn = runner.prepare_dummy_attn = MagicMock(return_value=((), torch.empty(0)))
     monkeypatch.setattr(runner, "_make_dummy_input_batch", MagicMock(return_value=input_batch))
