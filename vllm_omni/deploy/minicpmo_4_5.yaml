@@ -230,7 +230,6 @@ platforms:
           stop_token_ids: [1]
 
   npu:
-    model_runner: v2
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is
