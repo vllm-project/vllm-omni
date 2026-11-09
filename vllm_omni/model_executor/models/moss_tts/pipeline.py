@@ -188,7 +188,9 @@ def resolve_moss_capabilities(declaration: ServingCapabilities, stages: Sequence
     from vllm_omni.model_executor.models.moss_tts.model_variant import detect_moss_variant
 
     first = stages[0]
-    args = first.get("engine_args") if isinstance(first, Mapping) else getattr(first, "engine_args", None)
+    args = first.get("model_config") if isinstance(first, Mapping) else getattr(first, "model_config", None)
+    if args is None:
+        args = first.get("engine_args") if isinstance(first, Mapping) else getattr(first, "engine_args", None)
     model = args.get("model") if isinstance(args, Mapping) else getattr(args, "model", None)
     if not isinstance(model, str):
         return declare_capabilities(

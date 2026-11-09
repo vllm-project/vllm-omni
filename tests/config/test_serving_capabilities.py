@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 from transformers import Qwen3OmniMoeConfig
 
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
-from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.config.stage_config import DeployConfig, StageConfig
 from vllm_omni.diffusion.capability_resolvers import MINIMAX_H3_CAPABILITIES, resolve_minimax_h3_capabilities
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
@@ -150,10 +151,24 @@ def test_declaration_rejects_contradictory_ownership():
         ("ref2va", {"text_to_video"}),
     ],
 )
-def test_h3_partition_exclusions_do_not_invent_worker_release_tasks(task_type, excluded):
-    declaration = resolve_minimax_h3_capabilities(
-        MINIMAX_H3_CAPABILITIES, [StageConfig(0, "diffusion", yaml_engine_args={"task_type": task_type}).to_omegaconf()]
-    )
+@pytest.mark.parametrize("config_format", ["legacy", "structured_native", "structured_generic"])
+def test_h3_partition_exclusions_do_not_invent_worker_release_tasks(task_type, excluded, config_format):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
+
+    if config_format == "structured_native":
+        stages = VllmOmniConfig.from_pipeline_config(
+            MINIMAX_H3_PIPELINE,
+            user_deploy_config=DeployConfig(),
+            cli_overrides={"model": "local-checkpoint", "task_type": task_type},
+        ).stage_configs
+    elif config_format == "structured_generic":
+        stages = StageConfigFactory.create_typed_default_diffusion(
+            "local-checkpoint", {"model_class_name": "MiniMaxH3Pipeline", "task_type": task_type}
+        ).stage_configs
+    else:
+        stages = [StageConfig(0, "diffusion", yaml_engine_args={"task_type": task_type}).to_omegaconf()]
+    declaration = resolve_minimax_h3_capabilities(MINIMAX_H3_CAPABILITIES, stages)
     for profile in declaration.get("video_generation").profiles:
         assert profile.support == ("unsupported" if profile.id in excluded else "unknown")
         assert profile.reason_code == (
@@ -194,7 +209,11 @@ def test_startup_refiner_is_optional_serializable_and_uses_resolved_stages():
     from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 
     engine = object.__new__(OmniEngineBase)
-    engine.stage_configs = [StageConfig(0, "diffusion", yaml_engine_args={"task_type": "ref2va"}).to_omegaconf()]
+    engine.stage_configs = VllmOmniConfig.from_pipeline_config(
+        MINIMAX_H3_PIPELINE,
+        user_deploy_config=DeployConfig(),
+        cli_overrides={"model": "local-checkpoint", "task_type": "ref2va"},
+    ).stage_configs
     engine._set_pipeline_runtime_config(MINIMAX_H3_PIPELINE, None)
     assert _profile(engine.serving_capabilities, "video_generation", "text_to_video").support == "unsupported"
     assert _profile(MINIMAX_H3_PIPELINE.serving_capabilities, "video_generation", "text_to_video").support == "unknown"
@@ -212,13 +231,18 @@ def test_startup_refiner_is_optional_serializable_and_uses_resolved_stages():
         ("OpenMOSS-Team/MOSS-VoiceGenerator", "text_to_speech", ("text", "instructions")),
     ],
 )
-def test_moss_shared_topology_preserves_distinct_speech_contracts(model, profile_id, inputs):
+@pytest.mark.parametrize("config_format", ["legacy", "structured"])
+def test_moss_shared_topology_preserves_distinct_speech_contracts(model, profile_id, inputs, config_format):
     from vllm_omni.model_executor.models.moss_tts.pipeline import MOSS_TTS_PIPELINE, resolve_moss_capabilities
 
-    declaration = resolve_moss_capabilities(
-        MOSS_TTS_PIPELINE.serving_capabilities,
-        [StageConfig(0, "moss_tts", yaml_engine_args={"model": model}).to_omegaconf()],
+    stages = (
+        VllmOmniConfig.from_pipeline_config(
+            MOSS_TTS_PIPELINE, user_deploy_config=DeployConfig(), cli_overrides={"model": model}
+        ).stage_configs
+        if config_format == "structured"
+        else [StageConfig(0, "moss_tts", yaml_engine_args={"model": model}).to_omegaconf()]
     )
+    declaration = resolve_moss_capabilities(MOSS_TTS_PIPELINE.serving_capabilities, stages)
     profile = _profile(declaration, "speech", profile_id)
     assert profile.support == "supported" and profile.required_inputs == inputs
     if profile_id == "caption_to_audio":

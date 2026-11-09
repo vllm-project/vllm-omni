@@ -60,6 +60,16 @@ def _field(value: object, name: str) -> object:
     return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
 
 
+def _stage_task_type(stage: object) -> object:
+    # Structured stages are the production owner. Keep the legacy view for
+    # plugins overriding the historical stage-config resolution seam.
+    for owner in ("diffusion_config", "model_config", "engine_args"):
+        task = _field(_field(stage, owner), "task_type")
+        if task is not None:
+            return task
+    return None
+
+
 def resolve_minimax_h3_capabilities(declaration: ServingCapabilities, stages: Sequence[object]) -> ServingCapabilities:
     """Apply explicit partition exclusions; release task lists stay unknown.
 
@@ -67,9 +77,7 @@ def resolve_minimax_h3_capabilities(declaration: ServingCapabilities, stages: Se
     reads the release's task list, which can further narrow those components.
     An explicit partition therefore proves exclusions, but not admission.
     """
-    task_types = {
-        str(task).lower() for stage in stages if (task := _field(_field(stage, "engine_args"), "task_type")) is not None
-    }
+    task_types = {str(task).lower() for stage in stages if (task := _stage_task_type(stage)) is not None}
     # Conflicting stage overrides cannot establish a single public contract.
     if len(task_types) != 1:
         return declaration
