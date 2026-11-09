@@ -18,20 +18,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"np
 @pytest.mark.parametrize("cached,alias", [(0, False), (17, False), (17, True), (512, False), (512, True)])
 @pytest.mark.parametrize("mask_kind", ["none", "padding", "ragged"])
 @pytest.mark.parametrize("qkv_bias", [False, True])
-@pytest.mark.parametrize("extra_capacity", [0, 3])
 @torch.inference_mode()
-def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_capacity):
+def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias):
     decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     prepare_code2wav_graph_runtime()
     torch.manual_seed(42)
     batch, frames, heads, dim = 2, 6, 2, 16
     attn = decoder.Attention(heads * dim, heads, dim, qkv_bias=qkv_bias, qk_norm=True).npu().eval()
     x = torch.randn(batch, frames, heads * dim, device="npu")
-    # _attend_in_place keeps a split (2, N, H, capacity, D) K/V buffer:
+    # _attend_in_place keeps a split (2, N, H, frames, D) K/V buffer:
     # K in the leading half, V in the trailing one.
-    kv = torch.randn(2, batch, heads, frames + cached + extra_capacity, dim, device="npu")
+    kv = torch.randn(2, batch, heads, frames + cached, dim, device="npu")
     span = frames + cached
-    tail = kv[:, :, :, span:].clone()
     cache = kv[:, :, :, frames:span] if cached else None
     if cache is not None and not alias:
         cache = cache.clone()
@@ -46,19 +44,10 @@ def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_ca
         mask[..., -2:] = False
 
     with npu_token2wav_sdpa_context(require_math=True):
-        if extra_capacity:
-            # A buffer wider than the live span would attend tail frames
-            # nobody wrote; the fused path refuses it without touching the tail.
-            with pytest.raises(ValueError, match="live span"):
-                BatchedToken2Wav._attend_in_place(attn, x, cache, mask, kv)
-            torch.testing.assert_close(kv[:, :, :, span:], tail)
-            return
-
         expected, expected_cache = attn.forward_chunk(x, packed(cache), mask)
         actual = BatchedToken2Wav._attend_in_place(attn, x, cache, mask, kv)
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
         torch.testing.assert_close(packed(kv[:, :, :, :span]), expected_cache)
-        torch.testing.assert_close(kv[:, :, :, span:], tail)
 
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
@@ -73,7 +62,29 @@ def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_ca
             torch.npu.synchronize()
             torch.testing.assert_close(replayed, expected, atol=2e-5, rtol=2e-5)
             torch.testing.assert_close(packed(kv[:, :, :, :span]), expected_cache)
-            torch.testing.assert_close(kv[:, :, :, span:], tail)
+
+
+@pytest.mark.parametrize("cached", [0, 17])
+@torch.inference_mode()
+def test_attention_rejects_a_buffer_wider_than_the_live_span(cached):
+    decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    prepare_code2wav_graph_runtime()
+    torch.manual_seed(42)
+    batch, frames, heads, dim = 2, 6, 2, 16
+    attn = decoder.Attention(heads * dim, heads, dim, qkv_bias=False, qk_norm=True).npu().eval()
+    x = torch.randn(batch, frames, heads * dim, device="npu")
+    # A padded buffer would attend tail frames nobody wrote, and the refusal
+    # sits after both the in-place cache copy and the cat branch, so exercise
+    # it with and without a cache. The tail frames must stay untouched.
+    kv = torch.randn(2, batch, heads, frames + cached + 3, dim, device="npu")
+    span = frames + cached
+    tail = kv[:, :, :, span:].clone()
+    cache = kv[:, :, :, frames:span] if cached else None
+    with npu_token2wav_sdpa_context(require_math=True):
+        with pytest.raises(ValueError, match="live span"):
+            BatchedToken2Wav._attend_in_place(attn, x, cache, None, kv)
+        torch.testing.assert_close(kv[:, :, :, span:], tail)
+
 
 @pytest.mark.parametrize("inference", [False, True])
 def test_packed_qkv_tracks_weight_and_bias_loads(inference):

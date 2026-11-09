@@ -405,6 +405,6 @@ def test_fused_tail_keeps_a_valid_distribution_on_tied_logits(name, top_p):
     # count and the sorted kept values, which the kernel guarantees by
     # construction, not the identity of the kept members.
     assert int(kept.sum()) == int(kept_eager.sum()), f"{name}/{top_p}: kept count differs"
-    assert torch.equal(
-        torch.sort(fused[kept]).values, torch.sort(eager[kept_eager]).values
-    ), f"{name}/{top_p}: kept logits differ"
+    assert torch.equal(torch.sort(fused[kept]).values, torch.sort(eager[kept_eager]).values), (
+        f"{name}/{top_p}: kept logits differ"
+    )
