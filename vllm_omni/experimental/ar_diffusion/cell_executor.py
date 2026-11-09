@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -209,6 +209,7 @@ class PendingAdmit:
     req: str
     plan: CellPlan
     chunk_tokens: int
+    retain: frozenset[Cell] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -218,10 +219,32 @@ class ARDiffusionCellContext:
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
 
-    def enqueue(self, req: str, plan: CellPlan, *, chunk_tokens: int) -> None:
-        self.pending.append(PendingAdmit(req=req, plan=plan, chunk_tokens=chunk_tokens))
+    def enqueue(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        retain: Collection[Cell] | None = None,
+    ) -> None:
+        self.pending.append(
+            PendingAdmit(
+                req=req,
+                plan=plan,
+                chunk_tokens=chunk_tokens,
+                retain=frozenset(retain or ()),
+            )
+        )
 
-    def admit(self, req: str, plan: CellPlan, *, chunk_tokens: int, slot: int) -> bool:
+    def admit(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        slot: int,
+        retain: Collection[Cell] | None = None,
+    ) -> bool:
         pending = tuple(self.inflight)
         # Sink bootstrap contains a replica-local wrap. Keep its activation
         # packets request-local until mixed-bootstrap batching is supported.
@@ -235,7 +258,7 @@ class ARDiffusionCellContext:
         inflight_tokens = {self.kv._chunk_tokens[item.req] for item in self.inflight}
         if inflight_tokens and chunk_tokens not in inflight_tokens:
             return False
-        self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot)
+        self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot, retain=retain)
         self.inflight.append(Inflight(req=req, t0=slot, plan=plan))
         self.kv.set_inflight(tuple(self.inflight))
         return True
@@ -243,7 +266,8 @@ class ARDiffusionCellContext:
     def drop(self, req: str) -> None:
         self.inflight = [item for item in self.inflight if item.req != req]
         self.pending = [item for item in self.pending if item.req != req]
-        self.kv.end_request(req)
+        # Fail-closed: drop session history for this id as well as temporary cells.
+        self.kv.end_request(req, retain=())
         self.kv.set_inflight(tuple(self.inflight))
 
     def admit_pending(self, slot: int) -> None:
@@ -252,7 +276,13 @@ class ARDiffusionCellContext:
             if still:
                 still.append(item)
                 continue
-            if self.admit(item.req, item.plan, chunk_tokens=item.chunk_tokens, slot=slot):
+            if self.admit(
+                item.req,
+                item.plan,
+                chunk_tokens=item.chunk_tokens,
+                slot=slot,
+                retain=item.retain,
+            ):
                 continue
             still.append(item)
         self.pending = still
@@ -367,6 +397,9 @@ def run_cell_pipeline(
         while (ctx.inflight or ctx.pending) and slot < limit:
             ctx.admit_pending(slot)
             kv.set_inflight(tuple(ctx.inflight))
+            # Prior-history handoffs for requests that start on this global slot must
+            # complete before their first prepare (exchange normally runs after forward).
+            kv.exchange_and_await_prior_handoffs(slot)
             tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
             _assert_i8(tasks)
             schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None

@@ -41,7 +41,7 @@ import time
 import wave
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Container, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -510,6 +510,13 @@ _FATAL_RESUME_CODES = frozenset(
     }
 )
 
+#: Error codes a duplex server uses to refuse a ``response.create``: the
+#: committed turn holds nothing the model can answer, so no response will ever
+#: be produced for that ask. A caller waiting on such a request should treat
+#: these as a definitive answer rather than as a failure -- and, symmetrically,
+#: must not read them as a health signal about the session.
+DEFINITIVE_REFUSAL_CODES = frozenset({"response_create_without_input", "text_only_turn_unsupported"})
+
 
 def wrap_event(raw: dict[str, object]) -> DuplexEvent:
     event_type = raw.get("type")
@@ -921,19 +928,30 @@ class DuplexClientBase(ABC):
 
     # -- server-side stats -----------------------------------------------------
 
-    async def get_session_stats(self, *, timeout_s: float = 10.0) -> dict[str, object]:
+    async def get_session_stats(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        event_id: str | None = None,
+    ) -> dict[str, object]:
         """Fetch the server's per-turn stage work and audio (``session.stats``, RFC #8325).
 
         Needs ``capabilities.supports_session_stats`` (``duplex_session.collect_stats``
         on the server). Busy RTF and stall ratio are derived from the returned raw
         document by ``vllm_omni.benchmarks.duplex_session_metrics``.
         """
-        event_id = f"evt_{uuid4().hex}"
+        request_id = event_id or f"evt_{uuid4().hex}"
         # Subscribe before sending: the reply can arrive before send() returns.
         queue = self._add_subscriber()
         try:
-            await self.send({"type": "session.stats.get", "event_id": event_id})
             deadline = time.monotonic() + timeout_s
+            try:
+                await asyncio.wait_for(
+                    self.send({"type": "session.stats.get", "event_id": request_id}),
+                    timeout=timeout_s,
+                )
+            except TimeoutError as exc:
+                raise asyncio.TimeoutError("timed out sending session.stats.get") from exc
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -941,9 +959,9 @@ class DuplexClientBase(ABC):
                 item = await asyncio.wait_for(queue.get(), remaining)
                 if isinstance(item, _ClosedMarker):
                     raise DuplexSessionClosedError(item.reason)
-                if isinstance(item, ErrorEvent) and item.related_event_id == event_id:
+                if isinstance(item, ErrorEvent) and item.related_event_id == request_id:
                     raise item.to_exception()
-                if item.type == "session.stats" and item.raw.get("request_event_id") == event_id:
+                if item.type == "session.stats" and item.raw.get("request_event_id") == request_id:
                     stats = item.raw.get("stats")
                     return stats if isinstance(stats, dict) else {}
         finally:
@@ -1579,8 +1597,18 @@ class EventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
-    def errors(self) -> list[dict[str, object]]:
-        return [event for event in self.events if event.get("type") == "error"]
+    def errors(self, exclude_indexes: Container[int] = frozenset()) -> list[dict[str, object]]:
+        """Collected ``error`` events, optionally skipping forgive-list indexes.
+
+        ``exclude_indexes`` refers to positions in :attr:`events`, so callers
+        that forgive specific errors keep a single definition of what an error
+        is instead of re-filtering ``events`` themselves.
+        """
+        return [
+            event
+            for index, event in enumerate(self.events)
+            if event.get("type") == "error" and index not in exclude_indexes
+        ]
 
     def response_is_done(self, response_id: str) -> bool:
         return any(

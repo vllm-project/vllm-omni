@@ -1048,6 +1048,33 @@ class MiniMaxH3DiTModel(nn.Module):
                         head_dim=self.arch.attention_head_dim,
                     )
                     weight_loader(param, loaded_weight)
+            elif name.endswith(
+                (
+                    ".attn.qkv_proj.qweight",
+                    ".attn.qkv_proj.proj_up",
+                    ".attn.qkv_proj.wcscales",
+                )
+            ):
+                # Serialized quantization checkpoints keep the same grouped
+                # Q/K/V row order as the BF16 checkpoint. Reorder every tensor
+                # with an output dimension before the QKV loader shards it.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.wscales"):
+                # E8M0 scales are stored [K // block, N], so reorder their N
+                # axis through the same grouped-QKV permutation.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight.T,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                ).T.contiguous()
+                weight_loader(param, loaded_weight)
             elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
                 if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)

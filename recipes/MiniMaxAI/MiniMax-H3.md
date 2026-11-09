@@ -622,16 +622,18 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-Install (ROCm wheel + source vLLM-Omni):
+For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
+source using the repository Dockerfile, from the Omni repository root:
 
 ```bash
-pip install "vllm==0.26.0+rocm723" \
-  --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
-VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
 ```
 
-Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. All tasks work out of the box:
-the image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
+See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
+for source/runtime details. Container and native H3 validation on ROCm remain
+pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+
+Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
 
 ### ROCm single GPU
@@ -1629,6 +1631,13 @@ differ from each other.
 
 The four-step adapter recipe has moved to the [FastH3 section](../FastVideo/README.md):
 [FastH3](../FastVideo/FastH3.md).
+
+### Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+re-renders a 768P draft from this model at 2560x1440 in three steps. It is a
+load-time adapter served as its own deployment; see
+[Open-H3-Regenerate-2K — H200](../Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md).
 
 ### FastH3 8-Step V2 full checkpoint
 

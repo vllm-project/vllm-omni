@@ -6,7 +6,9 @@ Drives a real MiniCPM-o 4.5 duplex session end to end through
 :class:`DuplexClient`: session handshake with reference audio, paced PCM
 streaming, a speak response consumed via :class:`ResponseHandle` with
 incremental playback acks, a forced transport drop recovered by automatic
-``session.resume``, and a clean close.
+``session.resume``, and a clean close. The live server needs real weights (``--run-level
+advanced_model``): random weights may never emit the turn terminator that
+completes the response. The assertions remain basic client lifecycle checks.
 """
 
 from __future__ import annotations

@@ -63,12 +63,62 @@ def test_runner_assisted_mixed_batch_has_independent_token_and_request_capacity(
 def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
     runner._staged_writes = staged_writes.StagedWrites()
     runner.model = MagicMock()
     runner.model_config = SimpleNamespace(logits_processors=None)
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+@pytest.mark.parametrize("hook_fails", [False, True])
+def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monkeypatch, hook_fails):
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.worker.gpu import model_runner as upstream_model_runner
+
+    from vllm_omni.worker_v2 import omni_model_runner
+
+    runner = _make_runner()
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+    runner.use_aux_hidden_state_outputs = False
+    runner.model = SimpleNamespace(has_preprocess=False)
+    state = object.__new__(OmniModelState)
+    state.model = runner.model
+    sampler_kernel = object()
+    outer_kernel = object()
+    outer_registry = JitWarmupRegistry(SimpleNamespace())
+
+    def custom_sampler(sampler):
+        JitWarmupRegistry.register(sampler_kernel)
+        if hook_fails:
+            raise RuntimeError("custom sampler initialization failed")
+        return sampler, None
+
+    runner.model.mrv2_custom_sampler = custom_sampler
+
+    def upstream_load(self):
+        # Match the target's ordering: model state and its sampler hook are
+        # initialized after the model-construction registry context ends.
+        self.model_state = upstream_model_runner.init_model_state(None, self.model, None, None)
+        self.model_state.custom_sampler(object())
+
+    monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load)
+    monkeypatch.setattr(omni_model_runner, "init_omni_model_state", lambda *args: state)
+    monkeypatch.setattr(runner, "_configure_cudagraph_output_contract", lambda: None)
+
+    original_init_model_state = upstream_model_runner.init_model_state
+    with outer_registry.activate():
+        if hook_fails:
+            with pytest.raises(RuntimeError, match="custom sampler initialization failed"):
+                runner.load_model()
+        else:
+            runner.load_model()
+        JitWarmupRegistry.register(outer_kernel)
+
+    assert set(runner.jit_warmup_registry._registrations) == {sampler_kernel}
+    assert set(outer_registry._registrations) == {outer_kernel}
+    assert upstream_model_runner.init_model_state is original_init_model_state
 
 
 @pytest.mark.parametrize("moss", [False, True])
@@ -225,6 +275,8 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
         apply_duplex_kv_reanchor=lambda r, scheduler_output: order.append(("reanchor", r, scheduler_output))
     )
     runner.aux_output_connector = None
+    # Encoder payload updates are disabled in this fixture.
+    runner.encoder_cache = None
     output = object()
     runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
     runner._merge_ec_connector_no_forward = lambda _s, value: value
@@ -577,6 +629,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner.is_encoder_decoder = False
     runner.eplb = MagicMock()
     runner.kv_connector = MagicMock()
+    runner.pcp_manager = None
     runner.input_buffers = object()
     runner.kv_cache_config = object()
     runner.attn_groups = []
@@ -646,6 +699,7 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     runner.cudagraph_manager = MagicMock()
     runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
     runner.use_aux_hidden_state_outputs = True
+    runner.pcp_manager = None
     runner.model_config = SimpleNamespace()
     runner.vllm_config = SimpleNamespace()
     runner.req_states = SimpleNamespace()

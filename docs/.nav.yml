@@ -15,6 +15,7 @@ nav:
         - Image Edit: serving/image_edit_api.md
         - Image Segmentation: serving/image_segmentation_api.md
         - Video Segmentation: serving/video_segmentation_api.md
+        - Video Depth: serving/video_depth_api.md
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
         - Full Duplex OpenAI: serving/realtime_openai_duplex_api.md
