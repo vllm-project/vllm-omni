@@ -59,6 +59,7 @@ nav:
       - Independent Stage Execution (experimental): features/independent_stage_execution.md
       - Sleep Mode: features/sleep_mode.md
       - HF Numerics for RL Rollouts: features/hf_numerics.md
+      - Encoder Length Bucketing (experimental): features/encoder_length_bucketing.md
     - Watermarking: features/watermarking.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md

@@ -415,6 +415,9 @@ stages:
 
 ### Encoder length bucketing
 
+For a quick start (enable via deploy YAML or `--stage-overrides`), see the
+[Encoder Length Bucketing](../features/encoder_length_bucketing.md) user guide.
+
 `stages[].additional_config.audio_bucket_seconds` enables length bucketing for
 variable-length encoders on that stage. The feature is **off by default** —
 unset (or `[]`) disables it — because the path is lossy for some encoder

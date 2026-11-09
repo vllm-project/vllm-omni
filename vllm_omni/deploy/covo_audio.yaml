@@ -16,6 +16,11 @@ trust_remote_code: true
 
 stages:
   - stage_id: 0
+    # Optional: encoder length bucketing (off by default). NOTE: lossy for
+    # Covo's unmasked fixed-window encoder — outputs may differ from the
+    # un-bucketed forward. See docs/features/encoder_length_bucketing.md
+    # additional_config:
+    #   audio_bucket_seconds: [2, 4, 8, 16, 30]
     max_num_seqs: 1
     gpu_memory_utilization: 0.5
     mm_processor_cache_gb: 0

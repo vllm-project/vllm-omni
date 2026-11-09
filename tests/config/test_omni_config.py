@@ -487,6 +487,30 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
 
 
+def test_audio_bucketing_opt_in_override_reaches_stage_engine_args():
+    """Pin the enablement path documented in docs/features/encoder_length_bucketing.md.
+
+    ``--stage-overrides '{"0": {"additional_config": {"audio_bucket_seconds": [...]}}}'``
+    must survive config resolution into the engine args that build ``VllmConfig`` —
+    the config surface ``install_bucketed_encoders`` reads the knob from. The
+    ``OmniEngineArgs`` field filter is the drop-risk link: a knob missing from
+    the dataclass surface would be silently discarded there.
+    """
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    knob = {"audio_bucket_seconds": [2.0, 4.0]}
+    omni_config = _from_pipeline_key(
+        "step_audio_2_asr",
+        cli_overrides={"stage_0_additional_config": dict(knob)},
+    )
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(omni_config.stage_by_id(0), model="test-model")
+    assert engine_args["additional_config"] == knob
+    assert filter_dataclass_kwargs(OmniEngineArgs, engine_args)["additional_config"] == knob
+
+
 def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
     """Flat CLI parallel flags override the deploy YAML's nested parallel_config.
 

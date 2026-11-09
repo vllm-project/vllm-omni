@@ -754,6 +754,17 @@ def install_bucketed_encoders(model: nn.Module, encoders: Mapping[str, nn.Module
     model._bucketed_installed = True
     if ladder is not None:
         logger.info("Bucketed encoder enabled over rungs %s for modules %s", ladder.buckets, wrapped)
+    elif verified is not None:
+        # Discoverability: the feature is available for this verified model but
+        # off by default (opt-in). Say so once at startup instead of hiding it
+        # behind a debug line — a user who never learns the knob exists cannot
+        # enable it.
+        logger.info(
+            "Encoder length bucketing is available for model_type %r but disabled; "
+            "enable it with stages[].additional_config.audio_bucket_seconds "
+            "(for example [2, 4, 8, 16, 30]); see docs/configuration/stage_configs.md",
+            vllm_config.model_config.hf_config.model_type,
+        )
     else:
         logger.debug("Bucketed encoder pass-through installed for modules %s (feature off)", wrapped)
     return wrapped
