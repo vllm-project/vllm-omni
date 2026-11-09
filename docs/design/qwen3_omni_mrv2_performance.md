@@ -18,11 +18,14 @@ stages for duplex on CUDA. Its Thinker request stays resident across turns,
 while Talker and Code2Wav remain per-turn. Turn-mode measurements do not
 establish duplex latency or interruption behavior.
 
+The default `qwen3_omni_moe.yaml` enables these codec options on CUDA. The
+codec chunk ramp and Code2Wav graph batch sizes apply on CUDA only; other
+platforms keep the 4-frame initial chunk and its graph shapes.
 First-frame delivery requires `talker_first_audio: true` in connector extra,
-a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix caching disabled.
-Other deployments retain the regular Code2Wav path.
-`codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
-the base V1 profile retains its original blocks and indexed text cache.
+a one-frame initial codec chunk, CUDA MRv2, a local single-rank Talker and
+Talker prefix caching disabled. Other deployments retain the regular Code2Wav path.
+`codec_fused_snake` opts CUDA into fused decoder blocks; other platforms
+retain the original blocks and indexed text cache.
 
 ## Ascend generation stage
 

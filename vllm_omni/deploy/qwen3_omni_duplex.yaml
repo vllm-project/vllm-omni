@@ -1,8 +1,8 @@
 # Concurrent input / interruptible VAD turns with resident Thinker KV.
-# CUDA uses Model Runner V2; non-CUDA platforms stay on V1 through the base
-# profile. Thinker retains KV across turns; Talker and Code2Wav remain per-turn.
+# CUDA uses Model Runner V2; other platforms use V1. Thinker retains KV across
+# turns; Talker and Code2Wav remain per-turn.
 # Native transport ends each turn independently of the resident Thinker.
-base_config: qwen3_omni_moe_mrv2.yaml
+base_config: qwen3_omni_moe.yaml
 
 session_mode: duplex
 
@@ -14,3 +14,8 @@ stages:
     limit_mm_per_prompt:
       audio: 4
       image: 8
+
+platforms:
+  # Resident Thinker continuation supports V1 and CUDA MRv2 only.
+  npu:
+    model_runner: v1

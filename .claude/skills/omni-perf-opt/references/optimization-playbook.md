@@ -99,7 +99,7 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 ## Model runner V2
 
 Knob: `model_runner: v2` (top-level or per stage). Ready-made overlays:
-`qwen3_omni_moe_mrv2.yaml`, `qwen3_omni_moe_mrv2_h200.yaml`,
+`qwen3_omni_moe_mrv2_h200.yaml` (Qwen3-Omni's default `qwen3_omni_moe.yaml` already uses V2),
 `minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`). MiniCPM-o duplex runs llm and code2wav on MRv2
 on CUDA through the default `minicpmo_4_5.yaml`; tts keeps v1 for multi-frame decode.
 

@@ -1699,6 +1699,11 @@ stages:
         connector = deploy.connectors["connector_of_shared_memory"]
         assert "async_chunk_batch_min_size" not in connector["extra"]
         assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
+        assert connector["extra"]["initial_codec_chunk_frames"] == 4
+        assert connector["extra"]["talker_first_audio"] is True
+        assert connector["extra"]["codec_chunk_ramp"] == [1, 2, 4, 8, 16, 25]
+        assert connector["extra"]["codec_graph_batch_sizes"] == [2, 3, 4, 6, 8, 12, 16]
+        assert connector["extra"]["codec_fused_snake"] is True
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -2104,7 +2109,7 @@ stages:
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
-            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_moe_mrv2_h200.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", True),
             *(("qwen3_omni_duplex.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
