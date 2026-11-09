@@ -1463,6 +1463,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
 
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
