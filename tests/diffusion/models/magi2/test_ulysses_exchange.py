@@ -440,11 +440,12 @@ def _head_shards(tensor, world_size):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("musa", [False, True])
-def test_attention_requests_head_shards_on_musa(monkeypatch, musa):
+@pytest.mark.parametrize("musa,world_size,expected", [(False, 4, False), (True, 1, False), (True, 4, True)])
+def test_attention_requests_head_shards_for_the_ulysses_degree(monkeypatch, musa, world_size, expected):
     monkeypatch.setattr(modeling_magi2, "current_omni_platform", SimpleNamespace(is_musa=lambda: musa))
+    monkeypatch.setattr(modeling_magi2, "get_magi2_ulysses_group", lambda: Magi2ParallelGroup(None, world_size, 0))
     module = Magi2Attention(_attention_config(torch.float32), num_modality=1)
-    assert module.packed_attention.attention.head_shard_output is musa
+    assert module.packed_attention.attention.head_shard_output is expected
 
 
 @pytest.mark.cpu
