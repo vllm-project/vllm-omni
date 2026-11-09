@@ -359,16 +359,16 @@ def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                split(command)[:6]
+                split(command)[:7]
                 == [
                     "python",
                     "-u",
                     ".buildkite/amd/scripts/run_cpu_suite.py",
+                    "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
                     "model-executor",
                     "-sv",
                     "tests/model_executor",
                 ]
-                and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
                 for command in commands
             ):
                 matches.append(step)
@@ -531,11 +531,12 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
     argv = split(pytest_command)
 
-    assert step["parallelism"] == 3
-    assert argv[:6] == [
+    assert step["parallelism"] == 5
+    assert argv[:7] == [
         "python",
         "-u",
         ".buildkite/amd/scripts/run_cpu_suite.py",
+        "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
         "model-executor",
         "-sv",
         "tests/model_executor",
@@ -546,8 +547,7 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         PERSONAPLEX_TEMPORAL_STRESS_NODES
     )
-    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
-    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
+    assert not any(arg.startswith(("--num-shards", "--shard-id")) for arg in argv)
     assert "-k" not in argv
 
 
@@ -998,7 +998,7 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     assert step["agent_pool"] == agent_pool
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
-    assert step["timeout_in_minutes"] == 40
+    assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == [artifacts]
     assert "retry" not in step
 
@@ -1014,6 +1014,7 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     run_argv = split(run_command)
     assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
     assert collect_argv[2] == str(expected_count)
+    assert "timeout --signal=TERM --kill-after=2m 40m" in run_command
 
     for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
         assert TINY_DIFFUSION_PATH in argv
@@ -1028,6 +1029,19 @@ def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
     assert "pytest.xml" in all_commands
     assert "pytest.log" in all_commands
     assert "pytest-summary.txt" in all_commands
+
+
+def test_flux2_klein_tiny_diffusion_has_cold_start_headroom() -> None:
+    """The distributed Flux2Klein cold start must not retain the 600s default."""
+    settings_source = Path("tests/model_tests/diffusion/model_settings.py").read_text(encoding="utf-8")
+    flux2_settings = settings_source.split('"Flux2KleinPipeline":', 1)[1].split('"LTX2Pipeline":', 1)[0]
+    config_source = Path("tests/model_tests/diffusion/config_types.py").read_text(encoding="utf-8")
+    offline_source = Path("tests/model_tests/diffusion/test_common_offline.py").read_text(encoding="utf-8")
+
+    assert "offline_init_timeout_s: int | None = None" in config_source
+    assert "offline_init_timeout_s=900" in flux2_settings
+    assert "if settings.offline_init_timeout_s is not None:" in offline_source
+    assert 'model_kwargs["init_timeout"] = settings.offline_init_timeout_s' in offline_source
 
 
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
@@ -1418,6 +1432,16 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "test_hunyuan_image_ep_startup.py" not in hunyuan_command
 
 
+def test_hunyuan_offline_accuracy_has_cold_start_headroom() -> None:
+    accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
+    offline_accuracy = accuracy.split("def _run_vllm_omni_hunyuan_image3_offline", maxsplit=1)[1].split(
+        "def _assert_against_baseline", maxsplit=1
+    )[0]
+
+    assert '"--stage-init-timeout",\n            "900"' in offline_accuracy
+    assert '"--init-timeout",\n            "1800"' in offline_accuracy
+
+
 def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     from vllm_omni.config.stage_config import resolve_deploy_yaml
 
@@ -1579,7 +1603,14 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         "tests/helpers/stage_config.py",
     ):
         assert dependency in qwen_deps
-    qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
+    qwen_step = _find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)
+    qwen_weekly = "\n".join(qwen_step["commands"])
+    assert qwen_step["env"] == {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
     known_red = "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
     assert 'collection_status="$${PIPESTATUS[0]}"' in qwen_weekly
     assert qwen_weekly.count(f"--deselect='{known_red}'") == 2
@@ -2309,31 +2340,61 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen3-TTS Perf" not in text
 
 
-def test_minicpmo_accuracy_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("MiniCPM-o 4.5 Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_1" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "exit 5" in commands
-    assert "pytest.xml" in commands
-    assert step["env"]["SEED_TTS_WER_EVAL"] == "1"
-    assert step["env"]["SEED_TTS_SIM_EVAL"] == "1"
-    assert "SEED_TTS_EVAL_DEVICE" not in commands
-    assert "SEED_TTS_UTMOS_EVAL" not in commands
-    assert "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes" in commands
-    for node in (
-        "test_minicpmo_4_5_daily_omni_accuracy_bench",
-        "test_minicpmo_4_5_seed_tts_wer_bench",
-    ):
-        assert node in commands
+def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
+    group = _find_group(":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
+    jobs: tuple[tuple[str, str, str, str, str, dict[str, str]], ...] = (
+        (
+            "MiniCPM-o 4.5 Daily-Omni Accuracy",
+            "test_minicpmo_4_5_daily_omni_accuracy_bench",
+            "artifacts/rocm-minicpmo-daily-omni-accuracy/**/*",
+            "ROCM_MINICPMO_DAILY_ACCURACY_ARTIFACT_DIR",
+            "Expected exactly one MiniCPM-o 4.5 Daily-Omni accuracy node",
+            {},
+        ),
+        (
+            "MiniCPM-o 4.5 Seed-TTS Accuracy",
+            "test_minicpmo_4_5_seed_tts_wer_bench",
+            "artifacts/rocm-minicpmo-seed-tts-accuracy/**/*",
+            "ROCM_MINICPMO_SEED_ACCURACY_ARTIFACT_DIR",
+            "Expected exactly one MiniCPM-o 4.5 Seed-TTS accuracy node",
+            {
+                "SEED_TTS_WER_EVAL": "1",
+                "SEED_TTS_SIM_EVAL": "1",
+                "VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S": "60",
+            },
+        ),
+    )
+
+    assert [step["label"] for step in group["steps"]] == [job[0] for job in jobs]
+    all_nodes = {job[1] for job in jobs}
+    for step, (label, node, artifact, artifact_env, collection_guard, env) in zip(group["steps"], jobs, strict=True):
+        commands = "\n".join(step["commands"])
+        assert step["label"] == label
+        assert step["grade"] == "NonBlocking"
+        assert step["agent_pool"] == "mi300_1"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["timeout_in_minutes"] == 180
+        assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
+        assert step["artifact_paths"] == [artifact]
+        assert step.get("env", {}) == env
+        assert "full_model and omni and rocm and MI325 and cards_1" in commands
+        assert "--run-level full_model" in commands
+        assert commands.count("--collect-only") == 1
+        assert "exit 5" in commands
+        assert "pytest.xml" in commands
+        assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+        assert artifact_env in commands
+        assert collection_guard in commands
+        assert commands.count(node) == 2
+        for other_node in all_nodes - {node}:
+            assert other_node not in commands
+        assert "SEED_TTS_EVAL_DEVICE" not in commands
+        assert "SEED_TTS_UTMOS_EVAL" not in commands
+
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
-        assert "MiniCPM-o 4.5 Accuracy" not in text
+        for label, *_ in jobs:
+            assert label not in text
 
 
 def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
