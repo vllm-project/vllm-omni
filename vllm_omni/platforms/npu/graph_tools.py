@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reusable exact-signature NPUGraph capture and replay helpers."""
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ class NPUExactGraphRunner:
         self.disable_config_hint = disable_config_hint
         self._use_shared_pool = use_shared_pool
         self._enabled = self.max_graphs > 0
+        self._frozen = False
         self._graphs: dict[tuple[object, ...], CapturedDeviceGraph] = {}
         self._failed_keys: set[tuple[object, ...]] = set()
         self._hits = 0
@@ -99,6 +100,10 @@ class NPUExactGraphRunner:
             "failed": len(self._failed_keys),
             "hits": self._hits,
         }
+
+    def freeze(self) -> None:
+        """Stop capturing: unseen signatures run eagerly, captured ones replay."""
+        self._frozen = True
 
     def capture(
         self,
@@ -162,6 +167,8 @@ class NPUExactGraphRunner:
             if self._hits == 1:
                 logger.info("%s started NPUGraph replay", self.component_name)
             return graph.replay(inputs)
+        if self._frozen:
+            return compute(*inputs)
 
         # Prime lazy kernels and allocator state before capture. The next call
         # with the same exact tensor signature replays this graph.
