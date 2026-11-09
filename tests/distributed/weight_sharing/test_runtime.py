@@ -518,3 +518,40 @@ def test_health_monitor_stops_with_orchestrator_before_group_close(host):
         assert runtime.termination_complete
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [None, (0, "synchronize"), (1, "synchronize")])
+def test_aborted_request_drains_all_ranks_before_resuming(host, monkeypatch, failure):
+    from vllm_omni.platforms import current_omni_platform
+
+    synchronized = []
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: synchronized.append(True))
+
+    async def drain():
+        host.events.append((0, "drain"))
+
+    async def resume():
+        host.events.append((0, "resume"))
+
+    host.drain_requests = drain
+    host.resume_provider = resume
+
+    async def run():
+        runtime = host.runtime.SharingRuntime(host.plan(), host)
+        await runtime.start()
+        host.events.clear()
+        host.fail_at = failure
+        if failure:
+            with pytest.raises(TimeoutError):
+                await runtime.drain_requests()
+            assert runtime.state == "FAILED"
+            assert (0, "resume") not in host.events
+        else:
+            await runtime.drain_requests()
+            assert host.events == [(0, "drain"), (0, "synchronize"), (1, "synchronize"), (0, "resume")]
+            assert len(synchronized) == 4  # Two TP ranks in each stage.
+            assert runtime.state == "READY"
+        host.fail_at = None
+        await runtime.close()
+
+    asyncio.run(run())

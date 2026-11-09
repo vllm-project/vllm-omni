@@ -417,7 +417,9 @@ def compare_semantic(
     return torch.dot(expected, features).item()
 
 
-def _generate_outputs(omni: Omni, use_system_prompt: str | None, image_size: int, *, include_text: bool = False):
+def _generate_outputs(
+    omni: Omni, use_system_prompt: str | None, image_size: int, *, include_text: bool = False, num_requests: int = 1
+):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -450,7 +452,8 @@ def _generate_outputs(omni: Omni, use_system_prompt: str | None, image_size: int
         "height": image_size,
         "width": image_size,
     }
-    return omni.generate(prompt, params_list)
+    prompts = prompt if num_requests == 1 else [dict(prompt) for _ in range(num_requests)]
+    return omni.generate(prompts, params_list)
 
 
 def _generate_image(omni: Omni, use_system_prompt: str | None, image_size: int = 1024) -> Image.Image:
@@ -465,8 +468,19 @@ def sharing_tp4_config():
 
 @pytest.mark.full_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
-def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_config):
+def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_config, monkeypatch):
     """Real model/connector test; CPU backend tests cannot establish this result."""
+    from vllm_omni.engine.stage_pool import StagePool
+
+    submitted = []
+    submit = StagePool.submit_initial
+
+    async def record_submit(pool, request_id, *args, **kwargs):
+        result = await submit(pool, request_id, *args, **kwargs)
+        submitted.append((pool.stage_id, request_id))
+        return result
+
+    monkeypatch.setattr(StagePool, "submit_initial", record_submit)
     with OmniRunner(
         MODEL_NAME,
         deploy_config=str(sharing_tp4_config),
@@ -477,10 +491,15 @@ def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_confi
         sharing = omni.engine._runtime.sharing
         assert sharing is not None and sharing.state == "READY"
         assert len(sharing.identities) == 4
-        for _ in range(2):
-            image = _generate_image(omni, "en_think_recaption", image_size=512)
+        outputs = _generate_outputs(omni, "en_think_recaption", 512, num_requests=2)
+        assert len(outputs) == 2
+        for output in outputs:
+            image = _extract_generated_image([output])
             assert image.size == (512, 512)
             assert any(low != high for low, high in image.convert("RGB").getextrema())
+        request_ids = list(dict.fromkeys(request_id for _, request_id in submitted))
+        assert len(request_ids) == 2
+        assert submitted == [(stage, request_id) for request_id in request_ids for stage in (0, 1)]
         # The worker reports the larger of allocator reservation and recorded
         # allocation peak; imported storage is never subtracted on the consumer.
         ranks = asyncio.run_coroutine_threadsafe(

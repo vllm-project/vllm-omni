@@ -176,6 +176,10 @@ class WorkerSharingSession:
                 self.backend.release_export(self.handle.session_id)
             elif operation == "fail":
                 self.backend.mark_failed(self.handle)
+            elif operation == "synchronize":
+                from vllm_omni.platforms import current_omni_platform
+
+                current_omni_platform.synchronize()
             elif operation != "status":
                 raise ValueError(f"unknown sharing control: {operation}")
             status = self.backend.session_status(self.handle)

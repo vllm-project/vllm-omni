@@ -34,6 +34,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
     RoundRobinBalancer,
 )
+from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -463,6 +464,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    weight_sharing: SharingRuntime | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -499,6 +501,7 @@ def _build_harness(
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
+            orchestrator.weight_sharing = weight_sharing
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
             await orchestrator.run()
 
@@ -4662,3 +4665,136 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
         for submit in submits:
             submit.assert_not_awaited()
         assert "req" not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_complete_requests_are_serial_only_with_shared_weights(orchestrator_factory, mocker, shared):
+    """A second AR request waits for DiT1 only when the shared group is enabled."""
+    ar = FakeStageClient()
+    dit = FakeStageClient(
+        stage_type="diffusion", final_output=True, final_output_type="image", next_inputs=[{"prompt": "draw a cat"}]
+    )
+    processor = FakeOutputProcessor()
+    group = mocker.Mock(spec=SharingRuntime, state="READY")
+    group.monitor = AsyncMock(side_effect=lambda stop: stop.wait())
+
+    # An async callback must await the stop event, not return its coroutine.
+    async def monitor(stop):
+        await stop.wait()
+
+    group.monitor = AsyncMock(side_effect=monitor)
+    group.close = AsyncMock()
+    group.drain_requests = AsyncMock()
+    harness = orchestrator_factory(
+        [ar, dit], output_processors=[processor, FakeOutputProcessor()], weight_sharing=group if shared else None
+    )
+    try:
+        for rid in ("one", "two"):
+            await _enqueue_add_request(
+                harness,
+                request_id=rid,
+                prompt=_processed_request(rid, _sampling_params()),
+                original_prompt={"prompt": "cat"},
+                sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams()],
+                final_stage_id=1,
+            )
+        await _wait_for(lambda: len(ar.add_request_calls) >= 1)
+        if shared:
+            await _wait_for(lambda: "two" in harness.orchestrator._shared_requests.pending)
+            assert len(ar.add_request_calls) == 1
+        else:
+            await _wait_for(lambda: len(ar.add_request_calls) == 2)
+            assert harness.orchestrator._shared_requests is None
+
+        processor.request_outputs = [_build_request_output("one", token_ids=[4], finished=True)]
+        ar.push_engine_core_outputs(_engine_core_outputs("one", 1.0))
+        await _wait_for(lambda: len(dit.add_request_calls) == 1)
+        assert len(ar.add_request_calls) == (1 if shared else 2)
+        dit.push_diffusion_output(OmniRequestOutput(request_id="one", finished=True, images=["image-one"]))
+        await _wait_for(lambda: len(ar.add_request_calls) == 2)
+        processor.request_outputs = [_build_request_output("two", token_ids=[5], finished=True)]
+        ar.push_engine_core_outputs(_engine_core_outputs("two", 2.0))
+        await _wait_for(lambda: len(dit.add_request_calls) == 2)
+        dit.push_diffusion_output(OmniRequestOutput(request_id="two", finished=True, images=["image-two"]))
+        await _wait_for(lambda: not harness.orchestrator.request_states)
+        group.drain_requests.assert_not_called()
+    finally:
+        await _shutdown_orchestrator(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_stage", [0, 1])
+async def test_shared_cancel_drains_active_work_and_removes_queued_request(orchestrator_factory, mocker, cancel_stage):
+    ar = FakeStageClient()
+    dit = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    processor = FakeOutputProcessor()
+    group = mocker.Mock(spec=SharingRuntime, state="READY")
+
+    async def monitor(stop):
+        await stop.wait()
+
+    drain_entered, drain_done = threading.Event(), threading.Event()
+
+    async def drain():
+        drain_entered.set()
+        assert await asyncio.to_thread(drain_done.wait, 5)
+
+    group.monitor = AsyncMock(side_effect=monitor)
+    group.close = AsyncMock()
+    group.drain_requests = AsyncMock(side_effect=drain)
+    harness = orchestrator_factory(
+        [ar, dit], output_processors=[processor, FakeOutputProcessor()], weight_sharing=group
+    )
+    try:
+        for rid in ("one", "two", "three"):
+            await _enqueue_add_request(
+                harness,
+                request_id=rid,
+                prompt=_processed_request(rid, _sampling_params()),
+                original_prompt={"prompt": "cat"},
+                sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams()],
+                final_stage_id=1,
+            )
+        await _wait_for(
+            lambda: len(ar.add_request_calls) == 1 and len(harness.orchestrator._shared_requests.pending) == 2
+        )
+        await _enqueue_abort_request(harness, ["two"])
+        await _wait_for(lambda: "two" not in harness.orchestrator._shared_requests.pending)
+        assert len(ar.add_request_calls) == 1
+        group.drain_requests.assert_not_called()
+        if cancel_stage == 1:
+            processor.request_outputs = [_build_request_output("one", token_ids=[4], finished=True)]
+            ar.push_engine_core_outputs(_engine_core_outputs("one", 1.0))
+            await _wait_for(lambda: len(dit.add_request_calls) == 1)
+        await _enqueue_abort_request(harness, ["one"])
+        await _wait_for(drain_entered.is_set)
+        assert len(ar.add_request_calls) == 1
+        drain_done.set()
+        await _wait_for(lambda: len(ar.add_request_calls) == 2)
+        assert ar.add_request_calls[-1][0].request_id == "three"
+        assert all(call[0].request_id != "two" for call in ar.add_request_calls)
+    finally:
+        drain_done.set()
+        await _shutdown_orchestrator(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_shared_kv_ready_waits_for_ar_terminal_output(mocker, shared):
+    orch = object.__new__(Orchestrator)
+    orch.async_chunk = False
+    orch.weight_sharing = mocker.Mock(spec=SharingRuntime) if shared else None
+    orch.request_states = {
+        "one": OrchestratorRequestState(request_id="one", prompt="cat", sampling_params_list=[], final_stage_id=1)
+    }
+    orch._cfg_tracker = mocker.Mock()
+    orch._cfg_tracker.is_companion.return_value = False
+    orch._cfg_tracker.has_companions.return_value = False
+    forward = mocker.patch.object(orch, "_forward_to_next_stage", new_callable=AsyncMock)
+    raw = OmniEngineCoreOutput(request_id="one", new_token_ids=[], kv_transfer_params={"kv_ready": True})
+    await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
+    assert forward.await_count == (0 if shared else 1)
+    raw.finish_reason = FinishReason.STOP
+    await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
+    assert forward.await_count == (1 if shared else 2)

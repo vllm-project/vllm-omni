@@ -216,3 +216,26 @@ def test_shared_vllm_config_supports_upstream_replace(rank, tmp_path):
     config.weight_sharing = bootstrap.groups[rank]
     with pytest.raises(ValueError, match="Field 'weight_sharing' not found"):
         replace(config, cache_config=config.cache_config)
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_abort_drain_uses_existing_stage_controls(host, mocker, confirmed):
+    provider = mocker.Mock()
+    provider.pause_scheduler_async = mocker.AsyncMock()
+    provider.resume_scheduler_async = mocker.AsyncMock()
+    consumer = mocker.Mock(spec=StagePoolClient)
+    consumer.collective_rpc_async = mocker.AsyncMock(return_value=confirmed)
+    host.clients = {0: provider, 1: consumer}
+
+    async def run():
+        if confirmed:
+            await host.drain_requests()
+            await host.resume_provider()
+        else:
+            with pytest.raises(RuntimeError, match="not confirmed"):
+                await host.drain_requests()
+            provider.resume_scheduler_async.assert_not_called()
+
+    asyncio.run(run())
+    provider.pause_scheduler_async.assert_awaited_once_with(mode="abort", clear_cache=False)
+    consumer.collective_rpc_async.assert_awaited_once_with("weight_sharing_drain", timeout=host.plan.timeout)

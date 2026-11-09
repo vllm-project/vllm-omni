@@ -274,6 +274,19 @@ class StageSharingHost:
         else:
             await client.collective_rpc_async("weight_sharing_quiesce", timeout=self.plan.timeout)
 
+    async def drain_requests(self) -> None:
+        """Abort late submissions and wait for stage execution to drain."""
+        provider = cast(StageEngineCoreClient, self.clients[self.plan.provider_stage])
+        await provider.pause_scheduler_async(mode="abort", clear_cache=False)
+        consumer = self.clients[self.plan.consumer_stage]
+        result = await consumer.collective_rpc_async("weight_sharing_drain", timeout=self.plan.timeout)
+        if result is not True:
+            raise RuntimeError("consumer request drain was not confirmed")
+
+    async def resume_provider(self) -> None:
+        """Resume AR after the runtime has synchronized every shared rank."""
+        await cast(StageEngineCoreClient, self.clients[self.plan.provider_stage]).resume_scheduler_async()
+
     def check_health(self, stage: int) -> None:
         self.clients[stage].check_health()
 

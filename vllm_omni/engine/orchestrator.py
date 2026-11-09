@@ -80,6 +80,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
@@ -392,6 +393,7 @@ class OrchestratorBase:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
     weight_sharing: SharingRuntime | None = None
+    _shared_requests: SharedRequestQueue | None = None
     _running_counter: OmniRequestCounter | None = None
     _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
@@ -548,6 +550,9 @@ class OrchestratorBase:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
 
+        if self.weight_sharing is not None:
+            self._shared_requests = SharedRequestQueue(self.weight_sharing)
+
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
         output_task = asyncio.create_task(
             self._orchestration_output_handler(),
@@ -571,8 +576,15 @@ class OrchestratorBase:
 
         tasks = [request_task, output_task]
         if self.weight_sharing is not None:
+            assert self._shared_requests is not None
             tasks.append(
                 asyncio.create_task(self.weight_sharing.monitor(self._shutdown_event), name="weight-sharing-health")
+            )
+            tasks.append(
+                asyncio.create_task(
+                    self._shared_requests.run(self._dispatch_message, self._shutdown_event),
+                    name="shared-request-admission",
+                )
             )
         for index, coro in enumerate(self._background_tasks()):
             tasks.append(asyncio.create_task(coro, name=f"orchestrator-background-{index}"))
@@ -622,6 +634,8 @@ class OrchestratorBase:
 
             self._orch_monitor.flush()
             if self.weight_sharing is not None:
+                if self._shared_requests is not None:
+                    self._discard_shared_requests(list(self._shared_requests.pending))
                 # Request handlers have stopped before shared views are detached.
                 try:
                     await self.weight_sharing.close()
@@ -710,6 +724,13 @@ class OrchestratorBase:
 
             if self.weight_sharing is not None and self.weight_sharing.state != "READY":
                 raise RuntimeError("sharing group is unavailable; stopping request admission")
+            if self._shared_requests is not None and self._shared_requests.enqueue(msg):
+                continue
+            if self._shared_requests is not None and isinstance(msg, AddCompanionRequestMessage):
+                async with self._shared_requests.submission(msg.parent_id) as allowed:
+                    if allowed:
+                        await self._dispatch_message(msg)
+                continue
             if await self._dispatch_message(msg):
                 continue
             if msg_type == "abort":
@@ -1997,6 +2018,13 @@ class OrchestratorBase:
 
     # ---- Shared helpers ----
 
+    def _discard_shared_requests(self, request_ids: list[str]) -> None:
+        """Drop unsubmitted shared requests and their frontend-owned artifacts."""
+        if self._shared_requests is not None:
+            for message in self._shared_requests.discard(request_ids):
+                if isinstance(message, StageSubmissionMessage):
+                    cleanup_request_artifact_dirs(message.request_artifact_dirs or [])
+
     async def _cleanup_request_ids(
         self,
         request_ids: list[str],
@@ -2024,6 +2052,7 @@ class OrchestratorBase:
         if not request_ids:
             return []
 
+        self._discard_shared_requests(request_ids)
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
         orphaned_parents: dict[str, str] = {}
@@ -2069,6 +2098,8 @@ class OrchestratorBase:
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
                 req_state.running_counter_registered = False
+        if self._shared_requests is not None:
+            self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
         return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
@@ -2771,6 +2802,9 @@ class OrchestratorBase:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
             if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
                 continue
+            if self.weight_sharing is not None and getattr(raw_output, "finish_reason", None) is None:
+                # KV publication alone must not overlap DiT with unfinished AR.
+                continue
 
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
@@ -2889,20 +2923,24 @@ class OrchestratorBase:
         is_final_update: bool = False,
     ) -> None:
         """Forward output to the next stage; a dead stage fails only this request."""
-        await self._dispatch_or_fail_request(
-            lambda: self._forward_to_next_stage_unguarded(
-                req_id,
-                src_stage_id,
-                output,
-                req_state,
-                src_replica_id=src_replica_id,
-                is_streaming_session=is_streaming_session,
-                is_final_update=is_final_update,
-            ),
-            req_id=req_id,
-            stage_id=src_stage_id + 1,
-            operation="inter-stage forward",
-        )
+        guard = self._shared_requests.submission(req_id) if self._shared_requests is not None else nullcontext(True)
+        async with guard as allowed:
+            if not allowed:
+                return
+            await self._dispatch_or_fail_request(
+                lambda: self._forward_to_next_stage_unguarded(
+                    req_id,
+                    src_stage_id,
+                    output,
+                    req_state,
+                    src_replica_id=src_replica_id,
+                    is_streaming_session=is_streaming_session,
+                    is_final_update=is_final_update,
+                ),
+                req_id=req_id,
+                stage_id=src_stage_id + 1,
+                operation="inter-stage forward",
+            )
 
     async def _forward_to_next_stage_unguarded(
         self,

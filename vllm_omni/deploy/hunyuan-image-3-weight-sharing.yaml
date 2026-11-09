@@ -1,6 +1,8 @@
 # Single-host BF16 sharing on four colocated NVIDIA GPUs; one replica/stage.
 # Startup measures weights and private peaks against the group ratio below.
 # This is not a CUDA allocation cap or a guarantee for every request size.
+# Requests execute FIFO across the whole group: AR1 -> DiT1 -> AR2 -> DiT2.
+# Disabling weight_sharing restores ordinary concurrent stage scheduling.
 # Requires the normal Hunyuan/Mooncake dependencies and an immutable checkpoint.
 # vllm serve <checkpoint> --omni --deploy-config <this-file> \
 #   --stage-init-timeout 1800 --init-timeout 3600

@@ -113,6 +113,10 @@ class SharingHost(Protocol):
 
     async def quiesce(self, stage: int) -> None: ...
 
+    async def drain_requests(self) -> None: ...
+
+    async def resume_provider(self) -> None: ...
+
     def check_health(self, stage: int) -> None: ...
 
     async def terminate(self, stage: int) -> None:
@@ -278,6 +282,27 @@ class SharingRuntime:
         if self.state != "CLOSED":
             self.state = "FAILED"
             self.error = reason
+
+    async def drain_requests(self) -> None:
+        """Confirm aborted work has stopped on every rank before admitting more.
+
+        A sent abort is not a device completion acknowledgement. Any uncertain
+        drain freezes the group and leaves teardown to its normal failure path.
+        """
+
+        async def drain() -> None:
+            await self.host.drain_requests()
+            self._require(await self._rpc(self.plan.provider_stage, "synchronize"), SessionState.ATTACHED)
+            self._require(await self._rpc(self.plan.consumer_stage, "synchronize"), SessionState.MAPPED)
+            await self.host.resume_provider()
+
+        try:
+            if self.state != "READY":
+                raise RuntimeError("cannot drain an unavailable sharing group")
+            await asyncio.wait_for(drain(), self.plan.timeout)
+        except Exception as exc:
+            self.fail(f"request drain: {exc}")
+            raise
 
     async def monitor(self, stop: asyncio.Event | None = None) -> None:
         try:

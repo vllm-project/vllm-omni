@@ -69,3 +69,21 @@ def test_quiesce_waits_for_active_diffusion_requests():
         assert await quiesce is True
 
     asyncio.run(run())
+
+
+def test_request_drain_aborts_and_waits_without_sealing_diffusion_stage(mocker):
+    async def run():
+        proc = object.__new__(StageDiffusionProc)
+        proc._engine = mocker.Mock()
+        finish = asyncio.Event()
+        request = asyncio.create_task(finish.wait())
+        proc._active_tasks = {"request": request}
+        drain = asyncio.create_task(proc._handle_collective_rpc("weight_sharing_drain", 1, (), {}))
+        await asyncio.sleep(0)
+        proc._engine.abort.assert_called_once_with("request")
+        assert not proc._sharing_quiesced and not drain.done()
+        finish.set()
+        assert await drain is True
+        assert not proc._sharing_quiesced
+
+    asyncio.run(run())

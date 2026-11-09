@@ -256,8 +256,13 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
-        if method == "weight_sharing_quiesce":
-            self._sharing_quiesced = True
+        if method in ("weight_sharing_quiesce", "weight_sharing_drain"):
+            if method == "weight_sharing_quiesce":
+                self._sharing_quiesced = True
+            else:
+                assert self._engine is not None
+                for request_id in list(self._active_tasks or {}):
+                    self._engine.abort(request_id)
             active = list((self._active_tasks or {}).values())
             if active:
                 await asyncio.gather(*active)
