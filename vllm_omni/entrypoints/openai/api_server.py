@@ -35,8 +35,8 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
-from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
@@ -71,6 +71,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.speech_to_text.transcription.serving import (
@@ -81,6 +82,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
 )
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
+from vllm.renderers.online_derenderer import OnlineDerenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -105,7 +107,6 @@ from vllm_omni.entrypoints.duplex.warmup import (
     _warmup_duplex_realtime,
     lookup_duplex_plugin,
     startup_warmup_kind,
-    wait_for_duplex_warmup,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -169,8 +170,10 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
+    VideoDepthResponse,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoListResponse,
@@ -185,6 +188,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -199,6 +203,13 @@ from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_v
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.depth.helpers import (
+    VIDEO_DEPTH_COLORMAPS,
+    VIDEO_DEPTH_MAX_BYTES,
+    extract_video_depth,
+    render_video_depth_response,
+    supports_video_depth,
+)
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
@@ -234,7 +245,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -411,6 +422,20 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        provider = getattr(getattr(engine_client, "engine", None), "tracer_provider", None)
+        if provider is not None:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+            from vllm_omni.tracing import TraceContextMiddleware
+
+            # Upstream build_app may already have cached the uninstrumented stack.
+            app.middleware_stack = None
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=provider,
+                exclude_spans=["send", "receive"],
+                excluded_urls="health,healthz,metrics",
+            )
         app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
@@ -456,6 +481,9 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # Shutdown run requests unless we enabled it directly
+        shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -519,6 +547,7 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
+                self._asgi = TraceContextMiddleware(inner) if provider is not None else inner
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
@@ -528,7 +557,7 @@ async def omni_run_server_worker(
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 
-                await self._inner(scope, receive, send)
+                await self._asgi(scope, receive, send)
 
         # Startup duplex warmup: real /v1/realtime connections wait on this
         # event. Video-required models (AURA) do this by default — one short
@@ -758,6 +787,7 @@ async def _init_duplex_app_state(
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
     state.online_renderer = None
+    state.online_derenderer = None
     for attribute in (
         "openai_serving_chat_batch",
         "openai_serving_completion",
@@ -776,6 +806,7 @@ async def _init_duplex_app_state(
         "openai_streaming_video_output",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
+        "run_serving",
     ):
         setattr(state, attribute, None)
     state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
@@ -851,7 +882,20 @@ def _init_chat_services(
     enable_batch: bool,
 ) -> None:
     """Share chat setup while callers retain capability and endpoint gating."""
-    state.online_renderer = OnlineRenderer(
+    # Serving classes cache system_fingerprint at init. Match upstream
+    # init_generate_state: configure the mode before those constructors run.
+    set_default_fingerprint_mode(
+        getattr(args, "fingerprint_mode", "full"),
+        getattr(args, "fingerprint_value", None),
+    )
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    # Pin CLI fields. getattr keeps test namespaces that predate these flags
+    # on the same disabled defaults the upstream constructors use.
+    trust_request_mm_kwargs = getattr(args, "trust_request_mm_kwargs", False)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
+    reasoning_effort_map = getattr(args, "reasoning_effort_map", None)
+    reasoning_parser = args.structured_outputs_config.reasoning_parser
+    renderer_kwargs = dict(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
         request_logger=request_logger,
@@ -861,10 +905,17 @@ def _init_chat_services(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
+        reasoning_effort_map=reasoning_effort_map,
         log_error_stack=args.log_error_stack,
     )
+    state.online_renderer = OnlineRenderer(
+        **renderer_kwargs,
+        trust_request_mm_kwargs=trust_request_mm_kwargs,
+    )
+    state.online_derenderer = OnlineDerenderer(**renderer_kwargs)
     chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -873,17 +924,19 @@ def _init_chat_services(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
     state.openai_serving_chat = OmniOpenAIServingChat(**chat_kwargs) if enable_chat else None
     state.openai_serving_chat_batch = (
@@ -951,6 +1004,7 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    state.run_serving = ServingRun(engine_client)
 
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
@@ -1040,11 +1094,14 @@ async def omni_init_app_state(
     logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = await _resolve_chat_template(engine_client, args)
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
 
     chat_template_config = ChatTemplateConfig(
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
         trust_request_chat_template=args.trust_request_chat_template,
+        trust_request_mm_kwargs=getattr(args, "trust_request_mm_kwargs", False),
     )
 
     if args.tool_server == "demo":
@@ -1132,11 +1189,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             tool_server=tool_server,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
             enable_log_outputs=args.enable_log_outputs,
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -1151,6 +1211,9 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
         )
         if "generate" in supported_tasks
         else None
@@ -1204,7 +1267,7 @@ async def omni_init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
     state.openai_serving_transcription = (
@@ -1239,10 +1302,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
-            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            enable_log_outputs=getattr(args, "enable_log_outputs", False),
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            default_chat_template_kwargs=default_chat_template_kwargs,
+            disabled_thinking_effort=getattr(args, "anthropic_disabled_thinking_effort", "auto"),
         )
         if "generate" in supported_tasks
         else None
@@ -1252,6 +1319,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             state.online_renderer,
+            online_derenderer=state.online_derenderer,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -1884,7 +1952,6 @@ async def realtime_websocket(websocket: WebSocket):
     if use_duplex_realtime and duplex_handler is not None:
         if await _reject_multi_api_duplex(websocket):
             return
-        await wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
         return
 
@@ -1914,7 +1981,6 @@ async def duplex_websocket(websocket: WebSocket):
     """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
     if await _reject_multi_api_duplex(websocket):
         return
-    await wait_for_duplex_warmup(websocket)
     handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     if handler is None:
         await websocket.accept()
@@ -1981,6 +2047,28 @@ async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
     )
     await websocket.close(code=1008)
     return True
+
+
+@router.post("/v1/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def run_stage(request: RunRequest, raw_request: Request):
+    """Run one pipeline stage and return its encoded result; see `ServingRun`."""
+    serving: ServingRun | None = raw_request.app.state.run_serving
+    if serving is None:
+        return _unsupported_api_response(raw_request, "Run API")
+    request_id = f"run-{random_uuid()}"
+    raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+    try:
+        response = await serving.run(request, request_id=request_id)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        # Includes stage_input payloads that fail to decode.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    return response.model_dump(exclude_none=True)
 
 
 # RL Rollout serving (RFC #3747, P0)
@@ -2234,6 +2322,11 @@ async def generate_images(
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.layers is not None:
+                # Layered models (e.g. Qwen-Image-Layered) read the requested
+                # layer count from ``extra_body``; the single-stage and
+                # multi-stage edit paths already forward it here.
+                extra_body["layers"] = request.layers
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
@@ -2290,6 +2383,12 @@ async def generate_images(
             extra_args["flow_shift"] = request.flow_shift
         if extra_args:
             gen_params.extra_args = extra_args
+        try:
+            # The params were built before extra_args was set, and the inline stage client's clone()
+            # does not re-run __post_init__, so move the schedule onto the typed field here.
+            absorb_attention_schedule_extra_args(gen_params, override=True)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
@@ -2929,6 +3028,85 @@ async def segment_video(
 
 
 @router.post(
+    "/v1/videos/depth",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": VideoDepthResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def estimate_video_depth(
+    raw_request: Request,
+    video: UploadFile | None = File(None),
+    input_size: int | None = Form(None),
+    max_res: int | None = Form(None),
+    colormap: str = Form("grayscale"),
+    return_depth: bool = Form(False),
+    model: str | None = Form(None),
+) -> Response:
+    """Estimate temporally consistent depth for every frame of a video."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not supports_video_depth(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support video depth estimation.",
+        )
+    if video is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'video'.")
+    if colormap not in VIDEO_DEPTH_COLORMAPS:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"colormap must be one of {', '.join(VIDEO_DEPTH_COLORMAPS)}, got {colormap!r}.",
+        )
+    path = None
+    try:
+        request_id = f"vid_depth-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        suffix = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+        path = await _persist_uploaded_reference(
+            video, field_name="video", suffix=suffix, max_bytes=VIDEO_DEPTH_MAX_BYTES
+        )
+        extra_args = {
+            key: value for key, value in (("input_size", input_size), ("max_res", max_res)) if value is not None
+        }
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=OmniTextPrompt(prompt="", multi_modal_data={"video": path}),
+            request_id=request_id,
+        )
+        payload = extract_video_depth(result)
+        # Encode off the event loop: a long video's depth video and raw maps can be hundreds of MB.
+        body = await asyncio.to_thread(render_video_depth_response, payload, model_name, colormap, return_depth)
+        return Response(content=body, media_type="application/json")
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Video depth estimation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video depth estimation failed: {e}"
+        ) from e
+    finally:
+        if path is not None and os.path.exists(path):
+            os.unlink(path)
+
+
+@router.post(
     "/v1/videos",
     dependencies=[Depends(_require_single_api_video_store)],
     responses={
@@ -3283,7 +3461,19 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        await engine_client.start_profile(stages=stages)
+        # Forward only supplied per-session overrides. AsyncOmni.start_profile
+        # already accepts these; a stages-only body stays a stages-only call.
+        profile_kwargs: dict[str, Any] = {}
+        if request is not None:
+            if request.profile_prefix is not None:
+                profile_kwargs["profile_prefix"] = request.profile_prefix
+            if request.delay_iterations is not None:
+                profile_kwargs["delay_iterations"] = request.delay_iterations
+            if request.max_iterations is not None:
+                profile_kwargs["max_iterations"] = request.max_iterations
+            if request.profiler_kwargs is not None:
+                profile_kwargs["profiler_kwargs"] = request.profiler_kwargs
+        await engine_client.start_profile(stages=stages, **profile_kwargs)
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:

@@ -39,6 +39,8 @@ def _has_spec(method: object | None, spec: QuantSpec) -> bool:
 class Cosmos3PrecisionStrategy:
     """Quantization-format boundary behind the shared precision schedule."""
 
+    format_name: str
+
     def accepts(self, method: object | None) -> bool:
         """Return whether this strategy owns a native linear method."""
         raise NotImplementedError
@@ -97,6 +99,8 @@ class Cosmos3PrecisionStrategy:
 
 class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W8A8 or reference dense W8A16."""
+
+    format_name = "fp8"
 
     def accepts(self, method: object | None) -> bool:
         return _has_spec(method, _FP8_W8A8_SPEC)
@@ -159,6 +163,8 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
 
 class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W4A4 or reference dense W4A16."""
+
+    format_name = "nvfp4"
 
     def accepts(self, method: object | None) -> bool:
         return _has_spec(method, _NVFP4_W4A4_SPEC)
