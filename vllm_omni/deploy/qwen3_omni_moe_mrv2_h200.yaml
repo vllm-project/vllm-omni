@@ -19,8 +19,6 @@ stages:
   - stage_id: 0
     devices: "0"
     gpu_memory_utilization: 0.60
-    # The measurements in the design doc ran without the Thinker prefix cache.
-    enable_prefix_caching: false
   - stage_id: 1
     devices: "0"
     gpu_memory_utilization: 0.22

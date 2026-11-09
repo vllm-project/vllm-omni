@@ -22,7 +22,7 @@ disables audio output), `first_frame_decoder.py` (talker first-audio path),
 | YAML | Use |
 |------|-----|
 | `qwen3_omni_moe.yaml` | Default CUDA MRv2 with Thinker prefix caching on. 2×H100: thinker on GPU 0 (0.9), talker + code2wav on GPU 1 (0.6 / 0.1). `async_chunk: true`, shared-memory connector with `codec_chunk_frames: 25`, `codec_left_context_frames: 25`. CUDA adds `talker_first_audio`, `codec_chunk_ramp`, Code2Wav graph batch sizes and fused snake; other platforms keep `initial_codec_chunk_frames: 4` |
-| `qwen3_omni_moe_mrv2_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10), Thinker prefix caching off, plus code-predictor KV and sampling optimizations |
+| `qwen3_omni_moe_mrv2_h200.yaml` | MRv2 with all stages on one H200 (0.60 / 0.22 / 0.10), plus code-predictor KV and sampling optimizations |
 | `qwen3_omni_moe_thinking.yaml` | Thinker-only pipeline, TP=2, prefix caching on |
 | `qwen3_omni_duplex.yaml` | `session_mode: duplex` |
 | `qwen3_omni_moe_mori_intranode.yaml` | MI300X with Mori connector, one GPU per stage, all eager |

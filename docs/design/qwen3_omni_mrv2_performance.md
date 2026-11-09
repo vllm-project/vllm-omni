@@ -49,7 +49,6 @@ startup; `enforce_eager: true` on stage 2 disables inner graphs. NPU audio uses 
 host materialization path before the native data plane publishes output and
 releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
-The duplex profile keeps NPU on MRv1.
 
 ## Ascend prefix cache
 
