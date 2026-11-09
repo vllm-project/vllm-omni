@@ -278,6 +278,65 @@ Software: PyTorch `2.13.0+rocm10.0.0`, vLLM `0.33.0+rocm100`, Python 3.12.15,
 pytest 9.1.1; image digest
 `sha256:921f117d536431ea91bd2fbf08a74821af5738fb909aa48d557dd0bc5a564e14`.
 
+### Diffusion CPU: five-shard rebalance and bounded threads
+
+The five regular Diffusion shards use `diffusion-v1.json`, with 11,521 node
+timings from all five successful JUnit artifacts in build #15582. These legacy
+artifacts report total setup + call + teardown time. Their weights estimate
+17m58s per shard before collection/overhead; six shards would estimate 14m58s.
+Neither estimate establishes a measured speedup or p95. Start with five and
+trial six only if measured p95 remains above 20 minutes and queue capacity allows it.
+
+Regular and Slow CPU jobs bound OMP/MKL/OpenBLAS/NumExpr to two threads per
+process, allowing two gloo ranks to fit the observed four-CPU quota. Four unchanged
+reference cases (Wan fused/exact decode, long LingBot metadata rollout, and real
+causal-VAE continuation) passed at 1/2/4 threads. In the same image and host
+configuration documented above, three measured runs after a warmup averaged
+46.30s, 46.34s and 47.14s respectively (ranges 44.58–48.50s, 45.64–46.99s and
+46.03–48.20s). These results do not establish a meaningful advantage of two over
+one thread; two is a quota-bounded trial setting, including for spawned ranks.
+
+No network shape, rollout length, tolerance or assertion is reduced. Slow CPU
+retains exactly its six reference cases, blocking grade, 40-minute timeout and
+exit-134 retry rule. Regular shards retain their marker expression, both ignored
+files, six deselections, 60-minute timeout and retry rule. Whole modules retain
+fixture locality. Both jobs now emit phase, selection, CPU pressure and cgroup
+memory current/peak/limit/events artifacts under `artifacts/amd-cpu-suites/`.
+JUnit lives in each fresh run directory as `pytest.xml`.
+
+Reproduce the initial profile from the original artifact filenames:
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py --suite diffusion \
+  --junit downloaded/pytest-*-of-5.xml \
+  --source-build-url https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15582 \
+  --source-commit 438155621484248827a30256e679cb4c84f544fb \
+  --output diffusion-v2.json
+```
+
+The importer rejects missing/duplicate shards, failures, unresolved modules and
+overlapping node IDs. Zero-duration collection skips are not executable node IDs.
+Only use legacy JUnit produced with pytest's total-duration setting. For new
+profiles, use the instrumented artifact builder below and provide the five
+regular job directories separately from Slow CPU.
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/diffusion-thread-trial -- \
+  -q 'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-fused]' \
+  'tests/diffusion/ar_diffusion/test_kv_orchestration.py::test_rollout_keeps_metadata_bounded[2-False-lingbot-two-minutes]' \
+  'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]' \
+  'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+```
+
+Before rollout, refresh the historical profile from successful target-hardware
+runs with the bounded thread setting. Compare the exact executed node union and
+skip outcomes, and retain the original numerical checks. Measure concurrent
+five-shard plus Slow CPU memory peaks, CPU throttling, queue latency, summed
+agent-minutes and paired READY/MERGE wall time. The planning target remains
+p95 below 18 minutes for every regular shard and Slow CPU. Revert the pipeline
+thread export and timing-profile option to roll back; do not move Slow CPU cases
+or weaken their assertions to meet the target.
+
 ### Prepare a shared profile
 
 Download the artifact directories from successful instrumented CPU jobs.
