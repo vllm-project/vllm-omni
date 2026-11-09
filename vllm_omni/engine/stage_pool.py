@@ -21,9 +21,9 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
+from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
-from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -1719,8 +1719,6 @@ class StagePool:
                     replica_id,
                     exc_info=True,
                 )
-
- 
 
     # ---- Stage-local control plane ----
 

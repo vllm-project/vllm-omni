@@ -40,6 +40,7 @@ from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
@@ -397,6 +398,8 @@ class OrchestratorBase:
     _stat_logger: OmniPrometheusStatLogger | None = None
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
+    _dit_load_state: DitLoadState | None = None
+    _dit_load_aware: bool = False
 
     def __init__(
         self,
@@ -416,6 +419,7 @@ class OrchestratorBase:
         collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         tracer: Tracer | None = None,
+        dit_load_aware: bool = False,
     ) -> None:
         self.tracer = tracer
         self.request_async_queue = request_async_queue

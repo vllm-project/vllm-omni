@@ -23,10 +23,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
-from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.core.sched.dtps_scheduler import DTPSScheduler
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
+from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -362,6 +362,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if cache is not None:
             cache[rid] = (payload_id, is_final, force_kv)
         return is_final, force_kv
+
     def _init_dtps_scheduler(self) -> None:
         if not hasattr(self, "vllm_config"):
             return
