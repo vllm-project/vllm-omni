@@ -197,3 +197,55 @@ def test_requests_require_per_camera_captions(caption: Any) -> None:
     view = {"camera_key": "camera_front_wide_120fov", "prompt": caption}
     with pytest.raises(ValueError, match="requires one prompt per camera"):
         validate_multiview_request({"multiview": {"views": [view]}})
+
+
+_CHECKPOINT_HEADS = {"num_attention_heads": 32, "num_key_value_heads": 8, "intermediate_size": 12288}
+
+
+def _validate_topology(checkpoint: dict[str, int] | None = None, **parallel: Any) -> None:
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.models.cosmos3.multiview_parallel import validate_multiview_parallel_config
+
+    validate_multiview_parallel_config(DiffusionParallelConfig(**parallel), **(checkpoint or _CHECKPOINT_HEADS))
+
+
+@pytest.mark.parametrize(
+    "parallel",
+    [
+        {},
+        {"cfg_parallel_size": 2},
+        {"ulysses_degree": 2},
+        {"tensor_parallel_size": 2, "ulysses_degree": 4},
+        {"ulysses_mode": "ag"},
+    ],
+    ids=["single_gpu", "cfg2", "cp2", "tp2_cp4", "ag_mode_without_cp"],
+)
+def test_parallel_config_accepts_supported_topologies(parallel: dict[str, Any]) -> None:
+    _validate_topology(**parallel)
+
+
+@pytest.mark.parametrize(
+    ("parallel", "checkpoint", "match"),
+    [
+        ({"cfg_parallel_size": 3}, None, r"cfg_parallel_size in \(1, 2\)"),
+        ({"ring_degree": 2}, None, "ring_degree=1"),
+        ({"allgather_degree": 2}, None, "allgather_degree=1"),
+        ({"pipeline_parallel_size": 2}, None, "pipeline_parallel_size=1"),
+        ({"vae_patch_parallel_size": 2}, None, "vae_patch_parallel_size=1"),
+        ({"ulysses_degree": 2, "ulysses_mode": "ag"}, None, "ulysses_mode='strict'"),
+        ({"ulysses_degree": 3}, None, r"query heads \(32\) must be divisible by TP × CP \(1 × 3\)"),
+        (
+            {"tensor_parallel_size": 2, "ulysses_degree": 8},
+            None,
+            r"KV heads \(8\) must be divisible by TP × CP \(2 × 8\)",
+        ),
+        ({}, {**_CHECKPOINT_HEADS, "num_attention_heads": 30}, "integral GQA ratio"),
+        ({"tensor_parallel_size": 2}, {**_CHECKPOINT_HEADS, "intermediate_size": 12289}, "intermediate_size"),
+    ],
+    ids=["cfg3", "ring", "allgather", "pipeline", "vae_patch", "ag_mode_cp2", "cp3", "tp2_cp8", "gqa", "mlp_tp2"],
+)
+def test_parallel_config_rejects_unsupported_topologies(
+    parallel: dict[str, Any], checkpoint: dict[str, int] | None, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _validate_topology(checkpoint, **parallel)
