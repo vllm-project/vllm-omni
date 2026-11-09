@@ -67,6 +67,8 @@ class _MiniCPMO45TerminalRow:
     stop_reason: int | str | None
     position: int
     token_id: int
+    # An output that ended at the own row before the recompute did: it was emitted.
+    row_emitted: bool = False
 
 
 # A held request is never decode-eligible during that schedule() call.
@@ -2248,8 +2250,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _finish_minicpmo45_terminal_row(
         self, request: Request, terminal: _MiniCPMO45TerminalRow, payload: object
     ) -> bool:
-        """Restore the length stop once the forward returned the final own row."""
-        from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
+        """Restore the length stop once the final own row was returned."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row, has_no_rows
 
         if not request.is_finished() and (
             request.num_computed_tokens < request.num_tokens or request.num_in_flight_tokens > 0
@@ -2257,12 +2259,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # A recompute has not returned the final token. Outputs arrive in
             # schedule order and _hold_minicpmo45_terminal_steps books nothing
             # after the step that reaches it, so that step's output comes last.
+            if ends_with_own_row(payload, terminal.position, terminal.token_id):
+                terminal.row_emitted = True
             return False
         self._minicpmo45_terminal_rows.pop(request.request_id, None)
         if request.is_finished():
             return True
-        if request.num_computed_tokens == request.num_tokens and ends_with_own_row(
-            payload, terminal.position, terminal.token_id
+        # The stage-0 prefix cache drops rows it already delivered from a recompute
+        # (worker_v2/prefix_cache.py), so a recompute after the emitted own row is empty.
+        if request.num_computed_tokens == request.num_tokens and (
+            ends_with_own_row(payload, terminal.position, terminal.token_id)
+            or (terminal.row_emitted and has_no_rows(payload))
         ):
             request.status, request.stop_reason = terminal.status, terminal.stop_reason
         else:

@@ -26,6 +26,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
 from vllm_omni.request import OmniRequest
@@ -62,7 +63,7 @@ def _speculative_config():
     return spec
 
 
-def _scheduler(prefix_caching):
+def _scheduler(prefix_caching, num_spec=NUM_SPEC):
     config = VllmConfig()
     config.model_config = SimpleNamespace(
         multimodal_config=None,
@@ -74,7 +75,7 @@ def _scheduler(prefix_caching):
         supports_multimodal_inputs=False,
         return_sampling_mask=False,
         recompute_preemption="allow",
-        # Stage 0 of minicpmo_4_5_turn_mrv2.yaml with a stage-0 draft.
+        # Stage 0 of minicpmo_4_5_turn_mrv2.yaml, with a stage-0 draft unless num_spec is 0.
         model_arch="MiniCPMO45OmniForConditionalGeneration",
         model_stage="llm",
         session_mode="turn",
@@ -86,7 +87,8 @@ def _scheduler(prefix_caching):
     config.scheduler_config = SchedulerConfig(
         max_model_len=256, max_num_seqs=4, max_num_batched_tokens=32, is_encoder_decoder=False, async_scheduling=True
     )
-    config.speculative_config = _speculative_config()
+    if num_spec:
+        config.speculative_config = _speculative_config()
     config.cache_config = CacheConfig(block_size=BLOCK, enable_prefix_caching=prefix_caching)
     config.cache_config.num_gpu_blocks = NUM_BLOCKS
     register_all_kvcache_specs(config)
@@ -95,7 +97,7 @@ def _scheduler(prefix_caching):
         num_blocks=NUM_BLOCKS, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)]
     )
     scheduler = OmniARAsyncScheduler(config, kv_config, Mock(spec=StructuredOutputManager), BLOCK)
-    assert scheduler._minicpmo45_terminal_rows_enabled() and scheduler.num_spec_tokens == NUM_SPEC
+    assert scheduler._minicpmo45_terminal_rows_enabled() and scheduler.num_spec_tokens == num_spec
     return scheduler
 
 
@@ -209,3 +211,59 @@ def test_ordinary_readmission_keeps_its_draft_slots():
     assert start == c.num_tokens - 1
     assert step.num_scheduled_tokens["C"] == 1 + NUM_SPEC
     assert step.scheduled_spec_decode_tokens["C"] == [-1] * NUM_SPEC
+
+
+class _TrimmingRunner:
+    """Rows as the MRv2 stage-0 prefix cache hands them on: the real delivery adapter
+    sees every step, and its trim drops already-delivered leading rows of a step's
+    slice the way PrefixCacheManager.materialize does (current[start + trim:end])."""
+
+    def __init__(self, prefix_caching):
+        self.adapter = PrefixCacheSchedulerAdapter(track_requests=True) if prefix_caching else None
+
+    def rows(self, scheduler, scheduler_output):
+        spans = _booked(scheduler, scheduler_output)
+        if self.adapter is None:
+            return spans
+        trims = {d.req_id: d.trim for d in self.adapter.translate_step(scheduler_output).deliveries}
+        return {rid: (start + trims.get(rid, 0), ids[trims.get(rid, 0) :]) for rid, (start, ids) in spans.items()}
+
+
+@pytest.mark.parametrize("prefix_caching", [True, False], ids=["prefix_hit", "cold"])
+@pytest.mark.parametrize("stale_row", [True, False], ids=["stale_row_emitted", "stale_row_dropped"])
+def test_recompute_after_the_emitted_own_row(prefix_caching, stale_row):
+    """Drafts off: the terminal forward is preempted in flight and its stale output returns.
+
+    With the stage-0 prefix cache the recompute carries no rows (all were delivered);
+    the stop holds only if the stale output ended at the own row.
+    """
+    scheduler = _scheduler(prefix_caching, num_spec=0)
+    runner = _TrimmingRunner(prefix_caching)
+    a = _request("A", PROMPT, 2)
+    scheduler.add_request(a)
+    for sampled in (111, FINAL):
+        step = scheduler.schedule()
+        _deliver(scheduler, step, runner.rows(scheduler, step), {"A": [sampled]})
+    assert "A" in scheduler._minicpmo45_terminal_rows and a.num_tokens == len(PROMPT) + 2
+
+    terminal = scheduler.schedule()
+    terminal_rows = runner.rows(scheduler, terminal)
+    assert terminal_rows["A"][0] == a.num_tokens - 1
+    scheduler.running.remove(a)
+    scheduler._preempt_request(a, 0.0)
+    start, ids = terminal_rows["A"]
+    _, finishes = _deliver(scheduler, terminal, {"A": (start, ids if stale_row else [])}, {"A": [DRAFT_ID]})
+    assert finishes == [] and a.status == RequestStatus.PREEMPTED
+
+    readmit = scheduler.schedule()
+    start, ids = _booked(scheduler, readmit)["A"]
+    assert start == (len(PROMPT) if prefix_caching else 0)
+    rows = runner.rows(scheduler, readmit)["A"]
+    # The real adapter trims every recomputed row only under the prefix cache.
+    assert (rows[1] == []) is prefix_caching
+    payloads, finishes = _deliver(scheduler, readmit, {"A": rows}, {"A": [DRAFT_ID]})
+    expected = FinishReason.LENGTH if (stale_row or not prefix_caching) else FinishReason.ERROR
+    assert finishes == [("A", expected)]
+    assert list(a.output_token_ids) == [111, FINAL]
+    assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1

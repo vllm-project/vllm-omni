@@ -51,3 +51,11 @@ def ends_with_own_row(payload: object, position: int, token_id: int) -> bool:
         and positions == list(range(position - n + 1, position + 1))
         and int(ids[-1]) == token_id
     )
+
+
+def has_no_rows(payload: object) -> bool:
+    """Whether a forward's ledger is present and empty: every row was already delivered."""
+    if not isinstance(payload, dict):
+        return False
+    rows = [payload.get(k) for k in ("latent_input_ids", "latent_positions", "latent")]
+    return all(isinstance(v, torch.Tensor) and v.shape[0] == 0 for v in rows)
