@@ -94,6 +94,15 @@ def main() -> None:
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    hold_gate = out / "forward_hold.gate"
+    hold_ready = Path(str(hold_gate) + ".holding")
+    for stale in (hold_gate, hold_ready):
+        if stale.exists():
+            stale.unlink()
+    # Must be set before workers spawn so COMPUTE_DONE can block mid-forward.
+    os.environ["VLLM_OMNI_E2E_HOLD_FORWARD_GATE"] = str(hold_gate)
+    os.environ["VLLM_OMNI_E2E_HOLD_FORWARD_TIMEOUT_S"] = "180"
+
     started = time.perf_counter()
     omni = Omni(model="/data/models/Wan2.1-T2V-1.3B-Diffusers", deploy_config=str(deploy))
     print(f"[e2e] loaded {time.perf_counter() - started:.1f}s", flush=True)
@@ -129,6 +138,7 @@ def main() -> None:
     failures: list[str] = []
     events: list[dict] = []
     t0 = time.perf_counter()
+    saw_media_while_holding = False
     try:
         print("[e2e] streaming generate start", flush=True)
         for i, req_out in enumerate(omni.generate(PROMPT, params, py_generator=True, use_tqdm=False)):
@@ -156,13 +166,29 @@ def main() -> None:
                 "shape": list(tensor.shape) if tensor is not None else None,
                 "std": float(tensor.std()) if tensor is not None and tensor.numel() else None,
                 "type": type(req_out).__name__,
+                "hold_ready": hold_ready.exists(),
+                "hold_released": hold_gate.exists(),
             }
             events.append(event)
             print(f"[e2e] event {event}", flush=True)
+            if tensor is not None and not finished and not hold_gate.exists():
+                # First media while COMPUTE_DONE is still blocked.
+                deadline = time.perf_counter() + 30.0
+                while not hold_ready.exists() and time.perf_counter() < deadline:
+                    time.sleep(0.05)
+                if hold_ready.exists() and not finished:
+                    saw_media_while_holding = True
+                    hold_gate.write_text("release\n", encoding="utf-8")
+                    print("[e2e] released forward hold after first media chunk", flush=True)
     finally:
+        if not hold_gate.exists():
+            # Unblock workers if we failed before releasing.
+            hold_gate.write_text("release-on-cleanup\n", encoding="utf-8")
         close = getattr(omni, "close", None) or getattr(omni, "shutdown", None)
         if callable(close):
             close()
+        os.environ.pop("VLLM_OMNI_E2E_HOLD_FORWARD_GATE", None)
+        os.environ.pop("VLLM_OMNI_E2E_HOLD_FORWARD_TIMEOUT_S", None)
 
     elapsed = time.perf_counter() - t0
     media_events = [e for e in events if e["has_tensor"] and not e["finished"]]
@@ -170,6 +196,11 @@ def main() -> None:
     _expect(len(media_events) >= 1, f"got >=1 intermediate media chunks, got {len(media_events)}", failures)
     _expect(len(media_events) >= NUM_CHUNKS, f"got {NUM_CHUNKS} media chunks, got {len(media_events)}", failures)
     _expect(len(finals) == 1, f"exactly one finished marker, got {len(finals)}", failures)
+    _expect(
+        saw_media_while_holding,
+        "first media arrived while forward hold was active (before COMPUTE_DONE)",
+        failures,
+    )
     if media_events and finals:
         _expect(
             media_events[0]["t_s"] < finals[0]["t_s"],

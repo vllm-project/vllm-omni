@@ -292,6 +292,13 @@ the full video. `stream_decode` only overlaps VAE decode; without
 `streaming_output` it still accumulates the clip. A gap or out-of-order chunk is
 a protocol error. An error after any delivered chunk finishes as an error.
 
+CausVid also sets `supports_request_cancellation=True`. The engine registers a
+cooperative cancellation signal; each Noisy PP cell tick calls
+`check_request_cancellation()` so a disconnect can stop the wave at a PP-safe
+boundary and cancel any in-flight `stream_decode` job. Expected `execution_id`
+is bound to the stream state before the execute RPC is enqueued; late
+`CHUNK_READY` packs from a reused request id are reclaimed and not delivered.
+
 ## Open issues
 
 - Streaming: multi-GPU end-to-end coverage, reorder/buffering beyond in-order

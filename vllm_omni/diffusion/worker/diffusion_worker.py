@@ -1509,6 +1509,10 @@ class WorkerProc:
                     f"Worker {self.gpu_id}: CHUNK_READY packs still pending after "
                     f"{_ASYNC_OUTPUT_DRAIN_TIMEOUT_S:.1f}s; refusing COMPUTE_DONE"
                 )
+            # Optional e2e gate: prove CHUNK_READY reached the client before this.
+            from vllm_omni.diffusion.worker.e2e_forward_hold import maybe_hold_before_compute_done
+
+            maybe_hold_before_compute_done()
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:

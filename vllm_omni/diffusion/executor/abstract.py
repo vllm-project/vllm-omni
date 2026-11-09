@@ -147,6 +147,16 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def register_execution_bind_handler(
+        self,
+        handler: Callable[[list[str], str], None] | None,
+    ) -> None:
+        """Bind expected execute RPC ids before workers can emit CHUNK_READY.
+
+        ``handler`` is ``(request_ids, execution_id)``. Default is a no-op.
+        """
+        return None
+
     def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
         """Resolve deferred output; only asynchronous executors implement this."""
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")

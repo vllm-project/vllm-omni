@@ -97,6 +97,37 @@ def _uses_text_encoder_allgather(config: object) -> bool:
     return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
+def _request_ids_for_execution_bind(method: str, args: tuple[Any, ...]) -> list[str]:
+    """Extract request ids from execute RPC args for pre-dispatch identity bind."""
+    if not args:
+        return []
+    if method == "execute_model":
+        first = args[0]
+        request_id = getattr(first, "request_id", None)
+        if isinstance(request_id, str):
+            return [request_id]
+        if isinstance(first, (list, tuple)):
+            ids: list[str] = []
+            for item in first:
+                rid = getattr(item, "request_id", None)
+                if not isinstance(rid, str):
+                    req = getattr(item, "req", None)
+                    rid = getattr(req, "request_id", None)
+                if isinstance(rid, str):
+                    ids.append(rid)
+            return ids
+        return []
+    if method == "execute_model_batch":
+        scheduled = getattr(args[0], "scheduled_new_reqs", None) or ()
+        ids: list[str] = []
+        for nr in scheduled:
+            rid = getattr(nr, "request_id", None)
+            if isinstance(rid, str):
+                ids.append(rid)
+        return ids
+    return []
+
+
 def _schedule_extra_args_signature(extra_args: dict | None) -> str | None:
     """``extra_args`` as far as they can change the forward schedule; request identities are left out."""
     schedule = {key: value for key, value in (extra_args or {}).items() if key not in REQUEST_IDENTITY_EXTRA_ARGS}
@@ -221,6 +252,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._dropped_output_ids: OrderedDict[str, None] = OrderedDict()
         self._futures_lock = threading.RLock()
         self._chunk_ready_handler: Callable[..., None] | None = None
+        self._execution_bind_handler: Callable[[list[str], str], None] | None = None
         self._pump_running = False
         self._pump_stop = threading.Event()
         # When pumps are active they are the sole readers of the worker result
@@ -541,6 +573,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         """
         self._chunk_ready_handler = handler
 
+    def register_execution_bind_handler(
+        self,
+        handler: Callable[[list[str], str], None] | None,
+    ) -> None:
+        """Register the engine callback that binds RPC ids before enqueue."""
+        self._execution_bind_handler = handler
+
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPCs.
 
@@ -834,6 +873,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         ):
             rpc_id = self._next_rpc_id()
             rpc_request["rpc_id"] = rpc_id
+            # Bind expected execution identity before workers can emit CHUNK_READY.
+            if self._execution_bind_handler is not None:
+                request_ids = _request_ids_for_execution_bind(method, args)
+                if request_ids:
+                    self._execution_bind_handler(request_ids, rpc_id)
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut

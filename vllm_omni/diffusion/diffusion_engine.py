@@ -420,6 +420,7 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
         self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
+        self.executor.register_execution_bind_handler(self._bind_request_streaming_execution)
 
     def _init_scheduler(
         self,
@@ -966,6 +967,20 @@ class DiffusionEngine:
             output_ack=bool(sampling.streaming_output_ack),
         )
 
+    def _bind_request_streaming_execution(self, request_ids: list[str], execution_id: str) -> None:
+        """Record the expected RPC id before workers can emit CHUNK_READY."""
+        if not request_ids or not execution_id:
+            return
+        with self._cv:
+            states = getattr(self, "_request_chunk_states", None)
+            if not states:
+                return
+            for request_id in request_ids:
+                state = states.get(request_id)
+                if state is None or not state.expect_streaming or state.cancelled or state.terminal_emitted:
+                    continue
+                state.execution_id = execution_id
+
     def _release_request_chunk_bytes_locked(self, request_id: str, chunk_index: int) -> None:
         """Caller holds ``_cv``. Decrement in-flight bytes when the client acks a chunk."""
         states = getattr(self, "_request_chunk_states", None)
@@ -1038,13 +1053,10 @@ class DiffusionEngine:
                 return self._fail_request_chunk_locked(state, error)
             if output is None or async_output_id is None:
                 return self._fail_request_chunk_locked(state, "request streaming chunk missing output")
-            if state.execution_id is None and execution_id is not None:
-                state.execution_id = execution_id
-            elif state.execution_id is not None and execution_id != state.execution_id:
-                return self._fail_request_chunk_locked(
-                    state,
-                    f"request streaming execution_id mismatch for {request_id}",
-                )
+            # Identity must be bound at dispatch (§4.3–4.4). Late packs from a
+            # prior execution that reused this request_id are reclaimed only.
+            if state.execution_id is None or execution_id is None or execution_id != state.execution_id:
+                return "drop", None
             if chunk_index < 0 or chunk_index > state.next_chunk_index:
                 return self._fail_request_chunk_locked(
                     state,

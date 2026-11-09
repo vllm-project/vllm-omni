@@ -106,6 +106,8 @@ class CausVidWanPipeline(nn.Module):
     supports_request_batch = True
     # One request forward can emit decoded chunks before COMPUTE_DONE.
     supports_request_streaming_output = True
+    # Engine registers cancellation SHM; cell ticks call check_request_cancellation.
+    supports_request_cancellation: ClassVar[bool] = True
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
     _transformer_cls: ClassVar[type[StageWanTransformer]] = StageWanTransformer

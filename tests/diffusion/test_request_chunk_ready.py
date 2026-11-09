@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -406,6 +407,67 @@ def test_bind_request_chunk_emitter_requires_request_id_for_live_emitter() -> No
         assert get_emit_chunk() is None
     finally:
         reset_emit_chunk(token_none)
+
+
+def test_engine_drops_chunk_with_unbound_or_mismatched_execution_id() -> None:
+    """Late packs from a prior execution must not be adopted by a reused request id."""
+    engine, output_queue = _engine_for_chunks()
+    state = engine._request_chunk_states["req"]
+    state.execution_id = "rpc-new"
+    late = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2), async_output_id="old-0")
+
+    engine._on_request_chunk_ready("req", "rpc-old", 0, late, None)
+
+    assert output_queue.empty()
+    engine.executor.drop_output.assert_called_once_with("old-0")
+    assert state.next_chunk_index == 0
+    assert state.terminal_emitted is False
+    assert state.failed is False
+
+    state.execution_id = None
+    engine.executor.drop_output.reset_mock()
+    unbound = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2), async_output_id="early-0")
+    engine._on_request_chunk_ready("req", "rpc-1", 0, unbound, None)
+    assert output_queue.empty()
+    engine.executor.drop_output.assert_called_once_with("early-0")
+
+
+def test_bind_request_streaming_execution_sets_expected_rpc_id() -> None:
+    engine, _queue = _engine_for_chunks()
+    state = engine._request_chunk_states["req"]
+    state.execution_id = None
+
+    engine._bind_request_streaming_execution(["req", "missing"], "rpc-42")
+
+    assert state.execution_id == "rpc-42"
+    output = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2), async_output_id="c0")
+    engine._on_request_chunk_ready("req", "rpc-42", 0, output, None)
+    assert _queue.qsize() == 1
+
+
+def test_causvid_declares_request_cancellation() -> None:
+    from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+
+    assert CausVidWanPipeline.supports_request_cancellation is True
+    assert CausVidWanPipeline.supports_request_streaming_output is True
+
+
+def test_e2e_forward_hold_waits_for_release(tmp_path, monkeypatch) -> None:
+    from vllm_omni.diffusion.worker.e2e_forward_hold import maybe_hold_before_compute_done
+
+    gate = tmp_path / "hold.gate"
+    monkeypatch.setenv("VLLM_OMNI_E2E_HOLD_FORWARD_GATE", str(gate))
+    monkeypatch.setenv("VLLM_OMNI_E2E_HOLD_FORWARD_TIMEOUT_S", "2")
+
+    def _release() -> None:
+        time.sleep(0.2)
+        gate.write_text("go\n", encoding="utf-8")
+
+    thread = threading.Thread(target=_release, daemon=True)
+    thread.start()
+    maybe_hold_before_compute_done()
+    thread.join(timeout=2.0)
+    assert Path(str(gate) + ".holding").exists()
 
 
 def test_return_result_fails_when_chunk_pack_times_out(mocker) -> None:
