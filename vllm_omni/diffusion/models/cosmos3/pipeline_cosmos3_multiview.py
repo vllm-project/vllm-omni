@@ -42,7 +42,6 @@ from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
-    expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, patch_grid, unpack_state
@@ -785,7 +784,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        latent_t = num_views * latent_frames_per_view
         raw_indexes = multiview.get("condition_frame_indexes_vision")
         if raw_indexes is None:
             if not has_vision:
@@ -805,7 +803,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         else:
             if any(index < 0 or index >= latent_frames_per_view for index in local_indexes):
                 raise ValueError("Camera condition frame index is outside the generated latent clip.")
-            condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
+            condition_indexes = [
+                view * latent_frames_per_view + frame for view in range(num_views) for frame in local_indexes
+            ]
 
         generator = sp.generator
         seed = self._resolve_seed(sp, generator)

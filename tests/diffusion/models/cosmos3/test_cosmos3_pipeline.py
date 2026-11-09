@@ -4168,6 +4168,49 @@ def test_multiview_output_reports_generated_rate_as_video_fps(
     assert OmniOpenAIServingVideo._resolve_fps(result) == expected_fps
 
 
+@pytest.mark.parametrize(
+    ("multiview_args", "vision_views", "expected"),
+    [
+        ({}, (0, 1), [0, 1, 8, 9]),
+        ({"condition_video_as_image": True}, (0, 1), [0, 8]),
+        ({"condition_frame_indexes_vision": "2,0,2"}, (0, 1), [0, 2, 8, 10]),
+        ({}, (1,), list(range(8, 16))),
+    ],
+    ids=["default_video_prefix", "video_as_image", "explicit_local_indexes", "view_completion"],
+)
+def test_multiview_condition_indexes_expand_per_view_local_frames(
+    make_cosmos3_pipeline, multiview_args: dict[str, Any], vision_views: tuple[int, ...], expected: list[int]
+) -> None:
+    """Per-view-local latent indexes select the same frames in every camera's camera-major block."""
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+    prepare_latents = pipeline._prepare_multiview_latents
+    captured: dict[str, Any] = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return prepare_latents(**kwargs)
+
+    pipeline._prepare_multiview_latents = capture
+    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
+    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 16, 1, 1)
+    views = [
+        {**view, "control_path": f"control{index}.mp4"}
+        | ({"vision_path": f"vision{index}.mp4"} if index in vision_views else {})
+        for index, view in enumerate(_t2v_multiview_views())
+    ]
+    sp = make_sampling_params(
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": views, **multiview_args}, "wsm": {}, "aspect_ratio": "16,9"},
+    )
+
+    pipeline.forward(make_request_batch({"prompt": "Driving."}, sp))
+
+    assert captured["num_views"] == 2
+    assert captured["condition_indexes"] == expected
+
+
 @pytest.mark.parametrize("above_ceiling", [False, True], ids=["negative", "above_ceiling"])
 def test_multiview_forward_rejects_out_of_range_max_sequence_length(make_cosmos3_pipeline, above_ceiling: bool) -> None:
     """A negative length would otherwise slice tokens off the end of every caption."""
