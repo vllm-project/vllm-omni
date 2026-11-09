@@ -61,6 +61,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def diffusion_scheduler_queue_wait_ms(request_outputs: list[Any]) -> float | None:
+    """Return the diffusion scheduler wait carried on a finished stage output.
+
+    The engine stores this on ``output.metrics`` as milliseconds. A missing key
+    means the stage did not measure scheduler admission. A present ``0`` is a
+    real measurement.
+    """
+    for output in request_outputs:
+        raw_metrics = getattr(output, "metrics", None)
+        if isinstance(raw_metrics, list):
+            raw_metrics = raw_metrics[0] if raw_metrics else None
+        if not isinstance(raw_metrics, dict) or "scheduler_queue_wait_ms" not in raw_metrics:
+            continue
+        wait_ms = raw_metrics["scheduler_queue_wait_ms"]
+        if wait_ms is None:
+            continue
+        return float(wait_ms)
+    return None
+
+
 class StageUnavailableError(RuntimeError):
     """Raised when dispatch cannot reach a live replica of a stage.
 
@@ -848,10 +868,28 @@ class StagePool:
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
+        pipeline_timings: dict[str, float] | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
+        scheduler_wait_ms = diffusion_scheduler_queue_wait_ms(request_outputs)
+        if scheduler_wait_ms is not None:
+            if scheduler_wait_ms > stage_gen_time_ms:
+                logger.warning(
+                    "Stage-%s diffusion scheduler wait %.3f ms exceeds stage generation %.3f ms",
+                    self.stage_id,
+                    scheduler_wait_ms,
+                    stage_gen_time_ms,
+                )
+            stage_gen_time_ms -= scheduler_wait_ms
+            if pipeline_timings is not None:
+                # A missing orchestrator hop still records the scheduler wait,
+                # so subtracting it from generation does not drop the time.
+                if "queue_wait_ms" in pipeline_timings:
+                    pipeline_timings["queue_wait_ms"] = float(pipeline_timings["queue_wait_ms"]) + scheduler_wait_ms
+                else:
+                    pipeline_timings["queue_wait_ms"] = scheduler_wait_ms
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         native_text_metrics = {}
         if request_id:

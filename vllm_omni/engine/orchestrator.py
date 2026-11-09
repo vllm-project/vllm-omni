@@ -1583,7 +1583,6 @@ class OrchestratorBase:
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
-        pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
@@ -1602,17 +1601,36 @@ class OrchestratorBase:
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
-                stage_metrics = pool.build_stage_metrics(
-                    [output],
-                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-                    request_timestamp=req_state.request_timestamp,
-                    replica_id=replica_id,
-                    sampling_params=req_state.sampling_params_list[stage_id],
-                )
-                if self.collect_stage_metrics:
-                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics = self._attach_finished_stage_metrics(stage_id, replica_id, output, req_state)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+
+    def _attach_finished_stage_metrics(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> Any:
+        """Build finished-stage metrics and fold scheduler wait into queue wait.
+
+        ``pipeline_timings`` is updated before the per-stage copy, so every
+        later stage publishes the sum of the orchestrator hop and all diffusion
+        scheduler waits seen so far. ``extract_queue_wait_s`` then reads that
+        one key.
+        """
+        pool = self.stage_pools[stage_id]
+        stage_metrics = pool.build_stage_metrics(
+            [output],
+            submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+            request_timestamp=req_state.request_timestamp,
+            replica_id=replica_id,
+            sampling_params=req_state.sampling_params_list[stage_id],
+            pipeline_timings=req_state.pipeline_timings,
+        )
+        if self.collect_stage_metrics:
+            stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+        return stage_metrics
 
     async def _handle_stage_error(
         self,
