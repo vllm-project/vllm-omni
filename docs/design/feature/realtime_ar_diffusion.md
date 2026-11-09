@@ -15,7 +15,7 @@ ABot World uses this tick path with a single KV branch. DreamZero uses the
 same runner capability with two logical CFG branches. LingBot World v2 no
 longer uses ticks: it runs on the same runner through step execution, where one
 request covers the whole rollout (see the
-[LingBot World 2.0 recipe](../../../recipes/Robbyant/LingBot-World-2.0.md)).
+[LingBot World 2.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-World-2.0.md)).
 
 ## Identities
 
