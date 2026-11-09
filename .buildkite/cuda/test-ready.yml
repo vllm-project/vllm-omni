@@ -25,7 +25,11 @@ steps:
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
         timeout_in_minutes: 25
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          # cpu tests are one loadgroup per module file. -n 4 matches
+          # Tiny Model Tests · Diffusion (base) on L4_1. Do not use -n auto
+          # (mp children scale with vCPU) or --cpu-shard-profile (timing
+          # shards reject xdist).
+          - "pytest -sv -n 4 tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"

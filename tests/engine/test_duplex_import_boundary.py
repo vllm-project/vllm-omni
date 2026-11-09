@@ -37,19 +37,25 @@ def _assert_isolated_import_succeeds(script: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Import-boundary checks must not depend on GPU state leaked by prior tests."""
+def test_non_duplex_graph_keeps_stable_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turn-based imports and stable contracts share one child interpreter.
+
+    These checks only import modules that must stay off the duplex, client, and
+    plugin graph, so one fresh ``sys.modules`` still sees each boundary. The
+    parent GPU visibility variables are set to a conflicting pair first; the
+    child clears them before importing. The duplex stack, the CLI graph, and
+    the client package each keep their own interpreter: those graphs either
+    must load duplex or must observe a different baseline.
+    """
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
 
-    _assert_isolated_import_succeeds("import vllm_omni.outputs")
-
-
-def test_turn_based_stack_has_no_duplex_vocabulary() -> None:
     # The generic bases and the turn-based siblings (AsyncOmni / AsyncOmniEngine /
-    # Orchestrator) carry no duplex code: importing them must not load the
-    # engine-side duplex package, the model plugins or the client library.
+    # Orchestrator) carry no duplex code. Stable messages, outputs, and the
+    # sampling-helper spec are the same non-duplex side of the boundary.
     _assert_isolated_import_succeeds("""
+import dataclasses
+import importlib.util
 import sys
 
 import vllm_omni.engine.async_omni_engine
@@ -70,14 +76,52 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
 )
-loaded = sorted(
-    name
-    for name in sys.modules
-    if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden_prefixes)
-)
+
+def loaded_forbidden() -> list[str]:
+    return sorted(
+        name
+        for name in sys.modules
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden_prefixes)
+    )
+
+loaded = loaded_forbidden()
 if loaded:
     raise SystemExit("turn-based imports loaded duplex modules: " + ", ".join(loaded))
+
+from vllm_omni.engine import messages
+
+legacy_modules = (
+    "vllm_omni.engine.duplex_contracts",
+    "vllm_omni.engine.duplex_lease",
+    "vllm_omni.engine.resumable",
+)
+present = [name for name in legacy_modules if importlib.util.find_spec(name) is not None]
+if present:
+    raise SystemExit("stable duplex modules still exist: " + ", ".join(present))
+
+duplex_exports = sorted(name for name in vars(messages) if name.startswith("Duplex"))
+if duplex_exports:
+    raise SystemExit("stable messages still expose duplex contracts: " + ", ".join(duplex_exports))
+
+from vllm_omni.outputs import OmniRequestOutput
+
+fields = {field.name for field in dataclasses.fields(OmniRequestOutput)}
+if "duplex_output_decision" in fields:
+    raise SystemExit("stable output declares duplex_output_decision")
+
+if importlib.util.find_spec("vllm_omni.model_executor.duplex_sampling") is None:
+    raise SystemExit("model_executor duplex_sampling helper module is missing")
+
+loaded = loaded_forbidden()
+if loaded:
+    raise SystemExit("stable-contract imports loaded duplex modules: " + ", ".join(loaded))
 """)
+
+
+def test_duplex_sampling_helper_lives_in_model_executor() -> None:
+    # The spec check runs in the shared non-duplex child above. This only
+    # guards the removed experimental path, which does not need an interpreter.
+    assert not (REPO_ROOT / "vllm_omni" / "experimental" / "fullduplex" / "model_executor.py").exists()
 
 
 def test_duplex_stack_loads_the_framework_but_not_the_model_plugins() -> None:
@@ -173,49 +217,6 @@ added = sorted(
 if added:
     raise SystemExit("the client package pulled in server modules: " + ", ".join(added))
 """)
-
-
-def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
-    _assert_isolated_import_succeeds("""
-import importlib.util
-
-from vllm_omni.engine import messages
-
-legacy_modules = (
-    "vllm_omni.engine.duplex_contracts",
-    "vllm_omni.engine.duplex_lease",
-    "vllm_omni.engine.resumable",
-)
-present = [name for name in legacy_modules if importlib.util.find_spec(name) is not None]
-if present:
-    raise SystemExit("stable duplex modules still exist: " + ", ".join(present))
-
-duplex_exports = sorted(name for name in vars(messages) if name.startswith("Duplex"))
-if duplex_exports:
-    raise SystemExit("stable messages still expose duplex contracts: " + ", ".join(duplex_exports))
-""")
-
-
-def test_stable_outputs_do_not_declare_duplex_decision_field() -> None:
-    _assert_isolated_import_succeeds("""
-import dataclasses
-
-from vllm_omni.outputs import OmniRequestOutput
-
-fields = {field.name for field in dataclasses.fields(OmniRequestOutput)}
-if "duplex_output_decision" in fields:
-    raise SystemExit("stable output declares duplex_output_decision")
-""")
-
-
-def test_duplex_sampling_helper_lives_in_model_executor() -> None:
-    _assert_isolated_import_succeeds("""
-import importlib.util
-
-if importlib.util.find_spec("vllm_omni.model_executor.duplex_sampling") is None:
-    raise SystemExit("model_executor duplex_sampling helper module is missing")
-""")
-    assert not (REPO_ROOT / "vllm_omni" / "experimental" / "fullduplex" / "model_executor.py").exists()
 
 
 def test_runtime_package_does_not_bundle_the_browser_demo() -> None:

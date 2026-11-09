@@ -638,6 +638,8 @@ def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
     assert argv == [
         "pytest",
         "-sv",
+        "-n",
+        "4",
         "tests/entrypoints",
         "tests/engine",
         "tests/diffusion",
