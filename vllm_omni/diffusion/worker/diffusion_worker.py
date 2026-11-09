@@ -1503,9 +1503,11 @@ class WorkerProc:
         # first so the result pump delivers them before the RPC future resolves.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             if not self._wait_chunk_outputs():
-                logger.warning(
-                    "Worker %d: chunk outputs still packing; COMPUTE_DONE may pass CHUNK_READY",
-                    self.gpu_id,
+                # Do not send COMPUTE_DONE: the engine would mark success and drop
+                # any CHUNK_READY that lands later, truncating streamed video.
+                raise TimeoutError(
+                    f"Worker {self.gpu_id}: CHUNK_READY packs still pending after "
+                    f"{_ASYNC_OUTPUT_DRAIN_TIMEOUT_S:.1f}s; refusing COMPUTE_DONE"
                 )
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
@@ -1661,8 +1663,11 @@ class WorkerProc:
         """Bind the chunk emitter for one request forward.
 
         Only the rank that replies with media gets a live emitter. Other ranks
-        bind ``None`` so a pipeline cannot emit duplicate chunks. Returns the
-        context token to reset, or ``None`` when this RPC is not a request forward.
+        bind ``None`` so a pipeline cannot emit duplicate chunks. Batch /
+        unidentified executes also bind ``None`` so models fall back to a full
+        accumulated output instead of emitting unroutable CHUNK_READY packs.
+        Returns the context token to reset, or ``None`` when this RPC is not a
+        request forward.
         """
         method = rpc_request.get("method")
         if getattr(self.od_config, "step_execution", False) or method not in _REQUEST_CHUNK_EXECUTE_METHODS:
@@ -1670,6 +1675,10 @@ class WorkerProc:
         if not should_reply or self.result_mq is None or self._async_output_queue is None:
             return bind_emit_chunk(None)
         request_id = _request_id_from_execute_args(method, tuple(rpc_request.get("args") or ()))
+        if request_id is None:
+            # execute_model_batch (and any execute without a request id) cannot
+            # label CHUNK_READY for the engine; keep accumulation / final media.
+            return bind_emit_chunk(None)
         return bind_emit_chunk(self._make_emit_chunk(request_id, rpc_request.get("rpc_id")))
 
     def drain_async_outputs(self, timeout: float | None = None) -> bool:

@@ -269,14 +269,18 @@ def _start_local(
                 item = latent_q.get()
                 if item is stop:
                     break
-                chunk_index, host, event = item
+                # WanCell passes session-absolute chunk ids; client streaming
+                # and the engine expect request-local 0..n-1 indices (same as
+                # the remote decode path's enumerate).
+                _session_chunk, host, event = item
+                del _session_chunk
                 if event is not None:
                     event.synchronize()
                 scaled = _rescale_latents(vae, host)
                 pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
                 _record_decoded_chunk(
                     pixels=pixels,
-                    chunk_index=int(chunk_index),
+                    chunk_index=emitted[0],
                     on_chunk=on_chunk,
                     pixels_out=pixels_out,
                     emitted=emitted,

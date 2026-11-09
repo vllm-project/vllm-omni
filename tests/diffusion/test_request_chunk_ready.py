@@ -351,3 +351,78 @@ def test_worker_emit_chunk_does_not_send_compute_done(mocker) -> None:
     assert message.rpc_id == "rpc-9"
     assert message.kind != AsyncOutputKind.COMPUTE_DONE
     assert proc._chunk_output_pending == 0
+
+
+def test_bind_request_chunk_emitter_disables_streaming_for_batch() -> None:
+    """Batch execute has no per-request id; bind None so models keep full media."""
+    from vllm_omni.diffusion.worker.request_chunk_emit import get_emit_chunk, reset_emit_chunk
+
+    proc = object.__new__(WorkerProc)
+    proc.od_config = SimpleNamespace(step_execution=False)
+    proc.result_mq = MagicMock()
+    proc._async_output_queue = queue.Queue()
+
+    token = proc._bind_request_chunk_emitter(
+        {"method": "execute_model_batch", "args": (object(),), "rpc_id": "rpc-batch"},
+        should_reply=True,
+    )
+    try:
+        assert token is not None
+        assert get_emit_chunk() is None
+    finally:
+        reset_emit_chunk(token)
+
+
+def test_bind_request_chunk_emitter_requires_request_id_for_live_emitter() -> None:
+    from vllm_omni.diffusion.worker.request_chunk_emit import get_emit_chunk, reset_emit_chunk
+
+    proc = object.__new__(WorkerProc)
+    proc.od_config = SimpleNamespace(step_execution=False)
+    proc.result_mq = MagicMock()
+    proc._async_output_queue = queue.Queue()
+    proc.gpu_id = 0
+    proc._async_output_done = threading.Condition()
+    proc._async_output_pending = 0
+    proc._chunk_output_pending = 0
+
+    req = SimpleNamespace(request_id="req-1")
+    token = proc._bind_request_chunk_emitter(
+        {"method": "execute_model", "args": (req,), "rpc_id": "rpc-1"},
+        should_reply=True,
+    )
+    try:
+        emit = get_emit_chunk()
+        assert emit is not None
+        assert callable(emit)
+    finally:
+        reset_emit_chunk(token)
+
+    missing = SimpleNamespace()
+    token_none = proc._bind_request_chunk_emitter(
+        {"method": "execute_model", "args": (missing,), "rpc_id": "rpc-2"},
+        should_reply=True,
+    )
+    try:
+        assert get_emit_chunk() is None
+    finally:
+        reset_emit_chunk(token_none)
+
+
+def test_return_result_fails_when_chunk_pack_times_out(mocker) -> None:
+    proc = object.__new__(WorkerProc)
+    proc.gpu_id = 0
+    proc.result_mq = MagicMock()
+    proc._result_mq_lock = threading.Lock()
+    proc._async_output_queue = queue.Queue()
+    proc._async_output_done = threading.Condition()
+    proc._async_output_pending = 0
+    proc._chunk_output_pending = 1
+    proc.od_config = SimpleNamespace(step_execution=False)
+
+    mocker.patch.object(proc, "_wait_chunk_outputs", return_value=False)
+
+    with pytest.raises(TimeoutError, match="CHUNK_READY packs still pending"):
+        proc._return_result(DiffusionOutput(finished=True, output=torch.zeros(1)), rpc_id="rpc-t")
+
+    proc.result_mq.enqueue.assert_not_called()
+    assert proc._async_output_queue.empty()

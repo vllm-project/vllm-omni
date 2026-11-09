@@ -262,3 +262,23 @@ def test_local_on_chunk_does_not_accumulate():
     assert decoder.chunks == 2
     assert seen == [(0, (1, 3, 2, 4, 4)), (1, (1, 3, 2, 4, 4))]
     assert job.emitted_chunks == 2
+
+
+def test_local_on_chunk_remaps_session_absolute_ids_to_request_relative():
+    """Session continuation uses chunk_base>0; client protocol still starts at 0."""
+    vae = _FakeVae()
+    decoder = _FakeDecoder()
+    seen: list[int] = []
+
+    def on_chunk(idx: int, pixels: torch.Tensor) -> None:
+        del pixels
+        seen.append(idx)
+
+    job = _start_local(vae=vae, decoder=decoder, session_id="world-e2e", on_chunk=on_chunk)
+    assert job.on_finished is not None
+    # WanCell reports session-absolute ids (chunk_base=5 continuation).
+    job.on_finished(5, torch.randn(1, 4, 2, 4, 4))
+    job.on_finished(6, torch.randn(1, 4, 2, 4, 4))
+    assert job.join() is None
+    assert seen == [0, 1]
+    assert job.emitted_chunks == 2
