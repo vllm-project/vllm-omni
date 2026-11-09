@@ -9,6 +9,7 @@ claim of identical conditioning or bitwise equivalence between the pipelines.
 """
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -95,7 +96,14 @@ def _generate_edit(client, *, model, images, prompt, output_path, capfd, **gener
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("tp_size,sp_size", [(4, 1), (2, 2)], ids=["tp4-sp1", "tp2-sp2"])
 def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
-    from tests.e2e.accuracy.helpers import CLIPScorer, compute_image_ssim_psnr, download_images, model_output_dir
+    from tests.e2e.accuracy.helpers import (
+        CLIPScorer,
+        assert_similarity_metrics,
+        download_images,
+        measure_image_similarity,
+        model_output_dir,
+        write_accuracy_result,
+    )
     from tests.helpers.runtime import OmniServer
 
     configs = json.loads(_BENCHMARK_CONFIG.read_text())
@@ -187,15 +195,46 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
 
     # Score every mode against the official output, not an uncached Omni output.
     clip_scorer = CLIPScorer()
-    metrics, failures = {}, []
+    metrics, clip_failures = {}, []
     for (mode, case), image in results.items():
-        ssim, psnr = compute_image_ssim_psnr(prediction=image, reference=reference)
         label = f"{mode}_{case} vs official_ref"
-        metrics[label] = {"clip_score": clip_scorer.image_image_score(image, reference), "ssim": ssim, "psnr": psnr}
-        for name, threshold in _ACCURACY_THRESHOLDS.items():
-            value = metrics[label][name]
-            print(f"{label} {name}: {value:.6f}, required >= {threshold}")
-            if not value >= threshold:
-                failures.append(f"{label}: {name}={value:.6f} < {threshold}")
-    (output_dir / "quality_metrics.json").write_text(json.dumps(metrics, indent=2))
-    assert not failures, "\n".join(failures)
+        ssim, psnr = measure_image_similarity(
+            model_name=label,
+            vllm_image=image,
+            diffusers_image=reference,
+        )
+        clip_score = clip_scorer.image_image_score(image, reference)
+        metrics[label] = {"clip_score": clip_score, "ssim": ssim, "psnr": psnr}
+        print(f"{label} clip_score: {clip_score:.6f}, required >= {_ACCURACY_THRESHOLDS['clip_score']}")
+        # Fail closed on NaN/Inf: ``nan < threshold`` is False, but ``not nan >= threshold`` is True.
+        if not clip_score >= _ACCURACY_THRESHOLDS["clip_score"]:
+            clip_failures.append(
+                f"{label}: clip_score={clip_score:.6f} does not meet >= {_ACCURACY_THRESHOLDS['clip_score']}"
+            )
+    clip_scores = [scores["clip_score"] for scores in metrics.values()]
+    # Prefer a non-finite CLIP when present so the dashboard top-level mirrors fail-closed gates.
+    worst_clip = next((score for score in clip_scores if not math.isfinite(score)), min(clip_scores))
+    write_accuracy_result(
+        model_id=model,
+        dataset="image_similarity",
+        metrics={
+            "ssim": min(scores["ssim"] for scores in metrics.values()),
+            "psnr": min(scores["psnr"] for scores in metrics.values()),
+            "clip_score": worst_clip,
+        },
+        baseline=dict(_ACCURACY_THRESHOLDS),
+        extra={
+            "tp_size": tp_size,
+            "sp_size": sp_size,
+            "per_label": metrics,
+        },
+    )
+    assert not clip_failures, "\n".join(clip_failures)
+    for label, scores in metrics.items():
+        assert_similarity_metrics(
+            model_name=label,
+            ssim_score=scores["ssim"],
+            psnr_score=scores["psnr"],
+            ssim_threshold=_ACCURACY_THRESHOLDS["ssim"],
+            psnr_threshold=_ACCURACY_THRESHOLDS["psnr"],
+        )

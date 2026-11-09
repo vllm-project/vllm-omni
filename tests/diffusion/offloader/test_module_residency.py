@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 import vllm_omni.diffusion.offloader.module_residency as residency_module
+from vllm_omni.diffusion.cache.exact_projection_cache import ExactProjectionCache
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -81,6 +82,19 @@ def test_inference_staging_preserves_parameter_version_tracking(patched_runtime,
             version = module.weight._version
             module.weight.add_(1)
             assert module.weight._version == version + 1
+
+
+def test_inference_staging_preserves_projection_cache_invalidation(patched_runtime, mocker):
+    module = nn.Linear(4, 2)
+    with torch.inference_mode():
+        stager = PinnedModuleStager(
+            module, torch.device("cpu"), pin_memory=False, cache_retention=mocker.Mock(spec=BoundedAllocatorCache)
+        )
+        for transition in (stager.load, stager.offload):
+            transition()
+            signature = ExactProjectionCache._signature(module)
+            module.weight.add_(1)
+            assert ExactProjectionCache._signature(module) != signature
 
 
 def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_runtime, mocker):

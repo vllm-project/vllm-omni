@@ -43,6 +43,13 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# AMD build 15260 already auto-prefetched its 65.68 GiB NFS checkpoint;
+# sibling SHM stages spent about 578s loading weights near the 600s deadline.
+# Start with a bounded 900s stage allowance. Direct/online test paths use a
+# 1200s overall bound; offline OmniRunner tests retain their 1800s default.
+# These are ROCm Qwen3-Omni test settings, pending cold-storage qualification.
+QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S = 900
+QWEN3_OMNI_COLD_INIT_TIMEOUT_S = 1200
 # Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
 # and signal escalation. Keep their tracker alive while the API owns teardown.
 SERVER_SHUTDOWN_TIMEOUT_S = 60
@@ -83,6 +90,20 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
+
+
+def assign_ephemeral_master_port() -> int:
+    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
+
+    A literal port is shared by every xdist worker, so concurrent
+    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
+    ``setdefault`` does not help: the first test on a worker leaves
+    ``MASTER_PORT`` set, and every later test keeps that occupied port.
+    """
+    port = get_open_port()
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    return port
 
 
 def dummy_messages_from_mix_data(
@@ -587,6 +608,14 @@ class OmniServerStageCli(OmniServer):
             time.sleep(2)
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
+
+    def read_stage_logs(self) -> dict[int, str]:
+        """Return the log each stage subprocess has written so far, keyed by stage id."""
+        logs: dict[int, str] = {}
+        for stage_id, log_path in self._stage_log_paths.items():
+            if log_path and log_path.exists():
+                logs[stage_id] = log_path.read_text(encoding="utf-8", errors="replace")
+        return logs
 
     def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
         """Tail each stage's subprocess log back to stdout on teardown.

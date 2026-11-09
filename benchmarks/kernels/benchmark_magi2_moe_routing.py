@@ -30,7 +30,7 @@ from collections.abc import Callable
 import torch
 from vllm.triton_utils import triton
 
-from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
+from vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels import (
     _reference_global_sort_routes,
     global_sort_routes,
     triton_mh_moe_forward,

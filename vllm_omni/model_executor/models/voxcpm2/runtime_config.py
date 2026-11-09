@@ -78,7 +78,12 @@ class _VoxCPM2RuntimeConfig:
         model_config = vllm_config.model_config
         values: dict[str, Any] = {}
         if getattr(model_config, "use_v2_model_runner", False):
-            values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
+            from vllm_omni.platforms import current_omni_platform
+
+            # Incremental VAE decoding is a per-patch unified-graph feature and
+            # only exists on CUDA. Other platforms keep the v1 audio profile.
+            if current_omni_platform.is_cuda():
+                values.update(enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3)
         raw = getattr(model_config, "voxcpm2_runtime_config", None)
         if raw is None:
             raw = getattr(getattr(model_config, "hf_config", None), "voxcpm2_runtime_config", None)

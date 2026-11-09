@@ -353,6 +353,20 @@ def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
     }
 
 
+def test_thinker2talker_token_only_accepts_plain_text_prompt() -> None:
+    source_outputs = [
+        SimpleNamespace(
+            request_id="req-plain-text",
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(cumulative_token_ids=[3])],
+        )
+    ]
+
+    [talker_prompt] = q3.thinker2talker_token_only(source_outputs, prompt="What is the capital of China?")
+
+    assert talker_prompt["additional_information"] is None
+
+
 def test_accumulator_replaces_keys_in_replace_set() -> None:
     """REPLACE-key semantics: subsequent emissions of the same key replace, not append."""
     from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -811,6 +825,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
     model._batch_stats_decoded_frames = 0
     model._batch_stats_actual_frames = Counter()
     model._batch_stats_bucket_groups = Counter()
+    model._streaming_codec = None
 
     payload_codes = torch.tensor([1, 3, 2, 4], dtype=torch.long)
     out = model.forward(
