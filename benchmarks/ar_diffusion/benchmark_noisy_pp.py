@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# 外部 torchrun 运行原生 Noisy PP；预编码文本与 CUDA events 隔离 DiT 吞吐。
+# External torchrun harness for native Noisy PP; pre-encoded text and CUDA
+# events isolate DiT throughput.
 
 import argparse
 import hashlib
@@ -38,36 +39,6 @@ def main():
     p.add_argument("--expected-sha", default=None)
     args = p.parse_args()
     rank, world, local_rank = [int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK")]
-    if rank == 0:
-        root = Path(__file__).resolve().parents[2]
-        files = list((root / "benchmarks/ar_diffusion").glob("*.py"))
-        files.append(root / "benchmarks/ar_diffusion/provenance.json")
-        files += [
-            root / name
-            for name in (
-                "vllm_omni/diffusion/models/causvid_wan/transformer.py",
-                "vllm_omni/diffusion/models/causvid_wan/wan_cell.py",
-                "vllm_omni/diffusion/models/causvid_wan/weights.py",
-                "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
-                "vllm_omni/diffusion/layers/adalayernorm.py",
-                "vllm_omni/diffusion/layers/norm.py",
-                "vllm_omni/experimental/ar_diffusion/cell_executor.py",
-                "vllm_omni/experimental/ar_diffusion/cell_schedule.py",
-                "vllm_omni/experimental/ar_diffusion/flow_euler.py",
-                "vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py",
-                "vllm_omni/experimental/ar_diffusion/kv_cache/paged_attention.py",
-            )
-        ]
-        manifest = {}
-        for file in files:
-            relative = file.relative_to(root)
-            dst = args.out / "source_snapshot" / relative
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists() and dst.read_bytes() != file.read_bytes():
-                raise RuntimeError(f"result directory contains different source: {relative}")
-            shutil.copy2(file, dst)
-            manifest[str(relative)] = hashlib.sha256(file.read_bytes()).hexdigest()
-        (args.out / "source_snapshot/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     if world != (args.steps + 1) * args.groups:
         p.error("world must equal (steps + clean) times groups")
     if args.steps < 1 or args.shift <= 0:
@@ -76,6 +47,43 @@ def main():
         p.error("warmup must be nonnegative; repeat and measure must be positive")
     if args.skip < 1 or args.skip + args.measure > args.chunks:
         p.error("completion window must fit the request")
+    root = Path(__file__).resolve().parents[2]
+    snapshot_files = list((root / "benchmarks/ar_diffusion").glob("*.py"))
+    snapshot_files.append(root / "benchmarks/ar_diffusion/provenance.json")
+    snapshot_files += [
+        root / name
+        for name in (
+            "vllm_omni/diffusion/models/causvid_wan/transformer.py",
+            "vllm_omni/diffusion/models/causvid_wan/wan_cell.py",
+            "vllm_omni/diffusion/models/causvid_wan/weights.py",
+            "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
+            "vllm_omni/diffusion/layers/adalayernorm.py",
+            "vllm_omni/diffusion/layers/norm.py",
+            "vllm_omni/experimental/ar_diffusion/cell_executor.py",
+            "vllm_omni/experimental/ar_diffusion/cell_schedule.py",
+            "vllm_omni/experimental/ar_diffusion/flow_euler.py",
+            "vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py",
+            "vllm_omni/experimental/ar_diffusion/kv_cache/paged_attention.py",
+        )
+    ]
+    # Pre-flight the snapshot on every rank before rendezvous: a stale
+    # snapshot in --out must fail the whole job here instead of rank 0
+    # alone, which would leave the other ranks hanging in
+    # init_distributed_environment until torchrun's timeout.
+    for file in snapshot_files:
+        relative = file.relative_to(root)
+        dst = args.out / "source_snapshot" / relative
+        if dst.exists() and dst.read_bytes() != file.read_bytes():
+            p.error(f"result directory contains different source: {relative}")
+    if rank == 0:
+        manifest = {}
+        for file in snapshot_files:
+            relative = file.relative_to(root)
+            dst = args.out / "source_snapshot" / relative
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, dst)
+            manifest[str(relative)] = hashlib.sha256(file.read_bytes()).hexdigest()
+        (args.out / "source_snapshot/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     torch.set_num_threads(8)
     from vllm_omni.platforms import current_omni_platform
 

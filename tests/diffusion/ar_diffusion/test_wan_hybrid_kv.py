@@ -18,26 +18,30 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyK
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_hybrid_kv_surface_tracks_upstream_schedule_and_cache_kwargs():
-    """CPU guard for the GPU-only rename blind spot in the hybrid harness.
+def test_noisy_kv_cache_accepts_benchmark_kwargs():
+    """Call-site guard for the GPU-only rename blind spot in the benchmark.
 
-    ``HybridNoisyKVState.begin_request`` reads ``plan.schedule.step_replicas``
-    and ``benchmark_noisy_pp`` passes ``step_replicas=`` into main's
-    ``NoisyKVCache``; both run only inside GPU benchmark jobs, so a rename of
-    either kwarg on main previously surfaced only there. Pin the signatures
-    and the read on CPU so the next upstream rename fails here first.
+    ``NoisyKVCache`` is constructed only inside the GPU benchmark job, so a
+    kwarg rename on main would otherwise surface only there. Build it with
+    the exact kwargs ``benchmark_noisy_pp`` passes, on CPU with a tiny spec,
+    so the next rename fails here first. The schedule-side ``step_replicas``
+    read is exercised on the real admit path by
+    ``test_hybrid_adapter_satisfies_executor_protocol``.
     """
-    import inspect
-
-    from benchmarks.ar_diffusion import benchmark_noisy_pp
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache
 
-    # The import itself is part of the contract: the harness module must stay
-    # importable on CPU after upstream refactors.
-    assert benchmark_noisy_pp is not None
-    assert "step_replicas" in inspect.signature(CellSchedule).parameters
-    assert "step_replicas" in inspect.signature(NoisyKVCache.__init__).parameters
-    assert "step_replicas" in inspect.getsource(HybridNoisyKVState.begin_request)
+    spec = ARDiffusionNoisyKVSpec(15, 12, 128, 8, 8, 6)
+    kv = NoisyKVCache(
+        spec,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        layer_groups=2,
+        max_batch_size=1,
+        step_replicas=4,
+        layer_offset=0,
+        blocks_per_rank=15,
+    )
+    assert kv.blocks_per_rank == 15 and kv.pool.capacity > 0
 
 
 def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
@@ -54,7 +58,7 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
     state = HybridNoisyKVState(spec, model, None, torch.device("cpu"), torch.bfloat16)
     # begin_request wraps this CellPlan in BlockPlan and reads plan.schedule.
     native = build_cell_plan(CellSchedule(7, 3, 4, 2, Ordering.LATEST_KV, 6, blocks=30, blocks_per_rank=15))
-    # Must divide spec.block_size and fit spec.max_chunk_tokens.
+    # Must be a multiple of spec.block_size and <= spec.max_chunk_tokens.
     chunk_tokens = spec.block_size
 
     class FakePages:
