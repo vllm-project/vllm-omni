@@ -5,6 +5,7 @@ import asyncio
 import base64
 import importlib.util
 import sys
+import time
 import wave
 from pathlib import Path
 
@@ -972,7 +973,7 @@ def test_settle_inflight_answer_returns_when_pipeline_is_quiet():
     assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.2, quiet_s=0.5)) is True
 
 
-def test_settle_inflight_answer_waits_for_recent_text_delta():
+def test_settle_inflight_answer_releases_once_text_goes_quiet():
     demo = _load_demo_module()
     collector = demo.EventCollector()
     collector.add(
@@ -981,3 +982,169 @@ def test_settle_inflight_answer_waits_for_recent_text_delta():
     )
 
     assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.5, quiet_s=0.02)) is True
+
+
+def test_settle_inflight_answer_times_out_when_text_never_goes_quiet():
+    # Pins the quiet-time guard: the response list is balanced here, so
+    # removing the guard would return True immediately and fail this assert.
+    demo = _load_demo_module()
+    collector = demo.EventCollector()
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "delta": "正方形中间有"},
+        received_at_s=demo.time.monotonic(),
+    )
+
+    assert asyncio.run(demo._settle_inflight_answer(collector, timeout_s=0.1, quiet_s=5.0)) is False
+
+
+class _ScriptedEvent:
+    def __init__(self, raw: dict[str, object]) -> None:
+        self.raw = raw
+
+
+class _ScriptedDuplexClient:
+    """Offline DuplexClient stand-in replaying a scripted event timeline.
+
+    ``produce`` is an async-generator factory that receives the client and
+    yields raw event dicts; each yield becomes one realtime event.
+    ``commit_calls`` records the wall clock and the events emitted so far, so
+    tests can assert the ordering between the final commit and the scripted
+    answer without a live server.
+    """
+
+    def __init__(self, produce) -> None:
+        self._produce = produce
+        self.session_info = {"id": "session-scripted"}
+        self.input_timeline: list[dict[str, object]] = []
+        self.commit_calls: list[tuple[float, int]] = []
+        self.emitted: list[tuple[float, str]] = []
+        self._closed = asyncio.Event()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def events(self):
+        async for raw in self._produce(self):
+            self.emitted.append((time.monotonic(), str(raw["type"])))
+            yield _ScriptedEvent(raw)
+        await self._closed.wait()
+        self.emitted.append((time.monotonic(), "session.closed"))
+        yield _ScriptedEvent({"type": "session.closed"})
+
+    async def send(self, event: dict[str, object]) -> None:
+        self.input_timeline.append({"kind": "send", "type": event.get("type")})
+
+    async def stream_pcm(self, pcm16: bytes, *, chunk_ms: int, realtime: bool, **timeline) -> int:
+        # A real client awaits network IO here, which also lets the consume
+        # task pick up the first scripted events before the caller proceeds.
+        await asyncio.sleep(0)
+        self.input_timeline.append({"kind": "stream_pcm", "bytes": len(pcm16)})
+        return 1
+
+    async def commit(self, create_response: bool | None = None) -> None:
+        self.commit_calls.append((time.monotonic(), len(self.emitted)))
+
+    async def ack_playback(self, *args, **kwargs) -> None:
+        return None
+
+    async def close(self, timeout_s: float | None = None) -> None:
+        self._closed.set()
+
+
+def _write_silence_wav(path: Path, duration_s: float = 0.5) -> Path:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * int(16_000 * duration_s))
+    return path
+
+
+def _run_demo_with_scripted_client(demo, tmp_path: Path, *, timeout_s: float, produce):
+    client = _ScriptedDuplexClient(produce)
+    original_client_factory = demo._TimedInputClient
+    demo._TimedInputClient = lambda *args, **kwargs: client
+    wav_path = _write_silence_wav(tmp_path / "input.wav")
+    argv = [
+        "demo",
+        "--input-wav",
+        str(wav_path),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--no-realtime-pacing",
+        "--timeout-s",
+        str(timeout_s),
+    ]
+    original_argv = sys.argv
+    sys.argv = argv
+    try:
+        args = demo.parse_args()
+        result = asyncio.run(demo.run_demo(args))
+    finally:
+        sys.argv = original_argv
+        demo._TimedInputClient = original_client_factory
+    return client, result
+
+
+def test_run_demo_holds_final_commit_until_inflight_answer_settles(tmp_path):
+    # The pre-commit wait and its release, driven through the final-commit
+    # call site in run_demo: the model is still answering when the input
+    # stream ends, so the commit must not cut the answer off.
+    demo = _load_demo_module()
+
+    async def produce(client):
+        yield {"type": "response.created", "response": {"id": "resp-final"}}
+        for i in range(9):
+            await asyncio.sleep(0.1)
+            yield {"type": "response.output_audio_transcript.delta", "delta": f"最后场景片段{i}"}
+        await asyncio.sleep(0.1)
+        yield {"type": "response.done", "response": {"id": "resp-final"}}
+        for _ in range(250):
+            if client.commit_calls:
+                break
+            await asyncio.sleep(0.02)
+        yield {"type": "input_audio_buffer.committed"}
+        await asyncio.sleep(0.02)
+        yield {"type": "response.listen"}
+
+    client, result = _run_demo_with_scripted_client(demo, tmp_path, timeout_s=5.0, produce=produce)
+
+    assert len(client.commit_calls) == 1
+    commit_at_s, _ = client.commit_calls[0]
+    done_at_s = [t for t, ty in client.emitted if ty == "response.done"][-1]
+    last_delta_at_s = [t for t, ty in client.emitted if ty == "response.output_audio_transcript.delta"][-1]
+    # Not while the response is still active, and not while its trailing text
+    # is recent: the settle waits out the 0.5 s quiet window before committing.
+    assert commit_at_s > done_at_s
+    assert commit_at_s - last_delta_at_s >= 0.45
+    assert result["ok"] is True
+    assert result["post_commit"]["decision"] == "listen"
+
+
+def test_run_demo_final_commit_falls_through_when_answer_never_settles(tmp_path):
+    # Bounded timeout fallthrough at the final-commit call site: an answer
+    # that never settles must not block the commit forever.
+    demo = _load_demo_module()
+
+    async def produce(client):
+        yield {"type": "response.created", "response": {"id": "resp-stuck"}}
+        for _ in range(500):
+            if client.commit_calls:
+                break
+            await asyncio.sleep(0.02)
+            yield {"type": "response.output_audio_transcript.delta", "delta": "仍在描述最后一个场景"}
+        yield {"type": "input_audio_buffer.committed"}
+        await asyncio.sleep(0.02)
+        yield {"type": "response.done", "response": {"id": "resp-stuck"}}
+
+    client, result = _run_demo_with_scripted_client(demo, tmp_path, timeout_s=0.4, produce=produce)
+
+    assert len(client.commit_calls) == 1
+    _, emitted_at_commit = client.commit_calls[0]
+    # The commit happened while the response was still running: no
+    # response.done had been emitted when the settle window expired.
+    assert all(ty != "response.done" for _, ty in client.emitted[:emitted_at_commit])
+    assert result["ok"] is True
