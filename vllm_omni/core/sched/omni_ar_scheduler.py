@@ -852,6 +852,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         without booking, where there is no accounting to settle.
         """
         self._enforce_kstep_span_uniformity(scheduler_output)
+        self._trim_minicpmo45_terminal_drafts(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -2171,6 +2172,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 held.append((request, request.next_decode_eligible_step))
                 request.next_decode_eligible_step = _HELD_DECODE_STEP
         return held
+
+    def _trim_minicpmo45_terminal_drafts(self, scheduler_output: SchedulerOutput) -> None:
+        """Book a pending terminal forward without drafts, before upstream books the step.
+
+        The holds above only see ``self.running``. A readmission whose prefix hit
+        reaches the final token is padded with draft slots by upstream admission.
+        """
+        terminal_rows = getattr(self, "_minicpmo45_terminal_rows", None)
+        if not terminal_rows:
+            return
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        trimmed = [r for r in spec_tokens if r in terminal_rows]
+        for req_id in trimmed:
+            scheduler_output.num_scheduled_tokens[req_id] -= len(spec_tokens.pop(req_id))
+        if trimmed:
+            scheduler_output.total_num_scheduled_tokens = sum(scheduler_output.num_scheduled_tokens.values())
 
     def _release_minicpmo45_terminal_holds(self, held: list[tuple[Request, int]]) -> None:
         """Undo the holds, keeping any value schedule() wrote for a held request."""
