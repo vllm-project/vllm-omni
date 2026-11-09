@@ -166,6 +166,7 @@ def test_ambiguous_native_result_pins_sources_destinations_and_capacity(connecto
     assert sender._local_buffers[key][2] is source
     assert not sender.put("0", "1", "key", b"replacement")[0]
     assert receive(receiver, metadata, key="different") is None
+    assert receiver.health()["receive_capacity_rejections"] == 1
     # Sender capacity is also exhausted: a different receiver gets a safe
     # pre-submission rejection, not another native operation.
     other = connectors()
