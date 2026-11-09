@@ -3089,7 +3089,7 @@ class MiniMaxH3Pipeline(
         returns a pinned ladder -- task, long-video continuation, audio
         labels, timeline guides, ``continue_from``, ``pad_seq_len``, step
         execution, reference-KV offload, turbo/native LoRA, latent
-        refine/upscale). Still enforced
+        refine/upscale, attention schedules). Still enforced
         only in the authoritative check, because they need encoded
         conditioning or runtime model state: audio-reference/guide tensors,
         latent-mask editing, control rows, the AdaLN sidecar, and cache_dit
@@ -3162,6 +3162,12 @@ class MiniMaxH3Pipeline(
             # the same prepared kwargs; the base branch is built for the
             # first full schedule only.
             raise OmniClientError("MiniMax H3 keep_steps does not support latent refine/upscale passes")
+        if require_request_attention_schedule_fits(
+            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
+        ):
+            # The switch changes the packed layout mid-schedule; per-step
+            # attention profiles have not been validated across it.
+            raise OmniClientError("MiniMax H3 keep_steps does not support attention_schedule in this revision")
         return keep_steps
 
     def _prepare_local_conditioning(

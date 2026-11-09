@@ -774,6 +774,19 @@ def test_local_long_video_continuation_fails_before_any_encoder_pass(monkeypatch
     assert encode_prompt.call_count == 0
 
 
+def test_local_attention_schedule_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    """keep_steps plus an attention schedule rejects with zero Qwen passes."""
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "require_request_attention_schedule_fits",
+        lambda sampling, schedule, num_steps: SimpleNamespace(),
+    )
+    with pytest.raises(OmniClientError, match="attention_schedule"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
+    assert encode_prompt.call_count == 0
+
+
 def test_plain_requests_never_touch_the_keep_steps_resolver(monkeypatch: pytest.MonkeyPatch):
     """Requests without keep_steps keep their original code path untouched."""
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
