@@ -59,7 +59,6 @@ def test_mixed_conv_path_rejects_unknown_activation(adapter):
 
 @pytest.mark.parametrize("distributed", [False, True])
 def test_explicit_ncthw_layout_dispatch(monkeypatch, distributed):
-    from vllm_omni.platforms.npu.layers import dist_group_norm as cf
     from vllm_omni.platforms.npu.layers import dist_group_norm as op
 
     x = torch.randn(1, 32, 1, 2, 2)
@@ -71,8 +70,8 @@ def test_explicit_ncthw_layout_dispatch(monkeypatch, distributed):
         return actual
 
     monkeypatch.setattr(op.dist, "is_initialized", lambda: distributed)
-    monkeypatch.setattr(cf, "_group_norm_ncthw", kernel)
-    monkeypatch.setattr(cf, "_distributed_group_norm_ncthw", kernel)
+    monkeypatch.setattr(op, "_group_norm_ncthw", kernel)
+    monkeypatch.setattr(op, "_distributed_group_norm_ncthw", kernel)
     assert op.dist_group_norm(x, 32, None, None, 1e-6, device_group=group, layout="NCTHW") is x
     assert len(calls) == 1
     assert torch.equal(calls[0][1], torch.ones(32))

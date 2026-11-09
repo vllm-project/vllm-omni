@@ -28,6 +28,7 @@ def global_group_norm(x: torch.Tensor, norm: torch.nn.GroupNorm, activation: str
         activation=activation,
         device_group=context.group,
         layout="NCTHW",
+        communication_guard=context.communication_guard,
     )
 
 

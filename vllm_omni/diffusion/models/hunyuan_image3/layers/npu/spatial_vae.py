@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -18,6 +20,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.autoencoder_blocks imp
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import DistributedAutoencoderKLHunyuan
+    from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeExecutor
 
 logger = init_logger(__name__)
 
@@ -67,22 +70,39 @@ def spatial_vae_forward(
     ):
         logger.warning_once("HunyuanImage3 spatial %s found an unsupported convolution; using tile execution", stage)
         return None
-    return run_spatial_vae(network, x, group)
+    return run_spatial_vae(network, x, group, executor=executor)
 
 
 def run_spatial_vae(
     network: nn.Module,
     x: torch.Tensor,
     group: dist.ProcessGroup,
+    *,
+    executor: DistributedVaeExecutor | None = None,
 ) -> torch.Tensor:
     """Execute equal-height, prevalidated shards; also used by the component benchmark."""
     world = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    token = VAE_SPATIAL_CONTEXT.set(VaeSpatialContext(group))
-    try:
-        with torch.autocast("npu", dtype=torch.bfloat16):
-            local = x.chunk(world, dim=3)[rank].to(torch.bfloat16).contiguous()
-            y = network(local)
-            return all_gather_along_dim(y, group=group, dim=3)
-    finally:
-        VAE_SPATIAL_CONTEXT.reset(token)
+    with ExitStack() as local_stage:
+        communication_guard: Callable[[str], AbstractContextManager] = nullcontext
+        if executor is not None:
+            local_stage.enter_context(executor._sync_errors("spatial decode before first communication"))
+
+            @contextmanager
+            def checked_communication(stage: str):
+                # Agree on all local work since the previous collective,
+                # including input/receive allocations for this collective.
+                local_stage.close()
+                yield
+                local_stage.enter_context(executor._sync_errors(f"spatial decode after {stage}"))
+
+            communication_guard = checked_communication
+
+        token = VAE_SPATIAL_CONTEXT.set(VaeSpatialContext(group, communication_guard))
+        try:
+            with torch.autocast("npu", dtype=torch.bfloat16):
+                local = x.chunk(world, dim=3)[rank].to(torch.bfloat16).contiguous()
+                y = network(local)
+                return all_gather_along_dim(y, group=group, dim=3, communication_guard=communication_guard)
+        finally:
+            VAE_SPATIAL_CONTEXT.reset(token)

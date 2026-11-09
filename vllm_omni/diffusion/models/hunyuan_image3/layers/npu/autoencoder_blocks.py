@@ -69,6 +69,7 @@ class VaeConv3d(nn.Conv3d):
                 halo_size=pad_h,
                 recv_top_buf=self._halo_recv_top,
                 recv_bottom_buf=self._halo_recv_bottom,
+                communication_guard=context.communication_guard,
             )
         return F.conv3d(x, self.weight, self.bias, self.stride, (pad_t, 0, pad_w), self.dilation, self.groups)
 
@@ -96,8 +97,8 @@ class AttnBlock(NativeAttnBlock):
             return super().attention(x)
         x = global_group_norm(x, self.norm, activation="identity")
         q = self.q(x)
-        k = all_gather_along_dim(self.k(x), group=context.group, dim=3)
-        v = all_gather_along_dim(self.v(x), group=context.group, dim=3)
+        k = all_gather_along_dim(self.k(x), group=context.group, dim=3, communication_guard=context.communication_guard)
+        v = all_gather_along_dim(self.v(x), group=context.group, dim=3, communication_guard=context.communication_guard)
         batch, channels, frames, height, width = q.shape
         q = q.flatten(2).transpose(1, 2).unsqueeze(1)
         k = k.flatten(2).transpose(1, 2).unsqueeze(1)

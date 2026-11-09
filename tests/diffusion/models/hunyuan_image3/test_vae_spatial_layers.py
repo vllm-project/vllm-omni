@@ -7,6 +7,7 @@ from __future__ import annotations
 import builtins
 import contextlib
 import runpy
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from vllm_omni.diffusion.distributed.autoencoders import distributed_vae_executor, wan_spatial_shard
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks import AttnBlock as NativeAttnBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.autoencoder_blocks import ResnetBlock as NativeResnetBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.native.vae_context import VAE_SPATIAL_CONTEXT, VaeSpatialContext
@@ -126,6 +128,85 @@ def test_two_rank_spatial_semantics(tmp_path):
     mp.spawn(_spatial_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
 
 
+def _spatial_oom_worker(rank, rendezvous):
+    from vllm_omni.diffusion.models.hunyuan_image3.layers.npu.normalization import global_group_norm
+    from vllm_omni.platforms.npu.layers import dist_group_norm
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        group = dist.group.WORLD
+        error_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=15))
+        with patch.object(
+            distributed_vae_executor,
+            "get_world_group",
+            return_value=SimpleNamespace(cpu_group=error_group, device_group=group),
+        ):
+            executor = distributed_vae_executor.DistributedVaeExecutor()
+        x = torch.ones(1, 1, 1, 8, 4)
+        halo_conv = VaeConv3d(1, 1, 3, padding=1, dtype=torch.bfloat16).eval()
+        original_recv_buf = wan_spatial_shard._ensure_recv_buf
+        original_cat = torch.cat
+        original_empty = torch.empty
+        norm = nn.GroupNorm(1, 1)
+
+        class HaloThenNorm(nn.Module):
+            def forward(self, x):
+                return global_group_norm(halo_conv(x), norm)
+
+        def fail_recv_alloc(*args, **kwargs):
+            if rank == 1:
+                raise torch.OutOfMemoryError("injected halo allocation failure")
+            return original_recv_buf(*args, **kwargs)
+
+        def fail_output_cat(*args, **kwargs):
+            if rank == 1:
+                raise torch.OutOfMemoryError("injected final output assembly failure")
+            return original_cat(*args, **kwargs)
+
+        def fail_gn_gather_alloc(size, *args, **kwargs):
+            # (ranks, batch, packed mean/m2/count) in the real NCTHW GN path.
+            if rank == 1 and size == (2, 1, 3):
+                raise torch.OutOfMemoryError("injected DistGN statistics gather buffer allocation failure")
+            return original_empty(size, *args, **kwargs)
+
+        with patch.object(torch, "autocast", return_value=contextlib.nullcontext()), torch.no_grad():
+            with patch.object(wan_spatial_shard, "_ensure_recv_buf", fail_recv_alloc):
+                with pytest.raises(torch.OutOfMemoryError, match="before first communication"):
+                    spatial_vae.run_spatial_vae(halo_conv, x, group, executor=executor)
+            # Stub only the NPU kernels. The Halo, DistGN buffer allocation,
+            # communication guard and CPU error agreement run through real code.
+            with (
+                patch.object(dist_group_norm, "_vectorcore_num", return_value=1),
+                patch.object(dist_group_norm, "_collect_cf"),
+                patch.object(
+                    dist_group_norm, "_reduce", return_value=(torch.zeros(1, 1), torch.zeros(1, 1), torch.ones(1))
+                ),
+                patch.object(torch, "empty", fail_gn_gather_alloc),
+                patch.object(dist, "batch_isend_irecv", wraps=dist.batch_isend_irecv) as halo,
+                patch.object(dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor) as gn_gather,
+            ):
+                detail = "injected DistGN statistics gather buffer" if rank == 1 else "another rank ran out of memory"
+                with pytest.raises(torch.OutOfMemoryError, match=f"after halo exchange failed: {detail}"):
+                    spatial_vae.run_spatial_vae(HaloThenNorm(), x, group, executor=executor)
+                halo.assert_called_once()
+                gn_gather.assert_not_called()
+            with patch.object(torch, "cat", fail_output_cat):
+                with pytest.raises(torch.OutOfMemoryError, match="after all-gather"):
+                    spatial_vae.run_spatial_vae(nn.Identity(), x, group, executor=executor)
+            assert VAE_SPATIAL_CONTEXT.get() is None
+            actual = spatial_vae.run_spatial_vae(nn.Identity(), x, group, executor=executor)
+            torch.testing.assert_close(actual, x.bfloat16())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_two_rank_spatial_allocation_oom_preserves_process_group(tmp_path):
+    if not dist.is_gloo_available():
+        pytest.skip("Gloo unavailable")
+    mp.spawn(_spatial_oom_worker, args=((tmp_path / "oom_rendezvous").as_uri(),), nprocs=2, join=True)
+
+
 @pytest.mark.parametrize("stage", ["encode", "decode"])
 def test_spatial_mode_leaves_cpu_on_native_path(stage):
     assert (
@@ -146,8 +227,6 @@ def test_other_parallel_modes_leave_native_execution(mode):
 
 
 def _check_encoder_decoder_shards(rank):
-    from unittest.mock import patch
-
     from vllm_omni.diffusion.models.hunyuan_image3 import autoencoder as ae
     from vllm_omni.diffusion.models.hunyuan_image3.layers.native.normalization import (
         vae_group_norm_for_conv as native_norm,
@@ -206,8 +285,8 @@ def test_spatial_gate_reuses_executor_and_falls_back_before_execution(monkeypatc
     sentinel = torch.zeros(1)
     calls = []
 
-    def execute(actual_network, actual_x, actual_group):
-        calls.append((actual_network, actual_x, actual_group))
+    def execute(actual_network, actual_x, actual_group, *, executor):
+        calls.append((actual_network, actual_x, actual_group, executor))
         return sentinel
 
     monkeypatch.setattr(spatial_vae, "run_spatial_vae", execute)
@@ -215,7 +294,7 @@ def test_spatial_gate_reuses_executor_and_falls_back_before_execution(monkeypatc
         result = spatial_vae.spatial_vae_forward(vae, x, "decode")
     if case == "supported":
         assert result is sentinel
-        assert calls == [(network, x, group)]
+        assert calls == [(network, x, group, executor)]
     else:
         assert result is None
         assert not calls

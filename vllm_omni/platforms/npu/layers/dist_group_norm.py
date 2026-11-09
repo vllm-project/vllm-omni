@@ -31,6 +31,9 @@ plain function rather than a ``direct_register_custom_op`` custom op.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+
 import torch
 import torch.distributed as dist
 from vllm.triton_utils import tl, triton
@@ -516,6 +519,7 @@ def _distributed_group_norm_ncthw(
     group: torch.distributed.ProcessGroup,
     activation: str = "swish",
     output_dtype: torch.dtype | None = None,
+    communication_guard: Callable[[str], AbstractContextManager] = nullcontext,
 ) -> torch.Tensor:
     """GroupNorm over equal-height shards with stable FP32 global statistics."""
     if activation not in ("swish", "identity"):
@@ -540,7 +544,8 @@ def _distributed_group_norm_ncthw(
     mean, m2, count = _reduce(mp, m2, wp, eps, finalize=False)
     packed = torch.cat((mean, m2, count.unsqueeze(1)), dim=1)
     parts = torch.empty((world, n, 2 * g + 1), device=x.device, dtype=torch.float32)
-    dist.all_gather_into_tensor(parts, packed, group=group)
+    with communication_guard("group norm statistics"):
+        dist.all_gather_into_tensor(parts, packed, group=group)
     mean, rstd = _reduce_cross_rank(parts, g, eps)
     y = torch.empty_like(x, dtype=output_dtype or x.dtype)
     total = x.numel()
@@ -562,6 +567,8 @@ def dist_group_norm(
     local_only: bool = False,
     layout: str = "NHWC",
     output_dtype: torch.dtype | None = None,
+    *,
+    communication_guard: Callable[[str], AbstractContextManager] = nullcontext,
 ) -> torch.Tensor:
     """Fused local/distributed GroupNorm for explicit NCTHW or NHWC layout.
 
@@ -577,6 +584,7 @@ def dist_group_norm(
         output_dtype: optional output precision; NCTHW fuses its conversion.
         device_group: process group to reduce stats over (the caller-owned spatial group);
             ``None`` -> default group; a single-rank group -> no collective.
+        communication_guard: optional context around the statistics collective.
 
     Returns a tensor with the same shape/dtype as ``x``.
     """
@@ -599,6 +607,7 @@ def dist_group_norm(
             device_group,
             activation=activation,
             output_dtype=output_dtype,
+            communication_guard=communication_guard,
         )
     if layout != "NHWC":
         raise ValueError(f"Unsupported GroupNorm layout: {layout}; expected NHWC or NCTHW")
@@ -619,7 +628,8 @@ def dist_group_norm(
         n, g = mean.shape
         packed = torch.cat((mean, m2, weight_local.unsqueeze(1)), dim=1)  # (N, 2G+1)
         gathered = torch.empty((world, n, 2 * g + 1), dtype=packed.dtype, device=packed.device)
-        dist.all_gather_into_tensor(gathered, packed, group=device_group)
+        with communication_guard("group norm statistics"):
+            dist.all_gather_into_tensor(gathered, packed, group=device_group)
         mean, rstd = _reduce_cross_rank(gathered, g, eps)
     else:
         mean, rstd = _reduce(mean_p, m2_p, w_p, eps, finalize=True)
