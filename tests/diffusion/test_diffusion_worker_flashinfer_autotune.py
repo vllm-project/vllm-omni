@@ -165,10 +165,35 @@ def test_step_requests_stay_in_tune_mode_until_finished(mocker, fake_flashinfer,
 
     assert step(new=["a"], ids=["a"]) is True  # prefill of a new shape
     assert step(ids=["a"]) is True  # decode steps of the same request have other row counts
-    assert step(new=["b"], ids=["a", "b"]) is True  # same shape as "a", batched with it while it tunes
+    assert step(new=["b"], ids=["a", "b"]) is True  # [S, S] is a new batch: twice the GEMM rows
     worker._finish_flashinfer_tuning(["a"])
-    assert step(ids=["b"]) is False  # "b" never needed tuning
-    assert step(new=["c"], ids=["c"]) is False  # repeat shape after "a" finished
+    assert step(ids=["b"]) is True  # "b" keeps tuning its decode steps until it finishes
+    worker._finish_flashinfer_tuning(["b"])
+    assert step(new=["c"], ids=["c"]) is False  # repeat of the [S] batch
+    assert step(ids=["c"]) is False
+    assert step(new=["d"], ids=["c", "d"]) is False  # repeat of the [S, S] batch
+    worker._finish_flashinfer_tuning(["c", "d"])
+    assert worker._flashinfer_step_signatures == {}  # finished requests are forgotten
+
+
+def test_batch_size_is_part_of_the_tuned_shape(mocker, fake_flashinfer, tmp_path, monkeypatch):
+    _cuda(mocker)
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    seen = []
+    worker = _make_worker(_od_config(True), None)
+    worker.model_runner = SimpleNamespace(
+        execute_model_batch=lambda sched, od: seen.append(fake_flashinfer.is_tuning_mode) or "out"
+    )
+
+    def batch(n, **shape):
+        new_reqs = [SimpleNamespace(req=SimpleNamespace(sampling_params=_params(**shape))) for _ in range(n)]
+        return SimpleNamespace(scheduled_new_reqs=new_reqs)
+
+    # Wan's effective batch is requests x outputs per prompt: [S] then [S, S] are different GEMM row counts.
+    for sched in (batch(1), batch(2), batch(2), batch(1), batch(2, height=720, width=1280)):
+        assert worker.execute_model_batch(sched, worker.od_config) == "out"
+
+    assert seen == [True, True, False, False, True]
 
 
 def test_existing_cache_is_loaded_once(mocker, fake_flashinfer, tmp_path, monkeypatch):

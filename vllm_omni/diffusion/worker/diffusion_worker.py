@@ -600,9 +600,10 @@ class DiffusionWorker:
         stage runs FlashInfer GEMMs (on SM100+: MXFP8 linears and per-tensor-activation FP8 linears;
         online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
         only cache misses, but it also adds milliseconds of host time to every FlashInfer call even
-        on cache hits, so it is entered only for the first request of each
-        new shape signature (with step execution: every step of that request, since prefill and
-        decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
+        on cache hits, so it is entered only for the first forward of each new batch composition
+        (the sorted per-request shape signatures, so a batch of two ``S`` requests differs from one;
+        with step execution: every step of the requests in that batch until they finish, since
+        prefill and decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
         The per-rank cache file is loaded once and rewritten when new tactics were profiled.
         Graph-captured paths are safe: their eager warm-up runs before capture, so capture only
         sees cache hits.
@@ -619,12 +620,20 @@ class DiffusionWorker:
         self._load_flashinfer_autotune_cache(cache_path)
         seen: set[tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
         tuning_ids: set[str] = self.__dict__.setdefault("_flashinfer_tuning_request_ids", set())
+        step_signatures: dict[str, tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_step_signatures", {})
         signatures = [_flashinfer_tune_signature(sp) for sp in sampling_params or []]
-        new_signature = any(sig not in seen for sig in signatures)
-        seen.update(signatures)
-        if new_signature and new_request_ids:
-            tuning_ids.update(new_request_ids)
-        tune = new_signature or bool(request_ids and tuning_ids.intersection(request_ids))
+        if request_ids is not None:
+            # Step mode: the forward batches every scheduled request, not only the newly admitted ones.
+            step_signatures.update(zip(new_request_ids or [], signatures))
+            signatures = [step_signatures[rid] for rid in request_ids if rid in step_signatures]
+        # GEMM row counts follow the whole batch (requests x outputs per prompt x CFG), so the batch
+        # composition is the key: [S] and [S, S] are different shapes.
+        batch_signature = tuple(sorted(signatures, key=repr))
+        new_batch = bool(batch_signature) and batch_signature not in seen
+        seen.add(batch_signature)
+        if new_batch and request_ids:
+            tuning_ids.update(request_ids)
+        tune = new_batch or bool(request_ids and tuning_ids.intersection(request_ids))
         if not tune:
             return nullcontext()
         return self._flashinfer_autotune_session(cache_path)
@@ -633,6 +642,10 @@ class DiffusionWorker:
         tuning_ids = self.__dict__.get("_flashinfer_tuning_request_ids")
         if tuning_ids:
             tuning_ids.difference_update(request_ids)
+        step_signatures = self.__dict__.get("_flashinfer_step_signatures")
+        if step_signatures:
+            for request_id in request_ids:
+                step_signatures.pop(request_id, None)
 
     def _load_flashinfer_autotune_cache(self, cache_path: str) -> None:
         if getattr(self, "_flashinfer_autotune_loaded", None) == cache_path:

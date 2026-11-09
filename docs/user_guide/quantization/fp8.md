@@ -109,11 +109,13 @@ vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune     # force
 On one B200, Wan2.2-T2V-A14B MXFP8 (832x480, 81 frames, 40 steps) went from
 112 s to 95 s per request with identical output.
 
-The first request of each new shape (output size, frame count, outputs per
-prompt and CFG on or off) runs under FlashInfer's autotune context, which
-profiles the GEMM shapes it has not seen; with step execution that covers every
-step of the request, since prefill and decode differ. That request is slower,
-so send a warm-up request at the measured shape before timing. Later requests
+The first forward of each new batch (the shapes of the requests it batches:
+output size, frame count, outputs per prompt and CFG on or off, so two
+requests of one shape count as a new batch after a single one) runs under
+FlashInfer's autotune context, which profiles the GEMM shapes it has not seen;
+with step execution that covers every step of the requests in that batch,
+since prefill and decode differ. That forward is slower, so send a warm-up
+request at the measured shape and batch size before timing. Later requests
 run in FlashInfer's normal mode and use the tuned tactics: tune mode is not kept
 on, because it adds host time to every FlashInfer call even when the tactic is
 cached. Tactics are cached per rank under
