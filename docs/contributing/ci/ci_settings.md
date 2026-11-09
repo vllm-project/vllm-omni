@@ -320,6 +320,13 @@ OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
   -k 'remap' --durations=10
 ```
 
+In paired fresh containers on the reference host/image above, with four CPUs,
+two threads and a 32 GiB memory limit, one warmup plus three measured runs per
+variant passed all three original tests. Mean process wall time fell from
+61.62s (61.11–62.18s) to 31.62s (31.52–31.83s). Peak pytest process RSS was
+26.33 GiB before and 15.24 GiB after. This measures the fixture change only;
+it does not establish the full shard p95 or a target-agent memory limit.
+
 Reproduce the initial profile from the original artifact filenames:
 
 ```bash
