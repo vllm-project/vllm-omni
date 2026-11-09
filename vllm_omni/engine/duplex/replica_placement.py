@@ -183,19 +183,9 @@ class DuplexReplicaPlacement:
             self._reserved[replica] -= 1
             self._owners[replica].remove(session_id)
 
-    def reattach(self, stage_id: int, replica_id: int) -> set[str]:
-        """Re-enable a replicated slot and release the sessions it held.
-
-        A slot that comes back belongs to a new process: the reservations it held
-        reference state that is gone, and the slot must be eligible again. This
-        undoes ``mark_unavailable`` for the slot.
-        """
-        replica = (stage_id, replica_id)
-        self._unavailable.discard(replica)
-        affected = set(self._owners.get(replica, ()))
-        for session_id in affected:
-            self.release(session_id)
-        return affected
+    def is_declared_replica(self, stage_id: int, replica_id: int) -> bool:
+        """Return whether the replica belongs to the startup-declared topology."""
+        return (stage_id, replica_id) in self._all_replicas
 
     def route(self, session_id: str, stage_id: int) -> int:
         reservation = self._sessions.get(session_id)

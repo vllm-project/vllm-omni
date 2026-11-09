@@ -163,6 +163,37 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             raise StageUnavailableError(f"stage {stage_id}: pinned duplex replica {replica_id} is unavailable")
         return replica_id
 
+    def _mark_placement_unavailable(self, stage_id: int, replica_id: int) -> set[str]:
+        """Mark a replica unavailable, tolerating ids outside the declared topology.
+
+        A headless replica can register after startup and receive an id past the
+        declared ``replica_groups``. It may serve ordinary requests but holds no
+        duplex reservation, so placement bookkeeping for it is a no-op instead of
+        a fatal lookup.
+        """
+        placement = self.replica_placement
+        if placement is None:
+            return set()
+        try:
+            return placement.mark_unavailable(stage_id, replica_id)
+        except ValueError:
+            return set()
+
+    async def _evict_replica_and_fail_sessions(self, stage_id: int, replica_id: int, *, reason: str) -> None:
+        """Evict a replica and fail the sessions recorded on it in placement.
+
+        Shared by the submit-time ``EngineDeadError`` path and the membership
+        detach path. A replica outside the declared topology has no placement
+        entry and no reservation; it is still evicted so the generic cleanup can
+        attribute and fail its ordinary requests.
+        """
+        affected = self._mark_placement_unavailable(stage_id, replica_id)
+        # Prevent dispatch before any cleanup await. Preserve request bindings
+        # so the generic failure path can still attribute ordinary requests.
+        self.stage_pools[stage_id].evict_replica(replica_id)
+        if affected:
+            await self.session_manager.fail_sessions(sorted(affected), reason=reason)
+
     async def _handle_dead_replica(
         self,
         stage_id: int,
@@ -172,71 +203,43 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         failed_request_id: str | None = None,
     ) -> None:
         if self.replica_placement is not None:
-            affected = self.replica_placement.mark_unavailable(stage_id, replica_id)
-            # Prevent dispatch before any cleanup await. Preserve request bindings
-            # so the generic failure path can still attribute ordinary requests.
-            self.stage_pools[stage_id].evict_replica(replica_id)
-            await self.session_manager.fail_sessions(
-                affected, reason=f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}"
+            await self._evict_replica_and_fail_sessions(
+                stage_id,
+                replica_id,
+                reason=f"Stage-{stage_id} replica-{replica_id} is unavailable: {error}",
             )
         await super()._handle_dead_replica(stage_id, replica_id, error, failed_request_id=failed_request_id)
-
-    async def _fail_reserved_sessions(
-        self, stage_id: int, replica_id: int, *, reason: str, replica_is_gone: bool
-    ) -> None:
-        """Fail the sessions reserved on a replica.
-
-        ``replica_is_gone`` separates the two cases. A replica that left the pool
-        is marked unavailable and evicted, exactly as ``_handle_dead_replica``
-        does. A slot taken over by a restarted process is *not* marked
-        unavailable: the process is healthy and must stay eligible for new
-        sessions, but the reservations on it reference state that is gone.
-        """
-        placement = self.replica_placement
-        if placement is None:
-            return
-        if replica_is_gone:
-            try:
-                affected = placement.mark_unavailable(stage_id, replica_id)
-            except ValueError:
-                # A replica outside the declared topology holds no reservation.
-                return
-            self.stage_pools[stage_id].evict_replica(replica_id)
-        else:
-            affected = placement.reattach(stage_id, replica_id)
-        if affected:
-            await self.session_manager.fail_sessions(sorted(affected), reason=reason)
 
     async def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
         """Fail the sessions reserved on a replica that membership detached.
 
         ``_handle_dead_replica`` covers a submit-time ``EngineDeadError``. A replica
-        the hub removes reaches the membership path instead, where nothing marked
-        its reservations unavailable, so idle sessions kept their group and the
-        next turn was dispatched to a replica that is gone.
+        the hub removes reaches the membership path instead; without this hook its
+        reservations stayed live and idle sessions kept their group.
         """
         super()._on_replica_removed(stage_id, replica_id)
-        await self._fail_reserved_sessions(
-            stage_id,
-            replica_id,
-            reason=f"Stage-{stage_id} replica-{replica_id} left the pool",
-            replica_is_gone=True,
-        )
+        if self.replica_placement is not None:
+            await self._evict_replica_and_fail_sessions(
+                stage_id,
+                replica_id,
+                reason=f"Stage-{stage_id} replica-{replica_id} left the pool",
+            )
 
     async def _on_replica_added(self, stage_id: int, replica_id: int, client: Any) -> None:
-        """Re-enable a re-attached slot and fail the sessions it used to hold.
+        """Warn when a dynamic replica cannot host duplex sessions.
 
-        An attach that follows a detach means the process behind the slot is new.
-        At startup there was no detach, and the slot holds no reservation, so this
-        is a no-op.
+        The master allocates a replacement replica a new id rather than restoring
+        its old startup slot, so a re-attached replica is outside the declared
+        groups. It can serve ordinary requests; it cannot receive a session pin.
         """
+        if self.replica_placement is not None and not self.replica_placement.is_declared_replica(stage_id, replica_id):
+            logger.warning(
+                "[DuplexOrchestrator] stage-%s replica-%s attached outside duplex_session.replica_groups; "
+                "it can serve ordinary requests but cannot host duplex sessions",
+                stage_id,
+                replica_id,
+            )
         await super()._on_replica_added(stage_id, replica_id, client)
-        await self._fail_reserved_sessions(
-            stage_id,
-            replica_id,
-            reason=f"Stage-{stage_id} replica-{replica_id} was restarted; session state is gone",
-            replica_is_gone=False,
-        )
 
     def _on_stage_submitted(
         self,

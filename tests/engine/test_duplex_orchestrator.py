@@ -41,7 +41,12 @@ from vllm_omni.engine.duplex.messages import (
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
-from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
@@ -1550,29 +1555,161 @@ async def test_membership_detach_fails_the_sessions_reserved_on_the_replica() ->
 
 
 @pytest.mark.asyncio
-async def test_reattached_slot_fails_the_sessions_reserved_on_it() -> None:
-    """A restarted replica returns to its slot with none of the session state."""
-    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config())
-    pool = None
+async def test_dynamic_replica_death_is_evicted_without_a_placement_lookup() -> None:
+    """A replica attached after startup is outside the declared groups.
+
+    It can serve ordinary requests, so it can also die. Placement has no record
+    of its id; the dead-replica handler must still evict it and keep the loop
+    alive instead of raising ``ValueError`` from ``mark_unavailable``.
+    """
+    orchestrator, _, rpc_q, _ = _build(replicas=1, runtime_config=_placement_config(replica_groups=[{0: 0}]))
     try:
         assert (await _open(orchestrator, rpc_q)).ok
         placement = orchestrator.replica_placement
         assert placement is not None
-        reserved = placement.route(SESSION_ID, 0)
         pool = orchestrator.stage_pools[0]
-        addr = "tcp://192.0.2.10:5001"
-        pool.add_client(addr, pool.clients[reserved], replica_id=reserved)
-        pool.remove_client(addr)
-        restarted = FakeStageClient()
-        pool.add_client(addr, restarted, replica_id=reserved)
+        dynamic = FakeStageClient()
+        addr = "tcp://192.0.2.55:5001"
+        dynamic.client_addresses = {"input_address": addr}
+        pool.add_client(addr, dynamic, replica_id=1)
+        assert pool.bind_request_to_replica("dynamic-turn", 1) == 1
 
-        await orchestrator._on_replica_added(0, reserved, restarted)
+        await orchestrator._handle_dead_replica(0, 1, EngineDeadError("dynamic replica died"))
 
-        # The replacement process is healthy, so the slot stays eligible for new
-        # sessions; only the reservations that referenced the old state are gone.
-        assert (0, reserved) not in set(placement.snapshot()["unavailable"])
-        assert SESSION_ID not in placement.snapshot()["sessions"]
+        assert pool.clients[1] is None
+        assert (0, 1) not in set(placement.snapshot()["unavailable"])
+        assert placement.route(SESSION_ID, 0) == 0
+        assert pool.is_replica_available(0)
     finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_unregister_fails_active_and_idle_sessions_and_keeps_healthy_group(monkeypatch) -> None:
+    """Exercise the real hub-detach path, not just the placement callback.
+
+    One session has a submitted pinned turn, one is idle but reserved on the
+    same group, and one is on a healthy group. Removing the replica must fail
+    the first two through ``MembershipController.handle_unregister``, release
+    their bindings after cleanup, and leave the healthy group routable.
+    """
+    from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
+    from vllm_omni.engine.membership_controller import MembershipController
+
+    orchestrator, _, rpc_q, output_q = _build(replicas=2, runtime_config=_placement_config())
+    controller = None
+    buffers: dict[str, DuplexOutputBuffer] = {}
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+            assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+        placement = orchestrator.replica_placement
+        assert placement is not None
+        reservations = placement.snapshot()["sessions"]
+        assert reservations[SESSION_ID] == reservations["idle"] != reservations["healthy"]
+
+        grouped = placement.route(SESSION_ID, 0)
+        healthy = placement.route("healthy", 0)
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        pool = orchestrator.stage_pools[0]
+        assert pool.get_bound_replica_id(request_id) == grouped
+        active_session = orchestrator.session_manager.runners[SESSION_ID].session
+        idle_session = orchestrator.session_manager.runners["idle"].session
+        healthy_session = orchestrator.session_manager.runners["healthy"].session
+
+        addresses: dict[tuple[int, int], str] = {}
+        for stage_pool in orchestrator.stage_pools:
+            for rid, client in enumerate(stage_pool.clients):
+                addr = f"tcp://stage-{stage_pool.stage_id}-replica-{rid}"
+                addresses[(stage_pool.stage_id, rid)] = addr
+                client.client_addresses = {"input_address": addr}
+                stage_pool.add_client(addr, client, replica_id=rid)
+
+        class _Hub:
+            def get_replica_list(self):
+                return SimpleNamespace(replicas=[])
+
+            def get_replicas_for_stage(self, stage_id):
+                return SimpleNamespace(
+                    replicas=[
+                        SimpleNamespace(stage_id=stage_id, input_addr=addr, status=ReplicaStatus.UP)
+                        for (sid, _rid), addr in addresses.items()
+                        if sid == stage_id
+                    ]
+                )
+
+            def close(self):
+                pass
+
+        hub = _Hub()
+        monkeypatch.setattr(
+            "vllm_omni.engine.membership_controller.OmniCoordClientForHub",
+            lambda _address: hub,
+        )
+        controller = MembershipController(
+            stage_pools=orchestrator.stage_pools,
+            coordinator_pub_address="tcp://127.0.0.1:12345",
+            load_balancer_factory=lambda: SimpleNamespace(select=lambda task, candidates: 0),
+            remote_replica_factory=lambda *_args: FakeStageClient(),
+        )
+
+        async def cleanup(request_ids):
+            await orchestrator._cleanup_request_ids(request_ids, abort=True, trace_error="replica_removed")
+
+        controller.install_membership_handlers(
+            output_queue=orchestrator.output_async_queue,
+            cleanup_callback=cleanup,
+            replica_removed_callback=orchestrator._on_replica_removed,
+        )
+        await controller.handle_unregister(0, f"tcp://stage-0-replica-{grouped}")
+
+        for _ in range(200):
+            if (
+                SESSION_ID not in orchestrator.session_manager.runners
+                and "idle" not in orchestrator.session_manager.runners
+            ):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(orchestrator.session_manager._dispatched_control_tasks)), timeout=2
+        )
+        await asyncio.wait_for(orchestrator.session_manager.reap_expired(), timeout=2)
+
+        messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
+        assert any(isinstance(message, ErrorMessage) and message.request_id == request_id for message in messages)
+        terminal_events = [message.event for message in messages if hasattr(message, "event")]
+        for session_id in (SESSION_ID, "idle"):
+            events = [await buffers[session_id].get() for _ in range(buffers[session_id].pending_events)]
+            events.extend(event for event in terminal_events if event.session_id == session_id)
+            errors = [event for event in events if event.type == "error"]
+            assert any(event.code == "replica_unavailable" for event in errors)
+            assert events[-1].type == "session.expired"
+        healthy_events = [await buffers["healthy"].get() for _ in range(buffers["healthy"].pending_events)]
+        assert not any(event.type in {"error", "session.expired"} for event in healthy_events)
+
+        assert (0, grouped) in set(placement.snapshot()["unavailable"])
+        assert request_id not in orchestrator.request_states
+        assert pool.get_bound_replica_id(request_id) is None
+        assert active_session.state == DuplexSessionState.CLOSED
+        assert idle_session.state == DuplexSessionState.CLOSED
+        assert SESSION_ID not in orchestrator.session_manager.runners
+        assert "idle" not in orchestrator.session_manager.runners
+        assert "healthy" in orchestrator.session_manager.runners
+        assert healthy_session.state != DuplexSessionState.CLOSED
+        assert orchestrator.session_manager.active_count() == 1
+        assert placement.route("healthy", 0) == healthy
+        assert pool.is_replica_available(healthy)
+
+        await orchestrator._dispatch_message(DuplexSessionCommandMessage(session_id="healthy", command=_append_audio()))
+        for _ in range(200):
+            if pool.clients[healthy].add_request_calls:
+                break
+            await asyncio.sleep(0.01)
+        assert pool.clients[healthy].add_request_calls
+    finally:
+        if controller is not None:
+            controller.shutdown()
         await orchestrator.session_manager.shutdown()
 
 

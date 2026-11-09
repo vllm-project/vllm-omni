@@ -1004,12 +1004,13 @@ def validate_duplex_replica_policy(
     if runtime_config.replica_policy == "legacy":
         return
     if distributed and runtime_config.replica_groups is None:
-        # In a distributed deployment the coordinator assigns ``replica_id`` to a
-        # host at runtime, so a group derived here would be numerically correct
-        # and physically arbitrary: nothing in this process knows which replica
-        # runs where. Pinning a session to such a group could straddle hosts in a
-        # way the operator never chose, and the operator has no way to say so.
-        # Requiring an explicit mapping keeps that placement decision with them.
+        # In a distributed deployment the coordinator assigns ``replica_id`` as
+        # replicas register, so a group derived here would be numerically valid
+        # and physically arbitrary: this process does not know which replica runs
+        # where, and the operator cannot choose the ids from the config either.
+        # Requiring an explicit map forces the operator to read the attach log and
+        # record the grouping they observed; the config cannot verify that the
+        # numeric ids still correspond to those hosts.
         raise ValueError(
             "duplex_session.replica_policy=least_sessions in distributed hub/LB mode "
             "requires duplex_session.replica_groups to declare the stage replica topology"

@@ -165,16 +165,24 @@ When no group has capacity, opening a session fails with the retryable
 stage replica topology; a distributed deployment without `replica_groups` is
 rejected at startup. The reason is placement, not counting: locally the stage's
 replica ids come from the deploy config, but in a distributed deployment the
-coordinator assigns each `replica_id` to a host at runtime, and the engine has no
-basis for choosing which replicas should form a group across hosts. Declaring the
-groups keeps that decision with the operator.
+coordinator assigns ids as replicas register, so the engine cannot tell which
+numeric ids share a host. The operator cannot choose those ids either; declaring
+`replica_groups` records the mapping they observed, and a config-only check
+cannot prove that the ids still correspond to those hosts.
 
-To build the mapping, the coordinator assigns first-vacant slots and restores a
-known address to the slot it held before; each replica registers with an input
-address, and the coordinator's replica list exposes it as `ReplicaInfo.input_addr`.
-The attach log pairs them: `[MembershipController] attached remote replica
-stage=<id> replica=<id> addr=<host:port>`. There is no dedicated endpoint for
-dumping the mapping yet.
+The coordinator fills unfilled startup slots in registration order and allocates
+ids past the startup count once those slots are filled. It does not restore a
+previously used startup slot when a replica restarts. Each replica registers with
+an input address, exposed as `ReplicaInfo.input_addr`; the attach log pairs it
+with the numeric slot: `[MembershipController] attached remote replica
+stage=<id> replica=<id> addr=<host:port>`. Build `replica_groups` from that log.
+There is no dedicated endpoint for dumping the mapping.
+
+A replica that leaves the declared topology is not re-added to its group: the
+group stays unavailable, its sessions are failed, and recovery requires
+restarting the head. A replacement replica gets a new id outside
+`replica_groups`, logs a warning, and can serve ordinary requests but not duplex
+sessions. Dynamic regrouping is out of scope.
 
 A per-replica cap above `1` also
 requires the model plugin to support concurrent sessions on one replica; use

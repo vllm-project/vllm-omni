@@ -599,8 +599,11 @@ replica.
 Replica failure marks the replica unavailable and closes every session in its
 reverse index, including idle sessions without an in-flight request. Other
 groups retain their reservations and can continue serving. This policy does
-not migrate model state or support coordinator/distributed deployments.
-Worker-local state capacity uses the per-replica cap, while `max_sessions`
+not migrate model state between replicas. A replica that leaves the declared
+topology is not re-added automatically: its group stays unavailable and
+recovery requires restarting the head. A replacement replica gets a new id
+outside `replica_groups` and can serve ordinary requests but not duplex
+sessions. Worker-local state capacity uses the per-replica cap, while `max_sessions`
 remains the global service cap. The default `legacy` policy preserves the
 existing routing, admission and worker capacity behavior. See the
 [configuration reference](../configuration/stage_configs.md#duplex-replica-placement)
