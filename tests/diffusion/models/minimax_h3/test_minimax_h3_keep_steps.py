@@ -743,6 +743,8 @@ def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(
     with pytest.raises(OmniClientError, match=expected_match):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(**extra_args))
     assert encode_prompt.call_count == 0
+    if active_resolver == "refine":
+        refine.assert_called_once()
     if active_resolver == "upscale":
         upscale.assert_called_once()
 
@@ -920,6 +922,12 @@ def test_pinned_schedule_step_counts_diverge_between_intake_and_diffusion(monkey
     value normalizes away — while the split-stage intake, which only sees the
     default step count of 50, conservatively rejects the same request before
     the encoder stage runs. An explicit matching step count passes intake.
+
+    The intake rejection is the current conservative limitation, not a
+    desired endpoint: intake cannot see the pinned step count (see the
+    encoder-stage TODO in stage_input_processors/minimax_h3.py). If intake
+    later learns it, the rejection assertion here should flip to a
+    passthrough.
     """
     from vllm_omni.model_executor.stage_input_processors import minimax_h3 as processor
     from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
