@@ -792,6 +792,21 @@ def test_local_attention_schedule_fails_before_any_encoder_pass(monkeypatch: pyt
     assert encode_prompt.call_count == 0
 
 
+def test_local_turbo_and_native_lora_fail_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    """keep_steps plus an active turbo or native LoRA adapter rejects with zero Qwen passes."""
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_active_turbo_spec", lambda sampling: SimpleNamespace())
+    with pytest.raises(OmniClientError, match="turbo or native LoRA"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
+    assert encode_prompt.call_count == 0
+
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    monkeypatch.setattr(pipeline, "_has_active_native_lora", lambda sampling: True)
+    with pytest.raises(OmniClientError, match="turbo or native LoRA"):
+        pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(keep_steps=2))
+    assert encode_prompt.call_count == 0
+
+
 def test_plain_requests_never_touch_the_keep_steps_resolver(monkeypatch: pytest.MonkeyPatch):
     """Requests without keep_steps keep their original code path untouched."""
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)

@@ -3715,10 +3715,6 @@ class MiniMaxH3Pipeline(
         attention_schedule = require_request_attention_schedule_fits(
             sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
         )
-        if keep_steps is not None and attention_schedule:
-            # The switch changes the packed layout mid-schedule; per-step
-            # attention profiles have not been validated across it.
-            raise OmniClientError("MiniMax H3 keep_steps does not support attention_schedule in this revision")
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
