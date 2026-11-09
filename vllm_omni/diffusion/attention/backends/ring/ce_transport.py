@@ -90,7 +90,7 @@ where A writes B's slots, in a ring of 4:
 
 Two credits let the writer run at most two blocks ahead of the reader. A call returns every
 credit it used, so the next call (the next layer) starts from the setup state. Setup therefore
-runs once per buffer (see ``_CREDITED``). Running it again would hang, because ``put_signal``
+runs once per buffer (tracked on the workspace). Running it again would hang, because ``put_signal``
 waits for a flag that is still set.
 
 Callers. ``Attention._run_ring_attention`` -> ``RingParallelAttention.run_attention`` ->
@@ -108,10 +108,13 @@ the process-wide symmetric-memory backend to NCCL.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.distributed.distributed_c10d import _get_process_group_store
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.a2a_permute import _SYMM_WORKSPACES, _get_symm_buffer
@@ -129,10 +132,43 @@ logger = init_logger(__name__)
 _READY = (0, 1)
 _FREE = (2, 3)
 
-# Per (device, group): the workspace handle whose signal pad already holds the setup credits.
-# Credits stay in the pad between calls, so they are granted once per buffer. Growing the
-# workspace for a bigger shape creates a new buffer with a zeroed pad, which needs them again.
-_CREDITED: dict[tuple[torch.device, str], object] = {}
+
+class _CeSetupUnavailableError(RuntimeError):
+    """All ranks agreed that local CE setup failed; NCCL fallback is safe."""
+
+
+class _SetupAgreement:
+    """Host-only setup agreement; never used by steady-state ring calls.
+
+    Coordinate local failures before the next collective and before granting any
+    credits. A failed collective/store operation propagates instead of selecting
+    a fallback on only one rank. Process crashes and stalled native collectives
+    remain subject to the process group's timeout.
+    """
+
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.rank = dist.get_rank(group)
+        self.world_size = dist.get_world_size(group)
+        store = dist.PrefixStore(f"ring_ce/{group.group_name}", _get_process_group_store(group))
+        attempt = store.add(f"attempt/{self.rank}", 1)
+        self.store = dist.PrefixStore(str(attempt), store)
+        self.phase = 0
+
+    @contextmanager
+    def stage(self) -> Generator[None, None, None]:
+        reason = ""
+        try:
+            yield
+        except Exception as exc:
+            # Deliberate setup boundary: report the failure to every peer before
+            # any of them can enter a different transport or collective phase.
+            reason = f"rank {self.rank}: {type(exc).__name__}: {exc}"
+        phase = dist.PrefixStore(str(self.phase), self.store)
+        self.phase += 1
+        phase.set(str(self.rank), reason)
+        reasons = [phase.get(str(rank)).decode() for rank in range(self.world_size)]
+        if any(reasons):
+            raise _CeSetupUnavailableError("; ".join(reason for reason in reasons if reason))
 
 
 @functools.cache
@@ -168,14 +204,15 @@ def maybe_ce_ring_comm(process_group: dist.ProcessGroup, k: torch.Tensor, v: tor
 
     ``k`` and ``v`` must be contiguous. Buffer setup is collective, so a rank that picked this
     transport while another picked ``RingComm`` would hang. The checks therefore read only state
-    that is identical across the ring group (backend, shape, dtype, mode).
+    that is identical across the ring group (backend, shape, dtype, mode). Setup
+    then agrees on rank-local failures before granting credits or choosing NCCL.
     """
     comm = None
     try:
         reason = _unavailable_reason(process_group, k, v)
         if reason is None:
             comm = CeRingComm(process_group, k)
-    except Exception as e:  # rendezvous or peer mapping failed, e.g. across nodes
+    except _CeSetupUnavailableError as e:
         reason = f"{type(e).__name__}: {e}"
     if comm is None:
         logger.warning_once(
@@ -202,23 +239,35 @@ class CeRingComm:
         self._pred = (self.rank - 1) % self.world_size
         self._succ = (self.rank + 1) % self.world_size
         shape = (2, 2, *k.shape)  # [slot][K, V][B, S, H, D] = 4 x B*S*H*D elements
-        # Collective on first use and on growth; every rank reaches it at step 0.
-        self._slots = _get_symm_buffer(shape, k.dtype, k.device, group.group_name)
         key = (k.device, group.group_name)
-        self._handle = _SYMM_WORKSPACES[key].handle
-        if _CREDITED.get(key) is not self._handle:
-            # Setup: both of my slots are empty, so the predecessor may fill either.
+        workspace = _SYMM_WORKSPACES.get(key)
+        needs_setup = (
+            workspace is None
+            or workspace.capacity_bytes < 4 * k.numel() * k.element_size()
+            or not workspace.ring_credited
+        )
+        agreement = _SetupAgreement(group) if needs_setup else None
+        setup_context: Callable[[], AbstractContextManager[None]] = nullcontext
+        if agreement is not None:
+            setup_context = agreement.stage
+        # Setup/growth is collective; local allocation errors must be agreed on
+        # before any rank enters rendezvous. Reuse takes no host agreement path.
+        self._slots = _get_symm_buffer(shape, k.dtype, k.device, group.group_name, setup_context=setup_context)
+        workspace = _SYMM_WORKSPACES[key]
+        self._handle = workspace.handle
+        with setup_context():
+            # Validate peer mapping and stream/event creation before any rank
+            # grants credits. Failed setup therefore leaves signal pads untouched.
+            self._peer = self._handle.get_buffer(self._succ, shape, k.dtype, 0)
+            self._copy = _copy_stream(k.device)
+            self._compute = torch.cuda.current_stream(k.device)
+            self._ready = torch.cuda.Event()
+            self._pending: list[torch.Tensor] = []
+            self._step = 0
+        if not workspace.ring_credited:
             for channel in _FREE:
                 self._handle.put_signal(self._pred, channel)
-            _CREDITED[key] = self._handle
-        # The successor's buffer, mapped into this process: copying into it writes the successor's
-        # GPU memory over NVLink. Building the view is host-only work of a few microseconds.
-        self._peer = self._handle.get_buffer(self._succ, shape, k.dtype, 0)
-        self._copy = _copy_stream(k.device)
-        self._compute = torch.cuda.current_stream(k.device)
-        self._ready = torch.cuda.Event()
-        self._pending: list[torch.Tensor] = []
-        self._step = 0
+            workspace.ring_credited = True
 
     def send_recv(self, to_send: torch.Tensor) -> torch.Tensor:
         """Queue K (first call) or V (second) for the successor; return the slot that receives it here."""

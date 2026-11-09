@@ -30,6 +30,8 @@ import shlex
 import sys
 import sysconfig
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +56,7 @@ class _SymmWorkspace:
     handle: Any
     capacity_bytes: int
     stream_id: int
+    ring_credited: bool = False
 
 
 # A single grow-only byte workspace per device/process-group. Shape changes
@@ -152,7 +155,12 @@ def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 
 
 def _get_symm_buffer(
-    symm_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device, group_name: str
+    symm_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    group_name: str,
+    *,
+    setup_context: Callable[[], AbstractContextManager[None]] = nullcontext,
 ) -> torch.Tensor:
     """Get a typed view from a grow-only symmetric-memory workspace.
 
@@ -163,13 +171,16 @@ def _get_symm_buffer(
     device = torch.device(device)
     key = (device, group_name)
     required_bytes = _required_nbytes(symm_shape, dtype)
-    stream_id = torch.cuda.current_stream(device).cuda_stream
     with _WORKSPACE_LOCK:
-        workspace = _SYMM_WORKSPACES.get(key)
-        if workspace is not None and workspace.stream_id != stream_id:
-            raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
-        if workspace is None or workspace.capacity_bytes < required_bytes:
-            if torch.cuda.is_current_stream_capturing():
+        # CE supplies a host-side agreement context on setup/growth. Check local
+        # prerequisites before peers enter any collective or rendezvous.
+        with setup_context():
+            stream_id = torch.cuda.current_stream(device).cuda_stream
+            workspace = _SYMM_WORKSPACES.get(key)
+            if workspace is not None and workspace.stream_id != stream_id:
+                raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
+            grow = workspace is None or workspace.capacity_bytes < required_bytes
+            if grow and torch.cuda.is_current_stream_capturing():
                 capacity = 0 if workspace is None else workspace.capacity_bytes
                 raise RuntimeError(
                     "a2a_permute: cannot grow the symmetric-memory workspace "
@@ -177,16 +188,20 @@ def _get_symm_buffer(
                     "warm up the maximum request shape before capture"
                 )
             if workspace is None:
-                # NCCL symmetric-memory rendezvous requires the communicator to
-                # exist before the first allocation.
                 pg = _resolve_process_group(group_name)
                 warm = torch.ones(1, device=device)
+        if grow:
+            if workspace is None:
+                # NCCL symmetric-memory rendezvous requires the communicator to
+                # exist before the first allocation. Collective errors propagate:
+                # an unhealthy process group cannot safely be used for fallback.
                 dist.all_reduce(warm, group=pg)
-            # Growth is rare and must not release the previous allocation while
-            # an earlier kernel is still consuming it.
-            torch.accelerator.synchronize(device)
-            allocation = symm_mem.empty(required_bytes, dtype=torch.uint8, device=device)
-            handle = symm_mem.rendezvous(allocation, group_name)
+            with setup_context():
+                # Do not release an older buffer while kernels still consume it.
+                torch.accelerator.synchronize(device)
+                allocation = symm_mem.empty(required_bytes, dtype=torch.uint8, device=device)
+            with setup_context():
+                handle = symm_mem.rendezvous(allocation, group_name)
             workspace = _SymmWorkspace(
                 allocation=allocation,
                 handle=handle,
@@ -194,6 +209,7 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
+        assert workspace is not None
         return workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
 
 

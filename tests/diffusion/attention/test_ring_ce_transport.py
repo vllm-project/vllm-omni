@@ -3,7 +3,11 @@
 
 """The copy-engine ring transport (``VLLM_OMNI_RING_CE_TRANSPORT=1``) must be bit-identical to ``RingComm``."""
 
+import gc
 import os
+import weakref
+from dataclasses import dataclass, field
+from datetime import timedelta
 
 import pytest
 import torch
@@ -14,6 +18,7 @@ from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.attention.backends import ring_flash_attn
 from vllm_omni.diffusion.attention.backends.ring import ce_transport
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
+from vllm_omni.diffusion.distributed import a2a_permute
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -100,7 +105,7 @@ def _run_ce_falls_back(local_rank: int, world_size: int, master_port: int) -> No
         MASTER_PORT=str(master_port),
     )
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    get_buffer = ce_transport._get_symm_buffer
+    empty = ce_transport.symm_mem.empty
 
     def failing_get_buffer(*args, **kwargs):
         raise RuntimeError("no P2P mapping")
@@ -110,12 +115,12 @@ def _run_ce_falls_back(local_rank: int, world_size: int, master_port: int) -> No
             q, k, v = _local_qkv(world_size, local_rank, 19, 4, 64, torch.bfloat16, seed=7)
             ref_out, ref_lse = _ring(q, k, v, False, ce=False)
             # A failed rendezvous or peer mapping falls back to RingComm.
-            ce_transport._get_symm_buffer = failing_get_buffer
+            ce_transport.symm_mem.empty = failing_get_buffer
             out, lse = _ring(q, k, v, False, ce=True)
             assert torch.equal(out, ref_out) and torch.equal(lse, ref_lse)
-            assert not ce_transport._CREDITED
+            assert not any(workspace.ring_credited for workspace in ce_transport._SYMM_WORKSPACES.values())
     finally:
-        ce_transport._get_symm_buffer = get_buffer
+        ce_transport.symm_mem.empty = empty
         os.environ.pop("VLLM_OMNI_RING_CE_TRANSPORT", None)
         dist.destroy_process_group()
 
@@ -182,3 +187,125 @@ def test_ce_transport_falls_back_to_ring_comm_off_cuda(monkeypatch):
 
     assert output.shape == qkv.shape
     assert SingleRankComm.constructed == 1
+
+
+@dataclass
+class _HostStream:
+    cuda_stream: int = 1
+
+
+@dataclass
+class _HostHandle:
+    fail_peer: bool = False
+    credits: list[tuple[int, int]] = field(default_factory=list)
+
+    def get_buffer(self, _rank, shape, dtype, _offset):
+        if self.fail_peer:
+            raise RuntimeError("injected peer mapping failure")
+        return torch.empty(shape, dtype=dtype)
+
+    def put_signal(self, rank, channel):
+        self.credits.append((rank, channel))
+
+
+def _run_rank_local_setup_failure(rank: int, rendezvous_path: str) -> None:
+    """Real Gloo/store coordination; only CUDA allocation/handles are replaced."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous_path}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    handles: list[_HostHandle] = []
+    failure = [""]
+    stream = _HostStream()
+
+    def current_stream(_device):
+        if rank == 1 and failure[0] == "stream":
+            raise RuntimeError("injected stream failure")
+        return stream
+
+    def empty(size, *, dtype, device):
+        if rank == 1 and failure[0] == "allocation":
+            raise RuntimeError("injected allocation failure")
+        return torch.empty(size, dtype=dtype, device=device)
+
+    def rendezvous(_allocation, _group):
+        if rank == 1 and failure[0] == "rendezvous":
+            raise RuntimeError("injected rendezvous failure")
+        handle = _HostHandle(fail_peer=rank == 1 and failure[0] == "peer")
+        handles.append(handle)
+        return handle
+
+    def event():
+        if rank == 1 and failure[0] == "event":
+            raise RuntimeError("injected event creation failure")
+        return object()
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            # The production workspace and agreement code run unchanged on CPU.
+            patch.setattr(ce_transport, "_unavailable_reason", lambda *_args: None)
+            patch.setattr(torch.cuda, "current_stream", current_stream)
+            patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+            patch.setattr(torch.cuda, "Event", event)
+            patch.setattr(torch.accelerator, "synchronize", lambda _device: None)
+            patch.setattr(ce_transport, "_copy_stream", lambda _device: stream)
+            patch.setattr(ce_transport.symm_mem, "empty", empty)
+            patch.setattr(ce_transport.symm_mem, "rendezvous", rendezvous)
+            patch.setattr(a2a_permute, "_SYMM_WORKSPACES", {})
+            patch.setattr(ce_transport, "_SYMM_WORKSPACES", a2a_permute._SYMM_WORKSPACES)
+            k = torch.empty(1, 4, 2, 8)
+            group = dist.group.WORLD
+            assert group is not None
+            for stage in ("peer", "stream", "allocation", "rendezvous", "event"):
+                failure[0] = stage
+                handles.clear()
+                a2a_permute.clear_a2a_permute_workspaces()
+                assert ce_transport.maybe_ce_ring_comm(group, k, k) is None
+                # No rank may grant credits when another rank's setup failed.
+                assert all(not handle.credits for handle in handles)
+                assert not any(workspace.ring_credited for workspace in a2a_permute._SYMM_WORKSPACES.values())
+
+            failure[0] = ""
+            handles.clear()
+            a2a_permute.clear_a2a_permute_workspaces()
+            comm = ce_transport.maybe_ce_ring_comm(group, k, k)
+            assert comm is not None
+            handle_ref = weakref.ref(comm._handle)
+            assert len(handles[-1].credits) == 2
+
+            # Failed growth on one rank preserves the previous usable workspace.
+            failure[0] = "allocation"
+            larger = torch.empty(1, 8, 2, 8)
+            assert ce_transport.maybe_ce_ring_comm(group, larger, larger) is None
+            assert a2a_permute._SYMM_WORKSPACES[(k.device, group.group_name)].handle is comm._handle
+            failure[0] = ""
+
+            # Reused workspaces must not perform host agreement or grant credits again.
+            with pytest.MonkeyPatch.context() as reuse_patch:
+
+                def unexpected_agreement(_group):
+                    raise AssertionError("steady-state CE must not coordinate setup")
+
+                reuse_patch.setattr(ce_transport, "_SetupAgreement", unexpected_agreement)
+                reused = ce_transport.maybe_ce_ring_comm(group, k, k)
+                assert reused is not None
+                assert reused._handle is comm._handle
+                assert len(handles[-1].credits) == 2
+            del reused, comm
+            handles.clear()
+            a2a_permute.clear_a2a_permute_workspaces()
+            gc.collect()  # Failed growth can leave transient exception/traceback cycles.
+            assert handle_ref() is None, "credit tracking must not retain the handle after workspace cleanup"
+
+            # A fresh workspace gets fresh credits after cleanup.
+            fresh = ce_transport.maybe_ce_ring_comm(group, k, k)
+            assert fresh is not None
+            assert len(handles[-1].credits) == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.cpu
+def test_ce_rank_local_setup_failures_and_cleanup(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_rank_local_setup_failure, args=(str(tmp_path / "gloo_store"),), nprocs=2, join=True
+    )
