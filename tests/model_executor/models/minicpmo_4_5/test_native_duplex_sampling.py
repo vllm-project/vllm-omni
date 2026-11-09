@@ -19,6 +19,20 @@ _NAMES = ("unit", "chunk_eos", "listen", "tts_bos", "turn_eos", "chunk_tts_eos",
 TOKEN_IDS = {f"{name}_token_id": token for name, token in zip(_NAMES, (1, CHUNK_EOS, LISTEN, 7, 8, 9, TTS_PAD))}
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_chunk_boundary_probability_preserves_softmax_shift_invariance(dtype):
+    # A shared logit offset must not change the decision to stop a speech chunk.
+    # Materializing logsumexp in BF16 loses precision before subtracting it.
+    logits = torch.zeros(5, 3, dtype=dtype)
+    logits += torch.tensor([0, 16, 32, 64, 128], dtype=dtype)[:, None]
+    probabilities = Model._duplex_boundary_chunk_eos_probs(logits, 1)
+    expected = torch.full((5,), 1 / 3, dtype=dtype)
+    torch.testing.assert_close(probabilities, expected, rtol=0, atol=0)
+    # A draw between the correct probability and the rounded logsumexp result
+    # must keep generating for every row, irrespective of the common offset.
+    assert not (torch.full((5,), 0.35) < probabilities).any()
+
+
 class _CharTokenizer:
     """Token t decodes to (t % 3) + 1 copies of one CJK character; special ids decode to ""."""
 
