@@ -52,16 +52,27 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
     spec = ARDiffusionNoisyKVSpec(15, 12, 128, 8, 8, 6)
     model = SimpleNamespace(local_num_layers=2, start_layer=0)
     state = HybridNoisyKVState(spec, model, None, torch.device("cpu"), torch.bfloat16)
+    # begin_request wraps this CellPlan in BlockPlan and reads plan.schedule.
     native = build_cell_plan(CellSchedule(7, 3, 4, 2, Ordering.LATEST_KV, 6, blocks=30, blocks_per_rank=15))
-    plan = BlockPlan(native)
+    # Must divide spec.block_size and fit spec.max_chunk_tokens.
+    chunk_tokens = spec.block_size
 
     class FakePages:
-        capacity = 4
-        device = torch.device("cpu")
-        sent_bytes = 0
-        received_bytes = 0
-        buffers = torch.zeros(2, 2, 64)
-        flags = torch.zeros(2)
+        def __init__(self, plan, spec, chunk_tokens, device, dtype, group):
+            del plan, chunk_tokens, group
+            self.capacity = 4
+            self.device = torch.device(device)
+            self.sent_bytes = 0
+            self.received_bytes = 0
+            # begin_request views buffers[local, field] as (-1, num_kv_heads, head_size).
+            self.buffers = torch.zeros(
+                model.local_num_layers,
+                2,
+                spec.num_kv_heads * spec.head_size,
+                dtype=dtype,
+                device=device,
+            )
+            self.flags = torch.zeros(2, device=device)
 
         def close(self, abort=False):
             pass
@@ -72,8 +83,8 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
 
     # Executor admission (cell_executor.admit) passes retain=, empty for
     # ordinary requests.
-    state.begin_request("req", plan, chunk_tokens=6, t0=0, retain=frozenset())
-    assert state._chunk_tokens["req"] == 6
+    state.begin_request("req", native, chunk_tokens=chunk_tokens, t0=0, retain=frozenset())
+    assert state._chunk_tokens["req"] == chunk_tokens
     # The pre-forward prior-handoff hook (cell_executor line 402) must exist
     # and be callable after admission.
     state.exchange_and_await_prior_handoffs(0)
@@ -84,7 +95,7 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
 
     # The benchmark owns no retained history: non-empty retain fails fast.
     with pytest.raises(ValueError, match="retained history"):
-        state.begin_request("req2", plan, chunk_tokens=6, t0=0, retain=frozenset({1}))
+        state.begin_request("req2", native, chunk_tokens=chunk_tokens, t0=0, retain=frozenset({1}))
     with pytest.raises(ValueError, match="retained history"):
         state.end_request("req2", retain=(1,))
 
