@@ -57,7 +57,6 @@ error to keep the server up usually is not.
 |------|---------|
 | `--stage-init-timeout` | 300 s per stage |
 | `--init-timeout` | 600 s overall |
-| `--shm-threshold-bytes` | 65536 |
 | Worker start method | Forced to `spawn` |
 
 ## Audio-output pitfalls

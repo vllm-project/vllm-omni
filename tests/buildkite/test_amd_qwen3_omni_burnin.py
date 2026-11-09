@@ -20,7 +20,6 @@ CORRECTNESS_TEST = Path("tests/e2e/online_serving/test_qwen3_omni_multi_replicas
 PERF_CONFIGS = {
     "Qwen3-Omni No-Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json"),
     "Qwen3-Omni Async-Chunk Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json"),
-    "Qwen3-Omni Multi-Replica Perf": Path("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json"),
 }
 RUNNER_COMMAND = "bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh"
 
@@ -63,19 +62,6 @@ JOB_SPECS = {
         "target": "tests/dfx/perf/scripts/run_benchmark.py",
         "inner_timeout": "165m",
         "config": str(PERF_CONFIGS["Qwen3-Omni Async-Chunk Perf"]),
-    },
-    "Qwen3-Omni Multi-Replica Perf": {
-        "pool": "mi300_4",
-        "timeout": 180,
-        "source_group": "omni_qwen3_omni_perf",
-        "artifact": "artifacts/rocm-qwen3-omni-multi-replica-perf/**/*",
-        "gpus": "4",
-        "tests": "4",
-        "results": "7",
-        "marks": "slow and omni and rocm and MI325 and cards_3",
-        "target": "tests/dfx/perf/scripts/run_benchmark.py",
-        "inner_timeout": "165m",
-        "config": str(PERF_CONFIGS["Qwen3-Omni Multi-Replica Perf"]),
     },
 }
 
@@ -168,6 +154,11 @@ def test_qwen3_omni_correctness_enables_only_the_new_rocm_resource() -> None:
     source = CORRECTNESS_TEST.read_text(encoding="utf-8")
     decorator = '@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)'
     assert source.count(decorator) == 3
+    assert "QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
+    assert source.count("current_omni_platform.is_rocm()") == 2
+    assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
 
 
 def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
@@ -175,14 +166,11 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         "Qwen3-Omni No-Async-Chunk Perf": [{"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}],
         "Qwen3-Omni Async-Chunk Perf": [
             {"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"},
-            {"cuda": ["H100", "B200"]},
         ],
-        "Qwen3-Omni Multi-Replica Perf": [{"cuda": "H100", "rocm": "MI325"}],
     }
     expected_baseline_keys = {
         "Qwen3-Omni No-Async-Chunk Perf": [{"A3", "H100"}] * 4,
-        "Qwen3-Omni Async-Chunk Perf": [{"A3", "H100"}] * 6 + [{"H100"}],
-        "Qwen3-Omni Multi-Replica Perf": [{"H100"}, set(), set(), set()],
+        "Qwen3-Omni Async-Chunk Perf": [{"A3", "H100"}] * 6,
     }
 
     for label, path in PERF_CONFIGS.items():
@@ -196,12 +184,3 @@ def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
         baseline_keys = [set(params.get("baseline", {})) for config in configs for params in config["benchmark_params"]]
         assert baseline_keys == expected_baseline_keys[label]
         assert all("MI325" not in keys for keys in baseline_keys)
-
-    multi_replica = json.loads(PERF_CONFIGS["Qwen3-Omni Multi-Replica Perf"].read_text(encoding="utf-8"))[0]
-    assert multi_replica["server_params"]["extra_cli_args"] == [
-        "--async-chunk",
-        "--stage-init-timeout",
-        "1200",
-        "--init-timeout",
-        "1500",
-    ]

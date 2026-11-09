@@ -82,7 +82,10 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
+@hardware_test(
+    res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
+    num_cards={"cuda": 1, "npu": 2, "rocm": 1},
+)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 @pytest.mark.parametrize("seed", [0, 42], ids=["seed0", "seed42"])
 def test_voice_clone_streaming_002(omni_server, openai_client, seed: int) -> None:
@@ -118,7 +121,10 @@ def test_voice_clone_streaming_002(omni_server, openai_client, seed: int) -> Non
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
+@hardware_test(
+    res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
+    num_cards={"cuda": 1, "npu": 2, "rocm": 1},
+)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_concurrent_003(omni_server, openai_client) -> None:
     """Concurrent voice-clone requests keep their own codebook-tower state.
@@ -141,7 +147,10 @@ def test_voice_clone_concurrent_003(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
+@hardware_test(
+    res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
+    num_cards={"cuda": 1, "npu": 2, "rocm": 1},
+)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_requires_ref_text_004(omni_server, openai_client) -> None:
     """``ref_audio`` without ``ref_text`` is rejected."""
