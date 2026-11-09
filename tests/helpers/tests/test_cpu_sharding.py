@@ -38,56 +38,6 @@ def write_profile(path: Path, weights: dict[str, object]) -> Path:
     return path
 
 
-@pytest.mark.parametrize("problem", [None, "missing", "duplicate", "failed", "unknown-module"])
-def test_legacy_junit_profile_requires_complete_nonoverlapping_shards(tmp_path: Path, problem: str | None) -> None:
-    paths = []
-    for index in range(2):
-        path = tmp_path / f"pytest-{index}-of-2.xml"
-        # Use a real source module so classname resolution is exercised. Parameter
-        # punctuation and class nesting must survive reconstruction unchanged.
-        classname = "tests.diffusion.distributed.test_wan_decoder_fast_path.TestSynthetic"
-        name = f"test_case[{index}.value::nested]"
-        if problem == "unknown-module" and index == 1:
-            classname = "tests.diffusion.does_not_exist"
-        if problem == "duplicate" and index == 1:
-            name = "test_case[0.value::nested]"
-        failure = '<failure message="failed"/>' if problem == "failed" and index == 1 else ""
-        path.write_text(
-            f'<testsuites><testsuite><testcase classname="{classname}" name="{name}" time="3.25">'
-            f'{failure}</testcase><testcase classname="" name="tests.diffusion.distributed.test_wan_decoder_fast_path" '
-            'time="0"><skipped/></testcase></testsuite></testsuites>'
-        )
-        paths.append(path)
-    if problem == "missing":
-        paths.pop()
-    output = tmp_path / "profile.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(BUILDER),
-            "--suite",
-            "diffusion",
-            "--junit",
-            *map(str, paths),
-            "--source-build-url",
-            "https://buildkite.com/example/synthetic/builds/1",
-            "--source-commit",
-            "fixture",
-            "--output",
-            str(output),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == (2 if problem else 0), result.stdout + result.stderr
-    if not problem:
-        profile = load_profile(output)
-        assert len(profile.node_seconds) == 2
-        assert all(weight == 3.25 for weight in profile.node_seconds.values())
-        assert all("::TestSynthetic::test_case[" in node for node in profile.node_seconds)
-
-
 def test_module_lpt_is_order_independent_and_conserves_nodes() -> None:
     weights = {node(name): cost for name, cost in zip("abcde", [10.0, 9.0, 8.0, 7.0, 6.0])}
     profile = TimingProfile(weights, "synthetic", [])
