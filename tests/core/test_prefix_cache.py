@@ -2289,6 +2289,73 @@ def test_session_decode_discard_appends_and_next_turn_hits():
         mgr.shutdown()
 
 
+def test_session_out_of_order_discard_then_materialize_appends_in_order():
+    """B4: a decode discard consumed before its prefill materialize
+    must not lose the decode rows.
+
+    The prefill step is still queued for materialize on the async
+    builder when the engine thread flushes the decode step via
+    discard_step. Without append ordering the decode append is
+    gap-refused and the stream stalls at 8 for the rest of the turn;
+    with it, the decode rows wait behind the prefill and the stream
+    covers [0, 12) in order.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+        # Reversed consumption order: decode first.
+        mgr.discard_step(s2)
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+    finally:
+        mgr.shutdown()
+
+
+def test_session_out_of_order_append_is_thread_safe():
+    """B4 (threaded): concurrent discard/materialize converge in order.
+
+    The outcome is order-independent: whichever consumer runs first,
+    the stream ends up covering [0, 12) with correct values. Repeated
+    with the discard thread started first, so the losing interleaving
+    (decode consumed before prefill) is exercised, not just the lucky
+    one.
+    """
+    for _ in range(5):
+        mgr, view = make_manager()
+        try:
+            s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+            s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+            errors: list[Exception] = []
+
+            def _run(fn):
+                try:
+                    fn()
+                except Exception as e:  # noqa: BLE001 - collected for the assertion below
+                    errors.append(e)
+
+            t1 = threading.Thread(target=lambda: _run(lambda: mgr.materialize(s1, ["a"])))
+            t2 = threading.Thread(target=lambda: _run(lambda: mgr.discard_step(s2)))
+            t2.start()
+            t1.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+            assert not errors
+            assert not t1.is_alive() and not t2.is_alive()
+            assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+            assert torch.equal(
+                mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+                expected_rows(view.slots_for("a", 0, 12)),
+            )
+        finally:
+            mgr.shutdown()
+
+
 def test_session_warm_pool_start_seeds_store_and_next_turn_hits():
     mgr, view = make_manager()
     try:

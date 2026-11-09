@@ -50,6 +50,7 @@ already in the next step. Warmup/dummy runs are never fed.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import threading
 from collections import deque
@@ -469,6 +470,21 @@ class OmniPrefixCacheManager:
         self._req_row_pos: dict[ReqId, int] = {}
         self._req_session_offset: dict[ReqId, int] = {}
 
+        # Append ordering across materialize (async builder) and
+        # discard_step (engine thread). A step whose expected position
+        # is ahead of the stored stream — an earlier step for the same
+        # request has not landed yet — queues behind it instead of
+        # being gap-refused and lost (B4). Entries are (expected,
+        # sequence, rows), sorted by expected position; the sequence
+        # breaks ties without ever comparing tensors. Guarded by
+        # _append_lock, which never covers a D2H wait and is never held
+        # while taking _state_lock, so it cannot deadlock against the
+        # state lock (new_step_starts takes it under _state_lock only
+        # to drop a finished request's queue).
+        self._append_lock = threading.Lock()
+        self._pending_appends: dict[tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor]]] = {}
+        self._pending_seq = 0
+
         # Planned-but-unread slot refs. A write reusing their slots copies the
         # old rows into ``_SlotRef.preserved`` before overwriting (COW). Guarded
         # by ``_state_lock``; each ref is dropped when its fetch completes.
@@ -550,6 +566,7 @@ class OmniPrefixCacheManager:
                 tids, dtask = self._request_tasks.finish(req_id)
                 self._req_row_pos.pop(req_id, None)
                 self._req_session_offset.pop(req_id, None)
+                self._drop_pending_appends(req_id)
                 # A resumable session request's termination is the
                 # session-end signal: its private rows are dropped with
                 # it. Anything else only loses its binding; segments
@@ -583,6 +600,7 @@ class OmniPrefixCacheManager:
                 # session position of each later step's rows.
                 self._req_session_offset[req_id] = num_computed
                 self._req_row_pos[req_id] = 0
+                self._drop_pending_appends(req_id)
                 if num_computed > 0:
                     self._register_hit_span(req_id, num_computed, event.block_ids, read_start=0)
             # Re-entries whose first position differs from what was already
@@ -1722,11 +1740,18 @@ class OmniPrefixCacheManager:
         skipped when already stored; when they are not stored after
         all (an earlier append stalled), the full slice goes through
         append_beyond's overlap check instead, so the tail can still
-        land. A gap — a saved step this stream never saw, or a
-        post-invalidation nonzero offset with no pool coverage to seed
-        from — means the stored stream no longer describes this prompt;
-        appending would misalign rows, so the stream stalls until a
-        seeding turn rebuilds it. Immediate
+        land. Appends run in publish order per (request, key):
+        materialize (async builder) and discard_step (engine thread)
+        consume steps concurrently, so a later step may arrive before
+        an earlier one landed; its rows queue in _pending_appends
+        (cloned — the caller's rows may be staging views) and drain
+        in position order when the earlier append lands, instead of
+        being gap-refused and lost for the rest of the turn. A gap — a
+        saved step this stream never saw, or a post-invalidation
+        nonzero offset with no pool coverage to seed from — means the
+        stored stream no longer describes this prompt; appending would
+        misalign rows, so the stream stalls until a seeding turn
+        rebuilds it. Immediate
         pool keys only: deferred mm is not on CPU at materialize time,
         and leftover mm is not a pool key. A misaligned tail, if one
         ever forms, is never served: serving requires the store to cover
@@ -1747,13 +1772,58 @@ class OmniPrefixCacheManager:
                 # and the append happen under one store-lock hold, so a
                 # concurrent invalidate cannot land these rows at the
                 # head of a fresh stream, where a later turn could serve
-                # them as its prefix.
-                a_start, a_expected = start, expected
-                if trim > 0 and self._session_store.stored_tokens(session_id, key) >= expected + trim:
-                    a_start, a_expected = start + trim, expected + trim
-                if a_start >= end:
-                    continue
-                self._session_store.append_beyond(session_id, key, a_expected, cur[a_start:end])
+                # them as its prefix. The _append_lock additionally
+                # serializes the queue-or-append decision with the
+                # drain, so a concurrent append cannot slip between
+                # another thread's append and its drain.
+                with self._append_lock:
+                    a_start, a_expected = start, expected
+                    if trim > 0 and self._session_store.stored_tokens(session_id, key) >= expected + trim:
+                        a_start, a_expected = start + trim, expected + trim
+                    if a_start >= end:
+                        continue
+                    rows = cur[a_start:end]
+                    if a_expected > self._session_store.stored_tokens(session_id, key):
+                        self._pending_seq += 1
+                        queue = self._pending_appends.setdefault((req_id, key), [])
+                        bisect.insort(queue, (a_expected, self._pending_seq, rows.clone()))
+                        continue
+                    self._session_store.append_beyond(session_id, key, a_expected, rows)
+                    self._drain_pending_appends_locked(req_id, session_id, key)
+
+    def _drain_pending_appends_locked(self, req_id: ReqId, session_id: str, key: TensorName) -> None:
+        """Append queued rows for (req_id, key) whose position is now covered.
+
+        Caller holds ``_append_lock``. Drains in expected order; stops
+        at the first entry still ahead of the stream (an earlier step
+        has still not landed) or refused (a mismatch invalidated the
+        session — the remaining queued rows belong to a dead stream and
+        are dropped at turn end).
+        """
+        queue = self._pending_appends.get((req_id, key))
+        if not queue:
+            return
+        while queue:
+            expected, _, rows = queue[0]
+            if expected > self._session_store.stored_tokens(session_id, key):
+                break
+            queue.pop(0)
+            if not self._session_store.append_beyond(session_id, key, expected, rows):
+                break
+        if not queue:
+            self._pending_appends.pop((req_id, key), None)
+
+    def _drop_pending_appends(self, req_id: ReqId) -> None:
+        """Drop queued session appends for req_id (turn end / new turn).
+
+        Caller holds ``_state_lock``; takes ``_append_lock`` (no reverse
+        order exists: _append_session_rows never takes _state_lock). A
+        queued row belongs to its own turn's stream; after the turn ends
+        (or a new turn starts) it can never land.
+        """
+        with self._append_lock:
+            for entry in [k for k in self._pending_appends if k[0] == req_id]:
+                del self._pending_appends[entry]
 
     def _merge_uncached_mm(
         self,
