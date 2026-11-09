@@ -245,3 +245,53 @@ def test_session_replay_hit_serves_only_requested_range(harness):
     assert torch.equal(out.hidden_states["a"], rows_for(range(16, 36)))
     # The step's own rows still append at their true position.
     assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 36
+
+
+def test_adapter_absolute_starts_cover_started_extended_resumed():
+    """A1: the adapter reports the absolute start of every (re-)entry."""
+    adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    step = adapter.translate_step(sched_output(new=[("a", 0, [0, 1])], scheduled={"a": 8}))
+    assert step.absolute_starts == (("a", 0),)
+    adapter.translate_step(sched_output(preempted=["a"]))
+    step = adapter.translate_step(sched_output(new=[("a", 0, [0, 1])], scheduled={"a": 4}))
+    assert step.absolute_starts == (("a", 0),)
+    step = adapter.translate_step(sched_output(cached=[("a", 8, [2])], resumed=["a"], scheduled={"a": 1}))
+    assert step.absolute_starts == (("a", 8),)
+
+
+def test_untracked_adapter_reports_absolute_starts():
+    """A1: the V1 path reports absolute starts too (no deliveries)."""
+    adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_output(new=[("a", 4, [0, 1])], scheduled={"a": 4}))
+    assert step.absolute_starts == (("a", 4),)
+    assert step.deliveries == ()
+
+
+def test_session_preemption_reentry_does_not_misappend(harness):
+    """A1: a preemption re-entry recomputing [0, 16) must not append at 32.
+
+    After 32 stored rows, the re-entry's recompute starts at absolute
+    position 0, not at the saved within-turn position 32. Without the
+    absolute-start reconciliation the recomputed rows append at
+    [32, 48) as if continuing the sequence, and a later turn's append
+    then content-mismatches and invalidates the session.
+    """
+    harness.mgr.discard_step(harness.step([("a", 0, 32)], new=[("a", 0, [0, 1, 2, 3, 4, 5, 6, 7], "S")])[1])
+    assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 32
+    harness.mgr.discard_step(harness.step(preempted=["a"])[1])
+
+    step, s3 = harness.step([("a", 0, 16)], new=[("a", 0, [0, 1, 2, 3, 4, 5, 6, 7])])
+    assert step.deliveries == (PrefixCacheDelivery("a", trim=16),)
+    harness.mgr.materialize(s3, ["a"], include_uncached=False)
+    assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 32
+    assert torch.equal(harness.mgr._session_store.fetch("S", HIDDEN_KEY, 32), rows_for(range(32)))
+
+    # A later turn hitting 32 serves the original rows and extends the
+    # stream; the recompute left no misaligned rows behind.
+    _, s4 = harness.step(
+        [("a2", 32, 16)], new=[("a2", 32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "S")], finished=["a"]
+    )
+    out = harness.mgr.materialize(s4, ["a2"], include_uncached=False)
+    assert torch.equal(out.hidden_states["a2"], rows_for(range(48)))
+    assert harness.mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 48
+    assert torch.equal(harness.mgr._session_store.fetch("S", HIDDEN_KEY, 48), rows_for(range(48)))

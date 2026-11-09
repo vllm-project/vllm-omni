@@ -77,6 +77,15 @@ class PrefixCacheStep:
     extended_req_ids: tuple[str, ...] = ()
     # Only produced by an adapter that tracks delivery.
     deliveries: tuple[PrefixCacheDelivery, ...] = ()
+    # Absolute prompt position where each scheduled (re-)entry's computed
+    # rows begin (num_computed_tokens at (re-)entry). The manager
+    # reconciles its per-request saved-row counter against it, so a
+    # preemption re-entry recomputing already-saved positions does not
+    # append at the stale position (A1). A step-level field, not an
+    # extended delivery: deliveries exist only on the tracked (MRv2)
+    # path, while the untracked (V1) path needs the same reconciliation
+    # and produces no deliveries.
+    absolute_starts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +203,7 @@ class PrefixCacheSchedulerAdapter:
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = finished | aborted
         deliveries: list[PrefixCacheDelivery] = []
+        absolute_starts: dict[str, int] = {}
 
         self._observed_req_ids.difference_update(terminal_ids)
         for req_id in sorted(terminal_ids):
@@ -214,6 +224,7 @@ class PrefixCacheSchedulerAdapter:
                 continue
             emitted.add(req_id)
             computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
+            absolute_starts[req_id] = computed_tokens
             if self._track:
                 self._block_ids[req_id] = self._group0(getattr(data, "block_ids", None))
             if req_id in self._observed_req_ids:
@@ -261,6 +272,8 @@ class PrefixCacheSchedulerAdapter:
                 )
             )
             emitted.add(req_id)
+            if index < len(computed):
+                absolute_starts[req_id] = int(computed[index])
 
         # Missing payloads are tolerated for explicit resume signals, as
         # before; their order is deterministic even for a partial test stub.
@@ -296,7 +309,9 @@ class PrefixCacheSchedulerAdapter:
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
                 extended.append(req_id)
-        return PrefixCacheStep(tuple(events), tuple(counts), tuple(extended), tuple(deliveries))
+        return PrefixCacheStep(
+            tuple(events), tuple(counts), tuple(extended), tuple(deliveries), tuple(absolute_starts.items())
+        )
 
     def build_write_layout(
         self,

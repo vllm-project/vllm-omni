@@ -595,6 +595,26 @@ class OmniPrefixCacheManager:
                 elif delivery.trim > 0:
                     self._trims[delivery.req_id] = int(delivery.trim)
 
+            # Absolute prompt positions (A1): a re-entering request's
+            # recompute starts behind the saved position (preemption
+            # re-entry, resume). Reset the within-turn counter so the
+            # append lands at the recompute's absolute position and
+            # append_beyond's overlap check reconciles it (match ->
+            # tail only, mismatch -> invalidate). Without this, the
+            # recomputed rows append at the stale position as if
+            # continuing the sequence. A start behind the turn-start
+            # offset rewinds the offset itself (the counter cannot go
+            # negative); a start ahead is a gap the append refuses.
+            for req_id, abs_start in step.absolute_starts:
+                offset = self._req_session_offset.get(req_id)
+                if offset is None:
+                    continue
+                if abs_start < offset:
+                    self._req_session_offset[req_id] = abs_start
+                    self._req_row_pos[req_id] = 0
+                elif abs_start != offset + self._req_row_pos.get(req_id, 0):
+                    self._req_row_pos[req_id] = abs_start - offset
+
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
             while self._prefetch_queue and self._prefetch_queue[0][0].done():
                 self._prefetch_queue.popleft()
@@ -1698,7 +1718,11 @@ class OmniPrefixCacheManager:
         — which carry no hit in the context — it is the only correct
         position, so decode rows (including coalesced decode flushes,
         which arrive via discard_step) now extend the stream instead of
-        leaving a gap. A gap — a saved step this stream never saw, or a
+        leaving a gap. Rows the merge trimmed as already-delivered are
+        skipped when already stored; when they are not stored after
+        all (an earlier append stalled), the full slice goes through
+        append_beyond's overlap check instead, so the tail can still
+        land. A gap — a saved step this stream never saw, or a
         post-invalidation nonzero offset with no pool coverage to seed
         from — means the stored stream no longer describes this prompt;
         appending would misalign rows, so the stream stalls until a
@@ -1717,13 +1741,19 @@ class OmniPrefixCacheManager:
             if start == end:
                 continue
             expected = ctx.session_offsets.get(req_id, 0) + ctx.positions.get(req_id, 0)
+            trim = ctx.trims.get(req_id, 0)
             for key, cur in current.items():
                 # Atomic overlap handling: the check, the tail slice,
                 # and the append happen under one store-lock hold, so a
                 # concurrent invalidate cannot land these rows at the
                 # head of a fresh stream, where a later turn could serve
                 # them as its prefix.
-                self._session_store.append_beyond(session_id, key, expected, cur[start:end])
+                a_start, a_expected = start, expected
+                if trim > 0 and self._session_store.stored_tokens(session_id, key) >= expected + trim:
+                    a_start, a_expected = start + trim, expected + trim
+                if a_start >= end:
+                    continue
+                self._session_store.append_beyond(session_id, key, a_expected, cur[a_start:end])
 
     def _merge_uncached_mm(
         self,
