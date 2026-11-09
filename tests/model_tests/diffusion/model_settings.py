@@ -51,6 +51,9 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # ROCm multi-GPU cold starts repeatedly straddle the default 600s
+        # deadline while succeeding just beyond it. Keep a finite 50% margin.
+        offline_init_timeout_s=900,
     ),
     "LTX2Pipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",

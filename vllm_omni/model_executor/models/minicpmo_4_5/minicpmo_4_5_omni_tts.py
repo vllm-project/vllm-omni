@@ -31,7 +31,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
+from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -59,6 +62,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     talker_kstep_frames,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
@@ -765,11 +769,14 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
 def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
     """Wrap the runner's MRv2 sampler with codec penalties and EOS control.
 
-    The upstream sampler already applies ``min_tokens`` (codec EOS is a stage
-    stop token), temperature, top-k/top-p and seeded sampling on the device.
-    The Talker adds its 16-frame codec penalty and overrides rows the model
-    terminates (``_mrv2_forced_eos``) with codec EOS after sampling, exactly
-    where V1's ``_force_eos_on_sampled_ids`` does.
+    The upstream sampler applies ``min_tokens`` (codec EOS is a stage stop
+    token), temperature and top-k/top-p. Its seeded draw is Triton Gumbel, which
+    is not the torch generator V1's sampler advances, so the same seed and
+    logits were producing a different codec stream (shorter audio, higher WER).
+    The wrapper keeps that logit pipeline and draws with V1's seeded exponential
+    sampler instead. Rows the model terminates (``_mrv2_forced_eos``) are
+    overwritten with codec EOS after sampling, exactly where V1's
+    ``_force_eos_on_sampled_ids`` does.
     """
 
     stock = sampler.penalties_state
@@ -792,10 +799,12 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     )
     talker._codec_classes(sampler.req_states.device)
     logger.info(
-        "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty and EOS control",
+        "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty, "
+        "EOS control, and the V1 seeded exponential draw",
         _CODEC_PENALTY_WINDOW,
     )
-    return MiniCPMO45TalkerSampler(sampler, talker)
+    talker._mrv2_sampler = MiniCPMO45TalkerSampler(sampler, talker)
+    return talker._mrv2_sampler
 
 
 class MiniCPMO45TalkerSampler(OmniSampler):
@@ -804,6 +813,37 @@ class MiniCPMO45TalkerSampler(OmniSampler):
     def __init__(self, base_sampler, talker):
         super().__init__(base_sampler)
         self.talker = talker
+        # Per request id, the torch generator V1 builds from sampling_params.seed
+        # (None when unseeded). MRv2 re-adds a request after preemption and on
+        # each streaming-input update; V1 keeps the generator in both cases, so
+        # only a finished request drops it.
+        self._v1_generators: dict[str, torch.Generator | None] = {}
+
+    def add_request(self, req_idx: int, sampling_params: Any) -> None:
+        req_id = self.req_states.index_to_req_id.get(req_idx)
+        seed = getattr(sampling_params, "seed", None)
+        if req_id is None:
+            # Upstream profiling registers unseeded warmup slots directly,
+            # before RequestState has real requests. They need the stock
+            # sampling state, but must not create persistent V1 generators.
+            if seed is None:
+                self.base_sampler.add_request(req_idx, sampling_params)
+                return
+            raise RuntimeError(
+                f"MiniCPM-o Talker sampler: slot {req_idx} has no request id; "
+                "RequestState.add_request must assign the slot before Sampler.add_request"
+            )
+        if req_id not in self._v1_generators:
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=self.req_states.device)
+                generator.manual_seed(int(seed))
+            self._v1_generators[req_id] = generator
+        self.base_sampler.add_request(req_idx, sampling_params)
+
+    def forget_requests(self, finished_req_ids: set[str] | list[str]) -> None:
+        for req_id in finished_req_ids:
+            self._v1_generators.pop(req_id, None)
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
@@ -811,11 +851,105 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         self.talker._mrv2_masked_eos = None
         if masked is not None and masked.shape[0] == logits.shape[0]:
             logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
-        output = self.base_sampler(logits, input_batch)
+        output = self._sample_like_v1(logits, input_batch)
         if forced is not None:
             sampled = output.sampled_token_ids
             sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(self.talker._codec_eos_id))
         return output
+
+    def _sample_like_v1(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        """Logit pipeline of the MRv2 sampler, then V1's seeded exponential draw."""
+        num_rows = logits.shape[0]
+        expanded = input_batch.expanded_idx_mapping
+        idx_np = input_batch.idx_mapping_np
+        if expanded.shape[0] != num_rows or idx_np.shape[0] != num_rows:
+            # Speculative rows are rejected for this Talker. Keep the stock
+            # sampler if a batch ever arrives with a different layout.
+            return self.base_sampler(logits, input_batch)
+        sampler = self.base_sampler
+        # The stock sampler owns trace replay, sampling masks and logprobs.
+        # With any of them in the batch, every row takes the stock Gumbel draw,
+        # so seeded rows match V1 only in batches without them.
+        if (
+            sampler.trace_replay_state is not None
+            or sampler.return_sampling_mask
+            or sampler.get_logprobs_dims(idx_np) is not None
+        ):
+            return sampler(logits, input_batch)
+
+        num_nans = get_num_nans(logits) if sampler.compute_nans else None
+        if np.any(sampler.needs_logits_processing[idx_np]):
+            processed = sampler.apply_sampling_params(
+                logits,
+                expanded,
+                input_batch.idx_mapping,
+                idx_np,
+                input_batch.positions[input_batch.logits_indices],
+                input_batch.input_ids[input_batch.logits_indices],
+                input_batch.expanded_local_pos,
+                input_batch.seq_lens_cpu_upper_bound.numpy(),
+                skip_top_k_top_p=True,
+            )
+        else:
+            processed = logits if logits.dtype == torch.float32 else logits.float()
+            sampler.sampling_states.apply_temperature(processed, expanded, idx_np)
+            sampler.sampling_states.apply_min_p(processed, expanded, idx_np)
+        top_k, top_p, has_topp_only_rows = sampler.sampling_states.get_top_k_top_p(
+            expanded, idx_np, processed.shape[-1]
+        )
+        temperature = sampler.sampling_states.temperature.gpu.index_select(0, expanded.long())
+        # One logit row per request here, so expanded_idx_mapping equals the
+        # host-side idx_mapping_np and the slot ids need no device read.
+        index_to_req_id = self.req_states.index_to_req_id
+        generators = {}
+        for row, slot in enumerate(idx_np.tolist()):
+            generator = self._v1_generators.get(index_to_req_id.get(slot))
+            if generator is not None:
+                generators[row] = generator
+        # Chunked prefill still draws a token, but the runner discards it.
+        # Preserve V1's stream for those rows using the host prefill lengths;
+        # reading num_sampled from the device would synchronize every step.
+        held = []
+        if generators and input_batch.has_prefill:
+            num_reqs = input_batch.num_reqs
+            seq_lens = (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+            )
+            unfinished = seq_lens < input_batch.prefill_len_np[:num_reqs]
+            held = [(generator, generator.get_state()) for row, generator in generators.items() if unfinished[row]]
+        sampled = draw_v1_codec_ids(
+            processed,
+            top_k=top_k,
+            top_p=top_p,
+            has_topp_only_rows=has_topp_only_rows,
+            temperature=temperature,
+            # The host copy is the source of temperature.gpu. Only add_request
+            # writes it, before this step's apply_staged_writes, and the next
+            # step's writes go to another UVA pool buffer; the stock sampler
+            # reads the same host copy for its temperature fast path.
+            host_temperature=sampler.sampling_states.temperature.np[idx_np],
+            generators=generators,
+            use_fp64_gumbel=sampler.use_fp64_gumbel,
+        )
+        for generator, state in held:
+            generator.set_state(state)
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        output_kwargs: dict[str, Any] = {
+            "sampled_token_ids": sampled.view(-1, 1),
+            "logprobs_tensors": None,
+            "num_nans": num_nans,
+            "num_sampled": num_sampled,
+            "num_rejected": num_rejected,
+        }
+        if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
+            output_kwargs["sampling_mask_tensors"] = None
+        return Mrv2SamplerOutput(**output_kwargs)
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -957,6 +1091,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mrv2_masked_eos: torch.Tensor | None = None
         # Per request slot: silent and quiet codes in a row (see _install_mrv2_talker_sampler).
         self._mrv2_code_runs: torch.Tensor | None = None
+        self._mrv2_sampler: MiniCPMO45TalkerSampler | None = None
         # Per codec id ``_CODEC_CLASS_*`` bits on the device (see _codec_classes).
         self._codec_class_table: torch.Tensor | None = None
         self._mrv2_decode_rows_logged = False
@@ -2425,7 +2560,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
-        meta_outputs = {"finished": terminal_flags}
+        # Eager sampling already drops non-emitted frames. Still publish a
+        # row mask so full-payload accumulation stays aligned when this request
+        # also runs CUDA graph steps, which retain masked padding rows.
+        meta_outputs = {
+            "finished": terminal_flags,
+            "codec_frame_valid": [
+                torch.ones(delta.shape[0], dtype=torch.bool, device=delta.device) for delta in codec_deltas
+            ],
+        }
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
@@ -2493,6 +2636,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 meta_outputs[key] = [
                     self._merge_frame_finished([frame[index] for frame in per_frame]) for index in range(num_reqs)
                 ]
+            elif key == "codec_frame_valid":
+                meta_outputs[key] = [torch.cat([frame[index] for frame in per_frame]) for index in range(num_reqs)]
             else:
                 # Duplex metadata is per request and constant across the step's
                 # frames; the last frame is as good as any and matches what a
@@ -2878,6 +3023,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
+        # Not deferred: the runner frees the slots right after this hook, and a
+        # request id resubmitted in the same step must start a fresh generator.
+        sampler = getattr(self, "_mrv2_sampler", None)
+        if sampler is not None:
+            sampler.forget_requests(finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
         """Drop every per-request cache a finished request left behind.
@@ -3095,8 +3245,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
-        codec_deltas = [empty_delta for _ in infos]
-        terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
+        codec_deltas: list[Any] | torch.Tensor = [empty_delta for _ in infos]
+        terminal_flags: list[Any] | torch.Tensor = [None] * len(infos)
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
         empty_history = torch.empty(0, dtype=torch.long, device="cpu")
@@ -3105,7 +3255,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec_eos_id = int(self._codec_eos_id)
         gpu_rows = []
         gpu_groups = []
-        frame_valid = [torch.empty(0, dtype=torch.bool, device="cpu") for _ in infos]
+        batch_codec_output = False
+        frame_valid: list[Any] | torch.Tensor = [None] * len(infos)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             if emit_duplex_metadata:
@@ -3229,13 +3380,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 silent_frames=_TURN_END_SILENT_FRAMES,
                 quiet_stop_frames=_TURN_END_QUIET_STOP_FRAMES,
             )
+            batch_codec_output = (
+                device.type == "cuda"
+                and len(gpu_rows) == len(infos)
+                and all(code is not None for _, _, code in gpu_rows)
+                and len(spans) == len(infos)
+                and all(end - start == 1 for start, end in spans)
+            )
             history_rows = histories.unbind()
-            valid_rows = valid.split(1)
-            done_rows = done.unbind()
-            masked_rows = masked.unbind()
-            id_rows = ids.reshape(-1, 1).split(1)
+            valid_rows = () if batch_codec_output else valid.split(1)
+            done_rows = () if batch_codec_output else done.unbind()
+            masked_rows = () if batch_codec_output else masked.unbind()
+            id_rows = () if batch_codec_output else ids.reshape(-1, 1).split(1)
             for row, (index, state, code) in enumerate(gpu_rows):
                 state["recent_codes"] = history_rows[row]
+                if batch_codec_output:
+                    continue
                 if code is not None:
                     codec_deltas[index] = id_rows[row]
                     frame_valid[index] = valid_rows[row]
@@ -3258,6 +3418,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
                 force_eos_rows = device_flags(force_eos_rows, done)
                 mask_eos_rows = device_flags(mask_eos_rows, masked)
+
+        if gpu_rows and batch_codec_output:
+            # Preserve batches through the owned async snapshot; only split
+            # after D2H. No views into a reusable device buffer escape without
+            # the runner's normal snapshot clone.
+            codec_deltas = ids.reshape(-1, 1, 1)
+            frame_valid = valid.reshape(-1, 1)
+            terminal_flags = done
+
+        # Device decode fills these rows directly. Allocate CPU placeholders
+        # only for fallback rows, after the device results have been assigned.
+        if not batch_codec_output:
+            for index in range(len(infos)):
+                if terminal_flags[index] is None:
+                    terminal_flags[index] = torch.tensor(False, dtype=torch.bool)
+                if frame_valid[index] is None:
+                    frame_valid[index] = torch.empty(0, dtype=torch.bool, device="cpu")
 
         # Empty-speech rows, finished duplex chunks, and offline requests that
         # fill the remaining Talker context must sample codec EOS so the
@@ -3287,6 +3464,34 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "meta": meta_outputs,
             },
         )
+
+    @staticmethod
+    def finalize_multimodal_outputs_from_cpu_snapshot(outputs):
+        if not isinstance(outputs, dict):
+            return outputs
+        codes = outputs.get("codes", {})
+        audio = codes.get("audio") if isinstance(codes, dict) else None
+        if isinstance(audio, torch.Tensor) and audio.ndim == 3:
+            # Restore the existing per-request shape and scalar flag contract
+            # at the output boundary, after the batch copy has completed.
+            meta = outputs.get("meta")
+            missing = [
+                key
+                for key in ("codec_frame_valid", "finished")
+                if not isinstance(meta, dict) or not isinstance(meta.get(key), torch.Tensor)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "MiniCPM-o Talker batched codec output needs batched tensors in "
+                    f"meta[{', '.join(missing)}] (see make_omni_output batch_codec_output)"
+                )
+            outputs = dict(outputs)
+            outputs["codes"] = {**codes, "audio": list(audio.unbind(0))}
+            meta = dict(meta)
+            for key in ("codec_frame_valid", "finished"):
+                meta[key] = list(meta[key].unbind(0))
+            outputs["meta"] = meta
+        return outputs
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         if not isinstance(hidden_states, torch.Tensor):
