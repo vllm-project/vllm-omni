@@ -1413,10 +1413,12 @@ class OmniKVTransferManager:
         target_device: torch.device | None = None,
         *,
         sender_info: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
         """Receive KV cache for *request_id*; returns (data dict, size) or (None, 0).
 
         ``sender_info`` overrides instance ``_sender_base_*`` (per-call endpoint).
+        ``timeout`` overrides the configured ``recv_timeout`` for this call.
         """
         if not self.config.need_recv_cache:
             logger.debug("Skip receiving KV cache for %s (need_recv_cache=False)", request_id)
@@ -1436,7 +1438,7 @@ class OmniKVTransferManager:
             logger.info("Skip receiving KV cache for dummy warmup request")
             return None, 0
 
-        timeout = self.config.recv_timeout
+        timeout = self.config.recv_timeout if timeout is None else timeout
         start_time = time.time()
         poll_interval = 0.01
         max_poll_interval = 0.5
@@ -1699,9 +1701,15 @@ class OmniKVTransferManager:
         caches: list[Any] = []
         metadata: list[Any] = []
         missing: list[int] = []
-        # Receive every sample even after a miss, so no sender keeps a sample's KV waiting.
+        # Receive every sample even after a miss, so no sender keeps a sample's KV waiting, but within one
+        # shared deadline: missing samples cost one receive timeout, not one each.
+        deadline = time.time() + self.config.recv_timeout
         for index in range(num_samples):
-            data, _ = self.receive_kv_cache_for_request(per_sample_kv_request_id(request_id, index), target_device)
+            data, _ = self.receive_kv_cache_for_request(
+                per_sample_kv_request_id(request_id, index),
+                target_device,
+                timeout=max(0.0, deadline - time.time()),
+            )
             if not data or "layer_blocks" not in data:
                 missing.append(index)
                 continue

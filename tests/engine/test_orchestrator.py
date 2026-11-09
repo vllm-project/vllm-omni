@@ -4617,6 +4617,47 @@ def test_per_sample_kv_is_not_used_with_async_chunk(async_chunk: bool, feeds: bo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("n", "accepted"), [(6, True), (7, False)])
+async def test_add_request_bounds_per_sample_n_by_max_num_seqs(mocker, n: int, accepted: bool) -> None:
+    # The diffusion stage holds every sample's KV prefix at once.
+    pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
+    pools[0]._stage_vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(omni_kv_config={"per_sample_kv": True}),
+        scheduler_config=SimpleNamespace(max_num_seqs=6),
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    fail = mocker.patch.object(orchestrator, "_fail_request_client_error", new_callable=mocker.AsyncMock)
+    dispatch = mocker.patch.object(pools[0], "submit_initial", new_callable=mocker.AsyncMock, return_value=0)
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="req",
+            prompt=SimpleNamespace(sampling_params=SamplingParams(n=n), resumable=False),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[SamplingParams(n=n), OmniDiffusionSamplingParams()],
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+        )
+    )
+
+    if accepted:
+        fail.assert_not_awaited()
+        dispatch.assert_awaited_once()
+    else:
+        dispatch.assert_not_awaited()
+        assert "n=7 exceeds stage 0's max_num_seqs=6" in fail.await_args.args[2]
+
+
+@pytest.mark.asyncio
 async def test_add_request_drops_a_client_per_sample_kv_count(mocker) -> None:
     pools = [StagePool(0, FakeStageClient(stage_type="llm")), StagePool(1, FakeStageClient(stage_type="diffusion"))]
     orchestrator = Orchestrator(

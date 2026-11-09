@@ -278,3 +278,26 @@ def test_expert_samples_one_trajectory_per_reasoning_sample():
     for sample, args in enumerate([(5, 7), (9, 8)]):
         (alone,) = _run(pipeline, _expert_request(*args))
         torch.testing.assert_close(output.output[ACTIONS_KEY][sample], alone.output[ACTIONS_KEY], rtol=1e-4, atol=1e-4)
+
+
+def test_expert_samples_follow_a_given_generator():
+    # A generator given without a seed fixes every sample: sample i matches a request with seed initial_seed + i.
+    pipeline = _make_pipeline()
+
+    def sampled():
+        request = _expert_request(5, 7)
+        request.sampling_params.seed = None
+        request.sampling_params.generator = torch.Generator().manual_seed(11)
+        other = _expert_request(9, 8)
+        request.sampling_params.past_key_values = [
+            request.sampling_params.past_key_values,
+            other.sampling_params.past_key_values,
+        ]
+        request.sampling_params.kv_metadata = [request.sampling_params.kv_metadata, other.sampling_params.kv_metadata]
+        (output,) = _run(pipeline, request)
+        return output.output[ACTIONS_KEY]
+
+    first, again = sampled(), sampled()
+    torch.testing.assert_close(first, again)
+    (second_alone,) = _run(pipeline, _expert_request(9, 12))
+    torch.testing.assert_close(first[1], second_alone.output[ACTIONS_KEY], rtol=1e-4, atol=1e-4)

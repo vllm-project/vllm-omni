@@ -3875,6 +3875,12 @@ class Orchestrator(OrchestratorBase):
             and self.stage_pools[final_stage_id].stage_type == "diffusion"
         )
 
+    def _per_sample_kv_limit(self, stage_id: int) -> float:
+        """Largest n for a per-sample KV request: the sending stage's ``max_num_seqs``."""
+        scheduler_config = getattr(self.stage_pools[stage_id].stage_vllm_config, "scheduler_config", None)
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        return float("inf") if max_num_seqs is None else int(max_num_seqs)
+
     def _diffusion_params_for_samples(self, req_state: OrchestratorRequestState, src_stage_id: int, params: Any) -> Any:
         """Tell the diffusion stage how many per-sample KV caches to receive."""
         params = _without_per_sample_kv_count(params)
@@ -3938,7 +3944,8 @@ class Orchestrator(OrchestratorBase):
                 )
                 return
         entry_params = sampling_params_list[stage_id]
-        if (getattr(entry_params, "n", 1) or 1) > 1:
+        entry_n = getattr(entry_params, "n", 1) or 1
+        if entry_n > 1:
             reason = None
             # An LLM stage returns its n samples as one output; later stages cannot take one input per sample,
             # except a diffusion stage that receives one KV per sample from this stage.
@@ -3947,6 +3954,10 @@ class Orchestrator(OrchestratorBase):
                     f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
                     f"to stage {final_stage_id}"
                 )
+            # The diffusion stage holds every sample's KV prefix at once: no more samples than the
+            # sending stage runs requests at a time.
+            elif final_stage_id != stage_id and entry_n > (limit := self._per_sample_kv_limit(stage_id)):
+                reason = f"n={entry_n} exceeds stage {stage_id}'s max_num_seqs={limit} for per-sample KV transfer"
             # Streaming-input errors take the segment path, which does not resolve samples to their request.
             elif getattr(prompt, "resumable", False):
                 reason = "n > 1 is not supported for streaming (resumable) input"

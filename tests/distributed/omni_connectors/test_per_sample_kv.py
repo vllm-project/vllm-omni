@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors import kv_transfer_manager
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVCacheConfig, OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -83,3 +84,21 @@ def test_samples_share_the_cfg_companion_kv(monkeypatch):
     assert manager.receive_multi_kv_cache(req, cfg_kv_collect_func=collect)
     assert [metadata["key"] for metadata in req.sampling_params.kv_metadata] == ["req-sample0", "req-sample1"]
     assert req.sampling_params.cfg_text_kv_metadata == {"key": "req__cfg_text"}
+
+
+def test_missing_samples_share_one_receive_deadline(monkeypatch):
+    # Each sample waits only for what is left of one recv_timeout, so K missing samples cost one timeout, not K.
+    manager = _receiver(monkeypatch, set())
+    clock = [1000.0]
+    timeouts: list[float] = []
+
+    def slow_miss(request_id, target_device=None, *, timeout=None, **kwargs):
+        timeouts.append(timeout)
+        clock[0] += 20.0  # each miss waits 20 s
+        return None, 0
+
+    monkeypatch.setattr(kv_transfer_manager.time, "time", lambda: clock[0])
+    monkeypatch.setattr(manager, "receive_kv_cache_for_request", slow_miss)
+
+    assert not manager.receive_multi_kv_cache(_request(3))
+    assert timeouts == [manager.config.recv_timeout, manager.config.recv_timeout - 20.0, 0.0]

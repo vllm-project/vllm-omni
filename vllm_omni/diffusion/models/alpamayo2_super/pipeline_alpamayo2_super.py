@@ -233,11 +233,15 @@ class Alpamayo2SuperPipeline(nn.Module):
             return params.generator[row.sample]
         generator = torch.Generator(device=self.device)
         # The seed fixes the expert's noise (sample i of an n-sample request uses
-        # seed + i, like n separate requests); without one, draw a fresh random seed.
-        if params.seed is None:
+        # seed + i, like n separate requests); a generator given without a seed
+        # fixes it through its initial seed; without either, draw a fresh random seed.
+        seed = params.seed
+        if seed is None and isinstance(params.generator, torch.Generator):
+            seed = params.generator.initial_seed()
+        if seed is None:
             generator.seed()
         else:
-            generator.manual_seed(int(params.seed) + row.sample)
+            generator.manual_seed(int(seed) + row.sample)
         return generator
 
     def _history(self, extra_args: Mapping[str, Any] | None) -> tuple[torch.Tensor, torch.Tensor]:
