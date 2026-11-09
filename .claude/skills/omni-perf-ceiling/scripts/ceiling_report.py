@@ -59,6 +59,15 @@ warns when a stage's KV cache cannot hold C requests; ``--series A,B,...``
 lists cells of one configuration and warns when throughput, aggregate RTF,
 TTFT or TTFP falls as C rises.
 
+Two readings sit beside the bound and never replace it:
+
+- ``--efficiency-target compute=F,memory=F``: the shared-device floor with each
+  row priced at a fraction of the measured peak (``F <= 1``). It is a
+  projection of one utilization target, not a lower bound.
+- ``--profiled NAME=SECONDS_PER_AUDIO_S``: a profiled duration of the
+  implementation the row names. The implementation floor is
+  ``max(roofline, profiled)``; it constrains that implementation only.
+
 Rows of one stage are summed roofline by roofline, so each flag must cover
 kernels no other flag of that stage covers. The bounds cover kernel work and
 launch latency only, not host scheduling, inter-stage transfer or queueing.
@@ -367,8 +376,9 @@ def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int)
     terms: dict[str, dict] = {}
 
     def row(name: str, stage: str | None, compute: float, memory: float) -> dict:
-        entry = terms.setdefault(name, {"stage": None, "device": 0.0, **dict.fromkeys(BOUND_CLASSES, 0.0)})
+        entry = terms.setdefault(name, {"stage": None, "device": 0.0, "rows": [], **dict.fromkeys(BOUND_CLASSES, 0.0)})
         entry["stage"] = stage or entry["stage"]
+        entry["rows"].append((compute, memory))
         entry["compute"] += compute
         entry["memory"] += memory
         entry["device"] += max(compute, memory)
@@ -404,7 +414,39 @@ def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int)
     return terms
 
 
-def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gpus: int) -> dict:
+def efficiency_target(raw: str | None) -> dict[str, float] | None:
+    """``compute=F,memory=F`` with each fraction in (0, 1]."""
+    if not raw:
+        return None
+    parsed = {}
+    for part in raw.split(","):
+        key, _, value = part.partition("=")
+        try:
+            fraction = float(value)
+        except ValueError:
+            fraction = 0.0
+        if key not in ("compute", "memory") or not 0.0 < fraction <= 1.0:
+            raise SystemExit(f"--efficiency-target {raw!r}: each entry is compute=F or memory=F with 0 < F <= 1")
+        parsed[key] = fraction
+    return parsed
+
+
+def scaled_device(entry: dict, efficiency: dict[str, float]) -> float:
+    """Row time at a fraction of the measured peak, taken per row before summing."""
+    total = 0.0
+    for compute, memory in entry["rows"]:
+        total += max(compute / efficiency.get("compute", 1.0), memory / efficiency.get("memory", 1.0))
+    return total
+
+
+def physical_bounds(
+    cell: dict,
+    peaks: dict,
+    specs: dict[str, list[str]],
+    num_gpus: int,
+    efficiency: dict[str, float] | None = None,
+    profiled: dict[str, float] | None = None,
+) -> dict:
     """End-to-end RTF, TTFT and TTFP floors for one cell.
 
     Per audio second, each stage's device time is the sum of its rows'
@@ -493,6 +535,22 @@ def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gp
         cell["ttfp_bound_ms"] = sum(t["latency"] for t in per_request) * 1000.0
         if cell.get("mean_audio_ttfp_ms"):
             cell["ttfp_pct_of_sol"] = cell["ttfp_bound_ms"] / cell["mean_audio_ttfp_ms"]
+
+    if efficiency and terms:
+        device_target = sum(scaled_device(entry, efficiency) for entry in terms.values())
+        # Fixed and fill terms stay at the full measured peak: the target says
+        # how the streaming rows move, and launch time is not a peak fraction.
+        cell["efficiency_projection"] = {
+            "compute": efficiency.get("compute", 1.0),
+            "memory": efficiency.get("memory", 1.0),
+            "device_s": device_target,
+            "rtf": (batch * work_s / num_gpus) / mean_d + batch * device_target / num_gpus,
+        }
+    for name, seconds in (profiled or {}).items():
+        if name not in terms:
+            raise SystemExit(f"--profiled names {name!r}, which no bound row has")
+        terms[name]["profiled_s"] = seconds
+        terms[name]["implementation_s"] = max(terms[name]["device"], seconds)
     return cell
 
 
@@ -630,8 +688,21 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
                     f"device {e['device']:.4f}, launch {e['launch']:.4f} -> {e['bound']} bound; "
                     f"serial at batch 1 {e['serial_1']:.4f}{measured}"
                 )
+                if "profiled_s" in e:
+                    source = "profiled" if e["profiled_s"] >= e["device"] else "roofline"
+                    lines.append(
+                        f"    profiled {e['profiled_s']:.4f}; implementation floor "
+                        f"{e['implementation_s']:.4f} ({source})"
+                    )
             if "g_total" in c:
                 lines.append(f"  measured g_total {c['g_total']:.4f} vs device bound {c['g_bound_total']:.4f}")
+        if proj := c.get("efficiency_projection"):
+            lines.append(
+                f"Efficiency projection ({c['name']}, compute {proj['compute']:.2f} of peak, "
+                f"memory {proj['memory']:.2f} of peak): shared-device aggregate RTF {proj['rtf']:.3f} "
+                f"against the bound {c['rtf_bound']:.3f} and measured {fmt(c.get('aggregate_rtf'))}; "
+                f"per-audio device {proj['device_s']:.4f} s vs bound {c['g_bound_total']:.4f} s"
+            )
         for t in c.get("request_terms") or []:
             if t["stage"] == OUTPUT_STAGE:
                 stage = " (gates first packet)"
@@ -730,7 +801,18 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
                 f"{c['name']}: pmon stage sum {pmon_sum:.2f} vs GPU busy {busy:.2f}; "
                 "pmon dropped readings, use stage proportions only"
             )
+        proj = c.get("efficiency_projection")
+        if proj and c.get("aggregate_rtf") and proj["rtf"] > 1.05 * c["aggregate_rtf"]:
+            warnings.append(
+                f"{c['name']}: efficiency projection {proj['rtf']:.3f} is above measured aggregate RTF "
+                f"{c['aggregate_rtf']:.3f}; the cell already beats this utilization target"
+            )
         for name, e in (c.get("bound_terms") or {}).items():
+            if e.get("profiled_s") is not None and e["device"] and e["profiled_s"] < 0.95 * e["device"]:
+                warnings.append(
+                    f"{c['name']}: {name} profiled {e['profiled_s']:.4f} s per audio-s is below its roofline "
+                    f"{e['device']:.4f}; the work count is too high, the peak too low, or the profile covers less work"
+                )
             if e["pct_of_sol"] and e["pct_of_sol"] > 1.05:
                 warnings.append(
                     f"{c['name']}: {name} measured g {e['measured_g']:.4f} is below its bound "
@@ -795,6 +877,18 @@ def main() -> int:
         default=[],
         help="NAME,NAME,...: cells of one configuration at rising C; checks the sweep is monotone",
     )
+    parser.add_argument(
+        "--efficiency-target",
+        help="compute=F,memory=F with 0 < F <= 1: project the shared-device floor at that fraction of the "
+        "measured peak. A projection, printed beside the bound, never instead of it",
+    )
+    parser.add_argument(
+        "--profiled",
+        action="append",
+        default=[],
+        help="NAME=SECONDS_PER_AUDIO_S at this cell's batch: a profiled duration of that row's implementation. "
+        "The implementation floor is max(roofline, profiled) and does not enter the bound",
+    )
     parser.add_argument("--num-gpus", type=int, default=1, help="devices shared by all stages")
     parser.add_argument("--json", help="write the ledger to this path")
     args = parser.parse_args()
@@ -829,7 +923,16 @@ def main() -> int:
             "fixed": args.fixed_bound,
             "fill": args.fill_bound,
         }
-        cells = [physical_bounds(c, peaks, specs, args.num_gpus) for c in cells]
+        profiled = {}
+        for raw in args.profiled:
+            name, _, value = raw.partition("=")
+            if not value:
+                parser.error(f"--profiled {raw!r} must be NAME=SECONDS_PER_AUDIO_S")
+            profiled[name] = float(value)
+        cells = [
+            physical_bounds(c, peaks, specs, args.num_gpus, efficiency_target(args.efficiency_target), profiled)
+            for c in cells
+        ]
 
     capacity = kv_capacity(args.kv_capacity)
     for cell in cells:

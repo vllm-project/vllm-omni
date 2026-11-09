@@ -168,6 +168,9 @@ need re-measuring.
   of the card in hand; a bound is not portable, and neither is the envelope.
 - Sampling a card that another tenant is using. Check `npu status` first.
 - Treating `AI Core(%)` as total device busy time. It is cube occupancy.
+- Summing a fused kernel's cube work and vector work as two rows. The two
+  pipes overlap, so the kernel is one row at `max(cube, vector)`; two rows
+  overstate the floor and can push a stage past 100% of SOL.
 - Keeping `cuda_mps: true` in an overlay and reporting it as a lever. It is
   accepted and ignored.
 - Profiling and timing in one run: `msprof` perturbs the numbers like any other

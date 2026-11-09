@@ -196,6 +196,22 @@ Thinker's counts. Take its counts, not its times: it prices them with
 data-sheet peaks and a fixed launch constant, while this ledger uses the
 measured peaks. It does not cover audio stages.
 
+[mindie-sim](https://github.com/mindie-agent/sim) contributes two readings,
+both printed beside the bound
+([bound-models.md](bound-models.md#target-efficiency-and-profiled-completions)):
+
+```bash
+  --efficiency-target compute=0.8,memory=0.8 \
+  --profiled code2wav=<profiled seconds per audio-s at this batch>
+```
+
+The efficiency target projects the shared-device floor with every streaming
+row at that fraction of the measured peak. The profiled value is one row's
+measured duration; the report prints `max(roofline, profiled)` as that
+implementation's floor and warns when the profile beats the roofline. Its
+event-engine schedule is not used: contention only adds time, so the summed
+roofline is already the device floor.
+
 Count kernels per step from one short nsys capture of the stage, in a run
 that produces no timing numbers:
 

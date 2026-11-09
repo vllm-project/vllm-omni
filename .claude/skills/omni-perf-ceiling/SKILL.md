@@ -157,6 +157,12 @@ has no queueing term, so judge it at concurrency 1.
    mean and aggregate RTF) with the largest floor `a` and `b`: a fixed-cost
    gap points at prefill, first-chunk scheduling, connector waits and
    queueing; a per-audio gap points at kernels and batching.
+   Optionally pass `--efficiency-target compute=F,memory=F` (each `F` at most 1).
+   It projects the shared-device floor with every streaming row at that
+   fraction of the measured peak, and `--profiled NAME=SECONDS` compares one
+   row's roofline with a profiled duration of that implementation. Both are
+   readings beside the bound: the projection is not a floor, and the profiled
+   floor constrains only the implementation that was profiled.
 
 9. **Report.** Fill the template below. Hand the largest gap to
    `omni-perf-opt` as its first candidate.
@@ -170,7 +176,10 @@ has no queueing term, so judge it at concurrency 1.
   dataset subset, and RTF definition. Otherwise list it as context.
 - Physical bounds are lower limits on time, not predictions. Name the
   dominant term and the assumptions it hides (perfect batching, no host
-  overhead, peak bandwidth).
+  overhead, peak bandwidth). A target-efficiency projection and a profiled
+  implementation floor are readings beside the bound, and a schedule of
+  shared pipes would be a prediction: contention only adds time, so the sum
+  of the per-row rooflines is already the device floor.
 - Peaks and launch latency come from `measure_peaks.py` on the device in
   hand, never from memory or a data sheet.
 - Work counts (FLOPs, streamed weight bytes, KV bytes) come from the

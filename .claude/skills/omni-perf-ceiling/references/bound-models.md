@@ -9,6 +9,7 @@
 - End-to-end RTF: fixed and per-audio-second cost
 - First-token and first-packet latency
 - Sweep and capacity audits
+- Target efficiency and profiled completions
 - Reading the ledger
 
 ## RTF definitions
@@ -330,6 +331,59 @@ requests. `KV_cache_tokens` is the `GPU KV cache size` startup log line, and
 request of the workload. Below C, the cell measures queueing or preemption.
 The startup line `Maximum concurrency for <max_model_len> tokens per request`
 is the same formula at `max_model_len`, a worst case rather than the workload.
+
+## Target efficiency and profiled completions
+
+Two readings from [mindie-sim](https://github.com/mindie-agent/sim) sit beside the
+bound. Neither replaces it.
+
+### Target efficiency
+
+`fit_efficiency_targets` asks what the time becomes when each pipe runs at a
+stated fraction of its peak. With `η <= 1` a fraction of the measured peak:
+
+```text
+t_row(η) = max(compute_time / η_compute, memory_time / η_memory)
+projection = C * sum_i t_row(η) / N + C * W / (N * mean(d))
+```
+
+The max is taken per row before summing, same as the device floor. At `η = 1`
+the per-audio part equals the shared-device floor. Launch time does not scale,
+and neither do the per-request fixed and fill terms: the projection says how
+the streaming rows move. It is not a lower bound. An implementation can beat
+it, down to the bound. Split the gap:
+
+- `measured - projection`: time left even after every streaming row reaches the
+  target. Host, scheduling, transfer, queueing, or work the rows do not count.
+- `projection - bound`: the price of stopping at the target instead of the
+  measured peak.
+
+A projection above the measured aggregate means the cell already beats the
+target, and the report warns.
+
+### Profiled completion
+
+mindie-sim treats a measured primitive duration as a completion constraint on
+that implementation, and lets the physical program win when it is slower. The
+same rule, per row:
+
+```text
+implementation floor = max(roofline, profiled)
+```
+
+The roofline wins when it is slower, because a measured duration does not
+delete FLOPs or bytes. The floor constrains the profiled implementation only,
+so it never enters the bound. A profile below its roofline means the work
+count, the peak, or the profile's coverage is wrong.
+
+### What is not borrowed
+
+mindie-sim's event engine schedules shared pipes and predicts a completion
+time, including overlap and contention. Contention only adds time, so the sum
+of per-row rooflines is already the lower bound on device time; the schedule
+would be a prediction. Rows are assumed not to overlap. Where two pipes of one
+kernel do overlap, count the kernel as one row (see
+[npu-ceiling.md](npu-ceiling.md)).
 
 ## Reading the ledger
 
