@@ -76,6 +76,7 @@ from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.definitions import SCHEDULER_QUEUE_WAIT_MS
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
     extract_diffusion_denoise_ms,
@@ -549,7 +550,7 @@ class DiffusionEngine:
                     **scheduler_metrics,
                 }
                 if request.scheduler_queue_wait_ms is not None:
-                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                    metrics_update[SCHEDULER_QUEUE_WAIT_MS] = request.scheduler_queue_wait_ms
                 vae_decode_ms = extract_diffusion_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms

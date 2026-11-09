@@ -46,9 +46,10 @@ from vllm_omni.metrics import (
 )
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
-from vllm_omni.metrics.stats import StageStats, diffusion_output_metrics
+from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    extract_diffusion_scheduler_wait_ms,
     iter_mm_outputs,
 )
 from vllm_omni.outputs import OmniRequestOutput
@@ -59,14 +60,6 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
-
-
-def _scheduler_queue_wait_ms(output: Any) -> float | None:
-    """Milliseconds of diffusion scheduler admission on one finished output."""
-    wait_ms = diffusion_output_metrics(output).get("scheduler_queue_wait_ms")
-    if wait_ms is None:
-        return None
-    return float(wait_ms)
 
 
 class StageUnavailableError(RuntimeError):
@@ -860,7 +853,7 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
-        scheduler_wait_ms = _scheduler_queue_wait_ms(request_outputs[0]) if request_outputs else None
+        scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
         if scheduler_wait_ms is not None:
             if scheduler_wait_ms > stage_gen_time_ms:
                 logger.warning(

@@ -15,22 +15,20 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import _as_float, _as_float_list, _as_int, _build_field_defs, _build_row, _format_table
+from vllm_omni.metrics.utils import (
+    _as_float,
+    _as_float_list,
+    _as_int,
+    _build_field_defs,
+    _build_row,
+    _format_table,
+    diffusion_output_metrics,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.metrics.transfer import OmniTransferMetrics
 
 logger = init_logger(__name__)
-
-
-def diffusion_output_metrics(engine_output: Any) -> dict[str, Any]:
-    """Return the metrics dict on one engine output, or an empty dict."""
-    raw = getattr(engine_output, "metrics", None)
-    if isinstance(raw, list):
-        raw = raw[0] if raw else None
-    if isinstance(raw, dict):
-        return raw
-    return {}
 
 
 @dataclass
@@ -809,7 +807,7 @@ class OrchestratorAggregator:
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",
-        "scheduler_queue_wait_ms": "scheduler_queue_wait_s",
+        defs.SCHEDULER_QUEUE_WAIT_MS: "scheduler_queue_wait_s",
         "kv_recv_time_ms": "kv_recv_time_s",
     }
 

@@ -8,6 +8,7 @@ Uses behavior and Prometheus exposition to verify production call semantics.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -337,7 +338,7 @@ class TestStageGenExcludesQueueWait:
         orchestrator_wait_ms: float | None = 1.0,
         replay_final: bool = False,
     ) -> tuple[dict[str, float], list[Any], Any]:
-        from vllm_omni.engine.orchestrator import Orchestrator
+        from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
         from vllm_omni.engine.stage_pool import StagePool, _ReplicaMetrics
         from vllm_omni.entrypoints.omni_base import OmniBase
         from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -354,15 +355,21 @@ class TestStageGenExcludesQueueWait:
         orchestrator = object.__new__(Orchestrator)
         orchestrator.collect_stage_metrics = True
         orchestrator.stage_pools = pools
-        pipeline_timings: dict[str, float] = {}
-        if orchestrator_wait_ms is not None:
-            pipeline_timings["queue_wait_ms"] = orchestrator_wait_ms
-        req_state = SimpleNamespace(
-            pipeline_timings=pipeline_timings,
-            stage_submit_ts={},
-            request_timestamp=self._SUBMIT,
+        req_state = OrchestratorRequestState(
+            request_id="req-queue",
             sampling_params_list=[SimpleNamespace(num_inference_steps=4) for _ in stages],
+            final_stage_id=n_stages - 1,
         )
+        req_state.request_timestamp = self._SUBMIT
+        if orchestrator_wait_ms is not None:
+            req_state.pipeline_timings["queue_wait_ms"] = orchestrator_wait_ms
+        orchestrator.request_states = {"req-queue": req_state}
+        routed: list[Any] = []
+
+        async def record_route(_stage_id, _replica_id, _output, _state, stage_metrics):
+            routed.append(stage_metrics)
+
+        orchestrator._route_output = record_route
         aggregator = OrchestratorAggregator(
             num_stages=n_stages,
             log_stats=False,
@@ -412,7 +419,8 @@ class TestStageGenExcludesQueueWait:
                 "vllm_omni.engine.stage_pool._time.time",
                 return_value=self._SUBMIT + wall_ms / 1000.0,
             )
-            stage_metrics = orchestrator._attach_finished_stage_metrics(stage_id, 0, final_output, req_state)
+            asyncio.run(orchestrator._handle_processed_outputs(stage_id, 0, [final_output]))
+            stage_metrics = routed[-1]
             built.append(stage_metrics)
             final_result = SimpleNamespace(
                 request_id="req-queue",

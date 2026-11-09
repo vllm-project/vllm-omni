@@ -1628,9 +1628,7 @@ class OrchestratorBase:
         )
         if (wait_ms := stage_metrics.scheduler_queue_wait_ms) is not None:
             # A missing orchestrator hop still records the scheduler wait.
-            req_state.pipeline_timings["queue_wait_ms"] = (
-                float(req_state.pipeline_timings.get("queue_wait_ms", 0.0)) + wait_ms
-            )
+            req_state.pipeline_timings["queue_wait_ms"] = req_state.pipeline_timings.get("queue_wait_ms", 0.0) + wait_ms
         if self.collect_stage_metrics:
             stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
         return stage_metrics
