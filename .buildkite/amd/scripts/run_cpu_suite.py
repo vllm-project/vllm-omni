@@ -8,12 +8,12 @@ import json
 import os
 import sys
 import tempfile
-import time
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -53,7 +53,8 @@ class CpuSuiteArtifacts:
     def __init__(self, directory: Path, suite: str | None = None) -> None:
         self.directory = directory
         self.suite = suite
-        self.started = time.perf_counter()
+        # Tests may patch time.perf_counter; diagnostics must not consume their clock.
+        self.started = perf_counter()
         self.collected: list[str] = []
         self.selected: list[str] = []
         self.not_selected: list[str] = []
@@ -83,7 +84,7 @@ class CpuSuiteArtifacts:
     def event(self, kind: str, **fields: object) -> None:
         self.write(
             "events.jsonl",
-            {"event": kind, "elapsed_seconds": time.perf_counter() - self.started, **fields},
+            {"event": kind, "elapsed_seconds": perf_counter() - self.started, **fields},
             append=True,
         )
 
@@ -114,12 +115,12 @@ class CpuSuiteArtifacts:
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_collection(self) -> Generator[None, None, None]:
-        started = time.perf_counter()
+        started = perf_counter()
         self.event("collection_start")
         try:
             yield
         finally:
-            self.collection_seconds = time.perf_counter() - started
+            self.collection_seconds = perf_counter() - started
             self.event("collection_end", seconds=self.collection_seconds)
 
     def pytest_itemcollected(self, item: pytest.Item) -> None:
@@ -209,7 +210,7 @@ class CpuSuiteArtifacts:
                     **{name: counts[name] for name in ("passed", "failed", "skipped", "incomplete")},
                 },
                 "seconds": {
-                    "runner_wall": time.perf_counter() - self.started,
+                    "runner_wall": perf_counter() - self.started,
                     "collection": self.collection_seconds,
                     **{phase: self.phases[phase] for phase in ("setup", "call", "teardown")},
                 },

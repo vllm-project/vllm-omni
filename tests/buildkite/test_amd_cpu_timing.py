@@ -57,6 +57,25 @@ def read_json(directory: Path, name: str) -> dict:
     return json.loads((directory / name).read_text(encoding="utf-8"))
 
 
+def test_recorder_does_not_consume_the_application_clock(suite: Path) -> None:
+    source = """
+import time
+def test_clock(monkeypatch):
+    ticks = iter([10.0, 12.0])
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+    assert time.perf_counter() == 10.0
+    assert time.perf_counter() == 12.0
+"""
+    result, directory = run_suite(suite, source)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = read_json(directory, "summary.json")
+    assert summary["counts"]["passed"] == 1
+    assert summary["counts"]["incomplete"] == 0
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    elapsed = [event["elapsed_seconds"] for event in events]
+    assert elapsed == sorted(elapsed)
+
+
 def test_phase_totals_outcomes_and_context(suite: Path) -> None:
     source = """
 import pytest
