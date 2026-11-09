@@ -329,7 +329,12 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
 
 
 def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+    """Sample the full video at approximately one frame every three seconds.
+
+    The count is not capped. The ``video_url`` overflow fallback sends this
+    whole list, so a long clip can exceed the judge context again. That second
+    error is not caught and fails the sample.
+    """
     if duration <= 0:
         return []
     times = []

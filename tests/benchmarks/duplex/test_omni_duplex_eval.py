@@ -545,6 +545,49 @@ def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp
     assert score["content"]["content_score"] == 3
 
 
+def test_uncapped_frame_sample_fallback_propagates_a_second_overflow(tmp_path, monkeypatch):
+    # Frame sampling is one frame every three seconds with no cap, so the
+    # video_url fallback can overflow the judge again. That second error fails
+    # the sample instead of being retried.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+    observed = []
+
+    def overflow():
+        rejected = requests.Response()
+        rejected.status_code = 400
+        rejected._content = b"Input length exceeds the maximum context length"
+        return requests.HTTPError("400 response from judge", response=rejected)
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            observed.append((mode, None if frames is None else len(frames)))
+            raise overflow()
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=120,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
+    assert observed == [("video_url", None), ("frame-sample", 40)]
+
+
 def test_judge_context_length_error_detection():
     import requests
 
