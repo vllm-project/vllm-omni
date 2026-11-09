@@ -367,7 +367,7 @@ steps:
         # JoyImage's nonblocking nightly lane owns its cold AITER builds.
         # H3 VAE ops assume NVIDIA CUDA; ROCm sets torch.version.hip.
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 117
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 120
           tests/diffusion/models/
           --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           --ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py
@@ -652,12 +652,12 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # Shard 0 checks the full 1424-node set. The other shards skip that
+    # Shard 0 checks the full 1437-node set. The other shards skip that
     # collection and run their pytest slice immediately. CUDA READY runs the
     # same guard when tests/model_executor/ or this file changes.
     - |
       if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
-        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1424 \
+        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1437 \
           tests/model_executor/ \
           -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
           --run-level "core_model"

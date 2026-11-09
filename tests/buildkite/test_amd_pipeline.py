@@ -749,7 +749,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Diffusion · Model Test",
         AMD_READY_PIPELINE,
         "Blocking",
-        117,
+        120,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -757,7 +757,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1424,
+        1437,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -4015,7 +4015,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    35 ids. R2-01 still collects 1424 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1437 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4061,7 +4061,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1437" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -4273,7 +4273,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1424 model-executor nodes.
+    still collects 1437 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4325,7 +4325,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1437" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
