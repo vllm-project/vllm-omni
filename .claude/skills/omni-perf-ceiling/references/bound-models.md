@@ -6,6 +6,7 @@
 - Shared-device throughput bound
 - Low-concurrency pipeline bound
 - Per-stage physical bounds
+- End-to-end RTF: fixed and per-audio-second cost
 - Reading the ledger
 
 ## RTF definitions
@@ -151,6 +152,95 @@ shared-memory transfer between stages, request queueing, chunk hand-off and
 Python output processing are not priced. A cell whose measured RTF is far above
 this bound while the device idles points at those costs; say so in the report
 instead of attributing the gap to kernels.
+
+## End-to-end RTF: fixed and per-audio-second cost
+
+The per-audio-second terms above only bound how fast audio streams once it
+flows. Every request also pays costs that do not grow with its audio: Thinker
+prefill, the first Thinker token before the Talker starts, the first codec
+chunk before Code2Wav starts, and host and transfer work. Model each request as
+
+```text
+T_r = a + b * d_r
+rtf_r = b + a / d_r
+mean RTF      = b + a * mean(1 / d)
+aggregate RTF = b + a / mean(d)
+```
+
+`b` is the per-audio-second cost and `a` the fixed cost per request. The mean
+weights `a` by `mean(1/d)`, which exceeds `1/mean(d)` (Jensen), so short
+utterances make the mean RTF larger than the aggregate. The gap between the
+two is exactly `a * (mean(1/d) - 1/mean(d))`.
+
+### Measured split
+
+The result JSON carries both RTFs and each request's audio duration
+(`request_stage_metrics`), so the two equations solve for `a` and `b`:
+
+```text
+a = (mean RTF - aggregate RTF) / (mean(1/d) - 1/mean(d))
+b = aggregate RTF - a / mean(d)
+```
+
+`ceiling_report.py` prints the split. It is a two-point solve: noisy when the
+two RTFs differ by a few percent (C1), skipped when `1/d` barely varies, and
+warned when fewer than 90% of requests carry stage durations or `a` or `b`
+comes out negative. A per-request regression of `T_r` on `d_r` would be
+sturdier, but the benchmark does not save per-request E2EL.
+
+### Bound split
+
+Per-request terms come in two kinds, each `max(flops / peak, bytes / bandwidth,
+alpha * kernels)` in latency:
+
+- **fixed**: work a request adds beyond its audio (Thinker prefill, encoders).
+  One step reads the weights once for the whole batch, so the device work a
+  request adds is `max(flops / peak, weight_bytes / (bandwidth * C))`.
+- **fill**: latency before a downstream stage can start whose work is already
+  in the per-audio terms (one Thinker decode step before the Talker, the first
+  codec chunk of Talker steps before Code2Wav). It adds latency, not work.
+
+Each term gates a stage: it must finish before that stage, and every stage
+after it, sees its first input. Two families of floors follow, each of the
+form `rtf_r >= a / d_r + b`:
+
+```text
+shared device: a = C * W / N,                     b = C * sum_i g_device_i / N
+stage j path:  a = sum of latencies gating <= j,  b = C * serial_j
+```
+
+`W` is the per-request fixed work. The shared-device floor is work
+conservation: `X <= N / (sum_i g_device_i + W / mean(d))`, so by Little's law
+`aggregate RTF >= C * (sum_i g_device_i + W / mean(d)) / N`. The stage-path
+floor is the critical path of one request: stage `j` cannot start before its
+gating terms finish, and then streams at most one step per `step_time(C)`, which
+is `C * serial_j` seconds per audio second for that request.
+
+```text
+aggregate RTF bound = max over floors of (a / mean(d) + b)
+mean RTF bound      = mean_r max over floors of (a / d_r + b)
+```
+
+Every stage-path floor holds per request at any concurrency. The
+shared-device floor holds per request only at C = 1, where requests run one
+at a time; at higher concurrency it bounds the aggregate only, so the mean
+RTF bound there uses the stage-path floors alone. Drain after the binding
+stage is left out, which keeps the floor a lower bound.
+
+With no per-request terms, both reduce to the earlier
+`max(C * sum_i g_device_i / N, C * max_i serial_i)`.
+
+Reading it: compare the measured `a` with the largest floor `a`, and the
+measured `b` with the largest floor `b`. A fixed-cost gap is prefill,
+first-chunk scheduling, connector waits and host work, moved by chunk sizes,
+admission and hand-off; a per-audio gap is kernels and batching. Under load,
+`a` also absorbs queueing before a request's first step, which tracks
+`AUDIO_TTFP`.
+
+Prefix caching shrinks prefill FLOPs: count only tokens that can miss the
+cache. With block size `k` and a shared template no longer than the shortest
+prompt, at least `input_r - floor(min_input / k) * k` tokens per request miss.
+The weight read stays, since one prefill step reads every weight.
 
 ## Reading the ledger
 

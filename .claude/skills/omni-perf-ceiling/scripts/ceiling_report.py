@@ -37,6 +37,18 @@ sharing a NAME add up within each class:
   launch floor from the measured per-kernel latency; STEPS_PER_AUDIO_S is per
   sequence, so batching divides it.
 
+Per-request terms, ``NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]``, where
+STAGE is the first stage the term gates (default 0):
+
+- ``--fixed-bound``: work every request adds beyond its audio (Thinker prefill,
+  encoders). It lengthens the critical path and adds device work.
+- ``--fill-bound``: latency before STAGE can start whose work is already in
+  the per-audio terms (first Talker chunk before Code2Wav).
+
+Each request then satisfies ``RTF_r >= a / d_r + b``. The report prints the
+aggregate RTF floor (``a / mean(d) + b``), the mean RTF floor (per request), and
+the measured ``a`` and ``b`` solved from mean and aggregate RTF.
+
 The bounds cover kernel work and launch latency only, not host scheduling,
 inter-stage transfer or queueing.
 """
@@ -198,6 +210,30 @@ def percentile(result: dict, name: str, p: float) -> float | None:
     return None if value is None else float(value)
 
 
+def request_audio_durations(result: dict) -> list[float]:
+    """Per-request audio seconds from ``--save-detailed`` stage metrics."""
+    durations = []
+    for metrics in result.get("request_stage_metrics") or []:
+        audio_s = max((float(stage.get("audio_duration_s") or 0.0) for stage in (metrics or {}).values()), default=0.0)
+        if audio_s > 0:
+            durations.append(audio_s)
+    return durations
+
+
+def fixed_rate_split(mean_rtf: float, aggregate_rtf: float, mean_audio_s: float, durations: list[float]) -> dict:
+    """Solve ``T_r = a + b * d_r`` from the mean and aggregate RTF.
+
+    ``mean RTF = b + a * mean(1/d)`` and ``aggregate RTF = b + a / mean(d)``; only
+    the spread of ``1/d`` across requests separates ``a`` from ``b``.
+    """
+    inv_mean = sum(1.0 / d for d in durations) / len(durations)
+    spread = inv_mean - 1.0 / mean_audio_s
+    if spread <= 0.02 * inv_mean:
+        return {}
+    fixed_s = (mean_rtf - aggregate_rtf) / spread
+    return {"measured_fixed_s": fixed_s, "measured_rate": aggregate_rtf - fixed_s / mean_audio_s}
+
+
 def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
     parts = spec.split(":")
     result = json.loads(Path(parts[0]).read_text())
@@ -226,6 +262,11 @@ def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
     }
     if cell["aggregate_rtf"] and cell["little_rtf"]:
         cell["little_residual"] = cell["little_rtf"] / cell["aggregate_rtf"] - 1.0
+    if durations := request_audio_durations(result):
+        cell["request_audio_s"] = durations
+        cell["audio_coverage"] = len(durations) / max(1, int(result["completed"]))
+        if cell["aggregate_rtf"]:
+            cell.update(fixed_rate_split(cell["mean_audio_rtf"], cell["aggregate_rtf"], mean_audio_s, durations))
 
     if len(parts) > 1 and parts[1]:
         stage_ms = parse_stage_times(Path(parts[1]))
@@ -259,15 +300,58 @@ def measured_stage_g(cell: dict) -> dict[str, float]:
     return cell.get("stage_device_g") or cell.get("pmon_stage_g") or {}
 
 
-def physical_bounds(
-    cell: dict, peaks: dict, decode: list[str], compute: list[str], launch: list[str], num_gpus: int
-) -> dict:
-    """Per-stage compute / memory / launch floors at batch = cell concurrency.
+def alpha_s(peaks: dict, mode: str) -> float:
+    latency = peaks.get("launch_latency_us") or {}
+    if latency.get(mode) is None:
+        raise SystemExit(f"launch_latency_us[{mode!r}] missing from --peaks; rerun measure_peaks.py")
+    return float(latency[mode]) * 1e-6
 
-    Device time per audio second is ``max(compute, memory)`` (roofline). A stage
-    runs its steps in one process, so its serial time per audio second is
-    ``max(device, launch)``. Audio throughput is bounded both by the shared
-    devices (``N / sum device``) and by the slowest stage's serial time.
+
+def stage_order(stage: str | None) -> int:
+    return int(stage) if stage and stage.isdigit() else 0
+
+
+def request_terms(raws: list[str], peaks: dict, bw: float, batch: int, adds_work: bool) -> list[dict]:
+    """Per-request work on the critical path: ``TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]``.
+
+    One step reads its weights once for the whole batch, so the work a request
+    adds to the shared device divides the weight term by the batch, while its
+    own latency does not. ``adds_work=False`` is a fill term whose work is
+    already counted per audio second.
+    """
+    terms = []
+    for raw in raws:
+        name, stage, values = parse_bound(raw)
+        flops_s = float(values[0]) / float(peaks["matmul_tflops"][values[1]])
+        bytes_s = float(values[2]) * 2**30 / bw if len(values) > 2 and values[2] else 0.0
+        launch_s = alpha_s(peaks, values[4]) * float(values[3]) if len(values) > 4 else 0.0
+        terms.append(
+            {
+                "name": name,
+                "stage": stage,
+                "kind": "fixed" if adds_work else "fill",
+                "work": max(flops_s, bytes_s / batch) if adds_work else 0.0,
+                "latency": max(flops_s, bytes_s, launch_s),
+            }
+        )
+    return terms
+
+
+def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gpus: int) -> dict:
+    """End-to-end RTF floors at batch = cell concurrency.
+
+    Per audio second, each stage's device time is ``max(compute, memory)``
+    (roofline) and its serial time in its own process is ``max(device, launch)``.
+    Per request, fixed terms (prefill) add work and latency, fill terms (first
+    chunk before a downstream stage can start) add latency only. Each floor has
+    the form ``RTF_r >= a / d_r + b``:
+
+    - shared device: ``a = C * W / N``, ``b = C * sum device / N``;
+    - stage j path: ``a = sum of request latencies gating stages <= j``,
+      ``b = C * serial_j``.
+
+    Aggregate RTF is bounded by the largest ``a / mean(d) + b``. Mean RTF is
+    bounded per request, where the shared-device floor only holds at C = 1.
     """
     bw = float(peaks["copy_bandwidth_gbs"]) * 1e9
     batch = cell["concurrency"]
@@ -278,23 +362,25 @@ def physical_bounds(
         entry["stage"] = stage or entry["stage"]
         return entry
 
-    for raw in decode:
+    for raw in specs["decode"]:
         name, stage, values = parse_bound(raw)
         weight_gib, tokens_per_s = float(values[0]), float(values[1])
         kv_gib_per_seq = float(values[2]) if len(values) > 2 else 0.0
         step_s = (weight_gib + batch * kv_gib_per_seq) * 2**30 / bw
         term(name, stage)["memory"] += step_s / batch * tokens_per_s
-    for raw in compute:
+    for raw in specs["compute"]:
         name, stage, values = parse_bound(raw)
         entry = term(name, stage)
         entry["compute"] += float(values[0]) / float(peaks["matmul_tflops"][values[1]])
         if len(values) > 2:
             entry["memory"] += float(values[2]) * 2**30 / bw
-    for raw in launch:
+    for raw in specs["launch"]:
         name, stage, (kernels_per_step, steps_per_audio_s, mode) = parse_bound(raw)
-        alpha_s = float(peaks["launch_latency_us"][mode]) * 1e-6
-        term(name, stage)["launch"] += alpha_s * float(kernels_per_step) * float(steps_per_audio_s) / batch
-    if not terms:
+        term(name, stage)["launch"] += alpha_s(peaks, mode) * float(kernels_per_step) * float(steps_per_audio_s) / batch
+    per_request = request_terms(specs["fixed"], peaks, bw, batch, True) + request_terms(
+        specs["fill"], peaks, bw, batch, False
+    )
+    if not terms and not per_request:
         return cell
 
     measured = measured_stage_g(cell)
@@ -305,19 +391,40 @@ def physical_bounds(
         entry["measured_g"] = measured.get(entry["stage"]) if entry["stage"] is not None else None
         entry["pct_of_sol"] = entry["device"] / entry["measured_g"] if entry["measured_g"] and entry["device"] else None
     device_total = sum(entry["device"] for entry in terms.values())
-    limits = {f"stage {name} serial": 1.0 / entry["serial"] for name, entry in terms.items() if entry["serial"]}
-    if device_total:
-        limits["shared device"] = num_gpus / device_total
-    binding = min(limits, key=limits.get)
+    work_s = sum(t["work"] for t in per_request)
+
+    floors: dict[str, tuple[float, float]] = {}
+    if device_total or work_s:
+        floors["shared device"] = (batch * work_s / num_gpus, batch * device_total / num_gpus)
+    for name, entry in terms.items():
+        order = stage_order(entry["stage"])
+        gate_s = sum(t["latency"] for t in per_request if stage_order(t["stage"]) <= order)
+        floors[f"stage {name} path"] = (gate_s, batch * entry["serial"])
+    if not terms:
+        floors["request path"] = (sum(t["latency"] for t in per_request), 0.0)
+
+    mean_d = cell["mean_audio_duration_s"]
+    aggregate = {key: fixed / mean_d + rate for key, (fixed, rate) in floors.items()}
+    binding = max(aggregate, key=aggregate.get)
+    per_request_floors = [v for key, v in floors.items() if key != "shared device" or batch == 1]
+    durations = cell.get("request_audio_s") or []
+    if per_request_floors and durations:
+        cell["rtf_bound_mean"] = sum(
+            max(fixed / d + rate for fixed, rate in per_request_floors) for d in durations
+        ) / len(durations)
 
     cell["bound_terms"] = terms
+    cell["request_terms"] = per_request
+    cell["bound_floors"] = {key: {"fixed_s": fixed, "rate": rate} for key, (fixed, rate) in floors.items()}
     cell["g_bound"] = {name: entry["device"] for name, entry in terms.items()}
     cell["g_bound_total"] = device_total
-    cell["x_bound"] = limits[binding]
     cell["bound_binding"] = binding
-    cell["rtf_bound"] = batch / limits[binding]
+    cell["rtf_bound"] = aggregate[binding]
+    cell["x_bound"] = batch / aggregate[binding]
     if cell.get("aggregate_rtf"):
         cell["pct_of_sol"] = cell["rtf_bound"] / cell["aggregate_rtf"]
+    if cell.get("rtf_bound_mean"):
+        cell["pct_of_sol_mean"] = cell["rtf_bound_mean"] / cell["mean_audio_rtf"]
     return cell
 
 
@@ -332,8 +439,9 @@ def fmt_pct(value) -> str:
 def render(cells: list[dict]) -> str:
     lines = [
         "| Cell | C | Done/Fail | Mean RTF | P50 | P99 | Aggregate RTF | C/X | Little residual "
-        "| Audio X (s/s) | GPU busy | RTF if no idle | RTF bound | % of SOL |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Audio X (s/s) | GPU busy | RTF if no idle | Aggregate RTF bound | % of SOL | Mean RTF bound "
+        "| Mean % of SOL |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in cells:
         lines.append(
@@ -341,9 +449,16 @@ def render(cells: list[dict]) -> str:
             f"| {fmt(c['p50_audio_rtf'])} | {fmt(c['p99_audio_rtf'])} | {fmt(c['aggregate_rtf'])} "
             f"| {fmt(c['little_rtf'])} | {fmt(c.get('little_residual'), 3)} | {fmt(c['audio_throughput'], 2)} "
             f"| {fmt(c.get('gpu_busy_share'), 2)} | {fmt(c.get('rtf_floor_no_idle'))} | {fmt(c.get('rtf_bound'))} "
-            f"| {fmt_pct(c.get('pct_of_sol'))} |"
+            f"| {fmt_pct(c.get('pct_of_sol'))} | {fmt(c.get('rtf_bound_mean'))} | {fmt_pct(c.get('pct_of_sol_mean'))} |"
         )
     for c in cells:
+        if "measured_fixed_s" in c:
+            lines.append("")
+            lines.append(
+                f"Fixed / per-audio-second split ({c['name']}, T = a + b * d): "
+                f"a {c['measured_fixed_s'] * 1000:.0f} ms per request, b {c['measured_rate']:.3f} s per audio-s; "
+                f"a is {c['measured_fixed_s'] / c['mean_audio_duration_s'] / c['aggregate_rtf']:.0%} of aggregate RTF"
+            )
         if shares := c.get("stage_share_of_audio"):
             lines.append("")
             lines.append(f"Stage gen time / audio duration ({c['name']}):")
@@ -381,10 +496,32 @@ def render(cells: list[dict]) -> str:
                 )
             if "g_total" in c:
                 lines.append(f"  measured g_total {c['g_total']:.4f} vs device bound {c['g_bound_total']:.4f}")
+        for t in c.get("request_terms") or []:
+            stage = "" if t["stage"] is None else f" (gates stage {t['stage']})"
             lines.append(
-                f"  audio X bound {c['x_bound']:.2f} audio-s/s ({c['bound_binding']}); "
-                f"RTF bound {c['rtf_bound']:.3f}, measured aggregate RTF at {fmt_pct(c.get('pct_of_sol'))} of SOL"
+                f"  per request, {t['kind']} {t['name']}{stage}: latency {t['latency'] * 1000:.1f} ms, "
+                f"device work {t['work'] * 1000:.2f} ms"
             )
+        if floors := c.get("bound_floors"):
+            lines.append(
+                f"End-to-end floors RTF >= a / d + b ({c['name']}, mean d {c['mean_audio_duration_s']:.2f} s):"
+            )
+            for key, f in floors.items():
+                mark = "  <- binding" if key == c["bound_binding"] else ""
+                lines.append(f"  {key}: a {f['fixed_s'] * 1000:.1f} ms, b {f['rate']:.4f}{mark}")
+            fixed_floor = max(f["fixed_s"] for f in floors.values())
+            rate_floor = max(f["rate"] for f in floors.values())
+            lines.append(
+                f"  aggregate RTF bound {c['rtf_bound']:.3f} (audio X <= {c['x_bound']:.2f} audio-s/s), "
+                f"measured at {fmt_pct(c.get('pct_of_sol'))} of SOL; "
+                f"mean RTF bound {fmt(c.get('rtf_bound_mean'))}"
+            )
+            if "measured_fixed_s" in c:
+                lines.append(
+                    f"  measured a {c['measured_fixed_s'] * 1000:.0f} ms vs largest floor a "
+                    f"{fixed_floor * 1000:.1f} ms; measured b {c['measured_rate']:.3f} vs largest floor b "
+                    f"{rate_floor:.4f}"
+                )
     warnings = [
         f"{c['name']}: Little residual {c['little_residual']:+.1%}; concurrency was not held"
         for c in cells
@@ -402,6 +539,18 @@ def render(cells: list[dict]) -> str:
         f"({c['bound_binding']}); a bound input overcounts"
         for c in cells
         if (c.get("pct_of_sol") or 0.0) > 1.05
+    ]
+    warnings += [
+        f"{c['name']}: only {c['audio_coverage']:.0%} of requests carry stage audio durations; "
+        "the fixed / per-audio split and mean RTF bound use that subset"
+        for c in cells
+        if c.get("audio_coverage", 1.0) < 0.9
+    ]
+    warnings += [
+        f"{c['name']}: measured split gives a {c['measured_fixed_s'] * 1000:.0f} ms, b {c['measured_rate']:.3f}; "
+        "T = a + b * d does not fit, so do not read the split"
+        for c in cells
+        if "measured_fixed_s" in c and (c["measured_fixed_s"] < 0 or c["measured_rate"] < 0)
     ]
     for c in cells:
         pmon_sum = sum((c.get("pmon_stage_share") or {}).values())
@@ -451,6 +600,19 @@ def main() -> int:
         default=[],
         help="NAME[@STAGE]=KERNELS_PER_STEP,STEPS_PER_AUDIO_S,eager|graph (needs launch_latency_us in --peaks)",
     )
+    parser.add_argument(
+        "--fixed-bound",
+        action="append",
+        default=[],
+        help="NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]] per request, adding work (prefill, encoders)",
+    )
+    parser.add_argument(
+        "--fill-bound",
+        action="append",
+        default=[],
+        help="NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]] per request on the critical path before STAGE, "
+        "whose work is already in the per-audio terms (first chunk)",
+    )
     parser.add_argument("--num-gpus", type=int, default=1, help="devices shared by all stages")
     parser.add_argument("--json", help="write the ledger to this path")
     args = parser.parse_args()
@@ -478,12 +640,14 @@ def main() -> int:
         cell["pmon_stage_g"] = {stage: share / cell["audio_throughput"] for stage, share in shares.items()}
     if args.peaks:
         peaks = json.loads(Path(args.peaks).read_text())
-        if args.launch_bound and not peaks.get("launch_latency_us"):
-            parser.error("--launch-bound needs launch_latency_us in --peaks; rerun measure_peaks.py")
-        cells = [
-            physical_bounds(c, peaks, args.decode_bound, args.compute_bound, args.launch_bound, args.num_gpus)
-            for c in cells
-        ]
+        specs = {
+            "decode": args.decode_bound,
+            "compute": args.compute_bound,
+            "launch": args.launch_bound,
+            "fixed": args.fixed_bound,
+            "fill": args.fill_bound,
+        }
+        cells = [physical_bounds(c, peaks, specs, args.num_gpus) for c in cells]
 
     print(render(cells))
     if args.json:

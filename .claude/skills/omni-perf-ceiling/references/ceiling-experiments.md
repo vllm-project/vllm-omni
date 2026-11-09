@@ -95,6 +95,32 @@ sequence is the KV cache at the mean context length of the workload (layers x
 batch and `eager` for steps that fall back (check the startup log for the
 graph batch limit).
 
+Add the per-request terms for the end-to-end floor
+([bound-models.md](bound-models.md#end-to-end-rtf-fixed-and-per-audio-second-cost)).
+Each is `TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]` per request, gating `@STAGE`:
+
+```bash
+  --fixed-bound thinker_prefill@0=<2 * thinker_params * uncached_tokens / 1e12>,bf16,<thinker_weight_gib> \
+  --fill-bound thinker_first_token@1=0,bf16,<thinker_weight_gib> \
+  --fill-bound talker_first_chunk@2=0,bf16,<codec_chunk_frames * talker_weight_gib>
+```
+
+- Prefill FLOPs are `2 * params * tokens` for the dense part; add attention
+  and encoder FLOPs when the prompt carries audio or images. Use uncached
+  tokens only when prefix caching is on: `mean(input_lens) - floor(min(input_lens)
+  / block_size) * block_size` from the result JSON is a safe floor.
+- A fill term over `k` sequential decode steps reads the weights `k` times,
+  so its `WEIGHT_GIB` is `k * weight_gib`. The first codec chunk is the
+  deploy's `codec_chunk_frames` (or the request's `initial_codec_chunk_frames`
+  when it is set).
+- Append `,<kernels>,eager|graph` when the kernel count of that path is known.
+
+MiniCPM-o 4.5 turn on L20X, as a worked example: Thinker 14.1 GiB bf16
+(`7.57e9` params), mean input 137.9 tokens with the shortest at 130 and block
+size 16, so at least 9.9 uncached tokens, `2 * 7.57e9 * 9.9 = 0.149 TFLOP`;
+`codec_chunk_frames: 25` with a 0.648 GiB Talker gives `16.2` GiB for the
+first chunk.
+
 Count kernels per step from one short nsys capture of the stage, in a run
 that produces no timing numbers:
 

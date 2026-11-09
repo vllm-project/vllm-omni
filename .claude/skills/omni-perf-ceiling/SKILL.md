@@ -57,6 +57,14 @@ Do not use one model for both. Derivations:
   is its kernel-launch time per audio second. Small batches and eager
   fallbacks make that launch term bind before the device does.
 
+Both regimes also pay a fixed cost per request. End-to-end,
+`T_r = a + b * d_r`: `b` is the per-audio-second cost the terms above bound,
+`a` is prefill, first-chunk fill before each downstream stage, host work and,
+under load, queueing. So `aggregate RTF = b + a / mean(d)` and
+`mean RTF = b + a * mean(1/d)`; a mean-RTF target pays more for `a` because
+short utterances weigh more. Report the measured and bound `a` and `b`
+separately: they move with different levers.
+
 ## Workflow
 
 1. **Freeze the workload and commands.** Use the `omni-perf-opt`
@@ -109,6 +117,11 @@ Do not use one model for both. Derivations:
    launch)` in its own process; the larger term names the stage's bound class.
    Write each term's formula with the numbers substituted so it can be
    re-checked, and state which inputs are measured and which analytic.
+   Then add the per-request terms: `--fixed-bound` for work every request
+   adds (Thinker prefill on uncached tokens, encoders) and `--fill-bound` for
+   latency before a downstream stage can start (first Thinker step before the
+   Talker, the first codec chunk before Code2Wav). The report turns them into
+   aggregate and mean RTF floors of the form `a / d + b`.
 
 8. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
    flags so `ceiling_report.py` joins each term to that stage's measured
@@ -117,6 +130,10 @@ Do not use one model for both. Derivations:
    work; a launch-bound stage needs graph coverage or fewer, larger kernels.
    Measured RTF far above the whole bound, with high GPU idle, is host,
    scheduling or inter-stage transfer, which the bound does not price.
+   Compare the measured fixed cost `a` and per-audio cost `b` (solved from
+   mean and aggregate RTF) with the largest floor `a` and `b`: a fixed-cost
+   gap points at prefill, first-chunk scheduling, connector waits and
+   queueing; a per-audio gap points at kernels and batching.
 
 9. **Report.** Fill the template below. Hand the largest gap to
    `omni-perf-opt` as its first candidate.
@@ -139,6 +156,9 @@ Do not use one model for both. Derivations:
 - A stage measured below its own bound (% of SOL above 100%) means the work
   count, the peak or the attribution is wrong. Fix the input before reading
   the ledger.
+- Bound the RTF the target names. The aggregate floor uses `mean(d)`; the
+  mean floor uses each request's `d` and, above C = 1, only the per-request
+  critical path, so it can sit below the aggregate floor.
 - Report the regime for each cell. Do not extrapolate a high-concurrency
   RTF from low-concurrency runs, or the reverse.
 - A cell whose throughput is still rising with concurrency is not saturated;
@@ -174,6 +194,12 @@ Do not use one model for both. Derivations:
 | Stage 1 | | | | | | | |
 | Stage 2 | | | | | | | |
 | GPU idle / host | | | 0 | | host | | |
+
+## End-to-end split (T = a + b * d)
+| Cell | Measured a (ms) | Floor a (ms) | Measured b | Floor b | Fixed share of RTF |
+|------|-----------------|--------------|------------|---------|--------------------|
+| C1 | | | | | |
+| C<high> | | | | | |
 
 ## Bound arithmetic
 [Per stage: each term's formula with numbers substituted, its source
