@@ -522,25 +522,37 @@ class OmniPrefixCacheManager:
     def bind_session(self, req_id: str, session_id: str, *, resumable: bool = False) -> None:
         """Bind a request to a duplex session for session-level caching.
 
-        The duplex layer calls this when it knows the mapping; the
-        adapter also binds STARTED events that carry a session. A
-        non-resumable binding is dropped when the request finishes or
-        aborts; a resumable binding's termination drops the session's
-        stored rows as well (see ``SessionPrefixStore.terminate``).
+        Currently a test-only entry point: no production caller binds
+        through this method — the adapter path binds STARTED events
+        that carry a session directly via ``_session_store.bind`` in
+        ``new_step_starts``. A non-resumable binding is dropped when
+        the request finishes or aborts; a resumable binding's
+        termination drops the session's stored rows as well (see
+        ``SessionPrefixStore.terminate``).
         """
         self._session_store.bind(req_id, session_id, resumable=resumable)
 
     def invalidate_session(self, session_id: str) -> int:
         """Coarse invalidation: drop all of a session's stored segments.
 
-        Call on any session-history mutation (edit, truncation,
-        interruption). Bindings are kept: the session continues and
-        later appends rebuild a fresh stream. Returns segments dropped.
+        Intended to be called on any session-history mutation (edit,
+        truncation, interruption), but that wiring is not in place:
+        no production path calls this method yet, so a history
+        mutation currently leaves stale rows servable until an
+        appending batch's content check catches the mismatch.
+        Bindings are kept: the session continues and later appends
+        rebuild a fresh stream. Returns segments dropped.
         """
         return self._session_store.invalidate(session_id)
 
     def drop_session(self, session_id: str) -> int:
-        """End a session: invalidate its segments and unbind its requests."""
+        """End a session: invalidate its segments and unbind its requests.
+
+        Currently a test-only entry point: no production path calls
+        this method on session close or expiry, so a finished
+        session's rows keep occupying the shared store budget until
+        restart or an explicit call.
+        """
         return self._session_store.drop(session_id)
 
     @torch.inference_mode()

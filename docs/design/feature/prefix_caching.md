@@ -523,11 +523,16 @@ history or ends.
   stamps `session_id` on the stage request at submit time, the
   `OmniNewRequestData` conversions carry it to the worker-side adapter
   (explicitly, not relying on the upstream payload shape), and the
-  adapter binds the STARTED event. A duplex session's stage request is
-  long-lived (resumed across turns), so its FINISHED/ABORTED is the
-  worker-visible session-end signal: a resumable binding's termination
-  drops the session's rows. An ephemeral request's termination only
-  unbinds; the session continues and its rows stay servable.
+  adapter binds the STARTED event. Whether a stage request is
+  long-lived depends on the plugin: only plugins declaring
+  `supports_core_resumable_request = True` (MiniCPM-o) resume a stage
+  request across turns, so only there is FINISHED/ABORTED a
+  worker-visible session-end signal whose termination drops the
+  session's rows. For plugins that do not declare it (Qwen3-Omni),
+  every turn is a new ephemeral request: its termination only unbinds,
+  the session continues, and its rows stay servable — and no
+  worker-visible session-end signal exists yet, so finished sessions'
+  rows are retained until restart or an explicit `drop_session`.
 - Retention: each consumed step appends its new rows at their session
   position: exact continuation appends in full, a batch starting
   behind the stored length (a block-truncated pool hit) first passes a
@@ -542,9 +547,13 @@ history or ends.
   materialized steps through `materialize`. The slot pool is
   untouched, so existing cross-request sharing is unchanged.
 - Coarse invalidation: `invalidate_session` drops a session's segments
-  wholesale on any history mutation (edit, truncation, interruption),
-  or when an appending batch's overlapping rows mismatch the stored
-  rows (a forked session detected at append time).
+  wholesale when an appending batch's overlapping rows mismatch the
+  stored rows (a forked session detected at append time). Calling it
+  on any history mutation (edit, truncation, interruption) is the
+  intended design, but that wiring is not in place: no production
+  path calls it, so a history mutation currently leaves stale rows
+  servable until an appending batch's content check catches the
+  mismatch.
   Segments are per-session copies, so dropping one session can never
   corrupt another's hits. A later turn whose hit length is nonzero
   after an invalidation rebuilds the stream from its pool-hit prefix
