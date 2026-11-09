@@ -652,8 +652,9 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # Shard 0 checks the derived 1424-node expectation. The other shards skip that
-    # collection and run their pytest slice immediately.
+    # Shard 0 checks the full 1424-node set. The other shards skip that
+    # collection and run their pytest slice immediately. CUDA READY runs the
+    # same guard when tests/model_executor/ or this file changes.
     - |
       if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
         bash .buildkite/amd/scripts/assert-pytest-collection.sh 1424 \

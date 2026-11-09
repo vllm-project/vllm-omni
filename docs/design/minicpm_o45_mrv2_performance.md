@@ -13,9 +13,12 @@ because their mutable KV window cannot reuse prefix blocks.
 
 The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
-support. Stage-0 speculative decoding, including n-gram, is refused while
-the output cache is enabled; CUDA turn overlays using speculation must set
-stage 0 `enable_prefix_caching: false` under `platforms.cuda`.
+support. The output cache refuses stage-0 speculative decoding, so an MRv2
+Thinker with a `speculative_config` reuses native KV only and keeps prefix
+caching on (see "Thinker prefix cache with drafts" below). A V1 Thinker with
+speculation, including n-gram, is still refused while the cache is enabled;
+such overlays must set stage 0 `enable_prefix_caching: false` under
+`platforms.cuda`.
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
@@ -161,6 +164,23 @@ Validation covers CUDA turn sessions with greedy text and speech output.
 Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
+
+## Thinker prefix cache with drafts
+
+With a stage-0 `speculative_config` the MRv2 Thinker does not set
+`supports_mrv2_prefix_cache_outputs`, so it reuses native KV alone: no output
+rows are saved or merged and no host cache is allocated. `llm2tts` picks the
+Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`).
+The reply starts after `<|tts_bos|>`, the last prompt token, and the prompt's
+last token is always forwarded, so a new request's hit never covers a reply
+row. A request resumed after preemption can hit on its earlier reply tokens,
+whose rows are already in the ledger. A template that opens the reply earlier
+in the prompt has no rows for the cached part of it: on a hit the request logs
+the "Thinker rows stop" warning and produces no audio, so with such a template
+a draft overlay also sets stage 0 `enable_prefix_caching: false`.
+
+A hit changes which tokens share a prefill step, so greedy text on a hit can
+differ from a miss at near-tied tokens in BF16, as it does without drafts.
 
 ## Code2Wav batching across reference audio
 

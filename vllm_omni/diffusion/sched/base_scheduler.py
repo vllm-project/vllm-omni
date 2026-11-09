@@ -15,6 +15,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.diffusion.attention.schedule import (
+    DECODE_ONLY_PIPELINES,
+    InvalidAttentionScheduleError,
+    resolve_request_attention_schedule,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -39,14 +44,18 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 
 logger = init_logger(__name__)
 
 BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
 
 # LoRA identity and execution mode are request-owned rather than same-named
-# sampling-param fields, so they must be resolved separately from the bulk lookup.
+# sampling-param fields, and the attention schedule is resolved first, so
+# they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
+    "attention_schedule",
+    "attention_schedule_explicit",
     "condition_key",
     "lora_int_id",
     "use_step_execution",
@@ -154,6 +163,19 @@ class BaseScheduler(ABC):
         return self._add_request_with_request_id(request.request_id, request)
 
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
+        try:
+            # A schedule written into extra_args after construction reaches here unabsorbed on the
+            # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
+            # rebuilds the params and absorbs it. Normalize here so topology cannot change the result.
+            absorb_attention_schedule_extra_args(request.sampling_params)
+            if getattr(self.od_config, "model_class_name", None) in DECODE_ONLY_PIPELINES:
+                request.sampling_params.attention_schedule = None
+            resolve_request_attention_schedule(
+                request.sampling_params,
+                getattr(self.od_config, "diffusion_attention_schedule", None),
+            )
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
         if request_id in self._request_states or request_id in self._kv_draining_requests:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
@@ -750,6 +772,10 @@ class BaseScheduler(ABC):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         return StepBatchSamplingParamsKey(
+            attention_schedule=resolve_request_attention_schedule(
+                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+            ),
+            attention_schedule_explicit=sampling.attention_schedule is not None,
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),

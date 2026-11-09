@@ -140,44 +140,6 @@ def test_kstep_frame_sample_is_recorded_for_next_frame():
     assert model._request_codec_history["r1"] == [42, 43]
 
 
-@pytest.mark.parametrize("ordinary_first", [True, False])
-def test_full_payload_preserves_validity_across_ordinary_and_fixed_width_steps(ordinary_first):
-    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
-        _OmniConnectorPayloadTransportMixin,
-    )
-    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
-
-    model = _make_talker(k_step_frames=8, scripted_samples=[42, 43, _EOS_ID])
-    frames, stop_rows = [], []
-    for _ in range(3):
-        frames.append(_frame_call(model, torch.zeros(1, 8)))
-        stop_rows.append(model.take_batch_stop_logits())
-    ordinary = model.merge_frame_outputs(frames, stop_rows).multimodal_outputs
-    ordinary_payload = {"codes.audio": ordinary["codes"]["audio"][0]}
-    ordinary_valid = ordinary["meta"].get("codec_frame_valid")
-    if ordinary_valid is not None:
-        ordinary_payload["meta.codec_frame_valid"] = ordinary_valid[0]
-    # A fixed-width producer retains invalid EOS rows and supplies its own mask.
-    # These explicit CPU inputs do not reproduce a native scheduling history.
-    fixed_payload = {
-        "codes.audio": torch.tensor([[70], [_EOS_ID], [71], [_EOS_ID]]),
-        "meta.codec_frame_valid": torch.tensor([True, False, True, False]),
-    }
-    payloads = [ordinary_payload, fixed_payload] if ordinary_first else [fixed_payload, ordinary_payload]
-    expected = [42, 43, 70, 71] if ordinary_first else [70, 71, 42, 43]
-    transport = _OmniConnectorPayloadTransportMixin()
-    transport._pending_full_payload_send = {}
-    transport._full_payload_replace_keys_cached = frozenset()
-    request = SimpleNamespace(request_id="r1")
-    for payload in payloads:
-        transport.accumulate_full_payload_output("r1", payload, request)
-    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["r1"])
-
-    assert _extract_codec_delta(full, "r1") == expected
-    assert model._request_codec_history["r1"] == [42, 43]
-    assert model._request_audio_states["r1"]["finished"] is True
-
-
 def test_kstep_lazy_projection_skips_finished_and_ineligible_rows():
     model = _make_talker(k_step_frames=8, scripted_samples=[42])
 

@@ -495,15 +495,15 @@ steps:
     depends_on: upload-nightly-pipeline
     if: (build.pull_request.id == null || build.pull_request.labels includes "npu-test") && (build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test")
     steps:
-      - label: "Build CUDA evaluator image for NPU artifacts"
-        key: lingbot-npu-nightly-evaluator-image
+      - label: "Build shared CUDA test image for NPU results"
+        key: lingbot-npu-nightly-ci-image
         source_file_dependencies: lingbot_world_regression
         timeout_in_minutes: 90
         agents:
           queue: medium_cpu_queue_premerge
         commands:
           - bash .buildkite/cuda/scripts/build-ci-image.sh
-      - label: "LingBot World · NPU measured reference/candidate"
+      - label: "LingBot World · NPU paired measurements"
         key: lingbot-npu-nightly-generation
         concurrency: 1
         concurrency_group: vllm-omni/lingbot-world/npu-generation
@@ -517,49 +517,92 @@ steps:
         source_file_dependencies: lingbot_world_regression
         timeout_in_minutes: 240
         mirror_hardwares: a2b3_npu_8
-        # Match existing infra retry codes; pytest and OOM still fail.
-        retry:
-          manual:
-            permit_on_passed: true
-          automatic:
-            - exit_status: -1
-              limit: 1
-            - exit_status: 128
-              limit: 1
         artifact_paths:
           - "lingbot-artifacts/npu-nightly-measurements/**/*"
         commands:
           - bash tests/dfx/lingbot_world/run_ci.sh collect tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-measurements/pair-{{matrix.repeat}}
-      - label: "LingBot World · NPU nightly performance and precision gate"
-        key: lingbot-npu-nightly-gate
+      - label: "LingBot World · NPU measurement data"
+        key: lingbot-npu-nightly-data
         concurrency: 1
         concurrency_group: vllm-omni/lingbot-world/l4-cpu
         concurrency_method: eager
         priority: 0
         source_file_dependencies: lingbot_world_regression
         depends_on:
-          - lingbot-npu-nightly-generation
-          - lingbot-npu-nightly-evaluator-image
+          - step: lingbot-npu-nightly-generation
+            allow_failure: true
+          - lingbot-npu-nightly-ci-image
         timeout_in_minutes: 60
         mirror_hardwares: l4_1
         artifact_paths:
           - "lingbot-artifacts/npu-nightly/**/*"
         commands:
           - bash tests/dfx/lingbot_world/run_ci.sh aggregate tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly lingbot-artifacts/npu-nightly-measurements
-      - label: "LingBot World · NPU videos WBench/VBench gate on GPU"
-        key: lingbot-npu-nightly-quality
+      - label: "LingBot World · NPU numeric precision"
+        key: lingbot-npu-nightly-precision
+        concurrency: 1
+        concurrency_group: vllm-omni/lingbot-world/l4-cpu
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-npu-nightly-data
+            allow_failure: true
+          - lingbot-npu-nightly-ci-image
+        timeout_in_minutes: 60
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/npu-nightly-precision/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh precision tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-precision lingbot-artifacts/npu-nightly
+      - label: "LingBot World · NPU performance regression"
+        key: lingbot-npu-nightly-performance
+        concurrency: 1
+        concurrency_group: vllm-omni/lingbot-world/l4-cpu
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-npu-nightly-data
+            allow_failure: true
+          - lingbot-npu-nightly-ci-image
+        timeout_in_minutes: 60
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/npu-nightly-performance/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh performance tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-performance lingbot-artifacts/npu-nightly
+      - label: "LingBot World · NPU WBench accuracy"
+        key: lingbot-npu-nightly-wbench
         concurrency: 2
         concurrency_group: vllm-omni/lingbot-world/quality
         concurrency_method: eager
         priority: 0
         source_file_dependencies: lingbot_world_regression
         depends_on:
-          - step: lingbot-npu-nightly-gate
+          - step: lingbot-npu-nightly-data
             allow_failure: true
-          - lingbot-npu-nightly-evaluator-image
+          - lingbot-npu-nightly-ci-image
         timeout_in_minutes: 480
         mirror_hardwares: h100_1
         artifact_paths:
-          - "lingbot-artifacts/npu-nightly-quality/**/*"
+          - "lingbot-artifacts/npu-nightly-wbench/**/*"
         commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh evaluate tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-quality lingbot-artifacts/npu-nightly
+          - bash tests/dfx/lingbot_world/run_ci.sh wbench tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-wbench lingbot-artifacts/npu-nightly
+      - label: "LingBot World · NPU VBench accuracy"
+        key: lingbot-npu-nightly-vbench
+        concurrency: 2
+        concurrency_group: vllm-omni/lingbot-world/quality
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-npu-nightly-data
+            allow_failure: true
+          - lingbot-npu-nightly-ci-image
+        timeout_in_minutes: 480
+        mirror_hardwares: h100_1
+        artifact_paths:
+          - "lingbot-artifacts/npu-nightly-vbench/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh vbench tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-vbench lingbot-artifacts/npu-nightly

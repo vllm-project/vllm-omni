@@ -170,5 +170,34 @@ def test_cache_validation_follows_allocation(backend):
     )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "initialize_kv_cache")
-    assert "super().initialize_kv_cache" in ast.unparse(method.body[0])
-    assert "validate_duplex_kv_cache(self)" in ast.unparse(method.body[1])
+    calls = sorted((node.lineno, ast.unparse(node.func)) for node in ast.walk(method) if isinstance(node, ast.Call))
+    names = [name for _, name in calls]
+    assert names.index("super().initialize_kv_cache") < names.index("validate_duplex_kv_cache")
+
+
+@pytest.mark.parametrize("unhashable", [False, True])
+def test_hook_dispatch_does_not_retain_callable(unhashable):
+    import gc
+    import weakref
+
+    path = Path(__file__).resolve().parents[3] / "vllm_omni/worker/duplex_reanchor.py"
+    namespace: dict[str, Any] = {}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    calls = []
+
+    class Hook:
+        def __call__(self, runner, scheduler_output=None):
+            calls.append(scheduler_output)
+
+    class UnhashableHook(Hook):
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+    owner = UnhashableHook() if unhashable else Hook()
+    reference = weakref.ref(owner)
+    hook = owner if unhashable else owner.__call__
+    namespace["_call_reanchor"](hook, object(), "output")
+    assert calls == ["output"]
+    del hook, owner
+    gc.collect()
+    assert reference() is None

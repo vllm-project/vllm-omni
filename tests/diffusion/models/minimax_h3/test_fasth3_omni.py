@@ -155,7 +155,9 @@ def test_omni_base_components_do_not_download_either_base_transformer(monkeypatc
 def test_omni_serving_rejects_unavailable_tile128_provider(monkeypatch, device, capability, missing_module, message):
     from vllm_omni.diffusion.attention.ops import block_sparse
 
-    monkeypatch.setattr("vllm_omni.diffusion.distributed.utils.get_local_device", lambda: torch.device(device))
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint.get_local_device", lambda: torch.device(device)
+    )
     monkeypatch.setattr(block_sparse.current_omni_platform, "get_device_capability", lambda index: capability)
     if missing_module:
         monkeypatch.setitem(sys.modules, missing_module, None)
@@ -166,11 +168,25 @@ def test_omni_serving_rejects_unavailable_tile128_provider(monkeypatch, device, 
         FastH3OmniCheckpointSpec().check_serving_contract(partition="ref2va", od_config=config)
 
 
+def test_omni_serving_resolves_its_base_with_bf16_whatever_the_dtype(mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import fasth3_checkpoint
+
+    resolve = mocker.patch.object(fasth3_checkpoint, "resolve_block_sparse_provider", return_value="flashinfer")
+    config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        dtype=torch.float16,
+    )
+    FastH3OmniCheckpointSpec().check_serving_contract(partition="ref2va", od_config=config)
+    # H3's attention operands are BF16 whatever --dtype is, and tile128 requires BF16.
+    assert resolve.call_args.args[3] == torch.bfloat16
+    assert resolve.call_args.kwargs["block_size"] == 128
+
+
 def test_omni_serving_checks_flashinfer_on_the_worker_device(monkeypatch, mocker):
     from vllm_omni.diffusion.attention.ops import block_sparse, flashinfer_block_sparse
 
     device = torch.device("cuda:3")
-    monkeypatch.setattr("vllm_omni.diffusion.distributed.utils.get_local_device", lambda: device)
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint.get_local_device", lambda: device)
     capability = mocker.patch.object(block_sparse.current_omni_platform, "get_device_capability", return_value=(12, 0))
     require_kernel = mocker.patch.object(flashinfer_block_sparse, "require_flashinfer_sparse")
     config = OmniDiffusionConfig(

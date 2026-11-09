@@ -30,38 +30,18 @@ steps:
 
       - label: "Simple · Other Test"
         timeout_in_minutes: 20
-        artifact_paths:
-          - "artifacts/cuda-other/*"
         commands:
-          - |
-            export CPU_OTHER_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/cuda-other"
-            export PYTHONUNBUFFERED=1
-            bash .buildkite/common/scripts/run-pytest-ci.sh "$$CPU_OTHER_ARTIFACT_DIR" pytest -sv tests/ -m 'core_model and cpu' \
-              --ignore=tests/diffusion --ignore=tests/model_executor \
-              --ignore=tests/entrypoints --ignore=tests/engine \
-              --ignore-glob=tests/benchmarks/test_lingbot_world_*.py \
-              --junitxml="$$CPU_OTHER_ARTIFACT_DIR/pytest.xml"
+          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
-      - label: "Simple · LingBot World Regression Contract Test"
-        key: ready-lingbot-world-unit
-        env:
-          CI_POLICY_FILE: tests/dfx/lingbot_world/quality.json
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        timeout_in_minutes: 20
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/unit/**/*"
+      # AMD READY R2-01 is non-blocking, so fail the change that moves its
+      # pinned collection here. Some parametrizations need a visible GPU.
+      - label: "Simple · ROCm R2-01 Collection Count"
+        timeout_in_minutes: 10
+        source_file_dependencies: amd_ready_r2_01_collection
         commands:
-          - |
-            CUDA_VISIBLE_DEVICES="" bash .buildkite/common/scripts/run-pytest-ci.sh lingbot-artifacts/unit \
-              python -m pytest -sv -p tests.dfx.lingbot_world.conftest \
-              tests/benchmarks/test_lingbot_world_*.py --lingbot-output=lingbot-artifacts/unit \
-              -m 'core_model and cpu' --run-level core_model --junitxml=lingbot-artifacts/unit/pytest.xml
+          - "python3 .buildkite/amd/scripts/run_collection_guard.py .buildkite/amd/test-amd-ready.yml 'ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t'"
+        mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
@@ -329,17 +309,3 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
-
-      - label: "Diffusion · LingBot World Stream and Cancellation Test"
-        key: ready-lingbot-world-smoke
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/cuda-generation
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        timeout_in_minutes: 45
-        mirror_hardwares: h100_1
-        artifact_paths:
-          - "lingbot-artifacts/cuda-smoke/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh smoke tests/dfx/lingbot_world/configs/cuda_smoke.json lingbot-artifacts/cuda-smoke

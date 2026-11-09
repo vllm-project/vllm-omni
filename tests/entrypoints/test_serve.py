@@ -1382,3 +1382,13 @@ def test_tracking_namespace_copy_preserves_tracking(deep):
     restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
     assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
     assert restored.model == "example"
+
+
+def test_serve_parser_rejects_removed_shm_threshold_bytes() -> None:
+    """``--shm-threshold-bytes`` has no reader left in the tree; the serve
+    parser must reject it instead of accepting a value that is dropped."""
+    args = _parse_serve_args(["serve", "fake-model", "--omni"])
+    assert not hasattr(args, "shm_threshold_bytes")
+
+    with pytest.raises(SystemExit):
+        _parse_serve_args(["serve", "fake-model", "--omni", "--shm-threshold-bytes", "1048576"])

@@ -15,8 +15,7 @@ Canonical layout (prefer these paths for new changes):
 │   │   ├── ci_conditions.py         # Shared gates, YAML whitelists, uploader constants
 │   │   ├── skip_ci.py               # skip-ci decision (docs / skip-mark / CI YAML paths)
 │   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU)
-│   │   ├── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
-│   │   └── run-pytest-ci.sh         # Shared JUnit/setup-failure guard for pytest jobs
+│   │   └── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
 │   ├── ci_mirror_hardwares.yml      # CUDA/NPU hardware presets (referenced by name only)
 │   └── ci_source_file_dependencies.yml  # L2–L5 path-prefix presets (referenced by name only)
 ├── cuda/                            # Primary NVIDIA CUDA CI
@@ -116,7 +115,7 @@ Canonical layout (prefer these paths for new changes):
 
     Inferred form: unset/`empty` `MIRROR_HW` matches `H100` or `L4` in `-m` (both present → H100); no match skips the step. `MIRROR_HW=b200` must appear in `-m` or the step is skipped. The uploader does **not** rewrite pytest `-m`; B200 collection comes from the YAML expression and from tests that declare `B200` in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`. A `mirror_hardwares` name that is not a key in `ci_mirror_hardwares.yml` **fails the upload**.
 
-    Presets may set uploader-only `infer_from_marks: false` when reserved capacity differs from the test's device count. Such a preset requires an explicit `mirror_hardwares` string and is excluded from `not cards_1` inference. For example, `h100_8` reserves eight devices for isolation while LingBot's profile still uses four. The uploader strips this metadata before upload; unrelated inferred H100 jobs retain `h100_4`.
+    A preset with uploader-only `infer_from_marks: false` must be selected explicitly. `h100_8` reserves a full node for the four-device LingBot performance workload; ordinary inferred H100 jobs retain the four-device maximum. The uploader strips this metadata before upload.
 
     **Path filter in YAML:** `source_file_dependencies: <preset>` (string, or a list of preset names)—preset names in [`common/ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). Required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; see [Step filtering](#step-filtering).
 
@@ -147,7 +146,7 @@ Canonical layout (prefer these paths for new changes):
 
     **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
 
-    **L5 trigger:** PR label `weekly-test`, or a scheduled release line (`main` or `release/vX.Y.Z`) with `WEEKLY=1`. NPU weekly does not run under `NON_CRITICAL=1` alone. Docs-only PR labels still honor `skip_all`; scheduled release-line weekly retains coverage.
+    **L5 trigger:** `weekly-test`, or a scheduled release line (`main` or `release/vX.Y.Z`) with `WEEKLY=1`. NPU weekly does not use `NON_CRITICAL=1`; docs-only PR labels still honor `skip_all`.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -372,7 +371,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on a release line (`main` or `release/vX.Y.Z`), scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` still builds the image and uploads L5. CUDA additionally runs L5 for `NON_CRITICAL=1`; `WEEKLY=1` on a release line also uploads CUDA L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for a scheduled release line (`main` or `release/vX.Y.Z`) + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
+**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on a release line (`main` or `release/vX.Y.Z`), scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` still builds the image and uploads L5; CUDA also uploads L5 for `NON_CRITICAL=1`. `WEEKLY=1` on a release line also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for a scheduled release line (`main` or `release/vX.Y.Z`) + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -452,8 +451,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
@@ -486,14 +485,19 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 ### Labels and grouping
 
 - Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` weekly runs on a release line (`main` or `release/vX.Y.Z`, `WEEKLY=1`).
-- Put real-checkpoint PR smoke tests in the existing **E2E Test** group. Use **`:card_index_dividers: World Model Test`** for nightly/weekly world-model campaigns rather than one top-level group per model.
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
 
-### Pytest reports and setup failures
+### LingBot World regression cases
 
-Use `.buildkite/common/scripts/run-pytest-ci.sh <artifact-directory> <command...>` when a pytest job needs retained setup/interruption evidence. Pass `--junitxml=<artifact-directory>/pytest.xml` to pytest and declare the directory in the step's ordinary `artifact_paths`. The wrapper initializes a failed JUnit report before setup, captures source/package metadata, preserves the command's nonzero status, and retains structured errors. It rejects a zero exit with missing, empty, incomplete, failed or entirely skipped JUnit. Set `CI_POLICY_FILE` only when the job also needs to retain a copy of its input policy.
+The CUDA and NPU **World Model Test** groups define three categories:
 
-The ordinary CUDA Simple Other job and LingBot contract/model jobs share this wrapper. Keep workload-specific provisioning beside the tests; shared pipeline admission, hardware expansion and artifact upload remain in the existing Buildkite mechanisms. Buildkite already records console output, so the wrapper does not create a second full text log. Preserve model-server, evaluator and raw measurement artifacts needed to diagnose failures.
+- Nightly accuracy has separate numeric precision, WBench and VBench tests.
+- Nightly performance compares three measured reference/candidate pairs with a 5% regression threshold. The 12 FPS SLO defines the reported measurement basis, not an additional absolute pass gate.
+- Weekly stability runs two candidate-only 600-chunk sessions with memory, camera, lifecycle and cleanup checks.
+
+Shared generation produces measurements without deciding semantic acceptance. Numeric, performance, WBench and VBench jobs depend only on completed generation and retain separate reports; one accuracy result does not block another. NPU measurements retain three producer jobs and a completion-only aggregate step to bound each producer's runtime. WBench/VBench prepare isolated evaluator environments in the ordinary CUDA CI image. NPU result checks share a CUDA test-image build because both the L4 CPU and H100 presets require that image; numeric and performance tests do not prepare evaluators.
+
+The cases retain ordinary pytest exits, JUnit and diagnostic artifacts. CPU contracts use the existing Simple jobs. CI maintainers own actual execution and scheduling; no reference-only calibration campaign is required to define these cases.
 
 ### Per-model coverage
 

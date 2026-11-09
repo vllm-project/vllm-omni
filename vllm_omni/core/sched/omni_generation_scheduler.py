@@ -743,8 +743,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             req_to_new_blocks=req_to_new_blocks,
         )
 
-        cached_reqs_data = OmniCachedRequestData.from_base(
-            cached_reqs_data,
+        cached_reqs_data = OmniCachedRequestData(
+            req_ids=cached_reqs_data.req_ids,
+            resumed_req_ids=cached_reqs_data.resumed_req_ids,
+            new_token_ids=cached_reqs_data.new_token_ids,
+            all_token_ids=cached_reqs_data.all_token_ids,
+            new_block_ids=cached_reqs_data.new_block_ids,
+            num_computed_tokens=cached_reqs_data.num_computed_tokens,
+            num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
             additional_information=cached_additional_information,
         )

@@ -123,19 +123,33 @@ class _Unbatched:
 class _Instrumented:
     """Wraps a batch-capable backend: counts model runs, records batch sizes, can slow or fail a run."""
 
-    def __init__(self, backend, *, delay_s: float = 0.0, fail_on_run: int | None = None) -> None:
+    def __init__(
+        self,
+        backend,
+        *,
+        delay_s: float = 0.0,
+        fail_on_run: int | None = None,
+        block_on_run: int | None = None,
+    ) -> None:
         self.frame_samples = FRAME
         self._backend = backend
         self._delay_s = delay_s
         self._fail_on_run = fail_on_run
+        self._block_on_run = block_on_run
         self.runs = 0
         self.batch_sizes: list[int] = []
+        self.run_blocked = threading.Event()
+        self.release_run = threading.Event()
         self.new_state = backend.new_state
         self.infer = backend.infer
 
     def infer_batch(self, frames, states):
         self.runs += 1
         self.batch_sizes.append(len(frames))
+        if self.runs == self._block_on_run:
+            self.run_blocked.set()
+            if not self.release_run.wait(timeout=10):
+                raise TimeoutError("test did not release the blocked model run")
         if self._delay_s:
             time.sleep(self._delay_s)
         if self.runs == self._fail_on_run:
@@ -609,26 +623,32 @@ async def test_a_failure_stays_with_its_session(variant: _Variant) -> None:
 async def test_a_failed_model_run_does_not_stop_the_batcher(variant: _Variant) -> None:
     """A shared model run that raises fails the appends it was scoring -- none is left waiting -- and
     later appends are detected normally."""
-    backend = _Instrumented(variant.backend, fail_on_run=3)
+    # Hold the first run until every append is submitted. Whether the worker
+    # initially drains one or all four appends, each still has frames pending,
+    # so all four deterministically share the second (failing) model run.
+    backend = _Instrumented(variant.backend, fail_on_run=2, block_on_run=1)
     batcher, executor = _batcher()
     speech = _speech("complete.wav").astype(np.float32) / 32768.0
     session = _Session([])
 
-    outcomes = await asyncio.wait_for(
-        asyncio.gather(
-            *(
-                batcher.process_segments(
-                    _detector(session, backend, variant, _Trace()),
-                    speech[: (10 + i) * FRAME].tobytes(),
-                    fmt="pcm_f32le",
-                    sample_rate_hz=RATE,
-                )
-                for i in range(4)
-            ),
-            return_exceptions=True,
-        ),
-        timeout=30,
-    )
+    tasks = [
+        asyncio.create_task(
+            batcher.process_segments(
+                _detector(session, backend, variant, _Trace()),
+                speech[: (10 + i) * FRAME].tobytes(),
+                fmt="pcm_f32le",
+                sample_rate_hz=RATE,
+            )
+        )
+        for i in range(4)
+    ]
+    await asyncio.sleep(0)
+    try:
+        assert await asyncio.to_thread(backend.run_blocked.wait, 10)
+    finally:
+        backend.release_run.set()
+    outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30)
+    assert backend.batch_sizes[1] == 4
     assert [str(o) for o in outcomes] == ["injected model failure"] * 4
 
     after = _sessions(3, semantic_every=0, seed=4)

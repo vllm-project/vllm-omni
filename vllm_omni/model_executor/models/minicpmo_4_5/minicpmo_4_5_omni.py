@@ -173,8 +173,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # token-aligned, so MRv2 can restore them together on prefix hits.
         # Duplex uses a mutable KV window; Talker owns sampled codec outputs.
         # Opt in only when the construction path explicitly identifies turn mode.
+        # The output cache refuses speculative decoding, so with a draft the
+        # Thinker reuses native KV only. The Talker reads reply rows, which a
+        # new request's hit never covers, and llm2tts takes them from the row
+        # ledger.
         self.supports_mrv2_prefix_cache_outputs = (
-            self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", None) == "turn"
+            self.model_stage == "llm"
+            and getattr(vllm_config.model_config, "session_mode", None) == "turn"
+            and getattr(vllm_config, "speculative_config", None) is None
         )
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.

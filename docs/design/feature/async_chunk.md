@@ -204,6 +204,7 @@ In sequential mode, each stage must wait for the previous stage to complete enti
    - Non-chunk prompt inputs, including orchestrator-fed sender-only stages and full-payload inputs, retain their existing scheduling behavior rather than acquiring async-chunk atomicity.
 
 5. **Model Runners**: Handle chunk processing
+   - Stage zero has no upstream connector payload to receive. Its output drain must skip receive-side TP broadcasts: native MRv2 materializes output on the reply rank only, so other ranks cannot consume such broadcasts. Downstream async-chunk stages retain receive payload fanout.
    - `OmniGPUModelRunner`: Processes chunks in AR stages
    - `GPUGenerationModelRunner`: Processes chunks in generation stages
      - Uses `ubatch_slices` from `get_forward_context()` to track per-request sequence lengths in batched inference

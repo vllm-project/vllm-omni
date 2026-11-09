@@ -44,7 +44,7 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
 
 
-def _model(mocker, *, v2=True, session="turn", async_chunk=False):
+def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
@@ -57,7 +57,8 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False):
             use_v2_model_runner=v2,
             session_mode=session,
             async_chunk=async_chunk,
-        )
+        ),
+        speculative_config=speculative_config,
     )
     if session is None:
         del config.model_config.session_mode
@@ -71,6 +72,38 @@ def test_mrv2_thinker_output_cache_requires_explicit_turn_mode(mocker, session):
     runner._snapshot_prefix_cache_model_policy(model)
     assert model.supports_mrv2_prefix_cache_outputs is (session == "turn")
     assert runner._omni_cache_policy.native_kv_cache_only is (session != "turn")
+
+
+@pytest.mark.parametrize("drafts", [False, True], ids=["no_draft", "draft"])
+def test_mrv2_thinker_with_a_draft_reuses_native_kv_instead_of_being_refused(mocker, drafts):
+    from vllm_omni.core.prefix_cache.group_view import stage_prefix_cache_config
+    from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
+
+    speculative_config = SimpleNamespace(method="dspark", num_speculative_tokens=7) if drafts else None
+    model = _model(mocker, speculative_config=speculative_config)
+    runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
+    runner._snapshot_prefix_cache_model_policy(model)
+    assert model.supports_mrv2_prefix_cache_outputs is not drafts
+    assert runner._omni_cache_policy.native_kv_cache_only is drafts
+
+    def build(spec):
+        return stage_prefix_cache_config(
+            kv_cache_config=SimpleNamespace(num_blocks=4, kv_cache_groups=[]),
+            cache_config=SimpleNamespace(enable_prefix_caching=True, block_size=16),
+            kv_transfer_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=2),
+            model_config=SimpleNamespace(max_model_len=64),
+            is_pooling_model=False,
+            speculative_config=spec,
+            model_cache_policy=runner._omni_cache_policy,
+        )
+
+    if drafts:
+        # Native KV reuse alone: no stage-output cache to refuse the draft.
+        assert build(speculative_config) is None
+    else:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
+            build(SimpleNamespace(method="dspark"))
 
 
 def test_mrv2_thinker_keeps_native_multimodal_embeddings_and_raw_ids(mocker):

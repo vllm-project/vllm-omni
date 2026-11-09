@@ -1057,31 +1057,59 @@ class SimilarityThresholds:
     psnr: float
 
 
+def _current_device_identity() -> tuple[str | None, str | None]:
+    """Return the current device marketing name and architecture, best effort."""
+    try:
+        from vllm_omni.platforms import current_omni_platform
+    except Exception:
+        logging.getLogger(__name__).debug("Could not import the current Omni platform", exc_info=True)
+        return None, None
+
+    device_name: str | None = None
+    device_architecture: str | None = None
+    try:
+        value = current_omni_platform.get_device_name()
+        if value:
+            device_name = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device marketing name", exc_info=True)
+
+    try:
+        device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+        properties = device_module.get_device_properties(0)
+        value = getattr(properties, "gcnArchName", None)
+        if value:
+            device_architecture = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device architecture", exc_info=True)
+
+    return device_name, device_architecture
+
+
 def resolve_device_profile(
     device_name: str | None = None,
     *,
+    device_architecture: str | None = None,
     profiles: Mapping[str, Any],
 ) -> str:
-    """Map a device marketing name to a key in *profiles*.
+    """Map a device marketing name or architecture to a key in *profiles*.
 
-    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
-    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    When both identifiers are omitted, queries the current platform. Non-``default``
+    keys are matched as substrings of either identifier; unmatched devices use
+    ``default``. Callers with an already captured device record should pass both
+    values so profile selection uses the same evidence as the saved artifacts.
     """
-    if device_name is None:
-        try:
-            from vllm_omni.platforms import current_omni_platform
+    if device_name is None and device_architecture is None:
+        device_name, device_architecture = _current_device_identity()
 
-            device_name = current_omni_platform.get_device_name()
-        except Exception:
-            return DEFAULT_DEVICE_PROFILE
-
-    if not device_name:
+    identifiers = tuple(value for value in (device_name, device_architecture) if value)
+    if not identifiers:
         return DEFAULT_DEVICE_PROFILE
 
     for profile in profiles:
         if profile == DEFAULT_DEVICE_PROFILE:
             continue
-        if profile in device_name:
+        if any(profile in identifier for identifier in identifiers):
             return profile
     return DEFAULT_DEVICE_PROFILE
 
@@ -1091,11 +1119,16 @@ def resolve_similarity_thresholds(
     device_profile: str | None = None,
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
 ) -> SimilarityThresholds:
     """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
     if DEFAULT_DEVICE_PROFILE not in table:
         raise ValueError("threshold table must include a 'default' entry")
-    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    profile = device_profile or resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
@@ -1103,20 +1136,25 @@ def resolve_device_threshold(
     thresholds: float | int | Mapping[str, float],
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
     label: str = "threshold",
 ) -> tuple[str, float]:
-    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+    """Resolve a scalar or per-device threshold for the current accelerator.
 
     Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
-    A mapping matches keys as substrings of the device name via
-    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
-    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    A mapping matches keys as substrings of the device name or architecture via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "gfx942": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched devices should fall back;
     otherwise unmatched devices raise.
     """
     if isinstance(thresholds, float | int):
         return DEFAULT_DEVICE_PROFILE, float(thresholds)
 
-    profile = resolve_device_profile(device_name, profiles=thresholds)
+    profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=thresholds,
+    )
     if profile in thresholds:
         return profile, float(thresholds[profile])
     if DEFAULT_DEVICE_PROFILE in thresholds:

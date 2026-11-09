@@ -1075,6 +1075,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             real_missing = [m for m in real_missing if not m.startswith("tts_model.backbone.")]
         if real_missing:
             raise ValueError(f"NemotronVoiceChat talker is missing TTS weights: {sorted(real_missing)[:10]} ...")
+        if tts.tts_model.config.get("use_audio_prompt_frozen_projection", False):
+            projection = getattr(tts.tts_model, "audio_prompt_projection_W", None)
+            if projection is None or not torch.isfinite(projection).all().item():
+                raise ValueError(
+                    "NemotronVoiceChat talker did not load a finite "
+                    "tts_model.audio_prompt_projection_W from the checkpoint; refusing partial initialization."
+                )
         if unexpected:
             logger.warning(
                 "NemotronVoiceChat talker ignoring %d unexpected TTS tensors (e.g. %s)",

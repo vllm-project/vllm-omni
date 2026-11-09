@@ -14,7 +14,18 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec, RequestScopedCacheDiTRuntime
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+from vllm_omni.diffusion.models.minimax_h3.quality_policy import MINIMAX_H3_HIGH_CACHE_KEY, MiniMaxH3QualityPolicy
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -1250,19 +1261,20 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None):
+def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None, quality="lossless"):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     sampling = OmniDiffusionSamplingParams(
-        quality="lossless",
+        quality=quality,
         width=1344,
         height=768,
         fps=24,
         num_frames=124,
         num_inference_steps=num_inference_steps,
-        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+        extra_args={"task": "t2va", "aspect_ratio": "16:9", **(extra_args or {})},
+        attention_schedule=attention_schedule,
     )
     return DiffusionRequestBatch(
         [
@@ -1328,6 +1340,131 @@ def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
         pipeline.forward(_t2va_batch(num_inference_steps=50))
 
 
+def _scheduled_od_config(default=None, **fields):
+    """Service config with one prepared profile, an optional default schedule and any further config fields."""
+    return OmniDiffusionConfig(
+        diffusion_attention_schedule=AttentionScheduleConfig(
+            profiles={"sparse": AttentionConfig()}, default=[] if default is None else default
+        ),
+        **fields,
+    )
+
+
+def _allow_cpu_empty_cache(monkeypatch) -> None:
+    """CPU platform objects may leave empty_cache unset; the forward still calls it at stage boundaries."""
+    monkeypatch.setattr(pipeline_minimax_h3.current_omni_platform, "empty_cache", lambda: None, raising=False)
+
+
+def test_forward_checks_the_attention_schedule_against_the_actual_step_count(monkeypatch):
+    """The distilled table's four steps bound the schedule; num_inference_steps is omitted."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+
+    pipeline.forward(_t2va_batch(attention_schedule=[{"start": 3, "end": None, "profile": "sparse"}]))
+    assert [call["num_steps"] for call in diffuse_calls] == [4]
+
+    with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
+        pipeline.forward(_t2va_batch(attention_schedule=[{"start": 3, "end": 6, "profile": "sparse"}]))
+    assert len(diffuse_calls) == 1
+
+
+def test_prepare_encode_checks_the_attention_schedule_before_any_step():
+    """Step mode checks the request's own schedule in prepare_encode, before the runner binds it for a step."""
+    pipeline = _distilled_pipeline([], {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    batch = _t2va_batch(attention_schedule=[{"start": 2, "end": 6, "profile": "sparse"}])
+    state = StepRequestState(request_id="scheduled", prompt=batch.prompts[0], sampling=batch.sampling_params)
+
+    with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
+        pipeline.prepare_encode(state)
+
+
+def test_inherited_default_range_past_the_sequence_end_is_not_rejected(monkeypatch):
+    """A service default serves requests of any length, so a default range that ends after this
+    request's four distilled steps applies up to the last step instead of failing the request."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(default=[{"start": 2, "end": 6, "profile": "sparse"}])
+
+    pipeline.forward(_t2va_batch())
+
+    assert [call["num_steps"] for call in diffuse_calls] == [4]
+
+
+class _RecordingCacheDiTRuntime(RequestScopedCacheDiTRuntime):
+    """Records each Cache-DiT target the pipeline prepares; installing the hooks needs a real DiT."""
+
+    def __init__(self, pipeline) -> None:
+        super().__init__(pipeline)
+        self.prepared: list[CacheDiTRequestSpec | None] = []
+
+    def prepare(self, spec: CacheDiTRequestSpec | None) -> None:
+        self.prepared.append(spec)
+
+
+def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
+    """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    # quality=high resolves to the request-scoped Cache-DiT profile.
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    runtime = _RecordingCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_runtime = runtime
+    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+
+    with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
+        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=schedule, quality="high"))
+    assert runtime.prepared == []
+    assert diffuse_calls == []
+
+    # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
+    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
+    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+    prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
+    assert len(diffuse_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "server_schedule, request_schedule, server_refine, request_refine",
+    [
+        (False, True, False, True),
+        (True, False, True, False),
+    ],
+    ids=[
+        "request-schedule-request-refine",
+        "server-schedule-server-refine",
+    ],
+)
+def test_forward_rejects_an_attention_schedule_with_latent_refine(
+    server_schedule, request_schedule, server_refine, request_refine
+):
+    """A resolved schedule and a resolved latent_refine are rejected before any denoise call.
+
+    Either value can come from the request or from the server default.
+    """
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(
+        default=(AttentionScheduleRange(0, 2, "sparse"),) if server_schedule else None,
+        additional_config={"latent_refine": 0.5} if server_refine else {},
+    )
+    batch = _t2va_batch(
+        num_inference_steps=4,
+        attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}] if request_schedule else None,
+        extra_args={"latent_refine": 0.5} if request_refine else None,
+    )
+
+    with pytest.raises(InvalidAttentionScheduleError, match="cannot be combined with MiniMax H3 latent_refine"):
+        pipeline.forward(batch)
+    assert diffuse_calls == []
+
+
 def test_absent_base_schedule_key_differs_from_an_empty_list():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _read_base_schedule,
@@ -1357,6 +1494,9 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1409,6 +1549,9 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1471,6 +1614,9 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1588,6 +1734,9 @@ def _fake_packed_attention(
             super().__init__()
             self.metadata = None
 
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
             return query
@@ -1661,6 +1810,9 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
             super().__init__()
             self.metadata = None
 
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
             return query
@@ -1684,6 +1836,100 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
     assert metadata is not None
     assert metadata.attn_mask is None
     assert metadata.extra["valid_kv_length"] == 5
+
+
+def _packed_backend(name: str, *, mask_free=False, prefix_kv_slicing=False, multi_doc=False):
+    class FakeBackend:
+        supports_prefix_kv_slicing = prefix_kv_slicing
+
+        @staticmethod
+        def get_name() -> str:
+            return name
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return mask_free
+
+        @classmethod
+        def supports_multi_doc_packed_varlen(cls) -> bool:
+            return multi_doc
+
+    return FakeBackend
+
+
+def _scheduled_packed_attention(baseline, candidate):
+    """A MiniMaxH3Attention whose inner layer dispatches this forward to ``candidate``, not its baseline."""
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = baseline
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+            self.effective_reads = 0
+
+        def effective_attention(self):
+            self.effective_reads += 1
+            return None, candidate, None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    return attention
+
+
+@pytest.mark.parametrize(
+    "baseline, candidate, expect_mask, expect_packed_padding",
+    [
+        ({"mask_free": True}, {}, True, False),
+        ({}, {"mask_free": True}, False, True),
+        ({}, {"prefix_kv_slicing": True}, False, False),
+    ],
+    ids=["candidate-needs-mask", "candidate-mask-free", "candidate-slices-prefix"],
+)
+def test_packed_attention_builds_padding_metadata_for_the_scheduled_candidate(
+    baseline, candidate, expect_mask, expect_packed_padding
+):
+    attention = _scheduled_packed_attention(
+        _packed_backend("BASELINE", **baseline), _packed_backend("CANDIDATE", **candidate)
+    )
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert (metadata.attn_mask is not None) is expect_mask
+    assert (metadata.packed_padding is not None) is expect_packed_padding
+    assert attention.attention.effective_reads == 1
+
+
+def test_packed_batch_isolation_is_checked_on_the_scheduled_candidate():
+    attention = _scheduled_packed_attention(
+        _packed_backend("FLASH_ATTN", multi_doc=True), _packed_backend("SPARSE_CANDIDATE")
+    )
+    q = torch.randn(12, 2, 4)
+
+    with pytest.raises(ValueError, match="SPARSE_CANDIDATE"):
+        attention._run_packed_attention(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+            max_seqlen=5,
+            packed_total=12,
+            num_requests=2,
+        )
 
 
 @pytest.mark.parametrize(

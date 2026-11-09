@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fail-closed regression checks and calibration for real LingBot rollouts.
+"""Fail-closed per-run regression checks and reference baselines for real LingBot rollouts.
 
 The baseline uses independent starts of a frozen reference revision with a
 matching hardware and dependency contract.
 Neither a different accelerator topology nor another precision policy may reuse
-it. Calibration is explicit and never happens inside the candidate check.
+it. Reference limits are computed from the current paired measurements, never from candidate scores.
 """
 
 from __future__ import annotations
@@ -172,15 +172,12 @@ def calibrate(
     max_cv: float = 0.03,
     regression_fraction: float = 0.05,
     transient_noise_sigma: float = 3.0,
-    startup_stall_jitter_floor_ms: float = 0.0,
-    ttfc_jitter_floor_ms: float = 0.0,
-    p95_max_cv: float | None = None,
 ) -> dict[str, Any]:
     """Freeze limits from >=3 independent reference server starts.
 
     Unstable cadence rejects calibration. The worst reference value receives
-    a regression allowance; transient floors require separately frozen
-    reference-noise calibration.
+    a regression allowance; transient jitter is derived from these
+    same independent references only.
     """
     if len(reference) < 3:
         raise RegressionError("Calibration needs three independent server starts")
@@ -193,18 +190,8 @@ def calibrate(
     number(transient_noise_sigma, "transient_noise_sigma")
     if transient_noise_sigma > 3:
         raise RegressionError("Transient noise allowance cannot exceed three reference standard deviations")
-    number(startup_stall_jitter_floor_ms, "startup stall jitter floor")
-    number(ttfc_jitter_floor_ms, "TTFC jitter floor")
-    if p95_max_cv is not None:
-        number(p95_max_cv, "P95 reference CV ceiling", positive=True)
-        if p95_max_cv >= 1:
-            raise RegressionError("P95 reference CV ceiling must be below one")
-    if startup_stall_jitter_floor_ms and any("steady_stall_ms" not in row for row in reference):
-        raise RegressionError("Startup jitter calibration requires separately recomputed steady stalls")
     limits = {}
     metrics = ["mean_ms", "p50_ms", "p95_ms", "ttfc_ms", "generated_fps", "stall_ms"]
-    if startup_stall_jitter_floor_ms:
-        metrics.append("steady_stall_ms")
     for metric in metrics:
         values = [number(row[metric], metric) for row in reference]
         mean = statistics.mean(values)
@@ -212,7 +199,7 @@ def calibrate(
         # Startup and discrete playback stalls have measured reference jitter,
         # unlike stationary cadence. Calibrate their allowance from references
         # only; never use a failed candidate to raise a limit.
-        cv_ceiling = p95_max_cv if metric == "p95_ms" and p95_max_cv is not None else max_cv
+        cv_ceiling = max_cv
         if metric in {"mean_ms", "p50_ms", "p95_ms"} and cv > cv_ceiling:
             raise RegressionError(f"Unstable reference {metric}: CV={cv:.3%} > {cv_ceiling:.3%}")
         lower_is_better = metric != "generated_fps"
@@ -223,10 +210,7 @@ def calibrate(
             if metric in {"ttfc_ms", "stall_ms", "steady_stall_ms"}
             else 0.0
         )
-        startup_floor = startup_stall_jitter_floor_ms if metric == "stall_ms" else 0.0
-        ttfc_floor = ttfc_jitter_floor_ms if metric == "ttfc_ms" else 0.0
-        floor = max(startup_floor, ttfc_floor)
-        allowance = max(relative_allowance, jitter_allowance, floor)
+        allowance = max(relative_allowance, jitter_allowance)
         limits[metric] = {
             "direction": "max" if lower_is_better else "min",
             "value": worst + allowance if lower_is_better else worst - allowance,
@@ -234,9 +218,6 @@ def calibrate(
             "cv": cv,
             "relative_allowance": relative_allowance,
             "reference_jitter_allowance": jitter_allowance,
-            "startup_jitter_floor_ms": startup_floor,
-            **({"ttfc_jitter_floor_ms": ttfc_floor} if ttfc_floor else {}),
-            **({"max_reference_cv": cv_ceiling} if metric == "p95_ms" and p95_max_cv is not None else {}),
         }
     if all(row["steady_samples"] >= 1000 for row in reference):
         limits["p99_ms"] = {
@@ -327,210 +308,6 @@ def check_quality(
         if not passed:
             violations.append(f"{dimension}: {actual} outside [{lower_bound}, {upper_bound}]")
     return {"passed": not violations, "violations": violations, "dimensions": dimensions}
-
-
-def _verify_engine_environment(actual: object, expected: object, description: str) -> None:
-    if (
-        not isinstance(expected, Mapping)
-        or not expected
-        or any(not isinstance(key, str) or not isinstance(value, str) for key, value in expected.items())
-        or actual != expected
-    ):
-        raise RegressionError(f"{description} engine environment is missing or changed")
-
-
-def _verify_source_attestation_binding(
-    profile: Mapping[str, Any], hardware: Mapping[str, Any], expected_hardware: Mapping[str, Any]
-) -> None:
-    runtime = profile.get("inference_runtime", {})
-    if not isinstance(runtime, Mapping) or not {"source_snapshot_sha256", "source_packages_sha256"}.intersection(
-        runtime
-    ):
-        return
-    digest = runtime.get("source_snapshot_sha256")
-    packages_digest = runtime.get("source_packages_sha256")
-    revisions = runtime.get("source_revisions", {})
-    if (
-        not isinstance(digest, str)
-        or len(digest) != 64
-        or any(character not in "0123456789abcdef" for character in digest)
-        or not isinstance(packages_digest, str)
-        or len(packages_digest) != 64
-        or any(character not in "0123456789abcdef" for character in packages_digest)
-        or not isinstance(revisions, Mapping)
-        or not revisions
-    ):
-        raise RegressionError("Invalid runtime source snapshot contract")
-    observed = hardware.get("source_attestations")
-    expected = expected_hardware.get("source_attestations")
-    for attestation in (observed, expected):
-        if (
-            not isinstance(attestation, Mapping)
-            or set(attestation) != {"schema_version", "source_snapshot_sha256", "packages"}
-            or type(attestation["schema_version"]) is not int
-            or attestation["schema_version"] != 1
-            or attestation["source_snapshot_sha256"] != digest
-            or not isinstance(attestation["packages"], Mapping)
-            or set(attestation["packages"]) != set(revisions)
-            or contract_digest(attestation["packages"]) != packages_digest
-            or any(
-                not isinstance(attestation["packages"][package], Mapping)
-                or attestation["packages"][package].get("head") != revision
-                for package, revision in revisions.items()
-            )
-        ):
-            raise RegressionError("Missing or mismatched runtime source attestation")
-    if contract_digest(observed) != contract_digest(expected):
-        raise RegressionError("Runtime source attestation differs from frozen calibration")
-
-
-def verify_reference_calibration_contract(contract: Mapping[str, Any], calibration: Mapping[str, Any]) -> None:
-    """Reject reuse of reference-noise budgets after runtime/model changes.
-
-    Hardware, deployment, precision, playback/warmup policy and model/runtime
-    revisions must match calibration. Legacy records permit held-out scenes
-    and rollout lengths; profile-bound records require the complete workload.
-    """
-    if contract["deploy_sha256"] != calibration["deploy_sha256"]:
-        raise RegressionError("Reference calibration deployment changed")
-    for field in (
-        "reference_revision",
-        "model_revision",
-        "height",
-        "width",
-        "precision",
-        "target_fps",
-        "mux_fps",
-        "warmup_chunks",
-        "warmup_num_chunks",
-    ):
-        if (
-            field not in contract["profile"]
-            or field not in calibration["workload"]
-            or contract["profile"][field] != calibration["workload"][field]
-        ):
-            raise RegressionError(f"Reference calibration profile changed: {field}")
-    for field in ("platform", "cards", "dies", "devices", "packages"):
-        if contract["hardware"][field] != calibration["hardware"][field]:
-            raise RegressionError(f"Reference calibration hardware/runtime changed: {field}")
-    _verify_source_attestation_binding(contract["profile"], contract["hardware"], calibration["hardware"])
-    _verify_engine_environment(
-        contract.get("engine_environment"), calibration.get("engine_environment"), "Reference calibration"
-    )
-    if contract["profile"].get("reference_calibration") and not calibration.get("qualified_profile_sha256"):
-        raise RegressionError("Profile-owned reference calibration requires its complete workload digest")
-    if "qualified_profile_sha256" in calibration and calibration["qualified_profile_sha256"] != contract_digest(
-        contract["profile"]
-    ):
-        raise RegressionError("Reference calibration profile is not qualified")
-
-
-def verify_quality_population_contract(
-    population: Mapping[str, Any],
-    contract: Mapping[str, Any],
-    *,
-    evaluator_packages: Mapping[str, str],
-    evaluator_lock_sha256: str,
-    asset_lock_sha256: str,
-) -> None:
-    """Bind a reviewed reference population to its exact rollout workload.
-
-    Physical allocation identifiers vary between runners. Device properties,
-    topology, runtime packages and deployment must still match exactly.
-    Fresh reference scores must separately pass the frozen population's gates.
-    """
-    expected = population["contract"]
-    schema = population.get("schema_version")
-    if type(schema) is not int or schema not in (1, 2, 3, 4) or contract["profile"] != expected["profile"]:
-        raise RegressionError("Quality reference population profile changed")
-    if schema == 4:
-        if contract["profile"].get("platform") not in ("cuda", "npu") or contract["profile"].get("num_chunks") not in (
-            40,
-            160,
-            600,
-        ):
-            raise RegressionError("Quality reference population requires a calibrated full workload")
-    elif contract["profile"].get("platform") != "cuda" or contract["profile"].get("num_chunks") not in (40, 600):
-        raise RegressionError("Quality reference population requires a calibrated CUDA workload")
-    pixel_calibration = population.get("reference_pixel_calibration")
-    if schema in (2, 3, 4) and (
-        (schema in (2, 3) and contract["profile"]["num_chunks"] != 40)
-        or not isinstance(pixel_calibration, Mapping)
-        or pixel_calibration.get("protocol") != "all_unordered_pairs_of_six_references"
-    ):
-        raise RegressionError("Pooled reference pixels require the recorded nightly calibration protocol")
-    if contract["deploy_sha256"] != expected["deploy_sha256"]:
-        raise RegressionError("Quality reference population deployment changed")
-    for key in ("platform", "cards", "dies", "devices", "packages"):
-        if contract["hardware"][key] != expected["hardware"][key]:
-            raise RegressionError(f"Quality reference population hardware/runtime changed: {key}")
-    _verify_source_attestation_binding(contract["profile"], contract["hardware"], expected["hardware"])
-    _verify_engine_environment(
-        contract.get("engine_environment"), expected.get("engine_environment"), "Quality reference population"
-    )
-    if (
-        hashlib.sha256(json.dumps(dict(evaluator_packages), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        != population["evaluator_packages_sha256"]
-        or evaluator_lock_sha256 != population["evaluator_lock_sha256"]
-        or asset_lock_sha256 != population["asset_lock_sha256"]
-    ):
-        raise RegressionError("Quality reference population evaluator or assets changed")
-    pixel_packages = {name: evaluator_packages.get(name) for name in ("numpy", "opencv-python", "scikit-image")}
-    if any(not isinstance(value, str) or not value for value in pixel_packages.values()):
-        raise RegressionError("Quality reference population pixel environment requires pinned decoder dependencies")
-    cases = {case["id"]: case for case in contract["profile"]["cases"]}
-    if set(cases) != set(population["cases"]):
-        raise RegressionError("Quality reference population case coverage changed")
-    reference_spreads = population.get("max_reference_spreads")
-    if not isinstance(reference_spreads, Mapping) or set(reference_spreads) != {"wbench", "vbench"}:
-        raise RegressionError("Quality reference population requires recorded reference spread limits")
-    for name, case in population["cases"].items():
-        if case["input"] != cases[name] or len(case["pixels"]) != (15 if schema in (2, 3, 4) else 6):
-            raise RegressionError("Quality reference population requires both complete reference cohorts")
-        if schema in (2, 3, 4):
-            videos = case.get("reference_videos")
-            pairs = case.get("pixel_pairs")
-            expected_pairs = [[first, second] for first in range(6) for second in range(first + 1, 6)]
-            if pairs != expected_pairs or any(type(index) is not int for pair in pairs for index in pair):
-                raise RegressionError("Pooled reference pixels require every unordered pair exactly once")
-            if not isinstance(videos, list) or len(videos) != 6:
-                raise RegressionError("Pooled reference pixels require six recorded reference videos")
-            cohorts: dict[str, list[str]] = {}
-            for video in videos:
-                if not isinstance(video, Mapping):
-                    raise RegressionError("Pooled reference video provenance is invalid")
-                job, path, digest = (video.get(key) for key in ("generation_job_id", "path", "sha256"))
-                if (
-                    not isinstance(job, str)
-                    or not job
-                    or not isinstance(path, str)
-                    or path not in {f"reference/{repeat}/{name}/rollout.mp4" for repeat in range(3)}
-                    or not isinstance(digest, str)
-                    or len(digest) != 64
-                    or any(character not in "0123456789abcdef" for character in digest)
-                ):
-                    raise RegressionError("Pooled reference videos require reference roles and recorded hashes")
-                cohorts.setdefault(job, []).append(path)
-            if len(cohorts) != 2 or any(
-                sorted(paths) != [f"reference/{repeat}/{name}/rollout.mp4" for repeat in range(3)]
-                for paths in cohorts.values()
-            ):
-                raise RegressionError("Pooled reference videos require two complete three-start cohorts")
-        if set(case["suites"]) != {"wbench", "vbench"} or any(len(rows) != 6 for rows in case["suites"].values()):
-            raise RegressionError("Quality reference population requires six native reference scores per suite")
-        case_spreads = case.get("max_reference_spreads") if schema in (3, 4) else reference_spreads
-        if not isinstance(case_spreads, Mapping) or set(case_spreads) != {"wbench", "vbench"}:
-            raise RegressionError("Quality reference population requires per-case reference spread limits")
-        for suite, rows in case["suites"].items():
-            limits = case_spreads[suite]
-            if not isinstance(limits, Mapping) or set(limits) != set(rows[0]):
-                raise RegressionError("Quality reference population reference spread dimensions changed")
-            for value in limits.values():
-                number(value, "Quality reference population reference spread limit")
-        for row in case["pixels"]:
-            environment = row.get("pixel_environment")
-            if not isinstance(environment, Mapping) or environment.get("packages") != pixel_packages:
-                raise RegressionError("Quality reference population pixel environment is missing or changed")
 
 
 def check_binary_activity(

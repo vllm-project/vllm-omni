@@ -14,6 +14,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.diffusion.attention.test_attention_schedule_candidates import _make_metadata_candidate
+from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeLinear, _small_od_config
+from vllm_omni.diffusion.attention import layer
+from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABackend
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionBackend
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, resolve_request_attention_schedule
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    set_forward_context,
+)
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _HIDDEN = 8
@@ -62,6 +84,10 @@ class _SegmentMeanModel:
             video = video * kwargs["update_mask"].view(-1).unsqueeze(-1)
         return video, audio
 
+    def modules(self):
+        """The nn.Module walk the serial step branch uses to look for ring attention; this DiT has none."""
+        return iter([self])
+
 
 def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int, seed: int):
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
@@ -98,7 +124,9 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
-    state = StepRequestState(request_id=request_id, sampling=SimpleNamespace())
+    state = StepRequestState(
+        request_id=request_id, sampling=OmniDiffusionSamplingParams(guidance_scale=1.0, true_cfg_scale=4.0)
+    )
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
@@ -181,7 +209,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
-    input_batch = SimpleNamespace(states=(state,))
+    input_batch = InputBatch.make_batch([state])
 
     steps = 0
     while not state.denoise_completed:
@@ -421,7 +449,7 @@ def test_step_execution_matches_request_mode_with_latent_edits():
     state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
     pipeline = _step_pipeline(model)
     while not state.denoise_completed:
-        velocity = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        velocity = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
         pipeline.step_scheduler(state, velocity)
 
     for name, expected in request_first_call.items():
@@ -476,7 +504,7 @@ def test_batched_step_execution_matches_independent_requests(lock_audio):
     for index in range(len(specs)):
         state = make_state("solo", index)
         while not state.denoise_completed:
-            pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
+            pipeline.step_scheduler(state, pipeline.denoise_step(InputBatch.make_batch([state]), states=[state]))
         alone.append((state.latents, state.extra[mod._STEP_AUDIO_ROWS]))
 
     states = [make_state(f"req-{index}", index) for index in range(len(specs))]
@@ -542,7 +570,7 @@ def test_both_modes_publish_denoise_progress_for_gated_attention():
         pipeline = _step_pipeline(model)
         state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
         while not state.denoise_completed:
-            pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
+            pipeline.step_scheduler(state, pipeline.denoise_step(InputBatch.make_batch([state]), states=[state]))
         step_mode = list(published)
     finally:
         fc._forward_context = original
@@ -574,12 +602,100 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     original = fc._forward_context
     fc._forward_context = recorder
     try:
-        _step_pipeline(model).denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
     finally:
         fc._forward_context = original
 
     assert recorder.denoise_step_idx is None
     assert recorder.denoise_timestep is None
+
+
+class _ProgressRecordingModel(_SegmentMeanModel):
+    """Records the denoise progress in the forward context that each forward runs under."""
+
+    def __init__(self, *, fail_on_call: int | None = None):
+        super().__init__()
+        self.progress: list[tuple[int | None, float | None, int | None, str | None, int]] = []
+        self.fail_on_call = fail_on_call
+
+    def __call__(self, **kwargs):
+        self.progress.append(
+            (*_denoise_progress(get_forward_context()), kwargs["packed_seq_params"].get("num_requests", 1))
+        )
+        if len(self.progress) == self.fail_on_call:
+            raise RuntimeError("request forward failed")
+        return super().__call__(**kwargs)
+
+
+def _denoise_progress(ctx) -> tuple[int | None, float | None, int | None, str | None]:
+    return ctx.denoise_step_idx, ctx.denoise_timestep, ctx.total_denoise_steps, get_attention_schedule_profile()
+
+
+def _mixed_progress_states(model):
+    """Two requests at different steps of sequences with different lengths (6 and 4 steps)."""
+    first, first_video, first_audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=21)
+    second, second_video, second_audio = _make_branch(
+        text_len=5, latent_t=3, latent_h=6, latent_w=4, audio_t=2, seed=22
+    )
+    states = [
+        _make_state("req-0", model, first, first_video, first_audio, _sigmas(6, 12.0), _sigmas(6, 3.0)),
+        _make_state("req-1", model, second, second_video, second_audio, _sigmas(4, 12.0), _sigmas(4, 3.0)),
+    ]
+    states[1].step_index = 2
+    return states
+
+
+def _sparse_schedule():
+    return (AttentionScheduleRange(0, None, "sparse"),)
+
+
+def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
+    """Under a bound schedule, each request selects attention at its own step and total."""
+    model = _ProgressRecordingModel()
+    states = _mixed_progress_states(model)
+    pipeline = _step_pipeline(model)
+    with set_forward_context():
+        packed_velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+        packed_progress = list(model.progress)
+        model.progress.clear()
+        with bind_attention_schedule(_sparse_schedule()):
+            velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+            after = _denoise_progress(get_forward_context())
+
+    first_sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    second_sigmas = states[1].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    assert packed_progress == [(None, None, None, None, 2)]
+    assert model.progress == [
+        (0, float(first_sigmas[0]), 6, "sparse", 1),
+        (2, float(second_sigmas[2]), 4, "sparse", 1),
+    ]
+    # The batch-level progress (no single point for this batch) is back after the requests.
+    assert after == (None, None, None, None)
+    # One forward per request computes the same velocities as the packed forward.
+    torch.testing.assert_close(velocity, packed_velocity)
+
+
+def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
+    """forward() runs one request-mode loop per seed and per window; each selects from step 0 of its own total."""
+    model = _ProgressRecordingModel()
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=23)
+    sigmas_video, sigmas_audio = _sigmas(4, 12.0), _sigmas(4, 3.0)
+    total = len(sigmas_video) - 1
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        for _ in range(2):
+            model.progress.clear()
+            minimax_h3_denoise_loop(
+                model=model,
+                positive=branch,
+                initial_video_rows=video_rows,
+                initial_audio_rows=audio_rows,
+                keyframe_cond_rows=None,
+                sigmas_video=sigmas_video,
+                sigmas_audio=sigmas_audio,
+                device=torch.device("cpu"),
+            )
+            assert model.progress == [(step, sigmas_video[step], total, "sparse", 1) for step in range(total)]
+            assert _denoise_progress(get_forward_context()) == (None, None, None, None)
 
 
 @pytest.mark.parametrize("batch_frames", [1, 33])
@@ -710,8 +826,12 @@ def _fake_attention_module(
     use_ring: bool,
     backend: str = "FLASH_ATTN",
     supports_multi_doc: bool = True,
+    candidate: SimpleNamespace | None = None,
 ):
     """Build a bare MiniMaxH3Attention with the attributes ``_packed_batch_supported`` reads.
+
+    ``candidate`` stands for the backend a scheduled step selects; without it the
+    layer runs its baseline.
 
     ``supports_multi_doc`` models the platform-dependent capability probe on
     ``AttentionBackend`` (e.g. FLASH_ATTN returns True on CUDA/ROCm/MUSA and
@@ -720,14 +840,18 @@ def _fake_attention_module(
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 
     attn = object.__new__(MiniMaxH3Attention)
+    attn_backend = _fake_packed_backend(backend, supports_multi_doc)
+    selected = attn_backend if candidate is None else candidate
     attn.attention = SimpleNamespace(
-        attn_backend=SimpleNamespace(
-            get_name=lambda: backend,
-            supports_multi_doc_packed_varlen=lambda: supports_multi_doc,
-        ),
+        attn_backend=attn_backend,
+        effective_attention=lambda: (None, selected, None),
         use_ring=use_ring,
     )
     return attn
+
+
+def _fake_packed_backend(name: str, supports_multi_doc: bool) -> SimpleNamespace:
+    return SimpleNamespace(get_name=lambda: name, supports_multi_doc_packed_varlen=lambda: supports_multi_doc)
 
 
 class _FakeTransformer:
@@ -752,6 +876,117 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
+
+
+def test_packed_batch_checks_the_backend_the_step_selects():
+    """A scheduled step is packed only when the candidate it runs isolates requests, whatever the baseline."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    isolating = _fake_packed_backend("FLASH_ATTN", True)
+    leaking = _fake_packed_backend("XFORMERS", False)
+    supported = MiniMaxH3Pipeline._packed_batch_supported
+
+    leaking_step = _fake_attention_module(use_ring=False, candidate=leaking)
+    isolating_step = _fake_attention_module(
+        use_ring=False, backend="XFORMERS", supports_multi_doc=False, candidate=isolating
+    )
+
+    assert supported(_FakeTransformer([leaking_step])) is False
+    assert supported(_FakeTransformer([isolating_step])) is True
+
+
+def _same_progress_states(model, schedules):
+    """Two requests at the same step of equal-length sequences, each carrying its own resolved schedule."""
+    states = []
+    for index, schedule in enumerate(schedules):
+        branch, video, audio = _make_branch(
+            text_len=9 - 4 * index, latent_t=2 + index, latent_h=4, latent_w=6, audio_t=3, seed=31 + index
+        )
+        state = _make_state(f"req-{index}", model, branch, video, audio, _sigmas(4, 12.0), _sigmas(4, 3.0))
+        state.step_index = 1
+        state.attention_schedule = schedule
+        states.append(state)
+    return states
+
+
+def test_scheduled_step_batch_at_one_progress_is_packed():
+    """Requests with one schedule at one progress select one profile, so they share a packed forward."""
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, [_sparse_schedule(), _sparse_schedule()])
+    pipeline = _step_pipeline(model)
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        packed_velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    assert model.progress == [(1, float(sigmas[1]), 4, "sparse", 2)]
+
+    model.progress.clear()
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        serial_velocity = _step_pipeline(model, packed_batch_supported=False).denoise_step(
+            InputBatch.make_batch(states), states=states
+        )
+    torch.testing.assert_close(serial_velocity, packed_velocity)
+
+
+def test_inherited_and_explicit_equal_schedules_resolve_to_one_hashable_value():
+    """An omitted schedule and the same ranges sent explicitly resolve to equal, hashable tuples.
+
+    So the pipeline gate packs them: ``test_scheduled_step_batch_at_one_progress_is_packed`` drives
+    the gate with two equal resolved schedules. The runner storing the resolved value is pinned by
+    ``test_cached_step_reuses_the_schedule_resolved_at_admission``. The scheduler keeps these two
+    requests in different batches (the key also records whether the request sent a schedule).
+    """
+    service = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig()}, default=[{"start": 0, "end": None, "profile": "sparse"}]
+    )
+    inherited = resolve_request_attention_schedule(OmniDiffusionSamplingParams(), service)
+    explicit = resolve_request_attention_schedule(
+        OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": None, "profile": "sparse"}]), service
+    )
+    assert inherited == explicit == _sparse_schedule()
+    assert type(inherited) is tuple and type(explicit) is tuple
+    assert hash(inherited) == hash(explicit)
+    assert len({inherited, explicit}) == 1
+
+
+@pytest.mark.parametrize(
+    ("schedules", "packed_batch_supported"),
+    [
+        # Same progress, but the requests carry different schedules, so they can select different profiles.
+        ([_sparse_schedule(), (AttentionScheduleRange(0, None, "dense"),)], True),
+        # One profile, but its backend does not isolate packed requests.
+        ([_sparse_schedule(), _sparse_schedule()], False),
+    ],
+)
+def test_scheduled_step_batch_runs_serially_unless_one_packable_profile(schedules, packed_batch_supported):
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, schedules)
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        _step_pipeline(model, packed_batch_supported=packed_batch_supported).denoise_step(
+            InputBatch.make_batch(states), states=states
+        )
+
+    assert [entry[-1] for entry in model.progress] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "packed"),
+    [
+        ((AttentionScheduleRange(0, None, "sparse"),), True),
+        ((AttentionScheduleRange(0, 1, "sparse"), AttentionScheduleRange(1, None, "dense")), False),
+    ],
+)
+def test_packed_gate_sees_the_profile_selected_for_the_published_step(schedule, packed):
+    """The gate runs after the step's progress is published, so it reads the step's profile, not the baseline."""
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, [schedule, schedule])
+    pipeline = _step_pipeline(model)
+    pipeline._packed_batch_supported = lambda transformer: get_attention_schedule_profile() == "sparse"
+    with set_forward_context(), bind_attention_schedule(schedule):
+        pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    profile = "sparse" if packed else "dense"
+    assert [(entry[3], entry[-1]) for entry in model.progress] == ([(profile, 2)] if packed else [(profile, 1)] * 2)
 
 
 def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
@@ -782,3 +1017,92 @@ def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     assert len(seen) == 2
     torch.testing.assert_close(result_audio, audio)
     assert not torch.equal(result_video, video)
+
+
+def _schedule_candidate(name: str, *, mask_free=False, prefix_kv_slicing=False, attention_mask=False):
+    """A prepared schedule candidate carrying only what the MiniMax H3 checks read."""
+
+    class _Backend:
+        supports_prefix_kv_slicing = prefix_kv_slicing
+
+        @staticmethod
+        def get_name() -> str:
+            return name
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return mask_free
+
+        @classmethod
+        def supports_attention_mask(cls, spec) -> bool:
+            del spec
+            return attention_mask
+
+    return _make_metadata_candidate(_Backend)
+
+
+def _small_dit(monkeypatch, baseline) -> h3.MiniMaxH3DiTModel:
+    """A small CPU MiniMax H3 DiT whose blocks use real Attention layers resolved to ``baseline``."""
+    # The DiT blocks live in minimax_h3_blocks; the model's own projections stay in minimax_h3_transformer.
+    for name in ("ColumnParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(h3, name, _FakeLinear)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(layer, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (baseline, None))
+    config = _small_od_config()
+    # With the AdaLN cache on, the constructor probes the current CUDA device for the SM120 offload
+    # default, which fails when CUDA is built but no device is visible. These checks need no cache.
+    config.cache_config = {"minimax_h3_adaln_cache": False}
+    model = h3.MiniMaxH3DiTModel(config)
+    attention = [block.attn.attention for block in model.blocks]
+    assert all(isinstance(a, layer.Attention) and a.attn_backend is baseline for a in attention)
+    return model
+
+
+def _candidate_rejections(attention: layer.Attention, record) -> list[str]:
+    return [reason for check in attention._schedule_candidate_checks if (reason := check(record)) is not None]
+
+
+def test_vdn_attention_accepts_only_vdnh3_candidates(monkeypatch):
+    """VDN-H3 checkpoints read the frame window only in VDNH3_ATTN, so other profiles are rejected at startup."""
+    monkeypatch.setattr(blocks, "VDNH3HybridAttention", lambda *args, **kwargs: object())
+    model = _small_dit(monkeypatch, VDNAttentionBackend)
+
+    model.enable_vdn(config=None)
+
+    vdn = _schedule_candidate("VDNH3_ATTN", mask_free=True)
+    flash = _schedule_candidate("FLASH_ATTN", mask_free=True)
+    for attention in (block.attn.attention for block in model.blocks):
+        assert _candidate_rejections(attention, vdn) == []
+        [reason] = _candidate_rejections(attention, flash)
+        assert "VDNH3_ATTN" in reason
+
+
+def test_gateless_dit_accepts_a_vsa_candidate_when_its_baseline_is_vsa(monkeypatch):
+    """FastH3 VSA gates only self.transformer (the FL2VA DiT); the combined partition's transformers_ref has none.
+
+    Its self role still resolves to FASTVIDEO_VSA, which the FastH3 VSA contract requires, so one self-role
+    profile is checked on both DiTs. The DiTs use real Attention layers, whose baseline the check reads.
+    """
+
+    def dit_attention(baseline, *, gated: bool):
+        model = _small_dit(monkeypatch, baseline)
+        if gated:
+            model.enable_vsa_gates()
+        return [block.attn.attention for block in model.blocks]
+
+    gated = dit_attention(FastVideoVSABackend, gated=True)
+    gateless = dit_attention(FastVideoVSABackend, gated=False)
+
+    # One self-role profile covers both DiTs, so it has to pass on each of them.
+    vsa = _schedule_candidate("FASTVIDEO_VSA", mask_free=True)
+    assert all(_candidate_rejections(attention, vsa) == [] for attention in gated + gateless)
+    # The gated FastH3 DiT still accepts only FASTVIDEO_VSA.
+    sdpa = _schedule_candidate("SDPA", attention_mask=True)
+    assert all(any("FastH3" in reason for reason in _candidate_rejections(a, sdpa)) for a in gated)
+    # A gateless DiT on another baseline still rejects the VSA candidate.
+    dense = dit_attention(SDPABackend, gated=False)
+    assert all(any("VSA compression gate" in reason for reason in _candidate_rejections(a, vsa)) for a in dense)

@@ -635,7 +635,7 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: "LingBot World · CUDA measured reference/candidate"
+      - label: "LingBot World · CUDA paired measurements"
         key: lingbot-cuda-nightly-generation
         concurrency: 1
         concurrency_group: vllm-omni/lingbot-world/cuda-generation
@@ -644,19 +644,44 @@ steps:
         source_file_dependencies: lingbot_world_regression
         timeout_in_minutes: 240
         mirror_hardwares: h100_8
-        # Retry a lost agent once; pytest, OOM and cancellation remain failures.
-        retry:
-          manual:
-            permit_on_passed: true
-          automatic:
-            - exit_status: -1
-              limit: 1
         artifact_paths:
           - "lingbot-artifacts/cuda-nightly/**/*"
         commands:
           - bash tests/dfx/lingbot_world/run_ci.sh generate tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly
-      - label: "LingBot World · CUDA videos WBench/VBench gate on GPU"
-        key: lingbot-cuda-nightly-quality
+      - label: "LingBot World · CUDA numeric precision"
+        key: lingbot-cuda-nightly-precision
+        concurrency: 1
+        concurrency_group: vllm-omni/lingbot-world/l4-cpu
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-cuda-nightly-generation
+            allow_failure: true
+        timeout_in_minutes: 60
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-nightly-precision/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh precision tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-precision lingbot-artifacts/cuda-nightly
+      - label: "LingBot World · CUDA performance regression"
+        key: lingbot-cuda-nightly-performance
+        concurrency: 1
+        concurrency_group: vllm-omni/lingbot-world/l4-cpu
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-cuda-nightly-generation
+            allow_failure: true
+        timeout_in_minutes: 60
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-nightly-performance/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh performance tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-performance lingbot-artifacts/cuda-nightly
+      - label: "LingBot World · CUDA WBench accuracy"
+        key: lingbot-cuda-nightly-wbench
         concurrency: 2
         concurrency_group: vllm-omni/lingbot-world/quality
         concurrency_method: eager
@@ -668,6 +693,22 @@ steps:
         timeout_in_minutes: 480
         mirror_hardwares: h100_1
         artifact_paths:
-          - "lingbot-artifacts/cuda-nightly-quality/**/*"
+          - "lingbot-artifacts/cuda-nightly-wbench/**/*"
         commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh evaluate tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-quality lingbot-artifacts/cuda-nightly
+          - bash tests/dfx/lingbot_world/run_ci.sh wbench tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-wbench lingbot-artifacts/cuda-nightly
+      - label: "LingBot World · CUDA VBench accuracy"
+        key: lingbot-cuda-nightly-vbench
+        concurrency: 2
+        concurrency_group: vllm-omni/lingbot-world/quality
+        concurrency_method: eager
+        priority: 0
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-cuda-nightly-generation
+            allow_failure: true
+        timeout_in_minutes: 480
+        mirror_hardwares: h100_1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-nightly-vbench/**/*"
+        commands:
+          - bash tests/dfx/lingbot_world/run_ci.sh vbench tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-vbench lingbot-artifacts/cuda-nightly

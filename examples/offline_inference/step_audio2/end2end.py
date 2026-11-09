@@ -490,12 +490,6 @@ def parse_args():
         help="Initialization timeout in seconds (default: 300)",
     )
     parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Shared memory threshold in bytes (default: 65536)",
-    )
-    parser.add_argument(
         "--worker-backend",
         type=str,
         default="multi_process",

@@ -63,7 +63,7 @@ def normalize_diffusion_postprocess_output(
 
     if isinstance(outputs, dict):
         payload = {key: value for key, value in outputs.items() if key not in {"audio_sample_rate", "fps"}}
-        metadata = _metadata_from_legacy_payload(cast(DiffusionPayload, outputs))
+        metadata = _metadata_from_legacy_payload(outputs)
         if "text" in payload and "text" not in metadata:
             metadata["text"] = {}
         if metadata:
@@ -137,7 +137,7 @@ def format_diffusion_outputs(
 
     primary_payload = _primary_payload(postprocess_output)
     outputs = _ensure_list(primary_payload)
-    metrics: dict[str, object] = {
+    metrics = {
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": (
             int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
@@ -151,7 +151,7 @@ def format_diffusion_outputs(
     # include reasoning text in metadata, but their final output is still an image.
     is_text_output = postprocess_output.primary_key == "text"
 
-    is_audio_output = supports_audio_output(cast(str, od_config.model_class_name))
+    is_audio_output = supports_audio_output(od_config.model_class_name)
     final_output_type = (
         postprocess_output.primary_key
         if postprocess_output.primary_key in {"image", "video"}
@@ -162,9 +162,7 @@ def format_diffusion_outputs(
         model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
         audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
 
-    stream_metadata = _stream_metadata_from_diffusion_output(
-        diffusion_output, streaming_output=getattr(od_config, "streaming_output", False)
-    )
+    stream_metadata = _stream_metadata_from_diffusion_output(diffusion_output)
     if stream_metadata:
         existing_stream = postprocess_output.metadata.get("stream")
         merged_stream = dict(existing_stream) if isinstance(existing_stream, Mapping) else {}
@@ -186,14 +184,9 @@ def format_diffusion_outputs(
     )
 
 
-def _stream_metadata_from_diffusion_output(
-    diffusion_output: DiffusionOutput, *, streaming_output: bool = False
-) -> DiffusionMetadata | None:
-    # A single finished block still belongs to a configured stream. Preserve
-    # its model-provided index instead of inferring one from transport fragments.
+def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) -> DiffusionMetadata | None:
     has_stream_data = (
-        streaming_output
-        or diffusion_output.total_chunks > 1
+        diffusion_output.total_chunks > 1
         or not diffusion_output.finished
         or bool(diffusion_output.started_event_ids)
         or bool(diffusion_output.active_event_ids)
@@ -393,7 +386,7 @@ def _trajectory_payload(
         ):
             value = payload.get(source_key)
             if value is not None:
-                cast(dict[str, Any], trajectory)[target_key] = value
+                trajectory[target_key] = value
 
     fallback_fields = (
         ("latents", diffusion_output.trajectory_latents),
@@ -403,5 +396,5 @@ def _trajectory_payload(
     )
     for key, value in fallback_fields:
         if key not in trajectory and value is not None:
-            cast(dict[str, Any], trajectory)[key] = value
+            trajectory[key] = value
     return trajectory

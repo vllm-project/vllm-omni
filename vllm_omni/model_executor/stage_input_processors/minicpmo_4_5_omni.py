@@ -914,7 +914,7 @@ def _turn_hidden_rows(
         # Only the last sampled token is expected to have no row.
         logger.warning(
             "MiniCPM-o turn handoff: req=%s Thinker rows stop at token %d of %d (position %d); "
-            "the Talker gets the shorter reply",
+            "the Talker conditions only on the rows before it",
             request_id,
             len(rows),
             end - start,
@@ -1100,7 +1100,10 @@ def llm2tts(
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
         if not is_native_duplex_handoff:
-            if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
+            # Not guarded on the row count: a prefix-cache hit on Model Runner V2
+            # forwards no rows for the cached tokens, and a reply with no rows
+            # hands over an empty condition, which the Talker finishes up front.
+            if tts_bos_idx is not None:
                 end_idx = tts_eos_idx if tts_eos_idx is not None else len(full_token_ids)
                 tts_hidden_slice = _turn_hidden_rows(
                     mm_output, thinker_hidden_states, full_token_ids, tts_bos_idx, end_idx, llm_output.request_id

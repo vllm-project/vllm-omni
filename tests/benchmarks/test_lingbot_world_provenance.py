@@ -3,14 +3,12 @@
 """Source images must retain honest client and server measurement identities."""
 
 import subprocess
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
+from benchmarks.lingbot_world import benchmark_lingbot_world_realtime as realtime
+from benchmarks.lingbot_world.regression import RegressionError
 from tests.dfx.lingbot_world import runner
-from vllm_omni.benchmarks.lingbot_world import realtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -90,87 +88,3 @@ def test_real_checkout_wins_over_buildkite_and_rejects_conflicting_client(source
     document["git_revision"] = reference_revision
     runner.record_benchmark_revisions(document, reference)
     assert document == {"git_revision": reference_revision, "server_revision": reference_revision}
-
-
-@pytest.mark.parametrize(("platform", "repeat"), [("cuda", None), ("npu", 1)])
-def test_reference_generation_from_source_image_retains_strict_raw_provenance(
-    source_image, monkeypatch, platform, repeat
-):
-    import psutil
-
-    from tests.helpers import runtime
-
-    image, reference, reference_revision = source_image
-    (image / "deploy.yaml").write_text("stages: []\n")
-    protocol = image / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json"
-    write_json(protocol, {})
-    profile = {
-        "platform": platform,
-        "reference_revision": reference_revision,
-        "deploy_config": "deploy.yaml",
-        "cases": [{"id": "scene", "image": "image", "prompt": "test", "camera_pattern": "hold", "seed": 42}],
-        "height": 24,
-        "width": 32,
-        "mux_fps": 16,
-        "target_fps": 12,
-        "num_chunks": 3,
-        "warmup_chunks": 1,
-        "warmup_num_chunks": 1,
-        "first_chunk_timeout_s": 10,
-        "chunk_timeout_s": 10,
-        "startup_timeout_s": 10,
-        "dies": 1,
-        "lifecycle_checks": False,
-    }
-    profile_path = image / "profile.json"
-    write_json(profile_path, profile)
-    settings = {**profile, "profile_path": profile_path, "output": image / "output"}
-    starts = []
-
-    class Server:
-        def __init__(self, *args, source_root, **kwargs):
-            starts.append(Path(source_root))
-            self.proc = SimpleNamespace(pid=1)
-            self.port = 8181
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-    async def benchmark(args):
-        video = Path(args[args.index("--save-video") + 1])
-        video.write_bytes(b"reference video")
-        document = {"git_revision": realtime._git_revision(), "sessions": [{"request_id": str(video)}]}
-        write_json(video.with_name("benchmark.json"), document)
-        return document
-
-    monkeypatch.setattr(runtime, "OmniServer", Server)
-    monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(children=lambda recursive: []))
-    monkeypatch.setattr(runner, "checked_assets", lambda settings: (image / "model", {"image": image / "image"}))
-    monkeypatch.setattr(runner, "validate_reference", lambda settings: reference)
-    monkeypatch.setattr(runner, "hardware_contract", lambda settings: {})
-    monkeypatch.setattr(runner, "server_arguments", lambda settings: [])
-    monkeypatch.setattr(runner, "_capture", lambda source, model, path, settings: path.write_bytes(b"precision"))
-    monkeypatch.setattr(runner, "diagnostic_session", lambda server, settings, image, path: write_json(path, {}))
-    monkeypatch.setattr(runner, "assert_device_cleanup", lambda dies, path: write_json(path, {}))
-    monkeypatch.setattr(runner, "_measured_metrics", lambda document, settings: {"ttfc_ms": 10.0})
-    monkeypatch.setattr(runner, "parse_args", lambda args: args)
-    monkeypatch.setattr(runner, "run_benchmark", benchmark)
-    report = runner.generate(settings, reference_only=True, measurement_repeat=repeat)
-    assert report["harness_revision"] == "b" * 40
-    assert report["complete"] is True and report["passed"] is False
-    assert starts == [reference] * (3 if repeat is None else 1)
-    assert not (settings["output"] / "candidate").exists()
-    runner.validate_reference_collection(settings, settings["output"], report, measurement_repeat=repeat)
-    raw_path = settings["output"] / "reference" / str(0 if repeat is None else repeat) / "scene/benchmark.json"
-    raw = read_json(raw_path)
-    assert raw["git_revision"] == "b" * 40
-    assert raw["server_revision"] == reference_revision
-    # A fully rehashed conflicting source claim must still fail strict validation.
-    raw["git_revision"] = "c" * 40
-    write_json(raw_path, raw)
-    report["artifacts"][str(raw_path.relative_to(settings["output"]))] = sha256(raw_path)
-    with pytest.raises(RegressionError, match="source or raw measurements changed"):
-        runner.validate_reference_collection(settings, settings["output"], report, measurement_repeat=repeat)

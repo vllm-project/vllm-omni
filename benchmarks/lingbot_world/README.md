@@ -1,11 +1,6 @@
 # LingBot-World Benchmarks — Realtime Streaming Cadence
 
-For blocking GPU/NPU performance, precision, WBench/VBench and long-session
-pytest jobs, see the [CI regression suite](../../tests/dfx/lingbot_world/README.md).
-The `vllm bench realtime-video --omni` command reports measurements; the pytest
-suite asserts gates. Both use the same packaged protocol client and metric math.
-
-`vllm bench realtime-video --omni` measures LingBot-World 2.0 as it is
+`benchmark_lingbot_world_realtime.py` measures LingBot-World 2.0 as it is
 actually deployed: one `WS /v1/realtime/video` session that streams one video
 chunk per AR block, for as long as the world keeps running.
 
@@ -39,7 +34,7 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
 
 # Terminal 2
 pip install websockets
-vllm bench realtime-video --omni \
+python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
   --host 127.0.0.1 --port 8000 \
   --num-chunks 16 \
   --output-json /tmp/lingbot_world_realtime.json
@@ -61,7 +56,7 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
   --deploy-config benchmarks/lingbot_world/configs/usp4_compiled.yaml \
   --port 8000
 
-vllm bench realtime-video --omni \
+python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py \
   --port 8000 --num-chunks 40 --warmup-sessions 1 --sessions 3 \
   --target-fps 12 --output-json /tmp/lingbot_world_repeated.json
 ```
@@ -77,28 +72,6 @@ Compiled mode can pay compilation and capture costs on the first rollout.
 Use `--warmup-sessions 1` before measured repetitions. Excluding the first six
 chunks addresses the attention-window ramp; it does not guarantee that
 compilation and capture have finished.
-
-## Unified CLI and regression ownership
-
-The command is installed with vLLM-Omni. Its workload construction, WebSocket
-client, validation and metrics live in `vllm_omni.benchmarks.lingbot_world`;
-the CLI adapter only registers arguments and dispatches execution. The historical
-`python benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py` command
-remains a compatibility wrapper around that implementation. Both commands accept
-the same flags, produce the same JSON schema, retain partial-session diagnostics,
-and exit unsuccessfully when the requested rollout is incomplete.
-
-This PR integrates the existing LingBot workload into `vllm bench`; its blocking
-pytest suite additionally owns reference/candidate server starts, frozen
-calibration, fixed-input numerical replay, native quality evaluators and artifact
-handoff. These acceptance policies stay in pytest and consume the shared
-benchmark implementation rather than introducing a second timing path.
-
-Follow-up work can add workloads for other realtime video models and align
-result export with other `vllm bench` modalities. A concurrent-session benchmark
-requires session-affine server routing first; the current serving contract allows
-one session, so this command measures sequential rollouts. Those extensions do
-not change this PR's metric populations, acceptance gates or default workload.
 
 ## Metrics
 
@@ -117,9 +90,9 @@ not change this PR's metric populations, acceptance gates or default workload.
 ### Which frame rate counts as real time
 
 **The checkpoint declares no frame rate.** There is none in `model_index.json`, the
-scheduler config, or the transformer config, and the pipeline never reads one. A
-chunk is twelve pixel frames; how long those frames *last* is a property of how the
-output is played, not of the model.
+scheduler config, or the transformer config, and the pipeline never reads one. The
+first chunk is nine pixel frames and following chunks are twelve; how long those
+frames *last* is a property of how the output is played, not of the model.
 
 That choice moves the verdict without moving anything measured:
 
@@ -229,8 +202,9 @@ cost dimension.
 | `--target-fps` | Playback rate the real-time verdict is measured against, independent of the mux label. |
 | `--sessions N` | N sequential measured rollouts; the report adds spread across them. |
 | `--warmup-sessions N` | Unmeasured rollouts first, to pay compile and capture cost. |
+| `--warmup-num-chunks N` | Optional shorter warmup rollout; measured rollout length is unchanged. |
 | `--print-chunks` | One line per chunk as it arrives. |
-| `--save-video PATH` | Remux the last measured session for eyeballing (needs vLLM-Omni). |
+| `--save-video PATH` | Losslessly remux the last measured session for eyeballing (needs PyAV); preserve received pixels and timestamps. |
 | `--ping-interval` | `session.ping` cadence keeping the server's stall clock fresh during a slow first chunk. `0` disables. |
 | `--first-chunk-timeout` | Raise it when the server is still compiling or capturing graphs. |
 
@@ -249,3 +223,16 @@ handling against a scripted WebSocket server. It needs no GPU:
 ```bash
 pytest tests/benchmarks/test_lingbot_world_realtime.py
 ```
+
+## CI regression cases
+
+The [LingBot CI cases](../../tests/dfx/lingbot_world/README.md) define separate
+numeric precision, WBench, VBench, performance and long-session stability tests
+for CUDA and NPU. Shared generation records real reference/candidate data;
+each semantic case validates its own artifacts and writes its own report.
+The performance gate retains the 5% relative threshold, while 12 FPS remains
+the SLO measurement basis. Long stability uses two candidate-only 600-chunk
+sessions with memory, camera, lifecycle and cleanup checks.
+
+CI maintainers own execution and scheduling. No reference-only calibration
+campaign or stored historical population is required to define these cases.

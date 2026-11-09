@@ -498,6 +498,7 @@ class TestPromptUpdateExecution:
             num_outputs_per_prompt=1,
             max_sequence_length=226,
             fps=None,
+            attention_schedule=None,
         )
         req = SimpleNamespace(
             request_id="req",

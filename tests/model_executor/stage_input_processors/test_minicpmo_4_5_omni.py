@@ -106,6 +106,46 @@ def test_plain_chat_handoff_reads_rows_from_ledger_when_steps_repeat() -> None:
     torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3)]))
 
 
+@pytest.mark.parametrize("repeat", [1, 2], ids=["v1", "mrv2_both_channels"])
+def test_plain_chat_handoff_after_a_prefix_hit_has_no_rows_for_the_cached_prompt(repeat) -> None:
+    """Native KV reuse forwards only the uncached tail, fewer rows than the reply's position."""
+    prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13]
+    # Tokens 0-14 hit; the last prompt token and the reply are forwarded.
+    steps = [[(115, 15)], [(11, 16)], [(12, 17)]]
+    forwarded = [row for step in steps for row in step * repeat]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17)]))
+
+
+def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition() -> None:
+    """A Thinker that stopped at its first token has no reply rows; the Talker finishes such a request."""
+    prompt_ids, output_ids = [101, 102], [11]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)])], prompt=[{}])[0][
+        "model_intermediate_buffer"
+    ]
+
+    assert info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
+
+
+def test_plain_chat_handoff_after_a_preemption_keeps_reply_rows_from_before_it() -> None:
+    """A resumed request hits on its earlier reply tokens, so their rows come from before the preemption."""
+    prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13, 14]
+    # Forwarded up to token 13, preempted, then resumed from a hit that ends after token 11.
+    forwarded = [(115, 15), (11, 16), (12, 17), (13, 18), (12, 17), (13, 18)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12, 13]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17), _row(13, 18)]))
+
+
 def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:
     """A rejected draft's row is replaced by the row forwarded at its position later."""
     prompt_ids, output_ids = [101, 102], [11, 12, 13, 14, 15]

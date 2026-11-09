@@ -154,6 +154,11 @@ def test_qwen3_omni_correctness_enables_only_the_new_rocm_resource() -> None:
     source = CORRECTNESS_TEST.read_text(encoding="utf-8")
     decorator = '@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)'
     assert source.count(decorator) == 3
+    assert "QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
+    assert source.count("current_omni_platform.is_rocm()") == 2
+    assert "stage_init_timeout=(QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S" in source
+    assert "init_timeout=QWEN3_OMNI_COLD_INIT_TIMEOUT_S" in source
 
 
 def test_qwen3_omni_perf_counts_and_existing_baselines_are_preserved() -> None:
