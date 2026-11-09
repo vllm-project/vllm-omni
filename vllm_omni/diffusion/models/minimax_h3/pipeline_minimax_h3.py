@@ -3026,6 +3026,7 @@ class MiniMaxH3Pipeline(
         condition_labels: Sequence[tuple[str, int]] | None = None,
         timeline_guides: bool = False,
         latent_hw: tuple[int, int] | None = None,
+        continuation: Any | None = None,
     ) -> int | None:
         """Validate and normalize ``keep_steps`` before the second encoder pass.
 
@@ -3036,9 +3037,10 @@ class MiniMaxH3Pipeline(
         malformed ``keep_steps``, the degenerate ``== num_steps`` value, and
         every restriction decidable from the request config alone (pinned
         schedules -- including the fused FastH3 student, whose resolver branch
-        returns a pinned ladder -- task, audio labels, timeline guides,
-        ``continue_from``, ``pad_seq_len``, step execution, reference-KV
-        offload, turbo/native LoRA, latent refine/upscale). Still enforced
+        returns a pinned ladder -- task, long-video continuation, audio
+        labels, timeline guides, ``continue_from``, ``pad_seq_len``, step
+        execution, reference-KV offload, turbo/native LoRA, latent
+        refine/upscale). Still enforced
         only in the authoritative check, because they need encoded
         conditioning or runtime model state: audio-reference/guide tensors,
         latent-mask editing, control rows, the AdaLN sidecar, and cache_dit
@@ -3083,6 +3085,8 @@ class MiniMaxH3Pipeline(
         if task is not None and task != "ref2va":
             raise OmniClientError("MiniMax H3 keep_steps requires task ref2va")
         extra = getattr(sampling, "extra_args", None) or {}
+        if continuation is not None:
+            raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
         if condition_labels is not None and any(label[0] == "audio" for label in condition_labels):
             raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
         if timeline_guides:
@@ -3174,7 +3178,16 @@ class MiniMaxH3Pipeline(
                 # only runs for requests that carry keep_steps, so plain
                 # requests keep their original error ordering; when it runs,
                 # it is the same resolver the authoritative check uses, so
-                # pinned schedules cannot make the two disagree.
+                # pinned schedules cannot make the two disagree. Long-video
+                # continuation resolves before the normalize call so the
+                # helper can reject the combination with zero encoder passes.
+                continuation = None
+                if prompts is not None or (request_context is not None and task == "ref2va"):
+                    continuation = resolve_continuation(
+                        sampling.extra_args or {},
+                        task=task,
+                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                    )
                 if (sampling.extra_args or {}).get("keep_steps") is None:
                     keep_steps = None
                 else:
@@ -3191,17 +3204,11 @@ class MiniMaxH3Pipeline(
                         # latent size (continue_from, which could rewrite
                         # it, is rejected above before this point matters).
                         latent_hw=(int(prepared.media.height) // 16, int(prepared.media.width) // 16),
+                        continuation=continuation,
                     )
                 base_encode_needed = (
                     keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
                 )
-                continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
-                    continuation = resolve_continuation(
-                        sampling.extra_args or {},
-                        task=task,
-                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
-                    )
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(
@@ -3453,21 +3460,31 @@ class MiniMaxH3Pipeline(
                 f"({expected_latent_t}, {expected_audio_t})"
             )
 
+        # keep_steps requests normalize before any continuation work: the
+        # switch check front-loads in _normalize_keep_steps (which rejects
+        # continue_from itself), so the resolver below never runs for a
+        # keep_steps request. Opt-in requests only, with the schedule
+        # resolved by the same resolver the authoritative block uses; the
+        # default path keeps its original ordering. conditioning is still
+        # the encoder's output here — continue_from, the one input that
+        # could rewrite its canvas, is rejected inside the helper before it
+        # is consumed.
+        early_keep_steps = None
+        early_normalized = False
+        if extra.get("keep_steps") is not None:
+            early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
+            early_keep_steps = self._normalize_keep_steps(
+                sampling,
+                num_steps=early_num_steps,
+                base_schedule=early_base_schedule,
+                task=task,
+                latent_hw=(conditioning.height // 16, conditioning.width // 16),
+                continuation=continuation,
+            )
+            early_normalized = True
         conditioning, latent_continuation = self._resolve_latent_continuation(
             extra, conditioning, inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling)
         )
-        # keep_steps requests normalize before any continuation work: the
-        # switch check front-loads in _normalize_keep_steps and rejects
-        # continue_from there, so the resolver's result is never consumed by
-        # a keep_steps request. Opt-in requests only; the default path keeps
-        # its original ordering.
-        early_keep_steps = None
-        if extra.get("keep_steps") is not None:
-            early_keep_steps = self._normalize_keep_steps(
-                sampling, num_steps=num_steps, base_schedule=base_schedule, task=task
-            )
-            if early_keep_steps is not None:
-                raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
         # A continuation samples audio on the chain's global timeline, which may
         # differ by a rounding step from the encoder's standalone length.
         audio_t = latent_continuation.audio_t if latent_continuation is not None else conditioning.audio_t
@@ -3594,22 +3611,29 @@ class MiniMaxH3Pipeline(
         # the request then continues from an image-only presentation.
         # Normalization runs before the second encoder pass (see
         # _normalize_keep_steps); every restriction decidable from the
-        # request config lives there. The checks below need the encoded
-        # conditioning or runtime model state and stay authoritative here.
-        # keep_steps requests were already normalized (and continue_from
-        # rejected) before the continuation resolver above; reuse that
-        # result so the check runs once. ``latent_hw`` matches the call
-        # site's canvas-derived size by the same argument as the early one.
-        keep_steps = self._normalize_keep_steps(
-            sampling,
-            num_steps=num_steps,
-            base_schedule=base_schedule,
-            task=task,
-            latent_hw=(conditioning.height // 16, conditioning.width // 16),
-        ) if early_keep_steps is None and extra.get("keep_steps") is not None else early_keep_steps
+        # request config lives there. keep_steps requests were normalized
+        # before the continuation resolver above (early_normalized) — reuse
+        # that result so the check runs once; every other request
+        # normalizes here. The checks below need the encoded conditioning
+        # or runtime model state and stay authoritative here.
+        if early_normalized:
+            keep_steps = early_keep_steps
+        else:
+            keep_steps = self._normalize_keep_steps(
+                sampling,
+                num_steps=num_steps,
+                base_schedule=base_schedule,
+                task=task,
+                latent_hw=(conditioning.height // 16, conditioning.width // 16),
+                continuation=continuation,
+            )
         if keep_steps is not None:
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
+            if latent_continuation is not None:
+                # Cheap guard: the helper rejects continue_from up front;
+                # this covers any future source of resolved continuations.
+                raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
             if control_rows is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support control conditioning")
             if (

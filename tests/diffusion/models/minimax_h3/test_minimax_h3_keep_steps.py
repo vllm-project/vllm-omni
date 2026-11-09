@@ -749,6 +749,22 @@ def test_local_continue_from_fails_before_any_encoder_pass(monkeypatch: pytest.M
     assert encode_prompt.call_count == 0
 
 
+def test_local_long_video_continuation_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
+    """keep_steps plus a long-video continuation rejects with zero Qwen passes."""
+    pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
+    # The fixture stubs resolve_continuation to None; mirror the real
+    # resolver's long-video return (upstream contract: (277, 22)) so the
+    # continuation actually materializes and the helper rejects it.
+    monkeypatch.setattr(
+        pipeline_minimax_h3, "resolve_continuation", lambda extra_args, **kwargs: (277, 22)
+    )
+    with pytest.raises(OmniClientError, match="does not support continuation"):
+        pipeline._prepare_local_conditioning(
+            {"prompt": "p"}, _local_sampling(keep_steps=2, long_video=True)
+        )
+    assert encode_prompt.call_count == 0
+
+
 def test_plain_requests_never_touch_the_keep_steps_resolver(monkeypatch: pytest.MonkeyPatch):
     """Requests without keep_steps keep their original code path untouched."""
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
