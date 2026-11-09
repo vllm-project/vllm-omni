@@ -45,6 +45,7 @@ EXCLUDED_MODELS = [
     # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
     "Alpamayo2SuperPipeline",
     "WanPipeline",
+    "SkyReelsV2Pipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
     "WanDMDPipeline",

@@ -9,6 +9,8 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| SkyReels V2 T2V (540P) | `Skywork/SkyReels-V2-T2V-14B-540P-Diffusers` |
+| SkyReels V2 T2V (720P) | `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
 | Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
@@ -42,6 +44,35 @@ The script allows overriding:
 - `FLOW_SHIFT` (default: `5.0`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
+
+## SkyReels V2 T2V
+
+Single-DiT Diffusers T2V (no MoE `transformer_2`). Omitted fields default to `flow_shift=8.0`, `guidance_scale=6.0`, 50 steps, and 544x960 / 97 frames (540P) or 720x1280 / 121 frames (720P).
+
+```bash
+vllm serve Skywork/SkyReels-V2-T2V-14B-540P-Diffusers --omni --port 8091 \
+  --flow-shift 8.0 --boundary-ratio 0.0
+```
+
+Sync smoke (540P):
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A cat and a dog baking a cake together in a kitchen." \
+  -F "size=960x544" \
+  -F "num_frames=33" \
+  -F "fps=24" \
+  -F "num_inference_steps=20" \
+  -F "guidance_scale=6.0" \
+  -F "flow_shift=8.0" \
+  -F "boundary_ratio=0.0" \
+  -F "seed=42" \
+  -o skyreels_v2_sync.mp4
+```
+
+For 720P, serve `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` and use `size=1280x720`.
+
+A prompt-only request runs the full defaults (97 frames, 50 steps at 540P), which took about 13 minutes on one H100 PCIe. That is longer than the default 600 s limit of `/v1/videos/sync`, so set `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` (for example `export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=2400`) before `vllm serve`, or use the async `/v1/videos` endpoint.
 
 ## Async Job Behavior
 
