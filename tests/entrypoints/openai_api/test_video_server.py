@@ -2593,6 +2593,23 @@ def test_video_generation_rejects_model_mismatch(test_client):
     assert "model mismatch" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("model", [None, "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "video-alias", "missing-model"])
+def test_video_generation_checks_all_served_model_names(test_client, model):
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+
+    primary = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    test_client.app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name=name, model_path=primary) for name in (primary, "video-alias")]
+    )
+    payload = {"prompt": "a moving blue square"}
+    if model is not None:
+        payload["model"] = model
+    response = test_client.post("/v1/videos", data=payload)
+    assert response.status_code == (400 if model == "missing-model" else 200)
+
+
 def test_invalid_size_parse_returns_422(test_client):
     response = test_client.post(
         "/v1/videos",

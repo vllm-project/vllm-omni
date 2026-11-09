@@ -1512,6 +1512,29 @@ def test_generate_images_rejects_model_mismatch(test_client):
     assert "model mismatch" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+@pytest.mark.parametrize("model", [None, "auto", "Qwen/Qwen-Image", "image-alias", "missing-model"])
+def test_image_endpoints_check_all_served_model_names(test_client, mock_async_diffusion, endpoint, model):
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    test_client.app.state.openai_serving_models.base_model_paths.append(
+        BaseModelPath(name="image-alias", model_path="Qwen/Qwen-Image")
+    )
+    listed = test_client.get("/v1/models").json()
+    assert {entry["id"] for entry in listed["data"]} == {"Qwen/Qwen-Image", "image-alias"}
+    payload = {"prompt": "a blue square"}
+    if model is not None:
+        payload["model"] = model
+    if endpoint == "edits":
+        response = test_client.post(
+            "/v1/images/edits", data=payload, files={"image": ("image.png", make_test_image_bytes(), "image/png")}
+        )
+    else:
+        response = test_client.post("/v1/images/generations", json=payload)
+    assert response.status_code == (400 if model == "missing-model" else 200)
+    assert mock_async_diffusion.generate_calls == (0 if model == "missing-model" else 1)
+
+
 @pytest.mark.parametrize(
     ("output_format", "expected_pil_format"),
     [("png", "PNG"), ("jpeg", "JPEG"), ("webp", "WEBP")],
