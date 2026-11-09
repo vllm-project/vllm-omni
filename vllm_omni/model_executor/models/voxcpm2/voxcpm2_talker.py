@@ -295,6 +295,12 @@ def build_voxcpm2_prompt(
     return prompt
 
 
+def _platform_copies_to_host_async() -> bool:
+    """Whether device-to-host copies here use pinned memory and a side stream."""
+    platform = omni_platform.current_omni_platform
+    return platform.device_type == "cuda" or getattr(platform, "is_npu", lambda: False)()
+
+
 @lru_cache(maxsize=32)
 def _audio_resampler_on_device(orig_sr: int, target_sr: int, device: torch.device) -> nn.Module:
     import torchaudio
@@ -3297,7 +3303,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def _enqueue_delayed_audio_copy(self, state: _RequestState, audio: torch.Tensor) -> None:
         src = audio.detach().contiguous()
-        if src.device.type != omni_platform.current_omni_platform.device_type:
+        if src.device.type != omni_platform.current_omni_platform.device_type or not _platform_copies_to_host_async():
             state.pending_audio_copies.append(_PendingAudioCopy(host=src.cpu().contiguous()))
             return
 
@@ -3415,11 +3421,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
 
-        on_device = (
-            omni_platform.current_omni_platform.device_type == "cuda"
-            or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
-        )
-        if not on_device:
+        if not _platform_copies_to_host_async():
             # No pinned async copy to overlap; MPS streams and events also do
             # not interoperate, so read the mask synchronously.
             stop_mask_cpu = (stacked[:, 1] > stacked[:, 0]).cpu()
