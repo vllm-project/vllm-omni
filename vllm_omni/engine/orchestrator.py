@@ -485,7 +485,8 @@ class OrchestratorBase:
     # [OmniDTPS] Min interval between DiT-load polls per replica.
     _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
     # [OmniDTPS] Consecutive poll failures before evicting a DiT replica's
-    # load data. Filters transient hiccups; 5 × 0.1s interval ≈ 0.5s.
+    # load data. Filters transient hiccups; requires at least 5 consecutive
+    # failed polls (actual window is longer due to RPC timeout per attempt).
     _DIT_LOAD_EVICT_THRESHOLD: int = 5
 
     def _init_metrics_state(
