@@ -1,0 +1,106 @@
+meta:
+  title: "Sophon-Realtime-32B-Tag"
+  slug: "sophon-realtime-32b-tag"
+  provider: "Adventists AI"
+  description: "Open full-duplex voice model that hears your tone and speaks with one: listens while you talk, takes interruptions, and laughs, sighs or stresses words when the conversation calls for it. One vLLM-Omni model (thinker -> expressive talker -> vocoder) on a single 80 GB GPU, with an OpenAI-Realtime-style full-duplex WebSocket and /v1/chat/completions (audio in, text + audio out)."
+  date_added: 2026-11-09
+  date_updated: 2026-11-09
+  difficulty: intermediate
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+model:
+  model_id: "adventists-ai/Sophon-Realtime-32B-Tag"
+  min_vllm_version: "0.30.0"
+  architecture: dense
+  parameter_count: "34.3B"
+  active_parameters: "34.3B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--trust-remote-code"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: a2a
+      label: "Speech → Speech (full duplex)"
+      endpoint: "/v1/chat/completions"
+      description: "Audio in, streamed text + audio out; full-duplex sessions on ws://HOST:8000/v1/realtime"
+      curl: |
+        curl -N http://localhost:8000/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "adventists-ai/Sophon-Realtime-32B-Tag",
+            "modalities": ["text", "audio"],
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+              {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}]}]
+          }'
+
+dependencies:
+  - note: "The Sophon-Realtime plugin for vLLM-Omni (installs vLLM 0.30 + vLLM-Omni 0.30 and registers the model; `sophon-realtime serve` downloads the weights and starts the server with the right deploy config)."
+    command: "uv pip install sophon-realtime"
+
+features: {}
+opt_in_features: []
+
+variants:
+  default:
+    precision: fp8
+    vram_minimum_gb: 80
+    description: "Thinker FP8 + tag-tts talker (4-step distilled flow) + HiFT, one 80 GB GPU; ~65 GB used, up to 16 concurrent users"
+
+compatible_strategies: []
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Sophon-Realtime-32B-Tag](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Tag) is the recommended build of
+  Sophon-Realtime v1, an open full-duplex voice model. A 32B thinker listens to the user's audio, decides when it is its
+  turn and writes the reply with inline sound tags (`[laughter]`, `[sigh]`, `<strong>…</strong>`); a streaming talker
+  performs those tags while the reply is still being written. The whole pipeline is one vLLM-Omni model.
+  VoiceBench 82.8 and Big Bench Audio 81.8% (#1 among open full-duplex models), NVV-SuperBench 0.86 (zh) / 0.80 (en).
+
+  ## Prerequisites
+
+  - One 80 GB GPU (H100 / H800 / A100 80G); about 65 GB per instance.
+  - Linux, CUDA, Python 3.12.
+
+  ## Installation and launch
+
+  ```bash
+  uv venv --python 3.12 && source .venv/bin/activate
+  uv pip install sophon-realtime
+  sophon-realtime serve --port 8000     # downloads the weights (~42 GB) on first run
+  ```
+
+  First start builds kernels and TensorRT engines (15–20 min); later starts take 5–8 min.
+
+  ## Client usage
+
+  - Full duplex: `ws://localhost:8000/v1/realtime` (OpenAI-Realtime-style: `input_audio_buffer.append`; the model decides
+    when the user has finished and handles barge-in).
+  - One-shot: `POST /v1/chat/completions` with `input_audio`, `"modalities": ["text","audio"]`.
+  - OpenAI GPT-Live / OpenAI Realtime compatible gateway (LiveKit, Pipecat, function calling):
+    [live/](https://github.com/adventists-ai/sophon-realtime/tree/main/live).
+
+  ## Performance (one H100 80 GB)
+
+  | concurrent users | first audio median / max |
+  |---|---|
+  | 1 | 0.67 s |
+  | 8 | 0.61 / 0.76 s |
+  | 16 | 0.75 / 1.07 s |
+
+  For more speed and users per GPU, see the Flash build (0.31 s first audio, 40 users per GPU):
+  [adventists-ai/Sophon-Realtime-32B-Flash](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash).
+
+  ## References
+
+  - [Model card](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Tag) · [GitHub](https://github.com/adventists-ai/sophon-realtime)
+  - Apache-2.0
