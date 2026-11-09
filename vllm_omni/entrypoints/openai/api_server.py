@@ -2947,12 +2947,14 @@ async def segment_image(
 ) -> ImageSegmentationResponse:
     """Segment every instance of a text and/or exemplar-box concept in one image."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not _supports_segmentation(raw_request, engine_client):
+    if not _supports_segmentation(raw_request, engine_client) or "x2i" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support image segmentation.",
@@ -3031,12 +3033,14 @@ async def segment_video(
 ) -> Response:
     """Track every instance of one or more text concepts through a video."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+    print(f"Debugging: supported tasks list = {supported_tasks}")
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not supports_video_segmentation(raw_request, engine_client):
+    if not supports_video_segmentation(raw_request, engine_client) or "x2v" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support video segmentation.",
@@ -3107,12 +3111,14 @@ async def estimate_video_depth(
 ) -> Response:
     """Estimate temporally consistent depth for every frame of a video."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not supports_video_depth(raw_request, engine_client):
+    if not supports_video_depth(raw_request, engine_client) or "x2v" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support video depth estimation.",
