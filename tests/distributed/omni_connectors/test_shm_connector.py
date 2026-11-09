@@ -324,7 +324,7 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     def fail_deserialize(_data):
         raise ValueError("invalid payload")
 
-    monkeypatch.setattr(connector, "deserialize_obj", fail_deserialize)
+    monkeypatch.setattr(connector._serde, "deserialize", fail_deserialize)
     assert connector.get("0", "1", key) is None
     assert not os.path.exists(connector._lock_file(connector._shm_name(key)))
     connector.reap_consumed()
