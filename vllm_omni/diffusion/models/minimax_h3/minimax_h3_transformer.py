@@ -89,8 +89,10 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
         # AllGather variants would gather target K/V without the cached rows.
         if attention_layer._get_active_parallel_strategy().name not in {"none", "ulysses"}:
             return False
-        backend = getattr(attention_layer, "attn_backend", None)
-        if backend is None or backend.get_name() == "FASTVIDEO_VSA":
+        backends = [getattr(attention_layer, "attn_backend", None)]
+        # A scheduled step runs its profile's backend on the same compacted Q and cached K/V.
+        backends += [record.backend_cls for record in getattr(attention_layer, "_schedule_candidates", {}).values()]
+        if any(backend is None or backend.get_name() == "FASTVIDEO_VSA" for backend in backends):
             return False
     return True
 
@@ -1048,6 +1050,33 @@ class MiniMaxH3DiTModel(nn.Module):
                         head_dim=self.arch.attention_head_dim,
                     )
                     weight_loader(param, loaded_weight)
+            elif name.endswith(
+                (
+                    ".attn.qkv_proj.qweight",
+                    ".attn.qkv_proj.proj_up",
+                    ".attn.qkv_proj.wcscales",
+                )
+            ):
+                # Serialized quantization checkpoints keep the same grouped
+                # Q/K/V row order as the BF16 checkpoint. Reorder every tensor
+                # with an output dimension before the QKV loader shards it.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.wscales"):
+                # E8M0 scales are stored [K // block, N], so reorder their N
+                # axis through the same grouped-QKV permutation.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight.T,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                ).T.contiguous()
+                weight_loader(param, loaded_weight)
             elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
                 if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)
@@ -1246,7 +1275,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "vdn_config", None) is not None:
             raise ValueError("MiniMax H3 reference-KV offload does not support VDN-H3 hybrid attention")
         if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
-            raise ValueError("MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention")
+            raise ValueError(
+                "MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention, and FASTVIDEO_VSA "
+                "in neither the base attention nor any attention schedule profile"
+            )
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 

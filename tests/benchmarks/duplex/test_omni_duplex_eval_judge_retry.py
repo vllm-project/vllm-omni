@@ -119,3 +119,22 @@ def test_immediate_score_json_skips_retry(tmp_path):
     assert result["pr"]["all_success"] is True
     assert len(judge.calls) == 1
     assert len(_trace(tmp_path)) == 1
+
+
+def test_parse_error_reaches_the_retry_and_the_trace(tmp_path):
+    """The format retry carries the parse error itself, and the trace records it.
+
+    A judge reply can fail to parse without being prose — e.g. a malformed
+    value in a field that is present — so the retry has to say what failed,
+    and the first trace line has to show which reply failed to parse.
+    """
+    judge = _FlakyJudge([_PROSE_REPLY, _SCORE_JSON])
+    result = evaluate_sample(_pr_sample(), _write_response(tmp_path), tmp_path / "512.json", judge)
+    assert result["pr"]["all_success"] is True
+
+    _, retried_followup = judge.calls[1]
+    assert "no score fields" in retried_followup[1]
+
+    first, _retried = _trace(tmp_path)
+    assert first["raw_response"] == _PROSE_REPLY
+    assert "no score fields" in first["error"]

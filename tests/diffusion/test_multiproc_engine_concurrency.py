@@ -3,12 +3,14 @@
 
 import asyncio
 import multiprocessing as mp
+import os
 import queue
 import signal
 import threading
 import time
 import weakref
 from collections import OrderedDict
+from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -303,6 +305,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -416,6 +419,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -433,6 +437,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -461,6 +466,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -478,6 +484,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -498,6 +505,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -518,6 +526,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -546,6 +555,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -567,6 +577,7 @@ class TestRequestModeDispatch:
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
+            diffusion_attention_schedule=None,
         )
         executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
         scheduler_output = _make_sched_output("A", "B")
@@ -589,6 +600,7 @@ class TestRequestModeDispatch:
         executor, req_q, res_q = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -626,6 +638,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -709,7 +722,7 @@ class TestConcurrentCollectiveRpc:
         a_enqueued, b_complete = _inject_interleave(executor)
         wt = _start_worker(req_q, res_q, count=2)
 
-        results: dict[str, object] = {}
+        results: dict[str, DiffusionOutput] = {}
 
         def _a():
             results["A"] = engine.collective_rpc(
@@ -750,7 +763,7 @@ class TestConcurrentRequestExecutionAndCollectiveRpc:
         a_enqueued, b_complete = _inject_interleave(executor)
         wt = _start_worker(req_q, res_q, count=2)
 
-        results: dict[str, object] = {}
+        results: dict[str, DiffusionOutput] = {}
 
         def _a():  # request execution path
             results["A"] = engine.add_req_and_wait_for_response(_mock_request("A"))
@@ -1544,8 +1557,11 @@ class TestExecutorShutdownCleaner:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             ready.set()
             stop.wait()
+            # This event-only worker must not spend its 0.2s shutdown budget
+            # flushing the test runner's inherited coverage data.
+            os._exit(0)
 
-        dead = ctx.Process(target=lambda: None)
+        dead = ctx.Process(target=os._exit, args=(0,))
         worker = ctx.Process(target=run_worker)
         monkeypatch.setattr(executor_module, "_WORKER_SHUTDOWN_GRACE_S", 0.2)
         monkeypatch.setattr(executor_module, "_WORKER_TERMINATE_GRACE_S", 0.1)
@@ -1673,7 +1689,7 @@ def _poll_flag(get_flag, *, timeout=5.0, interval=0.05) -> bool:
     return False
 
 
-def _make_short_lived_process() -> mp.Process:
+def _make_short_lived_process() -> BaseProcess:
     """Spawn a real subprocess that exits immediately.
 
     The process must be started with ``"fork"`` (or the platform default)

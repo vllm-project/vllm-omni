@@ -1005,11 +1005,12 @@ class DiffusionEngine:
                     fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
                 return
 
+        result: object = None
         try:
             if task.method == "pause_scheduler":
-                result = self._run_pause_barrier(remaining)
+                self._run_pause_barrier(remaining)
             elif task.method == "resume_scheduler":
-                result = self._open_scheduling_gate()
+                self._open_scheduling_gate()
             else:
                 result = self.executor.collective_rpc(
                     method=task.method,
@@ -1668,6 +1669,7 @@ class DiffusionEngine:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling on all diffusion workers.
 
@@ -1676,6 +1678,7 @@ class DiffusionEngine:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         if is_start:
             if profile_prefix is None:
@@ -1685,11 +1688,13 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            kwargs: dict[str, int] = {}
+            kwargs: dict[str, Any] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
             if max_iterations is not None:
                 kwargs["max_iterations"] = max_iterations
+            if profiler_kwargs is not None:
+                kwargs["profiler_kwargs"] = profiler_kwargs
             if kwargs:
                 self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
             else:
@@ -1748,6 +1753,9 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+                # Warm up the base attention only: service ranges are sized for real
+                # requests, not for the fixed short warm-up sequence.
+                attention_schedule=(),
             ),
         )
 

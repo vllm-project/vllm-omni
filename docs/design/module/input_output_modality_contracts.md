@@ -25,9 +25,6 @@ primary_code_paths:
   - vllm_omni/data_entry_keys.py
   - vllm_omni/engine/messages.py
   - vllm_omni/engine/serialization.py
-  - vllm_omni/engine/mm_outputs.py
-  - vllm_omni/engine/output_modality.py
-  - vllm_omni/engine/output_processor.py
 related_code_paths:
   - vllm_omni/model_executor/stage_input_processors/**
   - vllm_omni/core/sched/**
@@ -92,7 +89,7 @@ public rendering of its error fields belong to `error_contracts.md`.
 
 ## Current audio decoding compatibility
 
-Omni retains soundfile-first automatic audio decoding when using vLLM 0.32.
+Omni retains soundfile-first automatic audio decoding when using vLLM 0.33.
 Decoder rounding can affect BF16 model inputs and generated responses.
 Missing soundfile dependencies and unsupported formats fall back to upstream
 decoders; explicit backend selections keep upstream behavior. Encoded-size,
