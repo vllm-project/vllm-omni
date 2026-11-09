@@ -98,7 +98,8 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
     runner_cls = load_class_methods(
         "vllm_omni/diffusion/worker/diffusion_model_runner.py",
         "DiffusionModelRunner",
-        ["load_model"],
+        # load_model checks a configured attention schedule first; this config sets none.
+        ["load_model", "_require_attention_schedule_pipeline"],
         namespace,
     )
     runner = runner_cls()

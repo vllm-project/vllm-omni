@@ -620,7 +620,7 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     runner = _make_runner(connector)
     runner.state_cache = {}
     request = _make_request({"prompt": "a cat"})
-    request.sampling_params = SimpleNamespace()
+    request.sampling_params = SimpleNamespace(attention_schedule=None)
     kv_calls = []
 
     def receive_kv(state_request, **kwargs):
