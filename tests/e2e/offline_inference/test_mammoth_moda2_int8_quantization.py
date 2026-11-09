@@ -198,6 +198,9 @@ def _stage_config(quantization: str | None) -> str:
     base = get_deploy_config_path("mammoth_moda2_ar.yaml")
     stage_updates = dict(_AR_STAGE_OVERRIDES)
     if quantization is None:
+        # No-op today: the base YAML has no stage-0 ``quantization`` field, so
+        # this may log "Path quantization does not exist". Kept as a guard so
+        # the BF16 arm stays unquantized if a default is ever added upstream.
         return modify_stage_config(
             base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
         )
@@ -332,16 +335,13 @@ def test_bf16_vs_int8_generation_consistency(checkpoint_pair: tuple[str, str]):
 # generation experts are listed under ``ignore`` (kept BF16) while the extra
 # generation head either stays BF16 or carries its own scale.
 
-_AR_PATCH_SIZE = 16
-
-# Dev (Qwen3-VL) and Preview (Qwen2.5-VL) share the same vision token ids.
-_IMAGE_TOKEN_ID = 151655
-_VIDEO_TOKEN_ID = 151656
-_VISION_START_TOKEN_ID = 151652
-_VISION_END_TOKEN_ID = 151653
-
+_T2I_PROMPT = "A cat sitting on a laptop keyboard"
 
 _T2I_GEN_CONFIG_FILE = "t2i_generation_config.json"
+
+# Structural token ids the production prompt builder hardcodes, mirrored in
+# ``t2i_generation_config.json``. The test checks the two agree.
+_T2I_TOKEN_IDS = ("eol_token_id", "visual_token_start_id", "visual_token_end_id")
 
 
 def _load_t2i_gen_config(model: str, baseline_model: str) -> dict:
@@ -378,20 +378,44 @@ def _load_t2i_gen_config(model: str, baseline_model: str) -> dict:
     raise FileNotFoundError(f"Required {_T2I_GEN_CONFIG_FILE} missing from both checkpoints: {missing}")
 
 
-def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
-    return (
-        "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        f"<|image start|>{ar_width}*{ar_height}<|image token|>"
+def _build_t2i_request(prompt: str, height: int, width: int, gen_cfg: dict) -> dict[str, Any]:
+    """Build the t2i request through the production AR prompt builder.
+
+    The builder owns the AR chat template, the image-token suffix and the
+    structural ``additional_information`` (grid, image size and token ids), so
+    the test never maintains its own copy of the production prompt format. Only
+    the sampling knobs this gate needs are added on top.
+
+    The builder hardcodes the token ids that ``t2i_generation_config.json`` also
+    declares, so require them to agree: a checkpoint revision with different ids
+    must fail here instead of quietly driving the AR sampler with production's
+    ids while the test believes it uses the checkpoint's.
+    """
+    from vllm_omni.model_extras.mammothmodal2_preview import build_text_to_image_prompt
+
+    request = build_text_to_image_prompt(prompt, negative_prompt=None, height=height, width=width)
+    additional_information = request["additional_information"]
+    for key in _T2I_TOKEN_IDS:
+        expected = int(gen_cfg[key])
+        actual = additional_information[key]
+        assert actual == [expected], (
+            f"{_T2I_GEN_CONFIG_FILE} declares {key}={expected}, "
+            f"but the production prompt builder hardcodes {actual}"
+        )
+    additional_information.update(
+        {
+            "num_inference_steps": [2],
+            "text_guidance_scale": [1.0],
+            "cfg_range": [0.0, 1.0],
+        }
     )
+    return request
 
 
 def _t2i_stage_config(model: str, quantization: str | None, baseline_model: str) -> str:
     """Use the selected AR checkpoint and the matching BF16 DiT checkpoint.
 
-    The DiT stage (stage 1) keeps its deploy default (0.3); the AR stage takes
-    0.6 so both fit on a single 48 GiB device.
+    The DiT stage (stage 1) keeps its deploy default (0.3); the AR stage takes 0.6.
     Loading DiT from the BF16 baseline avoids auto-detecting the AR-only
     quantization recipe stored in the INT8 checkpoint's root config.json.
     """
@@ -402,6 +426,9 @@ def _t2i_stage_config(model: str, quantization: str | None, baseline_model: str)
     stage_updates["model"] = model
     updates = {"stages": {0: stage_updates, 1: {"model": baseline_model}}}
     if quantization is None:
+        # No-op today: the base YAML has no stage-0 ``quantization`` field, so
+        # this may log "Path quantization does not exist". Kept as a guard so
+        # the BF16 arm stays unquantized if a default is ever added upstream.
         return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
     stage_updates["quantization"] = quantization
     return modify_stage_config(base, updates=updates)
@@ -414,15 +441,11 @@ def _generate_t2i_image(model: str, quantization: str | None, baseline_model: st
     from tests.helpers.runtime import OmniRunner
 
     gen_cfg = _load_t2i_gen_config(model, baseline_model)
-    eol_token_id = int(gen_cfg["eol_token_id"])
-    visual_start = int(gen_cfg["visual_token_start_id"])
-    visual_end = int(gen_cfg["visual_token_end_id"])
-
     height, width = 256, 256  # small for CI speed
-    ar_height, ar_width = height // _AR_PATCH_SIZE, width // _AR_PATCH_SIZE
+    request = _build_t2i_request(_T2I_PROMPT, height, width, gen_cfg)
+    ar_info = request["additional_information"]
+    ar_height, ar_width = ar_info["ar_height"][0], ar_info["ar_width"][0]
     expected_grid_tokens = ar_height * (ar_width + 1)
-
-    formatted_prompt = _format_t2i_prompt("A cat sitting on a laptop keyboard", ar_width, ar_height)
 
     ar_sampling = SamplingParams(
         temperature=0.0,
@@ -433,35 +456,7 @@ def _generate_t2i_image(model: str, quantization: str | None, baseline_model: st
     dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False, seed=42)
 
     with OmniRunner(model, seed=42, deploy_config=_t2i_stage_config(model, quantization, baseline_model)) as runner:
-        outputs = list(
-            runner.omni.generate(
-                [
-                    {
-                        "prompt": formatted_prompt,
-                        "additional_information": {
-                            "omni_task": ["t2i"],
-                            "ar_width": [ar_width],
-                            "ar_height": [ar_height],
-                            "eol_token_id": [eol_token_id],
-                            "visual_token_start_id": [visual_start],
-                            "visual_token_end_id": [visual_end],
-                            "image_height": [height],
-                            "image_width": [width],
-                            "num_inference_steps": [2],
-                            "text_guidance_scale": [1.0],
-                            "cfg_range": [0.0, 1.0],
-                            "visual_ids": [
-                                _IMAGE_TOKEN_ID,
-                                _VIDEO_TOKEN_ID,
-                                _VISION_START_TOKEN_ID,
-                                _VISION_END_TOKEN_ID,
-                            ],
-                        },
-                    }
-                ],
-                [ar_sampling, dit_sampling],
-            )
-        )
+        outputs = list(runner.omni.generate([request], [ar_sampling, dit_sampling]))
 
     return _extract_image_tensor(outputs, expected_count=1, expected_size=(width, height))
 
