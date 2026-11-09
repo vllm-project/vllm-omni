@@ -53,6 +53,7 @@ def profile_from_artifacts(directories: list[Path], suite: str = "model-executor
             raise ValueError(f"Invalid selected {suite} nodes: {directory}")
         if len(set(nodes)) != len(nodes):
             raise ValueError(f"Duplicate selected nodes: {directory}")
+        selected_nodes = set(nodes)
         reports: dict[str, dict[str, float]] = defaultdict(dict)
         starts: Counter[str] = Counter()
         zero_calls: set[str] = set()
@@ -63,11 +64,14 @@ def profile_from_artifacts(directories: list[Path], suite: str = "model-executor
                 if not isinstance(event, dict):
                     raise ValueError(f"Invalid execution event: {directory}")
                 if event.get("event") == "test_start":
-                    starts[event["nodeid"]] += 1
+                    node = event.get("nodeid")
+                    if node not in selected_nodes:
+                        raise ValueError(f"Test start outside the selected nodes: {directory}")
+                    starts[node] += 1
                 if event.get("event") != "test_report":
                     continue
                 node, phase = event.get("nodeid"), event.get("phase")
-                if node not in nodes or phase not in ("setup", "call", "teardown"):
+                if node not in selected_nodes or phase not in ("setup", "call", "teardown"):
                     raise ValueError(f"Report outside the selected nodes/phases: {directory}")
                 if event.get("outcome") not in ("passed", "skipped"):
                     raise ValueError(f"Duplicate or unsuccessful phase report: {directory}")
@@ -86,15 +90,17 @@ def profile_from_artifacts(directories: list[Path], suite: str = "model-executor
                         zero_calls.discard(node)
                 if phase == "setup" and event["outcome"] == "passed":
                     calls_required.add(node)
-        if starts != Counter({node: 1 for node in nodes}):
+        if starts != Counter({node: 1 for node in selected_nodes}):
             raise ValueError(f"Need exactly one test start per selected node: {directory}")
-        if set(reports) != set(nodes) or any(not {"setup", "teardown"} <= phases.keys() for phases in reports.values()):
+        if set(reports) != selected_nodes or any(
+            not {"setup", "teardown"} <= phases.keys() for phases in reports.values()
+        ):
             raise ValueError(f"Incomplete execution reports: {directory}")
         if any("call" not in reports[node] for node in calls_required):
             raise ValueError(f"Missing call reports after successful setup: {directory}")
         for node, phases in reports.items():
             samples[node].append(math.fsum(phases.values()))
-        runs[(build_url, commit)].append((count, index, set(nodes)))
+        runs[(build_url, commit)].append((count, index, selected_nodes))
     if not runs:
         raise ValueError("No source runs were provided")
     for key, shards in runs.items():

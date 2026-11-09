@@ -355,7 +355,9 @@ def test_profile_builder_uses_complete_runs_and_median_phase_totals(tmp_path: Pa
     assert len(profile.sources) == 3
 
 
-@pytest.mark.parametrize("problem", ["missing-shard", "duplicate-shard", "failed", "partial", "missing-call"])
+@pytest.mark.parametrize(
+    "problem", ["missing-shard", "duplicate-shard", "failed", "partial", "missing-call", "missing-start-node"]
+)
 def test_profile_builder_rejects_unusable_evidence(tmp_path: Path, problem: str) -> None:
     directories = [tmp_path / str(index) for index in range(3)]
     for index, directory in enumerate(directories):
@@ -369,6 +371,11 @@ def test_profile_builder_rejects_unusable_evidence(tmp_path: Path, problem: str)
         summary = json.loads(path.read_text())
         summary["pytest_exit_code"] = 1
         path.write_text(json.dumps(summary))
+    elif problem == "missing-start-node":
+        path = directories[0] / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        events[0].pop("nodeid")
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
     else:
         path = directories[0] / "events.jsonl"
         lines = path.read_text().splitlines()
