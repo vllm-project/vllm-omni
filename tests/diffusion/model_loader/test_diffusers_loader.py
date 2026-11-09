@@ -1380,6 +1380,18 @@ def test_dlo_allgather_allows_unquantized_host_fallback():
     assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
 
 
+def test_dlo_allgather_rejects_configurable_online_fp8_blocks():
+    from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(OnlineBlockFp8LinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == (
+        "OnlineBlockFp8LinearMethod",
+    )
+
+
 def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
     """Through load_model(): DLO + online quant must build the model inside
     load_unquantizable_fallback_on_cpu(), and the over-wide fallback weight
