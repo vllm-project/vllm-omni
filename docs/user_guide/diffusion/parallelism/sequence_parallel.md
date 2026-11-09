@@ -22,6 +22,7 @@ See supported models list in [Diffusion Features - Supported Models](../../diffu
 - **DeepSpeed Ulysses Sequence Parallel (Ulysses-SP)** ([paper](https://arxiv.org/pdf/2309.14509)): Uses all-to-all communication for subset of attention heads per device
 - **Ring-Attention** ([paper](https://arxiv.org/abs/2310.01889)): Uses ring-based P2P communication with sharded sequence dimension throughout
 - **Hybrid Ulysses + Ring**: Combines both for larger scale parallelism (`ulysses_degree × ring_degree`)
+- **AllGather-KV**: Keeps Q sequence-sharded and all-gathers only K/V per attention layer. Especially useful for GQA denoisers where K/V have substantially fewer heads than Q (BAGEL first).
 - **Ulysses × AllGather-KV**: A two-dimensional topology where Ulysses shards attention heads and AllGather-KV makes K/V global (`ulysses_degree × allgather_degree`)
 
 ---
@@ -84,6 +85,36 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)  # 4 GPUs total
 )
 ```
+
+**AllGather-KV** (BAGEL first):
+
+```python
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    deploy_config="vllm_omni/deploy/bagel_allgather_kv4.yaml",
+    parallel_config=DiffusionParallelConfig(allgather_degree=4),
+)
+```
+
+AllGather-KV trades replicated full-sequence K/V memory for lower communication
+volume. Plain AllGather-KV sets `ulysses_degree=1` and `ring_degree=1`; the
+general strategy may be combined with Ulysses as described below, but not with
+Ring. For parallel degree `P` and GQA head ratio `R = Hq / Hkv`, its per-rank
+communication volume relative to Ulysses is `P / (R + 1)` (ignoring collective
+implementation overhead). BAGEL has `R=7`, so `allgather_degree=4` communicates
+half as many bytes as Ulysses-SP 4.
+
+BAGEL's complete-request `generate_image` path launches asynchronous K/V
+All-Gathers between independent K, V, and Q projections, so the communication
+can be fully hidden when the V/Q projection window covers the collective
+latency. When `step_execution=False`, `cfg_parallel_size=1`, and no custom
+scheduler, trajectory collection, or frame conditioning is requested, it also
+keeps the latent shard local across the denoising loop and gathers once for VAE
+decode. Stepwise `denoise_step` and CFG-parallel execution still gather the
+latent every step. Full K/V must fit on each rank, sequence shards must be equal
+and unmasked, and quantized QKV projections must expose independent projection
+slices to use the overlap path. A ready-made recipe is
+`vllm_omni/deploy/bagel_allgather_kv4.yaml`.
 
 **Ulysses × AllGather-KV** (4 GPUs total, no Ring in the attention computation):
 
@@ -210,6 +241,13 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
 ```bash
 # Text-to-image (requires >= 4 GPUs)
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+```
+
+**AllGather-KV:**
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_allgather_kv4.yaml
 ```
 
 **Ulysses × AllGather-KV:**
