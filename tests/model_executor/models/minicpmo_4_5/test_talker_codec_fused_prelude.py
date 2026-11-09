@@ -400,5 +400,11 @@ def test_fused_tail_keeps_a_valid_distribution_on_tied_logits(name, top_p):
     assert torch.allclose(probs.sum(-1), torch.ones(1, device=probs.device), atol=1e-5)
     eager = _eager_top_k_top_p(logits, 25, top_p)
     kept_eager = torch.isfinite(eager)
-    assert torch.equal(kept, kept_eager), f"{name}/{top_p}: support differs from eager"
-    assert torch.equal(fused[kept], eager[kept_eager]), f"{name}/{top_p}: logits differ"
+    # Membership inside a tie group is order-dependent -- ``torch.topk``'s here,
+    # ``torch.sort(stable=False)``'s in the reference -- so compare the kept
+    # count and the sorted kept values, which the kernel guarantees by
+    # construction, not the identity of the kept members.
+    assert int(kept.sum()) == int(kept_eager.sum()), f"{name}/{top_p}: kept count differs"
+    assert torch.equal(
+        torch.sort(fused[kept]).values, torch.sort(eager[kept_eager]).values
+    ), f"{name}/{top_p}: kept logits differ"

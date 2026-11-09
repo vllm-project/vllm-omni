@@ -148,10 +148,14 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         evaluated on the top-k-filtered distribution. The largest candidate
         is never removed (total mass 1 > 1 - top_p for top_p < 1), so the
         eager guard ``remove[..., -1:] = False`` holds by construction.
-        Ties are ordered by candidate index, matching the ascending cumsum the
-        eager path takes over ``torch.sort``: inside a tie group the cumsum is
-        the strict prefix plus ``k`` copies of the (equal) ``q``, so a member's
-        fate depends only on its position within the group. ``-inf`` top-k
+        Ties are ordered by candidate index: inside a tie group the cumsum is
+        the strict prefix plus ``k`` copies of the (equal) ``q``, so a group
+        keeps the same number of members whatever order it is walked in.
+        Which members those are does depend on the order -- here the order
+        ``torch.topk`` returns, in the eager path the order of ``torch.sort``
+        with its default ``stable=False`` -- and neither order is specified,
+        so only the kept count and the kept values are guaranteed to match
+        the eager path, not the identity of the kept members. ``-inf`` top-k
         padding candidates carry zero prob and sort before every finite value,
         so both paths always remove them.
 
@@ -712,16 +716,18 @@ def _topk_topp_fused(
     """Fused top-k + top-p mask on NPU; ``None`` falls back to the eager chain.
 
     One ``torch.topk`` for the candidate set, one Triton kernel for both
-    masks. The returned row is what the eager top-k/top-p pair would produce:
-    kept candidates keep their original logit, everything else is ``-inf``.
-    The caller's softmax + ``torch.multinomial`` input is therefore unchanged
-    in shape, dtype and RNG stream.
+    masks. The returned row matches the eager top-k/top-p pair on the kept
+    count, the kept logits and the ``-inf`` elsewhere; with tied finite
+    logits the kept *members* may differ, since neither this kernel's tie
+    order (``torch.topk``'s) nor the eager one (``torch.sort``'s) is
+    specified. The caller's softmax + ``torch.multinomial`` input is
+    therefore unchanged in shape, dtype and RNG stream.
     """
     global _TAIL_FUSION_OK
     if not _TAIL_FUSION_OK or logits.device.type != "npu":
         return None
-    # The kernel's grid is (1,): it masks exactly one row, and every other row
-    # of ``out`` would stay uninitialised. Batched logits go to the eager chain.
+    # The kernel's grid is (1,): it scatters into exactly one row of the host
+    # pre-filled ``out``. Batched logits go to the eager chain instead.
     if logits.dim() != 2 or int(logits.shape[0]) != 1:
         return None
     keep = min(int(logits.shape[-1]), int(top_k))

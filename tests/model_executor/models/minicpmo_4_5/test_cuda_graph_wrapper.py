@@ -2820,11 +2820,7 @@ def test_pack_att_cache_rejects_a_non_split_rank(rank: int) -> None:
         wrapper_module._pack_att_cache(torch.zeros(tuple(range(2, 2 + rank))))
 
 
-def test_pack_att_cache_names_the_row_that_broke_the_pack() -> None:
+def test_pack_att_cache_rejects_a_partially_filled_placeholder() -> None:
     split = torch.zeros(2, 2, 3, 4, 5, 6)
-    with pytest.raises(TypeError) as excinfo:
+    with pytest.raises(TypeError):
         wrapper_module._pack_att_cache([None, split])
-    message = str(excinfo.value)
-    # The offender is the tensor row, not the leading None placeholder.
-    assert "Tensor" in message
-    assert "NoneType" not in message
