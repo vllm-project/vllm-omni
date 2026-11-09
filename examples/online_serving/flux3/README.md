@@ -38,28 +38,47 @@ vllm serve /path/to/flux-3-image-klein --omni \
     --port 8099
 ```
 
-## 2. Run the client
+## 2. Send requests
 
-By default the client omits guidance scale, step count, and flow shift so the
-server uses the package defaults:
+Omitted sampling fields (`num_inference_steps`, `guidance_scale`,
+`flow_shift`) use the package defaults. Flow-map (distilled) packages reject
+an explicit `guidance_scale` and a nonempty `negative_prompt`; base packages
+accept both.
 
-Each invocation sends one request. Without `--image`, the client uses the
-text-to-image endpoint; supplying `--image` selects image-to-image.
+Text-to-image with the shared client, run from the repository root:
 
 ```bash
-# Text-to-image
-python openai_client.py --model flux-3-image-klein --prompt "alpine meadow at golden hour"
-
-# Image-to-image
-python openai_client.py --model flux-3-image-klein --prompt "restyle as watercolor" --image photo.jpg
-
-# Multiple reference images, in input order
-python openai_client.py --prompt "dress the person from image 1 in the clothing from image 2" --image person.jpg clothing.jpg
+python examples/online_serving/text_to_image/openai_chat_client.py \
+    --server http://localhost:8099 \
+    --prompt "alpine meadow at golden hour" \
+    --height 1024 --width 1024 \
+    --output flux3_t2i.png
 ```
 
-Explicit `--steps` and `--flow-shift` override package defaults. Explicit
-`--guidance-scale` and nonempty `--negative-prompt` are rejected for distilled
-packages; omit them. For base packages, those options remain available.
+Or call the Images API directly:
+
+```bash
+curl -s http://localhost:8099/v1/images/generations \
+    -H "Content-Type: application/json" \
+    -d '{"model": "flux-3-image-klein", "prompt": "alpine meadow at golden hour",
+         "size": "1024x1024", "n": 1, "response_format": "b64_json", "seed": 42}' \
+    | jq -r '.data[0].b64_json' | base64 -d > flux3_t2i.png
+```
+
+Image-to-image sends the references as `image_url` parts of one chat message,
+in reference order (up to 10):
+
+```bash
+IMG1=$(base64 -w0 person.jpg); IMG2=$(base64 -w0 clothing.jpg)
+curl -s http://localhost:8099/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "flux-3-image-klein", "seed": 42, "height": 1024, "width": 1024,
+         "messages": [{"role": "user", "content": [
+           {"type": "text", "text": "dress the person from image 1 in the clothing from image 2"},
+           {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG1"'"}},
+           {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG2"'"}}]}]}' \
+    | jq -r '.choices[0].message.content[0].image_url.url' | cut -d, -f2 | base64 -d > flux3_i2i.png
+```
 
 ## 3. API endpoints
 
@@ -105,22 +124,26 @@ docker run --name flux-3-image-klein-pup-vllm \
       --reasoning-parser qwen3
 ```
 
-`openai_client_pup.py` fetches the system prompts from the Hub and prints the caption.
-Without `--image` it uses the text-to-image prompt; with `--image` (repeatable, up to 10)
-the editing prompt, references first. `--bbox` switches to the `t2i_bbox` / `i2i_bbox`
-prompts, which return the caption followed by a JSON element table with one
-`[y_min, x_min, y_max, x_max]` box (0-1000 grid) per cited element; `--boxes` passes your
-own boxes as a JSON array after the request:
+The caption request follows the model card:
+
+- System prompt: the `t2i` entry of `system_prompts.json` (in the pup repository)
+  for text-to-image, or `i2i` for editing. The `t2i_bbox` / `i2i_bbox` entries
+  return the caption followed by a JSON element table with one
+  `[y_min, x_min, y_max, x_max]` box (0-1000 grid) per cited element.
+- Editing: send the reference images first (up to 10), then the text
+  `Reference images follow in order (the first image, the second image, ...).\nUser request: <request>\nOutput the caption.`
+- Sampling: `temperature: 0`, `max_tokens: 3584`,
+  `chat_template_kwargs: {"enable_thinking": false}`, and `presence_penalty`
+  1.5 for text-to-image or 0 for editing.
 
 ```bash
-# Text-to-image
-python openai_client_pup.py --prompt "A man walking with his dog, afternoon sun"
-
-# Editing with a reference image
-python openai_client_pup.py --prompt "put a red bandana around the dog's neck" --image dog.jpg
-
-# Layout: caption plus bounding-box table
-python openai_client_pup.py --prompt "A man walking with his dog, afternoon sun" --bbox
+SYSTEM=$(hf download black-forest-labs/flux-3-image-klein-pup system_prompts.json | xargs jq -r .t2i)
+jq -n --arg system "$SYSTEM" --arg request "A man walking with his dog, afternoon sun" '{
+    model: "flux-3-image-klein-pup", max_tokens: 3584, temperature: 0, presence_penalty: 1.5,
+    chat_template_kwargs: {enable_thinking: false},
+    messages: [{role: "system", content: $system}, {role: "user", content: $request}]}' \
+  | curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d @- \
+  | jq -r '.choices[0].message.content'
 ```
 
-Feed the printed caption to `openai_client.py --prompt` to generate the image.
+Use the printed caption as the FLUX 3 Image Klein prompt.

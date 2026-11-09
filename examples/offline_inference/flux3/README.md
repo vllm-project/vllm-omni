@@ -26,49 +26,48 @@ package includes a Diffusers pipeline index.
 
 ## Quick start
 
+FLUX 3 Image Klein uses the shared offline runners. Run them from the
+repository root:
+
 ```bash
-# Run text-to-image with the default prompt
-python end2end.py --model /path/to/flux-3-image-klein
-
-# Run image-to-image with a reference
-python end2end.py --model /path/to/flux-3-image-klein --prompt "restyle as watercolor" --image ref.jpg
-
-# Multiple reference images, in input order
-python end2end.py --model /path/to/flux-3-image-klein --prompt "dress the person from image 1 in the clothing from image 2" --image person.jpg clothing.jpg
-
-# Custom prompt and resolution
-python end2end.py --model /path/to/flux-3-image-klein \
+# Text-to-image
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model /path/to/flux-3-image-klein \
     --prompt "A fox sitting in a sunlit forest" \
-    --height 720 --width 1280 \
-    --num-inference-steps 50
+    --height 1024 --width 1024 \
+    --num-inference-steps 50 --guidance-scale 4.0 \
+    --output flux3_t2i.png
+
+# Image-to-image with one or more references, in input order
+python examples/offline_inference/image_to_image/image_edit.py \
+    --model /path/to/flux-3-image-klein \
+    --prompt "dress the person from image 1 in the clothing from image 2" \
+    --image person.jpg clothing.jpg \
+    --guidance-scale 4.0 \
+    --output flux3_i2i.png
 ```
 
-When height and width are omitted, FLUX 3 Image Klein uses the package sampler default
-(`1024x1024` for text-to-image). For image-to-image, the reference image aspect
-ratio is preserved at the same default area.
+Height and width must be multiples of 16. Pass the flow shift through
+`--extra-body '{"flow_shift": 3.0}'` (`text_to_image.py`) or
+`--extra-args '{"flow_shift": 3.0}'` (`image_edit.py`).
+
+The shared offline runners always send an explicit guidance scale. Flow-map
+(distilled) packages reject `guidance_scale`, so run them through the
+[online API](../../online_serving/flux3/README.md), which omits unset sampling
+fields and applies the package defaults.
 
 ## Inputs
 
-Each invocation generates one image. The prompt and optional reference image
-are forwarded directly to the model:
+Each request generates one image; `num_outputs_per_prompt` above one is
+rejected.
 
 | Inputs | Generation |
 | --- | --- |
-| `--prompt` (or the default prompt) | Text-to-image |
-| `--prompt` and `--image` | Image-to-image |
+| `--prompt` | Text-to-image |
+| `--prompt` and `--image` (up to 10 references) | Image-to-image |
 
-Omitted guidance, step count, and flow shift use the model package's defaults.
-
-See the [online serving README](../../online_serving/flux3/README.md) for
-server startup and client examples.
-
-## Outputs
-
-Outputs default to `outputs/` in the current working directory. Use
-`--output-dir` to change the location.
-
-The generated image is saved as `image.png`. Use different output directories to
-keep results from separate runs.
+When height and width are omitted for image-to-image, the reference aspect
+ratio is preserved at the package's default area.
 
 ## Benchmark
 
