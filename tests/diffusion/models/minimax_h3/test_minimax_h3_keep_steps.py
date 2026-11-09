@@ -963,6 +963,9 @@ def test_pinned_schedule_step_counts_diverge_between_intake_and_diffusion(monkey
     pipeline._base_schedule_by_partition["ref2va"] = SimpleNamespace(
         num_inference_steps=4, base_schedule=(1.0, 0.6, 0.3, 0.0)
     )
+    # num_inference_steps is left unspecified so the case matches the
+    # documented divergence scenario exactly: the resolver returns the
+    # pinned schedule's own count (4).
     sampling = OmniDiffusionSamplingParams(
         quality="lossless", fps=24, extra_args={"task": "ref2va", "keep_steps": 4}
     )

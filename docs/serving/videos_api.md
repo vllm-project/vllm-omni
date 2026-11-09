@@ -555,8 +555,9 @@ curl -s http://localhost:8091/v1/videos/sync \
 - `keep_steps=5` is the validated value for 20-step Ref2VA. Smaller values
   still follow the macro timeline but can lose fine contact details: at
   `keep_steps=3` the same benchmark kept the walk → stop → sit → groom
-  structure yet misplaced the tongue during the paw-lick close-up. The speed
-  curve is flat between 3 and 8, so there is little reason to go lower.
+  structure yet misplaced the tongue during the paw-lick close-up. The two
+  measured points differ by only 4.3% in engine time, so there is little
+  reason to go below 5.
 - Requires task `ref2va` with image reference(s) plus exactly one silent video
   reference. Rejected with explicit client errors when combined with audio
   references (`audio_mode=lock_source` included), latent-mask editing, control
