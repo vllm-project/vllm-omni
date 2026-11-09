@@ -367,11 +367,15 @@ def validate_multiview_request(
         )
     for hint in selected_hints:
         value = extra[hint]
-        if value is not True and (not isinstance(value, Mapping) or set(value) - {"weight"}):
-            raise ValueError("Cosmos3 multiview controls must be supplied per view; hint must be true or {weight}.")
-        weight = 1.0 if value is True else value.get("weight", 1.0)
+        if value is not True and (not isinstance(value, Mapping) or set(value) - {"control_weight"}):
+            raise ValueError(
+                "Cosmos3 multiview controls must be supplied per view; hint must be true or {control_weight}."
+            )
+        # Same field as single-view transfer. Weights are normalized over the
+        # selected hints, so the single multiview hint always resolves to 1.0.
+        weight = 1.0 if value is True else value.get("control_weight", 1.0)
         if isinstance(weight, bool) or not isinstance(weight, int | float) or not math.isfinite(weight) or weight <= 0:
-            raise ValueError("Cosmos3 multiview control weight must be finite and positive.")
+            raise ValueError("Cosmos3 multiview control_weight must be finite and positive.")
     for field in ("vision", "control"):
         values = [view.get(f"{field}_path", view.get(field)) for view in views]
         present = [value is not None for value in values]

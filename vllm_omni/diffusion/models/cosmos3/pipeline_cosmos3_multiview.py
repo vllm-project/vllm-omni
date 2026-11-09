@@ -413,8 +413,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if lengths_by_text is not None:
             kwargs["caption_lengths"] = lengths_by_text[kwargs["text_ids"].data_ptr()]
         # The shared transfer loop passes these to every branch. Captions are
-        # already compacted, hints carry no per-control weight, and the LiDAR
-        # condition prefix is applied by _apply_transfer_condition.
+        # already compacted, the single hint's normalized weight is always 1.0,
+        # and the LiDAR condition prefix is applied by _apply_transfer_condition.
         for key in ("text_mask", "control_weights", "lidar_condition_latents"):
             kwargs.pop(key, None)
         return super().predict_noise(**kwargs)

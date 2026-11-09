@@ -292,7 +292,8 @@ For strict Ulysses CP, set `--num-gpus` to the total GPU count and add
 JSON-encoded `extra_params` form field. The manifest carries `multiview.views`,
 one entry per camera with `camera_key`, `prompt` and, for transfer or view
 completion, `control_path`; I2V or prefix conditioning adds `vision_path`.
-Transfer requests also set exactly one hint (`"wsm": {}`). Set
+Transfer requests also set exactly one hint (`"wsm": {}`). As the only hint,
+its optional `control_weight` always normalizes to 1.0. Set
 `multiview.condition_video_as_image: true` to condition on the first frame only.
 Add a top-level `lidar` object for joint requests:
 
