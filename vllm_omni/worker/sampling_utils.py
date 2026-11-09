@@ -10,7 +10,7 @@ from vllm.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
     # Model Runner V1 only (removed upstream in vllm-project/vllm#63373). The
-    # MRv2 runner imports this module, so keep these out of module import.
+    # MRv2 runner imports this module, so keep it out of module import.
     from vllm.v1.sample.logits_processor import LogitsProcessors
 
 logger = init_logger(__name__)
