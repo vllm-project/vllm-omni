@@ -686,8 +686,8 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
-Qwen3-Omni supports resident Thinker requests in the V1 and CUDA MRv2 duplex
-profiles, using the upstream resumable streaming-input
+Qwen3-Omni supports resident Thinker requests in its duplex profile on both
+V1 and CUDA MRv2, using the upstream resumable streaming-input
 request path. A continued request drains its previous turn's in-flight outputs
 before worker delivery state is reset; other sessions remain schedulable. The
 `supports_core_resumable_request` capability is resolved from engine settings;

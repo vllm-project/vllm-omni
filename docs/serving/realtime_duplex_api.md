@@ -53,8 +53,8 @@ Talker and Code2Wav remain per-turn and do not enable prefix caching.
 
 Continuation is selected from the resolved engine configuration: stage 0 must
 use Model Runner V1 or CUDA MRv2, prefix caching, async-chunk transport and no speculative
-decoding. The existing V1 profile enables asynchronous scheduling; synchronous
-scheduling also supports continuation. At a turn boundary, only the continued
+decoding. The profile runs MRv2 on CUDA and V1 on other platforms. Both
+asynchronous and synchronous scheduling support continuation. At a turn boundary, only the continued
 request waits for its previous in-flight outputs to drain before resetting
 worker delivery state. Other sessions continue to run. Unsupported combinations
 retain fresh per-turn Thinker requests; startup logs the reason and the session reports

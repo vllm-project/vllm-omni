@@ -13,9 +13,9 @@ profile. Preserve a control with `code_predictor_fused_sampling=false` and
 `codec_cudnn_benchmark=false` when C64 P99 is the primary requirement.
 cuDNN search restores process settings on exit and has startup cost. Kernel
 arithmetic is not bitwise-equivalent; the first-frame decoder uses additional
-model memory. `vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` runs these MRv2
-stages for duplex. Qwen duplex submits each committed utterance as a new
-request, so it uses the turn-mode data plane. Turn-mode measurements do not
+model memory. `vllm_omni/deploy/qwen3_omni_duplex.yaml` runs these MRv2
+stages for duplex on CUDA. Its Thinker request stays resident across turns,
+while Talker and Code2Wav remain per-turn. Turn-mode measurements do not
 establish duplex latency or interruption behavior.
 
 First-frame delivery requires `talker_first_audio: true` in connector extra,
@@ -46,7 +46,7 @@ startup; `enforce_eager: true` on stage 2 disables inner graphs. NPU audio uses 
 host materialization path before the native data plane publishes output and
 releases each chunk slot. CUDA retains its asynchronous output path. This
 adaptation alone does not establish a performance or audio-quality gain.
-The duplex profile remains on MRv1.
+The duplex profile keeps NPU on MRv1.
 
 ## Ascend prefix cache
 

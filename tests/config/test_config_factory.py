@@ -1727,8 +1727,9 @@ stages:
             platform=platform,
         )
         duplex_stages = merge_pipeline_deploy(pipeline, duplex)
-        assert duplex.model_runner == "v1"
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [False, False, False]
+        duplex_v2 = platform == "cuda"
+        assert duplex.model_runner == ("v2" if duplex_v2 else "v1")
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [duplex_v2] * 3
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2105,12 +2106,7 @@ stages:
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", True),
-            ("qwen3_omni_duplex_mrv2.yaml", "cuda", True),
-            *(
-                (profile, platform, False)
-                for profile in ("qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml")
-                for platform in ("npu", "rocm", "xpu", "musa")
-            ),
+            *(("qwen3_omni_duplex.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
             *(
                 (yaml_name, platform, False)
@@ -2151,7 +2147,7 @@ stages:
         stages = merge_pipeline_deploy(pipeline, deploy)
         stage0 = next(stage for stage in stages if stage.stage_id == 0)
         assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
-        if yaml_name in ("qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"):
+        if yaml_name == "qwen3_omni_duplex.yaml":
             assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages if stage.stage_id > 0)
 
     @pytest.mark.parametrize("runner", ["v1", "v2"])

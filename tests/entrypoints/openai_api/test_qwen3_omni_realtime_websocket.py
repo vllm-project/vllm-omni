@@ -1084,14 +1084,14 @@ class _DuplexTestRuntime(NamedTuple):
 
 
 @pytest.fixture(scope="class")
-def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
+def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
     """Load real weights once for all interruption repetitions and history checks."""
     from transformers import AutoProcessor
 
     assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
     artifacts = tmp_path_factory.mktemp("qwen_duplex_playback")
     deploy = artifacts / "deploy.yaml"
-    base_path = get_deploy_config_path(getattr(request, "param", "qwen3_omni_duplex.yaml"))
+    base_path = get_deploy_config_path("qwen3_omni_duplex.yaml")
     base_session = load_deploy_config(base_path).duplex_session
     # An absolute base keeps the production YAML's relative inheritance intact
     # when the test's Silero override lives in a temporary directory.
@@ -1647,7 +1647,6 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
-    @pytest.mark.parametrize("qwen_duplex_server", ["qwen3_omni_duplex.yaml"], indirect=True)
     def test_resident_thinker_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         events_path = tmp_path / "events.json"
         asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path, direct_append=True))
@@ -1666,11 +1665,6 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.advanced_model
-    @pytest.mark.parametrize(
-        "qwen_duplex_server",
-        ["qwen3_omni_duplex_mrv2.yaml"],
-        indirect=True,
-    )
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
         stats = asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
         # Six turns preserve multimodal history, then prune its oldest turn.
