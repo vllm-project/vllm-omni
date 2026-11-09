@@ -5,9 +5,8 @@
 Exercise the real connector poll and scheduler update methods with simulated
 transfer results. These CPU tests do not read external caches or run a model.
 
-Recovery tests explicitly use ``kv_load_failure_policy="recompute"``, as did
-the M0 native Qwen/Mooncake recomputation validation. The upstream default is
-``"fail"``: failed loads terminate the request instead of recomputing its prefix.
+Failed receives trigger recomputation only with ``kv_load_failure_policy="recompute"``.
+The default ``"fail"`` policy terminates the request with an error.
 """
 
 from types import MethodType, SimpleNamespace
