@@ -423,6 +423,19 @@ pending sample or send-offset state. Routing is captured on the execution
 thread; connector cancellation still controls which payloads can be sent.
 The synchronous speculative path retains committed-ID embedding lookup.
 
+Both speculative span formats clip token IDs and embedding rows before the
+first `<tool_call>` marker. The sender retains the existing request-local
+speech-cut state so later tool-argument chunks cannot become Talker input.
+A marker at the first generated position releases any withheld prompt prefill
+without appending a generated embedding; connector terminal markers still
+follow the normal completion path.
+
+Qwen3-Omni with DFlash currently rejects resumable (streaming-input) requests
+at orchestrator admission with a request-local 400 error. Its multi-token
+payload spans do not yet support the Talker's resumable segment handling.
+Use non-resumable requests, or disable DFlash for streaming input. This
+restriction applies with either synchronous or asynchronous materialization.
+
 An unsupported combination does not prevent serving; it only falls back to
 synchronous output construction for that stage. CUDA and ROCm are the validated
 platforms. XPU inherits `GPUARModelRunner`, and MUSA selects `GPUARWorker`, so

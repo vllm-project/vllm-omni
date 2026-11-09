@@ -25,7 +25,7 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_hidden_state_rows
-from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID, spoken_span_end
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -530,6 +530,8 @@ def thinker2talker_async_chunk(
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
     payload_meta = multimodal_output.get("meta", {})
     decode_span = bool(payload_meta.get("decode_span", False)) if isinstance(payload_meta, Mapping) else False
+    if decode_span and _tool_speech_is_cut(transfer_manager, request_id):
+        return None
     payload_ids = multimodal_output.get("ids", {})
     payload_committed_ids = payload_ids.get("output") if isinstance(payload_ids, Mapping) else None
     raw_committed_ids = payload_committed_ids if decode_span and payload_committed_ids is not None else new_token_ids
@@ -604,14 +606,24 @@ def thinker2talker_async_chunk(
             if is_finished and not getattr(request, "resumable", False):
                 committed_ids = committed_ids[:-1]
                 thinker_emb = thinker_emb[:-1]
-        if not committed_ids:
+        spoken_end = spoken_span_end(committed_ids, 0, len(committed_ids))
+        reached_tool_call = spoken_end < len(committed_ids)
+        committed_ids = committed_ids[:spoken_end]
+        thinker_emb = thinker_emb[:spoken_end]
+        if not committed_ids and not reached_tool_call:
             return None
         token_end = token_start + len(committed_ids)
 
+        # Preserve a withheld prefill before marking the speech cut: the
+        # marker shares request_payload storage with that first-chunk state.
+        saved = transfer_manager.request_payload.pop(request_id, None) if chunk_id == 0 else None
+        if reached_tool_call:
+            _mark_tool_speech_cut(transfer_manager, request_id)
+
         # A prefill-only chunk 0 may have been held until a generated token
-        # became available. Flush it together with the first committed span.
+        # became available. A tool-only response must release it too, without
+        # appending the marker or any tool arguments to the Talker prompt.
         if chunk_id == 0:
-            saved = transfer_manager.request_payload.pop(request_id, None)
             if isinstance(saved, dict) and saved.get("embed", {}).get("prefill") is not None:
                 saved_prefill = saved["embed"]["prefill"]
                 saved_hidden = saved.get("hidden_states", {}).get("output")
@@ -637,6 +649,8 @@ def thinker2talker_async_chunk(
                     language=language,
                 )
 
+        if not committed_ids:
+            return None
         return OmniPayloadStruct(
             meta=MetaStruct(
                 finished=torch.tensor(is_finished, dtype=torch.bool),

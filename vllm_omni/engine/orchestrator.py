@@ -3962,6 +3962,23 @@ class Orchestrator(OrchestratorBase):
             return
 
         if getattr(prompt, "resumable", False):
+            for active_stage_id in range(stage_id, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+                vllm_config = getattr(self.stage_pools[active_stage_id], "stage_vllm_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                hf_config = getattr(model_config, "hf_config", None)
+                spec_config = getattr(vllm_config, "speculative_config", None)
+                if (
+                    getattr(hf_config, "model_type", None) == "qwen3_omni_moe"
+                    and spec_config is not None
+                    and spec_config.use_dflash()
+                ):
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        f"streaming (resumable) input is not supported with Qwen3-Omni DFlash on stage "
+                        f"{active_stage_id}; disable DFlash for streaming input or use a non-resumable request",
+                    )
+                    return
             mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
             if mrv2_stage_id is not None:
                 # Streaming-input sessions replace downstream prompts through
