@@ -54,7 +54,9 @@ class _CheckpointProxy(nn.Module):
                 raise ValueError(f"Missing checkpoint tensor {checkpoint_key!r} in {directory}")
             tensor = torch.empty(entry.size, dtype=entry.properties.dtype, device="meta")
             proxy_tensor_name = f"tensor_{index}"
-            if tensor.ndim and (tensor.is_floating_point() or tensor.is_complex()):
+            # FSDP2 shards Parameters of any dtype, including packed uint8
+            # NVFP4 weights, but not scalars or buffers.
+            if tensor.ndim:
                 self.register_parameter(proxy_tensor_name, nn.Parameter(tensor, requires_grad=False))
             else:
                 self.register_buffer(proxy_tensor_name, tensor)
@@ -316,7 +318,12 @@ def _process_and_shard_group(
             post_load()
     # Loading and backend processing can replace Parameters; refresh references
     # here without moving unfinished groups or changing ordinary HSDP loading.
-    ignored = _unshardable_parameters(module)
+    # Packed integer weights (NVFP4 uint8, Marlin int32) are sharded like the
+    # proxy's parameters; only scalars stay replicated. Replicating them would
+    # need every GPU to hold the whole quantized model.
+    ignored = _unshardable_parameters(module, shard_non_floating=True)
+    # vLLM's MoE quant config holds the full block scales; a sharded copy would go unused.
+    ignored.update(p for n, p in module.named_parameters() if n.endswith(("w13_weight_scale", "w2_weight_scale")))
     for name in getattr(root, "_hsdp_ignored_modules", ()):
         ignored.update(root.get_submodule(name).parameters())
     # Reuse the mesh, but derive precision after each group's postprocessing:

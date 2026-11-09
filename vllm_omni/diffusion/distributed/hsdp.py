@@ -21,12 +21,12 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
-def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
-    """Return packed/integer or scalar parameters unsupported by FSDP2."""
+def _unshardable_parameters(model: nn.Module, *, shard_non_floating: bool = False) -> set[nn.Parameter]:
+    """Return parameters to exclude from sharding: scalars, plus non-floating ones unless shard_non_floating."""
     return {
         param
         for param in model.parameters()
-        if param.ndim == 0 or not (param.is_floating_point() or param.is_complex())
+        if param.ndim == 0 or (not shard_non_floating and not (param.is_floating_point() or param.is_complex()))
     }
 
 

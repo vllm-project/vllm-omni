@@ -236,7 +236,9 @@ and native or emulated NVFP4 with TP 2 and 4, Ulysses SP 2 and 4, CFG 2, and
 the pairwise TP/SP/CFG combinations, and with HSDP alone, with Ulysses SP or
 CFG, and with `hsdp_replicate_size=2`. HSDP cannot be combined with CPU offload.
 Under HSDP, NVFP4 packed weights stay replicated, so their memory does not
-shrink with the shard count.
+shrink with the shard count, except with `hsdp_weight_load_strategy="pre_sharded"`,
+which shards them like the other parameters (only scalar global scales stay
+replicated).
 
 Without HSDP, the live-weight design is compatible with model-level and
 standard layer-wise offload, but those paths still require GPU end-to-end

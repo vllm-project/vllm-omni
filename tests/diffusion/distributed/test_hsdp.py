@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DeviceMesh, DTensor
 from vllm.utils.network_utils import get_file_store_init_method
 
@@ -54,6 +55,7 @@ def cpu_process_group():
 
 
 def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
+    # Default behavior, used by every non-pre-sharded model: unchanged.
     model = _PackedModel()
     ignored_params = _unshardable_parameters(model)
     expected_ignored = {model.block.packed_weight, model.block.input_global_scale}
@@ -74,6 +76,40 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert model.block.input_global_scale is input_global_scale
     assert not isinstance(model.block.packed_weight, DTensor)
     assert not isinstance(model.block.input_global_scale, DTensor)
+
+
+def test_hsdp_shards_packed_and_keeps_scalar_parameters_local_when_requested(cpu_process_group):
+    # Opt-in used by the pre-sharded checkpoint-proxy loader.
+    model = _PackedModel()
+    ignored_params = _unshardable_parameters(model, shard_non_floating=True)
+    assert ignored_params == {model.block.input_global_scale}
+
+    packed_values = torch.arange(4, dtype=torch.uint8).reshape(2, 2) * 37
+    model.block.packed_weight.data.copy_(packed_values)
+    input_global_scale = model.block.input_global_scale
+    shard_model(
+        model,
+        mesh=DeviceMesh("cpu", [0]),
+        # unshard() needs a real policy; bf16 gathers must not touch the uint8 bytes.
+        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        hsdp_shard_conditions=[lambda name, _module: name == "block"],
+        ignored_params=ignored_params,
+    )
+
+    assert isinstance(model.block.weight, DTensor)
+    assert isinstance(model.root_weight, DTensor)
+    assert isinstance(model.block.packed_weight, DTensor)
+    assert model.block.packed_weight.dtype == torch.uint8
+    assert model.block.input_global_scale is input_global_scale
+    assert not isinstance(model.block.input_global_scale, DTensor)
+
+    # A gather must return the packed bytes unchanged (no mixed-precision cast).
+    model.block.unshard()
+    gathered = model.block.packed_weight
+    assert not isinstance(gathered, DTensor)
+    assert gathered.dtype == torch.uint8
+    torch.testing.assert_close(gathered, packed_values, rtol=0, atol=0)
+    model.block.reshard()
 
 
 def test_hsdp_resolves_nested_ignored_module_and_preserves_mixed_dtypes(
@@ -358,6 +394,8 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
             self.block = nn.Linear(3, 4, bias=False)
             self.time_embedder = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
             self.root_weight = nn.Parameter(torch.zeros(2))
+            self.packed_weight = nn.Parameter(torch.zeros(2, 3, dtype=torch.uint8), requires_grad=False)
+            self.w13_weight_scale = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
             self.register_buffer("scratch", torch.tensor([7.0]), persistent=False)
             release_module_parameters_to_meta(self.block)
 
@@ -370,6 +408,8 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
     tensors = {
         "block.weight": torch.arange(12, dtype=torch.float32).reshape(4, 3),
         "root_weight": torch.tensor([2.0, 3.0]),
+        "packed_weight": torch.tensor([[0, 17, 255], [128, 1, 254]], dtype=torch.uint8),
+        "w13_weight_scale": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         "time_embedder.weight": torch.arange(4, dtype=torch.bfloat16).reshape(2, 2),
     }
     save_file(tensors, str(tmp_path / "model.safetensors"))
@@ -394,7 +434,11 @@ def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path
             assert not isinstance(actual, DTensor)
             assert actual.dtype == torch.float32
             torch.testing.assert_close(actual, expected.float())
+        elif name == "w13_weight_scale":
+            assert not isinstance(actual, DTensor)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             assert isinstance(actual, DTensor)
-            torch.testing.assert_close(actual.to_local(), expected)
+            assert actual.dtype == expected.dtype
+            torch.testing.assert_close(actual.to_local(), expected, rtol=0, atol=0)
     torch.testing.assert_close(model.transformer.scratch, torch.tensor([7.0]))
