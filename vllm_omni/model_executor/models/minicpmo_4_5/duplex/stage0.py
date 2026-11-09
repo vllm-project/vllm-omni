@@ -103,6 +103,10 @@ class _MiniCPMO45Stage0SessionState:
     turn_unit_has_text: bool = False
     #: Consecutive units that tried to end the turn without emitting text.
     textless_turn_end_units: int = 0
+    #: Decoded tail of the open turn, updated when a text token is recorded.
+    open_turn_tail: str = ""
+    #: How many turn_eos samples this turn has already held.
+    held_turn_ends: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -194,13 +194,21 @@ class _SentenceTokenizer:
         return "".join(glyphs.get(int(token_id), "") for token_id in ids)
 
 
-def _turn_end_model(generated: list[int], *, unit_has_text: bool, textless_units: int = 0):
+def _turn_end_model(
+    generated: list[int],
+    *,
+    unit_has_text: bool,
+    textless_units: int = 0,
+    held_turn_ends: int = 0,
+):
     """One greedy row whose open turn has already emitted ``generated``."""
     state = SimpleNamespace(
         generated_tokens=list(generated),
         current_turn_ended=False,
         turn_unit_has_text=unit_has_text,
         textless_turn_end_units=textless_units,
+        open_turn_tail=_SentenceTokenizer().decode(generated),
+        held_turn_ends=held_turn_ends,
         pending_terminator_token=None,
         last_terminator_token=None,
         pending_speech_response_open=False,
@@ -245,6 +253,7 @@ def test_unfinished_sentence_holds_turn_eos_as_chunk_eos(deferred, monkeypatch):
     assert state.current_turn_ended is False
     assert state.generated_tokens == [20]
     assert state.textless_turn_end_units == 0
+    assert state.held_turn_ends == 1
 
 
 @pytest.mark.parametrize("deferred", [False, True])
@@ -271,6 +280,18 @@ def test_first_textless_unit_still_holds_an_unfinished_turn(deferred, monkeypatc
     assert sampled == CHUNK_EOS
     assert state.current_turn_ended is False
     assert state.textless_turn_end_units == 1
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_hold_cap_accepts_turn_eos_on_an_unfinished_sentence(deferred, monkeypatch):
+    model, state, logits, md = _turn_end_model(
+        [20],
+        unit_has_text=True,
+        held_turn_ends=MiniCPMO45DuplexPolicy.MAX_HELD_UNFINISHED_TURN_ENDS,
+    )
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert sampled == TOKEN_IDS["turn_eos_token_id"]
+    assert state.current_turn_ended is True
 
 
 class _NoHostReads(TorchDispatchMode):

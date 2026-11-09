@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
@@ -694,11 +695,8 @@ def _decode_native_duplex_token_ids(
         return ""
 
 
-# A turn whose text ends with one of these (after closing quotes and brackets)
-# is treated as having ended a sentence; anything else as cut off mid-sentence.
-_SENTENCE_END_PUNCTUATION = "。！？.!?…"
-_CLOSING_PUNCTUATION = "\"'”’」』）)】"
-_TURN_TEXT_TAIL_CHARS = 16
+# Same sentence boundary Stage 0 uses when deciding whether to hold turn_eos.
+_TURN_TEXT_TAIL_CHARS = MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS
 
 
 def _native_duplex_segment_output_ids(
@@ -786,8 +784,7 @@ def _native_duplex_turn_text_ends_sentence(streaming_context, *, request_id: str
     state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
     if not isinstance(state, dict) or state.get("request_id") != request_id:
         return False
-    tail = str(state.get("turn_text_tail") or "").rstrip().rstrip(_CLOSING_PUNCTUATION)
-    return bool(tail) and tail[-1] in _SENTENCE_END_PUNCTUATION
+    return MiniCPMO45DuplexPolicy.turn_text_ends_sentence(str(state.get("turn_text_tail") or ""))
 
 
 def _native_duplex_forwarded_hidden_rows(
