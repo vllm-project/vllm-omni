@@ -182,6 +182,97 @@ def test_tied_nucleus_boundaries_match_the_dense_filter(n, top_p, dtype):
     torch.testing.assert_close(actual, expected)
 
 
+class _SentenceTokenizer:
+    """Ids 20 and 21 are the only decoded text. Special ids decode to empty."""
+
+    bad_token_ids = list[int]()
+    all_special_ids = sorted(TOKEN_IDS.values())
+
+    def decode(self, ids, skip_special_tokens=False):
+        del skip_special_tokens
+        glyphs = {20: "正", 21: "。"}
+        return "".join(glyphs.get(int(token_id), "") for token_id in ids)
+
+
+def _turn_end_model(generated: list[int], *, unit_has_text: bool, textless_units: int = 0):
+    """One greedy row whose open turn has already emitted ``generated``."""
+    state = SimpleNamespace(
+        generated_tokens=list(generated),
+        current_turn_ended=False,
+        turn_unit_has_text=unit_has_text,
+        textless_turn_end_units=textless_units,
+        pending_terminator_token=None,
+        last_terminator_token=None,
+        pending_speech_response_open=False,
+        pending_speech_context=False,
+    )
+    model = Model.__new__(Model)
+    model.model_stage = "llm"
+    model.max_new_speak_tokens_per_chunk = 20
+    model.max_speak_chars_per_chunk = 28
+    model._minicpmo45_native_duplex_token_ids_cache = dict(TOKEN_IDS)
+    model._minicpmo45_tokenizer_cache = _SentenceTokenizer()
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid": state})
+    model._minicpmo45_duplex_row_sessions = {0: "sid"}
+    model._minicpmo45_duplex_row_payloads = {0: {}}
+    logits = torch.full((1, VOCAB), -20.0)
+    logits[0, TOKEN_IDS["turn_eos_token_id"]] = 10.0
+    md = SimpleNamespace(
+        all_greedy=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([0]),
+        top_p=torch.tensor([1.0]),
+        output_token_ids=[[20]],
+        generators={0: torch.Generator().manual_seed(0)},
+    )
+    return model, state, logits, md
+
+
+def _sample_turn_end(model, logits, md, *, deferred: bool, monkeypatch):
+    if not deferred:
+        monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *args, **kwargs: None)
+    output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+    if deferred:
+        model._commit_minicpmo45_duplex_pending_samples()
+    return int(output.sampled_token_ids.squeeze(-1).tolist()[0])
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unfinished_sentence_holds_turn_eos_as_chunk_eos(deferred, monkeypatch):
+    model, state, logits, md = _turn_end_model([20], unit_has_text=True)
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert sampled == CHUNK_EOS
+    assert state.current_turn_ended is False
+    assert state.generated_tokens == [20]
+    assert state.textless_turn_end_units == 0
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_finished_sentence_keeps_turn_eos(deferred, monkeypatch):
+    model, state, logits, md = _turn_end_model([20, 21], unit_has_text=True)
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert sampled == TOKEN_IDS["turn_eos_token_id"]
+    assert state.current_turn_ended is True
+    assert state.generated_tokens[-1] == TOKEN_IDS["turn_eos_token_id"]
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_second_textless_unit_accepts_turn_eos(deferred, monkeypatch):
+    model, state, logits, md = _turn_end_model([20], unit_has_text=False, textless_units=1)
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert sampled == TOKEN_IDS["turn_eos_token_id"]
+    assert state.current_turn_ended is True
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_first_textless_unit_still_holds_an_unfinished_turn(deferred, monkeypatch):
+    model, state, logits, md = _turn_end_model([20], unit_has_text=False, textless_units=0)
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert sampled == CHUNK_EOS
+    assert state.current_turn_ended is False
+    assert state.textless_turn_end_units == 1
+
+
 class _NoHostReads(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func in (torch.ops.aten._local_scalar_dense.default, torch.ops.aten.is_nonzero.default):

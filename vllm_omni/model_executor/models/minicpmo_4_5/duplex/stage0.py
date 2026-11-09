@@ -99,6 +99,10 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    #: This unit already emitted a text token. Cleared when the unit closes.
+    turn_unit_has_text: bool = False
+    #: Consecutive units that tried to end the turn without emitting text.
+    textless_turn_end_units: int = 0
 
 
 @dataclass(frozen=True, slots=True)
