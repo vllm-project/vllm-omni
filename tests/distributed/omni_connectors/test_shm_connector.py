@@ -346,9 +346,7 @@ def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path)
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
     directory = tmp_path / "deployment"
-    monkeypatch.setattr(
-        module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory)
-    )
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory))
     original_scandir = os.scandir
     scanned = []
 
@@ -376,9 +374,7 @@ def test_missing_wakeup_directory_keeps_payload_transport_working(monkeypatch, t
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
     directory = tmp_path / "missing"
-    monkeypatch.setattr(
-        module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory)
-    )
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory))
     sender, receiver = _stage_connector(88), _stage_connector(89)
     key = f"wake_{uuid.uuid4().hex}"
     try:
@@ -517,9 +513,7 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(
-        module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path)
-    )
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path))
     receiver = _stage_connector(82)
     peer_path = tmp_path / "stage_82_peer"
     os.mkfifo(peer_path, 0o600)
@@ -547,9 +541,7 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 def test_wakeup_ignores_stale_fifo_and_non_fifo_paths(monkeypatch, tmp_path):
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(
-        module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path)
-    )
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path))
     sender, receiver = _stage_connector(83), _stage_connector(84)
     plain = tmp_path / "84_plain"
     plain.write_text("unchanged")
@@ -660,4 +652,3 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
-
