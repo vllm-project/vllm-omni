@@ -23,12 +23,18 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 
 ### Environment
 
+The original two-GPU recipe was validated with:
+
 - OS: Linux
 - Python: 3.10+
 - CUDA: 13.0
 - vLLM version: 0.29.0
 - vLLM-Omni version or commit: 6daf5b30f
-- 2x H100 80GB, or 1x H100 80GB co-located (see [Single-GPU co-location](#single-gpu-co-location-1x-h100))
+- 2x H100 80GB
+
+The single-GPU measurements use the separate environment documented in
+[Single-GPU co-location](#single-gpu-co-location-1x-h100). They do not establish
+single-GPU support for the older versions listed above.
 
 ### Commands
 
@@ -41,8 +47,19 @@ For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer
 
 ## Single-GPU co-location (1x H100)
 
-Both stages also fit on one 80 GB GPU. Copy `vllm_omni/deploy/ming_image.yaml`
-and change three fields (keep `max_num_seqs: 1` on both stages):
+Text-to-image with `inclusionAI/Ming-Image-0.1-Design` was validated on one
+H100 80GB using vLLM 0.31.0 and vLLM-Omni `099f9b553`, on a driver-535 host
+with the CUDA 13.0 forward-compatibility package. These measurements do not
+validate single-GPU image editing or Design-Layer decomposition.
+
+Copy the full deployment configuration:
+
+```bash
+cp vllm_omni/deploy/ming_image.yaml /tmp/ming_image_1gpu.yaml
+```
+
+Edit the following three fields in the copy. Keep the remaining configuration,
+including the connectors and `max_num_seqs: 1` on both stages:
 
 ```yaml
 stages:
@@ -54,26 +71,35 @@ stages:
     gpu_memory_utilization: 0.33   # new
 ```
 
-Validated end to end on one H100 80GB with the text-to-image smoke prompt
-(1024², 12 steps, cfg 1.0, seed 42; vLLM 0.31.0, vLLM-Omni 099f9b553,
-first request after server start, so stage-1 numbers include its
-compilation warmup):
+Launch with the edited copy:
 
-| Metric (single request) | 1x H100 co-located | 2x H100 (stock yaml) |
-|---|---|---|
-| E2E latency | 2.39 s | 3.73 s |
-| Stage 0 (VLM) | 0.22 s | 1.23 s |
-| Stage 1 (DiT) | 2.09 s | 2.41 s |
-| Stage 0→1 transfer | 0 ms | 0 ms |
-| Peak VRAM | 69.9 GiB | 44.2 GiB + 21.8 GiB |
+```bash
+MODEL=inclusionAI/Ming-Image-0.1-Design
+vllm serve "$MODEL" --omni --deploy-config /tmp/ming_image_1gpu.yaml --port 8091
+```
 
-The seed-42 output is byte-identical (SHA-256) to the two-GPU reference
-run; the shared-memory connector keeps the inter-stage hop free in both
-layouts. Reproduced on a second independent server start (2.74 s e2e,
-0.24 s / 2.40 s per stage, 69.9 GiB peak, identical output hash).
-0.60 + 0.33 leaves roughly 10 GB of headroom for the stage-1
-compile workspace and KV growth; raising the two fractions much further
-risks OOM during shape warmup.
+The two recorded runs below used independent server starts and the
+[text-to-image smoke request](#text-to-image): 1024², 12 steps, cfg 1.0,
+seed 42. Each measured the first request after startup, including any
+first-request compilation. These are cold-start observations, not steady-state
+latency or throughput measurements.
+
+| Metric (single request) | 1x H100, first start | 1x H100, second start |
+| --- | --- | --- |
+| E2E latency | 2.39 s | 2.74 s |
+| Stage 0 (VLM) | 0.22 s | 0.24 s |
+| Stage 1 (DiT) | 2.09 s | 2.40 s |
+| Peak VRAM | 69.9 GiB | 69.9 GiB |
+
+Both starts returned HTTP 200 and valid RGBA ONGs with identical SHA-256
+hashes. No performance comparison against a two-GPU deployment is established
+by these observations.
+
+The two memory fractions sum to 0.93, leaving 7% outside the configured
+budgets (about 5.6 GiB on an 80 GiB device). Separately, the measured
+69.9 GiB peak leaves roughly 10 GiB to that device's physical limit; it
+already includes first-request compilation. That measured gap is not an
+additional memory budget or a guarantee for larger shapes or KV caches.
 
 ## Text-to-image
 
