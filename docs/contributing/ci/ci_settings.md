@@ -129,7 +129,7 @@ Canonical layout (prefer these paths for new changes):
     1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
     3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
-    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model business-code paths only. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases that anchor and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
+    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model and shared runtime dependencies. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases the relevant anchors and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
     5. Dry-run:
 
     ```bash
@@ -448,7 +448,23 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 ### Policy
 
 - **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors group model code and shared runtime dependencies. Job keys alias the relevant anchors and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+
+Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
+with `omni_qwen3_omni_cuda`, `omni_qwen3_omni_npu`, or `omni_qwen3_omni_rocm`.
+Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
+benchmark infrastructure, and test fixtures select both accuracy and performance
+on all three platforms. Platform workers, CI images, requirements, build scripts,
+and nightly YAML select the corresponding platform. Accuracy datasets/evaluators
+and performance runners also have their own dependencies; Duplex helpers select
+the existing CUDA Duplex jobs.
+
+These are direct dependencies, so a diff containing both `tests/helpers/runtime.py`
+and MiniCPM model code retains Qwen3 accuracy/performance even when another job
+matches. CUDA V2 and prefix-cache dependencies select the existing CUDA jobs;
+selection alone does not add a cache-hit workload or exercise every deploy
+override. Scheduled full uploads still keep every job. Routing regressions live
+in `tests/buildkite/test_qwen3_omni_source_dependencies.py`.
 
 ### YAML examples
 
