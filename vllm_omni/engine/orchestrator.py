@@ -1461,13 +1461,8 @@ class OrchestratorBase:
                         except EngineDeadError as e:
                             await ready_q.put(("error", stage_id, replica_id, e))
                             continue
-                        if output is not None:
-                            await ready_q.put(("diffusion", stage_id, replica_id, output))
-                            self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
-                            got = True
-                        # [OmniDTPS] Poll DiT load after output is enqueued, in
-                        # its own try/except so DTPS errors never drop outputs
-                        # or kill the poller task.
+                        # [OmniDTPS] Poll DiT load in its own try/except so
+                        # DTPS errors never kill the poller task.
                         if self._dit_load_aware:
                             try:
                                 await self._poll_dit_load_throttled(
@@ -1482,6 +1477,11 @@ class OrchestratorBase:
                                     replica_id,
                                     exc_info=True,
                                 )
+                        if output is None:
+                            continue
+                        await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
+                        got = True
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
                 raise
