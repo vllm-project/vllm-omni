@@ -531,7 +531,7 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
     argv = split(pytest_command)
 
-    assert step["parallelism"] == 6
+    assert step["parallelism"] == 5
     assert argv[:7] == [
         "python",
         "-u",

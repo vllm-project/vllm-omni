@@ -9,7 +9,7 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 6
+      parallelism: 5
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking

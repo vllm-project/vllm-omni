@@ -161,7 +161,7 @@ def partition_args(index: int, output: str, count: int = 3) -> tuple[str, ...]:
     )
 
 
-@pytest.mark.parametrize("count", [3, 6])
+@pytest.mark.parametrize("count", [3, 5])
 def test_executed_partitions_match_filtered_baseline(suite: Path, count: int) -> None:
     filters = (f"--deselect={node('a', 'test_case[2]')}", "-k", "not test_b")
     baseline = run_pytest(suite, "--collect-only", *filters)

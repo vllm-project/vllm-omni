@@ -257,14 +257,17 @@ Canonical layout (prefer these paths for new changes):
 
 ## AMD CPU duration partitions and qualification
 
-READY/MERGE configure six duration-weighted Model Executor shards using
+READY/MERGE configure five duration-weighted Model Executor shards using
 `.buildkite/amd/cpu-timings/model-executor-v1.json`. Selectors, exclusions, blocking
-grades and timeouts are unchanged. The checked-in profile contains all 9,117
-selected nodes from the three successful jobs in
-[build #15582](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15582), commit
-`438155621484248827a30256e679cb4c84f544fb`.
-These historical phase totals estimate 13m06s–14m10s per new shard **before**
-collection and job overhead. They are not measured candidate runtimes or p95s.
+grades and timeouts are unchanged. The checked-in profile contains all 9,145
+selected nodes from the successful six-way target READY trial in
+[build #15651](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15651), merge
+commit `79b424021514b082757f60fbacf2fe010cdadd7c`. The trial used the same
+four-thread limit as production, selected every live node exactly once, and had
+no test, collection, or artifact failures. Repacking those measured phase totals
+into five module-preserving shards estimates 152.91 seconds per shard **before**
+collection and job overhead. This is a planning estimate until the five-way
+candidate completes target CI; it is not a measured p95.
 The Model Executor jobs also set OMP/MKL/OpenBLAS/NumExpr to four threads, matching
 their CPU quota. In the source CI image on an AMD EPYC 9965 host, with a four-CPU
 quota and 16 GiB memory, the four reference cases below all passed at 1/2/4 threads.
@@ -298,11 +301,11 @@ Use a new output path; existing profiles are never overwritten.
 ### Run a candidate shard
 
 Run from the repository root in the AMD CI image with the normal test dependencies.
-Use the **same profile bytes and source revision** on all six workers. The runner
+Use the **same profile bytes and source revision** on all five workers. The runner
 reads the count/index from Buildkite and creates a fresh artifact directory:
 
 ```bash
-BUILDKITE_PARALLEL_JOB_COUNT=6 BUILDKITE_PARALLEL_JOB=0 \
+BUILDKITE_PARALLEL_JOB_COUNT=5 BUILDKITE_PARALLEL_JOB=0 \
 python .buildkite/amd/scripts/run_cpu_suite.py \
   --timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json \
   model-executor -sv tests/model_executor \
@@ -345,9 +348,9 @@ Run baseline and candidate on the same source revision, image and resource limit
 
 Shared fixture cost can be counted repeatedly in historical hash shards; collection,
 imports, and CPU contention are not modeled by the weights. Estimated loads and
-synthetic tests are not hardware speedup evidence. Before merging the six-worker
+synthetic tests are not hardware speedup evidence. Before merging the five-worker
 trial, verify available `amd_mi300_1` capacity and queue latency at that concurrency.
-The build #15582 jobs expose 192 logical CPUs but have a four-CPU cgroup quota.
+The source jobs expose 192 logical CPUs but have a four-CPU cgroup quota.
 An agent inventory alone cannot establish spare cluster capacity. Measure paired
 READY/MERGE runs, whole-build latency, queue latency, CPU pressure, peak memory,
 and summed agent-minutes. The planning target is each shard p95 below 18 minutes;
