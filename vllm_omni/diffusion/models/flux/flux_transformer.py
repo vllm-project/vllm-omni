@@ -235,7 +235,8 @@ class FluxAttention(torch.nn.Module):
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
         # geometry; otherwise the original eager chain. The fused op reproduces
-        # the CUDA RMSNorm reduction, so both paths produce the same bits.
+        # the CUDA RMSNorm reduction. Bitwise parity also depends on the eager
+        # RoPE provider and execution mode; compiled RoPE may round differently.
         qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
         use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
             query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True

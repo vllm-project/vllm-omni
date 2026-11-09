@@ -103,4 +103,7 @@ def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
             hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin), **{QK_NORM_ROPE_TABLE_KEY: table}
         )
     for e, f in zip(eager if double_stream else (eager,), fused if double_stream else (fused,)):
+        # This integration check accepts the available eager RoPE provider.
+        # Exact CUDA-order parity is covered by the fused-op tests; different
+        # providers and compiled RoPE can have different rounding behavior.
         torch.testing.assert_close(f, e, atol=0.05, rtol=0.05)
