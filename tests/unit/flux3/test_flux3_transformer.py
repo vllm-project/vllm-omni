@@ -180,6 +180,15 @@ def _make_inputs(
 class TestShapeInvariants:
     """Shape / count invariants for the pipeline contract."""
 
+    def test_rejects_quant_config_in_base_pipeline(self):
+        from vllm_omni.diffusion.models.flux3.flux3_transformer import (
+            Flux3Transformer2DModel,
+        )
+
+        with pytest.raises(ValueError, match="does not support quantized checkpoints"):
+            kwargs = {k: v for k, v in _TINY_KWARGS.items() if k != "dtype"}
+            Flux3Transformer2DModel(**kwargs, quant_config=object())
+
     def test_channel_counts(self):
         """Image stream channel counts."""
         from vllm_omni.diffusion.models.flux3.flux3_transformer import (

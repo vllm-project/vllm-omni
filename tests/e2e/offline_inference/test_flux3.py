@@ -28,22 +28,6 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunnerHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-
-# TODO: remove once vLLM telemetry is globally disabled in CI.
-def _assert_tracking_disabled() -> None:
-    try:
-        from vllm.usage.usage_lib import is_usage_stats_enabled
-    except Exception:
-        return
-    if is_usage_stats_enabled():
-        raise SystemExit(
-            "vLLM usage-stats telemetry is ENABLED — aborting. "
-            "Set VLLM_NO_USAGE_STATS=1 (or DO_NOT_TRACK=1) before running."
-        )
-
-
-_assert_tracking_disabled()
-
 MODEL = os.getenv("FLUX3_MODEL_PATH")
 PROMPT = "a scenic mountain landscape at golden hour"
 

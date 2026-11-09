@@ -810,6 +810,8 @@ class Flux3Transformer2DModel(nn.Module, SupportsQuant):
         od_config: OmniDiffusionConfig | None = None,
     ):
         super().__init__()
+        if quant_config is not None:
+            raise ValueError("Flux3 BF16 base pipeline does not support quantized checkpoints")
         self.kernel_adapter = build_flux3_kernel_adapter(qk_norm_rope=_qk_norm_rope)
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // num_heads

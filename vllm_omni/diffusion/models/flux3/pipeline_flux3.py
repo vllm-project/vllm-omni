@@ -143,6 +143,11 @@ def _flux3_sampler_config(package_config: dict[str, Any] | None) -> dict[str, An
     }
 
 
+def _flow_match_timesteps(scheduler: FlowMatchEulerDiscreteScheduler, device: torch.device) -> torch.Tensor:
+    """Euler timesteps with a terminal zero closing the final step at sigma=0."""
+    return torch.cat([scheduler.sigmas, scheduler.sigmas.new_zeros(1)]).to(device)
+
+
 def _flux3_image_rope_scale(package_config: dict[str, Any] | None) -> float:
     dit = (package_config or {}).get("dit") or {}
     return float(dit.get("image_rope_scale", _F3_DEFAULT_IMAGE_ROPE_SCALE))
@@ -859,7 +864,7 @@ class Flux3Pipeline(
         if self._scheduler_key != sched_key:
             self.scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=num_inference_steps, shift=flow_shift)
             self._scheduler_key = sched_key
-        timesteps = torch.cat([self.scheduler.sigmas, self.scheduler.sigmas.new_zeros(1)]).to(device)
+        timesteps = _flow_match_timesteps(self.scheduler, device)
 
         decoded: dict[str, torch.Tensor] = {}
         img_cond_kwargs: dict[str, torch.Tensor] = {}
@@ -895,7 +900,8 @@ class Flux3Pipeline(
                 guidance_scale=guidance_scale,
                 cond_kwargs=img_cond_kwargs,
             )
-        grid = scatter_ids(final.to(torch.bfloat16), orig_ids)[0]
+        vae_dtype = next(self.vae._model.parameters()).dtype
+        grid = scatter_ids(final.to(vae_dtype), orig_ids)[0]
         decoded["image"] = self._decode_image(grid)
         return decoded
 

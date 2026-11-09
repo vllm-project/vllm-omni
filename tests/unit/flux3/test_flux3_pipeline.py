@@ -51,6 +51,7 @@ class _FakeSamplingParams:
     guidance_scale_provided: bool = True
     seed: int | None = None
     generator: Any = None
+    num_outputs_per_prompt: int = 1
 
 
 @dataclass
@@ -459,12 +460,17 @@ class TestLoading:
 
         assert _flux3_sampler_config({"sampler": {"guidance": None}})["guidance"] is None
 
-    def test_flow_match_sigmas_never_end_at_zero(self):
+    def test_flow_match_timesteps_single_terminal_zero(self):
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+        from vllm_omni.diffusion.models.flux3.pipeline_flux3 import _flow_match_timesteps
 
         for steps, shift in ((1, 1.0), (16, 3.0), (50, 7.0)):
             scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=steps, shift=shift)
-            assert scheduler.sigmas[-1] > 0
+            timesteps = _flow_match_timesteps(scheduler, torch.device("cpu"))
+            assert timesteps[-1] == 0
+            assert timesteps[-2] > 0
+            assert len(timesteps) == steps + 1
 
     def test_direct_quantized_package_path_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         model_root = tmp_path / "flux3"
@@ -945,6 +951,20 @@ class TestForwardContract:
                     multi_modal_data={"unsupported": object()},
                 )
             )
+
+    def test_rejects_multiple_outputs_per_prompt(self):
+        pipe = self._pipe()
+        req = self._request({})
+        req.sampling_params.num_outputs_per_prompt = 2
+        with pytest.raises(ValueError, match="num_outputs_per_prompt"):
+            pipe.forward(req)
+
+    def test_rejects_misaligned_image_size(self):
+        pipe = self._pipe()
+        req = self._request({})
+        req.sampling_params.height = 513
+        with pytest.raises(ValueError, match="multiples of 16"):
+            pipe.forward(req)
 
     @pytest.mark.parametrize("image", [None, torch.zeros(1, 3, 64, 64)])
     def test_passes_optional_image_condition(self, image):

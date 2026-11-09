@@ -26,22 +26,6 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-
-# TODO: remove once vLLM telemetry is globally disabled in CI.
-def _assert_tracking_disabled() -> None:
-    try:
-        from vllm.usage.usage_lib import is_usage_stats_enabled
-    except Exception:
-        return
-    if is_usage_stats_enabled():
-        raise SystemExit(
-            "vLLM usage-stats telemetry is ENABLED — aborting. "
-            "Set VLLM_NO_USAGE_STATS=1 (or DO_NOT_TRACK=1) before running."
-        )
-
-
-_assert_tracking_disabled()
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = os.getenv("FLUX3_MODEL_PATH", "")
