@@ -681,6 +681,19 @@ class DuplexModelPlugin(ABC):
         del stage_count
         return frozenset()
 
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        """Whether a new Stage0 request pre-submits its downstream stages.
+
+        In async-chunk mode the orchestrator pre-submits every connector-fed
+        stage after Stage0 when the request is first sent. Return False when
+        this request can never reach those stages (for example, a turn whose
+        response modalities have no audio), so no placeholder is created only
+        to be aborted when the turn ends. Called after ``plan_append`` bound
+        the request. Default is True.
+        """
+        del request_id
+        return True
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod

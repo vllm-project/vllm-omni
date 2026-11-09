@@ -173,6 +173,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             target_barge_in_latency_ms=None,
         )
 
+    def prewarms_downstream_stages(self, request_id: str) -> bool:
+        # A turn without audio output always ends at JoyAI (decide_output answers
+        # it directly), so the Talker and Code2Wav never run. Prewarming Code2Wav
+        # for it would only create a request that the turn end aborts.
+        observation = self.data_plane.requests.get(request_id)
+        return observation is None or "audio" in observation.modalities
+
     def create_session_state(self) -> JoyAISessionState:
         return JoyAISessionState(audio_buffer=JoyAIFrameBuffer(accepts_audio=self.asr_stage_id is not None))
 

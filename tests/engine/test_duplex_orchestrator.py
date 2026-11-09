@@ -104,6 +104,7 @@ def _open_message(
     *,
     output_buffer: DuplexOutputBuffer | None = None,
     session_id: str = SESSION_ID,
+    modalities: tuple[str, ...] = ("text",),
 ) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{session_id}",
@@ -111,7 +112,7 @@ def _open_message(
         output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
-            modalities=["text"],
+            modalities=list(modalities),
             instructions="public instructions",
             extra_body={"auto_response": True, **(extra_body or {})},
         ),
@@ -508,6 +509,24 @@ async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submis
     finally:
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_follows_plugin_choice(ephemeral_submissions, mocker):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    orchestrator.async_chunk = True
+    # "first" stands for a turn that can never reach the downstream stages.
+    mocker.patch.object(
+        orchestrator.plugin, "prewarms_downstream_stages", side_effect=lambda request_id: request_id != "first"
+    )
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", return_value=True)
+
+    assert (await orchestrator.submit(submissions[0])).request_id == "first"
+    assert (await orchestrator.submit(submissions[1])).request_id == "second"
+
+    # Stage0 still gets both requests; only the downstream prewarm is skipped.
+    assert [args[0].request_id for args in clients[0].add_request_calls] == ["first", "second"]
+    assert [call.args[0] for call in prewarm.call_args_list] == ["second"]
 
 
 @pytest.mark.asyncio
