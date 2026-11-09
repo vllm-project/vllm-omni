@@ -22,7 +22,7 @@ steps:
       # One sweep of the four former directory jobs. Split only when measured
       # durations show this step would pass timeout_in_minutes.
       - label: "Simple Test"
-        timeout_in_minutes: 25
+        timeout_in_minutes: 15
         automatic_shard: true
         commands:
           - "pytest -sv tests/ -m 'core_model and cpu'"
@@ -50,7 +50,8 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Offloader Test"
-        timeout_in_minutes: 40
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
           - pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
         mirror_hardwares: l4_1
@@ -69,7 +70,8 @@ steps:
 
       - label: "Diffusion · Distributed Test · Single-GPU"
         source_file_dependencies: diffusion_distributed_attention
-        timeout_in_minutes: 20
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
           - pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
@@ -119,14 +121,14 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: "Engine&Model Executor&Work Test · L4"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 15
         automatic_shard: true
         commands:
           - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
         mirror_hardwares: l4_1
 
       - label: "Engine&Model Executor&Work Test · H100"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 15
         automatic_shard: true
         source_file_dependencies: engine_model_executor_worker_function
         commands:
@@ -137,7 +139,7 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: "Distributed Test · 1GPU"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 15
         automatic_shard: true
         commands:
           - pytest -sv tests/distributed/ -m 'core_model and cuda and L4 and not cards_2' --run-level 'core_model'
@@ -157,7 +159,7 @@ steps:
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
     automatic_shard: true
-    timeout_in_minutes: 30
+    timeout_in_minutes: 15
     # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
     # leaves inline UniProc DiffusionWorker VRAM mapped in the pytest parent.
     # Isolate that leftover case in its own process so the driver drops the

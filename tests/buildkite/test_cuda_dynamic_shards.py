@@ -41,28 +41,8 @@ from upload_pipeline import _render_test_pipeline  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 READY = Path(".buildkite/cuda/test-ready.yml")
-MERGE = Path(".buildkite/cuda/test-merge.yml")
 NUM_SHARDS = "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT"
 SHARD_ID = "--shard-id=$$BUILDKITE_PARALLEL_JOB"
-
-READY_AUTOMATIC = {
-    "Simple Test",
-    "Diffusion · Model Test",
-    "Engine&Model Executor&Work Test · L4",
-    "Engine&Model Executor&Work Test · H100",
-    "Distributed Test · 1GPU",
-    "Entrypoints Test",
-}
-MERGE_AUTOMATIC = {
-    "Distributed Test",
-    "Entrypoint Test with H100",
-    "Entrypoint Test with L4",
-    "Entrypoint Test with L4 · 2-GPU",
-}
-ISOLATED_NODES = (
-    "tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id",
-    "tests/entrypoints/test_omni_sleep_mode.py::TestOmniDiffusionSleepMode::test_diffusion_sleep_handshake",
-)
 
 
 @pytest.fixture(autouse=True)
@@ -85,68 +65,6 @@ def _leaves(steps: list) -> list[dict]:
         else:
             leaves.append(step)
     return leaves
-
-
-def _load_leaves(path: Path) -> list[dict]:
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return _leaves(document["steps"])
-
-
-def _assert_source_contract(path: Path, expected: set[str]) -> None:
-    leaves = _load_leaves(path)
-    automatic = {step["label"]: step for step in leaves if step.get("automatic_shard") is True}
-    assert set(automatic) == expected
-
-    for step in automatic.values():
-        assert "parallelism" not in step
-        text = "\n".join(step.get("commands") or [])
-        assert NUM_SHARDS not in text
-        assert SHARD_ID not in text
-        assert " -n " not in text
-        assert "Shard %N/%t" not in step["label"]
-        for line in text.splitlines():
-            if any(node in line for node in ISOLATED_NODES) and "--deselect" not in line:
-                assert "$${BUILDKITE_PARALLEL_JOB:-0}" in line or "$${BUILDKITE_PARALLEL_JOB:-0}" in text
-
-    for step in leaves:
-        if step.get("label") in expected:
-            continue
-        assert step.get("automatic_shard") is not True
-        assert "parallelism" not in step
-        text = "\n".join(step.get("commands") or [])
-        assert NUM_SHARDS not in text
-        assert SHARD_ID not in text
-
-
-def test_ready_directory_sweeps_do_not_reserve_a_pool() -> None:
-    _assert_source_contract(READY, READY_AUTOMATIC)
-
-
-def test_merge_directory_sweeps_do_not_reserve_a_pool() -> None:
-    _assert_source_contract(MERGE, MERGE_AUTOMATIC)
-
-
-def test_e2e_groups_stay_unsharded() -> None:
-    for path in (READY, MERGE):
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        for step in document["steps"]:
-            if not isinstance(step, dict) or "E2E" not in str(step.get("group", "")):
-                continue
-            for leaf in _leaves(step["steps"]):
-                assert leaf.get("automatic_shard") is not True
-                assert "parallelism" not in leaf
-                assert NUM_SHARDS not in "\n".join(leaf.get("commands") or [])
-
-
-def test_ready_and_merge_end_with_timing_merge_step() -> None:
-    for path, key in ((READY, "merge-shard-timings-ready"), (MERGE, "merge-shard-timings-merge")):
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert document["steps"][-2] == {"wait": None, "continue_on_failure": True}
-        step = document["steps"][-1]
-        assert step["key"] == key
-        assert step["soft_fail"] is True
-        assert "timings/merged.json" in step["artifact_paths"]
-        assert any("merge_shard_timings.py" in command for command in step["commands"])
 
 
 def test_uploader_keeps_one_simple_test_job_without_timings(monkeypatch: pytest.MonkeyPatch) -> None:

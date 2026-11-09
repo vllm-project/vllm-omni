@@ -28,14 +28,15 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Diffusion · LoRA Test"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 25
+        automatic_shard: true
         commands:
           - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model"
         mirror_hardwares: l4_1
 
   - label: "Distributed Test"
     depends_on: upload-merge-pipeline
-    timeout_in_minutes: 60
+    timeout_in_minutes: 25
     automatic_shard: true
     commands:
       - export VLLM_IMAGE_FETCH_TIMEOUT=60
@@ -46,14 +47,14 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Entrypoint Test with H100"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 25
         automatic_shard: true
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model"
         mirror_hardwares: h100_2
 
       - label: "Entrypoint Test with L4"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 25
         automatic_shard: true
         # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
         # leaves inline UniProc DiffusionWorker VRAM mapped in the pytest parent.
@@ -72,7 +73,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Entrypoint Test with L4 · 2-GPU"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 25
         automatic_shard: true
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4 and cards_2" --run-level "advanced_model"

@@ -317,7 +317,7 @@ def _sink_pipeline_worker(
         cell_executor._post_activations_ws = original_post
 
 
-# Ready-lane budget: Simple Test is 25 minutes. The uploader adds shards only
+# Ready-lane budget: Simple Test is 15 minutes. The uploader adds shards only
 # when measured durations exceed that budget. Each Gloo spawn re-imports the
 # stack (~30–60s wall). One scalar + one
 # fixed-shape case here; the CUDA harness only varies chunks×history at
