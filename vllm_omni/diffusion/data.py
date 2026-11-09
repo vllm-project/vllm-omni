@@ -1763,6 +1763,8 @@ class OmniDiffusionConfig:
                             "Using explicitly selected diffusion pipeline %r with component-level configuration.",
                             self.model_class_name,
                         )
+                        self.update_multimodal_support()
+                        return
                     # Some native checkpoints (for example the Flux3
                     # format) intentionally contain only component weights
                     # and configs. When stage resolution or the caller has
