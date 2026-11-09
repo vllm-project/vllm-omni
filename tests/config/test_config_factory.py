@@ -3191,7 +3191,8 @@ class TestPlatformOverrides:
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
         base = load_deploy_config(deploy_path)
-        assert base.stages[0].attention_backend == "FLASHINFER"
+        assert base.model_runner == "v2"
+        assert base.stages[0].attention_backend == "FLASH_ATTN"
 
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].attention_backend == "TRITON_ATTN"

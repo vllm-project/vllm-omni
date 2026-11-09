@@ -55,7 +55,6 @@ def test_actual_state_guard_and_eos(bad_state):
     t._restore_terminal_audio_rows = (
         mod.HiggsAudioV3TalkerForConditionalGeneration._restore_terminal_audio_rows.__get__(t)
     )
-    t.config = SimpleNamespace(audio_async_prompt_mode=True, audio_full_sample_graph=False)
     t.mrv2_options = HiggsMrv2Options(
         audio_async_prompt_mode=True,
         audio_async_payload=True,
