@@ -100,11 +100,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self.temporal_config = config.temporal_config
         hidden = self.temporal_config.hidden_size
         self._dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
-        if bool(getattr(vllm_config.model_config, "use_v2_model_runner", False)):
-            raise ValueError(
-                "PersonaPlex Stage 0 (Talker) requires model_runner: v1 "
-                "for lockstep post-sample depformer execution and batched appends"
-            )
 
         # Temporal backbone on vLLM paged attention (consumes inputs_embeds).
         self.model = HeliumModel(
@@ -166,6 +161,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------
     # Core forward / logits
     # ------------------------------------------------------------------
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from .model_state import PersonaPlexModelState
+
+        return PersonaPlexModelState(vllm_config, self, encoder_cache, device)
+
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Placeholder embedding for vLLM's ``VllmModel`` protocol.
 

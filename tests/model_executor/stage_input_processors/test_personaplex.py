@@ -141,3 +141,16 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
     assert recorded[0][0] == ["r1", "r2"]
     assert recorded[0][1].tolist() == [101, 102]
     assert torch.equal(recorded[0][2], codes)
+
+
+def test_async_chunk_does_not_buffer_invalid_mrv2_placeholder() -> None:
+    manager = SimpleNamespace(
+        request_payload={}, connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1}})
+    )
+    request = SimpleNamespace(request_id="r", external_req_id="r", resumable=True)
+    talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.zeros(1, 8, dtype=torch.long)}, "meta": {"codec_frame_valid": torch.tensor([False])}},
+        request,
+    )
+    assert manager.request_payload["r"]["personaplex_frames"] == []

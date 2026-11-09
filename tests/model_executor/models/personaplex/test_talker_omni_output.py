@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
-    PersonaPlexConfig,
-)
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
 )
@@ -35,15 +33,9 @@ def test_make_omni_output_keeps_token_rows_for_mixed_prefill_and_live_rows():
     assert torch.equal(out.multimodal_outputs["codes"]["audio"], live_codes)
 
 
-def test_personaplex_talker_rejects_v2_model_runner():
-    mock_vllm_config = MagicMock()
-    mock_model_config = MagicMock()
-    mock_model_config.hf_config = PersonaPlexConfig()
-    mock_model_config.use_v2_model_runner = True
-    mock_vllm_config.model_config = mock_model_config
-
-    with pytest.raises(
-        ValueError,
-        match="PersonaPlex Stage 0 \\(Talker\\) requires model_runner: v1",
-    ):
-        PersonaPlexTalkerForConditionalGeneration(vllm_config=mock_vllm_config)
+def test_personaplex_talker_creates_owned_v2_state():
+    model = SimpleNamespace()
+    with patch("vllm_omni.model_executor.models.personaplex.model_state.PersonaPlexModelState") as state:
+        result = PersonaPlexTalkerForConditionalGeneration.create_mrv2_model_state(model, "config", None, "cpu")
+    state.assert_called_once_with("config", model, None, "cpu")
+    assert result is state.return_value
