@@ -3415,6 +3415,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
 
+        on_device = (
+            omni_platform.current_omni_platform.device_type == "cuda"
+            or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
+        )
+        if not on_device:
+            # No pinned async copy to overlap; MPS streams and events also do
+            # not interoperate, so read the mask synchronously.
+            stop_mask_cpu = (stacked[:, 1] > stacked[:, 0]).cpu()
+            for i, (state, _) in enumerate(pending):
+                state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
+                state.pending_stop_mask_event = None
+            return
+
         device_module = torch.get_device_module(current_omni_platform.get_torch_device())
 
         # Compute the mask and stage the D2H copy on a dedicated side stream:
@@ -3435,24 +3448,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 stop_logits.record_stream(self._stop_mask_stream)
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
-            # pin_memory=True raises on recent PyTorch builds without an
-            # accelerator; gate it like the host-tensor path below. The
-            # pending states were filtered to this device's tensors above,
-            # so the side-stream copy only ever runs with a device present.
-            on_device = (
-                omni_platform.current_omni_platform.device_type == "cuda"
-                or getattr(omni_platform.current_omni_platform, "is_npu", lambda: False)()
-            )
-            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=on_device)
+            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
             # the latch test's expected-value assertion (instead of
             # uninitialized garbage that can accidentally match).
             stop_mask_cpu.fill_(True)
-            if on_device:
-                stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
-            else:
-                stop_mask_cpu.copy_(stop_mask_gpu)
+            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
             copy_done.record(self._stop_mask_stream)
 
         for i, (state, _) in enumerate(pending):

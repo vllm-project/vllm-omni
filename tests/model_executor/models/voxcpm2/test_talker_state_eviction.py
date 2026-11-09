@@ -245,6 +245,27 @@ class TestStateEvictionContract:
         assert state.precomputed_stop_logits is None
         assert state.precomputed_is_stopping is None
 
+    @pytest.mark.cpu
+    def test_stop_precompute_reads_synchronously_without_cuda_or_npu(self, monkeypatch) -> None:
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_type", "cpu")
+        monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._vae_decode_every = 3
+        states = [
+            RState(request_id="stop", precomputed_stop_logits=torch.tensor([[0.0, 1.0]])),
+            RState(request_id="keep", precomputed_stop_logits=torch.tensor([[1.0, 0.0]])),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+
+        assert getattr(talker, "_stop_mask_stream", None) is None
+        assert [state.pending_stop_mask_event for state in states] == [None, None]
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
+
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_batched_stop_precompute_sets_audio_collect_cache(self) -> None:
         if not torch.cuda.is_available():
