@@ -9,6 +9,7 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+import vllm_omni.quantization.convrot_config as convrot_config
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.convrot_config import (
@@ -30,15 +31,13 @@ from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 try:
     from vllm.model_executor.kernels.linear import MxFp4LinearKernel, Mxfp8LinearKernel
 except ImportError:
-    _MXFP_KERNELS_AVAILABLE = False
 
     class MxFp4LinearKernel:  # type: ignore[no-redef]
         pass
 
     class Mxfp8LinearKernel:  # type: ignore[no-redef]
         pass
-else:
-    _MXFP_KERNELS_AVAILABLE = True
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -47,7 +46,7 @@ accelerator_available = pytest.mark.skipif(
     not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
     reason="GPU platform not available.",
 )
-mxfp_available = pytest.mark.skipif(not _MXFP_KERNELS_AVAILABLE, reason="vLLM MXFP kernels not available.")
+mxfp_available = pytest.mark.skipif(not convrot_config._MXFP_AVAILABLE, reason="vLLM MXFP kernels not available.")
 
 
 def accelerator_device() -> str:
@@ -156,8 +155,6 @@ def test_mxfp_from_config_rejects_int8_layers(config_cls):
 
 
 def test_missing_mxfp_support_only_disables_mxfp_methods(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    import vllm_omni.quantization.convrot_config as convrot_config
-
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     mocker.patch.object(convrot_config, "_MXFP_AVAILABLE", False)
     mocker.patch.object(ConvRotMxfp4OnlineLinearMethod, "__init__", lambda self, quant_config: None)

@@ -65,6 +65,7 @@ try:
     )
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 except ImportError as mxfp_import_error:
     _MXFP_AVAILABLE = False
     _MXFP_IMPORT_ERROR = mxfp_import_error
@@ -79,6 +80,7 @@ except ImportError as mxfp_import_error:
     init_mxfp8_linear_kernel = _missing_mxfp_support
     mxfp4_quantize = _missing_mxfp_support
     mxfp8_e4m3_quantize = _missing_mxfp_support
+    kMxfp4Dynamic = None  # noqa: N816
 else:
     _MXFP_AVAILABLE = True
 
@@ -454,8 +456,6 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         weight = _rotated_weight(layer, self.rotation_group_size).to(torch.bfloat16).contiguous()
         if weight.shape[-1] % 32:
             raise ValueError(f"convrot_mxfp4 needs an input size divisible by 32, got {weight.shape[-1]}")
-
-        from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
 
         kernel = init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
         self.kernel = kernel
