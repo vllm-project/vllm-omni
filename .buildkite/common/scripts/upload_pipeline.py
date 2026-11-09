@@ -23,7 +23,7 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     matches a job-key prefix; unrelated files must not reduce fallback coverage.
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -599,7 +599,8 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
-    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged

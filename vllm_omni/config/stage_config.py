@@ -625,6 +625,7 @@ class StageDeployConfig:
     """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
@@ -632,6 +633,7 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
@@ -1170,9 +1172,8 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 # Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
 # adapt a platform worker, so an entry is removed only with the real integration.
 # NPU AR stages use the Ascend V2 runner (attention metadata and input state).
-_MRV2_UNSUPPORTED_PLATFORMS = {
-    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
-}
+# Platforms whose workers still force the V1 runner; XPU and NPU build the omni V2 runners.
+_MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
 def _apply_platform_overrides(

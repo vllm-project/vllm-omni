@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -15,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
@@ -35,6 +37,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -184,6 +187,11 @@ class StagePool:
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        # The orchestrator records caller-selected replicas before admission,
+        # but they are not active affinities until submission. Keeping the
+        # intent separate prevents membership cleanup from reporting a
+        # pre-admission request as a running request whose replica disappeared.
+        self._requested_replica_ids: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
         # Invoked whenever the replica set changes, so the event-driven loop can
         # re-bind its readers without waiting for a tick. Must be thread-safe.
@@ -198,13 +206,15 @@ class StagePool:
         # Tracks which requests should apply watermarking
         self._request_watermarking: dict[str, bool] = {}
 
-        # Distributed-mode state. Populated by add_client / remove_client.
+        # Distributed-mode stable IDs. Address mappings survive client removal
+        # so reattaching the same address restores its previous slot.
         self._addr_to_replica_id: dict[str, int] = {}
+        self._replica_id_to_addr: dict[int, str] = {}
         for replica_id, client in enumerate(self.clients):
             if client is not None:
                 addr = self._client_input_addr(client)
                 if addr is not None:
-                    self._addr_to_replica_id[addr] = replica_id
+                    self._set_replica_address(replica_id, addr)
 
         # Distributed-mode dispatch hooks (injected by Orchestrator on bring-up).
         self._hub: OmniCoordClientForHub | None = None
@@ -314,6 +324,19 @@ class StagePool:
         if listener is not None:
             listener()
 
+    def _set_replica_address(self, replica_id: int, input_addr: str) -> None:
+        """Update the stable replica/address bijection in both directions."""
+        previous_replica_id = self._addr_to_replica_id.get(input_addr)
+        if previous_replica_id is not None and previous_replica_id != replica_id:
+            self._replica_id_to_addr.pop(previous_replica_id, None)
+
+        previous_addr = self._replica_id_to_addr.get(replica_id)
+        if previous_addr is not None and previous_addr != input_addr:
+            self._addr_to_replica_id.pop(previous_addr, None)
+
+        self._addr_to_replica_id[input_addr] = replica_id
+        self._replica_id_to_addr[replica_id] = input_addr
+
     def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
@@ -343,11 +366,8 @@ class StagePool:
         while len(self.clients) <= replica_id:
             self.clients.append(None)
             self._replica_metrics.append(_ReplicaMetrics())
-        for known_addr, known_replica_id in list(self._addr_to_replica_id.items()):
-            if known_replica_id == replica_id and known_addr != input_addr:
-                self._addr_to_replica_id.pop(known_addr, None)
         self.clients[replica_id] = client
-        self._addr_to_replica_id[input_addr] = replica_id
+        self._set_replica_address(replica_id, input_addr)
         self._unavailable_replicas.discard(replica_id)
         self._notify_membership_changed()
         return replica_id
@@ -452,6 +472,11 @@ class StagePool:
         no replica is currently serviceable, return ``None`` and let the async
         submit-time router wait without blocking the caller.
         """
+        requested_replica_id = self._requested_replica_ids.get(request_id)
+        if requested_replica_id is not None:
+            self._validate_requested_replica(requested_replica_id)
+            return requested_replica_id
+
         if self._hub is None or self._lb is None:
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
@@ -548,6 +573,103 @@ class StagePool:
         self._request_bindings[request_id] = replica_id
         return replica_id
 
+    def parallel_sample_parent_id(self, request_id: str) -> str | None:
+        """The id of the n > 1 request whose sample (child request) is ``request_id``, else None."""
+        request_states = getattr(self._output_processor, "request_states", None) or {}
+        parent = getattr(request_states.get(request_id), "parent_req", None)
+        return None if parent is None else parent.external_req_id
+
+    def _local_replica_unavailability_reason(self, replica_id: int) -> str | None:
+        """Return why a local replica slot cannot accept work, if any.
+
+        Keep local automatic and explicit routing aligned by making both
+        :meth:`is_replica_available` and :meth:`_validate_requested_replica`
+        consume this shared check.
+        """
+        if not 0 <= replica_id < self.num_replicas:
+            return f"out of range for {self.num_replicas} replica slot(s)"
+        if self.clients[replica_id] is None:
+            return "no local client is attached"
+        if replica_id in self._unavailable_replicas:
+            return "marked locally unavailable"
+        return None
+
+    def _validate_requested_replica(self, replica_id: int) -> str | None:
+        """Validate a caller-selected replica without creating an affinity.
+
+        Returns its input address in distributed mode and ``None`` otherwise.
+        """
+        input_addr: str | None = None
+        reason = self._local_replica_unavailability_reason(replica_id)
+        if reason is None and self.is_distributed:
+            input_addr = self._replica_id_to_addr.get(replica_id)
+            if input_addr is None:
+                reason = "no distributed input address is recorded"
+            elif self._serviceable_replica_id_for_addr(input_addr) != replica_id:
+                reason = f"distributed address {input_addr} is not UP and serviceable"
+        if reason is not None:
+            logger.debug(
+                "Rejecting requested stage-%s replica-%s: %s",
+                self.stage_id,
+                replica_id,
+                reason,
+            )
+            raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} does not exist or is not available")
+        return input_addr
+
+    def validate_requested_replica(self, replica_id: int) -> None:
+        """Read-only preflight for a caller-selected replica.
+
+        Admission must validate again because membership can change after this
+        method returns. This helper exists for frontend multimodal preprocessing,
+        where rejecting an already-invalid route before processing avoids
+        populating sender-cache entries that no replica will consume. The
+        frontend intentionally calls it only for prompts with multimodal data;
+        text-only explicit routes remain validated solely at admission.
+        """
+        self._validate_requested_replica(replica_id)
+
+    def _record_requested_replica(self, request_id: str, replica_id: int) -> int:
+        """Record already-validated explicit routing intent."""
+
+        reserved_replica_id = self._requested_replica_ids.get(request_id)
+        if reserved_replica_id is not None and reserved_replica_id != replica_id:
+            raise OmniClientError(
+                f"request {request_id} already requested stage-{self.stage_id} "
+                f"replica-{reserved_replica_id}, not replica-{replica_id}"
+            )
+
+        bound_replica_id = self.get_bound_replica_id(request_id)
+        if bound_replica_id is not None:
+            if bound_replica_id != replica_id:
+                raise OmniClientError(
+                    f"request {request_id} is already bound to stage-{self.stage_id} "
+                    f"replica-{bound_replica_id}, not requested replica-{replica_id}"
+                )
+        self._requested_replica_ids[request_id] = replica_id
+        return replica_id
+
+    def reserve_requested_replica(self, request_id: str, replica_id: int) -> int:
+        """Validate and record explicit intent without marking the request active."""
+        self._validate_requested_replica(replica_id)
+        return self._record_requested_replica(request_id, replica_id)
+
+    def bind_requested_replica(self, request_id: str, replica_id: int) -> int:
+        """Revalidate and activate a caller-requested stage-local replica."""
+        input_addr = self._validate_requested_replica(replica_id)
+        self._record_requested_replica(request_id, replica_id)
+
+        bound_replica_id = self.get_bound_replica_id(request_id)
+        if bound_replica_id is not None:
+            return bound_replica_id
+
+        if self.is_distributed:
+            assert input_addr is not None
+            self._affinity[request_id] = input_addr
+        else:
+            self._request_bindings[request_id] = replica_id
+        return replica_id
+
     def get_bound_replica_id(self, request_id: str) -> int | None:
         """Return the currently bound replica id for *request_id* if present.
 
@@ -611,6 +733,7 @@ class StagePool:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
         self._affinity.pop(request_id, None)
+        self._requested_replica_ids.pop(request_id, None)
         self._request_watermarking.pop(request_id, None)
         self._output_timestamps_by_request.pop(str(request_id), None)
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
@@ -662,11 +785,7 @@ class StagePool:
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
-        return (
-            0 <= replica_id < self.num_replicas
-            and self.clients[replica_id] is not None
-            and replica_id not in self._unavailable_replicas
-        )
+        return self._local_replica_unavailability_reason(replica_id) is None
 
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
@@ -1096,12 +1215,31 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
+    def will_watermark(self, params: OmniSamplingParams | PoolingParams) -> bool:
+        """Whether this stage watermarks the outputs of a request with these params."""
+        return bool(self._watermarkers) and not isinstance(params, PoolingParams) and params.watermarking is not False
+
     def maybe_update_watermarking_state(self, request_id: str, params: OmniSamplingParams | PoolingParams) -> None:
-        should_watermark = not isinstance(params, PoolingParams) and params.watermarking is not False
         if self._watermarkers:
-            self._request_watermarking[request_id] = should_watermark
+            self._request_watermarking[request_id] = self.will_watermark(params)
 
     # ---- Stage-local admission ----
+
+    def _validate_requested_replica_pin(
+        self,
+        requested_replica_id: int | None,
+        pinned_replica_id: int | None,
+    ) -> None:
+        """Reject contradictory external and internal route requirements."""
+        if (
+            requested_replica_id is not None
+            and pinned_replica_id is not None
+            and requested_replica_id != pinned_replica_id
+        ):
+            raise OmniClientError(
+                f"stage {self.stage_id} requested_replica_id {requested_replica_id} "
+                f"conflicts with pinned_replica_id {pinned_replica_id}"
+            )
 
     async def submit_initial(
         self,
@@ -1112,11 +1250,13 @@ class StagePool:
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
         pinned_replica_id: int | None = None,
+        requested_replica_id: int | None = None,
         submit_kwargs: DiffusionSubmitKwargs | None = None,
         params_override: Any = None,
         expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        self._validate_requested_replica_pin(requested_replica_id, pinned_replica_id)
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1131,19 +1271,25 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            if pinned_replica_id is not None:
+            if requested_replica_id is not None:
+                replica_id = self.bind_requested_replica(request_id, requested_replica_id)
+            elif pinned_replica_id is not None:
                 replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
             else:
                 replica_id = await self._pick_or_select(
                     request_id,
                     affinity_request_id=affinity_request_id,
                 )
+            if req_state.trace is not None:
+                req_state.trace.start_stage(self.stage_id, replica_id, self.stage_type)
             client = self._diffusion_client(replica_id)
             self.maybe_update_watermarking_state(request_id, params)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        if pinned_replica_id is not None:
+        if requested_replica_id is not None:
+            replica_id = self.bind_requested_replica(request_id, requested_replica_id)
+        elif pinned_replica_id is not None:
             replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
         else:
             replica_id = await self._pick_or_select(
@@ -1160,21 +1306,44 @@ class StagePool:
             )
         if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        if req_state.trace is not None:
+            req_state.trace.start_stage(self.stage_id, replica_id, "llm")
         self.maybe_update_watermarking_state(request_id, params)
+        # SamplingParams.n > 1 fans out into child requests, as in vLLM's AsyncLLM.
+        # Children keep the parent's external id, so aborting request_id reaches all.
+        engine_requests = [request]
+        parent_request = None
+        if (getattr(params, "n", 1) or 1) > 1:
+            parent_request = ParentRequest(request)
+            engine_requests = []
+            for index in range(params.n):
+                child_request_id, child_params = parent_request.get_child_info(index)
+                child_request = copy(request)
+                child_request.request_id = child_request_id
+                child_request.sampling_params = child_params
+                engine_requests.append(child_request)
+        added: list[str] = []
         try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
+            for index, engine_request in enumerate(engine_requests):
+                self.output_processor.add_request(
+                    request=engine_request,
+                    prompt=prompt_text,
+                    parent_req=parent_request,
+                    request_index=index,
+                    queue=None,
+                )
+                added.append(engine_request.request_id)
         except Exception:
             self.release_binding(request_id)
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                for added_request_id in added:
+                    rollback(added_request_id)
             raise
 
         try:
-            await self._llm_client(replica_id).add_request_async(request)
+            for engine_request in engine_requests:
+                await self._llm_client(replica_id).add_request_async(engine_request)
         except BaseException:
             # Sending can fail or be cancelled after the engine accepted the
             # request. Abort while its replica binding is still available.
@@ -1193,15 +1362,16 @@ class StagePool:
                 self.release_binding(request_id)
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
-                    try:
-                        rollback(request_id)
-                    except Exception as rollback_error:
-                        logger.warning(
-                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                            request_id,
-                            self.stage_id,
-                            rollback_error,
-                        )
+                    for added_request_id in added:
+                        try:
+                            rollback(added_request_id)
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                                added_request_id,
+                                self.stage_id,
+                                rollback_error,
+                            )
             raise
         return replica_id
 
@@ -1213,14 +1383,18 @@ class StagePool:
         *,
         prompt_text: Any = None,
         pinned_replica_id: int | None = None,
+        requested_replica_id: int | None = None,
         submit_kwargs: DiffusionSubmitKwargs | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        self._validate_requested_replica_pin(requested_replica_id, pinned_replica_id)
         submit_kwargs = submit_kwargs or DiffusionSubmitKwargs()
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        if pinned_replica_id is not None:
+        if requested_replica_id is not None:
+            replica_id = self.bind_requested_replica(request_id, requested_replica_id)
+        elif pinned_replica_id is not None:
             replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
         else:
             bound_replica_id = self.get_bound_replica_id(request_id)
@@ -1358,6 +1532,7 @@ class StagePool:
             raw_outputs.outputs,
             raw_outputs.timestamp,
             iteration_stats,
+            weight_version=raw_outputs.weight_version,
         )
         if self._watermarkers:
             self._discard_completed_llm_watermark_state(raw_outputs.outputs, processor.request_states)

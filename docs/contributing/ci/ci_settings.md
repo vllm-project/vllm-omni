@@ -185,6 +185,46 @@ Canonical layout (prefer these paths for new changes):
 
     **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).
 
+    **READY/MERGE CPU timing:** the three **Model Executor** shards and **Other Test** use
+    `.buildkite/amd/scripts/run_cpu_suite.py`. It invokes pytest once with the existing
+    selectors and shard arguments, adding `--durations=50` and JUnit output. Test
+    grades, timeouts, and shard counts are unchanged. READY and MERGE retain identical
+    definitions for these jobs so combined builds can still deduplicate them.
+
+    Each invocation uploads `artifacts/amd-cpu-suites/<suite>-<build>-<job>-<shard>-<unique>/`:
+
+    - `invocation.json`: pytest arguments, marker/run level, shard parameters, commit,
+      and Buildkite identifiers. The configured image tag is recorded; the resolved
+      digest is `null` because it is not exposed to this runner. Use the Buildkite
+      group/build metadata to identify READY, MERGE, or a combined tier.
+    - `selection.json`: node IDs collected before filtering, selected after filtering
+      and sharding, and `not_selected` (their difference). `deselected` records
+      pytest notifications only: pytest-shard 0.1.2 removes items silently.
+      No extra collection pass is run.
+    - `events.jsonl`: elapsed timestamps for collection, test starts, and each
+      setup/call/teardown report, including duration and outcome.
+    - `pytest.xml`: pytest's JUnit execution results.
+    - `cpu-before.json` / `cpu-after.json`: CPU affinity, cgroup v1/v2 limits,
+      throttling counters, CPU pressure, load, and thread environment settings.
+      Unavailable Linux fields are identified explicitly.
+    - `summary.json`: pytest exit code, collection status, node counts, and phase
+      totals. `executed` counts nodes with a call report; setup skips/errors are
+      separate outcomes. A teardown failure makes the node failed even if its call
+      passed. `skipped` includes expected failures (see `wasxfail` in events).
+
+    `runner_wall` spans the measured invocation, including artifact overhead.
+    Phase totals describe this pytest process: setup/teardown include fixture costs,
+    while collection is wall time around pytest's collection hook. They exclude
+    image-build, dependency-wait, and queue time and are not per-fixture profiles.
+    Match job IDs to Buildkite timestamps when analyzing end-to-end latency.
+
+    Events are closed after every write so completed records survive process
+    termination. SIGTERM/SIGKILL can leave no final summary or JUnit file; treat
+    such artifacts as partial, never as a passing run. Upload still depends on
+    the agent retaining the workspace. The runner preserves nonzero pytest exit
+    codes; artifact errors fail an otherwise successful invocation. This adds
+    measurement only; CI overhead and build-time savings require hardware evidence.
+
     **Data file fields**
 
     | Field | Purpose |
@@ -214,6 +254,82 @@ Canonical layout (prefer these paths for new changes):
     1. Add a step to `pipeline-intel.yml`, or extend an existing runner script.
     2. Match `agents`, `env`, `timeout_in_minutes`, and `command`/`commands` with sibling steps.
     3. Keep `pipeline-intel.yml` listed in `L2_YAML_FILES` in `ci_conditions.py`.
+
+## Opt-in AMD model-executor CPU partition qualification
+
+The timing-based partitioner is experimental. Production READY/MERGE retain their
+three hash shards, current selectors, exclusion, blocking grades, and timeouts.
+No measured timing profile or production activation is included with this feature.
+TIME-01 artifacts are the prerequisite for evaluating a new split; shard-level
+averages alone do not identify which test modules should move.
+
+### Prepare a shared profile
+
+Download the artifact directories from successful TIME-01 **Model Executor** jobs.
+Supply exactly one successful attempt of every shard from each source build:
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py \
+  downloaded/build-1/shard-0 downloaded/build-1/shard-1 downloaded/build-1/shard-2 \
+  --output model-executor-timings.json
+```
+
+The tool consumes `invocation.json`, `selection.json`, `summary.json`, and
+`events.jsonl`. Failed/incomplete runs, missing or duplicate shards, overlapping
+selected nodes, and incomplete phase reports are rejected. It sums setup, call,
+and teardown per node, then takes the median across supplied builds. The output
+records `schema_version: 1`, `node_seconds`, and source build URLs/commits.
+Use a new output path; existing profiles are never overwritten.
+
+### Run a candidate shard
+
+Run from the repository root in the AMD CI image with the normal test dependencies.
+Use the **same profile bytes and source revision** on all three workers, set the
+index to 0, 1, or 2, and choose a distinct output path for each invocation:
+
+```bash
+SHARD_INDEX=0
+PLAN_DIR=$(mktemp -d)
+pytest -sv tests/model_executor \
+  -m 'core_model and cpu and not omni' \
+  --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end \
+  --cpu-shard-profile=model-executor-timings.json \
+  --cpu-shard-count=3 --cpu-shard-index="$SHARD_INDEX" \
+  --cpu-shard-plan="$PLAN_DIR/plan.json" \
+  --durations=50 --junitxml="$PLAN_DIR/pytest.xml"
+```
+
+These options replace `--num-shards` / `--shard-id` for the qualification run.
+Combining the two partitioners or enabling xdist workers fails before execution.
+The opt-in scope is `core_model` + `cpu`, excluding `omni`, under
+`tests/model_executor/`. Marker, keyword, and explicit deselection filters run
+before partitioning. Without `--cpu-shard-profile`, collection behavior is unchanged.
+
+The current collected node set is authoritative. Nodes in a module stay together
+to preserve module/class fixture locality. Modules are assigned longest estimated
+cost first to the least-loaded shard. Module ties use path order; shard ties use
+node count, then shard index. New
+nodes use the median positive timing among currently collected measured nodes,
+or a one-second planning weight when none exists. Stale timing entries never
+select tests. Empty/unknown timing history preserves coverage but cannot establish
+a useful performance balance. Output preserves the original collection order
+inside each shard; an empty selected shard retains pytest's exit code 5.
+
+`plan.json` records all node assignments, estimated shard costs, matched/unknown/
+stale timing counts, source builds, the profile SHA-256, an eligible-node SHA-256,
+and algorithm version `module-lpt-v1`. The file is written before execution and
+is **not** an execution result. Invalid profiles or plan-write errors fail closed.
+All workers must report identical profile/eligible-node hashes and assignments;
+compare the executed JUnit node union and skip outcomes with the baseline too.
+
+Shared fixture cost can be counted repeatedly in historical hash shards; collection,
+imports, and CPU contention are not modeled by the weights. Estimated loads and
+synthetic tests are not hardware speedup evidence. Before production activation,
+measure paired READY/MERGE runs, whole-build latency, CPU pressure, and aggregate
+job minutes. Proposed qualification goals are a median slowest/fastest ratio at
+most 1.20 and no more than 10% growth in aggregate job minutes. Keep the existing
+three-worker/thread policy and coverage contract while evaluating the candidate.
+Rollback is omission of the opt-in flags; TIME-01 instrumentation is independent.
 
 ## Cross-cutting conventions
 
@@ -331,8 +447,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
@@ -480,3 +596,25 @@ between the online and offline XML rather than just confirming both files exist.
 - [Test Writing Guide](./test_writing_guide.md) — markers, directories, L1–L5 examples
 - [Test Execution Guide](./test_execution_guide.md) — running CI-aligned jobs locally
 - Implementation: `.buildkite/common/scripts/upload_pipeline.py`, `.buildkite/common/scripts/skip_ci.py`
+
+## Docker Hub release credentials
+
+Docker publishing and nightly cleanup use the Buildkite secret
+`OMNI_DOCKERHUB_TOKEN`, mapped to `RELEASE_DOCKERHUB_TOKEN` only on Docker jobs.
+Agents must support step-level secrets (Buildkite agent 3.106.0 or newer).
+Configure an organization access token for `vllm/vllm-omni` and use `vllm`
+as the Docker Hub username. Image Push grants image pull/push; Tag Admin
+grants tag listing/deletion for nightly cleanup. Do not grant access to
+other repositories or organization management.
+
+Restrict the secret's access policy to the immutable `omni-release` pipeline
+ID, main, and the small CPU release queue. A job's `secrets` entry
+controls injection; the access policy controls whether other jobs may
+retrieve the secret. Protect release refs and pipeline settings as well.
+
+The cleanup script uses Docker Hub's `/v2/auth/token` exchange and
+namespace-scoped tag API. Shell tracing stays disabled to avoid exposing
+credentials or bearer tokens. The legacy S3 `DOCKERHUB_TOKEN` variable is
+not used by these Docker jobs. After validating the replacement, remove
+obsolete S3 copies and revoke shared tokens only after all consumers have
+migrated. Never commit token values to this repository.
