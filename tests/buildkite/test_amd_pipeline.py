@@ -359,16 +359,16 @@ def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                split(command)[:6]
+                split(command)[:7]
                 == [
                     "python",
                     "-u",
                     ".buildkite/amd/scripts/run_cpu_suite.py",
+                    "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
                     "model-executor",
                     "-sv",
                     "tests/model_executor",
                 ]
-                and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
                 for command in commands
             ):
                 matches.append(step)
@@ -531,11 +531,12 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
     argv = split(pytest_command)
 
-    assert step["parallelism"] == 3
-    assert argv[:6] == [
+    assert step["parallelism"] == 6
+    assert argv[:7] == [
         "python",
         "-u",
         ".buildkite/amd/scripts/run_cpu_suite.py",
+        "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
         "model-executor",
         "-sv",
         "tests/model_executor",
@@ -546,8 +547,7 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         PERSONAPLEX_TEMPORAL_STRESS_NODES
     )
-    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
-    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
+    assert not any(arg.startswith(("--num-shards", "--shard-id")) for arg in argv)
     assert "-k" not in argv
 
 

@@ -50,8 +50,9 @@ def cpu_context() -> dict[str, object]:
 
 
 class CpuSuiteArtifacts:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, suite: str | None = None) -> None:
         self.directory = directory
+        self.suite = suite
         self.started = time.perf_counter()
         self.collected: list[str] = []
         self.selected: list[str] = []
@@ -87,16 +88,18 @@ class CpuSuiteArtifacts:
         )
 
     def pytest_configure(self, config: pytest.Config) -> None:
+        weighted = bool(config.getoption("cpu_shard_profile", default=None))
         self.write(
             "invocation.json",
             {
                 "schema_version": 1,
+                "suite": self.suite,
                 "pytest_version": pytest.__version__,
                 "args": list(config.invocation_params.args),
                 "markers": config.option.markexpr,
                 "run_level": config.getoption("run_level", default=None),
-                "num_shards": config.getoption("num_shards", default=1),
-                "shard_id": config.getoption("shard_id", default=0),
+                "num_shards": config.getoption("cpu_shard_count" if weighted else "num_shards", default=1),
+                "shard_id": config.getoption("cpu_shard_index" if weighted else "shard_id", default=0),
                 "buildkite": {
                     name: os.environ.get(f"BUILDKITE_{name}")
                     for name in ("BUILD_NUMBER", "BUILD_URL", "JOB_ID", "COMMIT", "BRANCH", "LABEL", "RETRY_COUNT")
@@ -219,7 +222,8 @@ class CpuSuiteArtifacts:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("model-executor", "other"))
+    parser.add_argument("suite", choices=("model-executor", "other", "diffusion"))
+    parser.add_argument("--timing-profile", type=Path, help="Use duration packing instead of hash sharding")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     artifact_root = Path(os.environ.get("BUILDKITE_BUILD_CHECKOUT_PATH", Path.cwd())) / "artifacts/amd-cpu-suites"
@@ -236,12 +240,30 @@ def main() -> int:
         print(f"Cannot create CPU timing artifacts: {error}", file=sys.stderr)
         return 1
     print(f"CPU timing artifacts: {directory}", flush=True)
-    recorder = CpuSuiteArtifacts(directory)
+    recorder = CpuSuiteArtifacts(directory, args.suite)
     recorder.write("cpu-before.json", cpu_context())
     # Match python -m pytest's import path when this script is invoked by path.
     sys.path.insert(0, str(Path.cwd()))
+    pytest_args = list(args.pytest_args)
+    if args.timing_profile:
+        from tests.helpers.cpu_sharding import load_profile
+
+        try:
+            if load_profile(args.timing_profile).suite != args.suite:
+                parser.error("Timing profile suite does not match the requested suite")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        # Buildkite assigns the worker count/index; the manifest only supplies costs.
+        pytest_args.extend(
+            [
+                f"--cpu-shard-profile={args.timing_profile}",
+                f"--cpu-shard-count={os.environ.get('BUILDKITE_PARALLEL_JOB_COUNT', '1')}",
+                f"--cpu-shard-index={os.environ.get('BUILDKITE_PARALLEL_JOB', '0')}",
+                f"--cpu-shard-plan={directory / 'plan.json'}",
+            ]
+        )
     status = int(
-        pytest.main([*args.pytest_args, "--durations=50", f"--junitxml={directory / 'pytest.xml'}"], plugins=[recorder])
+        pytest.main([*pytest_args, "--durations=50", f"--junitxml={directory / 'pytest.xml'}"], plugins=[recorder])
     )
     return recorder.finish(status)
 

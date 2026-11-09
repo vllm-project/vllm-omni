@@ -106,7 +106,7 @@ def suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    core_model\n    cpu\n    omni\n", encoding="utf-8")
     directory = tmp_path / "tests/model_executor"
     directory.mkdir(parents=True)
-    for name in "abcd":
+    for name in "abcdefgh":
         skipped_case = (
             "@pytest.mark.skip(reason='synthetic platform skip')\ndef test_skip(): pass\n" if name == "a" else ""
         )
@@ -146,24 +146,25 @@ def run_pytest(suite: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def partition_args(index: int, output: str) -> tuple[str, ...]:
+def partition_args(index: int, output: str, count: int = 3) -> tuple[str, ...]:
     return (
         "--cpu-shard-profile=profile.json",
-        "--cpu-shard-count=3",
+        f"--cpu-shard-count={count}",
         f"--cpu-shard-index={index}",
         f"--cpu-shard-plan={output}",
     )
 
 
-def test_three_executed_partitions_match_filtered_baseline(suite: Path) -> None:
+@pytest.mark.parametrize("count", [3, 6])
+def test_executed_partitions_match_filtered_baseline(suite: Path, count: int) -> None:
     filters = (f"--deselect={node('a', 'test_case[2]')}", "-k", "not test_b")
     baseline = run_pytest(suite, "--collect-only", *filters)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     nodes = {line for line in baseline.stdout.splitlines() if line.startswith("tests/model_executor/")}
     owners: dict[str, int] = {}
     plans = []
-    for index in range(3):
-        result = run_pytest(suite, *filters, *partition_args(index, f"plan-{index}.json"), "-vv")
+    for index in range(count):
+        result = run_pytest(suite, *filters, *partition_args(index, f"plan-{index}.json", count), "-vv")
         assert result.returncode == 0, result.stdout + result.stderr
         plan = json.loads((suite / f"plan-{index}.json").read_text())
         plans.append(plan)
@@ -178,8 +179,8 @@ def test_three_executed_partitions_match_filtered_baseline(suite: Path) -> None:
         assert not owners.keys() & selected
         owners.update({n: index for n in selected})
     assert set(owners) == nodes
-    assert plans[0] == plans[1] == plans[2]
-    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == ["test_a", "test_c", "test_d"]
+    assert all(plan == plans[0] for plan in plans)
+    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == [f"test_{name}" for name in "acdefgh"]
 
 
 def test_skip_outcome_matches_unsharded_execution(suite: Path) -> None:
@@ -263,7 +264,7 @@ def test_xdist_guard_and_default_fixture_grouping(suite: Path) -> None:
     assert not (suite / "fixtures.txt").exists()
     normal = run_pytest(suite, "-p", "xdist", "-n", "2", "--dist=loadgroup")
     assert normal.returncode == 0, normal.stdout + normal.stderr
-    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == ["test_a", "test_b", "test_c", "test_d"]
+    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == [f"test_{name}" for name in "abcdefgh"]
 
 
 def test_collection_error_is_not_hidden(suite: Path) -> None:
@@ -370,3 +371,59 @@ def test_profile_builder_rejects_unusable_evidence(tmp_path: Path, problem: str)
     result = run_builder(tmp_path, directories)
     assert result.returncode == 2, result.stdout + result.stderr
     assert not (tmp_path / "profile.json").exists()
+
+
+@pytest.mark.parametrize("suite_name,prefix", [("other", "tests/utils"), ("diffusion", "tests/diffusion")])
+def test_suite_profiles_preserve_new_nodes_and_reject_wrong_roots(tmp_path: Path, suite_name: str, prefix: str) -> None:
+    nodes = [f"{prefix}/test_{name}.py::test_case" for name in "abcdefgh"]
+    path = write_profile(tmp_path / "profile.json", {nodes[0]: 100})
+    data = json.loads(path.read_text())
+    data["suite"] = suite_name
+    path.write_text(json.dumps(data))
+    profile = load_profile(path)
+    plan = build_plan(nodes, profile, 3)
+    assert set(plan.node_shards) == set(nodes)
+    assert plan.unknown_timing_nodes == 7
+    with pytest.raises(ValueError, match="outside"):
+        build_plan([node("wrong_suite")], profile, 3)
+
+
+@pytest.mark.parametrize("problem", [None, "missing-node", "different-plan", "skip-changed", "duplicate-shard"])
+def test_execution_verifier_checks_union_outcomes_and_plans(tmp_path: Path, problem: str | None) -> None:
+    baseline: list[Path] = []
+    candidate: list[Path] = []
+    for build, directories in ((1, baseline), (2, candidate)):
+        for index in range(3):
+            directory = tmp_path / f"{build}-{index}"
+            write_artifact(directory, index, 6, build=build)
+            directories.append(directory)
+    plan = asdict(build_plan([node(name) for name in "abc"], TimingProfile({}, "test", []), 3))
+    for directory in candidate:
+        (directory / "plan.json").write_text(json.dumps(plan))
+    if problem == "duplicate-shard":
+        candidate.append(candidate[0])
+    elif problem == "different-plan":
+        plan["profile_sha256"] = "different"
+        (candidate[0] / "plan.json").write_text(json.dumps(plan))
+    elif problem == "missing-node":
+        (candidate[0] / "selection.json").write_text('{"selected": []}')
+        (candidate[0] / "events.jsonl").write_text("")
+    elif problem == "skip-changed":
+        path = candidate[0] / "events.jsonl"
+        path.write_text(path.read_text().replace('"outcome": "passed"', '"outcome": "skipped"'))
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILDER.with_name("verify_cpu_shards.py")),
+            "--suite",
+            "model-executor",
+            "--baseline",
+            *map(str, baseline),
+            "--candidate",
+            *map(str, candidate),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == (2 if problem else 0), result.stdout + result.stderr
