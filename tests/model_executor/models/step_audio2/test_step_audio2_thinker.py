@@ -63,7 +63,9 @@ def test_feature_length_calculation():
 
     assert calculate_audio_feature_length(100) > 0
 
-    assert calculate_audio_feature_length(1) >= 1
+    assert calculate_audio_feature_length(1) == 0
+    assert calculate_audio_feature_length(2) == 0
+    assert calculate_audio_feature_length(3) == 1
 
 
 def test_token_config_constants():
@@ -186,16 +188,23 @@ def audio_processor():
 @pytest.mark.parametrize(
     "durations, expected_chunks, expected_lengths",
     [
+        ((1 / 16000,), [1], [0]),
+        ((16 / 16000,), [1], [0]),
+        ((320 / 16000,), [1], [0]),
+        ((321 / 16000,), [1], [1]),
         ((25,), [1], [313]),
         ((30,), [2], [376]),
         ((40,), [2], [501]),
         ((50,), [2], [626]),
         ((60,), [3], [751]),
+        ((400160 / 16000,), [2], [313]),
+        ((800001 / 16000,), [3], [626]),
+        ((16 / 16000, 1), [1, 1], [0, 13]),
         ((1, 40, 2), [1, 2, 1], [13, 501, 25]),
     ],
 )
 def test_audio_chunks_preserve_items_and_prompt_lengths(audio_processor, durations, expected_chunks, expected_lengths):
-    """Long audio stays one item with bounded chunks and matching patch counts."""
+    """Short and chunked audio preserve items and match patches to embeddings."""
     from vllm.multimodal.inputs import MultiModalKwargsItems
 
     from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
@@ -205,7 +214,10 @@ def test_audio_chunks_preserve_items_and_prompt_lengths(audio_processor, duratio
     )
 
     hf_processor, processor = audio_processor
-    audios = [create_dummy_audio(duration_sec=duration)[0] for duration in durations]
+    audios = [
+        (0.5 * np.sin(2 * np.pi * 440 * np.arange(round(duration * 16000)) / 16000)).astype(np.float32)
+        for duration in durations
+    ]
     hf_inputs = hf_processor(text="", audio=audios)
     mm_items = processor.data_parser.parse_mm_data({"audio": audios})
     fields = processor._get_mm_fields_config(hf_inputs, {})
@@ -232,7 +244,6 @@ def test_audio_chunks_preserve_items_and_prompt_lengths(audio_processor, duratio
         assert update.full.count(151689) == n_chunks
         assert update.full.count(151691) == n_chunks
         assert update.is_embed(update.full).sum().item() == embeddings[i].shape[0]
-        assert embeddings[i].shape[0] > 0
 
 
 def test_text_only_audio_fields(audio_processor):

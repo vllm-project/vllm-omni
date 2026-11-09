@@ -353,7 +353,7 @@ def calculate_audio_feature_length(mel_length: int) -> int:
 
     adapter_output_len = (encoder_output_len - 1) // 2 + 1
 
-    return max(1, adapter_output_len)
+    return adapter_output_len
 
 
 class StepAudio2Processor(ProcessorMixin):
