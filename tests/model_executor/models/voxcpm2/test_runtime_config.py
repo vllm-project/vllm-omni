@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 
-from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig, reject_outer_full_cudagraph
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -17,9 +19,11 @@ def test_runner_specific_audio_defaults(uses_v2):
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
-    assert config.enable_incremental_vae is uses_v2
-    assert config.vae_decode_every == (1 if uses_v2 else 3)
-    assert config.audio_emit_every == (3 if uses_v2 else 1)
+    # Incremental VAE is the CUDA v2 default only. ROCm keeps the v1 profile.
+    incremental = uses_v2 and current_omni_platform.is_cuda()
+    assert config.enable_incremental_vae is incremental
+    assert config.vae_decode_every == (1 if incremental else 3)
+    assert config.audio_emit_every == (3 if incremental else 1)
 
 
 def test_mrv2_explicit_legacy_audio_override():
@@ -168,3 +172,24 @@ def test_exact_patch_batch_requires_incremental_unified_decode():
         enable_exact_patch_batch=True, enable_incremental_vae=True, vae_decode_every=1
     )._normalized()
     assert config.enable_exact_patch_batch
+
+
+def _graph_config(mode, *, uses_v2=False):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(use_v2_model_runner=uses_v2),
+        compilation_config=SimpleNamespace(cudagraph_mode=mode),
+    )
+
+
+@pytest.mark.parametrize("mode_name", ["FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_mrv1_rejects_outer_full_cudagraph(mode_name):
+    with pytest.raises(ValueError, match=f"cudagraph_mode={mode_name}.*PIECEWISE"):
+        reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name]))
+
+
+@pytest.mark.parametrize(
+    ("mode_name", "uses_v2"),
+    [("NONE", False), ("PIECEWISE", False), ("FULL_AND_PIECEWISE", True)],
+)
+def test_supported_graph_modes_pass(mode_name, uses_v2):
+    reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name], uses_v2=uses_v2))

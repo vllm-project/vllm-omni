@@ -38,11 +38,11 @@
         "max-concurrency": 1,
         "baseline": {
           "H200": {
-            "throughput_qps": 0.213,
-            "latency_mean": 4.6953,
-            "latency_p99": 4.8601,
-            "peak_memory_mb_max": 56912.0,
-            "peak_memory_mb_mean": 56912.0
+            "throughput_qps": 0.4463,
+            "latency_mean": 2.247,
+            "latency_p99": 2.5891,
+            "peak_memory_mb_max": 47020.0,
+            "peak_memory_mb_mean": 47020.0
           },
           "A3": {
             "throughput_qps": 0.1691,

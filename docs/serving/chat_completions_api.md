@@ -78,6 +78,43 @@ top-level JSON sent to the server.
     API](image_generation_api.md) or [Image Edit API](image_edit_api.md) when
     either endpoint matches the task.
 
+## Per-Stage Sampling Parameters
+
+Use `sampling_params_list` to override individual stages through the SDK's
+`extra_body` or as a top-level HTTP field. For LLM stages, each dictionary is
+a partial override. Values are resolved in this order, with later values
+taking precedence:
+
+1. The stage's deployment sampling defaults.
+2. Explicit top-level request parameters, for the comprehension stage only.
+3. Explicit fields in that stage's `sampling_params_list` dictionary.
+
+For example, this request retains `max_tokens=256` and the deployment's
+other defaults, while overriding the first stage's temperature:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Describe this recording."}],
+  "max_tokens": 256,
+  "temperature": 0.7,
+  "sampling_params_list": [{"temperature": 0.2}]
+}
+```
+
+`max_completion_tokens` takes precedence over top-level `max_tokens` when
+both are provided; an explicit stage `max_tokens` overrides either one.
+Omitted stages use their deployment defaults, with explicit top-level
+parameters still applied to an omitted comprehension stage. An empty list
+therefore uses defaults plus the explicit comprehension parameters.
+LLM stage `extra_args` dictionaries merge with deployment `extra_args` by
+key; setting `extra_args` to `null` clears it.
+
+Previously, providing an LLM stage dictionary replaced its entire sampling
+configuration with library defaults plus that dictionary. Clients relying
+on those library defaults should now provide the desired values explicitly.
+Diffusion stage dictionaries retain their existing replacement semantics;
+omitted diffusion stages retain their deployment defaults.
+
 ## Batch Requests
 
 `POST /v1/chat/completions/batch` accepts the same shared generation fields,

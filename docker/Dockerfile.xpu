@@ -1,4 +1,4 @@
-# Target vLLM version: v0.32.0. Keep VLLM_VERSION aligned with the target vLLM
+# Target vLLM version: v0.33.0. Keep VLLM_VERSION aligned with the target vLLM
 # release on every rebase.
 #
 # This file layers vLLM-Omni on top of the published upstream XPU image, which
@@ -8,8 +8,8 @@
 # pulls that base automatically, so there is nothing to build here beyond the
 # Omni layers. Mirrors how docker/Dockerfile.ci consumes vllm/vllm-openai.
 #
-# If the tag does not exist yet (targeting an unreleased vLLM commit), build the
-# base from upstream's own Dockerfile and point VLLM_BASE at the result:
+# If the matching image cannot be fetched, build the base from upstream's
+# Dockerfile at the selected tag and point VLLM_BASE at the result:
 #
 #   git clone --depth 1 --branch $VLLM_VERSION https://github.com/vllm-project/vllm /tmp/vllm
 #   docker build -t vllm-openai-xpu:local --target vllm-openai \
@@ -18,7 +18,7 @@
 #
 # .buildkite/intel/scripts/run-xpu-test.sh automates that pull-then-build fallback.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai-xpu
-ARG VLLM_VERSION=v0.32.0
+ARG VLLM_VERSION=v0.33.0
 ARG VLLM_BASE=${VLLM_BASE_IMAGE}:${VLLM_VERSION}
 
 FROM ${VLLM_BASE} AS vllm-omni
@@ -41,9 +41,9 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # vLLM XPU wheel requires triton==3.8.0+xpu; installing the old triton-xpu
 # overlay would replace that runtime with an incompatible version.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-build-isolation \
-    ".[dev]" && \
-    uv pip check
+    python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
+    uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
+    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl ".[dev]"
 
 FROM vllm-omni AS vllm-omni-openai
 

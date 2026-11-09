@@ -26,6 +26,20 @@ last_reviewed: 2026-07-16
 Cache management defines reusable state, cache identity, validity, lifecycle,
 and eviction across AR and diffusion execution.
 
+When upstream reports a multimodal encoder-cache size mismatch, both AR and
+generation schedulers drain that request into a terminal error output and
+discard its pending prewarm payload. A rejected cache identifier must not
+leave a request waiting indefinitely or replay the same error on later steps.
+
+When HiSparse defers asynchronous KV loads, a completed nonempty scheduler
+step advances the upstream fence and drains both deferred frees and loads.
+Empty steps leave the fence unchanged so a reused block cannot be loaded
+while an earlier GPU step still reads it.
+
+Diffusion supplies worker attention specs to the native KV planner and uses
+its default grouping. Its model-config adapter declares that it does not use
+a registered model's custom `SupportsKVCacheGrouping` hook.
+
 ## Candidate invariants
 
 ### CACHE-INV-001: Cache identity is complete

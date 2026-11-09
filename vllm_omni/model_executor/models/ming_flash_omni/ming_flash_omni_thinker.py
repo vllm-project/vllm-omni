@@ -67,6 +67,9 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
+from vllm_omni.model_executor.models.common.ming.whisper_encoder import (
+    WhisperAudioEncoder,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
 from vllm_omni.transformers_utils.processors.ming import (
@@ -78,7 +81,6 @@ from vllm_omni.transformers_utils.processors.ming import (
     raise_missing_video_processor,
 )
 
-from .audio_encoder import WhisperAudioEncoder
 from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
 from .projectors import AudioProjector, VisionProjector
 from .vision_encoder import MingVisionEncoder

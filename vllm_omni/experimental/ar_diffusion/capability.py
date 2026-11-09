@@ -242,7 +242,7 @@ class SupportsARDiffusionWarmup(Protocol):
 
 @runtime_checkable
 class SupportsARDiffusionCellPipeline(Protocol):
-    """Cell Self-Forcing/Latest-KV pipeline (vertical slice). Mutually exclusive with tick KV."""
+    """Cell Self-Forcing (S=1 layer PP) / Latest-KV (vertical slice) pipeline. Mutually exclusive with tick KV."""
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec: ...
 

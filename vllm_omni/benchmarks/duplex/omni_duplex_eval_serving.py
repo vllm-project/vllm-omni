@@ -26,10 +26,12 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, s
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
+    MIX_QUESTION,
     GenerateSampleResult,
     PreparedReferenceAudio,
     PreparedSample,
     prepare_sample,
+    write_failed_sample_diagnostics,
     write_sample_result,
 )
 from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_NONE
@@ -56,6 +58,7 @@ class OmniDuplexEvalSampleRequest(SampleRequest):
     response_root: Path = Path("omni-duplex-eval-output")
     ref_audio: PreparedReferenceAudio | None = field(default=None, repr=False)
     fps: float = 1.0
+    mix: str = MIX_QUESTION
     turn_detection: str = TURN_DETECTION_NONE
     instructions: str | None = DEFAULT_INSTRUCTIONS
     evaluation: DuplexEvalEvaluation | None = field(default=None, repr=False)
@@ -117,6 +120,7 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
                 response_root=root,
                 ref_audio=reference,
                 fps=args.duplex_eval_fps,
+                mix=args.duplex_eval_mix,
                 turn_detection=args.duplex_eval_turn_detection,
                 instructions=(
                     DEFAULT_INSTRUCTIONS
@@ -138,6 +142,7 @@ def prepare_duplex_eval_sample(request: OmniDuplexEvalSampleRequest) -> Prepared
         media_dir=request.response_root / request.sample.split / ".media" / request.sample.id,
         ref_audio=request.ref_audio,
         fps=request.fps,
+        mix=request.mix,
     )
 
 
@@ -204,9 +209,19 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
     errors: list[str] = []
     published: list[OmniDuplexEvalSampleRequest] = []
     published_with_unfinished_responses = 0
+    failed_diagnostics = 0
     for sample, output in rows:
         result = getattr(output, "duplex_eval_result", None)
-        if not output.success or not isinstance(result, GenerateSampleResult):
+        if not isinstance(result, GenerateSampleResult):
+            continue
+        if not output.success:
+            try:
+                write_failed_sample_diagnostics(result)
+                failed_diagnostics += 1
+            except OSError as exc:
+                message = f"Cannot publish failed-session diagnostics for {result.output}: {exc}"
+                errors.append(message)
+                logger.exception(message)
             continue
         request_metrics.extend(result.request_metrics)
         session_metrics.append(result.session_metrics)
@@ -230,6 +245,7 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
         "response_root": str(root),
         "published": len(published),
         "published_with_unfinished_responses": published_with_unfinished_responses,
+        "failed_diagnostics": failed_diagnostics,
         "artifact_errors": errors,
     }
     if published_with_unfinished_responses:

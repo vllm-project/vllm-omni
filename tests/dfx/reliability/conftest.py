@@ -1,4 +1,10 @@
-"""Pytest fixtures for reliability tests."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Pytest fixtures for reliability tests.
+
+Model tests call a fault scenario directly, so there is no case-lookup fixture.
+"""
 
 from __future__ import annotations
 

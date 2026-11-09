@@ -107,7 +107,7 @@ def test_encode_frames_assembles_1x1_latents_like_upstream(frames):
     """
     ref, fast = pair()
     assert install_wan_vae_encoder_fastpath(fast).installed
-    seen = {}
+    seen: dict[str, tuple[int, ...]] = {}
     for name, vae in (("expected", ref), ("actual", fast)):
         vae.quant_conv.register_forward_pre_hook(lambda _, args, name=name: seen.__setitem__(name, args[0].stride()))
     x = torch.randn(1, 3, frames, 16, 16)
@@ -398,7 +398,7 @@ def test_encoder_installation_rollback(monkeypatch, failure_stage):
         original_setattr = type(vae.encoder).__setattr__
 
         def fail_binding(module, name, value):
-            original_setattr(module, name, value)
+            original_setattr(module, name, value)  # type: ignore[call-arg]
             if module is vae.encoder and name == fp.CFG_ATTR:
                 raise RuntimeError("injected failure")
 
@@ -613,7 +613,7 @@ def test_norm_cache_fusion_falls_back_in_order(monkeypatch, reason):
     elif reason == "dropout_hook":
         dropout.register_forward_hook(lambda *_: events.append("hook"))
     elif reason == "dropout_custom":
-        dropout.forward = lambda x: events.append("custom") or x
+        dropout.forward = lambda x: events.append("custom") or x  # type: ignore[func-returns-value]
     x = torch.randn(1, 8, 1, 3, 5)
     cache = [torch.randn(1, 8, 2, 3, 5)]
     previous = cache[0]
@@ -668,7 +668,7 @@ def test_global_hooks_disable_only_inlined_module_calls(register):
         assert fp._has_forward_hooks(dropout) and fp._has_forward_hooks(norm)
         assert not fp._can_bypass_dropout(dropout)
         # A module's own optimized forward still runs: its hooks see the real arguments and output.
-        assert fp._kernels_allowed(SimpleNamespace(is_cuda=True))
+        assert fp._kernels_allowed(SimpleNamespace(device=torch.device("cuda")))
         assert fp.rms_norm_fastpath(norm, x) is not None
     finally:
         handle.remove()

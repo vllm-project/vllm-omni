@@ -96,6 +96,39 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
 
+##### Platform marker contract
+
+Do not add an `amd` marker. The repository already selects AMD with `rocm`.
+
+| Marker | Meaning |
+| --- | --- |
+| `cpu` | Shared CPU-mode test. AMD jobs keep running these. |
+| `cuda` | Qualified for NVIDIA CUDA. |
+| `rocm` | Qualified for AMD ROCm. Add `rocm: MI325` only after the test has passed on ROCm. |
+| `nvidia_only` | Explicit NVIDIA dependency. Keep it during migration. |
+
+A cross-platform test lists both platforms. The same card count stays one item:
+
+```python
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325"},
+    num_cards=1,
+)
+```
+
+Different card counts become one collected variant per platform:
+
+```python
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325"},
+    num_cards={"cuda": 4, "rocm": 2},
+)
+```
+
+`check-mark` rejects an effective item that has both `rocm` and `nvidia_only`, including combinations created by class-level and stacked function parametrizations. Using the `torch.cuda` namespace does not make a test NVIDIA-only: PyTorch ROCm also uses that namespace. A CPU test stays `pytest.mark.cpu`; do not relabel it to keep an AMD GPU job green.
+
+AMD GPU jobs select `rocm`, not `cuda`. To migrate a legacy selector, first run its current CUDA-marked collection on AMD, add `rocm: MI325` only to the items that pass, and preserve every existing CUDA mark. Compare the old and new node manifests, account explicitly for expected NVIDIA-only or runtime-skipped removals, and add an exact nonzero collection check to the job so later marker drift fails before the GPU workload starts.
+
 ##### Example usage for decorator
 
 - Single call for multiple platforms:
@@ -128,15 +161,17 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 ```python
 from tests.helpers.mark import hardware_marks
 
-MULTI_CARD_MARKS = hardware_marks(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2
-)
+MULTI_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2)
 
-@pytest.mark.parametrize("omni_server", [
-    pytest.param(OmniServerParams(...), id="case_001", marks=MULTI_CARD_MARKS),
-], indirect=True)
-def test_feature(omni_server):
-    ...
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(OmniServerParams(...), id="case_001", marks=MULTI_CARD_MARKS),
+    ],
+    indirect=True,
+)
+def test_feature(omni_server): ...
 ```
 
 #### JSON `mark` field (L4 perf configs)
@@ -188,6 +223,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    ```python
    # In vllm-omni/tests/helpers/mark.py
 
+
    def _tpu_marks(*, res: str, num_cards: int):
        _require_sku("tpu", res)
        return [pytest.mark.tpu, getattr(pytest.mark, res), _cards_mark(num_cards)]
@@ -206,8 +242,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        res={"tpu": "TPU_V3"},
        num_cards=2,
    )
-   def test_my_tpu_feature():
-       ...
+   def test_my_tpu_feature(): ...
    ```
 
 **Summary**:  
@@ -303,6 +338,7 @@ Examples from `tests/model_executor/models/qwen2_5_omni/test_audio_length.py`
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_resolve_max_mel_frames_default():
     from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import resolve_max_mel_frames
@@ -479,7 +515,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
             "audio": ["water", "cricket"],
             "video": ["sphere", "globe", "circle", "round"],
             "image": ["square", "quadrate"],
-            "text": ["beijing"]
+            "text": ["beijing"],
         },
     }
     ```
@@ -575,10 +611,9 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 - ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
 - ***Reliability Test Suite*** (`tests/dfx/reliability/`):
-    - `test_reliability_qwen3_omni.py` — Qwen3-Omni chat / multimodal reliability (GPU OOM, process kill, recovery, error contract under `--async-chunk` vs default).
-    - `test_reliability_wan22.py` — Wan2.2 I2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
-    - `test_reliability_hunyuan_image.py` — HunyuanImage-3.0-Instruct DiT-only reliability (`/v1/images/generations` under OOM and process kill; deploy `hunyuan_image3_dit.yaml`, H100 × 4).
-    - `helpers.py` — Shared primitives used by current suites: raw HTTP probes for `/v1/chat/completions` and `/health`, OpenAI-style error parsing, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
+    - `scenarios/` — one class per fault. The class owns the shared steps.
+    - `helpers.py` — `FaultModel`, signal lists, `scenario_params`, plus the shared primitives: raw HTTP probes, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
+    - `test_<model>.py` — that model's deploy, probes, and the scenarios it runs. Each test calls the matching scenario class.
     - `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
     - `README.md` — Short local run commands for this directory.
 
@@ -587,7 +622,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
     - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/run_stability_wan22.py` (or add `run_stability_<model>.py` alongside a matching JSON config)
-    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
+    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `minicpmo_4_5`).
 - ***Script Example***:
 
 <details>
@@ -663,19 +698,19 @@ All other optional parameters follow the same rules as in L4 §3.4.
 
 ##### Reliability
 
-Add pytest modules under `tests/dfx/reliability/` (for example `test_reliability_qwen3_omni.py`, `test_reliability_wan22.py`, `test_reliability_hunyuan_image.py`). Reuse `helpers.py` and `conftest.py` rather than duplicating OOM / process-kill / raw HTTP plumbing.
+Add `tests/dfx/reliability/test_<model>.py` with a `FaultModel` subclass for that model's deploy and probes, and call the scenario classes for the faults it runs. Reuse `scenarios/`, `helpers.py`, and `conftest.py` rather than duplicating OOM / process-kill / raw HTTP plumbing.
 
 ###### Parametrization and markers
 
-- Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
-- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=...)`** (Qwen3-Omni **2** cards; Wan2.2 **1** card; HunyuanImage DiT **4** cards).
+- The model's `scenarios` list (`test_name`, `server_params`) is turned into `OmniServerParams` by `create_reliability_omni_server_params()`. `scenario_params()` parametrizes `omni_server_function`.
+- The model test module is tagged `pytest.mark.slow` and `hardware_marks(...)` (Qwen3-Omni **2** cards; Wan2.2 **1** card; HunyuanImage DiT **4** cards; MiniCPM-o 4.5 **1** card).
 - **Process-kill** tests use POSIX **`pgrep` / `kill`**. The helper raises on Windows instead of skipping.
 
 ###### Adding a new model suite
 
-1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
-2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e deploy-config directory (same pattern as existing files).
-3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs deploy YAML.
-4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
+1. Add `test_<model>.py` under `tests/dfx/reliability/`.
+2. Subclass `FaultModel` in that file with the deploy and probes. Call `scenario_params` and the scenario class `run` method for each fault this model runs.
+3. Reuse **`helpers`** and **`scenarios`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs deploy YAML.
+4. Register **`slow`** and **`hardware_marks`** on the module; extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
 
 </details>

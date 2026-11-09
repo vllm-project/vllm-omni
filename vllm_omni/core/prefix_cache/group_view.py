@@ -10,11 +10,13 @@ returns None when the input batch has no block table.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -44,27 +46,96 @@ class FullAttentionGroupView:
         The device slot_mapping would need a stream sync to read back, which
         stalls the whole forward; the CPU block table carries the same
         information (positions are num_computed .. +num_scheduled per request).
+        Positions past the table width are dropped. Vectorized: this runs on
+        the engine thread every step.
         """
-        block_table = self._block_table_cpu()
         bs = self.block_size
-        max_blocks = int(block_table.shape[1])
-        computed = self._input_batch.num_computed_tokens_cpu
-        parts: list[torch.Tensor] = []
+        index_of = self._input_batch.req_id_to_index
+        sched = [(index_of[req_id], n) for req_id in req_ids if (n := int(num_scheduled.get(req_id, 0))) > 0]
+        if not sched:
+            return torch.empty((0,), dtype=torch.long)
+        rows, counts = np.array(sched, dtype=np.int64).T
+        starts = np.asarray(self._input_batch.num_computed_tokens_cpu)[rows].astype(np.int64)
+        first = np.cumsum(counts) - counts
+        pos = np.arange(int(counts.sum()), dtype=np.int64) + np.repeat(starts - first, counts)
+        row = np.repeat(rows, counts)
+        table = self._block_table_cpu().numpy()
+        blocks = pos // bs
+        if int(blocks.max()) >= table.shape[1]:
+            keep = blocks < table.shape[1]
+            pos, row, blocks = pos[keep], row[keep], blocks[keep]
+        return torch.from_numpy(table[row, blocks].astype(np.int64) * bs + pos % bs)
+
+
+class MRv2FullAttentionGroupView:
+    """View for Model Runner V2, whose block table has no host copy.
+
+    Block ids come from the adapter's per-request ledger (built from the
+    scheduler output it already translates); positions and batch order from
+    the ``InputBatch`` bound for the step being saved. Nothing is read back
+    from the device and the runner's ``BlockTables`` is not touched.
+    """
+
+    def __init__(self, adapter: Any, block_size: int):
+        self._adapter = adapter
+        self.block_size = block_size
+        self._input_batch: Any = None
+
+    def bind(self, input_batch: Any) -> None:
+        self._input_batch = input_batch
+
+    def _batch(self) -> Any:
+        if self._input_batch is None:
+            raise OmniPrefixCacheUnmatchError("MRv2 prefix-cache view has no bound input batch")
+        return self._input_batch
+
+    def batch_req_ids(self) -> list[str]:
+        batch = self._batch()
+        return list(batch.req_ids[: batch.num_reqs])
+
+    def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
+        batch = self._batch()
+        row_of = {req_id: row for row, req_id in enumerate(batch.req_ids[: batch.num_reqs])}
+        bs = self.block_size
+        parts: list[np.ndarray] = []
         for req_id in req_ids:
-            n = int(num_scheduled.get(req_id, 0))
-            if n <= 0:
+            count = int(num_scheduled.get(req_id, 0))
+            if count <= 0:
                 continue
-            req_idx = self._input_batch.req_id_to_index[req_id]
-            start = int(computed[req_idx])
-            pos = torch.arange(start, start + n, dtype=torch.long)
-            offs = pos // bs
-            if int(offs[-1]) >= max_blocks:
-                keep = offs < max_blocks
-                pos, offs = pos[keep], offs[keep]
-                if pos.numel() == 0:
-                    continue
-            parts.append(block_table[req_idx, offs].to(torch.long) * bs + (pos % bs))
-        return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
+            row = row_of.get(req_id)
+            if row is None or int(batch.num_scheduled_tokens[row]) != count:
+                raise OmniPrefixCacheUnmatchError(
+                    f"req {req_id}: scheduled {count} tokens, bound input batch disagrees"
+                )
+            blocks = self._adapter.block_ids(req_id)
+            pos = np.arange(count, dtype=np.int64) + int(batch.num_computed_tokens_np[row])
+            idx = pos // bs
+            if int(idx[-1]) >= len(blocks):
+                raise OmniPrefixCacheUnmatchError(
+                    f"req {req_id}: position {int(pos[-1])} lies past its {len(blocks)} recorded blocks"
+                )
+            parts.append(np.asarray(blocks, dtype=np.int64)[idx] * bs + pos % bs)
+        if not parts:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.from_numpy(np.concatenate(parts))
+
+
+def check_mrv2_prefix_cache_layout(*, block_sizes: list[int], block_size: int, dcp_size: int) -> None:
+    """Reject MRv2 layouts the ledger slot math cannot mirror.
+
+    MRv2 block tables hold allocator block ids and its slot mapping uses the
+    allocator block size; kernel-block splitting stays inside attention
+    metadata, so only DCP striping and a size mismatch need refusing.
+    """
+    if dcp_size != 1:
+        raise OmniPrefixCacheUnmatchError(
+            f"omni prefix caching does not support decode context parallel (dcp_world_size={dcp_size}); "
+            "disable enable_prefix_caching"
+        )
+    if not block_sizes or int(block_sizes[0]) != int(block_size):
+        raise OmniPrefixCacheUnmatchError(
+            f"omni prefix caching block_size {block_size} does not match the kv-cache block table ({block_sizes})"
+        )
 
 
 def check_prefix_cache_block_layout(block_table: object, block_size: int) -> None:
@@ -95,13 +166,13 @@ def check_prefix_cache_block_layout(block_table: object, block_size: int) -> Non
         )
 
 
-def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
+def check_prefix_cache_kv_groups(kv_cache_groups: Iterable[Any] | None) -> None:
     """Reject hybrid / multi-group models at kv-cache init, not first step.
 
     Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
     is imported here so ``tests/core`` can load this module without vllm.
     """
-    groups = list(kv_cache_groups or ())
+    groups = list(cast(Iterable[object], kv_cache_groups or ()))
     if len(groups) != 1:
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching requires a single full-attention kv-cache group; "
@@ -166,17 +237,22 @@ def stage_prefix_cache_config(
     model_config: object,
     is_pooling_model: bool,
     speculative_config: object = None,
+    model_cache_policy: ModelCachePolicy = ModelCachePolicy(),
 ) -> PrefixCacheConfig | None:
     """Runner-side gate shared by the GPU and NPU model runners.
 
     Returns None when the stage does not run an omni prefix cache
-    (``enable_prefix_caching`` off, or a pooling stage that never saves).
+    (``enable_prefix_caching`` off, a pooling stage that never saves, or
+    an explicit native-KV-only model). Native-only stages leave native KV
+    cache configuration and its validation untouched.
     Otherwise refuses kv_consumer / kv_both, speculative decoding,
     sub-block matching and hybrid kv groups, then sizes the config from
     the scheduler. One place so a platform runner cannot silently skip a
     refusal the other one has.
     """
     if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
+        return None
+    if model_cache_policy.native_kv_cache_only:
         return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)
@@ -192,7 +268,7 @@ def stage_prefix_cache_config(
 def get_prefix_cache_group_view(
     input_batch: InputBatch,
     block_size: int,
-    kv_cache_groups: object = None,
+    kv_cache_groups: Iterable[Any] | None = None,
 ) -> FullAttentionGroupView | None:
     """Build the group view; None only if the batch has no block table.
 

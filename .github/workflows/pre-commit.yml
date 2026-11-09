@@ -2,9 +2,10 @@ name: pre-commit
 
 on:
   pull_request:
-    branches: [main]
+    # Base branch filter. release/v* covers release/vX.Y.Z and release/vX.Y.ZrcN.
+    branches: [main, "release/v*"]
   push:
-    branches: [main]
+    branches: [main, "release/v*"]
   workflow_dispatch: # for manual trigger
 
 concurrency:

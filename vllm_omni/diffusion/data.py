@@ -27,6 +27,16 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+    collect_calibration_specs,
+    propagate_skip_softmax_calibration,
+)
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    parse_attention_schedule,
+    validate_attention_profile_name,
+    validate_attention_schedule,
+)
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -849,6 +859,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    diffusion_attention_schedule: "AttentionScheduleConfig | None" = None
     fa_deterministic: bool = False
 
     # Running mode
@@ -929,9 +940,12 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
+    lora_application: str = "runtime"
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -940,6 +954,7 @@ class OmniDiffusionConfig:
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
     # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
@@ -956,6 +971,7 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
     # Final-layout Host Weight Runtime policy. The loader only activates this
@@ -1236,6 +1252,12 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
+
+        parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
@@ -1446,10 +1468,31 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
+        if self.lora_application not in ("runtime", "merged"):
+            raise ValueError("lora_application must be 'runtime' or 'merged'")
+        if self.lora_application == "merged":
+            if self.lora_backend != LoRABackend.PEFT:
+                raise ValueError("Merged LoRA requires lora_backend='peft'")
+            if self.quantization_config is not None or self.parallel_config.use_hsdp:
+                raise ValueError("Merged LoRA requires unquantized weights without HSDP")
+            if offload_strategy is not OffloadStrategy.NONE:
+                raise ValueError("Merged LoRA does not support inference weight offloading")
+            if self.is_moe:
+                raise ValueError("Merged LoRA does not support MoE adapters")
+            if (
+                self.weight_transfer_config is not None
+                and self.weight_transfer_config.get("backend") != "omni_lora_ipc"
+            ):
+                raise ValueError("Merged LoRA weight updates require backend='omni_lora_ipc'")
+        elif self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") == "omni_lora_ipc":
+            raise ValueError("omni_lora_ipc requires lora_application='merged'")
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
@@ -1550,13 +1593,12 @@ class OmniDiffusionConfig:
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
         cfg = getattr(self, "diffusion_attention_config", None)
-        if not isinstance(cfg, AttentionConfig):
+        # The baseline plus every schedule profile, so a profile the service default never
+        # references still has its calibration discovered. The loader uses the same helper.
+        baseline = cfg if isinstance(cfg, AttentionConfig) else None
+        specs = collect_calibration_specs(baseline, getattr(self, "diffusion_attention_schedule", None))
+        if not specs:
             return
-        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
-
-        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-            propagate_skip_softmax_calibration,
-        )
 
         propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
@@ -1793,6 +1835,11 @@ class OmniDiffusionConfig:
                     # π0 (Pi-Zero) VLA — the LeRobot config.json uses ``type: "pi0"``.
                     if self.model_class_name is None:
                         self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif cfg.get("type") == "pi05":
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
@@ -2081,6 +2128,45 @@ class AttnQuantSpec:
         return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
+@dataclass
+class SpargeAttnSpec:
+    """Typed controls for SPARGE INT8 sparse attention on XPU.
+
+    ``topk`` is the fraction of logical K blocks retained per query block.
+    ``q_block_tokens``, ``k_block_tokens``, and ``q_tile_override`` tune the
+    sparse routing and prefill tiling. ``None`` keeps the backend's
+    head-dimension-specific default.
+    """
+
+    topk: float = 0.5
+    q_block_tokens: int | None = None
+    k_block_tokens: int | None = None
+    q_tile_override: int | None = None
+
+    _VALID_Q_BLOCK_TOKENS = frozenset({64, 256})
+    _VALID_Q_TILE_OVERRIDES = frozenset({0, 64, 128, 256})
+
+    def __post_init__(self) -> None:
+        topk = _in_range(self.topk, "sparge.topk", 0.0, 1.0)
+        if topk is None:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        self.topk = topk
+        if self.topk <= 0.0:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        if self.q_block_tokens is not None and self.q_block_tokens not in self._VALID_Q_BLOCK_TOKENS:
+            raise ValueError(
+                f"sparge.q_block_tokens={self.q_block_tokens!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_BLOCK_TOKENS)}."
+            )
+        if self.k_block_tokens is not None and self.k_block_tokens != 64:
+            raise ValueError("sparge.k_block_tokens must be 64 when set.")
+        if self.q_tile_override is not None and self.q_tile_override not in self._VALID_Q_TILE_OVERRIDES:
+            raise ValueError(
+                f"sparge.q_tile_override={self.q_tile_override!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_TILE_OVERRIDES)}."
+            )
+
+
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
@@ -2142,6 +2228,7 @@ class AttentionSpec:
     fastvideo_vsa_topk: int | None = None
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
+    sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2150,6 +2237,7 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
@@ -2161,11 +2249,11 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
-        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer"):
-            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo or flashinfer")
+        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton"):
+            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn or triton")
         if self.fastvideo_vsa_precision not in ("bf16", "sage"):
             raise ValueError("fastvideo_vsa_precision must be bf16 or sage")
-        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider == "fastvideo":
+        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider in ("fastvideo", "cudnn", "triton"):
             raise ValueError("Sage VSA precision requires the FlashInfer provider")
         if self.backend.upper() != "FASTVIDEO_VSA" and (
             self.fastvideo_vsa_provider not in ("auto", "fastvideo") or self.fastvideo_vsa_precision != "bf16"
@@ -2176,6 +2264,11 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.sparge is not None and self.backend.upper() != "SPARGE_ATTN":
+            raise ValueError(
+                f"sparge is only supported by the SPARGE_ATTN backend, but backend={self.backend!r}. "
+                "Remove sparge or set backend to SPARGE_ATTN."
+            )
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -2224,6 +2317,15 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.sparge is not None:
+            sp = self.sparge
+            kw["sparge_topk"] = sp.topk
+            if sp.q_block_tokens is not None:
+                kw["sparge_q_block_tokens"] = sp.q_block_tokens
+            if sp.k_block_tokens is not None:
+                kw["sparge_k_block_tokens"] = sp.k_block_tokens
+            if sp.q_tile_override is not None:
+                kw["sparge_q_tile_override"] = sp.q_tile_override
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -2309,6 +2411,7 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "sparge",
             "block_sparse",
         }
         node_dict = dict(node)
@@ -2343,6 +2446,58 @@ class AttentionConfig:
         if self.default is not None:
             return self.default, "attention_config.default"
         return None, None
+
+
+@dataclass
+class AttentionScheduleConfig:
+    """Startup-owned attention profiles and the default integer-step schedule.
+
+    Profiles resolve their own roles, without merging the baseline or its
+    environment fallback. Candidate construction and hardware validation happen
+    later, with the actual model layers available.
+    """
+
+    profiles: dict[str, AttentionConfig] = field(default_factory=dict)
+    default: AttentionSchedule = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profiles, Mapping):
+            raise TypeError("diffusion_attention_schedule.profiles must be a mapping")
+        normalized = {}
+        for name, profile in self.profiles.items():
+            validate_attention_profile_name(name)
+            if not isinstance(profile, (AttentionConfig, Mapping)):
+                raise TypeError(f"attention profile {name!r} must be an AttentionConfig or mapping")
+            normalized[name] = parse_attention_config(copy.deepcopy(profile))
+        self.profiles = normalized
+        default = parse_attention_schedule(self.default)
+        if default is None:
+            raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
+        validate_attention_schedule(default, profiles=self.profiles)
+        self.default = default
+
+
+def parse_attention_schedule_config(
+    value: AttentionScheduleConfig | Mapping[str, Any] | str | None,
+) -> AttentionScheduleConfig | None:
+    """Normalize service config without initializing backends or reading env vars.
+
+    A config without profiles can never select a candidate (its default must then be empty), so it
+    is returned as None: no schedule, and no attention layer prepares candidates.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if isinstance(value, AttentionScheduleConfig):
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+    elif isinstance(value, Mapping):
+        config = AttentionScheduleConfig(**dict(value))
+    else:
+        raise TypeError(
+            "diffusion_attention_schedule must be an AttentionScheduleConfig, mapping, JSON object, or None"
+        )
+    return config if config.profiles else None
 
 
 def parse_attention_config(
@@ -2445,23 +2600,36 @@ def build_attention_config(
 def validate_kv_cache_dtype_vs_attention_specs(
     kv_cache_dtype: str | None,
     attention_config: "AttentionConfig | None",
+    schedule: "AttentionScheduleConfig | None" = None,
 ) -> None:
     """Reject a global attention-quant knob combined with per-backend quant specs.
 
     ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
     an explicit ``quant`` spec is the advanced per-backend override. Setting both
     is contradictory intent — fail fast instead of picking one silently. A pure
-    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict. Attention
+    schedule profiles follow the same rule, because a scheduled step keeps the
+    global knob.
     """
-    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+    if kv_cache_dtype in (None, "auto", "float"):
         return
-    specs = [attention_config.default, *attention_config.per_role.values()]
-    for spec in specs:
+    configs = {"diffusion_attention_config": attention_config}
+    if schedule is not None:
+        configs |= {
+            f"diffusion_attention_schedule profile {name!r}": profile for name, profile in schedule.profiles.items()
+        }
+    specs = [
+        (source, spec)
+        for source, source_config in configs.items()
+        if source_config is not None
+        for spec in (source_config.default, *source_config.per_role.values())
+    ]
+    for source, spec in specs:
         if spec is None or spec.quant is None:
             continue
         if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
             raise ValueError(
-                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                f"diffusion_kv_cache_dtype conflicts with a {source} quant spec: "
                 "the unified knob already requests quantized attention. Remove the explicit "
                 "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
             )

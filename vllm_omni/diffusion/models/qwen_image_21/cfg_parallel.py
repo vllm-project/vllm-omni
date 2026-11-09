@@ -127,6 +127,11 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             # across requests, so cache state must never leak between them.
             cache_enabled = getattr(self.transformer, "causal_condition", False)
             kv_cache = QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
+            # Prefill is about to clone another prefix. Drop static copies left
+            # by finished requests first (#8831). The next request recaptures.
+            manager = getattr(self.transformer, "_decode_graph_manager", None)
+            if manager is not None:
+                manager.release_idle_entries()
             self.scheduler.set_begin_index(0)
             self.transformer.do_true_cfg = do_true_cfg
             additional_transformer_kwargs = additional_transformer_kwargs or {}

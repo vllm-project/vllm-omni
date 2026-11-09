@@ -103,6 +103,40 @@ def _calculate_test_metrics(outputs, goodput=None):
     )[0]
 
 
+def test_audio_ttfp_goodput_and_combined_slos() -> None:
+    fast = _make_output(100)
+    fast.audio_ttfp = 0.2
+    slow_audio = _make_output(100)
+    slow_audio.audio_ttfp = 0.8
+
+    audio_metrics = _calculate_test_metrics([fast, slow_audio], {"audio_ttfp": 500.0})
+    assert audio_metrics.request_goodput == 1.0
+
+    slow_ttft = _make_output(100)
+    slow_ttft.audio_ttfp = 0.2
+    slow_ttft.ttft = 0.8
+    combined_metrics = _calculate_test_metrics([fast, slow_ttft], {"ttft": 500.0, "audio_ttfp": 500.0})
+    assert combined_metrics.request_goodput == 1.0
+
+
+def test_goodput_rejects_unsupported_direct_metric() -> None:
+    with pytest.raises(ValueError, match="Invalid metric name"):
+        _calculate_test_metrics([], {"audio_ttft": 500.0})
+
+
+def test_unmeasured_audio_ttfp_does_not_pass_goodput() -> None:
+    missing = _make_output(100)
+    measured = _make_output(100)
+    measured.audio_ttfp = 0.2
+
+    metrics = _calculate_test_metrics([missing, measured], {"audio_ttfp": 500.0})
+    assert metrics.request_goodput == 1.0
+    assert metrics.num_audio_ttfp_samples == 1
+
+    combined = _calculate_test_metrics([missing], {"ttft": 500.0, "audio_ttfp": 500.0})
+    assert combined.request_goodput == 0.0
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================
@@ -200,7 +234,7 @@ def test_all_unmeasured_duplex_latency_is_not_reported_as_zero():
 
     metrics = _calculate_test_metrics(
         [listen_only],
-        {"ttft": float("inf"), "audio_ttft": float("inf")},
+        {"ttft": float("inf"), "audio_ttfp": float("inf")},
     )
 
     assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (0, 0, 0)
@@ -380,7 +414,7 @@ def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
     audio_only.ttft, audio_only.audio_ttfp = 0.0, 0.2
     audio_only.duplex_session_metrics = {"ttft_ms": None, "ttfp_ms": 200.0, "rtf": None}
 
-    metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttft": 500.0})
+    metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttfp": 500.0})
 
     assert metrics.request_goodput == 0.0
 

@@ -16,7 +16,7 @@ from vllm_omni.config.stage_config import (
 # when the checkpoint basename does not disambiguate.
 CAUSVID_WAN_PIPELINE = PipelineConfig(
     model_type="causvid_wan",
-    default_deploy_config_name="causvid_wan.yaml",
+    default_deploy_config_name="causvid_wan_self_forcing.yaml",
     model_arch="CausVidWanPipeline",
     diffusers_class_name="CausVidWanPipeline",
     stages=(

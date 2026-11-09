@@ -76,7 +76,7 @@ def start_async_stream_decode(
     """Wire producer (final denoise) → consumer (VAE owner) without blocking DiT.
 
     * Producer ``on_finished``: async D2H + queue; a send thread waits the copy
-      then ``isend`` (or local queue for S=1).
+      then ``isend`` (or local queue for S=1 single-rank layer PP, G=1).
     * Consumer thread: ``irecv``/queue → rescale → ``decode_chunk``.
     * ``join()`` waits side threads and returns concatenated pixels on owner,
       else ``None``.
@@ -84,7 +84,7 @@ def start_async_stream_decode(
     if source_rank is None:
         return _start_local(vae=vae, decoder=decoder, session_id=session_id)
     if pp_group is None or source_rank == 0:
-        raise ValueError("remote stream_decode needs S=T+1 with final denoise rank != 0")
+        raise ValueError("remote stream_decode needs vertical S (D or D+1) with source_rank != 0")
     if stream_group is None:
         raise ValueError("remote stream_decode requires a gloo stream process group")
     if vae is not None and (vae.use_tiling or vae.is_distributed_enabled()):
