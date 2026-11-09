@@ -141,8 +141,9 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
 
-    - label: "Simple · Other Test"
+    - label: "Simple · Other Test · Shard %N/%t"
       agent_pool: mi300_1
+      parallelism: 2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
@@ -152,7 +153,7 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "python -u .buildkite/amd/scripts/run_cpu_suite.py other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "python -u .buildkite/amd/scripts/run_cpu_suite.py --timing-profile=.buildkite/amd/cpu-timings/other-v1.json other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --ignore=tests/diffusion/cache/test_teacache_extractors.py"
 
 - label: "Custom Pipeline Test"
   agent_pool: mi300_1
