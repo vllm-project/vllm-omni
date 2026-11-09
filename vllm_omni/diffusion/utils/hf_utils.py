@@ -23,7 +23,7 @@ _MAGI2_REQUIRED_FILES = (
     "turbo_vae/checkpoint.ckpt",
 )
 
-# FastWAM-family checkpoints ship raw ``.pt`` files and no root config. Exact Hub
+# FastWAM-family checkpoints ship raw ``.pt`` files (a root config.json is optional). Exact Hub
 # IDs, or a local directory holding one of the signature file sets.
 _FASTWAM_MODEL_IDS = ("amd/CAE-FastWAM", "yuanty/fastwam")
 _FASTWAM_SIGNATURES = (

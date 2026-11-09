@@ -137,6 +137,7 @@ class FastWAMPipeline(nn.Module):
             raise ValueError("FastWAMPipeline needs od_config.model (a FastWAM checkpoint directory or Hub ID).")
         check_checkpoint_matches_preset(od_config.model, cfg)
         model_dir = resolve_local_dir(od_config.model, checkpoint_patterns(cfg), od_config.revision)
+        check_checkpoint_matches_preset(model_dir, cfg)
         base_model_dir = resolve_local_dir(
             str(model_config.get("base_model") or DEFAULT_BASE_MODEL), _BASE_MODEL_PATTERNS
         )

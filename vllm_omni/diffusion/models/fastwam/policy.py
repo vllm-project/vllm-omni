@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.fastwam.config import ActionCodecConfig, FastWAMConfig
+from vllm_omni.diffusion.models.fastwam.config import REPO_CONFIG, ActionCodecConfig, FastWAMConfig
 from vllm_omni.diffusion.models.fastwam.modeling.action_codec import ActionLatentDecoder
 from vllm_omni.diffusion.models.fastwam.modeling.fastwam import FastWAMModel
 from vllm_omni.diffusion.models.fastwam.modeling.umt5_encoder import (
@@ -67,7 +67,7 @@ def resolve_local_dir(model: str, allow_patterns: list[str], revision: str | Non
 
 
 def checkpoint_patterns(cfg: FastWAMConfig) -> list[str]:
-    patterns = [cfg.policy_checkpoint, cfg.stats_path.replace("{suite}", "*")]
+    patterns = [REPO_CONFIG, cfg.policy_checkpoint, cfg.stats_path.replace("{suite}", "*")]
     if cfg.action_codec_checkpoint:
         patterns.append(cfg.action_codec_checkpoint)
     return patterns

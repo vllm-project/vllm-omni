@@ -22,6 +22,7 @@ the preset at load time (:meth:`FastWAMConfig.check_policy_state_dict`).
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -220,6 +221,11 @@ def resolve_config(model_config: Mapping[str, Any]) -> FastWAMConfig:
     return replace(PRESETS[variant], **overrides)
 
 
+# Optional root config of a FastWAM checkpoint repo (amd/CAE-FastWAM ships one). It names the
+# preset (``fastwam_variant``); the Hub also counts model downloads by requests for this file.
+REPO_CONFIG = "config.json"
+
+
 def check_checkpoint_matches_preset(model: str, cfg: FastWAMConfig) -> None:
     """Fail with the right deploy config when ``model`` is a known checkpoint of another preset.
 
@@ -229,7 +235,11 @@ def check_checkpoint_matches_preset(model: str, cfg: FastWAMConfig) -> None:
     """
     expected: str | None = None
     if os.path.isdir(model):
-        if not os.path.isfile(os.path.join(model, cfg.policy_checkpoint)):
+        repo_config = os.path.join(model, REPO_CONFIG)
+        if os.path.isfile(repo_config):
+            with open(repo_config, encoding="utf-8") as f:
+                expected = json.load(f).get("fastwam_variant")
+        if expected is None and not os.path.isfile(os.path.join(model, cfg.policy_checkpoint)):
             expected = next(
                 (
                     name

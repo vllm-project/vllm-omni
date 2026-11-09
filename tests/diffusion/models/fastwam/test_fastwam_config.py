@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from vllm_omni.diffusion.models.fastwam.config import (
     check_checkpoint_matches_preset,
     resolve_config,
 )
+from vllm_omni.diffusion.models.fastwam.policy import checkpoint_patterns
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -107,3 +110,19 @@ def test_original_fastwam_checkpoint_with_cae_preset_names_the_right_deploy_conf
     check_checkpoint_matches_preset("amd/CAE-FastWAM", cae)
     check_checkpoint_matches_preset("someone/finetuned-cae", cae)
     check_checkpoint_matches_preset(str(tmp_path), uncond)
+
+
+def test_repo_config_names_the_preset(tmp_path):
+    cae, uncond = PRESETS["cae_fastwam_libero"], PRESETS["fastwam_libero_uncond"]
+    (tmp_path / "config.json").write_text(json.dumps({"fastwam_variant": "cae_fastwam_libero"}))
+    check_checkpoint_matches_preset(str(tmp_path), cae)
+    with pytest.raises(ValueError, match="cae_fastwam_libero.yaml"):
+        check_checkpoint_matches_preset(str(tmp_path), uncond)
+    # A root config.json without fastwam_variant falls back to the policy-file check.
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "other"}))
+    check_checkpoint_matches_preset(str(tmp_path), cae)
+
+
+def test_checkpoint_patterns_fetch_repo_config():
+    for preset in PRESETS.values():
+        assert checkpoint_patterns(preset)[0] == "config.json"
