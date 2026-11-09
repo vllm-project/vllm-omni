@@ -36,7 +36,11 @@ omni:
             "model": "adventists-ai/Sophon-Realtime-32B-Tag",
             "modalities": ["text", "audio"],
             "stream": true,
-            "messages": [{"role": "user", "content": [
+            "max_tokens": 300,
+            "messages": [
+              {"role": "system", "content": "You are a friendly voice assistant. Reply in one or two short spoken sentences."},
+              {"role": "user", "content": [
+              {"type": "text", "text": "<|audio|>"},
               {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}]}]
           }'
 
