@@ -131,6 +131,35 @@ def test_overlapping_recompute_chunks_after_preemption(monkeypatch):
     assert request.request_id not in scheduler._minicpmo45_terminal_rows
 
 
+def test_stale_output_commits_the_final_token_after_preemption(monkeypatch):
+    scheduler, request, _ = _cancellable(monkeypatch)
+    scheduler._free_request_blocks = lambda req: None
+    scheduler._inflight_prefills = set()
+    scheduler.log_stats = False
+    scheduler.reset_preempted_req_ids = set()
+    request.num_preemptions = 0
+    # The decode step that samples the final token is in flight when the request is preempted.
+    _book_chunk(request, 1, 1)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+
+    # Its stale output commits the final token; the recompute will take it as input.
+    _deliver(scheduler, request, 1, [12], _rows([11], 2))
+    assert request.status == RequestStatus.PREEMPTED and request.output_token_ids == [11, 12]
+    assert request.request_id in scheduler._minicpmo45_terminal_rows
+
+    _readmit(scheduler, request)
+    _book_chunk(request, 2, 0)
+    _book_chunk(request, 2, 1)
+    _deliver(scheduler, request, 2, [], _rows([1, 2], 0))
+    assert not request.is_finished() and request.num_output_placeholders == 1
+    _deliver(scheduler, request, 2, [999], _rows([11, 12], 2))
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.output_token_ids == [11, 12]
+    assert request.num_output_placeholders == 0
+    assert request.request_id not in scheduler._minicpmo45_terminal_rows
+
+
 def test_negative_in_flight_count_is_logged(monkeypatch):
     scheduler, request, _ = _cancellable(monkeypatch)
     scheduler._free_request_blocks = lambda req: None

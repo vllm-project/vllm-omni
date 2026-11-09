@@ -1253,7 +1253,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request, terminal_row, inter_stage_output if inter_stage_output is not None else mm_output
                 )
             elif stopped and not sampling_validation_failed and terminal_rows is not None:
-                stopped = self._defer_minicpmo45_terminal_row(request)
+                stopped = self._defer_minicpmo45_terminal_row(
+                    request, preempted=status_before_stop == RequestStatus.PREEMPTED
+                )
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
@@ -2081,12 +2083,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.next_decode_eligible_step == _HELD_DECODE_STEP:
                 request.next_decode_eligible_step = eligible_step
 
-    def _defer_minicpmo45_terminal_row(self, request: Request) -> bool:
+    def _defer_minicpmo45_terminal_row(self, request: Request, preempted: bool = False) -> bool:
         """Hold a length stop until its final token is a target input.
 
         Returns whether the request stops now. A final token that already was
         an input, or that the context limit leaves no position for, stops as
-        before.
+        before. A preempted request whose stale output committed the final
+        token waits for its recompute, whose last chunk supplies the row.
         """
         if not (
             request.status == RequestStatus.FINISHED_LENGTH_CAPPED
@@ -2102,6 +2105,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             logger.warning_once("MiniCPM-o replies that stop at max_model_len get no Talker row for their final token")
             logger.debug("MiniCPM-o request %s stopped at max_model_len without a final Talker row", request.request_id)
             return True
+        if preempted and request.num_computed_tokens == 0:
+            # schedule() readmits it only after its stale output drained.
+            self._minicpmo45_terminal_rows[request.request_id] = _MiniCPMO45TerminalRow(
+                request.status, request.stop_reason, request.num_tokens - 1, request.output_token_ids[-1]
+            )
+            request.status = RequestStatus.PREEMPTED
+            return False
         if missing != 1 or request.num_output_placeholders or request.num_in_flight_tokens:
             logger.warning("MiniCPM-o request %s cannot take a draft-free terminal forward", request.request_id)
             request.status = RequestStatus.FINISHED_ERROR
