@@ -67,7 +67,7 @@ class _MiniCPMO45TerminalRow:
     stop_reason: int | str | None
     position: int
     token_id: int
-    # An output that ended at the own row before the recompute did: it was emitted.
+    # Set only after an emitted output ended at this position's own row (same token id).
     row_emitted: bool = False
 
 
@@ -1516,6 +1516,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
                     num_generation_tokens=num_generation_tokens,
                 )
+                if terminal_row is not None and not stopped:
+                    self._note_minicpmo45_emitted_own_row(terminal_row, mm_output)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -2259,17 +2261,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # A recompute has not returned the final token. Outputs arrive in
             # schedule order and _hold_minicpmo45_terminal_steps books nothing
             # after the step that reaches it, so that step's output comes last.
-            if ends_with_own_row(payload, terminal.position, terminal.token_id):
-                terminal.row_emitted = True
             return False
         self._minicpmo45_terminal_rows.pop(request.request_id, None)
         if request.is_finished():
             return True
         # The stage-0 prefix cache drops rows it already delivered from a recompute
         # (worker_v2/prefix_cache.py), so a recompute after the emitted own row is empty.
+        trimmed_after_emit = (
+            terminal.row_emitted
+            and request.num_preemptions > 0
+            and getattr(getattr(self, "kv_cache_manager", None), "enable_caching", False)
+            and has_no_rows(payload)
+        )
         if request.num_computed_tokens == request.num_tokens and (
-            ends_with_own_row(payload, terminal.position, terminal.token_id)
-            or (terminal.row_emitted and has_no_rows(payload))
+            ends_with_own_row(payload, terminal.position, terminal.token_id) or trimmed_after_emit
         ):
             request.status, request.stop_reason = terminal.status, terminal.stop_reason
         else:
@@ -2277,6 +2282,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.FINISHED_ERROR
             request.stop_reason = "MiniCPM-o terminal forward did not return the final token's own row"
         return True
+
+    @staticmethod
+    def _note_minicpmo45_emitted_own_row(terminal: _MiniCPMO45TerminalRow, emitted: object) -> None:
+        """Record that an emitted output of a pending stop ended at its final own row."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
+
+        if ends_with_own_row(emitted, terminal.position, terminal.token_id):
+            terminal.row_emitted = True
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Do not resume a session whose queued update overflowed the model.

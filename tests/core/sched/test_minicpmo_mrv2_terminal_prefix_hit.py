@@ -267,3 +267,42 @@ def test_recompute_after_the_emitted_own_row(prefix_caching, stale_row):
     assert list(a.output_token_ids) == [111, FINAL]
     assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
+
+
+@pytest.mark.parametrize("damage", ["stale_row_other_position", "empty_without_prefix_cache", "reused_request_id"])
+def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage):
+    """The record is tied to the stop's token and position, to the prefix-cache trim, and to one request."""
+    prefix_caching = damage != "empty_without_prefix_cache"
+    scheduler = _scheduler(prefix_caching, num_spec=0)
+    runner = _TrimmingRunner(prefix_caching)
+
+    def cycle(stale_row_ok):
+        a = _request("A", PROMPT, 2)
+        scheduler.add_request(a)
+        for sampled in (111, FINAL):
+            step = scheduler.schedule()
+            _deliver(scheduler, step, runner.rows(scheduler, step), {"A": [sampled]})
+        terminal = scheduler.schedule()
+        start, ids = runner.rows(scheduler, terminal)["A"]
+        scheduler.running.remove(a)
+        scheduler._preempt_request(a, 0.0)
+        if not stale_row_ok:
+            start, ids = start - 1, ids[:1]  # the final token's id one position early: not its own row
+        _deliver(scheduler, terminal, {"A": (start, ids)}, {"A": [DRAFT_ID]})
+        readmit = scheduler.schedule()
+        booked = runner.rows(scheduler, readmit)["A"]
+        # Without the prefix cache nothing trims; force the empty ledger the rule must not accept there.
+        rows = booked if prefix_caching else (booked[0] + len(booked[1]), [])
+        _, finishes = _deliver(scheduler, readmit, {"A": rows}, {"A": [DRAFT_ID]})
+        return finishes
+
+    if damage == "stale_row_other_position":
+        assert cycle(stale_row_ok=False) == [("A", FinishReason.ERROR)]
+    elif damage == "empty_without_prefix_cache":
+        assert cycle(stale_row_ok=True) == [("A", FinishReason.ERROR)]
+    else:
+        # The first request's record must not carry over to a new request with the same id.
+        assert cycle(stale_row_ok=True) == [("A", FinishReason.LENGTH)]
+        assert not scheduler._minicpmo45_terminal_rows
+        assert cycle(stale_row_ok=False) == [("A", FinishReason.ERROR)]
+    assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
