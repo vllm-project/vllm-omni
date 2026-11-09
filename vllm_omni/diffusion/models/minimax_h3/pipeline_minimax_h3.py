@@ -3095,9 +3095,9 @@ class MiniMaxH3Pipeline(
         latent-mask editing, control rows, the AdaLN sidecar, and cache_dit
         quality. Resolved latent continuations are covered up front as well:
         ``_resolve_latent_continuation`` resolves exclusively from
-        ``extra["continue_from"]``; the authoritative-side check on the
-        resolved object stays as a guard in case another source is ever
-        added. Rejection here happens after media preparation
+        ``extra["continue_from"]``, which the ``continue_from`` check rejects
+        before any continuation resolution runs. Rejection here happens after
+        media preparation
         (``prepare_encoder_inputs`` already decoded the references) but before
         any Qwen/VAE model encode. Returns the validated integer, or ``None``
         when ``keep_steps`` is absent or equals the step count (degenerate:
@@ -3531,7 +3531,6 @@ class MiniMaxH3Pipeline(
         # could rewrite its canvas, is rejected inside the helper before it
         # is consumed.
         early_keep_steps = None
-        early_normalized = False
         if extra.get("keep_steps") is not None:
             early_base_schedule, early_num_steps = self._resolve_sigma_positions(task, sampling)
             early_keep_steps = self._normalize_keep_steps(
@@ -3542,7 +3541,6 @@ class MiniMaxH3Pipeline(
                 latent_hw=(conditioning.height // 16, conditioning.width // 16),
                 continuation=continuation,
             )
-            early_normalized = True
         conditioning, latent_continuation = self._resolve_latent_continuation(
             extra, conditioning, inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling)
         )
@@ -3672,29 +3670,13 @@ class MiniMaxH3Pipeline(
         # the request then continues from an image-only presentation.
         # Normalization runs before the second encoder pass (see
         # _normalize_keep_steps); every restriction decidable from the
-        # request config lives there. keep_steps requests were normalized
-        # before the continuation resolver above (early_normalized) — reuse
-        # that result so the check runs once; every other request
-        # normalizes here. The checks below need the encoded conditioning
-        # or runtime model state and stay authoritative here.
-        if early_normalized:
-            keep_steps = early_keep_steps
-        else:
-            keep_steps = self._normalize_keep_steps(
-                sampling,
-                num_steps=num_steps,
-                base_schedule=base_schedule,
-                task=task,
-                latent_hw=(conditioning.height // 16, conditioning.width // 16),
-                continuation=continuation,
-            )
+        # request config lives there, and keep_steps requests were normalized
+        # before the continuation resolver above — requests without
+        # keep_steps normalize to None there as well. The checks below need
+        # the encoded conditioning or runtime model state and stay
+        # authoritative here.
+        keep_steps = early_keep_steps
         if keep_steps is not None:
-            if continuation is not None:
-                raise OmniClientError("MiniMax H3 keep_steps does not support continuation")
-            if latent_continuation is not None:
-                # Cheap guard: the helper rejects continue_from up front;
-                # this covers any future source of resolved continuations.
-                raise OmniClientError("MiniMax H3 keep_steps does not support continue_from")
             if control_rows is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support control conditioning")
             if (

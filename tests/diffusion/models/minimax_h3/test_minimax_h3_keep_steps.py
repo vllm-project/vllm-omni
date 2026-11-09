@@ -645,7 +645,7 @@ def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(pipeline, "_extract_prompt", lambda raw: ("p", {}))
     monkeypatch.setattr(pipeline, "_active_turbo_spec", lambda sampling: None)
     monkeypatch.setattr(pipeline, "_has_active_native_lora", lambda sampling: False)
-    monkeypatch.setattr(pipeline, "_resolve_task", lambda task, **kwargs: "ref2va")
+    monkeypatch.setattr(pipeline, "_resolve_task", lambda task, multi_modal_data=None, **kwargs: "ref2va")
     monkeypatch.setattr(pipeline, "_extract_text_conditioning", lambda raw: None)
     monkeypatch.setattr(pipeline, "_encode_local_media", lambda media: media_conditioning)
     monkeypatch.setattr(pipeline_minimax_h3, "prepare_encoder_inputs", lambda *args, **kwargs: prepared)
@@ -705,47 +705,46 @@ def test_invalid_keep_steps_fails_before_any_encoder_pass(monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize(
-    "extra_args,config_patch,expected_match",
+    "extra_args,config_patch,active_resolver,expected_match",
     [
-        ({"keep_steps": 2}, {"kv_offload_config": "tier2"}, "reference-KV offload"),
-        ({"keep_steps": 2, "pad_seq_len": 64}, dict(), "pad_seq_len"),
-        ({"keep_steps": 2}, {"step_execution": True}, "step execution"),
+        ({"keep_steps": 2}, {"kv_offload_config": "tier2"}, None, "reference-KV offload"),
+        ({"keep_steps": 2, "pad_seq_len": 64}, dict(), None, "pad_seq_len"),
+        ({"keep_steps": 2}, {"step_execution": True}, None, "step execution"),
         (
             {"keep_steps": 2, "latent_refine": {"steps": 4}},
             dict(),
+            "refine",
             "latent refine/upscale",
         ),
         (
             {"keep_steps": 2, "latent_upscale": {"latent_height": 48, "latent_width": 48}},
             dict(),
+            "upscale",
             "latent refine/upscale",
         ),
     ],
 )
 def test_config_incompatible_keep_steps_fails_before_any_encoder_pass(
-    monkeypatch, extra_args, config_patch, expected_match
+    monkeypatch, extra_args, config_patch, active_resolver, expected_match
 ):
     """Restrictions decidable from the config alone reject before any Qwen pass."""
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
     for key, value in config_patch.items():
         setattr(pipeline.od_config, key, value)
-    # The refine/upscale resolvers consult od_config and the upscaler
-    # component; stub them to return minimal resolved specs so the helper's
-    # rejection fires without model wiring, matching the authoritative-side
-    # tests' stub pattern.
-    monkeypatch.setattr(
-        pipeline,
-        "_resolve_latent_refine",
-        lambda extra: SimpleNamespace(strength=0.2),
+    # Only the resolver under test returns a resolved spec — the helper's
+    # `or` chain would otherwise short-circuit on the other one and the case
+    # would not prove its own rejection path.
+    refine = Mock(return_value=SimpleNamespace(strength=0.2) if active_resolver == "refine" else None)
+    upscale = Mock(
+        return_value=SimpleNamespace(latent_height=1, latent_width=1) if active_resolver == "upscale" else None
     )
-    monkeypatch.setattr(
-        pipeline,
-        "_resolve_latent_upscale",
-        lambda extra, *, latent_h, latent_w: SimpleNamespace(latent_height=latent_h, latent_width=latent_w),
-    )
+    monkeypatch.setattr(pipeline, "_resolve_latent_refine", refine)
+    monkeypatch.setattr(pipeline, "_resolve_latent_upscale", upscale)
     with pytest.raises(OmniClientError, match=expected_match):
         pipeline._prepare_local_conditioning({"prompt": "p"}, _local_sampling(**extra_args))
     assert encode_prompt.call_count == 0
+    if active_resolver == "upscale":
+        upscale.assert_called_once()
 
 
 def test_local_continue_from_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
@@ -759,18 +758,22 @@ def test_local_continue_from_fails_before_any_encoder_pass(monkeypatch: pytest.M
 
 
 def test_local_long_video_continuation_fails_before_any_encoder_pass(monkeypatch: pytest.MonkeyPatch):
-    """keep_steps plus a long-video continuation rejects with zero Qwen passes."""
+    """keep_steps plus a long-video continuation rejects with zero Qwen passes.
+
+    request_context={} is what makes _prepare_local_conditioning resolve the
+    continuation at all (it only calls resolve_continuation when prompts or a
+    ref2va request_context is present, matching _prepare_request_inputs); the
+    stub then mirrors the real resolver's long-video return (upstream
+    contract: (277, 22)) so the helper's continuation rejection fires.
+    """
     pipeline, _, encode_prompt, _ = _local_pipeline(monkeypatch)
-    # The fixture stubs resolve_continuation to None; mirror the real
-    # resolver's long-video return (upstream contract: (277, 22)) so the
-    # continuation actually materializes and the helper rejects it.
-    monkeypatch.setattr(
-        pipeline_minimax_h3, "resolve_continuation", lambda extra_args, **kwargs: (277, 22)
-    )
+    resolve_continuation = Mock(return_value=(277, 22))
+    monkeypatch.setattr(pipeline_minimax_h3, "resolve_continuation", resolve_continuation)
     with pytest.raises(OmniClientError, match="does not support continuation"):
         pipeline._prepare_local_conditioning(
-            {"prompt": "p"}, _local_sampling(keep_steps=2, long_video=True)
+            {"prompt": "p"}, _local_sampling(keep_steps=2, long_video=True), request_context={}
         )
+    resolve_continuation.assert_called_once()
     assert encode_prompt.call_count == 0
 
 

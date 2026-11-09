@@ -108,6 +108,7 @@ MINIMAX_H3_SHAPE_PLANNER = MiniMaxH3ShapePlanner()
 # the diffusion-stage resolver and the split-stage intake must agree on it.
 MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS = 50
 
+
 def minimax_h3_align_frame_count(frame_count: int) -> int:
     return MINIMAX_H3_SHAPE_PLANNER.align_frame_count(frame_count)
 
