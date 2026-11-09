@@ -315,3 +315,15 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_weights_prewarm_default_and_opt_in_survive_the_roundtrip():
+    """Off unless asked for, and an explicit request is not dropped.
+
+    The default is the safe one (prewarm slows hosts whose construction reads the
+    same disk); the risk this pins down is the plumbing silently discarding either
+    the default or an explicit ``True`` while projecting engine args into the
+    diffusion config.
+    """
+    assert _roundtrip_diffusion_config(model="test-model").enable_weights_prewarm is False
+    assert _roundtrip_diffusion_config(model="test-model", enable_weights_prewarm=True).enable_weights_prewarm is True

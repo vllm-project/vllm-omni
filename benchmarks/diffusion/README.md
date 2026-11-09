@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0,1 python \
   --output wan22-tp2.mp4 2>&1 | tee wan22-tp2.log
 ```
 
-Implementation commit `0a673b4b` (tree `7e504120`) was validated with a
+This PR's TP=2 path was validated with a
 zero-residency 117.512 GiB checkpoint on one AWS `g7e.12xlarge` with two RTX
 PRO 6000 Blackwell GPUs. Both ranks cooperatively loaded each of the two Wan
 DiTs. Three cold runs completed model loading in

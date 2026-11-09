@@ -1069,3 +1069,30 @@ def test_removed_hsdp_loading_strategies_are_rejected(strategy):
 
     with pytest.raises(ValueError, match="hsdp_weight_load_strategy"):
         OmniDiffusionConfig(hsdp_weight_load_strategy=strategy)
+
+
+def test_serve_cli_weights_prewarm_is_opt_in_and_reaches_the_diffusion_config():
+    """`--enable-weights-prewarm` must be the only way in, and it must arrive.
+
+    Prewarm is off by default because it costs 6-9 s on hosts whose pipeline
+    construction reads the same cold disk. A previous wiring bug dropped the CLI
+    value in the diffusion-config projection, so this checks the value on the
+    parsed args *and* after the stage-config roundtrip.
+    """
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    default_args = parser.parse_args(["serve", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "--omni"])
+    assert default_args.enable_weights_prewarm is False
+
+    default_stage = StageConfigFactory.create_default_diffusion(default_args.get_explicit_kwargs_dict())[0]
+    # Unset means the key is not carried at all, and ``OmniDiffusionConfig`` then
+    # applies its own default (False) - so absence is the expected shape here.
+    assert default_stage["engine_args"].get("enable_weights_prewarm", False) is False
+
+    args = parser.parse_args(["serve", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "--omni", "--enable-weights-prewarm"])
+    assert args.enable_weights_prewarm is True
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    assert stage_cfg["engine_args"]["enable_weights_prewarm"] is True

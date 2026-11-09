@@ -1286,6 +1286,10 @@ class MiniMaxH3Pipeline(
                         revision=od_config.revision,
                         prefix="text_encoder.",
                         fall_back_to_pt=False,
+                        # Only ranks below ``text_encoder_tp_size`` hold this
+                        # encoder, so peers cannot join a staging collective
+                        # for it; it loads per rank.
+                        tp_shared=text_encoder_tp_size >= dit_world,
                     )
                 )
         else:

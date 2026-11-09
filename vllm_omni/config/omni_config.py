@@ -203,6 +203,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enable_multithread_weight_load: bool
     enable_broadcast_weight_load: bool
     num_weight_load_threads: int
+    enable_weights_prewarm: bool
     disable_autocast: bool
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str]
@@ -552,6 +553,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = Field(default=4, ge=1)
+    enable_weights_prewarm: bool = False
     disable_autocast: bool = False
     # Per-stage checkpoint/tokenizer subdirectories under the model root
     # (e.g. Audex stage 0 → checkpoint_folder_audiogen). Mirrors
@@ -879,6 +881,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
+    download_dir: str | None = None
     distributed_executor_backend: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
@@ -903,6 +906,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
     hsdp_weight_load_strategy: str = "full"
+    enable_weights_prewarm: bool = False
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
@@ -1280,6 +1284,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "enable_multithread_weight_load",
         "enable_broadcast_weight_load",
         "num_weight_load_threads",
+        "enable_weights_prewarm",
         "disable_autocast",
     }
 )

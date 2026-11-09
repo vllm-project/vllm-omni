@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 
 import pytest
+import torch
 
 from vllm_omni.diffusion.model_loader import prewarm
 
@@ -59,7 +60,9 @@ def test_read_order_and_ram_budget(tmp_path, monkeypatch):
         key=lambda p: prewarm._parent_read_order_key(os.path.relpath(p, d)),
     )
     parent_subdirs = [os.path.basename(os.path.dirname(f)) for f in parent_files]
-    assert parent_subdirs == ["text_encoder", "vae", "transformer", "transformer_2"]
+    # Parent prewarm runs through pipeline construction, so it must not race
+    # the text encoder the build is already opening: DiT shards first.
+    assert parent_subdirs == ["transformer", "transformer_2", "text_encoder", "vae"]
 
     # shared budget: takes succeed until exhausted, crossing zero is admitted once
     budget = prewarm._Budget(10)
@@ -162,9 +165,9 @@ def test_gating_and_loader_hook(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prewarm, "_prewarm_budget_bytes", lambda total: 1 << 30)
     monkeypatch.setattr(prewarm, "_MIN_WORTHWHILE", 0)
-    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path: True)
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path, **_kwargs: True)
     assert prewarm.start_weights_prewarm(str(d)) is None  # resident files skip userspace reads
-    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path: False)
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path, **_kwargs: False)
     monkeypatch.setattr(prewarm, "_is_prewarm_rank", lambda: False)
     assert prewarm.start_weights_prewarm(str(d)) is None  # non-zero TP rank skips
 
@@ -192,6 +195,9 @@ def test_gating_and_loader_hook(tmp_path, monkeypatch):
             assert self.stopped
             self.joined = True
 
+        def is_alive(self):
+            return not self.joined
+
     handle = _Handle()
     calls = []
 
@@ -208,7 +214,13 @@ def test_gating_and_loader_hook(tmp_path, monkeypatch):
     loader.od_config = type(
         "OD",
         (),
-        {"model": str(tmp_path), "revision": "fixed-revision", "dtype": torch.float32},
+        {
+            "model": str(tmp_path),
+            "revision": "fixed-revision",
+            "dtype": torch.float32,
+            # Opt-in: prewarm is off unless the flag asks for it.
+            "enable_weights_prewarm": True,
+        },
     )()
 
     sentinel = RuntimeError("stop after prewarm hook")
@@ -223,6 +235,12 @@ def test_gating_and_loader_hook(tmp_path, monkeypatch):
     assert calls == [(str(tmp_path), "fixed-revision", "/model-cache")]
     assert handle.stopped
     assert handle.joined
+
+    loader.od_config.enable_weights_prewarm = False
+    calls.clear()
+    with pytest.raises(RuntimeError):
+        loader.load_model(load_device="cpu")
+    assert calls == []
     assert loader._weights_prewarm_handle is None
 
 
@@ -238,6 +256,9 @@ def test_parent_prewarm_hands_off_before_worker_model_init(monkeypatch):
         def join(self, timeout=None):
             assert self.stopped.is_set()
             self.joined = True
+
+        def is_alive(self):
+            return not self.joined
 
     handle = _Handle()
     calls = []
@@ -256,12 +277,14 @@ def test_parent_prewarm_hands_off_before_worker_model_init(monkeypatch):
         assert handoff is not None
         assert not handle.stopped.is_set()
         with prewarm.use_parent_weights_prewarm(handoff):
-            assert handle.stopped.is_set()
-            assert handle.joined
-            # The worker's DiffusersPipelineLoader still calls this interface,
-            # but the parent handoff suppresses a duplicate speculative reader.
+            assert not handle.stopped.is_set()
+            assert not handle.joined
+            # Duplicate worker-local scans stay suppressed while parent readers
+            # keep running until this context exits.
             assert prewarm.start_weights_prewarm("org/model") is None
+        assert not handle.stopped.is_set()
 
+    assert handle.stopped.is_set() and handle.joined
     assert calls == [
         ("org/model", "fixed-revision", "/model-cache", prewarm._parent_read_order_key),
     ]
@@ -281,6 +304,9 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
         def join(self, timeout=None):
             assert self.stopped.is_set()
             self.joined = True
+
+        def is_alive(self):
+            return not self.joined
 
     handle = _Handle()
     monkeypatch.setattr(prewarm, "_start_weights_prewarm", lambda *args, **kwargs: handle)
@@ -302,8 +328,8 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
     created_worker = object()
 
     def _create_worker(self, *args, **kwargs):
-        assert handle.stopped.is_set()
-        assert handle.joined
+        assert not handle.stopped.is_set()
+        assert not handle.joined
         assert prewarm.start_weights_prewarm("org/model") is None
         return created_worker
 
@@ -320,6 +346,39 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
         )
 
     assert worker_proc.worker is created_worker
+    assert handle.stopped.is_set() and handle.joined
+
+
+def test_parent_prewarm_terminates_stalled_reader_before_releasing_workers(monkeypatch):
+    class _StalledWorker:
+        def __init__(self):
+            self.alive = True
+            self.join_timeouts = []
+            self.terminated = False
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+    worker = _StalledWorker()
+    handle = prewarm.WeightsPrewarmHandle(worker, prewarm.threading.Event())
+    monkeypatch.setattr(prewarm, "_start_weights_prewarm", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(prewarm, "_PREWARM_STOP_TIMEOUT_S", 0.01)
+
+    with prewarm.parent_weights_prewarm("org/model") as handoff:
+        with prewarm.use_parent_weights_prewarm(handoff):
+            assert not worker.terminated
+    assert worker.terminated
+    assert worker.join_timeouts == [0.01, 0.01]
 
 
 def test_parent_prewarm_suppresses_duplicate_worker_scan_when_no_reads_start(monkeypatch):
@@ -365,7 +424,11 @@ def test_diffusers_load_hands_off_prewarm_before_demand_loading(monkeypatch):
     loader.quant_config = None
     loader.parallel_config = type("PC", (), {"use_hsdp": False})()
     loader.load_config = type("LC", (), {"download_dir": None})()
-    loader.od_config = type("OD", (), {"model": "org/model", "revision": None, "dtype": torch.float32})()
+    loader.od_config = type(
+        "OD",
+        (),
+        {"model": "org/model", "revision": None, "dtype": torch.float32, "enable_weights_prewarm": True},
+    )()
     # Set in __init__, but this test bypasses it to exercise load_model alone.
     loader.host_weight_plan = None
     loader._hwr_state = None
@@ -384,3 +447,226 @@ def test_diffusers_load_hands_off_prewarm_before_demand_loading(monkeypatch):
 
     assert loader.load_model(load_device="cpu", load_format="diffusers") is model
     assert loader._weights_prewarm_handle is None
+
+
+def test_yield_file_skips_one_file_and_keeps_reading_others(tmp_path, monkeypatch):
+    monkeypatch.setattr(prewarm, "_advise_range", lambda *args, **kwargs: False)
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path, **_kwargs: False)
+    model_dir = _make_model_dir(
+        tmp_path,
+        [("text_encoder", 1 << 20), ("transformer", 1 << 20)],
+    )
+    files = sorted(
+        (
+            os.path.join(root, name)
+            for root, _, names in os.walk(model_dir)
+            for name in names
+            if name.endswith(".safetensors")
+        ),
+        key=lambda path: prewarm._parent_read_order_key(os.path.relpath(path, model_dir)),
+    )
+    assert len(files) == 2
+    handle = prewarm.WeightsPrewarmHandle(None, prewarm.threading.Event())
+    handle.yield_file(files[0])
+    done_bytes, done_files = prewarm._read_files(files, prewarm._Budget(4 << 20), handle)
+    assert done_bytes == os.path.getsize(files[1])
+    assert done_files == 1
+
+
+def test_residency_helpers(tmp_path, monkeypatch):
+    """Pause only when the demanded file still needs the disk; the group
+    residency helper requires every file to be resident."""
+    model_dir = _make_model_dir(
+        tmp_path,
+        [("transformer", 1 << 20), ("transformer_2", 1 << 20)],
+    )
+    files = sorted(
+        (
+            os.path.join(root, name)
+            for root, _, names in os.walk(model_dir)
+            for name in names
+            if name.endswith(".safetensors")
+        ),
+        key=lambda path: prewarm._parent_read_order_key(os.path.relpath(path, model_dir)),
+    )
+    assert len(files) == 2
+
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda p, **_kwargs: p == files[0])
+    assert prewarm.should_pause_for_demand(files[0]) is False
+    assert prewarm.should_pause_for_demand(files[1]) is True
+    assert prewarm.checkpoint_fully_resident(files) is False
+
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda p, **_kwargs: True)
+    assert prewarm.should_pause_for_demand(files[0]) is False
+    assert prewarm.checkpoint_fully_resident(files) is True
+    assert prewarm.checkpoint_fully_resident([]) is False
+
+
+def test_pause_copy_parks_until_resume_without_advising(tmp_path, monkeypatch):
+    """A pause must block the reader in place. Hinting and walking the rest of
+    the file exits the thread, so resume is a no-op, and the readahead faults
+    the pages the residency gate samples."""
+    advised = []
+    forced = []
+    monkeypatch.setattr(prewarm, "_advise_range", lambda fd, offset, length: advised.append((offset, length)) or True)
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: False)
+    monkeypatch.setattr(
+        prewarm,
+        "_force_read_range",
+        lambda handle, offset, length, buf, stop: forced.append(length) or length,
+    )
+    path = _make_model_dir(tmp_path, [("transformer", 3 << 20)]) / "transformer" / "model-00000.safetensors"
+    handle = prewarm.WeightsPrewarmHandle(None, prewarm.threading.Event())
+    handle.pause_copy()
+    box: dict[str, tuple[int, int]] = {}
+
+    def _run() -> None:
+        box["result"] = prewarm._read_files([str(path)], prewarm._Budget(4 << 20), handle)
+
+    worker = prewarm.threading.Thread(target=_run)
+    worker.start()
+    worker.join(0.2)
+    assert worker.is_alive()
+    assert advised == [] and forced == [] and "result" not in box
+
+    handle.resume_copy()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert box["result"] == (3 << 20, 1)
+    assert forced == [3 << 20]
+
+
+def test_stop_unblocks_paused_reader(tmp_path, monkeypatch):
+    monkeypatch.setattr(prewarm, "_advise_range", lambda *args, **kwargs: False)
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: False)
+    monkeypatch.setattr(prewarm, "_force_read_range", lambda handle, offset, length, buf, stop: length)
+    path = _make_model_dir(tmp_path, [("transformer", 3 << 20)]) / "transformer" / "model-00000.safetensors"
+    handle = prewarm.WeightsPrewarmHandle(None, prewarm.threading.Event())
+    handle.pause_copy()
+    worker = prewarm.threading.Thread(
+        target=prewarm._read_files,
+        args=([str(path)], prewarm._Budget(4 << 20), handle),
+    )
+    worker.start()
+    worker.join(0.1)
+    assert worker.is_alive()
+    handle.stop()
+    worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_strict_residency_probe_includes_chunk_tail():
+    page = prewarm.mmap.PAGESIZE
+    assert prewarm._residency_probe_offsets(prewarm._CHUNK, strict=False) == [0]
+    strict = prewarm._residency_probe_offsets(prewarm._CHUNK, strict=True)
+    assert strict[0] == 0 and strict[-1] == prewarm._CHUNK - page
+    # A file of exactly one page has no distinct tail probe.
+    assert prewarm._residency_probe_offsets(page, strict=True) == [0]
+    # Real safetensors sizes are not page-aligned. The tail probe is the page
+    # that contains the last byte, not the page before it.
+    assert prewarm._residency_probe_offsets(page + 1, strict=True) == [0, page]
+    assert prewarm._residency_probe_offsets((2 * page) + 100, strict=True) == [0, 2 * page]
+
+
+def test_chunked_advise_skips_copy_when_resident(tmp_path, monkeypatch):
+    """Hint the current and next chunk; copy only when mincore is negative."""
+    advised = []
+    forced = []
+
+    monkeypatch.setattr(prewarm, "_advise_range", lambda fd, offset, length: advised.append((offset, length)) or True)
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: True)
+    monkeypatch.setattr(
+        prewarm,
+        "_force_read_range",
+        lambda handle, offset, length, buf, stop: forced.append(length) or length,
+    )
+    path = _make_model_dir(tmp_path, [("transformer", 3 << 20)]) / "transformer" / "model-00000.safetensors"
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20))
+    assert done_bytes == 3 << 20 and done_files == 1
+    assert advised == [(0, 3 << 20)] and forced == []
+
+    advised.clear()
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: False)
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20))
+    assert done_bytes == 3 << 20 and done_files == 1
+    assert advised == [(0, 3 << 20)] and forced == [3 << 20]
+
+
+@pytest.mark.parametrize(
+    ("tp_rank", "tp_world", "local_world", "expected"),
+    [
+        # Single node (whole group fits here): one prewarmer, as measured.
+        (0, 2, 8, True),
+        (1, 2, 8, False),
+        (0, 2, 2, True),  # the exact configuration the numbers were measured on
+        (1, 2, 2, False),
+        (0, 8, 8, True),
+        (3, 8, 8, False),
+        # TP spans nodes: one prewarmer per node instead of one per world.
+        (0, 8, 4, True),
+        (1, 8, 4, False),
+        (4, 8, 4, True),
+        (5, 8, 4, False),
+        # Ambiguous visibility (one device per process): keep rank 0 only.
+        (0, 8, 1, True),
+        (4, 8, 1, False),
+        # Degenerate group.
+        (0, 1, 8, True),
+        (5, 1, 8, True),
+    ],
+)
+def test_prewarm_rank_is_per_node(monkeypatch, tp_rank, tp_world, local_world, expected):
+    """One prewarming rank per node, not one per world.
+
+    Gating on global TP rank 0 leaves every other node's page cache cold, so a
+    multi-node TP group needs a prewarmer per node. The node's rank count comes
+    from the visible device count, and anything ambiguous keeps the single-node
+    behaviour that was actually measured.
+    """
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_world)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: local_world)
+
+    assert prewarm._is_prewarm_rank() is expected
+
+
+def test_weights_prewarm_is_opt_in_by_default(monkeypatch, tmp_path):
+    """Prewarm must not start unless it is asked for.
+
+    It pays off when pipeline construction does little checkpoint I/O and costs
+    6-9 s when construction reads the same cold disk, so the default has to be the
+    safe one and the caller has to opt in.
+    """
+    import torch
+
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(dl, "start_weights_prewarm", lambda *a, **k: calls.append(a) or None)
+    model = torch.nn.Linear(2, 2)
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_load_model", lambda self, *a, **k: model)
+
+    def _loader(prewarm: bool | None):
+        built = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+        built.quant_config = None
+        built.parallel_config = type("PC", (), {"use_hsdp": False})()
+        built.load_config = type("LC", (), {"download_dir": None})()
+        od = {"model": str(tmp_path), "dtype": torch.float32}
+        if prewarm is not None:
+            od["enable_weights_prewarm"] = prewarm
+        built.od_config = type("OD", (), od)()
+        return built
+
+    # Field absent entirely: absent must mean off, not "some other default".
+    assert _loader(None).load_model(load_device="cpu") is model
+    assert calls == [], "prewarm must stay off when the flag is unset"
+
+    assert _loader(False).load_model(load_device="cpu") is model
+    assert calls == [], "prewarm must stay off when it is explicitly disabled"
+
+    assert _loader(True).load_model(load_device="cpu") is model
+    assert len(calls) == 1, "prewarm must start when it is explicitly enabled"

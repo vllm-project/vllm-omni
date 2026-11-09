@@ -68,6 +68,16 @@ def test_stream_contract_and_producer_lifecycle():
     out = list(pinned_staging_weights_iterator(iter([("big", torch.zeros(1 << 16))]), max_inflight_bytes=16))
     assert len(out) == 1
 
+    # lease: retaining a yielded tensor keeps its bytes stable after later
+    # items reuse the pool (same-shape tensors would otherwise overwrite it).
+    it = pinned_staging_weights_iterator(_weights(n=4), num_staging_threads=1)
+    _, first = next(it)
+    first_value = first.clone()
+    held = first
+    for _name, _tensor in it:
+        pass
+    assert torch.equal(held, first_value)
+
     # early close leaves no producer threads behind
     before = {t.ident for t in threading.enumerate()}
     gen = pinned_staging_weights_iterator(_weights(n=64), max_inflight_bytes=64)
@@ -255,7 +265,11 @@ def test_loader_gate_and_dtype_wiring(monkeypatch):
     loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
     loader.quant_config = None
     loader.parallel_config = type("PC", (), {"use_hsdp": False})()
-    loader.load_config = type("LC", (), {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False})()
+    loader.load_config = type(
+        "LC",
+        (),
+        {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False, "pt_load_map_location": "cpu"},
+    )()
     loader.od_config = type(
         "OD",
         (),
@@ -278,6 +292,9 @@ def test_loader_gate_and_dtype_wiring(monkeypatch):
             "joined": False,
             "stop": lambda self: setattr(self, "stopped", True),
             "join": lambda self, timeout=None: setattr(self, "joined", True),
+            # stop_weights_prewarm returns early only when the reader is gone.
+            "is_alive": lambda self: False,
+            "terminate": lambda self: True,
         },
     )()
     loader._weights_prewarm_handle = handoff
@@ -316,11 +333,16 @@ def test_loader_gate_and_dtype_wiring(monkeypatch):
 
     # A group preflight veto (including pinned allocation failure) preserves
     # the configured multithread source before entering local fallback.
-    vetoed_context = type("Context", (), {"comm": None})()
-    monkeypatch.setattr(dl, "prepare_cooperative_staging", lambda eligible: vetoed_context)
-    list(loader._get_weights_iterator(src))
+    vetoed_context = type("Context", (), {"comm": None, "resident": False})()
+    monkeypatch.setattr(dl, "prepare_cooperative_staging", lambda eligible, **kw: vetoed_context)
+    listed = list(loader._get_weights_iterator(src))
+    assert listed == []
+    # A vetoed preflight leaves no comm, so the loader keeps the local path and
+    # hands the iterator a group-free context. Passing ``None`` instead would
+    # let the iterator resolve the TP group itself, which is a collective: a
+    # component only some ranks load would strand its peers there.
     assert captured.get("called") is True
-    assert captured["context"] is vetoed_context
+    assert captured["context"] is not None and captured["context"].comm is None
     assert multithread["called"] is True
 
     captured.clear()
@@ -355,3 +377,526 @@ def test_loader_gate_and_dtype_wiring(monkeypatch):
     list(loader._get_weights_iterator(src, model=model))
     assert "weight" in captured["target_dtypes"]
     assert captured["default_dtype"] is None
+
+
+@pytest.mark.cpu
+def test_resident_verdict_skips_pinned_staging(monkeypatch):
+    """A group-agreed resident verdict bypasses pinned staging entirely.
+
+    Cooperation over a warm cache only buys the ~1.3 s H2D it removes and pays
+    a broadcast per bucket, so the loader must fall back to the plain
+    multithread iterator when every rank reports its pages are resident.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    captured = {}
+    monkeypatch.setattr(
+        dl,
+        "cooperative_staging_weights_iterator",
+        lambda inner, **kw: captured.update(called=True) or inner,
+    )
+    monkeypatch.setattr(dl, "safetensors_weights_iterator", lambda *a, **k: iter([]))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dl, "is_pin_memory_available", lambda: True)
+    monkeypatch.setattr(
+        dl,
+        "checkpoint_fully_resident",
+        lambda files, strict=False: captured.setdefault("probe", []).append(files) or True,
+    )
+    monkeypatch.setattr(
+        dl.DiffusersPipelineLoader,
+        "_prepare_weights",
+        lambda self, *a, **k: ("/tmp", ["x.safetensors"], True),
+    )
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_get_checkpoint_adapter", lambda self, *a, **k: None)
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_stop_weights_prewarm", lambda self: None)
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader.quant_config = None
+    loader.parallel_config = type("PC", (), {"use_hsdp": False})()
+    loader.load_config = type(
+        "LC",
+        (),
+        {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False, "pt_load_map_location": "cpu"},
+    )()
+    loader.od_config = type(
+        "OD",
+        (),
+        {
+            "enable_multithread_weight_load": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "dtype": torch.bfloat16,
+        },
+    )()
+    src = dl.DiffusersPipelineLoader.ComponentSource(model_or_path="m", subfolder=None, revision=None)
+
+    voted = {}
+    resident_context = type("Context", (), {"comm": None, "resident": True})()
+
+    def _prepare(eligible, **kwargs):
+        voted.update(eligible=eligible, **kwargs)
+        return resident_context
+
+    monkeypatch.setattr(dl, "prepare_cooperative_staging", _prepare)
+    list(loader._get_weights_iterator(src))
+
+    # The residency fact is voted on rather than acted on locally, and the
+    # strict probe (start page + last byte page) is what feeds it.
+    assert voted["eligible"] is True
+    assert voted["local_resident"] is True
+    assert captured.get("called") is None
+    assert captured.get("probe")
+
+    # An ineligible rank must not claim residency: its probe never happens,
+    # so it cannot outvote peers that still need the disk.
+    captured.clear()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    list(loader._get_weights_iterator(src))
+    assert voted["local_resident"] is False
+
+
+@pytest.mark.cpu
+def test_rank_local_source_never_joins_the_collective(monkeypatch):
+    """A source only some ranks iterate must not run a TP collective.
+
+    MiniMax-H3 appends its text-encoder source only when
+    ``rank < text_encoder_tp_size``. Voting on that source would send the
+    owner ranks into an all_reduce no peer joins, which the NCCL watchdog
+    reports 600 s later as a collective timeout.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    calls = []
+    monkeypatch.setattr(
+        dl,
+        "prepare_cooperative_staging",
+        lambda eligible, **kw: calls.append(eligible) or type("Context", (), {"comm": None, "resident": False})(),
+    )
+    monkeypatch.setattr(
+        dl,
+        "cooperative_staging_weights_iterator",
+        lambda inner, **kw: inner,
+    )
+    monkeypatch.setattr(dl, "safetensors_weights_iterator", lambda *a, **k: iter([]))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dl, "is_pin_memory_available", lambda: True)
+    monkeypatch.setattr(
+        dl.DiffusersPipelineLoader,
+        "_prepare_weights",
+        lambda self, *a, **k: ("/tmp", ["x.safetensors"], True),
+    )
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_get_checkpoint_adapter", lambda self, *a, **k: None)
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_stop_weights_prewarm", lambda self: None)
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader.quant_config = None
+    loader.parallel_config = type("PC", (), {"use_hsdp": False})()
+    loader.load_config = type(
+        "LC",
+        (),
+        {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False, "pt_load_map_location": "cpu"},
+    )()
+    loader.od_config = type(
+        "OD",
+        (),
+        {
+            "enable_multithread_weight_load": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "dtype": torch.bfloat16,
+        },
+    )()
+
+    rank_local = dl.DiffusersPipelineLoader.ComponentSource(
+        model_or_path="m", subfolder=None, revision=None, prefix="text_encoder.", tp_shared=False
+    )
+    contexts = []
+    monkeypatch.setattr(
+        dl,
+        "cooperative_staging_weights_iterator",
+        lambda inner, **kw: contexts.append(kw.get("context")) or inner,
+    )
+    list(loader._get_weights_iterator(rank_local))
+    assert calls == []
+    # The iterator must not be left to resolve the group itself: ``context=None``
+    # means "run a preflight", which is the very collective this source cannot
+    # join. A group-free context keeps per-rank pinned staging without talking.
+    assert len(contexts) == 1
+    assert contexts[0] is not None and contexts[0].comm is None
+
+    # The default is unchanged: shared sources still vote.
+    shared = dl.DiffusersPipelineLoader.ComponentSource(model_or_path="m", subfolder=None, revision=None)
+    list(loader._get_weights_iterator(shared))
+    assert calls == [True]
+
+
+def _bare_loader(dl, monkeypatch, *, use_safetensors=True, files=("x.safetensors",)):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dl, "is_pin_memory_available", lambda: True)
+    monkeypatch.setattr(dl, "checkpoint_fully_resident", lambda *a, **k: False)
+    monkeypatch.setattr(
+        dl.DiffusersPipelineLoader,
+        "_prepare_weights",
+        lambda self, *a, **k: ("/tmp", list(files), use_safetensors),
+    )
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_get_checkpoint_adapter", lambda self, *a, **k: None)
+    monkeypatch.setattr(dl.DiffusersPipelineLoader, "_stop_weights_prewarm", lambda self: None)
+    monkeypatch.setattr(dl, "safetensors_weights_iterator", lambda *a, **k: iter([]))
+    monkeypatch.setattr(dl, "pt_weights_iterator", lambda *a, **k: iter([]))
+    monkeypatch.setattr(dl, "multi_thread_safetensors_weights_iterator", lambda *a, **k: iter([]))
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader.quant_config = None
+    loader._rank_local_weight_load = False
+    loader.parallel_config = type("PC", (), {"use_hsdp": False})()
+    loader.load_config = type(
+        "LC",
+        (),
+        {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False, "pt_load_map_location": "cpu"},
+    )()
+    loader.od_config = type(
+        "OD",
+        (),
+        {
+            "enable_multithread_weight_load": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "dtype": torch.bfloat16,
+        },
+    )()
+    return loader
+
+
+@pytest.mark.cpu
+def test_vote_happens_even_when_this_rank_would_not_stage(monkeypatch):
+    """A rank that discovers no safetensors must still join the vote.
+
+    ``use_safetensors`` comes from the local snapshot, so one rank can see a
+    partial download and pick the .bin path while its peers pick safetensors.
+    Gating the preflight on it would send that rank elsewhere entirely - a
+    collective entered by only some ranks. Its own ineligibility travels inside
+    the vote instead, which the group turns into a shared fallback.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    loader = _bare_loader(dl, monkeypatch, use_safetensors=False, files=("x.pt",))
+    seen = []
+    monkeypatch.setattr(
+        dl,
+        "prepare_cooperative_staging",
+        lambda eligible, **kw: seen.append(eligible)
+        or type("Context", (), {"comm": None, "resident": False, "pool": None})(),
+    )
+    monkeypatch.setattr(dl, "local_cooperative_context", lambda *a, **k: type("C", (), {"comm": None})())
+    src = dl.DiffusersPipelineLoader.ComponentSource(model_or_path="m", subfolder=None, revision=None)
+
+    list(loader._get_weights_iterator(src))
+    assert seen == [False], "the vote must be entered with local_eligible=False"
+
+
+@pytest.mark.cpu
+def test_rank_local_load_never_votes(monkeypatch):
+    """The HSDP broadcast source loads on one rank only; no collective may run.
+
+    With a quantized HSDP checkpoint pinned staging stays enabled, so the source
+    rank would otherwise vote while its peers sit inside the weight broadcast.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    loader = _bare_loader(dl, monkeypatch)
+    voted = []
+
+    def _vote(eligible, **kwargs):
+        voted.append(eligible)
+        return None
+
+    monkeypatch.setattr(dl, "prepare_cooperative_staging", _vote)
+    contexts = []
+    monkeypatch.setattr(
+        dl,
+        "cooperative_staging_weights_iterator",
+        lambda inner, **kw: contexts.append(kw.get("context")) or inner,
+    )
+    src = dl.DiffusersPipelineLoader.ComponentSource(model_or_path="m", subfolder=None, revision=None)
+
+    loader._rank_local_weight_load = True
+    try:
+        list(loader._get_weights_iterator(src))
+    finally:
+        loader._rank_local_weight_load = False
+    assert voted == []
+    assert len(contexts) == 1 and contexts[0].comm is None
+
+
+def _fake_tp(monkeypatch, peers):
+    """Stand in for the TP group: `all_gather_object` returns this rank plus peers."""
+    import vllm.distributed.parallel_state as parallel_state
+
+    class _Group:
+        world_size = 1 + len(peers)
+        cpu_group = object()
+
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: _Group())
+
+    def _gather(out, local, **kwargs):
+        out[0] = local
+        for index, peer in enumerate(peers, start=1):
+            out[index] = peer
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", _gather)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+
+def _probe(dl, monkeypatch, sources, peers, *, rank_local=False, run=True):
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader._tp_shared_prefixes = None
+    loader._tp_shared_probed = False
+    loader._rank_local_weight_load = rank_local
+    loader.quant_config = None
+    loader.parallel_config = type("PC", (), {"use_hsdp": False})()
+    loader.load_config = type("LC", (), {"safetensors_load_strategy": "eager", "use_tqdm_on_load": False})()
+    loader.od_config = type(
+        "OD",
+        (),
+        {
+            "enable_multithread_weight_load": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "dtype": torch.bfloat16,
+        },
+    )()
+    model = type("M", (), {"weights_sources": list(sources)})()
+    _fake_tp(monkeypatch, peers)
+    if run:
+        loader._agree_tp_shared_sources(model)
+    return loader
+
+
+@pytest.mark.cpu
+def test_agree_tp_shared_sources_uses_the_ranks_not_the_annotations(monkeypatch, caplog):
+    """One exchange per load decides who cooperates, and divergence only degrades.
+
+    The per-model ``tp_shared`` annotation is a hint: MiniMax-H3 appends its text
+    encoder only on ``rank < text_encoder_tp_size``, and before this exchange that
+    mistake cost the group a 600 s collective timeout.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    src = dl.DiffusersPipelineLoader.ComponentSource
+
+    # Agreement: the whole list is shared.
+    loader = _probe(
+        dl,
+        monkeypatch,
+        [src(model_or_path="m", subfolder=None, revision=None, prefix="transformer.")],
+        [["transformer."]],
+    )
+    assert loader._tp_shared_prefixes == {"transformer."}
+
+    # Divergence: the rank-local encoder is dropped, the shared DiT keeps cooperating.
+    with caplog.at_level("WARNING", logger=dl.logger.name):
+        loader = _probe(
+            dl,
+            monkeypatch,
+            [
+                src(model_or_path="m", subfolder=None, revision=None, prefix="transformer."),
+                src(model_or_path="m", subfolder=None, revision=None, prefix="text_encoder.", tp_shared=False),
+            ],
+            [["transformer."]],
+        )
+    assert loader._tp_shared_prefixes == {"transformer."}
+    assert any("disagree on their weight sources" in record.message for record in caplog.records)
+
+    # Same set, different order: keep only the positionally aligned prefix.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=dl.logger.name):
+        loader = _probe(
+            dl,
+            monkeypatch,
+            [
+                src(model_or_path="m", subfolder=None, revision=None, prefix="a."),
+                src(model_or_path="m", subfolder=None, revision=None, prefix="b."),
+            ],
+            [["b.", "a."]],
+        )
+    assert loader._tp_shared_prefixes == set()
+    assert any("disagree on their weight sources" in record.message for record in caplog.records)
+
+
+@pytest.mark.cpu
+def test_agree_tp_shared_sources_fails_open(monkeypatch):
+    """No group, no cpu_group, or an unreadable list keeps the static hints."""
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    src = dl.DiffusersPipelineLoader.ComponentSource
+    sources = [src(model_or_path="m", subfolder=None, revision=None, prefix="transformer.")]
+
+    # A single rank has nothing to agree with.
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: type("G", (), {"world_size": 1, "cpu_group": None})())
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader._tp_shared_prefixes = None
+    loader._tp_shared_probed = False
+    loader._rank_local_weight_load = False
+    loader._agree_tp_shared_sources(type("M", (), {"weights_sources": sources})())
+    assert loader._tp_shared_prefixes is None
+
+    # A rank-local load must not enter the exchange at all (its peers are busy).
+    loader = dl.DiffusersPipelineLoader.__new__(dl.DiffusersPipelineLoader)
+    loader._tp_shared_prefixes = None
+    loader._tp_shared_probed = False
+    loader._rank_local_weight_load = True
+    entered = []
+    monkeypatch.setattr(torch.distributed, "all_gather_object", lambda *a, **k: entered.append(True))
+    loader._agree_tp_shared_sources(type("M", (), {"weights_sources": sources})())
+    assert loader._tp_shared_prefixes is None and entered == []
+
+    # The exchange runs once per load, never once per component.
+    loader = _probe(dl, monkeypatch, sources, [["transformer."]], run=False)
+    calls = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, local, **k: (calls.append(1), out.__setitem__(0, local), out.__setitem__(1, ["transformer."])),
+    )
+    model = type("M", (), {"weights_sources": sources})()
+    loader._agree_tp_shared_sources(model)
+    loader._agree_tp_shared_sources(model)
+    assert len(calls) == 1
+
+
+@pytest.mark.cpu
+def test_agree_tp_shared_sources_rejects_ambiguous_duplicate_prefixes(monkeypatch, caplog):
+    """Duplicate prefixes cannot be matched by name, so divergence disables them.
+
+    Several sources may share ``prefix=""``. If the lists also diverge, name-based
+    matching could give two ranks different cooperation counts for the same prefix
+    - the exact mismatch the exchange exists to prevent.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    src = dl.DiffusersPipelineLoader.ComponentSource
+
+    def _source(prefix):
+        return src(model_or_path="m", subfolder=None, revision=None, prefix=prefix)
+
+    with caplog.at_level("WARNING", logger=dl.logger.name):
+        loader = _probe(dl, monkeypatch, [_source(""), _source("")], [[""]], run=False)
+        loader._agree_tp_shared_sources(type("M", (), {"weights_sources": [_source(""), _source("")]})())
+    assert loader._tp_shared_prefixes == set()
+    assert any("duplicate prefixes" in record.message for record in caplog.records)
+
+
+@pytest.mark.cpu
+def test_agree_tp_shared_sources_skips_when_staging_is_impossible(monkeypatch):
+    """A path that cannot stage must not open a collective in ``load_weights``.
+
+    Distributed layerwise offload and the consumer-only shared-backbone branch do
+    not run ``load_weights`` on every rank, so the exchange has to stay out of
+    them; otherwise the ranks that do call it would wait for peers that never come.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    src = dl.DiffusersPipelineLoader.ComponentSource
+    sources = [src(model_or_path="m", subfolder=None, revision=None, prefix="transformer.")]
+    entered: list[int] = []
+
+    def _record(**kwargs):
+        entered.append(1)
+
+    def _loader():
+        # ``_probe(run=False)`` installs the fake TP group but leaves the exchange
+        # to us, so the recorder below is the one that runs.
+        built = _probe(dl, monkeypatch, sources, [["transformer."]], run=False)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda out, local, **k: (_record(), out.__setitem__(0, local), out.__setitem__(1, ["transformer."])),
+        )
+        return built
+
+    loader = _loader()
+    loader.od_config.enable_distributed_layerwise_offload = True
+    loader._agree_tp_shared_sources(type("M", (), {"weights_sources": sources})())
+    assert entered == [] and loader._tp_shared_prefixes is None
+
+    loader = _loader()
+    loader.load_config.safetensors_load_strategy = "torchao"
+    loader._agree_tp_shared_sources(type("M", (), {"weights_sources": sources})())
+    assert entered == [] and loader._tp_shared_prefixes is None
+
+    # The gate is config-only, so it must ignore per-rank runtime facts.
+    loader = _loader()
+    loader._agree_tp_shared_sources(type("M", (), {"weights_sources": sources})())
+    assert len(entered) == 1 and loader._tp_shared_prefixes == {"transformer."}
+
+
+@pytest.mark.cpu
+def test_agreement_can_only_withhold_cooperation(monkeypatch):
+    """The observed source set narrows the annotation, it never widens it.
+
+    ``tp_shared=False`` may mean more than rank-locality, so a fully shared source
+    that the model still marks private keeps loading per rank.
+    """
+    from vllm_omni.diffusion.model_loader import diffusers_loader as dl
+
+    loader = _bare_loader(dl, monkeypatch)
+    loader._tp_shared_prefixes = {"transformer.", "audio_vae."}
+    voted = []
+
+    def _vote(eligible, **kwargs):
+        voted.append(eligible)
+        return type("Context", (), {"comm": None, "resident": False})()
+
+    monkeypatch.setattr(dl, "prepare_cooperative_staging", _vote)
+    monkeypatch.setattr(dl, "local_cooperative_context", lambda *a, **k: type("C", (), {"comm": None})())
+    monkeypatch.setattr(
+        dl,
+        "cooperative_staging_weights_iterator",
+        lambda inner, **kw: inner,
+    )
+
+    agreed_and_allowed = dl.DiffusersPipelineLoader.ComponentSource(
+        model_or_path="m", subfolder=None, revision=None, prefix="transformer."
+    )
+    shared_but_private = dl.DiffusersPipelineLoader.ComponentSource(
+        model_or_path="m", subfolder=None, revision=None, prefix="audio_vae.", tp_shared=False
+    )
+    not_in_agreement = dl.DiffusersPipelineLoader.ComponentSource(
+        model_or_path="m", subfolder=None, revision=None, prefix="text_encoder."
+    )
+
+    list(loader._get_weights_iterator(agreed_and_allowed))
+    assert voted == [True], "an agreed, annotated-shared source must vote"
+
+    voted.clear()
+    list(loader._get_weights_iterator(shared_but_private))
+    assert voted == [], "the annotation must still be able to veto cooperation"
+
+    voted.clear()
+    list(loader._get_weights_iterator(not_in_agreement))
+    assert voted == [], "a source outside the agreement must not vote"

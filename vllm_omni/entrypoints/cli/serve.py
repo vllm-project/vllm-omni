@@ -1032,6 +1032,18 @@ class OmniServeCommand(CLISubcommand):
             default=4,
             help="Number of threads for parallel weight loading (default: 4).",
         )
+        omni_config_group.add_argument(
+            "--enable-weights-prewarm",
+            action="store_true",
+            dest="enable_weights_prewarm",
+            default=False,
+            help=(
+                "Prewarm diffusion checkpoint pages from the parent process while "
+                "workers spawn (default: disabled). It pays off when pipeline "
+                "construction does little checkpoint I/O; it slows startup when "
+                "construction reads the same cold disk, so measure before enabling."
+            ),
+        )
 
         # diffusion model offload parameters
         omni_config_group.add_argument(

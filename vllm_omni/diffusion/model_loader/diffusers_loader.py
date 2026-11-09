@@ -49,6 +49,7 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 )
 from vllm_omni.diffusion.model_loader.cooperative_staging import (
     cooperative_staging_weights_iterator,
+    local_cooperative_context,
     prepare_cooperative_staging,
 )
 from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
@@ -230,6 +231,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_patterns: tuple[str, ...] | None = None
         """Optional tensor-name globs applied before safetensor materialization."""
 
+        tp_shared: bool = True
+        """Hint that every rank of the tensor-parallel group loads this source.
+
+        Cooperative staging and the residency vote are collectives, so they may
+        only run for a source that all ranks iterate. The loader verifies this at
+        load start by exchanging the source lists (``_agree_tp_shared_sources``)
+        and cooperates only for a prefix that is both reported by every rank and
+        allowed here. Agreement therefore cannot grant cooperation this field
+        denies - only withhold it - and this field alone decides when the exchange
+        could not run. Set ``False`` for sources a model
+        appends on a subset of ranks (for example a text encoder sharded over
+        ``text_encoder_tp_size`` ranks); such a source loads per rank, which is
+        also the only correct behaviour, since no peer holds the tensors its owner
+        would broadcast.
+        """
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -242,6 +259,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self._hwr_state: dict[str, object] | None = None
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
+        # True while this rank loads weights that no peer loads (the HSDP
+        # broadcast source). Staging collectives must stay off: peers are already
+        # blocked in the broadcast, so a preflight here would wait forever.
+        self._rank_local_weight_load = False
+        # Prefixes of ``weights_sources`` that every TP rank iterates, as agreed
+        # once per load. ``None`` means "not established", in which case the
+        # per-model ``ComponentSource.tp_shared`` hint decides.
+        self._tp_shared_prefixes: set[str] | None = None
+        self._tp_shared_probed = False
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -400,9 +426,54 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """Hand page-cache ownership from speculative prewarm to the loader."""
         handle = getattr(self, "_weights_prewarm_handle", None)
         if handle is not None:
-            handle.stop()
-            handle.join()
+            stopped = stop_weights_prewarm(handle)
             self._weights_prewarm_handle = None
+            if not stopped:
+                # The reader outlived the bounded stop+terminate window, so it
+                # keeps issuing speculative I/O against the demand path. Say so
+                # here: prewarm itself only logs, and this is the only place
+                # that knows demand loading is about to start regardless.
+                logger.warning(
+                    "Weights prewarm reader did not stop before demand loading; "
+                    "checkpoint I/O may be shared with speculative reads."
+                )
+
+    def _yield_prewarm_file(self, path: str) -> None:
+        yield_parent_prewarm_file(path)
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.yield_file(path)
+
+    def _pause_prewarm_copy(self) -> None:
+        pause_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.pause_copy()
+
+    def _resume_prewarm_copy(self) -> None:
+        resume_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.resume_copy()
+
+    def _iter_safetensors(self, files: list[str], *, use_tqdm: bool, strategy: str):
+        """Yield tensors file-by-file; pause remaining copies only while this
+        component's staging actually needs the disk."""
+        paused_here = False
+        try:
+            for index, path in enumerate(files):
+                self._yield_prewarm_file(path)
+                if index == 0 and should_pause_for_demand(path):
+                    self._pause_prewarm_copy()
+                    paused_here = True
+                yield from safetensors_weights_iterator(
+                    [path],
+                    use_tqdm and index == 0,
+                    strategy,
+                )
+        finally:
+            if paused_here:
+                self._resume_prewarm_copy()
 
     def _get_weights_iterator(
         self,
@@ -417,7 +488,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-        quant_config = self._get_source_quant_config(source)
         # Executors without a parent handoff may use local prewarm during
         # pipeline construction. Stop those broad readers before demand
         # loading so they cannot compete with targeted staging faults.
@@ -426,15 +496,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # Decide the static gate before choosing the source iterator. Excluded
         # paths must retain their existing multi-thread loader rather than pay
         # the deterministic-order cost for cooperation they will never enter.
-        hsdp_cpu_load = self.parallel_config.use_hsdp and self.quant_config is None
-        use_pinned_staging = (
-            use_safetensors
-            and self.load_config.safetensors_load_strategy != "torchao"
-            and not getattr(self.od_config, "enable_cpu_offload", False)
-            and not getattr(self.od_config, "enable_layerwise_offload", False)
-            and not getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and not hsdp_cpu_load
-        )
+        # Only config-derived conditions may gate the collective below; anything
+        # this rank discovers at runtime (whether a safetensors snapshot is
+        # complete, CUDA visibility, pinned availability, page-cache state) goes
+        # into the vote instead, or one rank would enter while a peer skips it.
+        staging_config_ok = self._staging_config_ok()
+        use_pinned_staging = use_safetensors and staging_config_ok
         local_eligible = use_pinned_staging and torch.cuda.is_available() and is_pin_memory_available()
 
         # Cooperative TP staging plans byte buckets from the tensor stream and
@@ -454,9 +521,50 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             tp_cooperative = False
 
         cooperative_context = None
-        if use_pinned_staging and tp_cooperative:
-            cooperative_context = prepare_cooperative_staging(local_eligible)
+        # Collectives are per component, so they may only be issued for a source
+        # that every rank iterates. The observed set (see
+        # ``_agree_tp_shared_sources``) can only *withhold* cooperation from what the
+        # annotation already allows, never grant it: an author may have meant
+        # something else by ``tp_shared=False`` than rank-locality. When no exchange
+        # ran, the annotation alone decides. Everything else - CUDA visibility,
+        # pinned availability, page-cache state - travels inside the vote.
+        agreed_prefixes = getattr(self, "_tp_shared_prefixes", None)
+        source_shared = getattr(source, "tp_shared", True)
+        if agreed_prefixes is not None:
+            source_shared = source_shared and source.prefix in agreed_prefixes
+        if (
+            tp_cooperative
+            and source_shared
+            and staging_config_ok
+            and not getattr(self, "_rank_local_weight_load", False)
+        ):
+            # Strict probe: a one-page-per-chunk hit is not enough to skip the
+            # group load. Readahead faults that page without bringing the chunk
+            # in, and the fallback then rereads the checkpoint on every rank.
+            local_resident = (
+                local_eligible and bool(hf_weights_files) and checkpoint_fully_resident(hf_weights_files, strict=True)
+            )
+            cooperative_context = prepare_cooperative_staging(
+                local_eligible,
+                local_resident=local_eligible and local_resident,
+            )
+            if cooperative_context.resident:
+                # Fully page-cache resident: skip the cooperative group AND the
+                # pinned-staging wrapper, loading per rank through the
+                # multithread iterator exactly like the pre-staging loader (the
+                # executor restores OMP threads so any fp32->bf16 cast the
+                # consumer still does is parallel). Nothing is left for
+                # cooperation to win once the pages are warm.
+                use_pinned_staging = False
+            elif cooperative_context.comm is None and use_pinned_staging:
+                cooperative_context = local_cooperative_context()
+        elif use_pinned_staging:
+            # Rank-local source, single-rank load, or an excluded destination:
+            # staging must not resolve the TP group, because no peer gets here.
+            cooperative_context = local_cooperative_context()
         cooperation_enabled = cooperative_context is not None and cooperative_context.comm is not None
+        if cooperation_enabled and getattr(self.od_config, "enable_multithread_weight_load", False):
+            logger.info("Cooperative TP staging active; multi-thread weight loading is bypassed for this component.")
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
@@ -466,13 +574,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
-            # Keep deterministic shard order before passing to vLLM helper.
+            # Concurrent opens cannot yield per file; stop those shards first.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = multi_thread_safetensors_weights_iterator(
-                sorted_hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                max_workers=num_threads,
-            )
+            for path in sorted_hf_weights_files:
+                self._yield_prewarm_file(path)
+
+            def _multithread_iter():
+                # Concurrent opens cannot yield per file; pause remaining
+                # copies only if these shards still need the disk.
+                paused_here = not checkpoint_fully_resident(sorted_hf_weights_files)
+                if paused_here:
+                    self._pause_prewarm_copy()
+                try:
+                    yield from multi_thread_safetensors_weights_iterator(
+                        sorted_hf_weights_files,
+                        self.load_config.use_tqdm_on_load,
+                        max_workers=num_threads,
+                    )
+                finally:
+                    if paused_here:
+                        self._resume_prewarm_copy()
+
+            weights_iterator = _multithread_iter()
         elif not use_safetensors:
             # PyTorch pickles (.bin/.pt/.pth); torchao-serialized checkpoints take this path too.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
@@ -502,11 +625,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 # Glob order is not contractual; the cooperative plan needs
                 # an identical file order on every rank.
                 hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
-            )
+            if use_safetensors:
+                weights_iterator = self._iter_safetensors(
+                    hf_weights_files,
+                    use_tqdm=self.load_config.use_tqdm_on_load,
+                    strategy=self.load_config.safetensors_load_strategy,
+                )
+            else:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
@@ -582,6 +712,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model: nn.Module,
         sources: Sequence["ComponentSource"] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield every component's weights, establishing the source agreement first.
+
+        This is the single funnel both ``load_weights`` and direct callers use, and
+        its reachability is exactly the per-component vote's: a rank that iterates no
+        source issues no collective either. Keeping the agreement here rather than in
+        ``load_weights`` means no path can run the vote without having agreed, and no
+        path owes an exchange it never reaches.
+        """
+        self._agree_tp_shared_sources(model)
         if sources is None:
             sources = self._get_weight_sources(model)
         for source in sources:
@@ -670,6 +809,114 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 getattr(model, "weights_sources", ()),
             )
         )
+
+    def _staging_config_ok(self) -> bool:
+        """Whether this configuration may ever use pinned/cooperative staging.
+
+        Config-derived only, so it is safe to gate a collective on: a checkpoint's
+        on-disk format, CUDA visibility, pinned availability and page-cache state
+        are per-rank facts and must travel inside the vote instead.
+        """
+        return (
+            self.load_config.safetensors_load_strategy != "torchao"
+            and not getattr(self.od_config, "enable_cpu_offload", False)
+            and not getattr(self.od_config, "enable_layerwise_offload", False)
+            and not getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            and not (self.parallel_config.use_hsdp and self.quant_config is None)
+        )
+
+    def _agree_tp_shared_sources(self, model: nn.Module) -> None:
+        """Learn once, from every TP rank, which weight sources all of them iterate.
+
+        Staging collectives are issued per component, so the *set* of components has
+        to match across ranks. That set is model code (``weights_sources``) and
+        MiniMax-H3 already appends one conditionally (``rank < text_encoder_tp_size``),
+        which stranded the group for 600 s before ``ComponentSource.tp_shared``
+        existed. A per-model annotation is easy to forget, so this exchanges the
+        lists once per load and lets the ranks define the shared set themselves: a
+        divergence degrades to per-rank loading for the odd source instead of a
+        hang, and the log names the disagreement.
+
+        Called from ``get_all_weights``, whose reachability matches the per-component
+        vote: a rank that iterates no component issues no collective, so it owes no
+        agreement either. Skipped for a rank-local load (its peers are already inside
+        another collective), for a consumer-only shared-backbone load, and for
+        configurations where staging is impossible. Any failure leaves the answer
+        ``None``, which keeps the static ``tp_shared`` hint in charge.
+        """
+        if getattr(self, "_tp_shared_probed", False):
+            return
+        self._tp_shared_probed = True
+        self._tp_shared_prefixes = None
+        if getattr(self, "_rank_local_weight_load", False):
+            return
+        try:
+            if not self._staging_config_ok():
+                return
+        except (AttributeError, TypeError, ValueError):
+            return
+        local: list[str] | None
+        try:
+            local = [source.prefix for source in self._get_weight_sources(model)]
+        except (AttributeError, TypeError, ValueError):
+            # Still join the exchange: a rank that skipped it would strand peers.
+            local = None
+        try:
+            if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+                return
+            from vllm.distributed.parallel_state import get_tp_group
+
+            group = get_tp_group()
+            cpu_group = getattr(group, "cpu_group", None)
+            world = int(getattr(group, "world_size", 1))
+            if world <= 1 or cpu_group is None:
+                return
+            gathered: list[list[str] | None] = [None] * world
+            torch.distributed.all_gather_object(gathered, local, group=cpu_group)
+        except (ImportError, AttributeError, AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Cooperative staging: could not exchange TP weight-source lists (%s); "
+                "keeping the per-model tp_shared hints.",
+                exc,
+            )
+            return
+        if any(item is None for item in gathered):
+            logger.warning(
+                "Cooperative staging: a TP rank could not report its weight sources; "
+                "keeping the per-model tp_shared hints."
+            )
+            return
+        if all(item == local for item in gathered):
+            self._tp_shared_prefixes = set(local or ())
+            return
+        shared = set(local or ())
+        for item in gathered:
+            shared &= set(item or ())
+        # A duplicate prefix (several sources with ``prefix=""``) cannot be matched
+        # by name alone; cooperating on it could give two ranks different counts.
+        if any(len(item or ()) != len(set(item or ())) for item in gathered):
+            logger.warning(
+                "Cooperative staging: TP ranks disagree on their weight sources and the "
+                "lists contain duplicate prefixes %s; loading every component per rank.",
+                " vs ".join(str(list(item)) for item in gathered),
+            )
+            self._tp_shared_prefixes = set()
+            return
+        # The protocol also needs the same *order*, so keep only the prefixes that
+        # sit at the same position in every rank's filtered list.
+        filtered = [tuple(prefix for prefix in (item or ()) if prefix in shared) for item in gathered]
+        aligned = {
+            filtered[0][index]
+            for index in range(min(len(order) for order in filtered))
+            if all(order[index] == filtered[0][index] for order in filtered)
+        }
+        logger.warning(
+            "Cooperative staging: TP ranks disagree on their weight sources (%s); "
+            "cooperating only for %s and loading the rest per rank.",
+            ", ".join(f"rank{index}={list(item or ())}" for index, item in enumerate(gathered)),
+            sorted(aligned),
+        )
+        self._tp_shared_prefixes = aligned
 
     def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
         """Return parameter names that should be covered by strict load checks.
@@ -844,6 +1091,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """
         self.host_weight_plan = None
         self._hwr_state = None
+        # A fresh load starts with no agreed source set; the previous model's
+        # answer must not leak into this one.
+        self._tp_shared_prefixes = None
+        self._tp_shared_probed = False
         self._last_load_request = {
             "load_device": load_device,
             "load_format": load_format,
@@ -856,13 +1107,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # checkpoint while the pipeline is built. Demand loading owns the same
         # revision/cache, and finally cancels speculative I/O on every exit.
         model_ref = getattr(self.od_config, "model", None)
+        prewarm_enabled = bool(getattr(self.od_config, "enable_weights_prewarm", False))
         self._weights_prewarm_handle = (
             start_weights_prewarm(
                 str(model_ref),
                 revision=getattr(self.od_config, "revision", None),
                 cache_dir=self.load_config.download_dir,
             )
-            if model_ref
+            if model_ref and prewarm_enabled
             else None
         )
         try:
@@ -1551,6 +1803,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """
         if getattr(shared_group, "role", None) != "consumer":
             raise ValueError("diffusion weight sharing requires role='consumer'")
+        # Consumer-only branch: its TP peers may belong to another stage, and the
+        # shared component list already comes from the provider, so this path must
+        # not start the source-agreement exchange. The static hint decides instead.
+        self._tp_shared_probed = True
         if self.quant_config is not None:
             raise ValueError("shared-backbone loading does not support quantization in v1")
         if self.parallel_config.use_hsdp:
@@ -2199,7 +2455,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
             if enable_broadcast:
                 if rank == 0:
-                    self.load_weights(model)
+                    # The source rank loads alone; every other rank is already
+                    # parked in the broadcast, so this load must not issue a
+                    # staging collective (a quantized HSDP run keeps pinned
+                    # staging enabled, and its preflight would strand the group).
+                    self._rank_local_weight_load = True
+                    try:
+                        self.load_weights(model)
+                    finally:
+                        self._rank_local_weight_load = False
                     self._maybe_fuse_distilled_lora(model)
                 self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
                 if (

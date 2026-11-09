@@ -950,6 +950,9 @@ class OmniDiffusionConfig:
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
+    # Same cache the safetensors loader uses. Parent prewarm must resolve the
+    # snapshot from here, not from the default hub cache.
+    download_dir: str | None = None
 
     num_gpus: int | None = None
 
@@ -1058,6 +1061,9 @@ class OmniDiffusionConfig:
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+    # Page-cache prewarm overlaps pipeline construction. Disable it when that
+    # construction itself reads the checkpoint from a cold disk.
+    enable_weights_prewarm: bool = False
 
     # Shard meta parameters before reading rank-local HF safetensors slices.
     hsdp_weight_load_strategy: str = "full"

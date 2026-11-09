@@ -420,12 +420,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         model_ref = getattr(od_config, "model", None)
         load_format = getattr(od_config, "diffusion_load_format", "default")
+        prewarm_enabled = bool(getattr(od_config, "enable_weights_prewarm", False))
         prewarm_context = (
             parent_weights_prewarm(
                 str(model_ref),
                 revision=getattr(od_config, "revision", None),
+                cache_dir=getattr(od_config, "download_dir", None),
             )
-            if model_ref and load_format != "dummy"
+            if model_ref and load_format != "dummy" and prewarm_enabled
             else nullcontext(None)
         )
         try:
@@ -451,6 +453,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         sharing_registry: object,
         prewarm_handoff: WeightsPrewarmHandoff | None,
     ) -> tuple[list[mp.Process], list[Handle]]:
+        od_config = self.od_config
         mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes: list[mp.Process] = []
 
@@ -475,7 +478,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
-                    prewarm_handoff,
                 ),
                 kwargs={
                     "sharing_registry": sharing_registry,
