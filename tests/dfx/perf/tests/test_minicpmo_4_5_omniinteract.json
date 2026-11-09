@@ -17,7 +17,7 @@
       "model": "openbmb/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "vllm_omni/deploy/minicpmo_4_5_omniinteract.yaml",
         "--trust-remote-code"
       ]
     },
