@@ -1,4 +1,5 @@
 nav:
   - README.md
   - gpu.md
+  - wsl2.md
   - npu.md
