@@ -118,6 +118,7 @@ def multistage_handler(monkeypatch):
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OnlineDerenderer", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
@@ -539,6 +540,8 @@ class _FakeEngineClient:
     def __init__(
         self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None, supported_tasks=None
     ) -> None:
+        self.engine = object.__new__(OmniEngineBase)
+        self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
