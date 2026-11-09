@@ -224,6 +224,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
         self.thinker_config = thinker_config
+        # vLLM's multimodal draft-model loader reads this alias from the
+        # outer target config; Omni stores the token ID in thinker_config.
+        self.config.image_token_index = thinker_config.image_token_id
         self.multimodal_config = multimodal_config
 
         # Initialize talker components
@@ -583,8 +586,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     @torch.inference_mode()
     def materialize_thinker_token_embeddings(self, token_ids: Iterable[int]) -> torch.Tensor:
-        """Materialize embeddings for verifier-committed Thinker tokens.
-        """
+        """Materialize embeddings for verifier-committed Thinker tokens."""
         if self.model_stage != "thinker":
             raise RuntimeError("Thinker token embeddings are only available on the Thinker stage")
 

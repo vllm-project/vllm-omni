@@ -147,6 +147,8 @@ def _runner_factory(model, cfg, supports_mm_inputs=True):
 @pytest.mark.parametrize("stage,enabled", [("thinker", True), ("talker", False), ("code2wav", False), (None, True)])
 def test_real_wrapper_construction_controls_runner_protocol(monkeypatch, stage, enabled):
     model, cfg = _combined(monkeypatch, stage)
+    # The upstream multimodal draft loader reads the outer target config.
+    assert model.config.image_token_index == cfg.model_config.hf_config.thinker_config.image_token_id
     assert supports_encoder_cudagraph(model) is enabled
     manager = _runner_factory(model, cfg)
     assert (manager is not None) is enabled
