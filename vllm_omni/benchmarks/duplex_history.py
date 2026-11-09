@@ -16,7 +16,12 @@ import subprocess
 import time
 import unicodedata
 from collections import Counter
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm_omni.clients.duplex import ResponseHandle
 
 
 def normalize(text: str) -> str:
@@ -121,7 +126,7 @@ def synthesize(cases: list[dict], directory: Path) -> None:
     print("Synthetic speech created. Listen to key facts, negations and corrections before evaluation.")
 
 
-async def next_answer(responses):
+async def next_answer(responses: AsyncIterator[ResponseHandle]) -> ResponseHandle:
     """Ignore standalone input-listening beats; await a generated response."""
     while True:
         handle = await anext(responses)
@@ -130,7 +135,16 @@ async def next_answer(responses):
 
 
 async def run_case(case: dict, args) -> dict:
-    from vllm_omni.clients.duplex import AudioDelta, DuplexClient, ErrorEvent, SessionConfig, TextDelta, TranscriptDelta
+    from vllm_omni.clients.duplex import (
+        AudioDelta,
+        DuplexClient,
+        DuplexClientError,
+        DuplexProtocolError,
+        ErrorEvent,
+        SessionConfig,
+        TextDelta,
+        TranscriptDelta,
+    )
 
     config = SessionConfig(
         auto_response=False,
@@ -148,86 +162,105 @@ async def run_case(case: dict, args) -> dict:
     response_times: dict[str, dict] = {}
     errors = []
     turns = []
-    async with DuplexClient(args.url, model=args.model, config=config, reconnect=None) as client:
+    index = None
+    handle: ResponseHandle | None = None
+    failed_turn = None
+    try:
+        async with DuplexClient(args.url, model=args.model, config=config, reconnect=None) as client:
 
-        async def observe():
-            async for event in client.events():
-                if isinstance(event, ErrorEvent):
-                    errors.append(event.raw)
-                if event.response_id:
-                    entry = response_times.setdefault(event.response_id, {})
-                    if isinstance(event, (TextDelta, TranscriptDelta)):
-                        entry.setdefault("first_text", time.monotonic())
-                    if isinstance(event, AudioDelta):
-                        entry.setdefault("first_audio", time.monotonic())
+            async def observe():
+                async for event in client.events():
+                    if isinstance(event, ErrorEvent):
+                        errors.append(event.raw)
+                    if event.response_id:
+                        entry = response_times.setdefault(event.response_id, {})
+                        if isinstance(event, (TextDelta, TranscriptDelta)):
+                            entry.setdefault("first_text", time.monotonic())
+                        if isinstance(event, AudioDelta):
+                            entry.setdefault("first_audio", time.monotonic())
 
-        observer = asyncio.create_task(observe())
-        await asyncio.sleep(0)
-        responses = client.responses()
-        try:
-            for index, text in enumerate(case["turns"]):
-                if args.modality == "audio":
-                    from math import gcd
+            observer = asyncio.create_task(observe())
+            try:
+                await asyncio.sleep(0)
+                responses = client.responses()
+                for index, text in enumerate(case["turns"]):
+                    handle = None
+                    if args.modality == "audio":
+                        from math import gcd
 
-                    import numpy as np
-                    import soundfile as sf
-                    from scipy.signal import resample_poly
+                        import numpy as np
+                        import soundfile as sf
+                        from scipy.signal import resample_poly
 
-                    raw, rate = await asyncio.to_thread(sf.read, audio_path(args.audio_dir, text), dtype="float32")
-                    if raw.ndim > 1:
-                        raw = raw.mean(axis=1)
-                    divisor = gcd(rate, 16000)
-                    raw = resample_poly(raw, 16000 // divisor, rate // divisor)
-                    pcm = (np.clip(raw, -1, 1) * 32767).astype("<i2").tobytes()
-                    for offset in range(0, len(pcm), 3200):
-                        await client.append_audio(pcm[offset : offset + 3200])
-                        if args.realtime_input:
-                            await asyncio.sleep(len(pcm[offset : offset + 3200]) / 32000)
-                    start = time.monotonic()
-                    await client.commit(create_response=False)
-                else:
-                    await client.send(
+                        raw, rate = await asyncio.to_thread(sf.read, audio_path(args.audio_dir, text), dtype="float32")
+                        if raw.ndim > 1:
+                            raw = raw.mean(axis=1)
+                        divisor = gcd(rate, 16000)
+                        raw = resample_poly(raw, 16000 // divisor, rate // divisor)
+                        pcm = (np.clip(raw, -1, 1) * 32767).astype("<i2").tobytes()
+                        for offset in range(0, len(pcm), 3200):
+                            await client.append_audio(pcm[offset : offset + 3200])
+                            if args.realtime_input:
+                                await asyncio.sleep(len(pcm[offset : offset + 3200]) / 32000)
+                        start = time.monotonic()
+                        await client.commit(create_response=False)
+                    else:
+                        await client.send(
+                            {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": text}],
+                                },
+                            }
+                        )
+                        start = time.monotonic()
+                    await client.send({"type": "response.create"})
+
+                    async def consume_response() -> ResponseHandle:
+                        nonlocal handle
+                        handle = await next_answer(responses)
+                        async for chunk in handle.audio():
+                            # Simulated playback at output speed makes full ACKs
+                            # correspond to consumed audio, not mere generation.
+                            await asyncio.sleep(len(chunk) / 48000)
+                            await client.ack_playback(handle.played_ms, response_id=handle.response_id)
+                        await handle.wait()
+                        return handle
+
+                    handle = await asyncio.wait_for(consume_response(), timeout=args.timeout)
+                    if handle.played_ms:
+                        await client.ack_playback(handle.played_ms, response_id=handle.response_id)
+                    observed = response_times.get(handle.response_id or "", {})
+                    turns.append(
                         {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "message",
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": text}],
-                            },
+                            "index": index,
+                            "response_id": handle.response_id,
+                            "text": handle.transcript or handle.text,
+                            "ttft_ms": 1000 * (observed["first_text"] - start) if "first_text" in observed else None,
+                            "ttfp_ms": 1000 * (observed["first_audio"] - start) if "first_audio" in observed else None,
                         }
                     )
-                    start = time.monotonic()
-                await client.send({"type": "response.create"})
-
-                async def consume_response():
-                    handle = await next_answer(responses)
-                    async for chunk in handle.audio():
-                        # Simulated playback at output speed makes full ACKs
-                        # correspond to consumed audio, not mere generation.
-                        await asyncio.sleep(len(chunk) / 48000)
-                        await client.ack_playback(handle.played_ms, response_id=handle.response_id)
-                    await handle.wait()
-                    return handle
-
-                handle = await asyncio.wait_for(consume_response(), timeout=args.timeout)
-                if handle.played_ms:
-                    await client.ack_playback(handle.played_ms, response_id=handle.response_id)
-                observed = response_times.get(handle.response_id, {})
-                turns.append(
-                    {
-                        "index": index,
-                        "response_id": handle.response_id,
-                        "text": handle.transcript or handle.text,
-                        "ttft_ms": 1000 * (observed["first_text"] - start) if "first_text" in observed else None,
-                        "ttfp_ms": 1000 * (observed["first_audio"] - start) if "first_audio" in observed else None,
-                    }
-                )
-                if errors:
-                    break
-                await asyncio.sleep(args.idle_seconds)
-        finally:
-            observer.cancel()
-            await asyncio.gather(observer, return_exceptions=True)
+                    if errors:
+                        break
+                    await asyncio.sleep(args.idle_seconds)
+            finally:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+    except (TimeoutError, DuplexClientError, StopAsyncIteration) as exc:
+        # A failed conversation is an observation, not a reason to drop the
+        # rest of the paired workload. Bugs and task cancellation still escape.
+        if index is not None:
+            failed_turn = {
+                "index": index,
+                "response_id": handle.response_id if handle is not None else None,
+                "text": (handle.transcript or handle.text) if handle is not None else "",
+            }
+        error: dict[str, object] = {"type": type(exc).__name__, "message": str(exc), "turn_index": index}
+        if isinstance(exc, DuplexProtocolError):
+            error["raw"] = exc.raw
+        errors.append(error)
     answer = turns[-1]["text"] if len(turns) == len(case["turns"]) and not errors else ""
     return {
         "case_id": case["id"],
@@ -241,6 +274,7 @@ async def run_case(case: dict, args) -> dict:
         "idle_seconds": args.idle_seconds,
         "turns": turns,
         "errors": errors,
+        "failed_turn": failed_turn,
         "expected": case["accepted"],
         "answer": answer,
         "score": "run_error"

@@ -83,10 +83,10 @@ class IncompleteHistoryPolicy(QwenHistoryPolicy):
 class IdleHistoryPolicy(IncrementalHistoryPolicy):
     """Example extension that defers work while preparing or after rejection."""
 
-    def next_batch(self, state, limits):
+    def next_batch(self, state, limits, *, max_audio):
         if state.preparing or state.counts["rejected_summaries"]:
             return None
-        return super().next_batch(state, limits)
+        return super().next_batch(state, limits, max_audio=max_audio)
 
 
 def test_incomplete_external_policy_is_rejected_at_load():
@@ -417,8 +417,9 @@ async def test_new_tail_does_not_revoke_valid_summary_or_old_source_request():
 
 def test_configuration_rejects_nonintegral_and_unbounded_values():
     for value in (0, -1, True, 0.5):
-        with pytest.raises(ValueError):
-            replace(HistoryLimits(), max_audio_bytes=value)
+        for name in ("max_audio_bytes", "audio_summary_trigger_bytes"):
+            with pytest.raises(ValueError):
+                replace(HistoryLimits(), **{name: value})
 
 
 @pytest.mark.asyncio
@@ -570,3 +571,116 @@ def test_rebinding_audio_counts_source_still_held_by_preparation():
     assert state.audio_bytes == 0
     state.retain([((message["content"],), replacement)], limits)
     assert state.audio_for(message).encoded is replacement["audio"]
+
+
+@pytest.mark.asyncio
+async def test_audio_trigger_uses_bound_model_limit():
+    owner, state = runtime(recent_messages=100), QwenHistoryState()
+    model = Mock(spec=ModelConfig, max_model_len=4096)
+    model.multimodal_config.get_limit_per_prompt.return_value = 2
+    owner.bind(Processor(), model)
+    history, retained = [], []
+    for i in range(2):
+        message, payload = audio_message(i)
+        history += [message, {"role": "assistant", "content": "heard"}]
+        retained.append(((message["content"],), payload))
+    state.reconcile(history)
+    state.retain(retained, owner.limits)
+    request = await owner.prepare(state)
+    assert request is not None
+    assert request.history_length == 2
+    assert len(request.prompt["multi_modal_data"]["audio"]) == 1
+    assert not state.omissions
+
+
+@pytest.mark.parametrize(
+    "trigger_bytes,pool_bytes,expected",
+    [
+        (8 * 1024**2, 32 * 1024**2, True),
+        (16 * 1024**2, 32 * 1024**2, False),
+        (16 * 1024**2, 8 * 1024**2, True),
+    ],
+)
+def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, expected):
+    owner = runtime(recent_messages=100, audio_summary_trigger_bytes=trigger_bytes, max_audio_bytes=pool_bytes)
+    state, history, retained = QwenHistoryState(), [], []
+    for i in range(2):
+        message, payload = audio_message(i)
+        payload["audio"] = chr(65 + i) * (3 * 1024**2)
+        history += [message, {"role": "assistant", "content": "heard"}]
+        retained.append(((message["content"],), payload))
+    state.reconcile(history)
+    state.retain(retained, owner.limits)
+    assert (owner.work(state) is not None) is expected
+    assert len(state.audio) == 2
+
+
+@pytest.mark.asyncio
+async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
+    from tests.engine.duplex.test_session_runner import append_audio, tts_output
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateResponse
+
+    h = await open_qwen()
+    try:
+        owner = runtime(recent_messages=1)
+        h.runner.plugin._history_runtime = owner
+        # Keep automatic scheduling off to inspect the prepared request directly.
+        for _ in range(5):
+            await h.run(append_audio(value=0.1))
+            await h.run(Commit(final=True, create_response=False))
+        await h.run(CreateResponse())
+        submission = h.port.submissions[-1]
+        assert len(submission.prompt["multi_modal_data"]["audio"]) == 1
+        assert sum(m["role"] == "user" for m in h.session.history) == 5
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(submission.context.request_id, samples=0, text="heard all five", finished=True), stage_id=0
+        )
+        await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+        memory = h.runner.model_state.history_policy_state
+        memory.reconcile(h.session.history)
+        request = await owner.prepare(memory)
+        assert request is not None
+        assert len(request.prompt["multi_modal_data"]["audio"]) == 1
+        assert not memory.omissions
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deleting_assistant_boundaries_can_exceed_single_turn_audio_capacity(caplog):
+    from tests.engine.duplex.test_session_runner import append_audio, tts_output
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, DeleteItem
+
+    h = await open_qwen()
+    try:
+        owner = runtime(recent_messages=1)
+        h.runner.plugin._history_runtime = owner
+        responses = []
+        for i in range(5):
+            await h.run(append_audio(value=0.1 * (i + 1)))
+            await h.run(Commit(final=True, create_response=True))
+            submission = h.port.submissions[-1]
+            response_id = h.session.active_response_id
+            responses.append(response_id)
+            await h.deliver_and_settle(
+                tts_output(submission.context.request_id, samples=0, text="heard", finished=True), stage_id=0
+            )
+            await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+        for response_id in responses[:-1]:
+            await h.run(DeleteItem(item_id=f"item_{response_id}"))
+        memory = h.runner.model_state.history_policy_state
+        memory.reconcile(h.session.history)
+        assert len(memory.audio) == 5
+        assert len(h.session.history) == 6
+        request = await owner.prepare(memory)
+        assert request is None
+        assert list(memory.omissions) == [(0, 6, "summary_audio_capacity")]
+        assert "5 audio payloads exceed request limit 4" in caplog.text
+        assert memory.processed == 6 and not memory.summary
+    finally:
+        await h.manager.shutdown()

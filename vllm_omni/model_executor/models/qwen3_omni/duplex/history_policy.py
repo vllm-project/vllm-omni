@@ -29,6 +29,7 @@ class HistoryLimits:
     summary_tokens: int = 512
     max_audio_items: int = 64
     max_audio_bytes: int = 32 * 1024 * 1024
+    audio_summary_trigger_bytes: int = 8 * 1024 * 1024
     max_context_tokens: int | None = None
 
     def __post_init__(self) -> None:
@@ -252,8 +253,8 @@ class QwenHistoryPolicy(ABC):
         """Select ordered whole turns for foreground input, including the current turn."""
 
     @abstractmethod
-    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
-        """Select the next prefix starting at processed, or None when no work is due."""
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
+        """Select an old prefix using the renderer's effective per-request audio limit."""
 
 
 class BoundedRecentPolicy(QwenHistoryPolicy):
@@ -265,7 +266,7 @@ class BoundedRecentPolicy(QwenHistoryPolicy):
         # legacy 16-message cap. Rendering removes oldest complete turns.
         return turn_ranges(state.history)
 
-    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
         """The clipping control never generates memory."""
         return None
 
@@ -277,12 +278,12 @@ class IncrementalHistoryPolicy(BoundedRecentPolicy):
         """Offer only the unsummarized suffix alongside the existing memory."""
         return [(max(a, state.processed), b) for a, b in super().select(state, limits) if b > state.processed]
 
-    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits) -> tuple[int, int] | None:
-        """Prioritize completed media turns before either cache reaches capacity."""
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
+        """Prioritize completed media turns at the request limit or byte trigger."""
         history = state.history
         cutoff = max(0, len(history) - limits.recent_messages)
-        # Raw audio needs consolidation before it leaves the foreground audio
-        # window, independently of the text-message threshold.
+        # Consolidate before the next input exceeds the renderer's audio limit,
+        # independently of the text-message threshold and legacy recent cache.
         audio_positions, seen = [], set()
         for i in range(state.processed, len(history)):
             message = history[i]
@@ -293,13 +294,16 @@ class IncrementalHistoryPolicy(BoundedRecentPolicy):
             if key not in seen:
                 seen.add(key)
                 audio_positions.append(i)
-        audio_limit = min(4, limits.max_audio_items)
+        audio_limit = max(1, min(max_audio, limits.max_audio_items))
         if len(audio_positions) >= audio_limit:
             cutoff = max(cutoff, audio_positions[len(audio_positions) - audio_limit] + 1)
         # Leave room for another utterance as large as the largest retained one.
         # Checking only equality misses byte limits between two item sizes.
         next_audio_bytes = max((len(a.encoded) for a in state.audio), default=0)
-        if state.audio_bytes + next_audio_bytes > min(8 * 1024 * 1024, limits.max_audio_bytes) and audio_positions:
+        if (
+            state.audio_bytes + next_audio_bytes > min(limits.audio_summary_trigger_bytes, limits.max_audio_bytes)
+            and audio_positions
+        ):
             cutoff = max(cutoff, audio_positions[0] + 1)
         end = state.processed
         for start, stop in turn_ranges(history):

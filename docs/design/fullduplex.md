@@ -119,9 +119,13 @@ External policies inherit the `QwenHistoryPolicy` ABC; incomplete implementation
 fail at server initialization. Selection is stateless and may be cached while
 the Session history revision, memory generation and retained-media revision are
 unchanged. Source checks still run before submitting or applying a summary.
-Media compression follows the smaller of configured pool and foreground-cache
-limits. A still-valid foreground source can be recovered for compression, but
-its worker references must fit the strategy limits and remain charged until
+Audio compression uses the renderer's effective per-request audio count and a
+separate `audio_summary_trigger_bytes` setting (default 8 MiB). The trigger is
+capped by the strategy's `max_audio_bytes` retention limit (default 32 MiB),
+independently of the legacy recent cache. The policy receives the resolved
+per-request count as `next_batch(..., max_audio=...)`. A still-valid foreground
+source can be recovered for compression, but its worker references must fit the
+strategy limits and remain charged until
 feature preparation finishes. Current text/audio is preserved independently of
 background retention capacity; unavailable current audio is an explicit error.
 

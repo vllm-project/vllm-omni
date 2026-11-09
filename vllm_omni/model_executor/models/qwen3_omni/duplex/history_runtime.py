@@ -288,7 +288,7 @@ class QwenHistoryRuntime:
     def work(self, state: QwenHistoryState) -> HistoryWork | None:
         """Validate a policy-selected prefix and bind it to the current sources."""
         assert self.policy is not None
-        batch = self.policy.next_batch(state, self.limits)
+        batch = self.policy.next_batch(state, self.limits, max_audio=self.max_audio)
         if batch is None:
             return None
         start, end = batch
@@ -363,13 +363,24 @@ class QwenHistoryRuntime:
                     break
                 unique_audio = {id(value): value for value in group.audio}
                 if (
-                    len(unique_audio) > self.limits.max_audio_items
+                    len(group.audio) > self.max_audio
+                    or len(unique_audio) > self.limits.max_audio_items
                     or sum(map(len, unique_audio.values())) > self.limits.max_audio_bytes
                 ):
                     if len(boundaries) > 1:
                         boundaries.pop()
                         continue
-                    state.advance(candidate, omission="summary_capacity")
+                    reason = "summary_capacity"
+                    if len(group.audio) > self.max_audio:
+                        reason = "summary_audio_capacity"
+                        logger.warning(
+                            "Qwen history omitted whole turn [%d, %d): %d audio payloads exceed request limit %d",
+                            candidate.start,
+                            candidate.end,
+                            len(group.audio),
+                            self.max_audio,
+                        )
+                    state.advance(candidate, omission=reason)
                     break
                 # One quoted source message makes the old memory and every
                 # new turn inputs to the same update, rather than presenting

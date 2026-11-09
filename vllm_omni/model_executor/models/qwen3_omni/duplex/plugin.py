@@ -935,15 +935,22 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return self._prepare_recent_prompt_config(config, state=state, payload=payload)
         self._history_runtime.validate_history(config.get("conversation", ()))
         previous_audio = list(state.audio_history)
-        prepared = self._prepare_recent_prompt_config(config, state=state, payload=payload)
+        self._bind_audio_history(config, state=state, payload=payload)
         memory = state.history_policy_state
         memory.reconcile(config.get("conversation", ()))
         memory.retain([*previous_audio, *state.audio_history], self._history_runtime.limits)
-        prepared[HISTORY_PROMPT] = self._history_runtime.foreground(memory, payload, state.audio_history)
+        prompt = self._history_runtime.foreground(memory, payload, state.audio_history)
         logger.debug("Qwen history memory counts=%s retained_audio_bytes=%d", dict(memory.counts), memory.audio_bytes)
-        return prepared
+        return {**config, HISTORY_PROMPT: prompt}
 
-    def _prepare_recent_prompt_config(self, config, *, state, payload):
+    def _bind_audio_history(
+        self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
+    ) -> bool:
+        """Bind submitted PCM to Session items and maintain the shared audio cache.
+
+        Return whether the submitted audio has source items in Session history.
+        Prompt selection is performed separately by each history policy.
+        """
         history = config.get("conversation", [])
         bind_from = 0
         lengths = []
@@ -991,6 +998,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > 8 * 1024 * 1024:
             retained.pop(0)
         state.audio_history = retained
+        return current_is_in_history
+
+    def _prepare_recent_prompt_config(self, config, *, state, payload):
+        current_is_in_history = self._bind_audio_history(config, state=state, payload=payload)
+        history = config.get("conversation", [])
+        has_audio = bool(payload.get("audio"))
+        retained = state.audio_history
         # Match the official demo's unit of history: consecutive user items
         # followed by their assistant reply(s). Prune whole turns, before
         # formatting, so a camera item cannot rescue an orphaned answer.

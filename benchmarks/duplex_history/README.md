@@ -25,6 +25,7 @@ duplex_session:
       summary_tokens: 512
       max_audio_items: 64
       max_audio_bytes: 33554432
+      audio_summary_trigger_bytes: 8388608
       max_context_tokens: 2048
 ```
 
@@ -57,7 +58,10 @@ feature extraction runs on CPU and can temporarily hold decoded copies.
 Oversized individual audio is not sliced. Unavailable sources and input that
 cannot fit a summary request produce distinct omissions; subsequent turns
 continue. Failed model completions retain progress and have bounded short
-retries. Audio retained solely for processed sources is released.
+retries: one initial attempt and two retries after 1 and 3 seconds. If all fail,
+the same source remains parked until changed source selection or a new foreground
+submission allows another attempt. Idle time alone does not restart it. Audio
+retained solely for processed sources is released.
 
 ## Frozen evaluation inputs
 
@@ -137,22 +141,49 @@ fit raises an error instead of producing a degradation record. These fields do
 not count sources already missing before rendering; media eviction and summary
 omission counters are separate.
 
-Media consolidation starts when the smaller configured-pool/foreground-cache
-item limit is reached, or the byte limit cannot hold another utterance as large
-as the largest retained one, independently of the text-message threshold.
+Audio consolidation has separate trigger and retention settings. The byte
+trigger is `audio_summary_trigger_bytes` (default 8 MiB), independent of the
+legacy recent cache. Planning starts when retained encoded bytes plus the
+largest retained utterance would exceed the smaller of this trigger and
+`max_audio_bytes` (default 32 MiB). Raising the retention limit alone does not
+delay compression. The extra space lets pending work retain original sources
+while foreground requests take priority. These defaults are not tuned quality
+or performance recommendations.
+
+The item-count trigger uses the smaller of the effective per-request model
+audio limit and `max_audio_items`. Both media triggers operate independently
+of the recent text-message window and select completed whole turns.
 Still-valid foreground-cache audio can supply a summary after strategy eviction;
 selected sources are charged to the strategy limit until feature preparation
 finishes, including cancellation. If a source exists but cannot fit that limit,
 the omission reason is `summary_capacity`, not `source_unavailable`.
+
+An indivisible turn with too many distinct audio payloads records
+`summary_audio_capacity` and logs the count/limit before advancing past it.
+Consecutive commits before one response share a single payload. Deleting
+assistant replies between previously separate audio turns can join distinct
+payloads into a turn that exceeds the per-request limit. Such a turn is omitted
+without a summary; this prototype does not split a turn across summary requests.
+The omission allows later turns to progress but cannot preserve the omitted
+turn's facts in memory.
+
+Operational failures (response timeout, protocol rejection, connection loss or
+an ended response iterator) are written as `run_error` rows before the next
+case starts in a fresh session. Completed turns remain in `turns`; `failed_turn`
+records the interrupted turn's index, response ID and partial text when
+available. Failed turns are excluded from latency aggregation. Programming
+errors and cancellation stop the run rather than becoming model-quality scores.
 
 ## Replacing the policy
 
 Set `history_policy: your_package.policy:YourPolicy`. The server imports the
 class with a no-argument constructor. Clients cannot supply this import path.
 Inherit the `QwenHistoryPolicy` abstract base class in `duplex/history_policy.py`
-and implement `select(state, limits)` and `next_batch(state, limits)`. Incomplete
-implementations are rejected when the server loads the strategy. The built-in clipping and
-incremental classes are executable examples of the interface.
+and implement `select(state, limits)` and
+`next_batch(state, limits, *, max_audio)`. `max_audio` is the renderer's resolved
+per-request audio limit, including model configuration. Incomplete
+implementations are rejected when the server loads the strategy. The built-in
+clipping and incremental classes are executable examples of the interface.
 
 A policy chooses ordered whole-turn source ranges. The Qwen plugin retains
 responsibility for input construction, context bounds, media correspondence,

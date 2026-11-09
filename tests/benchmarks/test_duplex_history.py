@@ -72,3 +72,128 @@ async def test_audio_listening_beats_do_not_finish_the_current_turn():
     handle = await next_answer(client.responses())
     assert handle.response_id == "answer-1"
     assert handle.text == "remembered"
+
+
+@pytest.fixture
+def scripted_clients(monkeypatch):
+    import asyncio
+
+    import vllm_omni.clients.duplex as duplex
+
+    modes: list[str] = []
+
+    class ScriptedClient(duplex.DuplexClientBase):
+        """Exercise real response/event iteration with a deterministic transport."""
+
+        def __init__(self, url, *, model, config, reconnect):
+            super().__init__(model=model, config=config)
+            self.mode = modes.pop(0)
+            self.turn = 0
+            self.torn_down = False
+            clients.append(self)
+
+        async def _open(self):
+            if self.mode == "connect":
+                raise duplex.DuplexConnectionError("connection refused")
+
+        async def _teardown(self):
+            self.torn_down = True
+
+        async def responses(self):
+            async for handle in super().responses():
+                if self.turn == 2 and self.mode == "bug":
+                    raise RuntimeError("unexpected benchmark bug")
+                yield handle
+
+        async def _send_command(self, payload):
+            kind = payload["type"]
+            if kind == "session.update":
+                await self._dispatch({"type": "session.created", "session": {"id": "fake-session"}})
+            elif kind == "session.close":
+                await self._dispatch({"type": "session.closed"})
+            elif kind == "response.create":
+                self.turn += 1
+                if self.turn == 2 and self.mode == "protocol":
+                    await self._dispatch({"type": "error", "error": {"code": "rejected", "message": "bad request"}})
+                    return
+                if self.turn == 2 and self.mode == "cancel":
+                    raise asyncio.CancelledError
+                response_id = f"answer-{self.turn}"
+                await self._dispatch({"type": "response.created", "response": {"id": response_id}})
+                await self._dispatch({"type": "response.text.delta", "response_id": response_id, "delta": "remembered"})
+                if self.turn == 2 and self.mode == "timeout":
+                    return
+                await self._dispatch({"type": "response.done", "response": {"id": response_id, "status": "completed"}})
+
+    clients: list[ScriptedClient] = []
+    monkeypatch.setattr(duplex, "DuplexClient", ScriptedClient)
+    return modes, clients
+
+
+def benchmark_args(tmp_path):
+    from argparse import Namespace
+
+    return Namespace(
+        url="ws://unused",
+        model="qwen",
+        max_output_tokens=128,
+        modality="text",
+        realtime_input=False,
+        policy="incremental",
+        idle_seconds=0,
+        timeout=0.02,
+        manifest=tmp_path / "cases.jsonl",
+        output=tmp_path / "results.jsonl",
+        split="eval",
+        limit=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_records_operational_failures_and_continues(tmp_path, scripted_clients):
+    from vllm_omni.benchmarks.duplex_history import run
+
+    modes, clients = scripted_clients
+    modes.extend(["timeout", "protocol", "connect", "success"])
+    args = benchmark_args(tmp_path)
+    cases = [
+        {
+            "id": str(i),
+            "split": "eval",
+            "category": "fact",
+            "turns": ["first", "last"],
+            "accepted": ["remembered"],
+            "forbidden": [],
+        }
+        for i in range(4)
+    ]
+    args.manifest.write_text("\n".join(json.dumps(case) for case in cases))
+    await run(args)
+    rows = [json.loads(line) for line in args.output.read_text().splitlines()]
+    assert [row["case_id"] for row in rows] == ["0", "1", "2", "3"]
+    assert [row["score"] for row in rows] == ["run_error", "run_error", "run_error", "correct"]
+    assert [len(row["turns"]) for row in rows] == [1, 1, 0, 2]
+    assert rows[0]["failed_turn"]["index"] == 1
+    assert rows[0]["failed_turn"]["text"] == "remembered"
+    assert rows[0]["failed_turn"]["response_id"] == "answer-2"
+    assert rows[0]["errors"][-1]["type"] == "TimeoutError"
+    assert rows[1]["errors"][-1]["type"] == "DuplexProtocolError"
+    assert rows[1]["errors"][-1]["raw"]["error"]["code"] == "rejected"
+    assert rows[2]["failed_turn"] is None
+    assert rows[2]["errors"][-1]["type"] == "DuplexConnectionError"
+    assert all(client.torn_down and not client._subscribers for client in clients)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["bug", "cancel"])
+async def test_run_does_not_swallow_bugs_or_cancellation(tmp_path, scripted_clients, mode):
+    import asyncio
+
+    from vllm_omni.benchmarks.duplex_history import run_case
+
+    modes, clients = scripted_clients
+    modes.append(mode)
+    case = {"id": "a", "category": "fact", "turns": ["first", "last"], "accepted": ["remembered"], "forbidden": []}
+    with pytest.raises(RuntimeError if mode == "bug" else asyncio.CancelledError):
+        await run_case(case, benchmark_args(tmp_path))
+    assert clients[0].torn_down and not clients[0]._subscribers
