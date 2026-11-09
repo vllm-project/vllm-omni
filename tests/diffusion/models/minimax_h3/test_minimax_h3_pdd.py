@@ -306,14 +306,69 @@ def test_validate_and_convert_tensors_against_real_artifact():
     assert tuple(hb["audio_out"].shape) == (32, 32)
     assert hw["video_out"].dtype == torch.float32
     # Spot-check adaln targets are remapped and shaped correctly.
-    fc1_up = [v for k, v in trunk.items() if "ff.net.0.proj.lora_up" in k][0]
-    ad_down = [v for k, v in trunk.items() if "adaln_proj.linear.lora_down" in k][0]
-    ad_up = [v for k, v in trunk.items() if "adaln_proj.linear.lora_up" in k][0]
+    fc1_up = [v for k, v in trunk.items() if "ff.net.0.proj.lora_B" in k][0]
+    ad_down = [v for k, v in trunk.items() if "adaln_proj.linear.lora_A" in k][0]
+    ad_up = [v for k, v in trunk.items() if "adaln_proj.linear.lora_B" in k][0]
     assert tuple(fc1_up.shape) == (2 * 14336, 64)  # post gate/value swap
     assert tuple(ad_down.shape) == (64, 2688)  # time_embed_dim input
     assert tuple(ad_up.shape) == (96768, 64)  # 18*5376 block adaln output
     # Trunk keys end with .weight (required by vLLM's parser).
     assert all(k.endswith(".weight") for k in trunk.keys())
+
+
+@pytest.mark.parametrize("partition,component", [("ref2va", "transformer"), ("combined", "transformers_ref")])
+def test_native_lora_loader_accepts_normalized_pdd_keys(tmp_path, monkeypatch, partition, component):
+    """vLLM parses the tensor name again without the component weights mapper."""
+    from safetensors.torch import save_file
+    from vllm.lora.lora_model import LoRAModel
+
+    from vllm_omni.diffusion.models.minimax_h3 import pdd_artifact as pdd
+
+    # Keep a real artifact/loader boundary with a small tensor layout. The
+    # released rank, metadata validation and native LoRAModel are unchanged.
+    target = "token_refiner.refiner_blocks.0.attn.to_k"
+    adaln_target = "transformer_blocks.0.adaln_proj.linear"
+    monkeypatch.setattr(pdd, "_PDD_TRUNK_RAW_TARGETS", frozenset({target, adaln_target}))
+    monkeypatch.setitem(pdd._PDD_TRUNK_TARGET_DIMS, "attn.to_k", (3, 4))
+    monkeypatch.setitem(pdd._PDD_TRUNK_TARGET_DIMS, "adaln_proj.linear", (3, 4))
+    monkeypatch.setattr(pdd, "_PDD_HIDDEN_SIZE", 3)
+    monkeypatch.setattr(pdd, "_PDD_VIDEO_OUT_DIM", 1)
+    monkeypatch.setattr(pdd, "_PDD_AUDIO_OUT_DIM", 1)
+    a = torch.arange(64 * 3, dtype=torch.float32).reshape(64, 3)
+    b = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64)
+    checkpoint = tmp_path / PDD_CKPT.name
+    save_file(
+        {
+            f"{target}.lora_down": a,
+            f"{target}.lora_up": b,
+            f"{adaln_target}.lora_down": a.clone(),
+            f"{adaln_target}.lora_up": b.clone(),
+            "proj_out.weight": torch.zeros(32, 1, 3),
+            "proj_out.bias": torch.zeros(32, 1),
+            "audio_proj_out.weight": torch.zeros(32, 1, 3),
+            "audio_proj_out.bias": torch.zeros(32, 1),
+        },
+        str(checkpoint),
+        metadata={"lora_targets": "attn.to_k,adaln_proj.linear"},
+    )
+    loaded = load_minimax_h3_pdd_lora(
+        partition=partition,
+        lora_request=LoRARequest(lora_int_id=9002, lora_name="pdd", lora_path=str(checkpoint)),
+        lora_path=checkpoint,
+        dtype=torch.float32,
+    )
+    assert loaded is not None
+    model, _peft, cfg, _weights, _biases = loaded
+    assert isinstance(model, LoRAModel)
+    assert cfg.dit_component == component
+    assert set(model.loras) == {
+        f"{component}.token_refiner.blocks.0.attn.to_k",
+        f"{component}.blocks.0.adaln_proj.linear",
+    }
+    weights = model.loras[f"{component}.token_refiner.blocks.0.attn.to_k"]
+    assert weights.rank == 64 and weights.scaling == 1.0
+    torch.testing.assert_close(weights.lora_a, a)
+    torch.testing.assert_close(weights.lora_b, b)
 
 
 @pytest.mark.skipif(not PDD_CKPT.is_file(), reason="PDD checkpoint not present")

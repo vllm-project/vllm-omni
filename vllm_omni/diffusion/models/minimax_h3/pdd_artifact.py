@@ -473,9 +473,10 @@ def _validate_and_convert_tensors(
 
     Returns ``(trunk_tensors, head_weights, head_biases)`` where:
 
-    * ``trunk_tensors`` -- dict keyed by the *original* diffusers tensor name,
-      ready for ``LoRAModel.from_lora_tensors`` (the weights mapper renames
-      them to vllm-omni conventions at load time).
+    * ``trunk_tensors`` -- original diffusers module names with canonical
+      ``.lora_A.weight`` / ``.lora_B.weight`` suffixes, ready for
+      ``LoRAModel.from_lora_tensors``. The mapper handles module naming and
+      component qualification at load time.
     * ``head_weights`` -- keys ``"video_out"``/``"audio_out"``, values shaped
       ``(num_steps, out_features, in_features)`` fp32.
     * ``head_biases`` -- same keys, values shaped ``(num_steps, out_features)`` fp32.
@@ -512,16 +513,15 @@ def _validate_and_convert_tensors(
         if name.endswith(_PDD_LORA_DOWN_SUFFIX):
             raw_target = name[: -len(_PDD_LORA_DOWN_SUFFIX)]
             side = "a"
-            # The PDD artifact drops the trailing `.weight` (e.g. `attn.to_q.lora_down`)
-            # but vLLM's LoRA key parser requires the qualified weight name ending in
-            # `.lora_A.weight` -- append it so the mapper produces canonical keys.
-            dict_name = name + ".weight"
         elif name.endswith(_PDD_LORA_UP_SUFFIX):
             raw_target = name[: -len(_PDD_LORA_UP_SUFFIX)]
             side = "b"
-            dict_name = name + ".weight"
         else:
             raise ValueError(f"Unconsumed PDD tensor: {name!r}")
+        # vLLM also parses this name without weights_mapper to resolve PEFT
+        # rank/alpha patterns, so normalize the tensor suffix before handing
+        # it to the native loader. Keep raw module names for that lookup.
+        dict_name = f"{raw_target}.lora_{'A' if side == 'a' else 'B'}.weight"
         raw_targets.add(raw_target)
 
         suffix = next((s for s in _PDD_TRUNK_TARGET_SUFFIXES if raw_target.endswith(s)), None)
