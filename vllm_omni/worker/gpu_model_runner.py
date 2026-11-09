@@ -995,6 +995,25 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([])
         return super()._dummy_sampler_run(hidden_states=hidden_states)
 
+    def _require_moe_specialty_runner(self) -> None:
+        """Fail fast when MoE specialty graphs are enabled on a no-op runner.
+
+        ``cudagraph_specialize_moe_routing`` expands capture keys in the
+        dispatcher. Without ``MammothGPUARModelRunner`` (or another override of
+        the annotate/select hooks), those graphs are never forced at capture
+        or selected at replay — fail here instead of silently staying on
+        BLEND after paying the extra capture cost.
+        """
+        specialize = bool(getattr(getattr(self, "compilation_config", None), "cudagraph_specialize_moe_routing", False))
+        if not specialize:
+            return
+        raise RuntimeError(
+            "cudagraph_specialize_moe_routing is enabled but "
+            f"{type(self).__name__} does not implement MoE specialty "
+            "capture/replay. Use MammothGPUARModelRunner for MammothModa2 "
+            "FULL AR stages, or disable cudagraph_specialize_moe_routing."
+        )
+
     def _annotate_moe_routing_batch_descriptor(
         self,
         batch_desc,
@@ -1003,10 +1022,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         force_moe_routing_key: int | None = None,
     ):
         """Hook for MoE specialty capture; default no-op (Mammoth overrides)."""
+        self._require_moe_specialty_runner()
         return batch_desc
 
     def _select_moe_replay_batch_descriptor(self, mode, batch_desc, num_tokens: int):
         """Hook for MoE specialty replay; default no-op (Mammoth overrides)."""
+        self._require_moe_specialty_runner()
         return batch_desc
 
     @torch.inference_mode()
