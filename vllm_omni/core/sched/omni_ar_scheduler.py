@@ -1197,9 +1197,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     sampling_validation_failed = True
 
             scheduled_spec_token_ids = spec_decode_tokens.get(req_id) if spec_decode_tokens else None
+            # Accepted drafts of this step's own output: each was an input with its own row.
+            accepted_inputs = 0
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
+                accepted_inputs = 0 if output_is_stale else num_accepted
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1341,7 +1344,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             elif stopped and not sampling_validation_failed and terminal_rows is not None:
                 stopped = self._defer_minicpmo45_terminal_row(
-                    request, preempted=status_before_stop == RequestStatus.PREEMPTED
+                    request,
+                    preempted=status_before_stop == RequestStatus.PREEMPTED,
+                    final_was_input=0 < len(new_token_ids) <= accepted_inputs,
                 )
 
             # If criteria returns True, it means we must STOP the request.
@@ -2195,7 +2200,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.next_decode_eligible_step == _HELD_DECODE_STEP:
                 request.next_decode_eligible_step = eligible_step
 
-    def _defer_minicpmo45_terminal_row(self, request: Request, preempted: bool = False) -> bool:
+    def _defer_minicpmo45_terminal_row(
+        self, request: Request, preempted: bool = False, final_was_input: bool = False
+    ) -> bool:
         """Hold a length stop until its final token is a target input.
 
         Returns whether the request stops now. A final token that already was
@@ -2210,7 +2217,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             return True
         missing = request.num_tokens - request.num_computed_tokens
-        if missing <= 0:
+        # vLLM 0.33 rolls num_computed_tokens back past a stop trim, so an
+        # accepted draft that ends the reply no longer shows as computed.
+        if missing <= 0 or final_was_input:
             return True
         # schedule() can admit one draft-free input only below this bound.
         if request.num_tokens > self.max_model_len - self.num_sampled_tokens_per_step:

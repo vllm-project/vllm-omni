@@ -176,8 +176,8 @@ def _unconsumed(request):
 
 @pytest.mark.parametrize(
     "speculative,drafts,sampled",
-    [(False, [], [12]), (True, [12, 99, 98], [12, 13])],
-    ids=["ordinary", "correction"],
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13]), (True, [12, 13, 14], [12, 13, 14, 15])],
+    ids=["ordinary", "correction", "bonus"],
 )
 def test_length_stop_leaves_the_final_token_unconsumed(monkeypatch, speculative, drafts, sampled):
     """The gap: at the length limit no target forward has the final token as input."""
@@ -190,8 +190,8 @@ def test_length_stop_leaves_the_final_token_unconsumed(monkeypatch, speculative,
 
 @pytest.mark.parametrize(
     "speculative,drafts,sampled",
-    [(False, [], [12]), (True, [12, 99, 98], [12, 13])],
-    ids=["ordinary", "correction"],
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13]), (True, [12, 13, 14], [12, 13, 14, 15])],
+    ids=["ordinary", "correction", "bonus"],
 )
 def test_length_stop_consumes_the_final_token_before_finishing(monkeypatch, speculative, drafts, sampled):
     """Contract: one draft-free target forward takes the final token; its sample is dropped."""
