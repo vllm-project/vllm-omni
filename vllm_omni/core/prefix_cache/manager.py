@@ -287,6 +287,14 @@ class _StepContext:
     positions: dict[ReqId, int] = field(default_factory=dict)
     session_offsets: dict[ReqId, int] = field(default_factory=dict)
 
+    # Session identity, frozen at publish: the session each request of
+    # this step belonged to when the step was saved. materialize and
+    # discard_step must not re-derive it from the live binding table:
+    # a FINISHED processed before a delayed materialize unbinds the
+    # request, and the fallback would then take a fresh slot ref that
+    # can belong to a new tenant after block reuse (A3).
+    session_for_req: dict[ReqId, str] = field(default_factory=dict)
+
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[TensorName] = field(default_factory=set)
     # Leftover mm copied to CPU at save (this-step deferred rows + mm
@@ -807,14 +815,12 @@ class OmniPrefixCacheManager:
 
                 # Session-level serving, captured now so the unlocked
                 # merge and append below use one consistent view.
-                # session_for_req survives a later unbind: a request
-                # being materialized may already have its finish event
-                # processed on the engine thread.
-                session_for_req: dict[str, str] = {}
-                for req_id in req_ids:
-                    session_id = self._session_store.session_of(req_id)
-                    if session_id is not None:
-                        session_for_req[req_id] = session_id
+                # Frozen at publish (ctx.session_for_req): re-deriving
+                # from the live binding table would lose the session
+                # for a request whose FINISHED was already processed
+                # (A3) and fall back to a possibly-reused slot ref
+                # (see _StepContext.session_for_req).
+                session_for_req = {r: session_id for r, session_id in ctx.session_for_req.items() if r in req_ids}
                 # (req, key) -> segment views covering the hit prefix.
                 # Snapshot only: concatenation happens unlocked. The views
                 # keep their segments alive, so a concurrent invalidate
@@ -931,11 +937,11 @@ class OmniPrefixCacheManager:
         with self._state_lock:
             ctx = self._take_step_ctx(step_id)
         try:
-            session_for_req: dict[str, str] = {}
-            for req_id in ctx.spans:
-                session_id = self._session_store.session_of(req_id)
-                if session_id is not None:
-                    session_for_req[req_id] = session_id
+            # Session rows, frozen at publish (ctx.session_for_req):
+            # re-deriving from the live binding table would lose the
+            # session for a request whose FINISHED was already processed
+            # (A3). The binding table is not consulted here.
+            session_for_req = ctx.session_for_req
             if session_for_req:
                 current: dict[str, torch.Tensor] = {}
                 if ctx.d2h_snapshot is not None:
@@ -1165,6 +1171,9 @@ class OmniPrefixCacheManager:
             hit_prefetch=dict(self._hit_prefetch),
             positions=positions,
             session_offsets={r: self._req_session_offset.get(r, 0) for r in req_order},
+            session_for_req={
+                r: session_id for r in req_order if (session_id := self._session_store.session_of(r)) is not None
+            },
             trims=dict(self._trims),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,

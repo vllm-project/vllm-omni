@@ -2206,6 +2206,42 @@ def run_session_step(
     return mgr.save_outputs(hidden, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
 
 
+def test_session_frozen_identity_serves_after_finish_and_slot_reuse():
+    """A3: a FINISHED processed before materialize must not lose the session.
+
+    The step's hit was session-served at prefetch (store covers), so
+    no slot ref was planned. If FINISHED runs first and another
+    request reuses the blocks, re-deriving the session from the live
+    binding table finds nothing and the pool fallback serves the new
+    tenant's rows. The frozen publish-time session identity serves the
+    original session rows instead.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Another request reuses the same blocks with different values.
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8, offset=1000, finished=["a"])
+        mgr.materialize(s2, ["b"])
+        # Same session, new turn, prefix hit on the reused blocks —
+        # saved but NOT materialized yet.
+        s3 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["b"])
+        # FINISHED for the new turn's request, then a reuser takes the
+        # blocks with yet different values — before materialize.
+        s4 = run_session_step(mgr, view, "b2", [0, 1, 2], 0, 12, offset=2000, finished=["a2"])
+        mgr.materialize(s4, ["b2"])
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 2000.0
+        outs = mgr.materialize(s3, ["a2"])
+        merged = outs.hidden_states["a2"]
+        # Prefix comes from the session store (original values), not
+        # the slot pool (the reuser's 2000+ rows).
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("a2", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
 def test_session_store_serves_hit_after_slot_reuse():
     mgr, view = make_manager()
     try:
@@ -2415,6 +2451,7 @@ def test_session_discard_uses_host_views_not_full_clone():
             hits={},
             positions={"a": 8},
             session_offsets={"a": 0},
+            session_for_req={"a": "S"},
             d2h_snapshot=fake,
         )
         mgr._step_ctxs[999] = ctx
