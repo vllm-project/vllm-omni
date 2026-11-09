@@ -271,6 +271,17 @@ def remove_block_hook(module: nn.Module) -> None:
         logger.debug("Removed offload hook from %s", module.__class__.__name__)
 
 
+def find_layerwise_offload_hook(module: nn.Module) -> LayerwiseOffloadHook | None:
+    """The layerwise offload hook registered on ``module`` itself, if any.
+
+    Layerwise hooks sit on each block's own registry, so presence checks walk
+    the tree and ask this function per module.
+    """
+    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+    hook = registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) if registry is not None else None
+    return hook if isinstance(hook, LayerwiseOffloadHook) else None
+
+
 def _install_layerwise_hook_group(
     blocks: Sequence[nn.Module] | nn.ModuleList,
     device: torch.device,

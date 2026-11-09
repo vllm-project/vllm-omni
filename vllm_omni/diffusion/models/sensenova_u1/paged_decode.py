@@ -136,23 +136,30 @@ def dynamic_lora_wrappers_present(module) -> bool:
     return any(isinstance(m, BaseLayerWithLoRA) for m in module.modules())
 
 
-def sequential_offload_hook_present(module) -> bool:
-    """True once model-level CPU offload has hooked ``module``'s forward.
+def offload_hook_present(module) -> bool:
+    """True once a CPU-offload hook sits anywhere on ``module``'s tree.
 
-    ``SequentialOffloadHook.pre_forward`` moves parameters between devices and
-    synchronizes the platform on every call. Neither is legal while a CUDA
-    graph capture runs -- the capture dies with "operation not permitted when
-    stream is capturing" -- and a replay would skip the swap the hook exists
-    to make. The paged decode path therefore stands down entirely, leaving
-    decode on the ordinary cache the hooked forward already serves. The check
-    reads the registry each call, so removing the hook brings the path back.
+    Both offload strategies make every forward unsafe to capture:
+    ``SequentialOffloadHook`` hooks the component root and moves parameters
+    between devices and synchronizes the platform on every call, while
+    ``LayerwiseOffloadHook`` hooks each block's own registry and swaps weight
+    storage inside every pre_forward. A capture dies with "operation not
+    permitted when stream is capturing" on the former and would skip the swap
+    the latter exists to make on replay. The paged decode path therefore stands
+    down entirely, leaving decode on the ordinary cache the hooked forward
+    already serves. The walk covers the two registrations -- root and per
+    block -- and reads the registries each call, so removing the hooks brings
+    the path back.
     """
-    registry = getattr(module, "_hook_registry", None)
-    if registry is None:
-        return False
-    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+    from vllm_omni.diffusion.offloader.layerwise_backend import find_layerwise_offload_hook
+    from vllm_omni.diffusion.offloader.sequential_backend import find_sequential_offload_hook
 
-    return registry.get_hook(SequentialOffloadHook._HOOK_NAME) is not None
+    # ``modules()`` yields ``module`` itself first, so the component-root
+    # sequential registration is covered by the same walk.
+    return any(
+        find_sequential_offload_hook(sub) is not None or find_layerwise_offload_hook(sub) is not None
+        for sub in module.modules()
+    )
 
 
 def _bucket_for(length: int) -> int:

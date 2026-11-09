@@ -60,8 +60,8 @@ from .paged_decode import (
     DecodeGraphRunner,
     PagedDecodeCache,
     dynamic_lora_wrappers_present,
+    offload_hook_present,
     paged_decode_supported,
-    sequential_offload_hook_present,
 )
 from .sensenova_u1_transformer import (
     SenseNovaU1CausalLMOutput,
@@ -801,7 +801,7 @@ class SenseNovaU1Pipeline(
         # platform inside ``language_model.forward``; a capture may do neither,
         # and a replay would skip the swap. The eager path the hooked forward
         # already serves is the fallback.
-        if sequential_offload_hook_present(self.language_model):
+        if offload_hook_present(self.language_model):
             return None
         if past_key_values is None or not past_key_values.layers:
             return None
@@ -1372,7 +1372,7 @@ class SenseNovaU1Pipeline(
                 return
             if dynamic_lora_wrappers_present(lm):
                 return
-            if sequential_offload_hook_present(lm):
+            if offload_hook_present(lm):
                 return
             if prefill_cache is None or not prefill_cache.layers:
                 return
@@ -1386,8 +1386,6 @@ class SenseNovaU1Pipeline(
                 layer0.keys.dtype,
                 min_length=READINESS_DECODE_WARM_BUCKET,
             )
-            if cache is None:
-                return
             runner = DecodeGraphRunner(lm, cache, device)
             # A step below the top bucket has to replay its own bucket's
             # graph, so each bucket gets its own capture. Each capture needs a

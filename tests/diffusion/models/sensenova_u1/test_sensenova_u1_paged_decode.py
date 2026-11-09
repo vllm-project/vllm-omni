@@ -924,6 +924,44 @@ def test_sequential_offload_takes_the_eager_path(monkeypatch):
     assert host._paged_decode[0].bucket == READINESS_DECODE_WARM_BUCKET
 
 
+@pytest.mark.cpu
+def test_layerwise_block_hooks_take_the_eager_path(monkeypatch):
+    """Layerwise offload registers on each block's own registry, not the
+    component root the probe used to read, and its pre_forward swaps weight
+    storage on every call -- the same capture hazard the sequential hook
+    poses. The probe walks the module tree, so the paged path stands down for
+    either registration and comes back once the hooks are removed.
+    """
+    from vllm_omni.diffusion.offloader.layerwise_backend import (
+        apply_block_hook,
+        remove_block_hook,
+    )
+
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    # Real modules in a ModuleList: the probe walks ``modules()``, which only
+    # reaches blocks registered the way a real transformer tower registers them.
+    tower = torch.nn.Module()
+    tower.layers = torch.nn.ModuleList(torch.nn.Module() for _ in range(LAYERS))
+    for block in tower.layers:
+        block.self_attn = SimpleNamespace(head_dim=HEAD_DIM)
+    host.language_model.model = tower
+
+    # An explicit stream keeps the hook off ``current_stream()``, which a
+    # CPU-only lane cannot provide; the hook is never run here.
+    apply_block_hook(tower.layers[0], tower.layers[1], torch.device("cpu"), object())
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "warm captured under a block hook that swaps weights"
+    assert ctx(host, _dyn_cache(10)) is None, "serving reached the capture path under layerwise offload"
+
+    remove_block_hook(tower.layers[0])
+    warm(host, _dyn_cache(2))
+    assert host._paged_decode is not None, "the path stayed down after the block hook was removed"
+
+
 @cuda_only
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_second_request_replays_the_first_capture(monkeypatch):
