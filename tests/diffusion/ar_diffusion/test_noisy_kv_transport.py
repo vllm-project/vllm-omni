@@ -131,7 +131,9 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
+# chunk_tokens={4,12}: 4 covers padding beyond the chunk; 12 covers full
+# max_chunk_tokens. The mid value 8 repeated the same asserts.
+@pytest.mark.parametrize("chunk_tokens", [4, 12])
 @pytest.mark.parametrize("mode", ["immediate", "delayed"])
 def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int, mode: str) -> None:
     torch.multiprocessing.spawn(

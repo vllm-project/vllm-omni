@@ -51,7 +51,6 @@ DIFFUSION_SLOW_CPU_NODES = [
     "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]",
     "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
     "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]",
-    "tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]",
     "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
     "::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]",
     "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
