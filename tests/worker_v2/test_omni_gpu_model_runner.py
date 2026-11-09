@@ -648,6 +648,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
     make_dummy = MagicMock(return_value=input_batch)
     monkeypatch.setattr(InputBatch, "make_dummy", make_dummy)
+    platform_dummy = MagicMock(wraps=runner._make_dummy_input_batch)
+    monkeypatch.setattr(runner, "_make_dummy_input_batch", platform_dummy)
     randomized = []
 
     def randomize(tensor, low, high):
@@ -663,6 +665,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         "vllm_omni.worker_v2.omni_generation_model_runner.OmniGenerationModelRunner._forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
+    platform_context = MagicMock(return_value=nullcontext())
+    monkeypatch.setattr(runner, "_forward_context", platform_context)
     scheduled = SchedulerOutput.make_empty()
     scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
     scheduled.total_num_scheduled_tokens = 1
@@ -679,6 +683,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         )
         is None
     )
+    platform_dummy.assert_called_once()
+    platform_context.assert_called_once()
     assert make_dummy.call_args.kwargs["is_padding"] is not is_profile
     should_randomize = randomize_inputs and runner_kind != "generation"
     assert randomized == ([(0, 32)] if should_randomize else [])

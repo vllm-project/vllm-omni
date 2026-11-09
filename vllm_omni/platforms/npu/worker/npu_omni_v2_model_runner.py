@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Omni autoregressive runner on Ascend Model Runner V2.
+"""Omni autoregressive and generation runners on Ascend Model Runner V2.
 
 ``OmniARModelRunner`` owns the speech lifecycle (frame outputs, connectors).
 ``NPUModelRunner`` owns Ascend input state (``AscendRequestState``,
@@ -14,7 +14,7 @@ the same step.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -22,6 +22,9 @@ from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 
 logger = init_logger(__name__)
 
@@ -146,8 +149,10 @@ def _default_ascend_decode_graph_flag() -> None:
     AscendInputBatch.__init__ = wrapped  # type: ignore[method-assign]
 
 
-class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
-    """Drama 3 (and any other NPU-ready AR model) on Model Runner V2."""
+class NPUOmniV2RunnerMixin:
+    """Ascend input buffers, batches and forward context for Omni V2 runners."""
+
+    input_buffers: AscendInputBuffers
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         _default_ascend_decode_graph_flag()
@@ -216,6 +221,19 @@ class NPUOmniARModelRunner(OmniARModelRunner, NPUModelRunner):
 
     def _close_omni_aux_output(self) -> None:
         """V1 aux-output streams are not used by this runner."""
+
+
+class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunner):
+    """NPU autoregressive models with Ascend attention metadata."""
+
+    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
+        super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        # The Ascend override initializes native KV directly, bypassing the
+        # shared MRv2 mixin. Thinker hits also need cached stage-output rows.
+        is_profiling = bool(kwargs.get("is_profiling", args[0] if args else False))
+        self._init_omni_prefix_cache(is_profiling=is_profiling)
+        if self.omni_prefix_cache is not None:
+            logger.info("NPU MRv2 stage-output prefix cache initialized.")
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         OmniGPUModelRunner.load_model(self, *args, **kwargs)

@@ -606,7 +606,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 self._release_generation_slots(input_batch, keep=pending)
             return async_output
 
-        # CPU execution keeps the synchronous materialization path. Final
+        # Non-CUDA execution keeps the synchronous materialization path. Final
         # generation stages publish audio only through multimodal_outputs,
         # matching the V1 generation-runner contract.
         self._reserve_native_data_plane_outputs(list(req_ids))
