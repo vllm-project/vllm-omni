@@ -3229,9 +3229,10 @@ class TestPlatformOverrides:
     def test_qwen3_omni_encoder_graph_defaults(self, deploy_name, platform):
         deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
         config = deploy.stages[0].compilation_config
-        # NPU runs the V1 runner, which applies the replay bounds. CUDA defaults
-        # to MRv2, which rejects encoder graphs, so they stay an opt-in there.
-        assert config["cudagraph_mm_encoder"] is (platform == "npu")
+        # CUDA and NPU both default to MRv2. MRv2 builds vLLM's generic encoder
+        # manager and the thinker rejects cudagraph_mm_encoder, so the shipped
+        # profiles keep encoder graphs off. A v1 overlay opts in.
+        assert config["cudagraph_mm_encoder"] is False
         assert config["encoder_cudagraph_token_budgets"] == [256, 512, 1024, 2048, 4096]
         if platform == "cuda":
             assert config["custom_ops"] == ["+rotary_embedding"]
