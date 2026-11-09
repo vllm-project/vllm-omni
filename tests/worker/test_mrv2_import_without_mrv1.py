@@ -38,18 +38,44 @@ REMOVED_MRV1_MODULES = (
 
 _PRELUDE = textwrap.dedent(
     """
-    import importlib.abc
+    import builtins
     import sys
 
     BLOCKED = {blocked!r}
+    _real_import = builtins.__import__
 
-    class _BlockRemovedMRv1(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if any(fullname == m or fullname.startswith(m + ".") for m in BLOCKED):
-                raise ModuleNotFoundError(f"No module named {{fullname!r}} (blocked: removed with MRv1)")
-            return None
+    def _is_blocked(name):
+        return any(name == m or name.startswith(m + ".") for m in BLOCKED)
 
-    sys.meta_path.insert(0, _BlockRemovedMRv1())
+    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        # Only vLLM-Omni's own imports are blocked: the vLLM release under test
+        # still imports these modules internally and drops them with MRv1.
+        # Checking the importer here (not in a finder) also catches modules
+        # that vLLM already loaded into sys.modules.
+        importer = (globals or {{}}).get("__name__") or ""
+        if importer == "vllm_omni" or importer.startswith("vllm_omni."):
+            if level:
+                package = globals.get("__package__") or importer.rpartition(".")[0]
+                base = package.rsplit(".", level - 1)[0] if level > 1 else package
+                absolute = f"{{base}}.{{name}}" if name else base
+            else:
+                absolute = name
+            targets = [absolute] + [f"{{absolute}}.{{item}}" for item in (fromlist or ()) if item != "*"]
+            for target in targets:
+                if _is_blocked(target):
+                    raise ModuleNotFoundError(
+                        f"No module named {{target!r}} (removed with MRv1; imported by {{importer}})"
+                    )
+        return _real_import(name, globals, locals, fromlist, level)
+
+    builtins.__import__ = _guarded_import
+
+    # vllm#63373 also drops VllmConfig.use_v2_model_runner, which
+    # vllm_omni.patch overrides at package import.
+    from vllm.config import VllmConfig
+
+    if hasattr(VllmConfig, "use_v2_model_runner"):
+        del VllmConfig.use_v2_model_runner
     """
 ).format(blocked=REMOVED_MRV1_MODULES)
 
