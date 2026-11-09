@@ -221,6 +221,23 @@ def test_successful_retry_counts_valid_zero_and_refreshes_trace(sample_paths, ju
         ([{"temporal_score": 0, "is_relevant": 0}, {"content_score": 0}], None),
     ],
 )
+def test_temporal_completion_budget_matches_official_evaluator(judge_http):
+    judge_http.return_value = _reply('{"temporal_score": 2, "is_relevant": 1}')
+    judge = judge_module.DuplexJudge("http://unused", "judge")
+    judge.temporal("prompt", [b"\xff\xd8"])
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 800
+
+
+def test_content_and_reminder_completion_budget_stays_at_1200(judge_http):
+    judge_http.return_value = _reply('{"content_score": 2}')
+    judge = judge_module.DuplexJudge("http://unused", "judge")
+    judge.content("prompt")
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
+    judge_http.return_value = _reply('{"success_score": 1}')
+    judge.chat("remind")
+    assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
+
+
 def test_rtd_requires_complete_scores_before_publishing(sample_paths, judge_http, monkeypatch, replies, missing_field):
     _, response, score = sample_paths
     sample = DuplexSample.from_row({"id": "sample", "split": "RTD_OCR", "video": "unused.mp4", "video_duration": 10})
