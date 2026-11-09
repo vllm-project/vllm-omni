@@ -124,6 +124,29 @@ GPU serving or audible playback.
 Janus queues and correlated RPC across separate frontend/backend event loops;
 it still uses synthetic stage output and a recording socket.
 
+### Codec validation boundaries
+
+`tests/model_executor/models/personaplex/test_mimi_prefix_flush.py` is a
+separate, opt-in weighted codec oracle. It checks PCM against per-frame
+decoding and exercises prefix drain with synthetic talker tokens, a stage-port
+bridge and a recording socket. It does not start a live EngineCore or certify
+audio quality, playback or serving performance.
+
+Run its CPU cases only with a locally cached Mimi checkpoint matching SHA256
+`09b782f0629851a271227fb9d36db65c041790365f11bbe5d3d59369cf863f50`:
+
+```bash
+PERSONAPLEX_MIMI_CHECKPOINT=/path/to/cached/mimi-checkpoint \
+  pytest -q tests/model_executor/models/personaplex/test_mimi_prefix_flush.py \
+  -m 'advanced_model and omni and cpu' --run-level advanced_model
+```
+
+The suite never downloads weights. Without the checkpoint variable its CPU
+cases skip. Current Buildkite pipelines do not select this module or provide
+that checkpoint, so CPU composition CI does not establish weighted PCM parity.
+CUDA cases require the separate `PERSONAPLEX_MIMI_CUDA=1` opt-in and are not
+selected by the command above.
+
 ## Components and ownership
 
 ### The plugin (engine side)

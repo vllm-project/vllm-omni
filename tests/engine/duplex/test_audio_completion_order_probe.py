@@ -201,7 +201,7 @@ async def test_dequeued_unsent_first_delta_cannot_be_credited_by_later_send(monk
             }
         )
         assert len(sends) == 1
-        assert state.completed_samples <= 1920
+        assert state.completed_samples == 0
         assert not drain.done()
     finally:
         await consumer.aclose()

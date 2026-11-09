@@ -6,7 +6,9 @@ import asyncio
 
 import pytest
 import torch
-from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
+from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType, UtilityOutput
+from vllm.v1.engine.core_client import AsyncMPClient, DPAsyncMPClient, DPLBAsyncMPClient, _process_utility_output
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
 
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
@@ -265,6 +267,25 @@ async def test_nonfinite_or_nonpositive_timeout_is_rejected_before_enqueue(timeo
 
 
 @pytest.mark.asyncio
+async def test_plugin_without_audio_drain_contract_rejects_before_enqueue(mocker):
+    h = await _open(mocker)
+    contract = mocker.patch.object(h.runner.plugin, "audio_drain_samples", return_value=None)
+    try:
+        await h.run(frame())
+        pending = h.runner._mailbox.qsize()
+        with pytest.raises(NotImplementedError, match="no acoustic drain contract"):
+            h.runner.begin_audio_drain(timeout=1)
+        contract.assert_called_once_with(0)
+        assert h.runner._mailbox.qsize() == pending
+        assert h.runner._audio_drain_result is None
+        assert h.runner._audio_drain_barrier is None
+        await h.run(frame())
+        assert h.session.audio_delivery.accepted_seq == 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_caller_releases_waiter_without_poisoning_append_tail(mocker):
     h = await _open(mocker)
     try:
@@ -297,6 +318,81 @@ async def test_dp_flush_targets_only_the_request_engine_and_never_broadcasts(moc
         result = await client.flush_codec_prefix_async("epoch-qualified", 4)
     assert result == 4
     targeted.assert_awaited_once_with("omni_flush_codec_prefix", "epoch-qualified", 4, engine=b"engine-two")
+    broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dp_flush_uses_upstream_admission_and_utility_wire(mocker):
+    """Run the vLLM DP route and utility helper; no processes or sockets.
+
+    Bootstrap stops at the transport-owning base constructor. The real DPLB
+    constructor initializes routing, and real admission populates the route.
+    The utility helper, encoder and utility-result handler remain unpatched.
+    """
+
+    def bootstrap(
+        client,
+        vllm_config,
+        executor_class,
+        log_stats,
+        client_addresses,
+        client_count,
+        client_index,
+        renderer,
+    ):
+        client.core_engines = [b"engine-one", b"engine-two"]
+        client.client_index = client_index
+        client.current_wave = 0
+        client.engines_running = True
+        client.encoder = MsgpackEncoder()
+        client.utility_results = {}
+
+    mocker.patch.object(DPAsyncMPClient, "__init__", new=bootstrap)
+    client = DPLBStageEngineCoreClient.__new__(DPLBStageEngineCoreClient)
+    client.stage_id = 0
+    DPLBAsyncMPClient.__init__(client, mocker.sentinel.config, mocker.sentinel.executor, False)
+    mocker.patch.object(client, "_ensure_stats_update_task")
+    mocker.patch.object(client, "_ensure_output_queue_task")
+    broadcast = mocker.patch.object(client, "call_utility_async", new=mocker.AsyncMock())
+    request_id = "session:epoch-3:stage-0"
+    request = EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=1,
+        resumable=True,
+        external_req_id=request_id,
+    )
+    admissions = []
+    utilities = []
+
+    async def send(message, engine):
+        if message[0] == EngineCoreRequestType.ADD.value:
+            admitted = MsgpackDecoder(EngineCoreRequest).decode(message[1:])
+            admissions.append((engine, admitted.request_id, admitted.external_req_id, admitted.resumable))
+            return
+        assert message[0] == EngineCoreRequestType.UTILITY.value
+        client_index, call_id, method, args = MsgpackDecoder().decode(message[1:])
+        utilities.append((engine, client_index, method, args))
+        _process_utility_output(UtilityOutput(call_id=call_id, result=UtilityResult(4)), client.utility_results)
+
+    mocker.patch.object(client, "_send_input_message", new=send)
+    assert not client.reqs_in_flight
+    await client.add_request_async(request)
+    assert client.reqs_in_flight == {request_id: b"engine-two"}
+    # A resumable append keeps its admission route, even if a new rank is
+    # requested. The flush must use that same recorded engine.
+    request.data_parallel_rank = 0
+    await client.add_request_async(request)
+    assert await client.flush_codec_prefix_async(request_id, 4) == 4
+    assert admissions == [(b"engine-two", request_id, request_id, True)] * 2
+    assert utilities == [(b"engine-two", 0, "omni_flush_codec_prefix", [request_id, 4])]
+    assert not client.utility_results
     broadcast.assert_not_awaited()
 
 

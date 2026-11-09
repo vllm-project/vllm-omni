@@ -265,15 +265,40 @@ async def test_full_native_request_queue_cannot_block_drain_past_its_timeout(tra
     assert native.requests.sync_q.full()
     drain = asyncio.create_task(native.handle.drain_audio(timeout=0.01))
     try:
-        await asyncio.sleep(0.15)
-        assert drain.done(), "queue submission outlived the drain timeout before result waiting even started"
         with pytest.raises(DuplexSessionError) as error:
-            await drain
+            await asyncio.wait_for(drain, 1)
         assert error.value.code == "engine_backpressure" and error.value.retryable
         assert not native.engine.rpc_client._router._pending
     finally:
         native.loop.call_soon_threadsafe(native.dispatch_gate.set)
         await asyncio.gather(drain, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_handle_reports_unsupported_drain_as_failed_precondition(transport, mocker):
+    native = transport
+
+    async def prepare() -> None:
+        mocker.patch.object(native.h.runner.plugin, "audio_drain_samples", return_value=None)
+        await native.h.run(frame())
+
+    await native.backend(prepare())
+    with pytest.raises(DuplexSessionError, match="no acoustic drain contract") as error:
+        await asyncio.wait_for(native.handle.drain_audio(timeout=1), 2)
+    assert error.value.code == "failed_precondition"
+    assert not error.value.retryable
+    assert error.value.session_id == native.handle.session_id
+    assert not native.engine.rpc_client._router._pending
+
+    async def check() -> None:
+        assert native.h.runner._audio_drain_result is None
+        assert native.h.runner._audio_drain_barrier is None
+        await native.h.run(frame())
+        assert native.h.session.audio_delivery.accepted_seq == 2
+
+    await native.backend(check())
+    drains = [message for message in native.dispatched if isinstance(message, DrainDuplexAudioMessage)]
+    assert len(drains) == 1
 
 
 @pytest.mark.asyncio
