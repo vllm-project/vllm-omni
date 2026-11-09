@@ -8,6 +8,11 @@ Four scenarios:
 - Merge CI: async_chunk on + send delay, full accuracy check.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
 - Server VAD: two turns without client commits.
+
+Turn tests that need async_chunk share one class-scoped server. pytest 9.1.1
+(the CI pin) finalizes that fixture when the next test's param value differs
+and does not revive it, so those tests stay contiguous and the async_chunk-off
+server runs after them. The JIT replay keeps its own function-scoped server.
 """
 
 from __future__ import annotations
@@ -26,6 +31,17 @@ import numpy as np
 import pytest
 import websockets
 import yaml
+from openai.types.realtime import (
+    ConversationItemCreateEvent,
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
+    RealtimeFunctionTool,
+    RealtimeSessionCreateRequest,
+    ResponseCreateEvent,
+    SessionUpdateEvent,
+)
+from openai.types.realtime.realtime_client_event import RealtimeClientEvent
+from openai.types.realtime.realtime_conversation_item_user_message import Content
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -33,6 +49,12 @@ from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     generate_synthetic_audio,
+)
+from tests.helpers.realtime import (
+    WEATHER_TOOL_ANSWER,
+    WEATHER_TOOL_OUTPUT,
+    WEATHER_TOOL_PROMPT,
+    WEATHER_TOOL_SPEC,
 )
 from tests.helpers.runtime import OmniServer, OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -63,22 +85,22 @@ ISSUE_6474_SYNTH_PHRASE_TEXT = (
     "Can you tell me the current temperature and weather conditions in New York City? "
     "What about Los Angeles? Please compare them in detail using at least eight complete sentences."
 )
-
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
 SEND_DELAY_MS = 200
 CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
+# Its seq and sampling caps stay: production max_tokens would change how long
+# these realtime replies run, not only how the server is launched.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
-server_vad_stage_config = modify_stage_config(
-    default_stage_config,
-    {
-        "async_chunk": True,
-        "duplex_session": (
-            {"server_vad_model_path": SERVER_VAD_MODEL_PATH} if SERVER_VAD_MODEL_PATH is not None else {}
-        ),
-    },
-)
+# One parsed deploy for every turn test that needs async_chunk, including
+# server VAD. The flag lives in the YAML (the CLI override used to disagree
+# with the overlay's ``async_chunk: false``). A pinned Silero path is applied
+# only when the env var is set; otherwise VAD resolves the same way as before.
+_async_chunk_updates: dict[str, bool | dict[str, str]] = {"async_chunk": True}
+if SERVER_VAD_MODEL_PATH is not None:
+    _async_chunk_updates["duplex_session"] = {"server_vad_model_path": SERVER_VAD_MODEL_PATH}
+async_chunk_stage_config = modify_stage_config(default_stage_config, _async_chunk_updates)
 
 realtime_sync_server_params = [
     pytest.param(
@@ -91,16 +113,26 @@ realtime_sync_server_params = [
     ),
 ]
 
+# Same server object under two ids. pytest 9.1.1 reuses a class-scoped fixture
+# for equal param values, including across ids, but only while those tests stay
+# adjacent. ``server_vad`` keeps its node id; it does not boot a second model.
+# ``async_chunk`` stays in the parsed deploy. The tool-call flags are the CLI
+# surface added for the audio tool-call case; they ride this shared server.
+_async_chunk_server = OmniServerParams(
+    model=MODEL,
+    stage_config_path=async_chunk_stage_config,
+    use_stage_cli=True,
+    server_args=[
+        "--tool-call-parser",
+        "hermes",
+        "--enable-auto-tool-choice",
+    ],
+)
 realtime_async_chunk_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=default_stage_config,
-            use_stage_cli=True,
-            server_args=["--async-chunk"],
-        ),
-        id="async_chunk",
-    ),
+    pytest.param(_async_chunk_server, id="async_chunk"),
+]
+realtime_server_vad_server_params = [
+    pytest.param(_async_chunk_server, id="server_vad"),
 ]
 
 # Stage-log lines the cold-start replay test checks.
@@ -109,17 +141,6 @@ REALTIME_CONNECTION_LOG_MARKER = "[realtime] connection opened"
 # text, once per kernel and process (``warning_once``).
 RUNTIME_JIT_LOG_MARKER = "JIT compilation during inference"
 MOE_PREFILL_WARMUP_LOG_MARKER = "MoE prefill warmup ran"
-
-realtime_server_vad_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=server_vad_stage_config,
-            use_stage_cli=True,
-        ),
-        id="server_vad",
-    ),
-]
 
 
 def _pcm16_mono_from_wav_bytes(wav_bytes: bytes, sample_rate_hz: int = 16000) -> bytes:
@@ -247,6 +268,110 @@ async def _run_realtime_audio_roundtrip(
         "delta_events": delta_events,
         "audio_done": audio_done,
     }
+
+
+async def _send_client_event(ws: Any, event: RealtimeClientEvent) -> None:
+    """Serialize a client event the same way the OpenAI SDK does."""
+    await ws.send(event.to_json(exclude_defaults=True, exclude_unset=True))
+
+
+async def _run_realtime_audio_tool_call(
+    host: str,
+    port: int,
+    model: str,
+    *,
+    timeout_s: float = 600,
+) -> dict:
+    """Ask for an audio response that must call a tool, then feed the result back."""
+
+    def summarize(events: list[dict]) -> dict:
+        transcript = "".join(
+            event.get("delta", "")
+            for event in events
+            if event.get("type") in ("response.output_audio_transcript.delta", "response.output_text.delta")
+        )
+        tool_calls = [
+            event["item"]
+            for event in events
+            if event.get("type") == "response.output_item.done" and event.get("item", {}).get("type") == "function_call"
+        ]
+        first_control = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("type") == "response.output_item.added"
+                and event.get("item", {}).get("type") == "function_call"
+            ),
+            len(events),
+        )
+        return {
+            "transcript": transcript,
+            "tool_calls": tool_calls,
+            "audio_deltas": sum(1 for event in events if event.get("type") == "response.output_audio.delta"),
+            "audio_after_tool_call": sum(
+                1 for event in events[first_control:] if event.get("type") == "response.output_audio.delta"
+            ),
+        }
+
+    async def recv_response(ws) -> list[dict]:
+        events: list[dict] = []
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
+            if isinstance(message, bytes):
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if event.get("type") == "error":
+                raise AssertionError(f"WebSocket error: {event}")
+            if event.get("type") == "response.done":
+                return events
+
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+        await _send_client_event(
+            ws,
+            SessionUpdateEvent(
+                type="session.update",
+                session=RealtimeSessionCreateRequest(
+                    type="realtime",
+                    model=model,
+                    output_modalities=["audio"],
+                    tools=[RealtimeFunctionTool(**WEATHER_TOOL_SPEC)],
+                    tool_choice="auto",
+                ),
+            ),
+        )
+        await _send_client_event(
+            ws,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item=RealtimeConversationItemUserMessage(
+                    type="message",
+                    role="user",
+                    content=[Content(type="input_text", text=WEATHER_TOOL_PROMPT)],
+                ),
+            ),
+        )
+        await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+        tool_turn = summarize(await recv_response(ws))
+
+        answer_turn = None
+        if tool_turn["tool_calls"]:
+            call = tool_turn["tool_calls"][0]
+            await _send_client_event(
+                ws,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item=RealtimeConversationItemFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=call["call_id"],
+                        output=WEATHER_TOOL_OUTPUT,
+                    ),
+                ),
+            )
+            await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+            answer_turn = summarize(await recv_response(ws))
+
+    return {"tool_turn": tool_turn, "answer_turn": answer_turn}
 
 
 async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
@@ -663,8 +788,10 @@ async def _conformance_open_session(host, port, model):
 class TestQwen3OmniRealtimeWebSocket:
     @pytest.fixture(scope="class")
     def omni_server(self, request, run_level):
-        # Release the legacy turn deployment before the duplex class below
-        # starts another model server on the same pair of GPUs.
+        # Class scope, not module: this process has to exit before the
+        # function-scoped JIT replay and the duplex class boot on the same GPUs.
+        # Keep equal ``omni_server`` params adjacent; pytest 9.1.1 drops the
+        # fixture when the next value differs and will not reuse the earlier one.
         from tests.helpers.fixtures.runtime import omni_fixture_lock
         from tests.helpers.runtime import iter_omni_server
 
@@ -739,6 +866,73 @@ class TestQwen3OmniRealtimeWebSocket:
             f"Expected an issue-like audio response longer than 5 seconds, got {output_duration_s:.2f}s"
         )
 
+    # -- Protocol conformance (same async_chunk server as the cases above) -- #
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_session_lifecycle_events(self, omni_server) -> None:
+        """session.created must precede session.updated; both appear exactly once."""
+
+        async def _run():
+            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                created = _conformance_events_of_type(events, "session.created")
+                updated = _conformance_events_of_type(events, "session.updated")
+                assert len(created) == 1
+                assert len(updated) == 1
+                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
+                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
+                assert ci < ui, "session.created must precede session.updated"
+                assert "id" in created[0].get("session", {})
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_empty_commit_returns_error(self, omni_server) -> None:
+        """Committing an empty audio buffer must return an error event."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                events = await _conformance_recv_until(
+                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
+                )
+                errors = _conformance_events_of_type(events, "error")
+                assert errors
+                assert "empty" in json.dumps(errors[0]).lower()
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_audio_response_parses_tool_call(self, omni_server) -> None:
+        """Audio turns must surface function calls, hide their markup, and speak the tool result."""
+        result = asyncio.run(_run_realtime_audio_tool_call(omni_server.host, omni_server.port, omni_server.model))
+
+        tool_turn = result["tool_turn"]
+        assert len(tool_turn["tool_calls"]) == 1, tool_turn["transcript"]
+        call = tool_turn["tool_calls"][0]
+        assert call["name"] == "get_weather"
+        assert "paris" in (call["arguments"] or "").lower()
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in tool_turn["transcript"]
+        assert tool_turn["audio_after_tool_call"] == 0, tool_turn
+
+        answer_turn = result["answer_turn"]
+        assert answer_turn is not None
+        assert answer_turn["audio_deltas"] > 0, "the tool result turn produced no audio"
+        assert WEATHER_TOOL_ANSWER in answer_turn["transcript"]
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in answer_turn["transcript"]
+
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -750,10 +944,6 @@ class TestQwen3OmniRealtimeWebSocket:
     ) -> None:
         """Two Qwen turns are endpointed without client commits."""
         assert cached_silero_vad_artifact
-        deploy = load_deploy_config(server_vad_stage_config)
-        assert deploy.session_mode == "turn"
-        assert deploy.async_chunk is True
-        assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
         pcm16_24k = _duplex_fixture_pcm(validated_input_wav())
 
         turns = asyncio.run(
@@ -807,49 +997,6 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
-
-    # -- Protocol conformance --------------------------------------------- #
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_session_lifecycle_events(self, omni_server) -> None:
-        """session.created must precede session.updated; both appear exactly once."""
-
-        async def _run():
-            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
-            async with ws:
-                created = _conformance_events_of_type(events, "session.created")
-                updated = _conformance_events_of_type(events, "session.updated")
-                assert len(created) == 1
-                assert len(updated) == 1
-                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
-                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
-                assert ci < ui, "session.created must precede session.updated"
-                assert "id" in created[0].get("session", {})
-
-        asyncio.run(_run())
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_empty_commit_returns_error(self, omni_server) -> None:
-        """Committing an empty audio buffer must return an error event."""
-
-        async def _run():
-            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
-            async with ws:
-                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                events = await _conformance_recv_until(
-                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
-                )
-                errors = _conformance_events_of_type(events, "error")
-                assert errors
-                assert "empty" in json.dumps(errors[0]).lower()
-
-        asyncio.run(_run())
 
 
 # These regressions use the engine-owned Qwen duplex plugin. The older class

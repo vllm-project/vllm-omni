@@ -50,6 +50,23 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
 
+### Thinking checkpoint chat template
+
+Serving `Qwen/Qwen3-Omni-30B-A3B-Thinking` with function tools through
+`/v1/chat/completions` or the turn-based `/v1/realtime` endpoint requires the
+compatibility chat template bundled with vLLM-Omni. From a source checkout:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/qwen3_omni_thinking.jinja \
+    --reasoning-parser qwen3 \
+    --tool-call-parser hermes \
+    --enable-auto-tool-choice
+```
+
+For an installed package, substitute the path to `qwen3_omni_thinking.jinja`
+inside its `vllm_omni/transformers_utils/chat_templates` directory.
+
 For a 3x-GPU multi-replica layout (talker/code2wav scale-out on cuda:1,2),
 use `--stage-overrides` on top of the default config:
 
