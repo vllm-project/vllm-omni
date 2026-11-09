@@ -615,6 +615,53 @@ class MiniMaxH3SPGather(nn.Module):
         return hidden_states
 
 
+def _validate_ulysses_head_divisibility(
+    num_attention_heads: int,
+    *,
+    tp_size: int,
+    ulysses_degree: int,
+    ulysses_mode: str,
+) -> None:
+    """Reject a Ulysses degree the DiT attention heads cannot support.
+
+    MiniMax-H3 has 56 attention heads, so a strict Ulysses degree must divide
+    56 (1/2/4/7/8/14/28/56).  ``advanced_uaa`` pads the head count up to the
+    next multiple of the degree before the all-to-all and drops the padding on
+    the reverse transform (``_ulysses_all_to_all_any_o(orig_head_cnt=...)``),
+    so a non-divisible count is legal there: degree 16 pads 56 heads to 64, a
+    1.14x attention cost whose padding heads are exact zeros that are sliced
+    away again.  Strict mode keeps the divisibility requirement.
+
+    The padded layout is currently enabled on Ascend NPU only: when the
+    sequence length is also non-divisible the padded rows reach the final
+    layer, whose indexed modulation kernel indexes the unpadded
+    ``inverse_indices`` and faults on CUDA (U3 reproduction in the 2026-11-10
+    review).  NPU remains the supported platform until that bookkeeping is
+    fixed.
+    """
+    local_heads = num_attention_heads // tp_size
+    if not local_heads % ulysses_degree:
+        return
+    if ulysses_mode != "advanced_uaa":
+        supported = [degree for degree in range(1, local_heads + 1) if local_heads % degree == 0]
+        raise ValueError(
+            "MiniMax H3 local attention heads must be divisible by "
+            "ulysses_degree: "
+            f"({num_attention_heads} / {tp_size}) % {ulysses_degree} != 0. "
+            f"Supported ulysses_degree values are {supported}, or set "
+            "ulysses_mode='advanced_uaa' to pad the head count."
+        )
+    if not current_omni_platform.is_npu():
+        raise ValueError(
+            "MiniMax H3 advanced_uaa with a non-divisible head count is currently "
+            "supported on Ascend NPU only: "
+            f"({num_attention_heads} / {tp_size}) % {ulysses_degree} != 0 requires "
+            "head padding, whose padded rows are not yet handled by the final-layer "
+            "indexing on this platform. Use a ulysses_degree dividing "
+            f"{local_heads}, or ulysses_mode='strict'."
+        )
+
+
 class MiniMaxH3DiTModel(nn.Module):
     # Loading is tensor-complete: constructor state plus final-layout
     # parameters and persistent buffers is sufficient to reconstruct a ready
@@ -794,16 +841,12 @@ class MiniMaxH3DiTModel(nn.Module):
             arch=arch,
             tp_size=get_tensor_model_parallel_world_size(),
         )
-        local_heads = arch.num_attention_heads // get_tensor_model_parallel_world_size()
-        ulysses_degree = int(self.parallel_config.ulysses_degree)
-        if local_heads % ulysses_degree:
-            raise ValueError(
-                "MiniMax H3 local attention heads must be divisible by "
-                "ulysses_degree: "
-                f"({arch.num_attention_heads} / "
-                f"{get_tensor_model_parallel_world_size()}) % "
-                f"{ulysses_degree} != 0"
-            )
+        _validate_ulysses_head_divisibility(
+            arch.num_attention_heads,
+            tp_size=get_tensor_model_parallel_world_size(),
+            ulysses_degree=self.parallel_config.ulysses_degree,
+            ulysses_mode=self.parallel_config.ulysses_mode,
+        )
 
         self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
