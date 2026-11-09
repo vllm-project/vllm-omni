@@ -98,6 +98,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "disable_autocast",
         "enable_broadcast_weight_load",
         "enable_multithread_weight_load",
+        "enable_weights_prewarm",
         "env",
         "has_sampling_extra_args",
         "log_stats",
@@ -397,6 +398,7 @@ def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
     assert {
         "enable_multithread_weight_load",
         "num_weight_load_threads",
+        "enable_weights_prewarm",
         "disable_autocast",
         "log_level",
     }.isdisjoint(engine_args)

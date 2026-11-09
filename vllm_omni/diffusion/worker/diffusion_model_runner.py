@@ -444,7 +444,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             # Own uncertain imports even when the loader never returns a pipeline.
             self._weight_share_backend = weight_sharing_backend
             self._weight_share_session_id = shared_group.session_id
-        load_config = LoadConfig()
+        # Parent prewarm resolves od_config.download_dir. Demand loading and the
+        # in-worker prewarm read load_config.download_dir, so an empty LoadConfig
+        # would warm a different snapshot than the one the workers open.
+        load_config = LoadConfig(download_dir=getattr(self.od_config, "download_dir", None))
         model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 

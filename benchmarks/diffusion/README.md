@@ -67,16 +67,9 @@ CUDA_VISIBLE_DEVICES=0,1 python \
   --output wan22-tp2.mp4 2>&1 | tee wan22-tp2.log
 ```
 
-Implementation commit `0a673b4b` (tree `7e504120`) was validated with a
-zero-residency 117.512 GiB checkpoint on one AWS `g7e.12xlarge` with two RTX
-PRO 6000 Blackwell GPUs. Both ranks cooperatively loaded each of the two Wan
-DiTs. Three cold runs completed model loading in
-27.381, 27.886, and 27.792 seconds; a confirmed 100%-resident run took 8.473
-seconds. All runs produced raw frame-tensor SHA256
-`546cbc02c686628e89c61d26daf6a2bb03c2796f7d5e5acd57d8e342060041de`
-and shut down both workers without cooperative fallback or rank loss.
-
-The transport-level regression test is
+The command above is a correctness check for the TP=2 topology, not a published
+timing. Loading time depends on the storage, the page cache, and whether
+prewarm is enabled. The transport check that runs in CI is
 `tests/diffusion/model_loader/test_cooperative_staging_cuda.py`. It launches two
 real CUDA processes, uses NCCL collectives with buckets owned by both ranks, and
 checks every received tensor.

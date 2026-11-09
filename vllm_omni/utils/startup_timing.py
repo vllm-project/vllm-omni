@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Low-overhead, parseable timings for startup critical paths."""
+"""Low-overhead, parseable timings for startup critical paths.
+
+These are host-clock intervals around Python code; they do not synchronize with
+device work, so a span can end while its kernels are still running and a later
+span can inherit the wait. Treat them as relative phase budgets on one host, not
+as GPU time - synchronize explicitly in a probe if the distinction matters.
+"""
 
 import os
 import time
