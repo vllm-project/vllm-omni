@@ -4,6 +4,8 @@
 # Adapted from https://github.com/feifeibear/long-context-attention
 
 
+import os
+
 import torch
 
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
@@ -62,8 +64,6 @@ def ring_flash_attn_forward(
             "the mask would silently shift. Unpad before the ring, or use causal=False."
         )
 
-    comm = RingComm(process_group)
-
     out = None
     lse = None
 
@@ -78,6 +78,15 @@ def ring_flash_attn_forward(
         k = k.contiguous()
     if not v.is_contiguous():
         v = v.contiguous()
+
+    if os.environ.get("VLLM_OMNI_RING_CE_TRANSPORT") == "1":
+        from vllm_omni.diffusion.attention.backends.ring.ce_transport import maybe_ce_ring_comm
+
+        # Opt-in copy-engine K/V transport; it returns None where it cannot run. It relies on the
+        # loop below calling send_recv(k), send_recv(v), commit(), attention, wait() each step.
+        comm = maybe_ce_ring_comm(process_group, k, v) or RingComm(process_group)
+    else:
+        comm = RingComm(process_group)
 
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
@@ -132,6 +141,10 @@ def ring_flash_attn_forward(
             comm.wait()
             k = next_k
             v = next_v
+
+    # CeRingComm hands back its last two FREE credits so the next call starts clean.
+    if hasattr(comm, "finish"):
+        comm.finish()
 
     assert out is not None
     out = out.to(q.dtype)

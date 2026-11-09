@@ -38,7 +38,7 @@ def main() -> None:
     parser.add_argument("--sequence", type=positive_int, default=4095)
     parser.add_argument("--heads", type=positive_int, default=40)
     parser.add_argument("--head-dim", type=positive_int, default=128)
-    parser.add_argument("--backend", choices=["FA", "FA3"], default="FA3")
+    parser.add_argument("--backend", choices=["FA", "FA3", "VLLM_FA"], default="FA3")
     parser.add_argument("--warmup", type=positive_int, default=5)
     parser.add_argument("--rounds", type=positive_int, default=10)
     parser.add_argument("--calls-per-round", type=positive_int, default=5)
@@ -117,6 +117,7 @@ def main() -> None:
                     key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
                 },
                 "world_size": world_size,
+                "ring_ce_transport": os.environ.get("VLLM_OMNI_RING_CE_TRANSPORT", "0"),
                 "shape_per_rank": shape,
                 "dtype": "bfloat16",
                 "gpu": torch.cuda.get_device_name(local_rank),
