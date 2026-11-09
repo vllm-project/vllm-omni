@@ -1568,9 +1568,9 @@ def merge_pipeline_deploy(
             _dit_load_aware = bool(ds.dit_load_aware) if ds is not None else False
             if _dit_load_aware:
                 _dit_stages = [
-                    s for s in pipeline.stages
-                    if s.execution_type == StageExecutionType.DIFFUSION
-                    and ps.stage_id in (s.input_sources or ())
+                    s
+                    for s in pipeline.stages
+                    if s.execution_type == StageExecutionType.DIFFUSION and ps.stage_id in (s.input_sources or ())
                 ]
                 if not _dit_stages:
                     logger.warning(
