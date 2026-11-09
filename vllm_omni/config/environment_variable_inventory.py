@@ -233,6 +233,8 @@ _MODEL_PROMOTE = (
     "H3_VAE_COMPILE",
     "H3_VAE_FP16_WEIGHTS",
     "H3_VAE_XEFMHA",
+    # Wan2.2 S2V: quantize the audio injector cross-attention like the DiT blocks (opt-in).
+    "VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR",
 )
 
 _MODEL_REQUEST_SCOPE = (

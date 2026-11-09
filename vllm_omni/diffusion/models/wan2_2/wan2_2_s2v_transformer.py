@@ -7,6 +7,7 @@ Audio and motion modules use standard nn.Linear (no TP needed).
 """
 
 import math
+import os
 from collections.abc import Iterable
 from copy import deepcopy
 
@@ -557,6 +558,29 @@ class AudioCrossAttention(WanS2VCrossAttention):
     pass
 
 
+class WanS2VAudioInjectLayer(nn.Module):
+    """One audio injection: AdaIN/LayerNorm over the noisy tokens, then cross-attention to the frame audio tokens.
+
+    Holds no parameters (the norm and the cross-attention are passed in, so checkpoint names stay under
+    ``audio_injector``); it exists so that regional compilation (``_repeated_blocks``) fuses the norm, the
+    casts and the scale/shift with the projections instead of running them eagerly.
+    """
+
+    def forward(self, x, audio_emb, norm, injector, temb, num_frames):
+        h = rearrange(x, "b (t n) c -> (b t) n c", t=num_frames)
+        h = norm(h, temb=temb) if temb is not None else norm(h)
+        # Back to the hidden-state dtype: the fp32 global audio embedding makes diffusers AdaLayerNorm (and the audio
+        # tokens) fp32, which turned the whole injection into fp32 passes. Upstream Wan2.2 S2V runs it under bf16
+        # autocast, and quantized GEMMs need a 16-bit activation.
+        h, audio_emb = h.to(x.dtype), audio_emb.to(x.dtype)
+        out = injector(
+            x=h,
+            context=audio_emb,
+            context_lens=torch.ones(h.shape[0], dtype=torch.long, device=h.device) * audio_emb.shape[1],
+        )
+        return rearrange(out, "(b t) n c -> b (t n) c", t=num_frames).to(x.dtype)
+
+
 class AudioInjector_WAN(nn.Module):
     def __init__(
         self,
@@ -569,6 +593,7 @@ class AudioInjector_WAN(nn.Module):
         enable_adain=False,
         adain_dim=2048,
         need_adain_ont=False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         if inject_layer is None:
@@ -584,7 +609,18 @@ class AudioInjector_WAN(nn.Module):
                         audio_injector_id += 1
 
         self.injector = nn.ModuleList(
-            [AudioCrossAttention(dim=dim, num_heads=num_heads, qk_norm=True) for _ in range(audio_injector_id)]
+            [
+                AudioCrossAttention(
+                    dim=dim,
+                    num_heads=num_heads,
+                    qk_norm=True,
+                    quant_config=quant_config,
+                    # Module path for the quant method (ignored_layers); unquantized keeps the old empty prefix,
+                    # which the attention backends also read for a layer index.
+                    prefix=f"audio_injector.injector.{i}" if quant_config is not None else "",
+                )
+                for i in range(audio_injector_id)
+            ]
         )
         self.injector_pre_norm_feat = nn.ModuleList(
             [nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(audio_injector_id)]
@@ -1185,7 +1221,9 @@ class WanS2VTransformer3DModel(nn.Module):
     - Attention layer for attention computation
     """
 
-    _repeated_blocks = ["WanS2VTransformerBlock"]
+    # WanS2VAudioInjectLayer: the audio injection after the audio_inject_layers blocks. Outside the block region it
+    # ran as ~30 eager fp32 kernels over every noisy token per injection (+1.5 s/step at 1280x720x81, 12 layers).
+    _repeated_blocks = ["WanS2VTransformerBlock", "WanS2VAudioInjectLayer"]
     _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
@@ -1340,8 +1378,13 @@ class WanS2VTransformer3DModel(nn.Module):
             enable_adain=enable_adain,
             adain_dim=dim,
             need_adain_ont=adain_mode != "attn_norm",
+            # Opt-in: the injector's q/k/v/out GEMMs in the DiT's quantization. Off by default: pre-quantized
+            # checkpoints carry no injector scales, and the audio injector drives lip sync.
+            quant_config=quant_config if os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", "0") == "1" else None,
         )
         self.adain_mode = adain_mode
+        # Parameter-free; listed in _repeated_blocks so regional compile covers the audio injection too.
+        self.audio_inject_layer = WanS2VAudioInjectLayer()
 
         self.trainable_cond_mask = nn.Embedding(3, dim)
 
@@ -1559,26 +1602,19 @@ class WanS2VTransformer3DModel(nn.Module):
             audio_emb = self.merged_audio_emb
             num_frames = audio_emb.shape[1]
 
-            input_hidden_states = hidden_states[:, : self.original_seq_len]
-            input_hidden_states = rearrange(input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-
             if self.enable_adain and self.adain_mode == "attn_norm":
-                audio_emb_global = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")
-                adain_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](
-                    input_hidden_states, temb=audio_emb_global[:, 0]
-                )
-                attn_hidden_states = adain_hidden_states
+                norm = self.audio_injector.injector_adain_layers[audio_attn_id]
+                temb = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")[:, 0]
             else:
-                attn_hidden_states = self.audio_injector.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
-
-            attn_audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c")
-            residual_out = self.audio_injector.injector[audio_attn_id](
-                x=attn_hidden_states,
-                context=attn_audio_emb,
-                context_lens=torch.ones(attn_hidden_states.shape[0], dtype=torch.long, device=attn_hidden_states.device)
-                * attn_audio_emb.shape[1],
+                norm, temb = self.audio_injector.injector_pre_norm_feat[audio_attn_id], None
+            residual_out = self.audio_inject_layer(
+                hidden_states[:, : self.original_seq_len],
+                rearrange(audio_emb, "b t n c -> (b t) n c"),
+                norm,
+                self.audio_injector.injector[audio_attn_id],
+                temb,
+                num_frames,
             )
-            residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
             hidden_states[:, : self.original_seq_len].add_(residual_out)
 
             if sp_active:
