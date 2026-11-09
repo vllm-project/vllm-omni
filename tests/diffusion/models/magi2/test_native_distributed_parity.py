@@ -191,6 +191,9 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
             ("tp2sp2", _current_group(rank, tp2_groups), _current_group(rank, sp2_groups), False),
             ("sp4", singleton, world_group, False),
             ("sp4_musa_ulysses", singleton, world_group, True),
+            # The head-shard count comes from the TP-sharded head counts, so the
+            # packed layouts need a non-trivial TP group to be exercised.
+            ("tp2sp2_musa_ulysses", _current_group(rank, tp2_groups), _current_group(rank, sp2_groups), True),
         )
 
         outputs = {}

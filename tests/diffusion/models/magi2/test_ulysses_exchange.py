@@ -623,6 +623,37 @@ def test_projection_head_shards_are_bitwise_unchanged(world_size, num_modality, 
     assert parallel._packed_head_shards(list(actual[:3]), world_size) is not None
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_compiled_projection_packs_head_shards_on_cpu(world_size):
+    # The send-buffer saving depends on Inductor handing back the three projection
+    # outputs as views of one buffer. The assertion above only sees the eager
+    # result, so compile the real projection here, where a torch/Inductor upgrade
+    # fails without a GPU.
+    module = _initialized(Magi2Attention(_attention_config(torch.float32), num_modality=1), 5)
+    module.ulysses_head_shards = world_size
+    inputs = _projection_inputs(module, 11, 1, torch.Generator().manual_seed(23))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        module.project,
+        fullgraph=True,
+        dynamic=True,
+        options={"emulate_precision_casts": True},
+    )
+    with torch.inference_mode():
+        module.ulysses_head_shards = 1
+        expected = module.project(*inputs)
+        module.ulysses_head_shards = world_size
+        actual = compiled(*inputs)
+
+    assert parallel._packed_head_shards(list(actual[:3]), world_size) is not None
+    # Inductor fuses and reorders the CPU GEMM, so the values are compared with a
+    # tolerance here; the bitwise comparison lives in the MUSA cases.
+    for view, tensor in zip(actual[:3], expected[:3], strict=True):
+        assert torch.allclose(_heads_flattened(view), tensor, atol=1e-5, rtol=1e-5)
+
+
 def _dense_layer(num_modality):
     # Production widths; layer 0 is multimodal and layer 1 single-modality, both dense.
     config = Magi2PreviewConfig(num_layers=2, multimodal_layers=(0,), moe=Magi2MoEConfig(layers=()))
