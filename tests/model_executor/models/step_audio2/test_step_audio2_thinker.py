@@ -280,3 +280,51 @@ def test_audio_duration_limit_and_budget(audio_processor, num_samples):
     count = sum(calculate_audio_feature_length(int(n)) for n in dummy_inputs["audio_lens"])
     assert info.get_mm_max_tokens_per_item(8192, {"audio": 1}) == {"audio": count}
     assert count == 751
+
+
+@pytest.mark.parametrize(
+    "counts, expected",
+    [
+        ([1, 2], [1, 2]),
+        (torch.tensor([1, 2]), [1, 2]),
+        ([0, 3], None),
+        ([-1, 4], None),
+        ([1.5, 1.5], None),
+        ([True, 2], None),
+        ([1, 1], None),
+        ([2, 2], None),
+        ([], None),
+    ],
+)
+def test_audio_chunk_metadata(counts, expected):
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2ThinkerForConditionalGeneration,
+    )
+
+    model = StepAudio2ThinkerForConditionalGeneration.__new__(StepAudio2ThinkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.register_parameter("test_parameter", torch.nn.Parameter(torch.zeros(1)))
+    kwargs = {"audio_mels": torch.zeros(3, 128, 10), "audio_lens": torch.tensor([8, 8, 8])}
+    kwargs["audio_num_chunks"] = counts
+    if expected is None:
+        with pytest.raises(ValueError, match="audio_num_chunks"):
+            model._parse_and_validate_audio_input(**kwargs)
+    else:
+        inputs = model._parse_and_validate_audio_input(**kwargs)
+        assert inputs["audio_num_chunks"].tolist() == expected
+
+
+@pytest.mark.parametrize("explicit_none", [False, True], ids=["missing", "explicit_none"])
+def test_audio_chunk_metadata_required(explicit_none):
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2ThinkerForConditionalGeneration,
+    )
+
+    model = StepAudio2ThinkerForConditionalGeneration.__new__(StepAudio2ThinkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.register_parameter("test_parameter", torch.nn.Parameter(torch.zeros(1)))
+    kwargs = {"audio_mels": torch.zeros(3, 128, 10), "audio_lens": torch.tensor([8, 8, 8])}
+    if explicit_none:
+        kwargs["audio_num_chunks"] = None
+    with pytest.raises(ValueError, match="audio_num_chunks is required when audio_mels is provided"):
+        model._parse_and_validate_audio_input(**kwargs)

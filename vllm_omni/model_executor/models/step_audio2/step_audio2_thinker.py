@@ -14,6 +14,7 @@ This file contains:
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import numpy as np
@@ -711,10 +712,22 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if audio_mels.ndim == 3 and audio_mels.size(1) != expected_n_mels:
             return None
 
+        audio_num_chunks = kwargs.get("audio_num_chunks")
+        if audio_num_chunks is None:
+            raise ValueError("audio_num_chunks is required when audio_mels is provided.")
+        if isinstance(audio_num_chunks, torch.Tensor):
+            audio_num_chunks = audio_num_chunks.tolist()
+        if (
+            not isinstance(audio_num_chunks, (list, tuple))
+            or any(not isinstance(n, Integral) or isinstance(n, bool) or n <= 0 for n in audio_num_chunks)
+            or sum(audio_num_chunks) != audio_mels.size(0)
+        ):
+            raise ValueError("audio_num_chunks must contain positive integers summing to the number of mel rows.")
+
         return StepAudio2AudioInputs(
             audio_mels=audio_mels.to(self.dtype).to(self.device),
             audio_lens=audio_lens,
-            audio_num_chunks=kwargs["audio_num_chunks"],
+            audio_num_chunks=torch.tensor(audio_num_chunks, dtype=torch.int32),
         )
 
     def _process_audio_input(self, audio_input: StepAudio2AudioInputs) -> tuple[torch.Tensor, ...]:
