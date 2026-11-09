@@ -30,7 +30,7 @@ reach stage 1 together share one expert batch.
 | --- | --- |
 | Images | Up to 7 cameras x 4 frames, camera-major, cameras sorted by index (0 cross left, 1 front wide, 2 cross right, 3 rear left, 4 rear tele, 5 rear right, 6 front tele); resized to the checkpoint's 163,840–196,608 pixel budget |
 | Ego history | 16 poses at 10 Hz ending at t0, in the ego frame at t0: `ego_history_xyz` `(16, 3)`, `ego_history_rot` `(16, 3, 3)` |
-| Output | Stage 0: the reasoning tokens. Stage 1: `actions`, `(64, 3)` ego positions at 10 Hz in the same frame |
+| Output | Stage 0: the reasoning tokens. Stage 1: `actions`, `(64, 3)` ego positions at 10 Hz in the same frame; `(n, 64, 3)` with `n > 1` |
 | Deployment | BF16, TP=1, both stages on one GPU, eager ([`alpamayo2_super.yaml`](../../vllm_omni/deploy/alpamayo2_super.yaml)) |
 
 ## References
@@ -146,9 +146,21 @@ if __name__ == "__main__":
     main()
 ```
 
-Each request returns one trajectory. To sample K trajectories, submit K
-requests with different seeds; requests in flight decode together and share
-expert batches.
+By default a request returns one trajectory. To sample several from one
+request, set `n` on the reasoning params; each reasoning sample gets its own
+trajectory:
+
+```python
+    reasoning_params.n = 6  # before omni.generate
+    ...
+    for sample in outputs[0].outputs:
+        print(sample.index, tokenizer.decode(sample.token_ids, skip_special_tokens=True))
+    trajectories = outputs[1].multimodal_output["actions"]  # trajectories[i] follows sample i
+    assert trajectories.shape == (6, 64, 3) and trajectories.isfinite().all()
+```
+
+Sample i uses seed `seed + i` on both stages, like six separate requests with
+seeds 42 to 47.
 
 ## Verification
 

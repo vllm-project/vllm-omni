@@ -13,6 +13,7 @@ padding is masked out.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -47,6 +48,18 @@ def _expert_shards(model: str, revision: str | None) -> list[str | None]:
     if index is None:
         return [None]
     return sorted({file for name, file in index["weight_map"].items() if name.startswith(_WEIGHT_PREFIX)})
+
+
+@dataclass
+class _Row:
+    """One trajectory to sample: a request, or one sample of an n-sample request."""
+
+    index: int  # position of the request in the batch
+    request: OmniDiffusionRequest
+    kv: Any
+    metadata: Mapping[str, Any]
+    history: tuple[torch.Tensor, torch.Tensor]
+    sample: int
 
 
 class Alpamayo2SuperPipeline(nn.Module):
@@ -97,8 +110,7 @@ class Alpamayo2SuperPipeline(nn.Module):
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
-        groups: dict[int, list[int]] = {}
-        histories: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        groups: dict[int, list[_Row]] = {}
         for index, request in enumerate(req.requests):
             params = request.sampling_params
             if params.past_key_values is None:
@@ -108,20 +120,25 @@ class Alpamayo2SuperPipeline(nn.Module):
                 else:
                     outputs[index] = DiffusionOutput(error="Alpamayo 2 Super expert stage received no KV prefix.")
                 continue
-            metadata = params.kv_metadata or {}
-            if "prefix_len" not in metadata:
+            # A request whose reasoning stage sampled n sequences carries one prefix per sample.
+            samples = isinstance(params.past_key_values, list)
+            kvs = params.past_key_values if samples else [params.past_key_values]
+            metadatas = [m or {} for m in (params.kv_metadata if samples else [params.kv_metadata])]
+            if any("prefix_len" not in metadata for metadata in metadatas):
                 outputs[index] = DiffusionOutput(
                     error="Reasoning ended without <|traj_future_start|> (for example at max_tokens); no trajectory."
                 )
                 continue
-            prefix_len = int(metadata["prefix_len"])
-            if int(metadata.get("seq_len", prefix_len)) != prefix_len:
+            mismatch = next(
+                (m for m in metadatas if int(m.get("seq_len", m["prefix_len"])) != int(m["prefix_len"])), None
+            )
+            if mismatch is not None:
                 outputs[index] = DiffusionOutput(
-                    error=f"KV transfer covers {metadata.get('seq_len')} tokens, expected {prefix_len}."
+                    error=f"KV transfer covers {mismatch.get('seq_len')} tokens, expected {mismatch['prefix_len']}."
                 )
                 continue
             try:
-                histories[index] = self._history(params.extra_args)
+                history = self._history(params.extra_args)
             except ValueError as exc:
                 outputs[index] = DiffusionOutput(error=str(exc))
                 continue
@@ -129,56 +146,54 @@ class Alpamayo2SuperPipeline(nn.Module):
             if steps < 1:
                 outputs[index] = DiffusionOutput(error=f"num_inference_steps must be >= 1, got {steps}")
                 continue
-            groups.setdefault(steps, []).append(index)
-        for steps, indices in groups.items():
-            trajectories = self._sample(
-                [req.requests[index] for index in indices], [histories[index] for index in indices], steps
+            groups.setdefault(steps, []).extend(
+                _Row(index, request, kv, metadata, history, sample)
+                for sample, (kv, metadata) in enumerate(zip(kvs, metadatas, strict=True))
             )
-            for index, xyz in zip(indices, trajectories, strict=True):
-                outputs[index] = DiffusionOutput(output={ACTIONS_KEY: xyz})
+        for steps, rows in groups.items():
+            trajectories = self._sample(rows, steps)
+            by_request: dict[int, list[torch.Tensor]] = {}
+            for row, xyz in zip(rows, trajectories, strict=True):
+                by_request.setdefault(row.index, []).append(xyz)
+            for index, xyzs in by_request.items():
+                many = isinstance(req.requests[index].sampling_params.past_key_values, list)
+                outputs[index] = DiffusionOutput(output={ACTIONS_KEY: torch.stack(xyzs) if many else xyzs[0]})
         # The received prefixes are freed now but stay reserved by this process's
         # caching allocator. The reasoning stage shares the GPU and stages each KV
         # handoff outside its memory budget, so hand the memory back.
         torch.accelerator.empty_cache()
         return outputs
 
-    def _batched_prefix(self, requests: list[OmniDiffusionRequest]) -> tuple[DynamicCache, torch.Tensor, int]:
-        """Right-pad the requests' prefixes into one cache; returns it, the lengths and the padded length."""
+    def _batched_prefix(self, rows: list[_Row]) -> tuple[DynamicCache, torch.Tensor, int]:
+        """Right-pad the rows' prefixes into one cache; returns it, the lengths and the padded length."""
         # forward() has checked that each transfer covers exactly its prefix.
-        lengths = [int(request.sampling_params.kv_metadata["prefix_len"]) for request in requests]
+        lengths = [int(row.metadata["prefix_len"]) for row in rows]
         padded_len = max(lengths)
-        received = [request.sampling_params.past_key_values for request in requests]
+        received = [row.kv for row in rows]
         cache = DynamicCache()
         for layer in range(len(received[0].key_cache)):
             # Received per layer as [seq_len, kv_heads, head_dim]; the expert's
             # Hugging Face attention takes [batch, kv_heads, seq_len, head_dim].
             heads, head_dim = received[0].key_cache[layer].shape[1:]
             dtype = received[0].key_cache[layer].dtype
-            key = torch.zeros(len(requests), heads, padded_len, head_dim, dtype=dtype, device=self.device)
+            key = torch.zeros(len(rows), heads, padded_len, head_dim, dtype=dtype, device=self.device)
             value = torch.zeros_like(key)
-            for row, (kv, length) in enumerate(zip(received, lengths, strict=True)):
-                key[row, :, :length] = kv.key_cache[layer][:length].transpose(0, 1)
-                value[row, :, :length] = kv.value_cache[layer][:length].transpose(0, 1)
+            for position, (kv, length) in enumerate(zip(received, lengths, strict=True)):
+                key[position, :, :length] = kv.key_cache[layer][:length].transpose(0, 1)
+                value[position, :, :length] = kv.value_cache[layer][:length].transpose(0, 1)
                 kv.key_cache[layer] = kv.value_cache[layer] = None  # release as we copy
             cache.update(key, value, layer)
         return cache, torch.tensor(lengths, device=self.device), padded_len
 
-    def _sample(
-        self,
-        requests: list[OmniDiffusionRequest],
-        histories: list[tuple[torch.Tensor, torch.Tensor]],
-        num_steps: int,
-    ) -> list[torch.Tensor]:
-        """Flow-matching (Euler) sampling of one trajectory per request."""
+    def _sample(self, rows: list[_Row], num_steps: int) -> list[torch.Tensor]:
+        """Flow-matching (Euler) sampling of one trajectory per row."""
         expert = self.expert
         device = self.device
-        batch = len(requests)
+        batch = len(rows)
         num_waypoints, action_dim = expert.action_space.get_action_space_dims()
-        prefix, lengths, padded_len = self._batched_prefix(requests)
+        prefix, lengths, padded_len = self._batched_prefix(rows)
 
-        trigger = torch.tensor(
-            [request.sampling_params.kv_metadata["trigger_position"] for request in requests], device=device
-        )  # [batch, 3]
+        trigger = torch.tensor([row.metadata["trigger_position"] for row in rows], device=device)  # [batch, 3]
         position_ids = (trigger.T[:, :, None] + 1 + torch.arange(num_waypoints, device=device)).long()
         dtype = expert.action_out_proj.weight.dtype
         # Waypoints attend to their own prefix and to each other; padding is masked.
@@ -188,10 +203,7 @@ class Alpamayo2SuperPipeline(nn.Module):
 
         # Per-request noise, so a request's trajectory does not depend on its batch.
         action = torch.cat(
-            [
-                torch.randn(1, num_waypoints, action_dim, device=device, generator=self._generator(request))
-                for request in requests
-            ]
+            [torch.randn(1, num_waypoints, action_dim, device=device, generator=self._generator(row)) for row in rows]
         )
         time_steps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         for i in range(num_steps):
@@ -208,23 +220,24 @@ class Alpamayo2SuperPipeline(nn.Module):
             # A (1, 1, 1) step keeps the update in float32, as in the reference.
             action = action + (time_steps[i + 1] - time_steps[i]).view(1, 1, 1) * velocity
 
-        history_xyz = torch.stack([xyz for xyz, _ in histories])
-        history_rot = torch.stack([rot for _, rot in histories])
+        history_xyz = torch.stack([row.history[0] for row in rows])
+        history_rot = torch.stack([row.history[1] for row in rows])
         trajectory_xyz, _ = expert.action_space.action_to_traj(action, history_xyz, history_rot)
         return list(trajectory_xyz.cpu().unbind(0))
 
-    def _generator(self, request: OmniDiffusionRequest) -> torch.Generator:
-        params = request.sampling_params
-        if isinstance(params.generator, torch.Generator):
+    def _generator(self, row: _Row) -> torch.Generator:
+        params = row.request.sampling_params
+        if isinstance(params.generator, torch.Generator) and row.sample == 0:
             return params.generator
-        if isinstance(params.generator, list) and params.generator:
-            return params.generator[0]  # one request per OmniDiffusionRequest
+        if isinstance(params.generator, list) and row.sample < len(params.generator):
+            return params.generator[row.sample]
         generator = torch.Generator(device=self.device)
-        # The seed fixes the expert's noise; without one, draw a fresh random seed.
+        # The seed fixes the expert's noise (sample i of an n-sample request uses
+        # seed + i, like n separate requests); without one, draw a fresh random seed.
         if params.seed is None:
             generator.seed()
         else:
-            generator.manual_seed(int(params.seed))
+            generator.manual_seed(int(params.seed) + row.sample)
         return generator
 
     def _history(self, extra_args: Mapping[str, Any] | None) -> tuple[torch.Tensor, torch.Tensor]:

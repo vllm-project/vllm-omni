@@ -44,6 +44,7 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import per_sample_kv_count
 from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 
 logger = init_logger(__name__)
@@ -298,7 +299,8 @@ class BaseScheduler(ABC):
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None and not nxt.is_finished():
                 sender_info = getattr(nxt.req, "kv_sender_info", None)
-                if sender_info:
+                # Per-sample KV is received in the forward, one transfer per sample.
+                if sender_info and per_sample_kv_count(nxt.req.sampling_params) == 1:
                     kv_prefetch_job = {
                         "request_id": nxt.request_id,
                         "kv_sender_info": sender_info,

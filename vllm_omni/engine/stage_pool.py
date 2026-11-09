@@ -22,6 +22,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_CONFIG_KEY, per_sample_kv_request_id
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -29,7 +30,13 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    PayloadSenderInfo,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -81,6 +88,20 @@ class _ReplicaMetrics:
     batch_seq: int = 0
     agg_total_tokens: int = 0
     agg_total_gen_time_ms: float = 0.0
+
+
+def _set_sample_global_request_id(request: Any, sample_request_id: str) -> None:
+    """Give one sample of an ``n > 1`` request its own ``global_request_id``.
+
+    The AR runners send a finished request's KV under its ``global_request_id``,
+    so each sample's KV arrives under its own key. The request's other
+    additional information is shared, not copied.
+    """
+    if not hasattr(request, "additional_information"):
+        return  # a plain EngineCoreRequest: the runner keys its KV by the engine request id
+    entries = dict(request.additional_information.entries) if request.additional_information else {}
+    entries["global_request_id"] = AdditionalInformationEntry(list_data=[sample_request_id])
+    request.additional_information = AdditionalInformationPayload(entries=entries)
 
 
 class StagePool:
@@ -247,6 +268,12 @@ class StagePool:
     def stage_type(self) -> str | None:
         client = self.stage_client
         return None if client is None else client.stage_type
+
+    @property
+    def per_sample_kv(self) -> bool:
+        """Whether each sample of an ``n > 1`` request sends its own KV (``omni_kv_config["per_sample_kv"]``)."""
+        omni_kv_config = getattr(getattr(self._stage_vllm_config, "model_config", None), "omni_kv_config", None)
+        return isinstance(omni_kv_config, dict) and bool(omni_kv_config.get(PER_SAMPLE_KV_CONFIG_KEY))
 
     @property
     def final_output(self) -> bool:
@@ -1321,6 +1348,8 @@ class StagePool:
                 child_request = copy(request)
                 child_request.request_id = child_request_id
                 child_request.sampling_params = child_params
+                if self.per_sample_kv:
+                    _set_sample_global_request_id(child_request, per_sample_kv_request_id(request_id, index))
                 engine_requests.append(child_request)
         added: list[str] = []
         try:

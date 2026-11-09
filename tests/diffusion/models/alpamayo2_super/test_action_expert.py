@@ -260,3 +260,21 @@ def test_pipeline_reads_config_and_weights_at_the_configured_revision(monkeypatc
         ("pinned", ["model-00014.safetensors"])
     ]
     assert pipeline.history_steps == 16
+
+
+def test_expert_samples_one_trajectory_per_reasoning_sample():
+    # A reasoning request with n = 2 hands over one prefix per sample; sample i
+    # draws its noise from seed + i, like separate requests with those seeds.
+    pipeline = _make_pipeline()
+    first, second = _expert_request(5, 7), _expert_request(9, 8)
+    sampled = _expert_request(5, 7)
+    sampled.sampling_params.past_key_values = [
+        first.sampling_params.past_key_values,
+        second.sampling_params.past_key_values,
+    ]
+    sampled.sampling_params.kv_metadata = [first.sampling_params.kv_metadata, second.sampling_params.kv_metadata]
+    (output,) = _run(pipeline, sampled)
+    assert output.output[ACTIONS_KEY].shape == (2, 64, 3)
+    for sample, args in enumerate([(5, 7), (9, 8)]):
+        (alone,) = _run(pipeline, _expert_request(*args))
+        torch.testing.assert_close(output.output[ACTIONS_KEY][sample], alone.output[ACTIONS_KEY], rtol=1e-4, atol=1e-4)

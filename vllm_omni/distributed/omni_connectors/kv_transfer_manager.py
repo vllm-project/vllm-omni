@@ -10,6 +10,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -34,6 +35,8 @@ from .utils.kv_utils import (
     kv_zmq_port,
     merge_received_rank_shards,
     normalize_layer_kv,
+    per_sample_kv_count,
+    per_sample_kv_request_id,
     slice_layer_blocks,
     slice_received_rank_shard,
 )
@@ -1655,7 +1658,12 @@ class OmniKVTransferManager:
         Returns:
             True if primary KV cache was received successfully.
         """
-        primary_ok = self.receive_kv_cache(req, target_device)
+        # An n > 1 source request sends one primary KV per sample; CFG companions stay shared.
+        num_samples = per_sample_kv_count(getattr(req, "sampling_params", None))
+        if num_samples > 1:
+            primary_ok = self._receive_sample_kv_caches(req, num_samples, target_device)
+        else:
+            primary_ok = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
         if cfg_ids and cfg_kv_collect_func:
@@ -1675,6 +1683,39 @@ class OmniKVTransferManager:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
         return primary_ok
+
+    def _receive_sample_kv_caches(self, req: Any, num_samples: int, target_device: torch.device | None) -> bool:
+        """Receive the KV of each sample of an ``n > 1`` source request.
+
+        ``past_key_values`` and ``kv_metadata`` become lists in sample order.
+        """
+        kv_sender_info = getattr(req, "kv_sender_info", None)
+        if kv_sender_info:
+            self.update_sender_info(kv_sender_info, sender_stage_id=self.recv_stages[0])
+        request_id = self._resolve_request_id(req)
+        if not request_id:
+            logger.warning("Request has no ID, cannot receive KV cache")
+            return False
+        caches: list[Any] = []
+        metadata: list[Any] = []
+        missing: list[int] = []
+        # Receive every sample even after a miss, so no sender keeps a sample's KV waiting.
+        for index in range(num_samples):
+            data, _ = self.receive_kv_cache_for_request(per_sample_kv_request_id(request_id, index), target_device)
+            if not data or "layer_blocks" not in data:
+                missing.append(index)
+                continue
+            caches.append(SimpleNamespace(**data["layer_blocks"]))
+            metadata.append(data.get("metadata"))
+        if missing:
+            logger.error("Missing KV cache for samples %s of request %s", missing, request_id)
+            return False
+        req.past_key_values = caches
+        req.kv_metadata = metadata
+        if getattr(req, "sampling_params", None) is not None:
+            req.sampling_params.past_key_values = caches
+            req.sampling_params.kv_metadata = metadata
+        return True
 
     def _extract_primary_kv_obj(self, kv_payload: dict[str, Any]) -> Any | None:
         """Return the primary KV object (``SimpleNamespace(key_cache, value_cache)``)."""
