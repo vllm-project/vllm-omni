@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.cell_executor import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellAdapter,
     CellRunSpec,
@@ -15,7 +15,11 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import (
     _consumer_stash_meta,
     run_cell_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    CellSchedule,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -210,8 +214,8 @@ def test_executor_releases_versions_when_forward_raises():
 @pytest.mark.parametrize("groups", [1, 2])
 @pytest.mark.parametrize("chunks", [1, 3])
 def test_sink_clean_activation_edges_follow_final_replica(groups, chunks):
-    from vllm_omni.experimental.ar_diffusion.cell_executor import _activation_edges
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import Inflight, rank_of_block
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import _activation_edges
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Inflight, rank_of_block
 
     schedule = CellSchedule(
         chunks=chunks,
