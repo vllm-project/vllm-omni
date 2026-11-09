@@ -706,12 +706,7 @@ def test_xpu_generation_worker_v2_warmup_skips_kv_cache_and_sampler_warmup(monke
     worker_cls = module.XPUGenerationWorker
     calls = []
     parent = next(cls for cls in worker_cls.__mro__[1:] if "compile_or_warm_up_model" in vars(cls))
-
-    def fake_parent_warmup(self):
-        calls.append("super")
-        return "v1-times"
-
-    monkeypatch.setattr(parent, "compile_or_warm_up_model", fake_parent_warmup)
+    monkeypatch.setattr(parent, "compile_or_warm_up_model", lambda self: calls.append("super") or "v1-times")
     worker = worker_cls.__new__(worker_cls)
     worker.use_v2_model_runner = use_v2
     worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile_run"))

@@ -1,10 +1,10 @@
-# Match the vLLM 0.33 source checkout with the vendor-integrated Ascend stack.
-# Update version and digest together; suffix variants need their own digest.
+# vLLM-Ascend v0.33.0 runtime matching the vLLM v0.33.0 alignment. CI injects
+# the per-device tag suffix through VLLM_ASCEND_DEVICE_SUFFIX (-a3/-a5/-310p);
+# the unsuffixed tag is the generic image used for A2.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
 ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
-ARG VLLM_ASCEND_DIGEST=sha256:4a666fd818058c26ce445fa890e31ba781d0d43c721631b0d43e2eb550fbef99
-FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}@${VLLM_ASCEND_DIGEST}
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
 WORKDIR ${APP_DIR}

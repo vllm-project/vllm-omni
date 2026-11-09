@@ -70,119 +70,6 @@ def _pixel_packages() -> dict[str, str]:
     return {name: version(name) for name in ("numpy", "opencv-python", "scikit-image")}
 
 
-def test_pixel_comparison_uses_isolated_evaluator_when_parent_decoder_is_unavailable(tmp_path, monkeypatch):
-    video = tmp_path / "reference.avi"
-    _write_textured_video(video, 20)
-    expected = _pixel_packages()
-    shadow = tmp_path / "shadow"
-    shadow.mkdir()
-    (shadow / "cv2.py").write_text('raise RuntimeError("uncontrolled parent decoder")\n')
-    monkeypatch.setenv("PYTHONPATH", str(shadow))
-    monkeypatch.setitem(sys.modules, "cv2", None)
-    result = quality.compare_video_pair_in_environment(
-        video,
-        video,
-        tmp_path / "pixels",
-        python=Path(sys.executable),
-        expected_packages=expected,
-        window_seconds=2,
-        ssim_stride=24,
-        timeout_s=30,
-    )
-    assert result["decoded_frames"] == 160 and result["total"]["psnr_is_infinite"]
-    assert result["pixel_environment"]["packages"] == expected
-    assert result["pixel_environment"]["python"] == sys.executable
-    assert len(result["pixel_environment"]["opencv_build_sha256"]) == 64
-    assert result["uniform_frame_indices"] == {"reference": [], "candidate": []}
-
-
-def test_pixel_dependency_drift_fails_and_retains_actual_environment(tmp_path):
-    video = tmp_path / "reference.avi"
-    _write_textured_video(video, 20)
-    expected = {**_pixel_packages(), "numpy": "0.0.0"}
-    output = tmp_path / "pixels"
-    with pytest.raises(quality.VideoQualityError, match="Pixel worker"):
-        quality.compare_video_pair_in_environment(
-            video,
-            video,
-            output,
-            python=Path(sys.executable),
-            expected_packages=expected,
-            window_seconds=2,
-            ssim_stride=24,
-            timeout_s=30,
-        )
-    result = json.loads(next(output.rglob("worker_result.json")).read_text())
-    assert result["status"] != "complete"
-    assert result["pixel_environment"]["packages"]["numpy"] == _pixel_packages()["numpy"]
-    assert "Pixel dependencies changed" in next(output.rglob("worker.log")).read_text()
-
-
-def test_pixel_worker_timeout_reaps_process_and_retains_incomplete_evidence(tmp_path, monkeypatch):
-    processes = []
-    original_popen = subprocess.Popen
-
-    def capture_process(*args, **kwargs):
-        process = original_popen(*args, **kwargs)
-        processes.append(process)
-        return process
-
-    monkeypatch.setattr(quality.subprocess, "Popen", capture_process)
-    monkeypatch.setattr(quality, "_PIXEL_WORKER", "import time;time.sleep(60)")
-    video = tmp_path / "reference.avi"
-    _write_textured_video(video, 20)
-    output = tmp_path / "pixels"
-    with pytest.raises(subprocess.TimeoutExpired):
-        quality.compare_video_pair_in_environment(
-            video,
-            video,
-            output,
-            python=Path(sys.executable),
-            expected_packages=_pixel_packages(),
-            window_seconds=2,
-            ssim_stride=24,
-            timeout_s=0.5,
-        )
-    assert len(processes) == 1 and processes[0].returncode is not None
-    assert next(output.rglob("worker.log")).is_file()
-    assert json.loads(next(output.rglob("worker_result.json")).read_text())["status"] != "complete"
-
-
-def test_pixel_worker_preserves_virtualenv_interpreter_path(tmp_path, monkeypatch):
-    executable = tmp_path / "venv/bin/python"
-    executable.parent.mkdir(parents=True)
-    executable.symlink_to(sys.executable)
-    video = tmp_path / "reference.avi"
-    _write_textured_video(video, 20)
-    packages = _pixel_packages()
-
-    def run(command, repo, log, timeout_s):
-        assert command[0] == str(executable) and command[1] == "-I"
-        inputs = json.loads(Path(command[-1]).read_text())
-        Path(inputs["result"]).write_text(
-            json.dumps(
-                {
-                    "status": "complete",
-                    "pixel_environment": {"python": str(executable), "packages": packages},
-                }
-            )
-        )
-        return 0
-
-    monkeypatch.setattr(quality, "_run_worker", run)
-    result = quality.compare_video_pair_in_environment(
-        video,
-        video,
-        tmp_path / "pixels",
-        python=executable,
-        expected_packages=packages,
-        window_seconds=2,
-        ssim_stride=24,
-        timeout_s=30,
-    )
-    assert result["pixel_environment"]["python"] == str(executable)
-
-
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 def test_noisy_reference_budget_cannot_hide_a_spatially_empty_window(tmp_path: Path, platform: str) -> None:
     paths = [tmp_path / f"reference-{index}.avi" for index in range(3)]
@@ -307,7 +194,7 @@ def evaluator_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     return {
         "videos": {"reference": video, "candidate": video},
         "output_dir": tmp_path / "output",
-        "suite": "vbench_long",
+        "suite": "vbench",
         "repo": repo,
         "python": Path(sys.executable),
         "dimensions": ["subject_consistency"],
@@ -341,7 +228,7 @@ def test_quality_adapter_checks_every_video_and_records_revision(
     assert result["status"] == "passed"
     assert result["scores"]["candidate"]["subject_consistency"] == 0.7
     assert result["repo_revision"] == "a" * 40
-    assert result["mode"] == "long_custom_input"
+    assert result["mode"] == "custom_input"
     assert calls[0]["command"][1] == "-c"
     assert calls[0]["manifest"]["videos"].keys() == {"reference", "candidate"}
 
@@ -374,16 +261,6 @@ def test_quality_adapter_rejects_nonzero_exit(evaluator_inputs: dict, monkeypatc
     assert "code 2" in result["errors"][0]
 
 
-def test_quality_adapter_rejects_unsupported_long_dimension(
-    evaluator_inputs: dict, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _worker_output(monkeypatch, {})
-    evaluator_inputs["dimensions"] = ["temporal_flickering"]
-    result = quality.evaluate_video_quality(**evaluator_inputs)
-    assert result["status"] == "failed"
-    assert calls == []
-
-
 def test_quality_adapter_does_not_reuse_stale_outputs(evaluator_inputs: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     _worker_output(
         monkeypatch,
@@ -398,7 +275,7 @@ def test_quality_adapter_does_not_reuse_stale_outputs(evaluator_inputs: dict, mo
     assert first["raw_result"] != second["raw_result"]
 
 
-@pytest.mark.parametrize("suite", ["vbench", "vbench_long"])
+@pytest.mark.parametrize("suite", ["vbench"])
 def test_quality_adapter_rejects_non_mp4_vbench_input(
     evaluator_inputs: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suite: str
 ) -> None:
@@ -438,7 +315,7 @@ def test_quality_adapter_reports_timeout(evaluator_inputs: dict, monkeypatch: py
     assert "TimeoutExpired" in result["errors"][0]
 
 
-@pytest.mark.parametrize("suite", ["vbench", "vbench_long"])
+@pytest.mark.parametrize("suite", ["vbench"])
 @pytest.mark.parametrize("wrong_identity", [False, True])
 def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, wrong_identity: bool) -> None:
     repo, run_dir = tmp_path / "repo", tmp_path / "run"
@@ -478,7 +355,7 @@ def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, 
                 "repo": str(repo),
                 "run_dir": str(run_dir),
                 "suite": suite,
-                "mode": "long_custom_input" if suite == "vbench_long" else "custom_input",
+                "mode": "custom_input",
                 "dimensions": ["subject_consistency"],
                 "videos": videos,
             }
@@ -550,35 +427,9 @@ def test_worker_rejects_hps_nonfinite_details_and_records_flow_backend(
     json.dumps(result, allow_nan=False)
 
 
-@pytest.mark.parametrize(
-    "reference_psnr,reference_ssim,candidate_psnr,candidate_ssim",
-    [
-        ([26.0183304, 23.5055139, 24.4058944], [0.4613212, 0.4506127, 0.4628122], 22.3198337, 0.4450724),
-        ([30.0] * 3, [0.3195815, 0.2982344, 0.3221995], 30.0, 0.2779404),
-    ],
-)
-@pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_full_rollout_pixel_calibration_remains_bounded(
-    reference_psnr, reference_ssim, candidate_psnr, candidate_ssim, platform
-):
-    # Observed H100-generated boardwalk window 3 and street SSIM comparisons.
-    # The input populations are retained; target-runner calibration is separate.
-    def row(psnr, ssim):
-        distance = {"psnr_db": psnr, "psnr_is_infinite": False}
-        return {
-            "total": distance,
-            "windows": [{"index": 3, "start_frame": 96, "frame_count": 32, **distance}],
-            "ssim": {"mean": ssim},
-        }
-
-    reference = [row(p, s) for p, s in zip(reference_psnr, reference_ssim)]
-    candidate = row(candidate_psnr, candidate_ssim)
-    assert not check_video_precision(reference, candidate, min_psnr_db=40, psnr_drop_db=1, ssim_drop=0.01)["passed"]
-    limits = json.loads((Path(__file__).parents[2] / "tests/dfx/lingbot_world/quality.json").read_text())
-    budgets = limits["pixel_budgets"][platform]
-    options = {"min_psnr_db": limits["min_psnr_db"], **budgets}
-    assert check_video_precision(reference, candidate, **options)["passed"]
-    worse_psnr = row(min(reference_psnr) - budgets["psnr_drop_db"] - 0.1, candidate_ssim)
-    worse_ssim = row(candidate_psnr, min(reference_ssim) - budgets["ssim_drop"] - 0.001)
-    assert not check_video_precision(reference, worse_psnr, **options)["passed"]
-    assert not check_video_precision(reference, worse_ssim, **options)["passed"]
+def test_semantic_video_coverage_checks_its_own_full_input(tmp_path):
+    path = tmp_path / "rollout.avi"
+    _write_video(path, [30, 60, 90], fps=4)
+    assert quality.verify_video_coverage(path, frames=3, width=32, height=24, fps=4)["decoded_frames"] == 3
+    with pytest.raises(quality.VideoQualityError):
+        quality.verify_video_coverage(path, frames=4, width=32, height=24, fps=4)

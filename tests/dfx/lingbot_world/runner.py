@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real reference/candidate generation using the existing server lifecycle."""
+"""Collect real paired measurements; semantic pytest cases judge them independently."""
 
 from __future__ import annotations
 
 import asyncio
-import importlib.metadata
 import os
 import shutil
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,23 +18,10 @@ from benchmarks.lingbot_world.benchmark_lingbot_world_realtime import (
     run_benchmark,
     run_session,
 )
-from benchmarks.lingbot_world.precision import compare_tensor_samples
-from benchmarks.lingbot_world.regression import (
-    RegressionError,
-    calibrate,
-    check_performance,
-    performance_metrics,
-    read_json,
-    sha256,
-    verify_reference_calibration_contract,
-    write_json,
-)
+from benchmarks.lingbot_world.regression import RegressionError, performance_metrics, read_json, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[3]
-ENGINE_ENVIRONMENT = {
-    "VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0",
-    "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0",
-}
+ENGINE_ENVIRONMENT = {"VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0", "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0"}
 
 
 def server_environment(source: Path, *, cpu_threads: int | None = None) -> dict[str, str]:
@@ -138,78 +123,6 @@ def checked_assets(settings: dict[str, Any]) -> tuple[Path, dict[str, Path]]:
     return model, images
 
 
-def hardware_contract(settings: dict[str, Any]) -> dict[str, Any]:
-    from vllm_omni.platforms import current_omni_platform as platform
-
-    if platform.device_type != settings["platform"] or platform.get_device_count() != settings["dies"]:
-        raise RegressionError("Wrong platform or visible die count for the requested profile")
-    allocation = None
-    if settings.get("reserved_cards", settings["cards"]) != settings["cards"]:
-        path = os.environ.get("LINGBOT_ALLOCATION_FILE")
-        if path is None:
-            raise RegressionError("Reserved-device profiles require the launcher allocation preflight")
-        allocation = read_json(Path(path))
-        npu = settings["platform"] == "npu"
-        identity_key = "runtime_id" if npu else "uuid"
-        visibility_key = "ASCEND_RT_VISIBLE_DEVICES" if npu else "CUDA_VISIBLE_DEVICES"
-        identities = {
-            device.get(identity_key)
-            for device in allocation.get("devices", [])
-            if isinstance(device, dict) and isinstance(device.get(identity_key), str) and device.get(identity_key)
-        }
-        if (
-            allocation.get("reserved_cards") != settings["reserved_cards"]
-            or allocation.get("visible_dies") != settings["dies"]
-            or len(allocation.get("devices", [])) != settings["reserved_cards"]
-            or len(identities) != settings["reserved_cards"]
-            or allocation.get("visible_devices") != os.environ.get(visibility_key)
-        ):
-            raise RegressionError("Device allocation evidence does not match the requested profile/visibility")
-        if npu:
-            from tests.dfx.lingbot_world.prepare import select_npu_devices
-
-            original = ",".join(device["runtime_id"] for device in allocation["devices"])
-            selected = select_npu_devices(
-                len(allocation["devices"]), original, dies=settings["dies"], reserved_cards=settings["reserved_cards"]
-            )
-            if allocation.get("platform") != "npu" or selected != os.environ.get(visibility_key):
-                raise RegressionError("NPU allocation evidence does not preserve the original device mapping")
-            for index, device in enumerate(allocation["devices"][: settings["dies"]]):
-                if device.get("name") != platform.get_device_name(index) or device.get(
-                    "total_bytes"
-                ) != platform.get_device_total_memory(index):
-                    raise RegressionError("NPU allocation evidence does not match the visible hardware")
-    devices = []
-    for index in range(settings["dies"]):
-        devices.append(
-            {"name": platform.get_device_name(index), "total_bytes": platform.get_device_total_memory(index)}
-        )
-    packages = {}
-    for package in ("torch", "vllm", "diffusers", "transformers", "torch-npu", "vllm-ascend"):
-        try:
-            packages[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            if package not in {"torch-npu", "vllm-ascend"} or settings["platform"] == "npu":
-                raise
-    source_attestations = None
-    runtime = settings.get("inference_runtime", {})
-    if settings["platform"] == "npu" and "source_snapshot_sha256" in runtime:
-        from tests.dfx.lingbot_world.prepare import verify_inference_runtime
-
-        # Prepare and generation are separate processes. Attest again before
-        # loading a model and carry the actual supplier snapshot into reports.
-        source_attestations = verify_inference_runtime("npu", profile_runtime=runtime)["source_attestations"]
-    return {
-        "platform": platform.device_type,
-        "cards": settings["cards"],
-        "dies": settings["dies"],
-        "devices": devices,
-        "packages": packages,
-        **({"allocation": allocation} if allocation is not None else {}),
-        **({"source_attestations": source_attestations} if source_attestations is not None else {}),
-    }
-
-
 def validate_reference(settings: dict[str, Any]) -> Path:
     root = settings["reference_root"]
     if root is None:
@@ -246,7 +159,300 @@ def _capture(source: Path, model: Path, destination: Path, settings: dict[str, A
     )
 
 
-def diagnostic_session(server, settings: dict[str, Any], image: Path, destination: Path) -> None:
+def _measured_metrics(document: dict, settings: dict) -> dict[str, float]:
+    sessions = document.get("sessions", [])
+    count = settings.get("measured_sessions", 1)
+    ids = [session.get("request_id") for session in sessions]
+    if (
+        len(sessions) != count
+        or [session.get("session_index") for session in sessions] != list(range(count))
+        or any(not isinstance(identity, str) or not identity for identity in ids)
+        or len(set(ids)) != count
+    ):
+        raise RegressionError("Missing or duplicated measured sessions in an independent start")
+    if any(document["config"].get(key) != settings[key] for key in ("warmup_chunks", "target_fps")):
+        raise RegressionError("Benchmark measurement policy differs from the profile")
+    if document["config"].get("playback_buffer_chunks") != 1:
+        raise RegressionError("LingBot regression requires the pinned one-chunk playback buffer")
+    warmups = document.get("warmups", [])
+    if (
+        document["config"].get("warmup_sessions") != 1
+        or document["config"].get("warmup_num_chunks") != settings["warmup_num_chunks"]
+        or len(warmups) != 1
+        or warmups[0].get("measured") is not False
+        or not isinstance(warmups[0].get("request_id"), str)
+        or not warmups[0]["request_id"]
+        or warmups[0]["request_id"] in ids
+    ):
+        raise RegressionError("Missing or mixed warmup session")
+    chunks = warmups[0].get("chunks", [])
+    if (
+        len(chunks) != settings["warmup_num_chunks"]
+        or [row.get("index") for row in chunks] != list(range(settings["warmup_num_chunks"]))
+        or any(
+            row.get("byte_length", 0) <= 0 or row.get("num_frames") != (9 if i == 0 else 12)
+            for i, row in enumerate(chunks)
+        )
+    ):
+        raise RegressionError("Incomplete warmup chunk population")
+    return performance_metrics(document, num_chunks=settings["num_chunks"], min_steady=settings["min_steady_samples"])
+
+
+def hardware_contract(settings):
+    from vllm_omni.platforms import current_omni_platform as platform
+
+    if platform.device_type != settings["platform"] or platform.get_device_count() != settings["dies"]:
+        raise RegressionError("Wrong platform or visible device count")
+    from tests.dfx.lingbot_world.prepare import verify_inference_runtime
+
+    return {
+        "platform": platform.device_type,
+        "cards": settings["cards"],
+        "dies": settings["dies"],
+        "devices": [
+            {"name": platform.get_device_name(i), "total_bytes": platform.get_device_total_memory(i)}
+            for i in range(settings["dies"])
+        ],
+        **verify_inference_runtime(settings["platform"]),
+    }
+
+
+def benchmark_args(server, settings, case, destination):
+    return parse_args(
+        [
+            "--port",
+            str(server.port),
+            "--model",
+            str(server.model),
+            "--image",
+            str(case["path"]),
+            "--prompt",
+            case["prompt"],
+            "--camera-pattern",
+            case["camera_pattern"],
+            "--seed",
+            str(case["seed"]),
+            "--height",
+            str(settings["height"]),
+            "--width",
+            str(settings["width"]),
+            "--fps",
+            str(settings["mux_fps"]),
+            "--target-fps",
+            str(settings["target_fps"]),
+            "--playback-buffer-chunks",
+            "1",
+            "--num-chunks",
+            str(settings["num_chunks"]),
+            "--sessions",
+            str(settings.get("measured_sessions", 1)),
+            "--warmup-sessions",
+            "1",
+            "--warmup-num-chunks",
+            str(settings["warmup_num_chunks"]),
+            "--warmup-chunks",
+            str(settings["warmup_chunks"]),
+            "--first-chunk-timeout",
+            str(settings["first_chunk_timeout_s"]),
+            "--chunk-timeout",
+            str(settings["chunk_timeout_s"]),
+            "--output-json",
+            str(destination / "benchmark.json"),
+            "--save-video",
+            str(destination / "rollout.mp4"),
+        ]
+    )
+
+
+def generation_paths(settings, repeats=range(3)):
+    return {
+        f"{role}/{repeat}/{name}"
+        for role in ("reference", "candidate")
+        for repeat in repeats
+        for name in [
+            "precision.npz",
+            *[f"{case['id']}/{file}" for case in settings["cases"] for file in ("benchmark.json", "rollout.mp4")],
+        ]
+    }
+
+
+def collect_measurements(settings, measurement_repeat=None):
+    from tests.helpers.runtime import OmniServer
+
+    if measurement_repeat is not None and (
+        type(measurement_repeat) is not int or measurement_repeat not in range(3) or settings["platform"] != "npu"
+    ):
+        raise RegressionError("Split measurements require NPU repeat 0, 1 or 2")
+    output = settings["output"]
+    if any((output / role).exists() for role in ("reference", "candidate")):
+        raise RegressionError("Use a fresh measurement output")
+    model, images = checked_assets(settings)
+    reference = validate_reference(settings)
+    repeats = [measurement_repeat] if measurement_repeat is not None else list(range(3))
+    report = {
+        "schema_version": 1,
+        "complete": False,
+        "candidate_revision": git_revision(ROOT),
+        "reference_revision": settings["reference_revision"],
+        "repeat": measurement_repeat,
+        "contract": {
+            "hardware": hardware_contract(settings),
+            "profile": read_json(settings["profile_path"]),
+            "deploy_sha256": sha256(ROOT / settings["deploy_config"]),
+            "engine_environment": dict(ENGINE_ENVIRONMENT),
+        },
+        "errors": [],
+        "artifacts": {},
+    }
+    write_json(output / "generation.json", report)
+    for repeat in repeats:
+        for role in ("reference", "candidate") if repeat % 2 == 0 else ("candidate", "reference"):
+            source = reference if role == "reference" else ROOT
+            arm = output / role / str(repeat)
+            arm.mkdir(parents=True)
+            try:
+                _capture(source, model, arm / "precision.npz", settings)
+            except (OSError, subprocess.SubprocessError) as error:
+                report["errors"].append({"role": role, "repeat": repeat, "component": "precision", "error": str(error)})
+            try:
+                with OmniServer(
+                    str(model),
+                    server_arguments(settings),
+                    source_root=str(source),
+                    env_dict=server_environment(source, cpu_threads=settings.get("cpu_threads_per_worker")),
+                    startup_timeout=settings["startup_timeout_s"],
+                ) as server:
+                    for case in settings["cases"]:
+                        destination = arm / case["id"]
+                        destination.mkdir()
+                        try:
+                            document = asyncio.run(
+                                run_benchmark(
+                                    benchmark_args(
+                                        server, settings, {**case, "path": images[case["image"]]}, destination
+                                    )
+                                )
+                            )
+                            record_benchmark_revisions(document, source)
+                            write_json(destination / "benchmark.json", document)
+                        except Exception as error:
+                            report["errors"].append(
+                                {
+                                    "role": role,
+                                    "repeat": repeat,
+                                    "case": case["id"],
+                                    "component": "stream",
+                                    "error": str(error),
+                                }
+                            )
+            except Exception as error:
+                report["errors"].append({"role": role, "repeat": repeat, "component": "server", "error": str(error)})
+            try:
+                assert_device_cleanup(settings["dies"], arm / "cleanup.json")
+            except Exception as error:
+                report["errors"].append({"role": role, "repeat": repeat, "component": "cleanup", "error": str(error)})
+            report["artifacts"] = {
+                str(p.relative_to(output)): sha256(p)
+                for role in ("reference", "candidate")
+                for p in (output / role).rglob("*")
+                if p.is_file()
+            }
+            write_json(output / "generation.json", report)
+    report["complete"] = not report["errors"] and generation_paths(settings, repeats) <= report["artifacts"].keys()
+    write_json(output / "generation.json", report)
+    if measurement_repeat is not None:
+        write_json(output / "measurement.json", report)
+    return report
+
+
+def aggregate_measurements(settings):
+    source, output = settings["generation"], settings["output"]
+    if source is None or source.resolve().is_relative_to(output) or output.is_relative_to(source.resolve()):
+        raise RegressionError("Use disjoint input/output measurement directories")
+    if any((output / role).exists() for role in ("reference", "candidate")):
+        raise RegressionError("Use a fresh aggregate output directory")
+    report = {
+        "schema_version": 1,
+        "complete": False,
+        "candidate_revision": git_revision(ROOT),
+        "reference_revision": settings["reference_revision"],
+        "repeat": None,
+        "contract": None,
+        "artifacts": {},
+        "errors": [],
+    }
+    complete_parts = 0
+    try:
+        for repeat in range(3):
+            root = source / f"pair-{repeat}"
+            try:
+                part = read_json(root / "measurement.json")
+                validate_manifest(settings, part)
+                if type(part.get("repeat")) is not int or part["repeat"] != repeat:
+                    raise RegressionError("Wrong measurement repeat")
+                if report["contract"] is None:
+                    report["contract"] = part["contract"]
+                elif part["contract"] != report["contract"]:
+                    raise RegressionError("Measurement hardware/runtime contracts differ")
+            except (RegressionError, OSError, KeyError) as error:
+                report["errors"].append({"repeat": repeat, "error": str(error)})
+                continue
+            complete_parts += part.get("complete") is True
+            report["errors"].extend({"repeat": repeat, "producer_error": error} for error in part.get("errors", []))
+            for name in sorted(generation_paths(settings, [repeat])):
+                try:
+                    path = checked_artifact(root, part, name)
+                    destination = output / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, destination)
+                    report["artifacts"][name] = part["artifacts"][name]
+                except (RegressionError, OSError) as error:
+                    report["errors"].append({"repeat": repeat, "artifact": name, "error": str(error)})
+        report["complete"] = (
+            complete_parts == 3 and not report["errors"] and generation_paths(settings) <= report["artifacts"].keys()
+        )
+    finally:
+        write_json(output / "generation.json", report)
+    return report
+
+
+def validate_manifest(settings, manifest):
+    contract = manifest.get("contract", {})
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("candidate_revision") != git_revision(ROOT)
+        or manifest.get("reference_revision") != settings["reference_revision"]
+        or contract.get("profile") != read_json(settings["profile_path"])
+        or contract.get("deploy_sha256") != sha256(ROOT / settings["deploy_config"])
+        or contract.get("engine_environment") != ENGINE_ENVIRONMENT
+    ):
+        raise RegressionError("Measurement source/profile/runtime contract mismatch")
+
+
+def checked_artifact(root, manifest, name):
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts or name not in manifest.get("artifacts", {}):
+        raise RegressionError(f"Missing or unsafe measurement artifact: {name}")
+    path = root / relative
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise RegressionError("Artifact escapes the measurement directory")
+    if sha256(path) != manifest["artifacts"][name]:
+        raise RegressionError(f"Measurement artifact checksum mismatch: {name}")
+    return path
+
+
+def measurement_data(settings):
+    root = settings["generation"]
+    if root is None:
+        raise RegressionError("--lingbot-generation must name real collected measurements")
+    manifest = read_json(root / "generation.json")
+    validate_manifest(settings, manifest)
+    # Completion and semantic verdicts are deliberately not shared prerequisites.
+    # Each consumer validates only its own required raw inputs.
+    return root, manifest
+
+
+def stability_session(server, settings: dict[str, Any], image: Path, destination: Path) -> dict[str, Any]:
     """Separate instrumented rollout for control updates and bounded memory."""
     from dataclasses import replace
 
@@ -267,6 +473,8 @@ def diagnostic_session(server, settings: dict[str, Any], image: Path, destinatio
             memory.append({"chunk": record.index, "used_bytes": used})
 
     workload = default_workload(
+        prompt=settings["cases"][0]["prompt"],
+        seed=settings["cases"][0]["seed"],
         image_reference=resolve_image_reference(str(image)),
         num_chunks=settings["num_chunks"],
         width=settings["width"],
@@ -305,9 +513,21 @@ def diagnostic_session(server, settings: dict[str, Any], image: Path, destinatio
             interactions_after_chunk={2: camera_update},
         )
     )
+    if (
+        len(result.records) != settings["num_chunks"]
+        or [r.index for r in result.records] != list(range(settings["num_chunks"]))
+        or any(r.num_frames != (9 if i == 0 else 12) or r.byte_length <= 0 for i, r in enumerate(result.records))
+    ):
+        raise RegressionError("Incomplete long-session chunk/frame population")
     write_json(
         destination,
-        {"events": result.events, "memory": memory, "timing_scope": "instrumented; excluded from performance"},
+        {
+            "events": result.events,
+            "memory": memory,
+            "timing_scope": "instrumented; excluded from performance",
+            "request_id": result.request_id,
+            "chunks": [row.to_dict() for row in result.records],
+        },
     )
     applied = [
         event
@@ -325,557 +545,55 @@ def diagnostic_session(server, settings: dict[str, Any], image: Path, destinatio
         samples = [entry["used_bytes"][device] for entry in memory]
         if max(samples) - min(samples) > settings["memory_growth_budget_bytes"]:
             raise RegressionError(f"Unbounded memory growth on device {device}: {samples}")
+    return {"memory": memory, "events": len(result.events), "request_id": result.request_id}
 
 
-def _measured_metrics(document: dict, settings: dict) -> dict[str, float]:
-    sessions = document.get("sessions", [])
-    count = settings.get("measured_sessions", 1)
-    ids = [session.get("request_id") for session in sessions]
-    if (
-        len(sessions) != count
-        or [session.get("session_index") for session in sessions] != list(range(count))
-        or any(not isinstance(identity, str) or not identity for identity in ids)
-        or len(set(ids)) != count
-    ):
-        raise RegressionError("Missing or duplicated measured sessions in an independent start")
-    if any(document["config"].get(key) != settings[key] for key in ("warmup_chunks", "target_fps")):
-        raise RegressionError("Benchmark measurement policy differs from the profile")
-    if document["config"].get("playback_buffer_chunks") != 1:
-        raise RegressionError("LingBot regression requires the pinned one-chunk playback buffer")
-    return performance_metrics(document, num_chunks=settings["num_chunks"], min_steady=settings["min_steady_samples"])
+def run_stability(settings):
+    import pytest
 
-
-def generate(
-    settings: dict[str, Any], *, measurement_repeat: int | None = None, reference_only: bool = False
-) -> dict[str, Any]:
-    """Collect paired acceptance data or a reference-only training cohort."""
-    if measurement_repeat is not None and (
-        type(measurement_repeat) is not int or measurement_repeat not in range(3) or settings["platform"] != "npu"
-    ):
-        raise RegressionError("Measurement collection requires an NPU repeat index 0, 1 or 2")
+    from tests.e2e.online_serving import test_lingbot_world_v2_stepwise as lifecycle
     from tests.helpers.runtime import OmniServer
 
+    if settings["num_chunks"] != 600 or settings.get("measured_sessions") != 2 or len(settings["cases"]) != 1:
+        raise RegressionError("Long stability requires two candidate 600-chunk sessions")
     output = settings["output"]
-    output.mkdir(parents=True, exist_ok=True)
-    if (output / "reference").exists() or (output / "candidate").exists():
-        raise RegressionError("Use a fresh output directory; never mix independent campaigns")
-    write_json(
-        output / "generation.json",
-        {"passed": False, "status": "running", "candidate_revision": git_revision(ROOT)},
-    )
-    model, images = checked_assets(settings)
-    reference = validate_reference(settings)
-    hardware = hardware_contract(settings)
-    deployment = ROOT / settings["deploy_config"]
-    config = read_json(settings["profile_path"])
-    contract = {
-        "hardware": hardware,
-        "profile": config,
-        "deploy_sha256": sha256(deployment),
-        "engine_environment": dict(ENGINE_ENVIRONMENT),
-    }
-    write_json(output / "contract.json", contract)
-    records: dict[str, Any] = {"reference": []} if reference_only else {"reference": [], "candidate": []}
-    for repeat in [measurement_repeat] if measurement_repeat is not None else range(3):
-        # Alternate AB/BA to reduce bias from thermal/host-load drift.
-        order = (
-            ("reference",)
-            if reference_only
-            else (("reference", "candidate") if repeat % 2 == 0 else ("candidate", "reference"))
-        )
-        for role in order:
-            source = reference if role == "reference" else ROOT
-            arm = output / role / str(repeat)
-            arm.mkdir(parents=True, exist_ok=True)
-            _capture(source, model, arm / "precision.npz", settings)
-            with OmniServer(
-                str(model),
-                server_arguments(settings),
-                source_root=str(source),
-                env_dict=server_environment(source, cpu_threads=settings.get("cpu_threads_per_worker")),
-                startup_timeout=settings["startup_timeout_s"],
-            ) as server:
-                process = server.proc
-                assert process is not None
-                import psutil
-
-                children = [(p.pid, p.create_time()) for p in psutil.Process(process.pid).children(recursive=True)]
-                case_results = {}
-                for case in settings["cases"]:
-                    destination = arm / case["id"]
-                    destination.mkdir(parents=True, exist_ok=True)
-                    args = parse_args(
-                        [
-                            "--port",
-                            str(server.port),
-                            "--model",
-                            str(model),
-                            "--image",
-                            str(images[case["image"]]),
-                            "--prompt",
-                            case["prompt"],
-                            "--camera-pattern",
-                            case["camera_pattern"],
-                            "--seed",
-                            str(case["seed"]),
-                            "--height",
-                            str(settings["height"]),
-                            "--width",
-                            str(settings["width"]),
-                            "--fps",
-                            str(settings["mux_fps"]),
-                            "--target-fps",
-                            str(settings["target_fps"]),
-                            "--playback-buffer-chunks",
-                            "1",
-                            "--num-chunks",
-                            str(settings["num_chunks"]),
-                            "--sessions",
-                            str(settings.get("measured_sessions", 1)),
-                            "--warmup-sessions",
-                            "1",
-                            "--warmup-num-chunks",
-                            str(settings["warmup_num_chunks"]),
-                            "--warmup-chunks",
-                            str(settings["warmup_chunks"]),
-                            "--first-chunk-timeout",
-                            str(settings["first_chunk_timeout_s"]),
-                            "--chunk-timeout",
-                            str(settings["chunk_timeout_s"]),
-                            "--output-json",
-                            str(destination / "benchmark.json"),
-                            "--save-video",
-                            str(destination / "rollout.mp4"),
-                        ]
-                    )
-                    document = asyncio.run(run_benchmark(args))
-                    record_benchmark_revisions(document, source)
-                    write_json(destination / "benchmark.json", document)
-                    case_results[case["id"]] = _measured_metrics(document, settings)
-                # Reuse lifecycle tests against this exact server, with the
-                # same pinned first frame; no second untracked service launch.
-                if settings["lifecycle_checks"]:
-                    import pytest
-
-                    from tests.e2e.online_serving import test_lingbot_world_v2_stepwise as lifecycle
-
-                    with pytest.MonkeyPatch.context() as patch:
-                        patch.setattr(lifecycle, "_IMAGE_PATH_OVERRIDE", str(images[settings["cases"][0]["image"]]))
-                        lifecycle.test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(server)
-                        lifecycle.test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(server)
-                        lifecycle.test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(server)
-                if repeat == 0:
-                    diagnostic_session(server, settings, images[settings["cases"][0]["image"]], arm / "diagnostic.json")
-            lingering = []
-            for pid, created in children:
-                if psutil.pid_exists(pid):
-                    child = psutil.Process(pid)
-                    if child.create_time() == created and child.status() != psutil.STATUS_ZOMBIE:
-                        lingering.append(pid)
-            if lingering:
-                raise RegressionError(f"Server children survived teardown: {lingering}")
-            assert_device_cleanup(settings["dies"], arm / "cleanup.json")
-            records[role].append(case_results)
-            write_json(output / "progress.json", {"records": records, "contract": contract})
-    if reference_only:
-        report = _reference_collection_report(settings, contract, records)
-        # Collection completion is deliberately different from acceptance.
-        # No frozen threshold is consulted or written during this campaign.
-        if measurement_repeat is None:
-            write_json(output / "generation.json", report)
-        else:
-            report.update(repeat=measurement_repeat, status="reference_measurement_complete")
-            write_json(output / "measurement.json", report)
-            write_json(
-                output / "generation.json",
-                {"passed": False, "status": "awaiting_reference_aggregate", "reference_only": True},
-            )
-        return report
-    if measurement_repeat is not None:
-        measurement = {
-            "measurement_only": True,
-            "complete": True,
-            "repeat": measurement_repeat,
-            "contract": contract,
-            "records": records,
-            "reference_revision": settings["reference_revision"],
-            "candidate_revision": git_revision(ROOT),
-            "buildkite_job_id": os.environ.get("BUILDKITE_JOB_ID"),
-            "artifacts": {
-                str(path.relative_to(output)): sha256(path)
-                for role in ("reference", "candidate")
-                for path in (output / role).rglob("*")
-                if path.is_file()
-            },
-        }
-        write_json(output / "measurement.json", measurement)
-        write_json(output / "generation.json", {"passed": False, "status": "awaiting_aggregate"})
-        return measurement
-    return _finalize_measurements(settings, contract, records)
-
-
-def _reference_collection_report(settings: dict[str, Any], contract: dict, records: dict) -> dict[str, Any]:
-    output = settings["output"]
-    job_id = os.environ.get("BUILDKITE_JOB_ID") or None
-    return {
+    report = {
         "passed": False,
-        "status": "reference_collection_complete",
-        "reference_only": True,
-        "measurement_only": True,
-        "complete": True,
-        "contract": contract,
-        "records": records,
-        "reference_revision": settings["reference_revision"],
-        "harness_revision": git_revision(ROOT),
-        "reference_protocol_sha256": sha256(ROOT / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json"),
-        "collection_id": str(uuid.uuid4()),
-        "collection_backend": "buildkite" if job_id is not None else "local",
-        "buildkite_job_id": job_id,
-        "artifacts": {
-            str(path.relative_to(output)): sha256(path) for path in (output / "reference").rglob("*") if path.is_file()
-        },
-    }
-
-
-def validate_reference_collection(
-    settings: dict[str, Any], generation: Path, manifest: dict, *, measurement_repeat: int | None = None
-) -> None:
-    """Verify a complete cohort, or one explicitly selected matrix producer."""
-    if measurement_repeat is not None and (
-        type(measurement_repeat) is not int
-        or measurement_repeat not in range(3)
-        or type(manifest.get("repeat")) is not int
-        or manifest["repeat"] != measurement_repeat
-        or settings["platform"] != "npu"
-    ):
-        raise RegressionError("Reference measurement requires the matching NPU repeat index")
-    repeats = [measurement_repeat] if measurement_repeat is not None else list(range(3))
-    try:
-        identity = manifest.get("collection_id")
-        if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
-            raise ValueError("invalid collection identity")
-    except ValueError as error:
-        raise RegressionError("Reference collection requires its recorded UUID identity") from error
-    job_id = manifest.get("buildkite_job_id")
-    if (
-        (manifest.get("collection_backend") == "local" and job_id is not None)
-        or (manifest.get("collection_backend") == "buildkite" and (not isinstance(job_id, str) or not job_id))
-        or manifest.get("collection_backend") not in {"local", "buildkite"}
-    ):
-        raise RegressionError("Reference collection backend and job provenance differ")
-    if (
-        manifest.get("reference_only") is not True
-        or manifest.get("measurement_only") is not True
-        or manifest.get("complete") is not True
-        or manifest.get("passed") is not False
-        or "candidate_revision" in manifest
-        or manifest.get("reference_revision") != settings["reference_revision"]
-        or manifest.get("harness_revision") != git_revision(ROOT)
-        or manifest.get("reference_protocol_sha256")
-        != sha256(ROOT / "tests/dfx/lingbot_world/calibration/v033_reference_protocol.json")
-        or manifest.get("contract", {}).get("profile") != read_json(settings["profile_path"])
-        or manifest.get("contract", {}).get("deploy_sha256") != sha256(ROOT / settings["deploy_config"])
-        or manifest.get("contract", {}).get("engine_environment") != ENGINE_ENVIRONMENT
-        or (generation / "candidate").exists()
-    ):
-        raise RegressionError("Incomplete, wrong-source or mixed reference-only collection")
-    cases = {case["id"] for case in settings["cases"]}
-    records = manifest.get("records", {})
-    if (
-        set(records) != {"reference"}
-        or len(records["reference"]) != len(repeats)
-        or any(set(row) != cases for row in records["reference"])
-    ):
-        raise RegressionError("Reference collection has an incomplete independent-start population")
-    required = {f"reference/{repeat}/precision.npz" for repeat in repeats}
-    required |= {
-        f"reference/{repeat}/{case}/{name}"
-        for repeat in repeats
-        for case in cases
-        for name in ("benchmark.json", "rollout.mp4")
-    }
-    artifacts = manifest.get("artifacts", {})
-    if not required.issubset(artifacts):
-        raise RegressionError("Reference collection is missing hashed measurement artifacts")
-    for relative, digest in artifacts.items():
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "reference":
-            raise RegressionError(f"Unsafe or non-reference collection artifact: {relative}")
-        if measurement_repeat is not None and (len(path.parts) < 3 or path.parts[1] != str(measurement_repeat)):
-            raise RegressionError(f"Wrong-repeat reference measurement artifact: {relative}")
-        if not (generation / path).resolve().is_relative_to(generation.resolve()):
-            raise RegressionError(f"Reference artifact escapes its collection: {relative}")
-        if sha256(generation / path) != digest:
-            raise RegressionError(f"Reference collection artifact checksum mismatch: {relative}")
-    request_ids: set[str] = set()
-    for index, repeat in enumerate(repeats):
-        for case in cases:
-            raw = read_json(generation / "reference" / str(repeat) / case / "benchmark.json")
-            if (
-                raw.get("git_revision") != manifest["harness_revision"]
-                or raw.get("server_revision") != settings["reference_revision"]
-                or _measured_metrics(raw, settings) != records["reference"][index][case]
-            ):
-                raise RegressionError("Reference collection source or raw measurements changed")
-            identities = {session["request_id"] for session in raw["sessions"]}
-            if identities & request_ids:
-                raise RegressionError("Reference requests were reused across independent starts")
-            request_ids.update(identities)
-
-
-def _finalize_measurements(settings: dict[str, Any], contract: dict, records: dict) -> dict[str, Any]:
-    output = settings["output"]
-    cases = {case["id"] for case in settings["cases"]}
-    if any(len(records.get(role, [])) != 3 for role in ("reference", "candidate")):
-        raise RegressionError("Final gates require three independent starts per role")
-    if any(set(row) != cases for role in ("reference", "candidate") for row in records[role]):
-        raise RegressionError("Measurement cases do not cover the complete profile")
-    startup_stall_floor = 0.0
-    ttfc_floor = 0.0
-    p95_max_cv: float | None = None
-    calibration_error: str | None = None
-    if settings.get("platform") == "cuda" or settings.get("reference_calibration"):
-        calibration_path = ROOT / settings.get(
-            "reference_calibration", "tests/dfx/lingbot_world/calibration/cuda_nightly_reference.json"
-        )
-        try:
-            if not calibration_path.is_file():
-                raise RegressionError(f"Frozen reference calibration is not available: {calibration_path.name}")
-            calibration = read_json(calibration_path)
-            write_json(output / "reference-calibration.json", calibration)
-            verify_reference_calibration_contract(contract, calibration)
-        except RegressionError as error:
-            calibration_error = str(error)
-            write_json(
-                output / "calibration-error.json",
-                {
-                    "error": calibration_error,
-                    "reference_record_sha256": sha256(calibration_path) if calibration_path.is_file() else None,
-                },
-            )
-        else:
-            startup_stall_floor = calibration["startup_stall_calibration"]["selected_floor_ms"]
-            ttfc_floor = calibration["ttfc_calibration"]["selected_floor_ms"]
-            p95_max_cv = calibration["p95_reference_cv_calibration"]["selected_ceiling"]
-            write_json(
-                output / "p95-cv-calibration.json",
-                {"reference_record_sha256": sha256(calibration_path), **calibration["p95_reference_cv_calibration"]},
-            )
-            write_json(
-                output / "ttfc-calibration.json",
-                {"reference_record_sha256": sha256(calibration_path), **calibration["ttfc_calibration"]},
-            )
-            write_json(
-                output / "startup-stall-calibration.json",
-                {
-                    "reference_record_sha256": sha256(calibration_path),
-                    **calibration["startup_stall_calibration"],
-                },
-            )
-    report: dict[str, Any] = {
-        "contract": contract,
-        "cases": {},
-        "passed": True,
-        "reference_revision": settings["reference_revision"],
         "candidate_revision": git_revision(ROOT),
+        "sessions": [],
+        "errors": [],
+        "profile": read_json(settings["profile_path"]),
+        "timing_scope": "instrumented stability, not performance",
     }
-    for case in settings["cases"]:
-        case_id = case["id"]
-        try:
-            if calibration_error is not None:
-                raise RegressionError(calibration_error)
-            baseline = calibrate(
-                [row[case_id] for row in records["reference"]],
-                contract=contract,
-                reference_revision=settings["reference_revision"],
-                max_cv=settings["max_reference_cv"],
-                regression_fraction=settings["performance_regression_fraction"],
-                transient_noise_sigma=settings["transient_noise_sigma"],
-                startup_stall_jitter_floor_ms=startup_stall_floor,
-                ttfc_jitter_floor_ms=ttfc_floor,
-                p95_max_cv=p95_max_cv,
-            )
-        except RegressionError as error:
-            # Invalid references still fail acceptance. Preserve the remaining
-            # cases, precision and hashes so independent scoring can diagnose it.
-            report["cases"][case_id] = {"baseline": None, "checks": [], "calibration_error": str(error)}
-            report["passed"] = False
-            continue
-        checks = [check_performance(row[case_id], baseline, contract=contract) for row in records["candidate"]]
-        report["cases"][case_id] = {"baseline": baseline, "checks": checks}
-        report["passed"] &= all(check["passed"] for check in checks)
-    # A separate repeatability gate precedes reference-vs-candidate precision.
-    precision_checks = []
-    for role in ("reference", "candidate"):
-        for repeat in (1, 2):
-            precision_checks.append(
-                compare_tensor_samples(
-                    output / role / "0/precision.npz", output / role / str(repeat) / "precision.npz", atol=0, rtol=0
-                )
-            )
-    for repeat in range(3):
-        precision_checks.append(
-            compare_tensor_samples(
-                output / "reference/0/precision.npz",
-                output / "candidate" / str(repeat) / "precision.npz",
-                atol=settings["precision_atol"],
-                rtol=settings["precision_rtol"],
-            )
-        )
-    report["precision"] = precision_checks
-    report["passed"] &= all(row["status"] == "passed" for row in precision_checks)
-    report["artifacts"] = {
-        str(path.relative_to(output)): sha256(path)
-        for path in output.rglob("*")
-        if path.is_file() and path.suffix in {".mp4", ".npz"}
-    }
-    write_json(output / "generation.json", report)
-    return report
-
-
-def aggregate_measurements(settings: dict[str, Any]) -> dict[str, Any]:
-    """Verify three complete NPU pairs before applying the full regression gate."""
-    return _aggregate_measurements(settings, reference_only=False)
-
-
-def aggregate_reference_measurements(settings: dict[str, Any]) -> dict[str, Any]:
-    """Reassemble three independent NPU reference producers without acceptance."""
-    return _aggregate_measurements(settings, reference_only=True)
-
-
-def _aggregate_measurements(settings: dict[str, Any], *, reference_only: bool) -> dict[str, Any]:
-    source = settings["generation"]
-    output = settings["output"].resolve()
-    if source is None or settings["platform"] != "npu":
-        raise RegressionError("NPU aggregation requires a measurement artifact directory")
-    source = source.resolve()
-    if output.is_relative_to(source) or source.is_relative_to(output):
-        raise RegressionError("Aggregate input and output directories must be disjoint")
-    output.mkdir(parents=True, exist_ok=True)
-    if any((output / role).exists() for role in ("reference", "candidate")):
-        raise RegressionError("Use a fresh aggregate output directory")
-    revision = git_revision(ROOT)
-    write_json(
-        output / "generation.json",
-        {
-            "passed": False,
-            "status": "aggregating",
-            "harness_revision" if reference_only else "candidate_revision": revision,
-        },
-    )
-    profile = read_json(settings["profile_path"])
-    cases = {case["id"] for case in settings["cases"]}
-    contract = None
-    records: dict[str, list] = {"reference": []} if reference_only else {"reference": [], "candidate": []}
-    provenance = []
-    request_ids: set[str] = set()
-    collection_ids: set[str] = set()
-    producer_jobs: set[str] = set()
-    for repeat in range(3):
-        root = source / f"pair-{repeat}"
-        if not (root / "measurement.json").is_file():
-            raise RegressionError(f"Missing measurement pair {repeat}")
-        manifest = read_json(root / "measurement.json")
-        if reference_only:
-            validate_reference_collection(settings, root, manifest, measurement_repeat=repeat)
-            identity = manifest["collection_id"]
-            job = manifest["buildkite_job_id"] if manifest["collection_backend"] == "buildkite" else f"local:{identity}"
-            if identity in collection_ids or job in producer_jobs:
-                raise RegressionError("Reference producers were reused across independent starts")
-            collection_ids.add(identity)
-            producer_jobs.add(job)
-        elif (
-            manifest.get("complete") is not True
-            or manifest.get("measurement_only") is not True
-            or type(manifest.get("repeat")) is not int
-            or manifest["repeat"] != repeat
-            or manifest.get("candidate_revision") != revision
-            or manifest.get("reference_revision") != settings["reference_revision"]
-        ):
-            raise RegressionError(f"Incomplete, duplicate or wrong-revision measurement pair {repeat}")
-        current = manifest["contract"]
-        if current.get("engine_environment") != ENGINE_ENVIRONMENT:
-            raise RegressionError(f"Measurement engine environment is missing or changed in pair {repeat}")
-        hardware = current["hardware"]
-        if (
-            current["profile"] != profile
-            or current["deploy_sha256"] != sha256(ROOT / settings["deploy_config"])
-            or any(hardware.get(key) != settings[key] for key in ("platform", "cards", "dies"))
-            or len(hardware.get("devices", [])) != settings["dies"]
-        ):
-            raise RegressionError(f"Measurement profile or hardware mismatch in pair {repeat}")
-        if contract is not None and current != contract:
-            raise RegressionError("Measurement hardware/dependency contracts differ between pairs")
-        contract = current
-        required = {f"{role}/{repeat}/precision.npz" for role in records}
-        required |= {
-            f"{role}/{repeat}/{case}/{name}"
-            for role in records
-            for case in cases
-            for name in ("benchmark.json", "rollout.mp4")
-        }
-        if repeat == 0:
-            required |= {f"{role}/0/diagnostic.json" for role in records}
-        artifacts = manifest["artifacts"]
-        if not required.issubset(artifacts):
-            raise RegressionError(f"Missing measurement artifacts in pair {repeat}")
-        for relative, digest in artifacts.items():
-            path = Path(relative)
-            if (
-                path.is_absolute()
-                or ".." in path.parts
-                or len(path.parts) < 3
-                or path.parts[0] not in records
-                or path.parts[1] != str(repeat)
-            ):
-                raise RegressionError(f"Unsafe or wrong-repeat measurement path: {relative}")
-            if sha256(root / path) != digest:
-                raise RegressionError(f"Measurement artifact checksum mismatch: {relative}")
-            destination = output / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / path, destination)
-        for role in records:
-            completed = manifest["records"].get(role, [])
-            if len(completed) != 1 or set(completed[0]) != cases:
-                raise RegressionError(f"Incomplete case population in {role} pair {repeat}")
-            metrics = {}
-            for case in cases:
-                raw = read_json(output / role / str(repeat) / case / "benchmark.json")
-                server_revision = settings["reference_revision"] if role == "reference" else revision
-                if raw.get("git_revision") != revision or raw.get("server_revision") != server_revision:
-                    raise RegressionError(f"Wrong benchmark producer/server revision in {role} pair {repeat}")
-                # Recompute from chunks; a claimed aggregate cannot set its own limits.
-                metrics[case] = _measured_metrics(raw, settings)
-                identities = {session["request_id"] for session in raw["sessions"]}
-                if identities & request_ids:
-                    raise RegressionError("Measured requests were reused across independent starts")
-                request_ids.update(identities)
-            records[role].append(metrics)
-        if reference_only:
-            relative = f"reference/provenance/measurement-{repeat}.json"
-            destination = output / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / "measurement.json", destination)
-            provenance.append(
-                {
-                    "repeat": repeat,
-                    "collection_id": manifest["collection_id"],
-                    "collection_backend": manifest["collection_backend"],
-                    "buildkite_job_id": manifest["buildkite_job_id"],
-                    "manifest_path": relative,
-                    "manifest_sha256": sha256(destination),
-                }
-            )
-        else:
-            provenance.append({"repeat": repeat, "buildkite_job_id": manifest.get("buildkite_job_id")})
-    assert contract is not None
-    write_json(output / "progress.json", {"records": records, "contract": contract})
-    write_json(output / "measurement-jobs.json", provenance)
-    if reference_only:
-        report = _reference_collection_report(settings, contract, records)
-        validate_reference_collection(settings, output, report)
-    else:
-        report = _finalize_measurements(settings, contract, records)
-    report["measurement_jobs"] = provenance
-    write_json(output / "generation.json", report)
+    try:
+        model, images = checked_assets(settings)
+        report["hardware"] = hardware_contract(settings)
+        image = images[settings["cases"][0]["image"]]
+        with OmniServer(
+            str(model),
+            server_arguments(settings),
+            env_dict=server_environment(ROOT, cpu_threads=settings.get("cpu_threads_per_worker")),
+            startup_timeout=settings["startup_timeout_s"],
+        ) as server:
+            for index in range(2):
+                row = stability_session(server, settings, image, output / f"session-{index}.json")
+                if row["request_id"] in {r["request_id"] for r in report["sessions"]}:
+                    raise RegressionError("Stability sessions reused a request")
+                report["sessions"].append(row)
+                write_json(output / "stability.json", report)
+            for device in range(settings["dies"]):
+                samples = [m["used_bytes"][device] for r in report["sessions"] for m in r["memory"]]
+                if max(samples) - min(samples) > settings["memory_growth_budget_bytes"]:
+                    raise RegressionError("Memory growth across stability sessions exceeds the profile budget")
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(lifecycle, "_IMAGE_PATH_OVERRIDE", str(image))
+                lifecycle.test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(server)
+                lifecycle.test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(server)
+                lifecycle.test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(server)
+        assert_device_cleanup(settings["dies"], output / "cleanup.json")
+        report["passed"] = True
+    except Exception as error:
+        report["errors"].append(str(error))
+    finally:
+        write_json(output / "stability.json", report)
     return report

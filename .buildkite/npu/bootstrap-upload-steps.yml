@@ -116,7 +116,6 @@ steps:
   - label: "Upload Weekly Pipeline"
     depends_on:
       - image-build-a2
-      - image-build-a3
     key: upload-weekly-pipeline
     commands:
       - |

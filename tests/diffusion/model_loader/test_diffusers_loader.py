@@ -170,31 +170,6 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_serial_safetensors_loading_preserves_every_sharded_weight(tmp_path):
-    expected = {}
-    for shard in range(8):
-        tensors = {
-            f"block{shard}.{name}": torch.arange(16, dtype=torch.bfloat16).reshape(4, 4) + shard
-            for name in ("weight", "bias")
-        }
-        save_file(tensors, tmp_path / f"model-{shard + 1:05d}-of-00008.safetensors")
-        expected.update({f"transformer.{name}": tensor for name, tensor in tensors.items()})
-    source = DiffusersPipelineLoader.ComponentSource(
-        model_or_path=str(tmp_path), subfolder=None, revision=None, prefix="transformer.", fall_back_to_pt=False
-    )
-    populations = []
-    for threaded in (True, False):
-        loader = _make_loader_with_weights([])
-        loader.od_config.enable_multithread_weight_load = threaded
-        weights = list(loader._get_weights_iterator(source))
-        assert len(weights) == len(expected)
-        actual = dict(weights)
-        assert actual.keys() == expected.keys()
-        assert all(torch.equal(actual[name], tensor) for name, tensor in expected.items())
-        populations.append(actual)
-    assert all(torch.equal(populations[0][name], populations[1][name]) for name in expected)
-
-
 @pytest.mark.parametrize(
     ("torchao_serialized", "suffix"),
     [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's

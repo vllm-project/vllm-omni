@@ -17,7 +17,6 @@ import re
 import signal
 import subprocess
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +38,6 @@ WBENCH_DIMENSIONS = (
     "hpsv3_quality",
 )
 _SUITES = {
-    "vbench_long": (VBENCH_DIMENSIONS, "long_custom_input"),
     "vbench": (STANDARD_VBENCH_DIMENSIONS, "custom_input"),
     "wbench": (WBENCH_DIMENSIONS, "video_quality"),
 }
@@ -75,6 +73,30 @@ def _distances(absolute_sum: float, squared_sum: float, samples: int) -> dict[st
         "psnr_db": 10 * math.log10(255.0**2 / mse) if mse else None,
         "psnr_is_infinite": mse == 0,
     }
+
+
+def verify_video_coverage(path: Path, *, frames: int, width: int, height: int, fps: int) -> dict:
+    """Decode the complete input; semantic scorers cannot accept a partial rollout."""
+    import cv2
+
+    capture = cv2.VideoCapture(str(path))
+    try:
+        metadata = _capture_metadata(capture, path, cv2)
+        if tuple(metadata[key] for key in ("frame_count", "width", "height", "fps")) != (frames, width, height, fps):
+            raise VideoQualityError("Video does not match the requested rollout")
+        count = 0
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame.shape[:2] != (height, width):
+                raise VideoQualityError("Decoded frame geometry changed")
+            count += 1
+        if count != frames:
+            raise VideoQualityError("Video does not decode to the complete frame population")
+        return {**metadata, "decoded_frames": count}
+    finally:
+        capture.release()
 
 
 def compare_video_pair(
@@ -245,10 +267,7 @@ try:
         evaluator = VideoQualityEvaluator(device="cuda", metrics=manifest["dimensions"])
     else:
         import torch
-        if manifest["suite"] == "vbench_long":
-            from vbench2_beta_long import VBenchLong as Evaluator
-        else:
-            from vbench import VBench as Evaluator
+        from vbench import VBench as Evaluator
     for index, (label, video) in enumerate(manifest["videos"].items()):
         try:
             if background_stats is not None:
@@ -285,17 +304,6 @@ try:
                 output.mkdir()
                 evaluator = Evaluator(torch.device("cuda"), str(repo / "vbench/VBench_full_info.json"), str(output))
                 kwargs = {"imaging_quality_preprocessing_mode": "longer"}
-                if manifest["suite"] == "vbench_long":
-                    configs = repo / "vbench2_beta_long/configs"
-                    kwargs.update(
-                        use_semantic_splitting=False, clip_length_config="clip_length_mix.yaml",
-                        sb_clip2clip_feat_extractor="dinov2", bg_clip2clip_feat_extractor="dreamsim",
-                        w_inclip=1.0, w_clip2clip=0.0, dev_flag=True,
-                        slow_fast_eval_config=str(configs / "slow_fast_params.yaml"),
-                        sb_mapping_file_path=str(configs / "subject_mapping_table.yaml"),
-                        bg_mapping_file_path=str(configs / "background_mapping_table.yaml"),
-                        num_of_samples_per_prompt=1, static_filter_flag=False,
-                    )
                 evaluator.evaluate(
                     str(stage), "result", dimension_list=manifest["dimensions"], local=True,
                     mode=manifest["mode"], **kwargs,
@@ -306,12 +314,7 @@ try:
                     raise ValueError("Unexpected dimension coverage in VBench output")
                 if any(not isinstance(value, list) or len(value) < 2 or not value[1] for value in raw.values()):
                     raise ValueError("Missing per-video detail in VBench output")
-                expected = (
-                    {path.resolve() for path in (stage / "split_clip").rglob("*.mp4")}
-                    if manifest["suite"] == "vbench_long" else {staged.resolve()}
-                )
-                if not expected:
-                    raise ValueError("VBenchLong produced no clips")
+                expected = {staged.resolve()}
                 for dimension, value in raw.items():
                     covered = []
                     if not isinstance(value[1], list):
@@ -357,93 +360,6 @@ def _run_worker(command: list[str], repo: Path, log: Path, timeout_s: float) -> 
             raise
 
 
-_PIXEL_WORKER = r"""
-import hashlib, importlib.metadata, json, sys
-from pathlib import Path
-inputs = json.loads(Path(sys.argv[1]).read_text())
-sys.path.insert(0, inputs["adapter_root"])
-import cv2
-from benchmarks.lingbot_world.video_quality import compare_video_pair
-environment = {
-    "python": sys.executable,
-    "packages": {name: importlib.metadata.version(name) for name in ("numpy", "opencv-python", "scikit-image")},
-    "opencv_version": cv2.__version__,
-    "opencv_build_sha256": hashlib.sha256(cv2.getBuildInformation().encode()).hexdigest(),
-}
-result = {"status": "failed", "pixel_environment": environment}
-try:
-    if environment["packages"] != inputs["expected_packages"]:
-        raise ValueError("Pixel dependencies changed from the verified evaluator environment")
-    result = {
-        **compare_video_pair(
-            Path(inputs["reference"]), Path(inputs["candidate"]),
-            window_seconds=inputs["window_seconds"], ssim_stride=inputs["ssim_stride"],
-        ),
-        "pixel_environment": environment,
-    }
-finally:
-    Path(inputs["result"]).write_text(json.dumps(result, allow_nan=False) + "\n")
-"""
-
-
-def compare_video_pair_in_environment(
-    reference: Path,
-    candidate: Path,
-    output_dir: Path,
-    *,
-    python: Path,
-    expected_packages: Mapping[str, str],
-    window_seconds: float,
-    ssim_stride: int,
-    timeout_s: float,
-) -> dict[str, Any]:
-    """Compare pixels in the verified evaluator interpreter and retain evidence."""
-    # Preserve the virtualenv path rather than resolving its interpreter symlink.
-    python = Path(python).expanduser().absolute()
-    names = ("numpy", "opencv-python", "scikit-image")
-    if any(not isinstance(expected_packages.get(name), str) or not expected_packages[name] for name in names):
-        raise VideoQualityError("Pixel environment requires verified decoder dependency versions")
-    if not python.is_file() or not math.isfinite(timeout_s) or timeout_s <= 0:
-        raise VideoQualityError("Pixel comparison requires an interpreter and a positive timeout")
-    expected = {name: expected_packages[name] for name in names}
-    output_dir.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="pixel-", dir=output_dir.resolve()))
-    result_path = run_dir / "worker_result.json"
-    result_path.write_text('{"status": "incomplete"}\n')
-    inputs = {
-        "adapter_root": str(Path(__file__).resolve().parents[2]),
-        "reference": str(reference.resolve()),
-        "candidate": str(candidate.resolve()),
-        "expected_packages": expected,
-        "window_seconds": window_seconds,
-        "ssim_stride": ssim_stride,
-        "result": str(result_path),
-    }
-    manifest = run_dir / "inputs.json"
-    manifest.write_text(json.dumps(inputs, allow_nan=False) + "\n")
-    log = run_dir / "worker.log"
-    # Isolated mode ignores the parent's PYTHONPATH and user site packages.
-    status = _run_worker(
-        [str(python), "-I", "-c", _PIXEL_WORKER, str(manifest)],
-        Path(inputs["adapter_root"]),
-        log,
-        timeout_s,
-    )
-    if status != 0:
-        raise VideoQualityError(f"Pixel worker exited with code {status}; see {log}")
-    result = json.loads(result_path.read_text())
-    if not isinstance(result, dict) or result.get("status") != "complete":
-        raise VideoQualityError(f"Pixel worker did not complete; see {result_path}")
-    environment = result.get("pixel_environment")
-    if (
-        not isinstance(environment, dict)
-        or environment.get("packages") != expected
-        or environment.get("python") != str(python)
-    ):
-        raise VideoQualityError(f"Pixel worker environment differs from the selected interpreter; see {result_path}")
-    return result
-
-
 def evaluate_video_quality(
     videos: dict[str, Path],
     output_dir: Path,
@@ -484,18 +400,7 @@ def evaluate_video_quality(
             raise VideoQualityError(f"Unknown evaluator suite: {suite}")
         allowed, mode = _SUITES[suite]
         report["mode"] = mode
-        report["protocol"] = (
-            {
-                "clip_seconds": 2,
-                "use_semantic_splitting": False,
-                "dev_flag": True,
-                "subject_feature": "dinov2",
-                "background_feature": "dreamsim",
-                "consistency_weights": "vbench2_beta_long/configs/slow_fast_params.yaml",
-            }
-            if suite == "vbench_long"
-            else {"sampling": "native evaluator defaults"}
-        )
+        report["protocol"] = {"sampling": "native evaluator defaults"}
         if suite == "vbench" and "background_consistency" in dimensions:
             from benchmarks.lingbot_world.encoder_inference import BACKGROUND_CLIP_BATCH_SIZE
 
@@ -516,7 +421,7 @@ def evaluate_video_quality(
         paths = {label: str(Path(path).resolve()) for label, path in videos.items()}
         if any(not Path(path).is_file() or Path(path).stat().st_size == 0 for path in paths.values()):
             raise VideoQualityError("Every requested video must be a nonempty file")
-        if suite in {"vbench", "vbench_long"} and any(Path(path).suffix.lower() != ".mp4" for path in paths.values()):
+        if suite == "vbench" and any(Path(path).suffix.lower() != ".mp4" for path in paths.values()):
             raise VideoQualityError("VBench video loaders require MP4 inputs; re-encode explicitly before evaluation")
         repo = Path(repo).expanduser().resolve()
         # Resolving venv/bin/python's symlink selects the base environment.

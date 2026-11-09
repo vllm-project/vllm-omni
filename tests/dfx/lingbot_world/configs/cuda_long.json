@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "reference_revision": "3094f0ea747cb2563d99d049da25725cc45f0d2e",
+  "reference_revision": "e96e3beeb6fa0842ad5f4a74b4d409edca39a0d5",
   "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
   "height": 480,
   "width": 832,
@@ -37,13 +37,5 @@
   "measured_sessions": 2,
   "warmup_num_chunks": 8,
   "transient_noise_sigma": 3.0,
-  "reference_repository": "https://github.com/tzhouam/vllm-omni.git",
-  "inference_runtime": {
-    "packages": {
-      "vllm": "0.33.0",
-      "torch": "2.14.0"
-    }
-  },
-  "reference_calibration": "tests/dfx/lingbot_world/calibration/cuda_long_v033_reference.json",
-  "quality_reference_population": "tests/dfx/lingbot_world/calibration/cuda_long_v033_quality_population.json"
+  "reference_repository": "https://github.com/vllm-project/vllm-omni.git"
 }

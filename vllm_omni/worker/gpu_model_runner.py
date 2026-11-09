@@ -2408,12 +2408,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # __class__ cell inside this nested function. `narrow.context`
                     # is None once a narrow step was restored (fused graph
                     # declined); only a live step owns the one-query buffers.
-                    active_narrow = narrow if narrow is not None and narrow.context is not None else None
+                    active = narrow is not None and narrow.context is not None
                     return super(OmniGPUModelRunner, self)._model_forward(
-                        input_ids=None if active_narrow is not None else input_ids,
-                        positions=active_narrow.positions if active_narrow is not None else positions,
+                        input_ids=None if active else input_ids,
+                        positions=narrow.positions if active else positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=active_narrow.inputs_embeds if active_narrow is not None else inputs_embeds,
+                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
                         **model_kwargs,
                         **model_kwargs_extra,
                     )

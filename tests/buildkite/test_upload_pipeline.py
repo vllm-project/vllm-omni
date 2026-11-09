@@ -33,6 +33,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+CUDA_READY_YAML = Path(".buildkite/cuda/test-ready.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
@@ -618,6 +619,50 @@ def test_qwen3_perf_pipeline_selection(
     assert surviving_keys & legacy_keys == expected_keys
 
 
+@pytest.mark.parametrize(
+    ("changed_files", "selected"),
+    [
+        (["tests/model_executor/models/minicpmo_4_5/test_talker_mrv2_cuda.py"], True),
+        ([".buildkite/amd/test-amd-ready.yml"], True),
+        (["vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py"], False),
+        (
+            [
+                ".buildkite/cuda/test-ready.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/ci_source_file_dependencies.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/scripts/upload_pipeline.py",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+    ],
+)
+def test_cuda_ready_r2_01_collection_count_follows_its_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_files: list[str],
+    selected: bool,
+) -> None:
+    """A change that can move the AMD R2-01 pin must run its CUDA READY check."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    _load_source_file_dependencies.cache_clear()
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=CUDA_READY_YAML)
+    labels = {step.get("label") for step in _iter_steps(rendered)}
+
+    assert ("Simple · ROCm R2-01 Collection Count" in labels) is selected
+
+
 def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
     doc = yaml.safe_load(AMD_MERGE_YAML.read_text(encoding="utf-8"))
     jobs = {
@@ -1171,56 +1216,87 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
 
 
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+def test_lingbot_semantic_cases_have_independent_data_dependencies(monkeypatch, platform: str) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(f".buildkite/{platform}/{'test-npu-nightly.yml' if platform == 'npu' else 'test-nightly.yml'}")
+    rendered = _render_test_pipeline(
+        yaml.safe_load(path.read_text()), ["tests/dfx/lingbot_world/runner.py"], pipeline_path=path
+    )
+    keyed = {step.get("key"): step for step in _iter_steps(rendered)}
+    data_key = f"lingbot-{platform}-nightly-{'data' if platform == 'npu' else 'generation'}"
+    outputs = set()
+    for role in ("precision", "performance", "wbench", "vbench"):
+        step = keyed[f"lingbot-{platform}-nightly-{role}"]
+        if platform == "npu":
+            assert step["depends_on"] == [{"step": data_key, "allow_failure": True}, "lingbot-npu-nightly-ci-image"]
+        else:
+            assert step["depends_on"] == [{"step": data_key, "allow_failure": True}]
+        command = next(command for command in step["commands"] if "run_ci.sh " in command).split()
+        assert command[1:3] == ["tests/dfx/lingbot_world/run_ci.sh", role]
+        assert command[-1] == f"lingbot-artifacts/{platform}-nightly"
+        outputs.add(command[-2])
+        assert step["artifact_paths"] == [command[-2] + "/**/*"]
+        if role in {"wbench", "vbench"}:
+            assert _gpu_limit(step) == 1
+            assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert len(outputs) == 4
+    if platform == "npu":
+        pair = keyed["lingbot-npu-nightly-generation"]
+        assert pair["matrix"]["setup"]["repeat"] == ["0", "1", "2"]
+        assert pair["env"]["LINGBOT_MEASUREMENT_REPEAT"] == "{{matrix.repeat}}"
+        assert keyed[data_key]["depends_on"] == [
+            {"step": "lingbot-npu-nightly-generation", "allow_failure": True},
+            "lingbot-npu-nightly-ci-image",
+        ]
+
+
 @pytest.mark.parametrize("changed_files", [None, ["tests/dfx/lingbot_world/runner.py"]])
 @pytest.mark.parametrize(
-    "pipeline_path,expected_jobs",
-    [
-        (Path(".buildkite/cuda/test-ready.yml"), 2),
-        (Path(".buildkite/cuda/test-nightly.yml"), 2),
-        (Path(".buildkite/cuda/test-weekly.yml"), 4),
-        (Path(".buildkite/npu/test-npu-nightly.yml"), 3),
-        (Path(".buildkite/npu/test-npu-weekly.yml"), 6),
-    ],
+    "platform,level,count", [("cuda", "nightly", 5), ("npu", "nightly", 6), ("cuda", "weekly", 1), ("npu", "weekly", 1)]
 )
-def test_lingbot_resource_budget_survives_pipeline_expansion(
-    monkeypatch: pytest.MonkeyPatch, pipeline_path: Path, expected_jobs: int, changed_files: list[str] | None
+def test_lingbot_resources_and_infrastructure_retry_survive_expansion(
+    monkeypatch, platform: str, level: str, count: int, changed_files: list[str] | None
 ) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
-    source = yaml.safe_load(pipeline_path.read_text())
-    rendered = _render_test_pipeline(source, changed_files, pipeline_path=pipeline_path)
+    path = Path(f".buildkite/{platform}/test-{'npu-' if platform == 'npu' else ''}{level}.yml")
+    source = yaml.safe_load(path.read_text())
+    rendered = _render_test_pipeline(source, changed_files, pipeline_path=path)
     original = {step.get("key"): step for step in _iter_steps(source) if "key" in step}
     jobs = [
-        step
-        for step in _iter_steps(rendered)
-        if step.get("key") == "ready-lingbot-world-unit"
-        or any("run_ci.sh " in command for command in step.get("commands", []))
+        step for step in _iter_steps(rendered) if any("run_ci.sh " in command for command in step.get("commands", []))
     ]
-    assert len(jobs) == expected_jobs
+    assert len(jobs) == count
+    retry = _load_mirror_hardwares()["h100_8"]["retry"]
+    assert retry["manual"]["permit_on_passed"]
+    assert retry["automatic"] == [
+        {"exit_status": -1, "limit": 1},
+        {"exit_status": 128, "limit": 1},
+        {"signal_reason": "agent_stop", "limit": 1},
+        {"signal_reason": "agent_refused", "limit": 1},
+    ]
     for step in jobs:
-        if step.get("key") == "ready-lingbot-world-unit":
-            role = "unit"
+        role = next(command for command in step["commands"] if "run_ci.sh " in command).split()[2]
+        if role in {"generate", "collect", "stability"}:
+            group, limit = f"{platform}-generation", 1
+        elif role in {"wbench", "vbench"}:
+            group, limit = "quality", 2
         else:
-            command = next(command for command in step["commands"] if "run_ci.sh " in command)
-            role = command.split("run_ci.sh ", 1)[1].split()[0]
-        platform = pipeline_path.parent.name
-        # Stable organization-wide groups: no build, branch, level or matrix suffix.
-        if role in {"smoke", "generate", "collect"}:
-            group, limit = f"vllm-omni/lingbot-world/{platform}-generation", 1
-        elif role == "evaluate":
-            group, limit = "vllm-omni/lingbot-world/quality", 2
-        else:
-            assert role in {"unit", "aggregate"}
-            group, limit = "vllm-omni/lingbot-world/l4-cpu", 1
-        assert step["concurrency_group"] == group
+            group, limit = "l4-cpu", 1
+        assert step["concurrency_group"] == f"vllm-omni/lingbot-world/{group}"
         assert step["concurrency"] == limit
-        # Ready jobs can take available slots without dependency-order barriers.
-        assert step["concurrency_method"] == "eager"
-        assert step["priority"] == 0
+        assert step["concurrency_method"] == "eager" and step["priority"] == 0
+        assert step["retry"] == retry
         assert "mirror_hardwares" not in step and "agents" in step
-        # Throttling must preserve every case/repeat and the blocking dependency DAG.
         for field in ("matrix", "depends_on", "env", "timeout_in_minutes"):
             assert step.get(field) == original[step["key"]].get(field)
         assert not step.get("soft_fail") and not step.get("skip")
+        assert all("tee " not in command and "run-pytest-ci.sh" not in command for command in step["commands"])
+        if role == "generate" or platform == "cuda" and role == "stability":
+            assert _gpu_limit(step) == 8
+        if level == "weekly":
+            assert role == "stability" and "matrix" not in step
+            assert step["key"] == f"lingbot-{platform}-weekly-stability"
 
 
 @pytest.mark.parametrize("level", ["nightly", "weekly"])
@@ -1268,63 +1344,6 @@ def test_lingbot_npu_admission_requires_pr_opt_in_after_pipeline_expansion(
         raise AssertionError(f"Unsupported Buildkite condition: {ast.dump(node)}")
 
     assert boolean(parsed.body) is selected
-
-
-@pytest.mark.parametrize("filename", ["test-npu-nightly.yml", "test-npu-weekly.yml"])
-def test_lingbot_npu_infra_retry_does_not_retry_test_failures(filename: str) -> None:
-    path = Path(".buildkite/npu") / filename
-    rendered = _render_test_pipeline(
-        yaml.safe_load(path.read_text()),
-        changed_files=["tests/dfx/lingbot_world/runner.py"],
-        pipeline_path=path,
-    )
-    steps = [
-        step
-        for step in _iter_steps(rendered)
-        if step.get("key")
-        in {"lingbot-npu-nightly-generation", "lingbot-npu-weekly-generation", "lingbot-npu-weekly-long"}
-    ]
-    assert len(steps) == (1 if "nightly" in filename else 2)
-    for step in steps:
-        assert step["agents"]["queue"] == "ascend-a2b3"
-        assert step["agents"]["resource_class"] == "npu-8"
-        assert step["retry"] == {
-            "manual": {"permit_on_passed": True},
-            "automatic": [{"exit_status": -1, "limit": 1}, {"exit_status": 128, "limit": 1}],
-        }
-        assert not step.get("soft_fail")
-
-
-def test_ready_lingbot_smoke_survives_the_shared_e2e_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MIRROR_HW", raising=False)
-    path = Path(".buildkite/cuda/test-ready.yml")
-    source = yaml.safe_load(path.read_text())
-    rendered = _render_test_pipeline(source, None, pipeline_path=path, e2e_only=True)
-    keyed = {step.get("key"): step for step in _iter_steps(rendered)}
-    smoke = keyed["ready-lingbot-world-smoke"]
-    assert smoke["agents"]["queue"] == "mithril-h100-pool"
-    assert _gpu_limit(smoke) == 1
-    assert not smoke.get("soft_fail") and smoke["artifact_paths"]
-    assert "ready-lingbot-world-unit" not in keyed
-
-
-def test_ready_cpu_contracts_have_one_owner_and_shared_failure_reporting() -> None:
-    source = yaml.safe_load(Path(".buildkite/cuda/test-ready.yml").read_text())
-    simple = next(group for group in source["steps"] if group.get("group") == ":card_index_dividers: Simple Test")
-    steps = {step["label"]: step for step in simple["steps"]}
-    other = "\n".join(steps["Simple · Other Test"]["commands"])
-    dedicated = "\n".join(steps["Simple · LingBot World Regression Contract Test"]["commands"])
-    assert "--ignore-glob=tests/benchmarks/test_lingbot_world_*.py" in other
-    assert "tests/benchmarks/test_lingbot_world_*.py" in dedicated
-    assert "-p tests.dfx.lingbot_world.conftest" in dedicated
-    # These contracts retain their existing generic Simple jobs; the model
-    # gate no longer replays them under a second command.
-    for path in ("tests/buildkite", "tests/helpers", "tests/diffusion/models", "tests/diffusion/offloader"):
-        assert path not in dedicated
-    for command in (other, dedicated):
-        assert ".buildkite/common/scripts/run-pytest-ci.sh" in command
-        assert "--junitxml=" in command
-        assert "tee " not in command
 
 
 def test_isolation_reservation_requires_an_explicit_preset(monkeypatch: pytest.MonkeyPatch) -> None:

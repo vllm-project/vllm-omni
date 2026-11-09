@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Provision pinned reference code and an isolated video evaluator environment."""
+"""Prepare the pinned code/input fixtures and isolated native quality evaluators."""
 
 from __future__ import annotations
 
@@ -9,56 +9,32 @@ import hashlib
 import importlib.metadata
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import regex as re
 from packaging.version import Version
 
 from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, verify_environment, write_json
 from tests.dfx.lingbot_world.opencv_provider import PROVIDER, validate_opencv_provider_record
-from tests.dfx.lingbot_world.runtime_sources import attest_runtime_sources
 
 ROOT = Path(__file__).resolve().parents[3]
-CUDA_RUNTIME = {"packages": {"vllm": "0.33.0", "torch": "2.14.0"}}
-NPU_PACKAGES = {
-    "vllm": "0.33.0+empty",
-    "torch": "2.10.0+cpu",
-    "torch-npu": "2.10.0.post7",
-    "vllm-ascend": "0.19.1rc2.dev3349+g221fb096c.d20261104",
-}
-NPU_SOURCE_REVISIONS = {
-    "vllm": "4ba787ec9959e566d3b587a796dff07673324da5",
-    "vllm-ascend": "221fb096cd1cdf9f0b273da9b9624fbf4bb7f200",
-}
-NPU_SOURCE_SNAPSHOT_SHA256 = "451a176d926f1f6e029475067eae84f13c9a62e187d8266dc1e4c79c9b2613cb"
-NPU_SOURCE_PACKAGES_SHA256 = "f7d639d3a41ad11a60685668cd01036ce534fda66a621bb350cf28e00688a89b"
-NPU_RUNTIME = {
-    "packages": NPU_PACKAGES,
-    "source_revisions": NPU_SOURCE_REVISIONS,
-    "source_snapshot_sha256": NPU_SOURCE_SNAPSHOT_SHA256,
-    "source_packages_sha256": NPU_SOURCE_PACKAGES_SHA256,
-}
 
 
-def profile_for_case_shard(settings: dict, selection: str) -> dict:
-    match = re.fullmatch(r"(\d+)/(\d+)", selection)
-    if match is None:
-        raise RegressionError("Case shard must be INDEX/COUNT")
-    index, count = map(int, match.groups())
-    cases = settings["cases"]
-    if count < 1 or index >= count or count > len(cases):
-        raise RegressionError("Case shard would be empty or outside the configured population")
-    selected = {**settings, "cases": cases[index::count], "case_shard": {"index": index, "count": count}}
-    for key in ("reference_calibration", "quality_reference_population"):
-        if key in settings:
-            path = Path(settings[key])
-            selected[key] = str(path.with_name(f"{path.stem}_shard{index}of{count}{path.suffix}"))
-    return selected
+def verify_inference_runtime(platform: str) -> dict:
+    names = ("vllm", "torch") + (("torch-npu", "vllm-ascend") if platform == "npu" else ())
+    packages = {name: importlib.metadata.version(name) for name in names}
+    version = Version(packages["vllm"])
+    if version.base_version != "0.33.0" or version.is_prerelease or version.is_devrelease:
+        raise RegressionError("LingBot comparison requires the supported vLLM 0.33.0 runtime")
+    if platform not in ("cuda", "npu"):
+        raise RegressionError(f"Unsupported platform: {platform}")
+    if platform == "cuda" and Version(packages["torch"]).base_version != "2.14.0":
+        raise RegressionError("CUDA comparison requires Torch 2.14.0")
+    return {"packages": packages}
 
 
 def select_cuda_devices(available: int, mask: str | None, *, dies: int, reserved_cards: int) -> str:
@@ -181,80 +157,6 @@ def checkout(path: Path, url: str, revision: str, *, submodules: bool = False) -
         subprocess.run(
             ["git", "-C", str(path), "submodule", "update", "--init", "--recursive"], check=True, timeout=1200
         )
-
-
-def verify_editable_runtime_sources(expected: dict[str, str]) -> dict[str, str]:
-    """Attest the vendor image's actual editable checkouts, independent of tags."""
-    revisions = {}
-    for package, revision in expected.items():
-        provenance = importlib.metadata.distribution(package).read_text("direct_url.json")
-        try:
-            record = json.loads(provenance or "{}")
-            url = urllib.parse.urlparse(record.get("url", ""))
-            if (
-                url.scheme != "file"
-                or url.netloc not in ("", "localhost")
-                or not record.get("dir_info", {}).get("editable")
-            ):
-                raise ValueError("no editable source provenance")
-            source = Path(urllib.parse.unquote(url.path))
-            actual = subprocess.check_output(
-                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True, timeout=30
-            ).strip()
-            dirty = subprocess.check_output(
-                ["git", "-C", str(source), "status", "--porcelain"], text=True, timeout=30
-            ).strip()
-        except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            raise RegressionError(f"Cannot attest {package} editable runtime source") from error
-        if actual != revision or dirty:
-            raise RegressionError(
-                f"LingBot NPU runtime source is changed or dirty: {package} (expected {revision}, found {actual})"
-            )
-        revisions[package] = actual
-    return revisions
-
-
-def verify_inference_runtime(
-    platform: str = "cuda", *, profile_runtime: dict[str, object] | None = None
-) -> dict[str, object]:
-    # A local vendor suffix is allowed; RC/dev builds cannot impersonate the
-    # final release used for the paired measurements. Ascend owns its Torch
-    # stack and must never receive the CUDA wheel to satisfy this check.
-    if profile_runtime is not None and profile_runtime != {"cuda": CUDA_RUNTIME, "npu": NPU_RUNTIME}.get(platform):
-        raise RegressionError("Profile inference runtime does not match the pinned runtime contract")
-    expected = {"vllm": "0.33.0"}
-    packages: dict[str, str] = {}
-    observed: dict[str, object] = {"packages": packages}
-    if platform == "cuda":
-        expected["torch"] = "2.14.0"
-    elif platform == "npu":
-        # Vendor images can retain a development plugin version even when
-        # built for final vLLM 0.33. Source imports and measured package/image
-        # identities establish compatibility; the image tag alone does not.
-        for package, version in NPU_PACKAGES.items():
-            try:
-                actual = importlib.metadata.version(package)
-            except importlib.metadata.PackageNotFoundError as error:
-                raise RegressionError(f"LingBot NPU reference requires the integrated {package} runtime") from error
-            if actual != version:
-                raise RegressionError(f"LingBot NPU reference requires {package} {version}, found {actual}")
-            packages[package] = actual
-        observed["source_attestations"] = attest_runtime_sources(
-            NPU_SOURCE_REVISIONS, expected_sha256=NPU_SOURCE_SNAPSHOT_SHA256
-        )
-        observed["source_revisions"] = dict(NPU_SOURCE_REVISIONS)
-    else:
-        raise RegressionError(f"Unsupported LingBot inference platform: {platform}")
-    for package, release in expected.items():
-        try:
-            version = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError as error:
-            raise RegressionError(f"LingBot {platform} reference requires {package} {release}") from error
-        parsed = Version(version)
-        if parsed.base_version != release or parsed.is_prerelease or parsed.is_devrelease:
-            raise RegressionError(f"LingBot {platform} reference requires {package} {release}, found {version}")
-        packages[package] = version
-    return observed
 
 
 def verify_source_imports(reference: Path) -> None:
@@ -427,72 +329,40 @@ def prepare_evaluators(root: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("reference", "evaluators", "devices", "shard"))
+    parser.add_argument("stage", choices=("reference", "model", "evaluators", "devices"))
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--env-output", type=Path)
-    parser.add_argument("--case-shard")
     args = parser.parse_args()
     if args.stage == "evaluators":
         print(prepare_evaluators(args.root.resolve()))
-    elif args.stage == "shard":
-        if args.profile is None or args.case_shard is None:
-            parser.error("shard needs --profile and --case-shard")
-        settings = profile_for_case_shard(read_json(args.profile), args.case_shard)
-        settings["case_shard"]["source_sha256"] = sha256(args.profile)
-        output = args.root.resolve() / "profile.json"
-        write_json(output, settings)
-        print(output)
-    elif args.stage == "devices":
-        if args.profile is None:
-            parser.error("devices needs --profile")
-        settings = read_json(args.profile)
+        return
+    if args.profile is None:
+        parser.error("--profile is required")
+    settings = read_json(args.profile)
+    if args.stage == "devices":
         prepare = prepare_npu_allocation if settings["platform"] == "npu" else prepare_cuda_allocation
         print(prepare(settings, args.root.resolve() / "allocation.json"))
-    else:
-        if args.profile is None:
-            parser.error("reference needs --profile")
-        settings = read_json(args.profile)
-        inference_runtime = verify_inference_runtime(
-            settings["platform"], profile_runtime=settings.get("inference_runtime")
-        )
+        return
+    runtime = verify_inference_runtime(settings["platform"])
+    if args.stage == "reference":
         checkout(args.root.resolve(), settings["reference_repository"], settings["reference_revision"])
         verify_source_imports(args.root)
-        model = os.environ.get("LINGBOT_MODEL_PATH")
-        if model is None:
-            lock = read_json(ROOT / "tests/dfx/lingbot_world/assets.lock.json")
-            # Use the CLI so runtime hub access remains owned by the existing
-            # model-loading stack, not another Python Hub API wrapper.
-            model = (
-                subprocess.check_output(
-                    ["hf", "download", lock["model_id"], "--revision", lock["model_revision"], "--quiet"],
-                    text=True,
-                    timeout=7200,
-                    # NPU CI defaults to offline inference. This explicit,
-                    # pinned provisioning subprocess needs Hub access.
-                    env={**os.environ, "HF_HUB_OFFLINE": "0"},
-                )
-                .strip()
-                .splitlines()[-1]
+    model = os.environ.get("LINGBOT_MODEL_PATH")
+    if model is None:
+        lock = read_json(ROOT / "tests/dfx/lingbot_world/assets.lock.json")
+        model = (
+            subprocess.check_output(
+                ["hf", "download", lock["model_id"], "--revision", lock["model_revision"], "--quiet"],
+                text=True,
+                timeout=7200,
+                env={**os.environ, "HF_HUB_OFFLINE": "0"},
             )
-        if args.env_output:
-            from tests.dfx.lingbot_world.resources import collect_resources
-
-            model_path = Path(model).resolve()
-            lock = read_json(ROOT / "tests/dfx/lingbot_world/assets.lock.json")
-            weight = next(
-                path
-                for path in lock["model_files"]
-                if path.startswith("transformer/") and path.endswith(".safetensors")
-            )
-            write_json(
-                args.env_output,
-                {
-                    "model_path": str(model_path),
-                    "resources": collect_resources(model_path / weight),
-                    "inference_runtime": inference_runtime,
-                },
-            )
+            .strip()
+            .splitlines()[-1]
+        )
+    if args.env_output:
+        write_json(args.env_output, {"model_path": str(Path(model).resolve()), "inference_runtime": runtime})
 
 
 if __name__ == "__main__":

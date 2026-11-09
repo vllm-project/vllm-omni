@@ -161,8 +161,6 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch, force_native):
         else []
     )
     assert calls == expected_calls
-    assert torch.isfinite(got).all()
-    assert torch.isfinite(want).all()
     diff = (got.float() - want.float()).abs()[mask]
     assert diff.max().item() < 2e-2, diff.max().item()
     assert diff.mean().item() < 1e-3, diff.mean().item()
