@@ -110,11 +110,59 @@ about 3.4x on a 910B1. A stage a CUDA ledger flags as precision bound can
 already sit near its roofline on Ascend, so recompute the term instead of
 carrying the conclusion across.
 
+A stage has both terms; its device floor is the roofline maximum, not the sum:
+
+```text
+g_device_i = max(flops_i / peak_flops(dtype), bytes_i / HBM_bandwidth)
+```
+
+Pass the bytes of a compute stage (activations, weights per micro-batch) when
+they are known; a stage whose memory term wins is not helped by lower
+precision matmuls.
+
+### Launch term
+
+Each kernel costs a launch latency `alpha` (measured by `measure_peaks.py`:
+eager PyTorch dispatch per op, or per node of a replayed graph). A stage runs
+one step at a time in its own process, so at batch `B`
+
+```text
+l_i = alpha(mode) * kernels_per_step * steps_per_audio_second / B
+serial_i = max(g_device_i, l_i)
+X <= min(N / sum_i g_device_i, min_i 1 / serial_i)
+```
+
+`steps_per_audio_second` is per sequence: codec tokens per audio second for a
+talker, text tokens for a thinker, chunks times sampling steps for a flow
+model. Launch time is host or front-end time, not device busy time, so it
+enters the stage's serial floor and leaves the shared-device sum alone. It is
+the term that binds at concurrency 1 and in stages that fall back to eager
+above their graph batch limit; use `alpha(eager)` for those.
+
+Count `kernels_per_step` from an nsys trace of that stage (kernels between two
+step markers), not from the module tree; fused and library kernels differ.
+For an eager stage, PyTorch ops per step is the closer count, since `alpha(eager)`
+is per op.
+
+### What the bound does not model
+
+Kernel execution and launch latency only. Host scheduling, connector and
+shared-memory transfer between stages, request queueing, chunk hand-off and
+Python output processing are not priced. A cell whose measured RTF is far above
+this bound while the device idles points at those costs; say so in the report
+instead of attributing the gap to kernels.
+
 ## Reading the ledger
 
 - `sum_i g_i_measured` versus `N / X`: the difference is idle time.
-- `g_i_measured / g_i_bound`: how far a stage is from its roofline. Above
-  about 3x, kernel or batching work is likely to pay; near 1x, only
-  algorithmic changes (fewer steps, smaller model, lower precision) help.
+- % of SOL per stage, `g_device_i / g_i_measured` (at most 100%): how close
+  a stage is to its roofline. Below about 30%, kernel or batching work is
+  likely to pay; near 100%, only algorithmic changes (fewer steps, smaller
+  model, lower precision) help. Above 100% means an input is wrong.
+- Cell % of SOL, `RTF_bound / aggregate_RTF`: the headline. Name the binding
+  term next to it (shared device or one stage's serial floor) and that
+  stage's bound class (compute, memory or launch).
 - Large `g_i` with low batch reached: raise admission or graph batch
   limits before touching kernels.
+- Launch-bound stage: raise graph coverage (capture sizes, graph batch
+  limits) or fuse; kernel speedups will not move it.

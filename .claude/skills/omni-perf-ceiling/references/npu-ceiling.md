@@ -138,10 +138,17 @@ Two consequences for the bounds:
 - HF32 sits between fp32 and bf16 rather than near bf16. Name the dtype the
   stage actually runs in, and check whether HF32 is enabled at all
   (`torch.npu.matmul.allow_hf32`), since the bound changes by 1.5x with it.
+- The launch term is re-measured, not ported. `measure_peaks.py` times eager
+  `torch_npu` dispatch and, when `torch.npu.NPUGraph` capture works on the
+  installed release, ACL graph replay; a null `graph` means only the eager
+  value is grounded. Kernel counts per step also change with the backend's
+  kernels and fusion, so recount them from an `msprof` capture of the stage.
+  The table above predates the launch measurement.
 
 Weight bytes, codec token rates and FLOPs per audio second are properties of
 the model, not the device, so they carry over from a CUDA ledger unmodified.
-Only the peaks and the measured `g_i` need re-measuring.
+Only the peaks, the launch latency, the kernel counts and the measured `g_i`
+need re-measuring.
 
 ## Envelope levers
 

@@ -52,7 +52,10 @@ Do not use one model for both. Derivations:
   the maximum audio throughput:
   `audio_throughput <= N_gpu / sum_i g_i(B)`, where `g_i(B)` is GPU-seconds
   that stage `i` spends per second of audio at batch `B`. Measure `g_i`,
-  bound each `g_i`, add them up.
+  bound each `g_i`, add them up. A stage also runs its steps serially in one
+  process, so `audio_throughput <= 1 / max(g_i, l_i)` per stage, where `l_i`
+  is its kernel-launch time per audio second. Small batches and eager
+  fallbacks make that launch term bind before the device does.
 
 ## Workflow
 
@@ -97,12 +100,25 @@ Do not use one model for both. Derivations:
    count.
 
 7. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
-   memory bandwidth and dense matmul throughput. Bound autoregressive decode
-   by bytes read per step, compute stages by FLOPs per audio second (torch
-   profiler `with_flops` on that stage, or analytic counts). State which
-   bound is analytic and which is measured.
+   memory bandwidth, dense matmul throughput and per-kernel launch latency
+   (eager and graph replay). Give each stage three terms: compute (FLOPs per
+   audio second from `FlopCounterMode` or analytic counts), memory (weights
+   plus KV read per decode step, or bytes moved), and launch (kernels per step
+   times steps per audio second, at the stage's eager or graph mode). The
+   stage floor is `max(compute, memory)` on the device and `max(device,
+   launch)` in its own process; the larger term names the stage's bound class.
+   Write each term's formula with the numbers substituted so it can be
+   re-checked, and state which inputs are measured and which analytic.
 
-8. **Report.** Fill the template below. Hand the largest gap to
+8. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
+   flags so `ceiling_report.py` joins each term to that stage's measured
+   `g_i` and reports its % of SOL (bound / measured, at most 100%). A stage
+   far below SOL with a compute or memory bound needs kernel or batching
+   work; a launch-bound stage needs graph coverage or fewer, larger kernels.
+   Measured RTF far above the whole bound, with high GPU idle, is host,
+   scheduling or inter-stage transfer, which the bound does not price.
+
+9. **Report.** Fill the template below. Hand the largest gap to
    `omni-perf-opt` as its first candidate.
 
 ## Rules
@@ -115,6 +131,14 @@ Do not use one model for both. Derivations:
 - Physical bounds are lower limits on time, not predictions. Name the
   dominant term and the assumptions it hides (perfect batching, no host
   overhead, peak bandwidth).
+- Peaks and launch latency come from `measure_peaks.py` on the device in
+  hand, never from memory or a data sheet. Structural inputs (weight bytes,
+  KV bytes, codec rate, FLOPs) come from the checkpoint and the result JSON.
+  A term that cannot be grounded is written as "not bounded: <reason>",
+  never estimated to fill the column.
+- A stage measured below its own bound (% of SOL above 100%) means the work
+  count, the peak or the attribution is wrong. Fix the input before reading
+  the ledger.
 - Report the regime for each cell. Do not extrapolate a high-concurrency
   RTF from low-concurrency runs, or the reverse.
 - A cell whose throughput is still rising with concurrency is not saturated;
@@ -132,11 +156,11 @@ Do not use one model for both. Derivations:
 
 ```markdown
 ## Ceiling summary
-| Cell | Measured | Envelope (config) | Bound | Binding stage |
-|------|----------|-------------------|-------|---------------|
-| RTF C1 (mean / aggregate) | | | | |
-| RTF C64 (mean / aggregate) | | | | |
-| Audio throughput C64 (audio-s/s) | | | | |
+| Cell | Measured | Envelope (config) | Bound | % of SOL | Binding term |
+|------|----------|-------------------|-------|----------|--------------|
+| RTF C1 (mean / aggregate) | | | | | |
+| RTF C64 (mean / aggregate) | | | | | |
+| Audio throughput C64 (audio-s/s) | | | | | |
 
 ## Setup
 - vllm-omni <sha>, vllm <ver>, <GPU>, driver
@@ -144,12 +168,17 @@ Do not use one model for both. Derivations:
 - Workload: dataset, prompts, warmup, extra body
 
 ## Headroom ledger (C<high>)
-| Stage | Time share | g_i (GPU-s per audio-s) | Bound g_i | Gap | Next lever |
-|-------|-----------|-------------------------|-----------|-----|------------|
-| Stage 0 | | | | | |
-| Stage 1 | | | | | |
-| Stage 2 | | | | | |
-| GPU idle / host | | | 0 | | |
+| Stage | Time share | g_i (GPU-s per audio-s) | Bound g_i | % of SOL | Bound class | Launch floor | Next lever |
+|-------|-----------|-------------------------|-----------|----------|-------------|--------------|------------|
+| Stage 0 | | | | | | | |
+| Stage 1 | | | | | | | |
+| Stage 2 | | | | | | | |
+| GPU idle / host | | | 0 | | host | | |
+
+## Bound arithmetic
+[Per stage: each term's formula with numbers substituted, its source
+(measured peak, checkpoint, result JSON, FLOP counter, analytic), and any
+term left "not bounded: <reason>"]
 
 ## Checks
 - Little's law: C / audio_throughput vs aggregate RTF

@@ -77,11 +77,36 @@ in the result JSON (stage `num_tokens_out` over stage-2 `audio_duration_s`):
 
 ```bash
   --peaks $OUT/peaks.json \
-  --decode-bound thinker=<weight_gib>,<text_tokens_per_audio_s> \
-  --decode-bound talker=<weight_gib>,<codec_tokens_per_audio_s> \
-  --compute-bound cfm=<tflop_per_audio_s>,tf32 \
-  --compute-bound vocoder=<tflop_per_audio_s>,fp32
+  --decode-bound thinker@0=<weight_gib>,<text_tokens_per_audio_s>,<kv_gib_per_seq> \
+  --decode-bound talker@1=<weight_gib>,<codec_tokens_per_audio_s>,<kv_gib_per_seq> \
+  --compute-bound code2wav@2=<cfm_tflop_per_audio_s>,tf32 \
+  --compute-bound code2wav@2=<vocoder_tflop_per_audio_s>,fp32 \
+  --launch-bound talker@1=<kernels_per_step>,<codec_tokens_per_audio_s>,graph \
+  --launch-bound code2wav@2=<kernels_per_chunk>,<chunks_per_audio_s>,eager
 ```
+
+`@STAGE` is the stage id used by `--stage-util` or `--pmon`; with it the
+report prints each stage's measured `g_i` beside its bound and the % of SOL.
+Terms with the same name add up per class (CFM and vocoder above), and the
+stage's floor is the larger of its compute and memory sums. KV GiB per
+sequence is the KV cache at the mean context length of the workload (layers x
+2 x KV heads x head dim x bytes x tokens); omit it for short contexts. Use
+`graph` launch latency for steps that replay a captured graph at the cell's
+batch and `eager` for steps that fall back (check the startup log for the
+graph batch limit).
+
+Count kernels per step from one short nsys capture of the stage, in a run
+that produces no timing numbers:
+
+```bash
+nsys profile -t cuda,nvtx --cuda-graph-trace node -o $OUT/c64_nsys \
+  vllm serve ... &   # same deploy, profiling only
+nsys stats -r cuda_gpu_kern_sum $OUT/c64_nsys.nsys-rep
+```
+
+Divide the stage process's kernel count by the number of steps it ran in the
+window. `--cuda-graph-trace node` is needed to see kernels inside replayed
+graphs.
 
 Count compute-stage FLOPs on CPU with `torch.utils.flop_counter.FlopCounterMode`
 around one forward of the stage's module at a representative chunk shape,
@@ -118,6 +143,12 @@ Choose the cheapest method that the hardware allows.
    batch sizes and time it. This gives the `g_i(B)` curve directly, including
    batch sizes the deployment cannot reach.
 
+4. **Per-kernel correlation (diagnosis only).** When a stage sits far below
+   SOL, the nsys capture above, grouped by kernel name, shows which ops own
+   the stage's time; `ncu` on its top kernels gives their compute and memory
+   SOL%. This locates the gap inside the stage; it does not replace `g_i`,
+   and profiled runs never supply timing numbers.
+
 `--print-stage` `stage_gen_time` is per-request wall time inside a stage.
 Under batching it overlaps across requests and is not GPU time; use it for
 the low-concurrency bound and for spotting the slowest stage, not for `g_i`.
@@ -147,7 +178,11 @@ python .claude/skills/omni-perf-ceiling/scripts/measure_peaks.py --json $OUT/pea
 Run it on an otherwise idle device. It reports copy bandwidth and dense matmul
 throughput for BF16, FP16, IEEE FP32, and the device's reduced-precision FP32
 mode: TF32 on CUDA, HF32 on Ascend. `--device` forces a backend when both are
-importable.
+importable. `launch_latency_us` holds the per-op cost of tiny kernels issued
+eagerly (`eager`, PyTorch dispatch included) and replayed from a captured
+graph (`graph`); `graph` is null when capture is not available. Launch latency
+depends on the host CPU as well as the device, so measure it on the serving
+host.
 
 ## Pitfalls
 
@@ -158,5 +193,7 @@ importable.
 - Mixed output modes: a single-file engine and a streaming engine differ in
   work per request.
 - Profilers on: never report profiler-enabled latency or throughput.
+- Bounds without arithmetic: a bound column that cannot be recomputed from the
+  report's substituted formulas is not evidence.
 - Shared hosts: record other processes on the device; GPU utilisation from
   another tenant invalidates the attribution.
