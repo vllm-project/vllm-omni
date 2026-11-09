@@ -2343,4 +2343,3 @@ def test_warmup_capture_forces_moe_routing_key_when_specializing(monkeypatch, ke
     assert len(calls) == 2  # one warmup + one capture
     for _, kwargs in calls:
         assert kwargs["force_moe_routing_key"] == int(key)
-
