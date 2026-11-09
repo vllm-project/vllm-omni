@@ -38,7 +38,10 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import lru_cache
 from importlib.util import find_spec
+from inspect import signature
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +62,120 @@ _HEADS_PER_PROGRAM = 8
 # program (bitwise-identical to four; faster in 51 of 52 measured H200 cases
 # across 320 to 16K tokens and 8 to 64 heads, slower only at 20 heads, by 2.6%).
 _INTERLEAVED_HEADS_PER_PROGRAM = 8
+
+
+@lru_cache(maxsize=1)
+def _load_norm_rope_concat() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+    """Resolve the optional public API on first use and cache it for this process."""
+    if not current_omni_platform.is_npu() or find_spec("mindiesd") is None:
+        return None
+    import mindiesd
+
+    op = getattr(mindiesd, "norm_rope_concat", None)
+    if not callable(op) or not {"input_layout", "output_layout"} <= signature(op).parameters.keys():
+        return None
+    return op
+
+
+def norm_rope_concat_available(device: torch.device) -> bool:
+    """Whether the public norm_rope_concat layout API is available on this device."""
+    return device.type == "npu" and _load_norm_rope_concat() is not None
+
+
+def prepare_norm_rope_concat_tables(
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleaved: bool,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand real [local_sequence, rotary_dim / 2] tables once per forward.
+
+    Returns (cos, sin), each [local_sequence, rotary_dim], shared by batches
+    and heads. Call after sequence sharding, including any padded positions.
+    Complex frequencies and model-specific position selection belong to callers.
+    """
+    if interleaved:
+        return cos.to(dtype).repeat_interleave(2, dim=-1), sin.to(dtype).repeat_interleave(2, dim=-1)
+    return torch.cat((cos, cos), dim=-1).to(dtype), torch.cat((sin, sin), dim=-1).to(dtype)
+
+
+def _norm_rope_concat_inputs_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor],
+    head_dim: int,
+    rotary_dim: int,
+) -> bool:
+    # The current SD kernel has full-head rotary and equal Q/K/V head counts.
+    # It accepts packed projection views: its Python wrapper owns input copies.
+    if q.ndim != 4 or min(q.shape) <= 0 or k.shape != q.shape or v.shape != q.shape:
+        return False
+    if not (head_dim == q.shape[-1] == rotary_dim and head_dim % 2 == 0 and head_dim <= 1024):
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    if q_weight.shape != (head_dim,) or k_weight.shape != (head_dim,):
+        return False
+    cos, sin = norm_rope_concat_tables
+    if cos.shape != (q.shape[1], rotary_dim) or sin.shape != cos.shape:
+        return False
+    return all(t.device == q.device and t.dtype == q.dtype for t in (k, v, q_weight, k_weight, cos, sin))
+
+
+def try_fused_qkv_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor],
+    eps: float,
+    *,
+    head_dim: int,
+    rotary_dim: int,
+    interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Try single-stream affine RMSNorm + RoPE, returning logical BSND Q/K/V.
+
+    Inputs are [batch, local_sequence, local_heads, head_dim]; ``norm_rope_concat_tables``
+    is (cos, sin), each [local_sequence, rotary_dim], in the activation dtype.
+    Outputs may be noncontiguous. V is unchanged numerically, but may be copied.
+    Only fresh projected tokens belong here: cached keys are already rotated.
+
+    Unsupported inputs/dependencies return None so the caller can preserve its
+    own numerical reference. Kernel execution errors propagate. The SD kernel
+    composes norm/rotation in FP32 before its final cast, so it need not be
+    bitwise identical to a chain that rounds the normalized activation first.
+    """
+    if torch.is_grad_enabled() or torch.compiler.is_compiling() or not norm_rope_concat_available(q.device):
+        return None
+    if not _norm_rope_concat_inputs_supported(
+        q, k, v, q_weight, k_weight, norm_rope_concat_tables, head_dim, rotary_dim
+    ):
+        return None
+    op = _load_norm_rope_concat()
+    if op is None:
+        return None
+    cos, sin = norm_rope_concat_tables
+    outputs = op(
+        q,
+        k,
+        v,
+        input_layout="BSND",
+        output_layout="BSND",
+        norm_query_weight=q_weight,
+        norm_key_weight=k_weight,
+        rope_cos=cos,
+        rope_sin=sin,
+        norm_type=4,
+        rope_type=1 if interleaved else 2,
+        eps=eps,
+    )
+    return outputs[0], outputs[1], outputs[2]
 
 
 def _apply_rope_table(
