@@ -368,8 +368,12 @@ def _apply_block_path_overrides(
                         f"Text encoder {path!r} stages itself on demand and does not support "
                         "streaming its blocks; layer_options['text_encoder'].block_paths cannot apply to it"
                     )
-            for block_path in block_paths:
-                _check_block_path_override(module, component, path, block_path)
+            # Distributed models may hold an unloaded stub on ranks where the
+            # component never runs; get_encoder_block_groups() treats that as
+            # a local no-op, so only the loaded rank validates the override.
+            if getattr(module, "is_loaded", True) is not False:
+                for block_path in block_paths:
+                    _check_block_path_override(module, component, path, block_path)
             overrides[component][path] = block_paths
     return replace(
         base,

@@ -85,6 +85,20 @@ class _StagedWrapper(nn.Module):
         self._stager.offload()
 
 
+class _RankStagedWrapper(_StagedWrapper):
+    """MAGI-2 rank roles: the output rank wraps the encoder, others an identity stub."""
+
+    def __init__(self, *, output_rank: bool):
+        super().__init__()
+        if not output_rank:
+            self.module = nn.Identity()
+            self._stager = LayerwiseAwareStager(self, self.module, CPU, pin_memory=False)
+
+    @property
+    def is_loaded(self) -> bool:
+        return not isinstance(self.module, nn.Identity)
+
+
 class _LegacyStagedEncoder(nn.Module):
     """On-demand encoder that always stages its whole module."""
 
@@ -220,6 +234,26 @@ class TestResolver:
 
         with pytest.raises(ValueError, match="does not support streaming its blocks"):
             resolve_offload_plan(pipeline, _config({"text_encoder"}, {"text_encoder": ("module.text_model.layers",)}))
+
+    @pytest.mark.parametrize("output_rank", [True, False])
+    def test_text_encoder_override_on_both_rank_roles(self, output_rank):
+        pipeline = _pipeline(_RankStagedWrapper(output_rank=output_rank), on_demand=True)
+
+        resolved = resolve_offload_plan(
+            pipeline, _config({"text_encoder"}, {"text_encoder": ("module.text_model.layers",)})
+        )
+
+        stacks = [stack for encoder in resolved.encoders for stack in encoder.stacks]
+        if output_rank:
+            assert [stack.blocks for stack in stacks] == [tuple(pipeline.text_encoder.module.text_model.layers)]
+        else:
+            assert stacks == []
+
+    def test_wrong_path_still_fails_on_the_loaded_rank(self):
+        pipeline = _pipeline(_RankStagedWrapper(output_rank=True), on_demand=True)
+
+        with pytest.raises(ValueError, match="not a streamable block list"):
+            resolve_offload_plan(pipeline, _config({"text_encoder"}, {"text_encoder": ("module.text_model.blocks",)}))
 
 
 class TestNonBlockModules:
