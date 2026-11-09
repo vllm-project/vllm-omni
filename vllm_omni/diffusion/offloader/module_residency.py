@@ -335,6 +335,14 @@ def _set_storage_preserving_inference(target: torch.Tensor, value: torch.Tensor)
         set_tensor_storage(target, value)
 
 
+def _view_preserving_inference(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:
+    # Creating a view while inference mode is enabled makes that view an
+    # inference tensor. Build it under the target's mode so rebinding a normal
+    # Parameter keeps its version counter available for cache invalidation.
+    with torch.inference_mode(_local_tensor(binding.target).is_inference()):
+        return _view_from_backing(backing, binding)
+
+
 def _move_module_to_packed_pinned_cpu(
     module: nn.Module,
     *,
@@ -385,7 +393,9 @@ def _move_module_to_packed_pinned_cpu(
         logger.debug("Packed pinned-host allocation failed; using ordinary tensor movement", exc_info=True)
         return None
     replacements = [
-        (binding.target, _view_from_backing(group.master, binding)) for group in groups for binding in group.bindings
+        (binding.target, _view_preserving_inference(group.master, binding))
+        for group in groups
+        for binding in group.bindings
     ]
     originals = [target.data for target, _ in replacements]
     committed = 0
@@ -493,7 +503,10 @@ class PinnedModuleStager:
         # cannot acquire a version counter by rebinding its storage either.
         for storage, group in zip(storages, self._groups):
             for binding in group.bindings:
-                _set_storage_preserving_inference(binding.target, self._view(storage, binding))
+                _set_storage_preserving_inference(
+                    binding.target,
+                    _view_preserving_inference(storage, binding),
+                )
 
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
