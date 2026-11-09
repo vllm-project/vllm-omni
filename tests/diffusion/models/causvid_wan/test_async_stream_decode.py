@@ -11,10 +11,12 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.causvid_wan import async_stream_decode as asd_mod
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
     _async_host_copy,
     _start_local,
 )
+from vllm_omni.diffusion.worker.request_chunk_emit import bind_emit_chunk, reset_emit_chunk
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -60,6 +62,26 @@ def test_async_host_copy_cpu_path():
     assert event is None
     assert host.device.type == "cpu"
     assert torch.equal(host, latent)
+
+
+def test_local_on_chunk_emits_each_chunk_and_join_returns_none():
+    vae = _FakeVae()
+    decoder = _FakeDecoder()
+    seen: list[int] = []
+
+    def on_chunk(idx: int, pixels: torch.Tensor) -> None:
+        seen.append(idx)
+        assert pixels.shape[1] == 3
+
+    job = _start_local(vae=vae, decoder=decoder, session_id="req-chunk", on_chunk=on_chunk)
+    assert job.on_finished is not None
+    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
+    job.on_finished(1, torch.randn(1, 4, 2, 4, 4))
+    assert job.join() is None
+    assert seen == [0, 1]
+    assert decoder.chunks == 2
+    assert job.streams_to_client is True
+    assert job.emitted_chunks == 2
 
 
 def test_local_sidepath_does_not_decode_inside_on_finished():
@@ -169,3 +191,74 @@ def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
             timeline_file=None,
         )
     assert cancelled == [True]
+
+
+def test_stream_decode_on_chunk_when_request_streaming_bound(monkeypatch):
+    captured: dict[str, object] = {}
+    emitted: list[DiffusionOutput] = []
+
+    def _fake_start(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(on_finished=None, cancel=lambda: None)
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_stream_decode",
+        _fake_start,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.WanCell",
+        lambda *_a, **_k: SimpleNamespace(),
+    )
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline.vae = None
+    pipeline.transformer = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(streaming_output=True)
+    token = bind_emit_chunk(emitted.append)
+    try:
+        pipeline._start_stream_decode_and_wan_cell(
+            kv_id="kv-stream",
+            n_chunks=3,
+            latent_shape=(1, 4, 1, 1, 1),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            seed=0,
+            prompt_embeds=torch.zeros(1, 1, 1),
+            sampler=SimpleNamespace(),
+            stream_decode=True,
+            finish_rank=0,
+            source_rank=None,
+            pp_rank=0,
+            pp_group=None,
+            timeline_file=None,
+        )
+        on_chunk = captured["on_chunk"]
+        assert callable(on_chunk)
+        on_chunk(1, torch.zeros(1, 3, 2, 2, 2))
+    finally:
+        reset_emit_chunk(token)
+
+    assert len(emitted) == 1
+    assert emitted[0].finished is False
+    assert emitted[0].chunk_index == 1
+    assert emitted[0].total_chunks == 3
+    assert CausVidWanPipeline.supports_request_streaming_output is True
+
+
+def test_local_on_chunk_does_not_accumulate():
+    vae = _FakeVae()
+    decoder = _FakeDecoder()
+    seen: list[tuple[int, tuple[int, ...]]] = []
+
+    def on_chunk(idx: int, pixels: torch.Tensor) -> None:
+        seen.append((idx, tuple(pixels.shape)))
+
+    job = _start_local(vae=vae, decoder=decoder, session_id="req-stream", on_chunk=on_chunk)
+    assert job.streams_to_client is True
+    assert job.on_finished is not None
+    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
+    job.on_finished(1, torch.randn(1, 4, 2, 4, 4))
+    video = job.join()
+    assert video is None
+    assert decoder.chunks == 2
+    assert seen == [(0, (1, 3, 2, 4, 4)), (1, (1, 3, 2, 4, 4))]
+    assert job.emitted_chunks == 2

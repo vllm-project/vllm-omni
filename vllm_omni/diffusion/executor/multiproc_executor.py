@@ -220,6 +220,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # wait_output_ready() fails fast instead of hanging on a new Future.
         self._dropped_output_ids: OrderedDict[str, None] = OrderedDict()
         self._futures_lock = threading.RLock()
+        self._chunk_ready_handler: Callable[..., None] | None = None
         self._pump_running = False
         self._pump_stop = threading.Event()
         # When pumps are active they are the sole readers of the worker result
@@ -527,6 +528,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     ) -> None:
         """Register a callback invoked when a worker process dies."""
         self._failure_callbacks.append(callback)
+
+    def register_chunk_ready_handler(
+        self,
+        handler: Callable[[str, str | None, int, DiffusionOutput | None, str | None], None] | None,
+    ) -> None:
+        """Register the engine callback for in-flight ``CHUNK_READY`` media.
+
+        The result pump unpacks shared memory, caches the payload for
+        ``wait_output_ready``, then calls ``handler`` without holding
+        ``_futures_lock`` and without resolving the execute RPC future.
+        """
+        self._chunk_ready_handler = handler
 
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPCs.
@@ -941,6 +954,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         Dispatches AsyncDiffusionOutput messages to the appropriate future:
         * RPC_RESULT / COMPUTE_DONE → _rpc_futures[rpc_id]
         * OUTPUT_READY → _output_futures[async_output_id]
+        * CHUNK_READY → wait_output_ready cache, then the chunk handler.
+          The execute RPC future stays pending.
         """
         result_mq = result_mq or self._result_mq
         if result_mq is None:
@@ -972,7 +987,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # is the only receive-side path that unlinks named SHM segments,
             # and the closed-time re-checks under _futures_lock already
             # prevent any cache write after unpack.
-            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
+            if self._closed and msg.kind not in (
+                AsyncOutputKind.OUTPUT_READY,
+                AsyncOutputKind.CHUNK_READY,
+            ):
                 continue
 
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
@@ -983,6 +1001,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         try_set_exception(fut, RuntimeError(msg.error))
                     else:
                         try_set_result(fut, msg)
+            elif msg.kind == AsyncOutputKind.CHUNK_READY:
+                self._deliver_chunk_ready(msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
                 with self._futures_lock:
@@ -1015,6 +1035,59 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                 # we were unpacking; drop this delivery.
                                 continue
                             self._finish_output(batch_id, output_result, exc)
+
+    def _deliver_chunk_ready(self, msg: AsyncDiffusionOutput) -> None:
+        """Unpack one in-flight chunk and notify the engine.
+
+        ``CHUNK_READY`` does not resolve ``_rpc_futures``. A successful payload
+        is cached like ``OUTPUT_READY`` so ``wait_output_ready`` can materialize
+        it. The handler runs without ``_futures_lock``. A closed executor still
+        unpacks so named SHM segments are unlinked, then drops the payload.
+        """
+        output_result: DiffusionOutput | None = None
+        exc: Exception | None = None
+        if msg.output is not None and not msg.error:
+            try:
+                unpack_diffusion_output_shm(msg.output)
+                output_result = msg.output
+            except Exception as e:
+                logger.exception("SHM unpack failed for chunk %s", msg.async_output_id)
+                exc = e
+        elif msg.error:
+            exc = RuntimeError(msg.error)
+            if msg.output is not None:
+                try:
+                    unpack_diffusion_output_shm(msg.output)
+                except Exception:
+                    logger.exception("SHM reclaim failed for chunk %s", msg.async_output_id)
+
+        if self._closed:
+            return
+
+        async_output_id = msg.async_output_id
+        if output_result is not None and async_output_id and output_result.async_output_id is None:
+            output_result.async_output_id = async_output_id
+
+        if async_output_id and output_result is not None and exc is None:
+            with self._futures_lock:
+                if self._closed:
+                    return
+                self._finish_output(async_output_id, output_result, None)
+
+        handler = getattr(self, "_chunk_ready_handler", None)
+        if handler is None:
+            return
+        error = None if exc is None else str(exc)
+        try:
+            handler(
+                msg.request_id or "",
+                msg.execution_id if msg.execution_id is not None else msg.rpc_id,
+                -1 if msg.chunk_index is None else msg.chunk_index,
+                output_result,
+                error,
+            )
+        except Exception:
+            logger.exception("CHUNK_READY handler failed for %s", async_output_id)
 
     def _finish_output(
         self,

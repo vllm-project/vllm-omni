@@ -2035,11 +2035,16 @@ class AsyncOutputKind(Enum):
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
+    * ``CHUNK_READY`` — one in-order decoded chunk from a still-running
+      request forward. Does not complete the RPC future and does not mark
+      compute done. The final ``COMPUTE_DONE`` / ``OUTPUT_READY`` pair is
+      still the execution return.
     """
 
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"
+    CHUNK_READY = "chunk_ready"
 
 
 @dataclass
@@ -2049,6 +2054,11 @@ class AsyncDiffusionOutput:
     In request-mode (``step_execution=False``), all ``result_mq``
     messages use this envelope.  The ``kind`` field routes the message
     to the correct consumer.
+
+    ``CHUNK_READY`` carries the request and the worker RPC id
+    (``execution_id``) plus ``chunk_index``. The executor caches the
+    unpacked payload under ``async_output_id`` and notifies the engine.
+    It must not resolve ``_rpc_futures``.
     """
 
     kind: AsyncOutputKind
@@ -2057,6 +2067,9 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    request_id: str | None = None
+    execution_id: str | None = None
+    chunk_index: int | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

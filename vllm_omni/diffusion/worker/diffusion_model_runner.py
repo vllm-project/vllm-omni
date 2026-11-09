@@ -407,7 +407,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
 
-        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
+        supports_request_streaming = (
+            self.pipeline is not None
+            and getattr(self.pipeline, "supports_request_streaming_output", False) is True
+        )
+        if (
+            self.od_config.streaming_output
+            and not getattr(self.od_config, "step_execution", False)
+            and not supports_request_streaming
+        ):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
 
@@ -417,9 +425,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if self.od_config.streaming_output and not self._supports_step_mode():
+        if (
+            self.od_config.streaming_output
+            and not self._supports_step_mode()
+            and not supports_request_streaming
+        ):
             raise ValueError(
-                "streaming_output=True requires step execution support; "
+                "streaming_output=True requires step execution support or "
+                "supports_request_streaming_output; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 

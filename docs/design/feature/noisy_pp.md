@@ -24,6 +24,7 @@
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Testing](#testing)
+- [Streaming](#streaming)
 - [Open issues](#open-issues)
 - [Related](#related)
 
@@ -281,8 +282,21 @@ plus CausVid / Physis model resolve tests.
 GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 (`benchmarks/` / recipe smoke).
 
+## Streaming
+
+Request-mode CausVid (`supports_request_streaming_output=True`) emits in-order
+`CHUNK_READY` video chunks during one forward when `streaming_output=True`,
+without forcing `step_execution`. The engine owns the client stream. Intermediate
+chunks do not update the request scheduler, and a success final does not resend
+the full video. `stream_decode` only overlaps VAE decode; without
+`streaming_output` it still accumulates the clip. A gap or out-of-order chunk is
+a protocol error. An error after any delivered chunk finishes as an error.
+
 ## Open issues
 
+- Streaming: multi-GPU end-to-end coverage, reorder/buffering beyond in-order
+  chunks, and cross-request cell batching are still open. The request-path
+  `CHUNK_READY` output above is in for CausVid.
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).

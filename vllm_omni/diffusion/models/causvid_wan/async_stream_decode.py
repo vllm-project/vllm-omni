@@ -62,6 +62,13 @@ class AsyncStreamDecodeJob:
     join: Callable[[], torch.Tensor | None]
     _send_works: list = field(default_factory=list)
     _cancel: Callable[[], None] | None = None
+    # Client streaming: chunks were handed to ``on_chunk`` and are not accumulated.
+    streams_to_client: bool = False
+    _emitted: list[int] = field(default_factory=lambda: [0])
+
+    @property
+    def emitted_chunks(self) -> int:
+        return int(self._emitted[0]) if self._emitted else 0
 
     def cancel(self) -> None:
         """Stop side threads when the request is aborted before ``join()``."""
@@ -83,17 +90,21 @@ def start_async_stream_decode(
     source_rank: int | None,
     pp_group: Any,
     stream_group: Any,
+    on_chunk: Callable[[int, torch.Tensor], None] | None = None,
 ) -> AsyncStreamDecodeJob:
     """Wire producer (final denoise) → consumer (VAE owner) without blocking DiT.
 
     * Producer ``on_finished``: async D2H + queue; a send thread waits the copy
       then ``isend`` (or local queue for S=1 single-rank layer PP, G=1).
     * Consumer thread: ``irecv``/queue → rescale → ``decode_chunk``.
-    * ``join()`` waits side threads and returns concatenated pixels on owner,
-      else ``None``.
+    * ``on_chunk`` is client streaming: each decoded chunk is handed off and
+      not accumulated. ``join()`` then returns ``None``.
+    * Without ``on_chunk``, ``join()`` waits and returns concatenated pixels
+      on the owner, else ``None``. ``stream_decode`` overlap does not by
+      itself stream to the client.
     """
     if source_rank is None:
-        return _start_local(vae=vae, decoder=decoder, session_id=session_id)
+        return _start_local(vae=vae, decoder=decoder, session_id=session_id, on_chunk=on_chunk)
     if pp_group is None or source_rank == 0:
         raise ValueError("remote stream_decode needs vertical S (D or D+1) with source_rank != 0")
     if stream_group is None:
@@ -147,20 +158,28 @@ def start_async_stream_decode(
         recv_works = [dist.irecv(buf, src=source, group=stream_group) for buf in buffers]
         pixels_out: list[torch.Tensor] = []
         error: list[BaseException] = []
+        emitted = [0]
         cancelled = threading.Event()
 
         def _consumer() -> None:
             assert decoder is not None and vae is not None
             state = decoder.new_decode_state(session_id)
             try:
-                for buf, work in zip(buffers, recv_works):
+                for chunk_index, (buf, work) in enumerate(zip(buffers, recv_works)):
                     if cancelled.is_set():
                         break
                     work.wait()
                     if cancelled.is_set():
                         break
                     scaled = _rescale_latents(vae, buf)
-                    pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
+                    pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                    _record_decoded_chunk(
+                        pixels=pixels,
+                        chunk_index=chunk_index,
+                        on_chunk=on_chunk,
+                        pixels_out=pixels_out,
+                        emitted=emitted,
+                    )
             except BaseException as exc:  # noqa: BLE001
                 error.append(exc)
                 decoder.release(state)
@@ -174,6 +193,8 @@ def start_async_stream_decode(
             thread.join()
             if error:
                 raise error[0]
+            if on_chunk is not None:
+                return None
             if not pixels_out:
                 return None
             return torch.cat(pixels_out, dim=2)
@@ -190,7 +211,14 @@ def start_async_stream_decode(
                     session_id,
                 )
 
-        return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works, _cancel=cancel)
+        return AsyncStreamDecodeJob(
+            on_finished=None,
+            join=join,
+            _send_works=send_works,
+            _cancel=cancel,
+            streams_to_client=on_chunk is not None,
+            _emitted=emitted,
+        )
 
     def join() -> torch.Tensor | None:
         return None
@@ -198,11 +226,28 @@ def start_async_stream_decode(
     return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
 
 
+def _record_decoded_chunk(
+    *,
+    pixels: torch.Tensor,
+    chunk_index: int,
+    on_chunk: Callable[[int, torch.Tensor], None] | None,
+    pixels_out: list[torch.Tensor],
+    emitted: list[int],
+) -> None:
+    """Hand a chunk to the client emitter, or keep it for the final ``cat``."""
+    if on_chunk is not None:
+        on_chunk(chunk_index, pixels)
+        emitted[0] += 1
+        return
+    pixels_out.append(pixels)
+
+
 def _start_local(
     *,
     vae: Any | None,
     decoder: WanStreamingDecoder | None,
     session_id: str,
+    on_chunk: Callable[[int, torch.Tensor], None] | None = None,
 ) -> AsyncStreamDecodeJob:
     """Same-rank path: queue latents to a decode thread (S=1)."""
     if vae is None or decoder is None:
@@ -214,6 +259,7 @@ def _start_local(
     stop = object()
     pixels_out: list[torch.Tensor] = []
     error: list[BaseException] = []
+    emitted = [0]
 
     def _consumer() -> None:
         assert decoder is not None and vae is not None
@@ -223,11 +269,18 @@ def _start_local(
                 item = latent_q.get()
                 if item is stop:
                     break
-                _chunk, host, event = item
+                chunk_index, host, event = item
                 if event is not None:
                     event.synchronize()
                 scaled = _rescale_latents(vae, host)
-                pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
+                pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                _record_decoded_chunk(
+                    pixels=pixels,
+                    chunk_index=int(chunk_index),
+                    on_chunk=on_chunk,
+                    pixels_out=pixels_out,
+                    emitted=emitted,
+                )
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
             decoder.release(state)
@@ -246,6 +299,8 @@ def _start_local(
         thread.join()
         if error:
             raise error[0]
+        if on_chunk is not None:
+            return None
         if not pixels_out:
             return None
         return torch.cat(pixels_out, dim=2)
@@ -254,4 +309,10 @@ def _start_local(
         latent_q.put(stop)
         thread.join(timeout=5.0)
 
-    return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _cancel=cancel)
+    return AsyncStreamDecodeJob(
+        on_finished=on_finished,
+        join=join,
+        _cancel=cancel,
+        streams_to_client=on_chunk is not None,
+        _emitted=emitted,
+    )

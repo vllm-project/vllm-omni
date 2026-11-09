@@ -135,6 +135,18 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def register_chunk_ready_handler(
+        self,
+        handler: Callable[[str, str | None, int, DiffusionOutput | None, str | None], None] | None,
+    ) -> None:
+        """Receive request-mode ``CHUNK_READY`` chunks. Default is a no-op.
+
+        ``handler`` is ``(request_id, execution_id, chunk_index, output, error)``.
+        A chunk must not complete the in-flight execute RPC. Executors without
+        an async result pump keep this no-op.
+        """
+        return None
+
     def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
         """Resolve deferred output; only asynchronous executors implement this."""
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")

@@ -157,6 +157,11 @@ def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     return pipeline_supports(od_config, "supports_request_batch")
 
 
+def supports_request_streaming_output(od_config: OmniDiffusionConfig) -> bool:
+    """Whether one request forward can emit client chunks before compute done."""
+    return pipeline_supports(od_config, "supports_request_streaming_output")
+
+
 def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
     try:
         return max(1, int(getattr(od_config, "max_num_seqs", 1)))
@@ -226,6 +231,24 @@ class _StreamingPlayback:
     idle_since: float | None = None
     wait_started_at: float | None = None
     wait_seconds: float = 0.0
+
+
+@dataclass
+class _RequestStreamState:
+    """In-order request-mode chunk stream. The scheduler does not see these chunks."""
+
+    execution_id: str | None
+    next_chunk_index: int = 0
+    in_flight_bytes: int = 0
+    max_output_bytes: int = 64 * 1024 * 1024
+    cancelled: bool = False
+    chunk_emitted_count: int = 0
+    expect_streaming: bool = False
+    output_ack: bool = False
+    failed: bool = False
+    terminal_emitted: bool = False
+    error: str | None = None
+    retained_by_chunk: dict[int, int] = field(default_factory=dict)
 
 
 class DiffusionExecutionMode(str, Enum):
@@ -367,10 +390,18 @@ class DiffusionEngine:
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        if od_config.streaming_output and not self.step_execution:
-            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
-            od_config.step_execution = True
-            self.step_execution = True
+        self._pipeline_supports_request_streaming_output = False
+        streaming_output = getattr(od_config, "streaming_output", False) is True
+        if streaming_output and not self.step_execution:
+            if supports_request_streaming_output(od_config):
+                self._pipeline_supports_request_streaming_output = True
+                logger.info(
+                    "streaming_output=True with supports_request_streaming_output; keeping request batch execution."
+                )
+            else:
+                logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+                od_config.step_execution = True
+                self.step_execution = True
 
         if self.step_execution:
             self.supports_request_batch = False
@@ -388,6 +419,7 @@ class DiffusionEngine:
     def _init_executor(self, od_config: OmniDiffusionConfig) -> None:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
+        self.executor.register_chunk_ready_handler(self._on_request_chunk_ready)
 
     def _init_scheduler(
         self,
@@ -461,6 +493,7 @@ class DiffusionEngine:
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False
         self._streaming_playback = {}
+        self._request_chunk_states: dict[str, _RequestStreamState] = {}
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
@@ -896,6 +929,7 @@ class DiffusionEngine:
     def release_streaming_output(self, request_id: str, chunk_index: int) -> None:
         """Release the single output credit only after its downstream consumer resumes."""
         with self._cv:
+            self._release_request_chunk_bytes_locked(request_id, chunk_index)
             state = (self._streaming_playback or {}).get(request_id)
             if state is None or state.outstanding_chunk != chunk_index:
                 return
@@ -907,6 +941,183 @@ class DiffusionEngine:
             elif state.idle_since is not None:
                 state.idle_since = time.monotonic()
             self._cv.notify_all()
+
+    def _request_streaming_enabled(self) -> bool:
+        od_config = getattr(self, "od_config", None)
+        return (
+            getattr(self, "_pipeline_supports_request_streaming_output", False) is True
+            and getattr(self, "execution_mode", None) == DiffusionExecutionMode.REQUEST_BATCH
+            and getattr(od_config, "streaming_output", False) is True
+        )
+
+    def _track_request_streaming_request(self, request: OmniDiffusionRequest, request_id: str) -> None:
+        """Caller holds ``_cv``."""
+        if not self._request_streaming_enabled():
+            return
+        states = getattr(self, "_request_chunk_states", None)
+        if states is None:
+            states = {}
+            self._request_chunk_states = states
+        sampling = request.sampling_params
+        states[request_id] = _RequestStreamState(
+            execution_id=None,
+            max_output_bytes=int(sampling.streaming_max_output_bytes),
+            expect_streaming=True,
+            output_ack=bool(sampling.streaming_output_ack),
+        )
+
+    def _release_request_chunk_bytes_locked(self, request_id: str, chunk_index: int) -> None:
+        """Caller holds ``_cv``. Decrement in-flight bytes when the client acks a chunk."""
+        states = getattr(self, "_request_chunk_states", None)
+        if not states:
+            return
+        chunk_state = states.get(request_id)
+        if chunk_state is None:
+            return
+        retained = chunk_state.retained_by_chunk.pop(chunk_index, None)
+        if retained is None:
+            return
+        chunk_state.in_flight_bytes = max(0, chunk_state.in_flight_bytes - int(retained))
+
+    def _cancel_request_chunk_states_locked(self, request_ids: Iterable[str] | None = None) -> None:
+        """Caller holds ``_cv``. Late CHUNK_READY messages are dropped, not delivered."""
+        states = getattr(self, "_request_chunk_states", None)
+        if not states:
+            return
+        selected = states.values() if request_ids is None else (states.get(request_id) for request_id in request_ids)
+        for state in selected:
+            if state is None:
+                continue
+            state.cancelled = True
+
+    def _on_request_chunk_ready(
+        self,
+        request_id: str,
+        execution_id: str | None,
+        chunk_index: int,
+        output: DiffusionOutput | None,
+        error: str | None,
+    ) -> None:
+        """Deliver one in-order chunk. Does not update the request scheduler."""
+        async_output_id = output.async_output_id if output is not None else None
+        decision, payload = self._classify_request_chunk(
+            request_id,
+            execution_id,
+            chunk_index,
+            output,
+            error,
+            async_output_id,
+        )
+        if decision == "drop":
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
+            return
+        if decision == "fail":
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
+            self._put_output(request_id, DiffusionOutput(finished=True, error=str(payload)))
+            return
+        assert isinstance(payload, DiffusionOutput)
+        self._put_output(request_id, payload)
+
+    def _classify_request_chunk(
+        self,
+        request_id: str,
+        execution_id: str | None,
+        chunk_index: int,
+        output: DiffusionOutput | None,
+        error: str | None,
+        async_output_id: str | None,
+    ) -> tuple[str, DiffusionOutput | str | None]:
+        with self._cv:
+            states = getattr(self, "_request_chunk_states", None)
+            state = None if not states or not request_id else states.get(request_id)
+            if state is None or state.cancelled or state.terminal_emitted:
+                return "drop", None
+            if error:
+                return self._fail_request_chunk_locked(state, error)
+            if output is None or async_output_id is None:
+                return self._fail_request_chunk_locked(state, "request streaming chunk missing output")
+            if state.execution_id is None and execution_id is not None:
+                state.execution_id = execution_id
+            elif state.execution_id is not None and execution_id != state.execution_id:
+                return self._fail_request_chunk_locked(
+                    state,
+                    f"request streaming execution_id mismatch for {request_id}",
+                )
+            if chunk_index < 0 or chunk_index > state.next_chunk_index:
+                return self._fail_request_chunk_locked(
+                    state,
+                    f"request streaming protocol error for {request_id}: "
+                    f"expected chunk {state.next_chunk_index}, got {chunk_index}",
+                )
+            if chunk_index < state.next_chunk_index:
+                return "drop", None
+            nbytes = output.output_nbytes()
+            if nbytes > state.max_output_bytes or state.in_flight_bytes + nbytes > state.max_output_bytes:
+                return self._fail_request_chunk_locked(
+                    state,
+                    "Decoded streaming output exceeds streaming_max_output_bytes",
+                )
+            state.next_chunk_index += 1
+            state.chunk_emitted_count += 1
+            state.in_flight_bytes += nbytes
+            state.retained_by_chunk[chunk_index] = nbytes
+            return (
+                "emit",
+                DiffusionOutput(
+                    finished=False,
+                    chunk_index=chunk_index,
+                    total_chunks=output.total_chunks,
+                    async_output_id=async_output_id,
+                ),
+            )
+
+    def _fail_request_chunk_locked(self, state: _RequestStreamState, message: str) -> tuple[str, str]:
+        """Caller holds ``_cv``. Finish this stream with an error, not a later success."""
+        state.failed = True
+        state.cancelled = True
+        state.terminal_emitted = True
+        state.error = message
+        logger.warning("%s", message)
+        return "fail", message
+
+    def _adjust_request_streaming_final(
+        self,
+        request_id: str,
+        out: DiffusionOutput,
+    ) -> DiffusionOutput | None:
+        """Do not resend a full video after chunks, and do not turn a partial failure into success.
+
+        Returns None when a terminal chunk-stream result was already queued.
+        """
+        states = getattr(self, "_request_chunk_states", None)
+        if not states:
+            return out
+        with self._cv:
+            state = states.pop(request_id, None)
+        if state is None or not state.expect_streaming:
+            return out
+        if state.terminal_emitted:
+            if out.async_output_id is not None:
+                self.executor.drop_output(out.async_output_id)
+            return None
+        if state.failed and not out.error and not out.aborted:
+            if out.async_output_id is not None:
+                self.executor.drop_output(out.async_output_id)
+            return DiffusionOutput(finished=True, error=state.error or "request streaming failed")
+        if out.error or out.aborted or state.chunk_emitted_count <= 0:
+            return out
+        has_payload = out.output is not None or out.media is not None or out.async_output_id is not None
+        if not has_payload:
+            return out
+        if out.async_output_id is not None:
+            self.executor.drop_output(out.async_output_id)
+        return DiffusionOutput(
+            finished=True,
+            chunk_index=max(state.chunk_emitted_count - 1, 0),
+            total_chunks=state.chunk_emitted_count,
+        )
 
     def _expire_streaming_idle(self) -> None:
         with self._cv:
@@ -1152,6 +1363,7 @@ class DiffusionEngine:
                 self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
+            self._cancel_request_chunk_states_locked()
             streams = list(self._out_streams.values())
             self._cv.notify_all()
 
@@ -1223,6 +1435,9 @@ class DiffusionEngine:
         with self._cv:
             stream = self._out_streams.get(request_id)
         out = self._finalize_finished_request(request_id, runner_output, missing_result_error)
+        out = self._adjust_request_streaming_final(request_id, out)
+        if out is None:
+            return
         self._put_stream_output(stream, out)
 
     def _emit_outputs(
@@ -1477,6 +1692,7 @@ class DiffusionEngine:
                     output_ack=request.sampling_params.streaming_output_ack,
                 )
             self._out_streams[request_id] = queue
+            self._track_request_streaming_request(request, request_id)
             self._cv.notify_all()
 
         return request_id
@@ -1548,6 +1764,16 @@ class DiffusionEngine:
                     playback = (self._streaming_playback or {}).get(request_id)
                     auto_release = playback is not None and not playback.output_ack
                 if auto_release and output.streaming_metrics:
+                    self.release_streaming_output(request_id, output.chunk_index)
+                chunk_states = getattr(self, "_request_chunk_states", None)
+                chunk_state = None if chunk_states is None else chunk_states.get(request_id)
+                if (
+                    chunk_state is not None
+                    and not chunk_state.output_ack
+                    and not output.finished
+                    and not output.request_started
+                    and output.async_output_id is not None
+                ):
                     self.release_streaming_output(request_id, output.chunk_index)
                 if output.finished:
                     break
@@ -2013,6 +2239,10 @@ class DiffusionEngine:
                 self._out_streams.clear()
                 if self._streaming_playback is not None:
                     self._streaming_playback.clear()
+                self._cancel_request_chunk_states_locked()
+                chunk_states = getattr(self, "_request_chunk_states", None)
+                if chunk_states is not None:
+                    chunk_states.clear()
                 # Registered streams retain ownership of queued outputs until
                 # their consumers finish draining or close their generators.
                 live_streams = set(pending_streams)
@@ -2107,8 +2337,10 @@ class DiffusionEngine:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
+        # Drop late chunks before any further executor wait so a chunk that
+        # arrives during KV drain is not delivered as success.
+        self._cancel_request_chunk_states_locked(request_ids)
         self._poll_native_kv(drain_request_ids=request_ids)
-
         for request_id in request_ids:
             if self._streaming_playback is not None:
                 self._streaming_playback.pop(request_id, None)

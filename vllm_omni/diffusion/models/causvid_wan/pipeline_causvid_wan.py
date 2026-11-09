@@ -48,6 +48,7 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
+from vllm_omni.diffusion.worker.request_chunk_emit import get_emit_chunk
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.causvid_wan.weights import (
@@ -103,6 +104,8 @@ class CausVidWanPipeline(nn.Module):
     """CausVid Wan on Cell Self-Forcing/Latest-KV (AR-Diffusion + noisy KV)."""
 
     supports_request_batch = True
+    # One request forward can emit decoded chunks before COMPUTE_DONE.
+    supports_request_streaming_output = True
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
     _transformer_cls: ClassVar[type[StageWanTransformer]] = StageWanTransformer
@@ -689,6 +692,7 @@ class CausVidWanPipeline(nn.Module):
                 source_rank=source_rank,
                 pp_group=pp_group,
                 stream_group=stream_group,
+                on_chunk=self._request_streaming_chunk_callback(n_chunks),
             )
             on_finished = stream_job.on_finished
         on_finished = self._maybe_timeline(on_finished, timeline_file, finish_rank=finish_rank, pp_rank=pp_rank)
@@ -709,13 +713,50 @@ class CausVidWanPipeline(nn.Module):
             raise
         return adapter, stream_job
 
+    def _request_streaming_chunk_callback(self, n_chunks: int) -> Callable[[int, torch.Tensor], None] | None:
+        """Emit decoded pixels as request chunks when the worker bound an emitter.
+
+        ``stream_decode`` alone still accumulates. Client streaming additionally
+        requires ``streaming_output`` and a bound emitter.
+        """
+        od_config = getattr(self, "od_config", None)
+        if getattr(od_config, "streaming_output", False) is not True:
+            return None
+        emit = get_emit_chunk()
+        if emit is None:
+            return None
+
+        def on_chunk(idx: int, pixels: torch.Tensor, _emit: Callable[[DiffusionOutput], None] = emit) -> None:
+            current = get_emit_chunk() or _emit
+            if current is None:
+                return
+            current(
+                DiffusionOutput(
+                    finished=False,
+                    chunk_index=idx,
+                    total_chunks=n_chunks,
+                    output=pixels,
+                )
+            )
+
+        return on_chunk
+
     def emit_cell_output(self, adapter: Any, kv_id: str, stream_job: Any | None = None) -> DiffusionOutput:
         """Decode / gather after Cell plans finished."""
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
         pp_rank, pp_group = resolve_pp_rank_and_group()
         if stream_job is not None:
+            streamed = bool(getattr(stream_job, "streams_to_client", False))
             video = stream_job.join()
+            if streamed:
+                # Chunks were already emitted. Join only waits; do not resend the clip.
+                emitted = int(getattr(stream_job, "emitted_chunks", 0) or 0)
+                return DiffusionOutput(
+                    finished=True,
+                    chunk_index=max(emitted - 1, 0),
+                    total_chunks=emitted,
+                )
             if video is not None:
                 return self._video_output(video)
             return self._placeholder_output(device, dtype)
