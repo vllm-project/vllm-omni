@@ -2857,6 +2857,53 @@ def test_cosmos3_multiview_upload_guards(test_client, mocker: MockerFixture, mod
     generate.assert_not_called()
 
 
+_COSMOS3_T2V_VIEW = {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}
+
+
+@pytest.mark.parametrize(
+    ("extra_params", "data", "files", "message"),
+    [
+        pytest.param(
+            {"multiview": {"views": [_COSMOS3_T2V_VIEW]}, "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [],
+            "frame rates disagree",
+            id="conflicting-fps-without-uploads",
+        ),
+        pytest.param(
+            {**_cosmos3_single_view_extra_params(), "resolved_frame_rate": 12},
+            {"fps": "24"},
+            [("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+            "frame rates disagree",
+            id="conflicting-fps-with-uploads",
+        ),
+        pytest.param(
+            {"multiview": {"views": [{"camera_key": "camera_front_wide_120fov"}]}},
+            {},
+            [],
+            "requires one prompt per camera",
+            id="missing-caption-without-uploads",
+        ),
+    ],
+)
+def test_cosmos3_multiview_admission_rejects_before_generation(
+    test_client, mocker: MockerFixture, extra_params, data, files, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    generate = mocker.patch.object(handler, "generate_video_bytes")
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Driving.", "extra_params": json.dumps(extra_params), **data},
+        files=files,
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    generate.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:

@@ -444,8 +444,16 @@ def has_multiview_upload_indexes(extra: Mapping[str, Any]) -> bool:
     )
 
 
-def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[str]) -> dict[str, Any]:
-    """Copy the manifest, substitute persisted upload paths for indexes, and validate the result."""
+def resolve_multiview_uploads(
+    extra: Mapping[str, Any],
+    upload_paths: Sequence[str],
+    *,
+    sampling_frame_rates: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy the manifest, substitute persisted upload paths for indexes, and validate the result.
+
+    ``sampling_frame_rates`` holds request-level rate aliases such as the video API's top-level ``fps``.
+    """
     if len(upload_paths) > MULTIVIEW_MAX_UPLOADS:
         raise ValueError(f"Cosmos3 multiview accepts at most {MULTIVIEW_MAX_UPLOADS} uploaded references.")
     multiview = dict(_mapping(extra.get("multiview"), "extra_params.multiview"))
@@ -492,7 +500,7 @@ def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[s
     # Upload admission has no deployment metadata. The pipeline enforces the
     # checkpoint's exported camera set after references are resolved. Per-camera
     # captions are required here, before the asynchronous generation job begins.
-    validate_multiview_request(resolved)
+    validate_multiview_request(resolved, sampling_frame_rates=sampling_frame_rates)
     return resolved
 
 
@@ -502,14 +510,17 @@ async def admit_multiview_uploads(
     negative_prompt: str | None,
     num_uploads: int,
     persist: Callable[[int, bool], Awaitable[str]],
+    sampling_frame_rates: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist multipart ``input_references`` and resolve the manifest to local paths.
 
     This is the video API's single admission entry point for Cosmos3 multiview
-    uploads. ``persist(index, numeric_lidar)`` stores one upload and returns its
-    path; the caller owns those files, including cleanup when this raises. The
-    LiDAR control and condition are numeric uploads, checked structurally as soon
-    as they are stored. Manifest problems raise ``ValueError`` or ``TypeError``.
+    requests, with or without uploads. ``persist(index, numeric_lidar)`` stores
+    one upload and returns its path; the caller owns those files, including
+    cleanup when this raises. The LiDAR control and condition are numeric
+    uploads, checked structurally as soon as they are stored.
+    ``sampling_frame_rates`` must agree with the manifest's rate aliases.
+    Manifest problems raise ``ValueError`` or ``TypeError``.
     """
     extra = extra_params or {}
     reject_multiview_negative_fields({"negative_prompt": negative_prompt}, "request")
@@ -521,4 +532,4 @@ async def admit_multiview_uploads(
         paths.append(path)
         if numeric_lidar:
             validate_lidar_header(path)
-    return resolve_multiview_uploads(extra, paths)
+    return resolve_multiview_uploads(extra, paths, sampling_frame_rates=sampling_frame_rates)

@@ -4737,6 +4737,28 @@ def test_admit_multiview_uploads_persists_checks_lidar_and_resolves(tmp_path) ->
     assert resolved["lidar"] == {"control_path": paths[1], "return_output": True}
 
 
+@pytest.mark.parametrize(("fps", "accepted"), [(None, True), (12, True), (24, False)])
+def test_admit_multiview_request_checks_request_frame_rate(fps: float | None, accepted: bool) -> None:
+    """Admission covers manifests without uploads and the video API's top-level fps."""
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        raise AssertionError("nothing to persist")
+
+    extra = {"multiview": {"views": _t2v_multiview_views()}, "resolved_frame_rate": 12}
+    admit = admit_multiview_uploads(
+        extra, negative_prompt=None, num_uploads=0, persist=persist, sampling_frame_rates={"fps": fps}
+    )
+
+    if accepted:
+        assert asyncio.run(admit)["multiview"]["views"] == _t2v_multiview_views()
+    else:
+        with pytest.raises(ValueError, match=r"disagree: extra_args\.resolved_frame_rate=12, sampling_params\.fps=24"):
+            asyncio.run(admit)
+
+
 def test_admit_multiview_uploads_rejects_before_and_after_persisting(tmp_path) -> None:
     import asyncio
 

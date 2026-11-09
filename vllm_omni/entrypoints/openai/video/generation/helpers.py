@@ -692,10 +692,12 @@ async def _admit_multiview_uploads(
     input_references: list[UploadFile],
     resources: VideoRequestResources,
 ) -> None:
-    """Persist multiview ``input_references`` and rewrite manifest indexes to their paths.
+    """Admit a multiview request: persist ``input_references`` and rewrite manifest indexes to their paths.
 
-    The model-specific manifest rules live in ``admit_multiview_uploads``; this
-    wrapper only supplies HTTP upload persistence and error mapping.
+    Runs for every multiview request, with or without uploads, so manifest errors
+    fail here instead of in the asynchronous job. The model-specific rules live in
+    ``admit_multiview_uploads``; this wrapper supplies upload persistence, the
+    request-level frame rate and error mapping.
     """
 
     async def persist(index: int, numeric_lidar: bool) -> str:
@@ -712,6 +714,7 @@ async def _admit_multiview_uploads(
         request.extra_params = await admit_multiview_uploads(
             request.extra_params,
             negative_prompt=request.negative_prompt,
+            sampling_frame_rates={"fps": request.fps},
             num_uploads=len(input_references),
             persist=persist,
         )
@@ -1287,10 +1290,11 @@ async def _parse_video_form(
 
     try:
         supports_multiview = handler.supports_multiview_reference_inputs
-        has_indexes = has_multiview_upload_indexes(request.extra_params or {})
+        extra = request.extra_params or {}
+        has_indexes = has_multiview_upload_indexes(extra)
         if has_indexes and not supports_multiview:
             raise HTTPException(400, detail="This model does not support multiview uploaded references.")
-        if supports_multiview and (input_references or has_indexes):
+        if supports_multiview and (input_references or has_indexes or extra.get("multiview") is not None):
             if has_latent_edit or any(
                 value is not None
                 for value in (
@@ -1304,7 +1308,7 @@ async def _parse_video_form(
                     mask_reference,
                 )
             ):
-                raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
+                raise HTTPException(400, detail="Multiview requests cannot be combined with generic reference fields.")
             await _admit_multiview_uploads(request, input_references, resources)
             return request, handler, effective_model_name, None, None, None, resources, None
 
