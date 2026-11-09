@@ -1272,11 +1272,12 @@ def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
         input_batch=batch,
         async_chunk=False,
     ).get_output()
-    # codes is not a client root key: it must ride exactly one channel.
-    if output.multimodal_outputs is not None and output.multimodal_outputs[0]:
-        assert (
-            "codes.audio" not in output.multimodal_outputs[0] or "codes.audio" not in (output.pooler_output or [{}])[0]
-        ), "codes mirrored on both channels"
+    # ``codes`` is not a client root key. It must remain on the inter-stage
+    # payload, while the client channel stays empty.
+    assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)
     engine_output = _rehydrated_output(pooling_output=(output.pooler_output or [None])[0])
     if output.multimodal_outputs is not None:
         engine_output.multimodal_output = output.multimodal_outputs[0]
@@ -1287,3 +1288,27 @@ def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
     assert audio is not None and audio.shape[0] == 1, (
         f"codes accumulated more than once: {audio.shape if audio is not None else None}"
     )
+
+
+@pytest.mark.cpu
+def test_full_payload_fallback_codes_have_explicit_inter_stage_ownership(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    row = torch.full((1, 8), 7, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": row.clone()}},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)

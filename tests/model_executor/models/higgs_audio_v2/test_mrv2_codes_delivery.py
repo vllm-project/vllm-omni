@@ -49,6 +49,61 @@ def test_decode_step_maps_each_request_to_its_own_row():
     assert pending["c"][0, 0].item() == 33
 
 
+def test_mrv2_current_codes_keep_request_slots_and_own_storage():
+    t = _talker()
+    batch = _batch(["a", "b", "c"], [0, 2, 2, 4], with_np=True)
+    current = torch.tensor([[11, 12], [13, 14], [21, 22], [23, 24]], dtype=torch.long)
+    t._last_audio_codes = current
+
+    payload = t._current_codes_by_request(batch)
+    rows = payload["codes"]["audio"]
+    assert [tuple(row.shape) for row in rows] == [(2, 2), (0, 2), (2, 2)]
+    torch.testing.assert_close(rows[0], current[:2].to(torch.int32))
+    torch.testing.assert_close(rows[2], current[2:].to(torch.int32))
+
+    # The runner can safely consume the payload after the model's reusable
+    # current-step buffer is changed by the next sampling step.
+    current.fill_(99)
+    torch.testing.assert_close(rows[0], torch.tensor([[11, 12], [13, 14]], dtype=torch.int32))
+    torch.testing.assert_close(rows[2], torch.tensor([[21, 22], [23, 24]], dtype=torch.int32))
+
+
+def test_mrv2_sampler_publishes_current_codes_before_batch_reordering():
+    t = _talker()
+    t._apply_audio_mode_bias = lambda logits, _metadata, **_: None
+    t.compute_logits = lambda hidden, _metadata: hidden
+    current = torch.tensor([[11, 12], [13, 14], [21, 22], [23, 24]], dtype=torch.int32)
+
+    def dispatch(output, _hidden, _metadata, *, row_req_ids):
+        assert row_req_ids == ["a", "a", "c", "c"]
+        t._last_audio_codes = current
+        return output
+
+    t._dispatch_audio_codes = dispatch
+
+    class BaseSampler:
+        def __call__(self, _logits, _input_batch):
+            return SimpleNamespace(
+                sampled_token_ids=torch.tensor([[101], [102], [103], [104]]),
+                num_sampled=torch.ones(2, dtype=torch.int32),
+                num_rejected=torch.zeros(2, dtype=torch.int32),
+            )
+
+    batch = _batch(["a", "c"], [0, 2, 4], with_np=True)
+    batch.num_draft_tokens = 0
+    batch.logits_indices = torch.arange(4)
+    batch.input_ids = torch.tensor([5, 6, 7, 8])
+
+    sampler, _ = t.mrv2_custom_sampler(BaseSampler())
+    result = sampler.sample_step(torch.zeros(4, 2), batch, None, None, None)
+    rows = result.multimodal_outputs["codes"]["audio"]
+    assert [tuple(row.shape) for row in rows] == [(2, 2), (2, 2)]
+    torch.testing.assert_close(rows[0], current[:2])
+    torch.testing.assert_close(rows[1], current[2:])
+    assert not result.include_hidden_states
+    assert result.owns_multimodal_outputs
+
+
 def test_mixed_prefill_step_skips_request_without_logits_rows():
     t = _talker()
     # Layout where prefilling "a" owns no row while "b" and "c" own rows 0

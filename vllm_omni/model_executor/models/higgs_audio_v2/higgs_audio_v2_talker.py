@@ -1493,9 +1493,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         The V1 AR runner calls :meth:`sample` directly; under MRV2 the stock
         OmniModelState dispatches here instead. The native gpu sampler samples
         LM tokens, so its staged per-request state such as temperature, top-k,
-        top-p, min-p, penalties and logprobs applies unchanged. Audio codes
-        flow through :meth:`_dispatch_audio_codes` and ``postprocess`` as on
-        V1.
+        top-p, min-p, penalties and logprobs applies unchanged. MRV2 publishes
+        the current step's audio codes directly in ``OmniSamplingOutput``;
+        V1 keeps its postprocess fallback.
         """
         from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
         from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -1506,7 +1506,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
                 if all(is_warmup_request(r) for r in input_batch.req_ids):
                     talker._last_audio_codes = None
-                    talker._pending_codes_by_req = {}
                     return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
                 if grammar_output is not None or input_batch.num_draft_tokens:
                     raise ValueError("Higgs Audio v2 MRV2 does not support grammar or speculative sampling")
@@ -1519,11 +1518,15 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 talker._apply_audio_mode_bias(logits, None, row_req_ids=row_req_ids, row_prev_tokens=row_prev_tokens)
                 out = self.base_sampler(logits, input_batch)
                 out = talker._dispatch_audio_codes(out, hidden, None, row_req_ids=row_req_ids)
-                talker._pending_codes_by_req = talker._split_codes_by_request(talker._last_audio_codes, input_batch)
-                # Do not rebuild the batch-row view here: the next forward's
-                # batch layout differs, so HiggsAudioV2ModelState.run_preprocess
-                # rebuilds it from the batch that forward consumes.
-                return OmniSamplingOutput(out, out.num_sampled, out.num_rejected)
+                multimodal_outputs = talker._current_codes_by_request(input_batch)
+                return OmniSamplingOutput(
+                    out,
+                    out.num_sampled,
+                    out.num_rejected,
+                    multimodal_outputs=multimodal_outputs,
+                    include_hidden_states=False,
+                    owns_multimodal_outputs=bool(multimodal_outputs),
+                )
 
         return _StepSampler(sampler), None
 
@@ -1553,7 +1556,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         if codes is None:
             return {}
-        cu = input_batch.cu_num_logits
+        # Prefer the host copy: reading the device prefix here would add a
+        # synchronization to every MRV2 sampling step.
+        cu_np = getattr(input_batch, "cu_num_logits_np", None)
+        cu = cu_np if cu_np is not None else input_batch.cu_num_logits
         ends = cu[1 : input_batch.num_reqs + 1].tolist()
         starts = cu[: input_batch.num_reqs].tolist()
         pending: dict[Any, torch.Tensor] = {}
@@ -1562,6 +1568,33 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             if hi > lo and not is_warmup_request(req_id):
                 pending[req_id] = codes[lo:hi]
         return pending
+
+    def _current_codes_by_request(self, input_batch: Any) -> dict[str, Any]:
+        """Own and publish this sampling step's codes in current batch order.
+
+        MRV2 calls forward postprocess before sampling. Returning fresh,
+        request-aligned rows here makes the sampled frame independent of the
+        next batch layout and of the reusable ``_last_audio_codes`` buffer.
+        Empty rows are retained so compaction cannot shift a later request's
+        audio into an earlier slot.
+        """
+        codes = getattr(self, "_last_audio_codes", None)
+        if codes is None:
+            return {}
+
+        cu_np = getattr(input_batch, "cu_num_logits_np", None)
+        cu = cu_np if cu_np is not None else input_batch.cu_num_logits
+        num_codebooks = int(codes.shape[-1])
+        rows: list[torch.Tensor] = []
+        for i in range(input_batch.num_reqs):
+            lo = int(cu[i])
+            hi = int(cu[i + 1])
+            slice_codes = codes[lo:hi]
+            valid = slice_codes[:, 0] >= 0
+            rows.append(slice_codes[valid].to(dtype=torch.int32).clone())
+            if rows[-1].ndim != 2 or rows[-1].shape[1] != num_codebooks:
+                raise RuntimeError("Higgs Audio v2 MRV2 code payload lost its codebook dimension")
+        return {"codes": {"audio": rows}}
 
     def _rebuild_audio_state_view(self, input_batch: Any) -> None:
         """Publish a batch-row-keyed view of the req_id-keyed audio state.
@@ -1591,9 +1624,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         ``audio_out_ids`` GPU tensors for the process lifetime. Under V1 the
         batch-row keys are bounded by slot reuse, so the hook is a no-op
         there. Aborted requests may also leave an unconsumed entry in
-        ``_pending_codes_by_req``, since postprocess only walks the current
-        batch. Preempted requests keep their state: a recomputed request
-        must resume its delay-pattern history.
+        Preempted requests keep their state: a recomputed request must resume
+        its delay-pattern history.
         """
         state = getattr(self, "_audio_state", None)
         lens = getattr(self, "_slot_output_len", None)
@@ -1817,16 +1849,15 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> dict[str, Any]:
         """Publish per-request audio codes into model_intermediate_buffer.
 
-        Under MRV2 the runner calls this once per request after every
-        forward, BEFORE the step's sampling, so codes produced by a sampling
-        step are consumed one step later. A positional cursor desyncs in
-        mixed prefill+decode steps, so the MRV2 sampling hook fills
-        ``_pending_codes_by_req`` keyed by request id and this method serves
-        entries from that map. The V1 runner calls postprocess in batch
-        order right after sampling, so the positional cursor over
-        ``_last_audio_codes`` remains the fallback there.
+        The V1 runner calls postprocess in batch order right after sampling,
+        so the positional cursor over ``_last_audio_codes`` remains the
+        fallback there. MRV2 publishes current codes from its sampling hook
+        before the runner snapshots the output.
         """
         _ = multimodal_outputs  # consumed by the runner directly
+        # Keep the explicit legacy map contract for V1 callers and older
+        # adapters. The MRV2 sampler never populates this map; it publishes
+        # current-step rows through ``OmniSamplingOutput`` instead.
         pending = getattr(self, "_pending_codes_by_req", None)
         if pending is not None:
             slice_codes = pending.pop(req_infos.get("req_id"), None)
