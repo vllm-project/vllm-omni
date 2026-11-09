@@ -22,7 +22,10 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
-from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
+from vllm_omni.worker.encoder_cudagraph import (
+    SingleReplayEncoderCudaGraphManager,
+    install_single_replay_encoder_manager,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -174,10 +177,32 @@ def test_runner_builds_no_manager_without_multimodal_inputs(monkeypatch):
     assert _runner_factory(model, cfg, supports_mm_inputs=False) is None
 
 
-def test_thinker_construction_enables_the_image_graph(monkeypatch):
+def test_upstream_runner_rejects_encoder_graphs():
+    with pytest.raises(ValueError, match="upstream runners"):
+        Qwen3OmniMoeThinkerForConditionalGeneration(vllm_config=_config())
+
+
+def test_mrv2_installs_the_single_replay_manager():
+    model = _thinker()
+    runner = SimpleNamespace(cudagraph_manager=object())
+    install_single_replay_encoder_manager(model, model.vllm_config, torch.device("cpu"), torch.float32, runner)
+    assert type(runner.cudagraph_manager) is SingleReplayEncoderCudaGraphManager
+
+
+def test_mrv2_keeps_the_generic_manager_without_the_opt_in():
+    model = _thinker()
+    model.encoder_cudagraph_single_replay = False
+    generic = object()
+    runner = SimpleNamespace(cudagraph_manager=generic)
+    install_single_replay_encoder_manager(model, model.vllm_config, torch.device("cpu"), torch.float32, runner)
+    assert runner.cudagraph_manager is generic
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_thinker_construction_enables_the_image_graph(monkeypatch, use_v2):
     cfg = _config()
     cfg.quant_config = None
-    cfg.model_config.use_v2_model_runner = False
+    cfg.model_config.use_v2_model_runner = use_v2
     thinker_config = cfg.model_config.hf_config.thinker_config
     thinker_config.architectures = ["Qwen3OmniMoeThinkerForConditionalGeneration"]
     thinker_config.vision_config.deepstack_visual_indexes = [0, 1]

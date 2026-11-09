@@ -141,12 +141,11 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
     def _enable_audio_encoder_cudagraph(self, vllm_config) -> None:
         # Same conditions as images. In addition audio stays eager when the
         # encoder runs data parallel (the audio tower itself stays tensor
-        # parallel there) and under model runner v2, which builds the upstream
-        # manager and never consults encoder_cudagraph_group_eligible; and the
-        # largest budget must hold at least one audio chunk. Audio graphs are
-        # validated on CUDA and on Ascend NPUs other than 310P, so ROCm and XPU
-        # take the eager path. The stage's additional_config can turn audio
-        # graphs off while images still replay.
+        # parallel there), and the largest budget must hold at least one audio
+        # chunk. Audio graphs are validated on CUDA and on Ascend NPUs other
+        # than 310P, so ROCm and XPU take the eager path. The stage's
+        # additional_config can turn audio graphs off while images still replay.
+        # V1 and V2 both install the single-replay manager.
         audio_tower = getattr(self, "audio_tower", None)
         mm = self.multimodal_config
         if not getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False):
@@ -157,8 +156,6 @@ class Qwen3OmniVisionEncoderCudaGraphMixin:
         reason = None
         if not _audio_graphs_requested(vllm_config):
             reason = "additional_config sets audio_encoder_cudagraph to false"
-        elif getattr(vllm_config, "use_v2_model_runner", False):
-            reason = "model runner v2 is in use"
         elif mm.mm_encoder_tp_mode == "data":
             reason = "the multimodal encoder runs data parallel"
         elif not (npu or current_omni_platform.is_cuda()):

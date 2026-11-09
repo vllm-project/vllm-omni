@@ -14,6 +14,83 @@ from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import 
 logger = init_logger(__name__)
 
 
+def create_single_replay_encoder_manager(vllm_config, device: torch.device, dtype: torch.dtype, model):
+    """Build the single-replay manager, using Ascend ACL graphs on NPU."""
+    if device.type == "npu":
+        from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import SingleReplayEncoderNpuGraphManager
+
+        manager_cls = SingleReplayEncoderNpuGraphManager
+    else:
+        manager_cls = SingleReplayEncoderCudaGraphManager
+    return manager_cls(vllm_config=vllm_config, device=device, dtype=dtype, model=model)
+
+
+def install_single_replay_encoder_manager(model, vllm_config, device: torch.device, dtype: torch.dtype, encoder_runner):
+    """Swap vLLM's generic manager for the single-replay one.
+
+    Model Runner V2 constructs ``EncoderCudaGraphManager`` inside ``ModelState``
+    and replays it from ``EncoderRunner``. Models that set
+    ``encoder_cudagraph_single_replay`` need one graph per group, so replace
+    that manager before capture. A missing runner or manager means encoder
+    graphs are off and there is nothing to replace.
+    """
+    if encoder_runner is None or not getattr(model, "encoder_cudagraph_single_replay", False):
+        return
+    manager = getattr(encoder_runner, "cudagraph_manager", None)
+    if manager is None or isinstance(manager, SingleReplayEncoderCudaGraphManager):
+        return
+    encoder_runner.cudagraph_manager = create_single_replay_encoder_manager(vllm_config, device, dtype, model)
+
+
+def measure_single_replay_encoder_memory(
+    vllm_config, device: torch.device, dtype: torch.dtype, model, *, supports_mm_inputs: bool
+) -> int:
+    """Capture the single-replay graphs once and return the bytes they hold.
+
+    NPU allocates the KV cache before ``capture_model``, so this reserve has to
+    be subtracted first. The temporary manager is cleared before returning.
+    """
+    import gc
+
+    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+    from vllm.config import CUDAGraphMode, set_current_vllm_config
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+    from vllm.platforms import current_platform
+    from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_npu():
+        from vllm_ascend.worker.v1.model_runner import graph_capture
+
+    compilation_config = vllm_config.compilation_config
+    if compilation_config.cudagraph_mode == CUDAGraphMode.NONE or not (
+        getattr(model, "encoder_cudagraph_single_replay", False)
+        and compilation_config.cudagraph_mm_encoder
+        and supports_mm_inputs
+        and supports_encoder_cudagraph(model)
+    ):
+        return 0
+    manager = create_single_replay_encoder_manager(vllm_config, device, dtype, model)
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    free_before = torch.accelerator.get_memory_info()[0]
+    try:
+        with set_current_vllm_config(vllm_config), freeze_gc_for_cudagraph_capture(), graph_capture(device=device):
+            set_cudagraph_capturing_enabled(True)
+            try:
+                manager.capture(graph_pool=current_platform.graph_pool_handle())
+            finally:
+                set_cudagraph_capturing_enabled(False)
+        torch.accelerator.synchronize()
+        return max(0, free_before - torch.accelerator.get_memory_info()[0])
+    finally:
+        manager.clear()
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+
 class SingleReplayEncoderCudaGraphManager(EncoderCudaGraphManager):
     """Replay an encoder group only when one captured graph holds all of it.
 

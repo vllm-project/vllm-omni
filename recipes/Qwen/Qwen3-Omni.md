@@ -82,34 +82,25 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 ### Encoder graphs
 
 The thinker can replay its vision (image and video) and audio encoders from
-captured graphs (`cudagraph_mm_encoder`). This needs model runner v1. Model
-Runner V2 builds vLLM's generic encoder manager and does not apply the replay
-bounds below, so the thinker rejects the flag at startup.
+captured graphs (`cudagraph_mm_encoder`). Model Runner V1 and V2 both install
+the single-replay manager, so both apply the replay bounds below. A plain
+`vllm serve` without `--omni` does not, and the thinker rejects the flag there.
 
-CUDA and NPU both default to MRv2, so encoder graphs stay off. To turn them
-on, save an overlay as `deploy.yaml` and launch with `--deploy-config
-deploy.yaml`. `compilation_config` is replaced as a whole, so repeat its other
-fields. On NPU (Ascend, not 310P) also keep `cudagraph_mode: PIECEWISE`:
+NPU (Ascend, not 310P) turns encoder graphs on by default and keeps
+`cudagraph_mode: PIECEWISE`. The worker reserves those graphs before it sizes
+the KV cache. CUDA leaves them off, because the reserve can crowd out KV on
+80 GiB cards. To turn them on, save this overlay as `deploy.yaml` and launch
+with `--deploy-config deploy.yaml` (`compilation_config` is replaced as a
+whole, so repeat its other fields):
 
 ```yaml
 base_config: /absolute/path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
 platforms:
   cuda:
-    model_runner: v1
     stages:
       - stage_id: 0
         compilation_config:
           custom_ops: ["+rotary_embedding"]
-          cudagraph_mm_encoder: true
-          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
-          encoder_cudagraph_max_vision_items_per_batch: 16
-          encoder_cudagraph_max_frames_per_batch: 128
-  npu:
-    model_runner: v1
-    stages:
-      - stage_id: 0
-        compilation_config:
-          cudagraph_mode: PIECEWISE
           cudagraph_mm_encoder: true
           encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
           encoder_cudagraph_max_vision_items_per_batch: 16

@@ -143,6 +143,17 @@ class OmniModelState(DefaultModelState):
                 super().__init__(vllm_config, model, encoder_cache, device)
             finally:
                 _default_mod.get_rope_state = orig_get_rope
+        # V2 builds vLLM's generic encoder manager. Models that opt into one
+        # replay per group need the same manager the V1 runner installs.
+        from vllm_omni.worker.encoder_cudagraph import install_single_replay_encoder_manager
+
+        install_single_replay_encoder_manager(
+            model,
+            vllm_config,
+            device,
+            self.dtype,
+            getattr(self, "encoder_runner", None),
+        )
         max_num_reqs = self.scheduler_config.max_num_seqs
         self.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)

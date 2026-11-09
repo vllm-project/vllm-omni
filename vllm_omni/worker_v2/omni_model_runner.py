@@ -424,6 +424,24 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
         self._publish_shared_backbone_if_configured()
 
+    @torch.inference_mode()
+    def profile_encoder_cudagraph_memory(self) -> int:
+        """Reserve single-replay encoder graphs before the NPU KV cache.
+
+        ``capture_model`` replays whatever manager the model state installed,
+        and on NPU that capture happens after the KV cache is sized. CUDA's
+        unified profiler already counts the same graphs.
+        """
+        from vllm_omni.worker.encoder_cudagraph import measure_single_replay_encoder_memory
+
+        return measure_single_replay_encoder_memory(
+            self.vllm_config,
+            self.device,
+            self.dtype,
+            self.get_model(),
+            supports_mm_inputs=bool(getattr(self, "supports_mm_inputs", False)),
+        )
+
     def reload_weights(self, *args: Any, **kwargs: Any) -> None:
         """Preserve upstream reload arguments, but reject updates to shared weights."""
         if getattr(self, "_weight_share_backend", None) is not None:
