@@ -1132,6 +1132,43 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+@pytest.mark.parametrize(
+    "fields,frames",
+    [
+        ({"num_frames": 97}, 97),
+        ({"seconds": "4", "num_frames": 97}, 97),
+        ({"extra_params": {"duration": 4}}, 97),
+        ({"extra_params": {"duration": 1}, "generate_sound": False}, 25),
+        ({"generate_sound": False}, 121),
+    ],
+)
+def test_hy_nomas_model_parameters_reach_model_validation(fields, frames):
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
+
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A forest", **fields), "hy-standard"))
+    assert engine.captured_sampling_params_list is not None
+    sampling = engine.captured_sampling_params_list[0]
+    assert sampling.num_frames == frames
+    assert normalize_request(engine.captured_prompt, sampling).num_frames == frames
+
+
+def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
+    from vllm_omni.errors import OmniClientError
+
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
+    request = VideoGenerationRequest(prompt="A forest", num_frames=121, extra_params={"duration": 4})
+    asyncio.run(handler._run_and_extract(request, "hy-conflicting-duration"))
+    assert engine.captured_sampling_params_list is not None
+    with pytest.raises(OmniClientError, match="conflicts with duration"):
+        normalize_request(engine.captured_prompt, engine.captured_sampling_params_list[0])
+
+
 def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
     steps) but is not a fixed-duration model: an explicit ``num_frames``
@@ -1159,6 +1196,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25
@@ -4177,7 +4215,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
-    captured = {}
+    captured: dict[str, float | str] = {}
     original = engine.generate
 
     async def generate(prompt, request_id, sampling_params_list):
@@ -4217,7 +4255,9 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
     for key in ("control_path", "source_path", "mask_path"):
         if key in captured:
-            assert not Path(captured[key]).exists()
+            path = captured[key]
+            assert isinstance(path, str)
+            assert not Path(path).exists()
 
 
 @pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])
