@@ -150,12 +150,21 @@ class DTPSScheduler:
                 del self._dit_inflight_ids[rid]
 
         inflight_blind = len(self._dit_inflight_ids)
+        # Only count blind (about-to-arrive at DiT) in effective_min, NOT
+        # inflight_running (still being processed by AR, won't reach DiT for
+        # tens of seconds).  Counting inflight_running caused budget to drop
+        # to 0 as soon as `threshold` downstream tasks entered AR — long
+        # before they actually reached DiT — starving DiT and defeating the
+        # purpose of the priority reordering.  With only blind counted, the
+        # budget stays positive while downstream tasks are in AR, and drops
+        # only when they actually arrive at (and fill) the DiT queue.
         inflight_total = inflight_running + inflight_blind
         if n_reps <= 1:
-            inflight_reduced = inflight_total
+            inflight_blind_reduced = inflight_blind
         else:
-            inflight_reduced = inflight_total // n_reps
-        effective_min = reported_min + inflight_reduced
+            inflight_blind_reduced = inflight_blind // n_reps
+        inflight_reduced = inflight_blind_reduced
+        effective_min = reported_min + inflight_blind_reduced
         phase = "busy" if effective_min >= self.dit_load_threshold else "idle"
 
         self._last_phase_stats = {
