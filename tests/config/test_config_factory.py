@@ -3205,11 +3205,10 @@ class TestPlatformOverrides:
         """Non-CUDA platforms must keep the V1 runner after the MRV2 flip.
 
         XPU rejects any v2 stage at deploy load, NPU generation workers
-        (Higgs stage 1) reject v2 at init, and ROCm/MUSA v2 is Phase 3
-        (#9387). The platforms section pins v1 and restores the shipped V1
-        stage-0 shape (eager, no async scheduling, prefix caching) and the
-        shipped V1 connector streaming geometry, so the fallback stays
-        valid when this file's base flips to model_runner: v2.
+        reject v2 at init, and ROCm/MUSA v2 is RFC #9387 Phase 3. The
+        platforms section pins v1 and restores the shipped V1 stage-0 shape
+        and connector streaming geometry, so the fallback stays valid under
+        the flipped v2 base.
         """
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -3413,10 +3412,8 @@ class TestPlatformOverrides:
     def test_higgs_audio_v2_v2_default_does_not_warn_unvalidated(self, caplog):
         """The flipped default declares its legacy-transport v2 path validated.
 
-        Without the pipeline declaration, every default boot logged the
-        generic "MRV2 support ... has not been validated" warning that tells
-        users to go back to model_runner: v1 — contradicting the shipped
-        default. The codec stage stays on v1 and never warns.
+        The pipeline declaration must silence the generic unvalidated-warning
+        at default boot; the codec stage stays on v1 and never warns.
         """
         deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
         pipeline = resolve_pipeline_config("higgs_audio_v2")
@@ -3432,8 +3429,7 @@ class TestPlatformOverrides:
 
         The default profile selects v2 for the talker on CUDA; NPU, XPU,
         ROCm and MUSA pin v1 for both stages through the platforms section
-        (XPU rejects v2 stages at deploy load, and NPU generation workers
-        reject v2 at init), clearing the stage-level v2 opt-in.
+        and clear the stage-level v2 opt-in.
         """
         deploy_path = Path(get_deploy_config_path("higgs_audio_v2.yaml"))
         pipeline = resolve_pipeline_config("higgs_audio_v2")

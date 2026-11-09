@@ -963,14 +963,11 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         state = getattr(self, "_audio_state_view", None) or getattr(self, "_audio_state", None)
         if not state:
             return hidden_states
-        # Resolve each flat position to its owning request row via this
-        # step's query_start_loc (stashed earlier in the same forward). A
-        # flat position equals its batch row only in pure-decode steps; in
-        # mixed prefill+decode steps the old positional lookup either missed
-        # (feedback silently skipped) or landed on another request's row
-        # (cross-request frame injection). Fail closed when the layout is
-        # unavailable: skipping one feedback frame matches today's miss case,
-        # while a positional guess would reintroduce the misattribution.
+        # Resolve each flat position to its owning row via this step's
+        # query_start_loc, stashed earlier in the same forward. A flat
+        # position is not a row index in mixed prefill+decode steps, and a
+        # wrong guess would inject another request's frame. If the layout is
+        # unavailable, skip feedback rather than guess.
         q_start = getattr(self, "_last_step_query_start_loc", None)
         if not isinstance(q_start, torch.Tensor) or int(q_start.numel()) < 2:
             logger.warning_once(
@@ -1010,29 +1007,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Embed the LM token stream, swapping in audio embeddings at placeholders.
 
-        Text positions use the standard ``embed_tokens`` lookup. At audio
-        positions (input id equals ``audio_token_id``) we substitute the
-        text embedding with the multi-codebook embedding of the LAST audio
-        frame stashed by :meth:`sample` in ``self._audio_state[req_id]``.
-        This mirrors upstream's ``HiggsAudioModel.forward`` flow where
-        ``_embed_audio_ids(audio_out_ids)`` is plugged into the input at
-        ``<|AUDIO_OUT|>`` placeholder positions.
+        At audio positions the text embedding is replaced with the
+        multi-codebook embedding of the last stashed audio frame, mirroring
+        upstream's ``_embed_audio_ids`` injection at ``<|AUDIO_OUT|>``.
 
-        Without this feedback the model receives the SAME embedding (just
-        the text ``<|AUDIO_OUT|>`` embedding) at every audio step and has no
-        way to attend to its own audio history — the resulting codes
-        collapse to a fixed loop and the ASR cannot recover the original
-        prompt.
-
-        Dead path for this talker under both runners: the MRV2
-        ``_prepare_mm_inputs`` early-returns when the runner-level
-        ``supports_mm_inputs`` is off, and the V1 AR runner embeds inline via
-        :meth:`_maybe_apply_audio_feedback` instead. If ever wired live, it
-        must receive ``query_start_loc`` from its caller — this hook runs
-        pre-forward, where the ``_last_step_query_start_loc`` stash still
-        holds the PREVIOUS step's layout, and the positional lookup below is
-        only valid in pure-decode steps (see
-        :meth:`_maybe_apply_audio_feedback` for the owner-row walk).
+        Dead path for this talker under both runners: the V1 AR runner embeds
+        inline via :meth:`_maybe_apply_audio_feedback`, and MRV2 disables
+        ``supports_mm_inputs``. If ever wired live, the caller must supply the
+        current step's ``query_start_loc``: this hook runs pre-forward, the
+        stash still holds the previous step's layout, and the positional
+        lookup is only valid in pure-decode steps.
         """
         text_embed = self.embed_tokens(input_ids)
         audio_token_id = int(self.config.audio_token_id)
@@ -1045,20 +1029,12 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         state = getattr(self, "_audio_state_view", None) or getattr(self, "_audio_state", None)
         if not state:
             return text_embed
-        # We expect one audio position per active request per decode step.
-        # Match rows by walking through the per-request audio_out_ids buffers.
-        # The runner concatenates requests in batch order; ``audio_positions``
-        # lists their indices into the flat ``input_ids``. For each position we
-        # look up the corresponding request's last audio frame.
-        # NOTE: this O(N_audio) loop is small (N_audio == active requests in a
-        # decode step) and runs once per step.
+        # One audio position per active request per decode step;
+        # ``audio_positions`` indexes into the flat stream in batch order.
         flat_embed = text_embed.reshape(-1, text_embed.shape[-1])
         for pos in audio_positions.tolist():
-            # ``state`` keys are the absolute batch row indices the sampler
-            # saw, which match the positions in flat ``input_ids`` during a
-            # decode step (one token per active request). For a prefill
-            # step's prompt-side audio_token_id positions, no state entry
-            # exists yet — that's fine, we leave the text embed in place.
+            # Row keys match flat positions in pure-decode steps. Prefill
+            # prompt positions have no state yet; keep the text embed.
             req_state = state.get(int(pos))
             if req_state is None:
                 continue
@@ -1202,22 +1178,18 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         return self._dispatch_audio_codes(sampler_output, hidden, sampling_metadata)
 
     def _dispatch_audio_codes(self, sampler_output, hidden, sampling_metadata, row_req_ids=None):
-        """Delay-pattern post-processing: turn this step's LM samples into per-request audio codes.
+        """Turn this step's LM samples into per-request audio codes.
 
-        Shared by the V1 model sampler and the MRV2 sampler hook. Both callers
-        finish LM token sampling on their own — the V1 metadata sampler here,
-        the native staged sampler under MRV2 — while audio-code sampling and
-        per-request state progression stay identical. ``hidden`` holds this
-        step's logits rows; the ``_last_logits_hidden`` stash is cleared on
-        entry.
+        Shared by the V1 model sampler and the MRV2 sampler hook; both callers
+        sample LM tokens themselves, so audio-code sampling and per-request
+        state progression stay identical. ``hidden`` holds this step's logits
+        rows; the ``_last_logits_hidden`` stash is cleared on entry.
 
-        ``row_req_ids`` maps each sampled row to its owning request id
-        (``_row_req_ids`` — derived from ``cu_num_logits``). Under MRV2 the
-        hook passes it so
-        ``_audio_state`` and ``_slot_output_len`` are keyed by req_id —
-        stable across the batch compaction that MRV2 performs between
-        steps. Under V1 (``None``), batch-row keys apply, matching the V1
-        runner's stable row layout.
+        ``row_req_ids`` maps each sampled row to its owning request id, as
+        built by :meth:`_row_req_ids` from ``cu_num_logits``. Passing it keys
+        ``_audio_state`` and ``_slot_output_len`` by req_id, which survives
+        MRV2's batch compaction between steps. Under V1 (``None``) batch-row
+        keys apply, matching the V1 runner's stable row layout.
         """
         self._last_logits_hidden = None
         if hidden is None:
@@ -1412,11 +1384,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # earlier (right after ``is_audio`` was computed) so the RAS check
         # can reference them.
 
-        # Per-request reset: under MRV2 the req_id keys make new requests
-        # self-evident (a key not yet in the dict is new). Under V1 the
-        # output_token_ids length heuristic detects slot reuse.
-        # ``_slot_output_len`` is always initialised above, next to
-        # ``_audio_state`` — this reset block runs after every early return.
+        # Per-request reset: under MRV2 a req_id not yet tracked is a new
+        # request; under V1 the output_token_ids length heuristic detects
+        # slot reuse. ``_slot_output_len`` is initialised above next to
+        # ``_audio_state``; this reset block runs after every early return.
         output_ids = getattr(sampling_metadata, "output_token_ids", None)
         for batch_i in audio_row_indices:
             bi = int(batch_i)
@@ -1517,15 +1488,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         return sampler_output
 
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
-        """MRV2 sampling step: delegate LM token sampling to the native staged sampler.
+        """MRV2 sampling hook: delegate LM token sampling to the native staged sampler.
 
-        The V1 AR runner honors ``prefer_model_sampler`` and calls
-        :meth:`sample` directly; under MRV2 the stock OmniModelState
-        dispatches to this hook instead. LM tokens are sampled by the native
-        gpu sampler, so its staged per-request state — temperature, top-k,
-        top-p, min-p, penalties and logprobs — applies unchanged. Audio codes
-        flow through :meth:`_dispatch_audio_codes` and the ``postprocess``
-        lifecycle, exactly as on V1.
+        The V1 AR runner calls :meth:`sample` directly; under MRV2 the stock
+        OmniModelState dispatches here instead. The native gpu sampler samples
+        LM tokens, so its staged per-request state such as temperature, top-k,
+        top-p, min-p, penalties and logprobs applies unchanged. Audio codes
+        flow through :meth:`_dispatch_audio_codes` and ``postprocess`` as on
+        V1.
         """
         from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
         from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -1542,24 +1512,17 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     raise ValueError("Higgs Audio v2 MRV2 does not support grammar or speculative sampling")
                 hidden = hidden_states[input_batch.logits_indices]
                 logits = talker.compute_logits(hidden, None)
-                # Key every per-request structure by the row's owning
-                # request id (derived from cu_num_logits; see _row_req_ids).
+                # Each row's owning request id, from cu_num_logits.
                 row_req_ids = talker._row_req_ids(input_batch)
-                # The context token at each row's position is exactly
-                # input_ids[logits_indices] — no heuristic walk needed.
+                # The context token at each row is input_ids[logits_indices].
                 row_prev_tokens = input_batch.input_ids[input_batch.logits_indices].tolist()
                 talker._apply_audio_mode_bias(logits, None, row_req_ids=row_req_ids, row_prev_tokens=row_prev_tokens)
                 out = self.base_sampler(logits, input_batch)
                 out = talker._dispatch_audio_codes(out, hidden, None, row_req_ids=row_req_ids)
                 talker._pending_codes_by_req = talker._split_codes_by_request(talker._last_audio_codes, input_batch)
-                # The batch-row-keyed view of the req_id-keyed audio state is
-                # deliberately NOT rebuilt here: the next forward's batch may
-                # drop finished requests or graduate prefills into the decode
-                # block, so a view materialized now is stale by then.
-                # HiggsAudioV2ModelState.run_preprocess rebuilds it from the
-                # layout the forward actually consumes.
-                # SamplerOutput.num_sampled/num_rejected are non-optional in
-                # the pinned vLLM; pass them straight through.
+                # Do not rebuild the batch-row view here: the next forward's
+                # batch layout differs, so HiggsAudioV2ModelState.run_preprocess
+                # rebuilds it from the batch that forward consumes.
                 return OmniSamplingOutput(out, out.num_sampled, out.num_rejected)
 
         return _StepSampler(sampler), None
@@ -1569,12 +1532,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """Map each logits row of this step to its owning request id.
 
         ``cu_num_logits`` is an inclusive prefix of length ``num_reqs + 1``:
-        request ``j`` owns rows ``[cu[j], cu[j+1])``. On the pinned vLLM the
-        non-spec branch builds it as ``arange(num_reqs + 1)`` — every request
-        owns exactly one row and a mid-prefill row's sample is discarded
-        downstream — but derive the mapping from the prefix rather than
-        assuming identity, so the row→owner attribution stays correct if the
-        construction ever changes.
+        request ``j`` owns rows ``[cu[j], cu[j+1])``. Derive the mapping from
+        the prefix rather than assuming row == request: a mid-prefill request
+        owns no row, and the upstream construction may change.
         """
         n = input_batch.num_reqs
         cu_np = getattr(input_batch, "cu_num_logits_np", None)
@@ -1586,10 +1546,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """Split the sampled code rows into a req_id-keyed map for postprocess.
 
         The MRV2 runner's postprocess runs before the step's sampling, so it
-        serves each request its entry from the previous step, keyed by req_id.
-        ``cu_num_logits`` is an inclusive prefix starting at 0
-        (``[num_reqs + 1]``), so request ``i`` owns rows ``[cu[i], cu[i+1])``
-        — see :meth:`_row_req_ids` for the row-ownership contract.
+        serves each request the previous step's entry. Row ownership follows
+        the ``cu_num_logits`` prefix, as in :meth:`_row_req_ids`.
         """
         from vllm_omni.worker_v2.warmup import is_warmup_request
 
@@ -1608,18 +1566,12 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     def _rebuild_audio_state_view(self, input_batch: Any) -> None:
         """Publish a batch-row-keyed view of the req_id-keyed audio state.
 
-        ``_maybe_apply_audio_feedback`` resolves each audio position's
-        owning batch row via ``query_start_loc`` and looks up the state by
-        row (``embed_input_ids``, a dead path for this talker, still uses
-        the positional form). Under MRV2 the authoritative ``_audio_state``
-        is keyed by req_id (stable across compaction); this view bridges
-        the two key spaces.
-
-        Called by :class:`HiggsAudioV2ModelState.run_preprocess` before every
-        forward with the batch that forward consumes: the layout can change
-        between steps (finished requests freed, prefills graduating into the
-        decode block), so a view materialized at sampling time would already
-        be stale at the next lookup.
+        ``_maybe_apply_audio_feedback`` looks state up by batch row, while
+        the authoritative ``_audio_state`` is keyed by req_id under MRV2;
+        this view bridges the two key spaces. Called by
+        :class:`HiggsAudioV2ModelState.run_preprocess` before every forward:
+        the batch layout can change between steps, so a view materialized at
+        sampling time would be stale by the next lookup.
         """
         state = getattr(self, "_audio_state", None)
         if not isinstance(state, dict):
@@ -1634,21 +1586,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str]) -> None:
         """Drop finished requests' per-request audio state.
 
-        Under MRV2 ``_audio_state``/``_slot_output_len`` are keyed by
-        req_id and a key never repeats, so without this cleanup every
-        finished request would retain its ``audio_out_ids`` GPU tensor for
-        the process lifetime (V1's batch-row keys were self-bounded by slot
-        reuse). ``_pending_codes_by_req`` needs the same drop: an aborted
-        request (or one cut at max_tokens mid-audio) leaves its last
-        sampled codes row unconsumed — postprocess only walks the current
-        batch, so the entry would otherwise sit in the map forever. A
-        normally finished request has no entry left to pop: its final frame
-        is served by the postprocess walk that precedes the finishing
-        sampling step, and the finishing step samples audio_eos (not an
-        audio token), which appends nothing. Preempted requests keep their
-        state: the MRV2 runner only invokes this hook for
-        ``finished_req_ids``, and a recomputed request must resume its
-        delay-pattern history.
+        Under MRV2 the per-request dicts are keyed by req_id and a key never
+        repeats, so finished entries would otherwise retain their
+        ``audio_out_ids`` GPU tensors for the process lifetime. Under V1 the
+        batch-row keys are bounded by slot reuse, so the hook is a no-op
+        there. Aborted requests may also leave an unconsumed entry in
+        ``_pending_codes_by_req``, since postprocess only walks the current
+        batch. Preempted requests keep their state: a recomputed request
+        must resume its delay-pattern history.
         """
         state = getattr(self, "_audio_state", None)
         lens = getattr(self, "_slot_output_len", None)
@@ -1729,27 +1674,26 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> None:
         """Mask non-audio tokens at audio-mode positions, in-place on ``logits``.
 
-        Heuristic: per-request, find the last token seen so far (last of
-        ``output_token_ids[i]`` if non-empty, else last of
-        ``prompt_token_ids[i]``). If that token is ``audio_bos_token_id`` or
-        ``audio_token_id``, force the next emit to be one of
-        ``{audio_token_id, audio_eos_token_id}``. This unblocks live audio
-        generation since the un-biased argmax over the 128k vocab favours
-        text-token-id ranges (in particular the global ``eos_token_id``).
+        Per request, find the last token seen so far: the last of
+        ``output_token_ids[i]`` if non-empty, else the last of
+        ``prompt_token_ids[i]``. If it is ``audio_bos_token_id`` or
+        ``audio_token_id``, force the next sample to one of
+        ``{audio_token_id, audio_eos_token_id}``. The un-biased argmax over
+        the 128k vocab favours text-token ranges, in particular the global
+        ``eos_token_id``.
 
-        The MRV2 sampling hook passes ``row_req_ids`` (each logits row's
-        owning request id — rows exclude requests still mid-prefill, so row
-        ``i`` is not request ``i`` in mixed steps) and ``row_prev_tokens``
-        (the context token at each row's position, i.e.
-        ``input_ids[logits_indices]``). Both default to ``None`` on the V1
-        path, which keeps the metadata/stash walk below; under MRV2 the
-        ``should_terminate`` state lookup must go through ``row_req_ids``
-        because ``_audio_state`` is keyed by request id there.
+        The MRV2 hook passes ``row_req_ids``, each logits row's owning
+        request id, and ``row_prev_tokens``, the context token at each row
+        (``input_ids[logits_indices]``). Rows exclude mid-prefill requests,
+        so row ``i`` is not request ``i`` in mixed steps. Both default to
+        ``None`` on V1, which keeps the metadata/stash walk below; the
+        ``should_terminate`` lookup needs ``row_req_ids`` under MRV2 because
+        ``_audio_state`` is keyed by request id there.
 
-        We deliberately do NOT include the standard ``eos_token_id`` in the
-        allowed set — letting it through would end the whole sequence at the
-        first step. Stopping inside the audio span is the ``audio_eos`` token's
-        job; once it fires we drop the bias and the next call falls back to
+        The standard ``eos_token_id`` is deliberately not in the allowed
+        set: letting it through would end the whole sequence at the first
+        step. Stopping inside the audio span is the ``audio_eos`` token's
+        job; once it fires the bias drops and the next call falls back to
         the stock sampler.
         """
         if logits is None or logits.ndim != 2:
@@ -1874,14 +1818,13 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """Publish per-request audio codes into model_intermediate_buffer.
 
         Under MRV2 the runner calls this once per request after every
-        forward, BEFORE the step's sampling — so codes produced by a
-        sampling step are consumed one step later, and a positional cursor
-        over a row tensor desyncs as soon as mixed prefill+decode steps
-        produce logits rows for a subset of the batch. The MRV2 sampling
-        hook therefore fills ``_pending_codes_by_req`` keyed by request id,
-        and this method serves entries from that map. The V1 runner calls
-        postprocess in batch order right after sampling, so the positional
-        cursor over ``_last_audio_codes`` remains the fallback there.
+        forward, BEFORE the step's sampling, so codes produced by a sampling
+        step are consumed one step later. A positional cursor desyncs in
+        mixed prefill+decode steps, so the MRV2 sampling hook fills
+        ``_pending_codes_by_req`` keyed by request id and this method serves
+        entries from that map. The V1 runner calls postprocess in batch
+        order right after sampling, so the positional cursor over
+        ``_last_audio_codes`` remains the fallback there.
         """
         _ = multimodal_outputs  # consumed by the runner directly
         pending = getattr(self, "_pending_codes_by_req", None)
@@ -1908,15 +1851,12 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
     @staticmethod
     def _emit_code_rows(slice_codes: torch.Tensor) -> dict[str, Any]:
-        # Drop placeholder rows (-1) — only emit codes for actual audio positions.
+        # Drop placeholder rows (-1): only emit codes for actual audio positions.
         audio_rows = slice_codes[:, 0] >= 0
         if not bool(audio_rows.any()):
             return {}
         new_codes = slice_codes[audio_rows].to(torch.int32)
 
-        # Return ONLY this step's frames. The engine's
-        # MultimodalOutputProcessor.add_multimodal_tensor accumulates per-step
-        # OmniOutput.multimodal_outputs across all steps and consolidates at
-        # request finish via torch.cat(dim=0). Returning cumulative codes here
-        # caused N(N+1)/2 duplication (prior bug: engine internal accumulation).
+        # Return only this step's frames: the engine accumulates per-step
+        # multimodal_outputs across steps and concatenates at request finish.
         return {"codes": {"audio": new_codes}}

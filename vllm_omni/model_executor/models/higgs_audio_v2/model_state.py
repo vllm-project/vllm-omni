@@ -2,15 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MRV2 model state for the Higgs Audio v2 talker.
 
-The stock ``OmniModelState`` already owns this pipeline's MRV2 lifecycle
-(``mrv2_custom_sampler`` dispatch, ``postprocess`` request walk); the single
-addition is a per-forward realignment of the talker's batch-row-keyed audio
-state view. vLLM rebuilds each step's batch layout after finished requests
-are freed and prefill requests graduate into the decode block, so a view
-materialized at sampling time goes stale before the next forward's
-``_maybe_apply_audio_feedback`` lookup. ``run_preprocess`` runs before every
-forward (all graph modes) with the current batch, which is the layout the
-forward actually consumes.
+The stock ``OmniModelState`` owns this pipeline's MRV2 lifecycle. The only
+addition realigns the talker's batch-row-keyed audio state view before every
+forward: vLLM rebuilds the batch layout between steps, so a view taken at
+sampling time goes stale before the next lookup.
 """
 
 from __future__ import annotations
@@ -30,9 +25,8 @@ class HiggsAudioV2ModelState(OmniModelState):
     ) -> None:
         """Realign the talker's audio-state view, then run the stock preprocess.
 
-        The stock preprocess is a no-op while the talker declares no
-        ``has_preprocess`` embedding path; the rebuild is the reason this
-        override exists and must stay ahead of it.
+        The rebuild is the reason this override exists and must run ahead of
+        the preprocess; the stock preprocess is a no-op for this talker.
         """
         rebuild = getattr(self.model, "_rebuild_audio_state_view", None)
         if callable(rebuild):

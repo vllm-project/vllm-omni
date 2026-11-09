@@ -1119,10 +1119,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 num_output_rows,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
-            # Partition the flat payload once instead of mirroring it into both
-            # channels: MultimodalOutputProcessor accumulates pooler_output and
-            # multimodal_output independently, so a mirror doubles every
-            # per-request tensor row (e.g. Higgs v2 codes frames decoded twice).
+            # Partition the flat payload once. pooler_output and
+            # multimodal_output are accumulated independently downstream, so
+            # mirroring the payload into both channels would double every row.
             pooler_inter, pooler_client = partition_payload_list(
                 cast("Sequence[Mapping[str, object]]", pooler_payload or [])
             )

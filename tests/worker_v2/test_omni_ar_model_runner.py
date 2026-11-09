@@ -1246,10 +1246,9 @@ def test_stream_history_allocates_only_for_scheduled_requests():
 def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
     """The full-payload fallback must partition, not mirror.
 
-    Mirroring put codes.audio on both the pooling bridge and
-    multimodal_output; MultimodalOutputProcessor accumulates both channels,
-    so every per-step row entered the request ledger twice and the codec
-    decoded each frame twice (Higgs v2 MRV2 legacy transport).
+    pooler_output and multimodal_output are accumulated independently by
+    MultimodalOutputProcessor, so mirroring the flat payload into both
+    channels doubles every per-step row in the request ledger.
     """
     from tests.engine.test_output_processor_mrv2_text import (
         _Detokenizer,

@@ -43,7 +43,7 @@ class HiggsMrv2Options:
 
 # Tri-state config fields resolved by ``resolve_mrv2_defaults``.
 _MRV2_FLAG_FIELDS = tuple(HiggsMrv2Options.__dataclass_fields__)
-# explicit False under v2 raises instead of silently degrading the sampler.
+# An explicit False under v2 raises instead of silently degrading the sampler.
 _MRV2_STRUCTURAL_FLAGS = frozenset({"audio_async_payload", "audio_async_prompt_mode"})
 
 
@@ -164,10 +164,10 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
         self.audio_full_sample_graph = audio_full_sample_graph
         self.codec_cuda_graph = codec_cuda_graph
-        # MRV2 feature switches: tri-state (None = follow the model runner).
-        # An explicit bool overrides under v2 only; v1 resolves every switch
-        # off. Resolved once at model init by ``resolve_mrv2_defaults`` —
-        # never read these raw.
+        # MRV2 feature switches: tri-state. None follows the model runner; an
+        # explicit bool overrides under v2; v1 resolves every switch off.
+        # Resolved once at model init by ``resolve_mrv2_defaults``; never
+        # read these raw.
         self.audio_async_prompt_mode = audio_async_prompt_mode
         self.audio_async_payload = audio_async_payload
         self.audio_mrv2_static_inputs = audio_mrv2_static_inputs
@@ -190,12 +190,11 @@ class HiggsAudioV3Config(PretrainedConfig):
         """Resolve the 8 MRV2 switches without mutating shared checkpoint config.
 
         Under v2, ``None`` defaults the switch on and an explicit bool
-        overrides it; under v1 every switch resolves off regardless, since
-        the V1 paths never read them — an explicitly set switch is ignored
-        with a warning instead of silently doing nothing.
-        ``audio_async_payload`` and ``audio_async_prompt_mode`` are structural
-        requirements of the v2 sampler, so an explicit ``False`` under v2
-        raises instead of silently degrading.
+        overrides it. Under v1 every switch resolves off because the V1
+        paths never read them; an explicitly set switch is ignored with a
+        warning. ``audio_async_payload`` and ``audio_async_prompt_mode`` are
+        structural requirements of the v2 sampler, so an explicit ``False``
+        under v2 raises.
         """
         resolved: dict[str, bool] = {}
         ignored: list[str] = []

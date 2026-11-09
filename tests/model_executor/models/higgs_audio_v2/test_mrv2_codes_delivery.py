@@ -4,13 +4,10 @@
 
 Drives the real split/postprocess pair with synthetic batches: cu_num_logits
 is an inclusive prefix of length num_reqs + 1 and stays the authority for
-row→request ownership (on the pinned vLLM every request owns exactly one
-row and a mid-prefill row's sample is discarded downstream, but nothing
-here may assume that identity). Wrong slicing shifts every request's audio
-codes onto its neighbor — the batch>1 slot-shift failure. Also locks the
-row→request keying the sampling hook relies on (bias state lookup,
-delay-pattern attribution), the mixed-step audio-feedback owner walk, the
-V1 bias walks, and the finished-request state cleanup.
+row-to-request ownership. Wrong slicing shifts every request's audio codes
+onto its neighbor. Also locks the req_id keying for bias state lookup and
+delay-pattern attribution, the mixed-step audio-feedback owner walk, the V1
+bias walks, and the finished-request state cleanup.
 """
 
 from types import SimpleNamespace
@@ -54,10 +51,9 @@ def test_decode_step_maps_each_request_to_its_own_row():
 
 def test_mixed_prefill_step_skips_request_without_logits_rows():
     t = _talker()
-    # Hypothetical layout where "a" (still prefilling) owns no row while
-    # "b" and "c" own rows 0 and 1: the cu prefix must stay the authority —
-    # a positional-cursor consumer would hand row 0 to "a". (On the pinned
-    # vLLM "a" instead owns a discarded row; the derivation is identical.)
+    # Layout where prefilling "a" owns no row while "b" and "c" own rows 0
+    # and 1: the cu prefix stays the authority, and a positional-cursor
+    # consumer would hand row 0 to "a".
     codes = torch.tensor([[22, 22], [33, 33]], dtype=torch.long)
     pending = t._split_codes_by_request(codes, _batch(["a", "b", "c"], [0, 0, 1, 2]))
     assert set(pending) == {"b", "c"}
@@ -102,9 +98,9 @@ def test_audio_state_survives_batch_row_shift():
     """req_id-keyed state must survive MRV2's batch compaction.
 
     Request "a" at batch row 0 accumulates audio state. Between steps,
-    another request finishes and "a" shifts to row 1 (compaction). The
-    batch-row-keyed view rebuilt by the hook must still resolve "a"'s state
-    at its new row — a batch-row-keyed store would have lost it.
+    another request finishes and "a" shifts to row 1. The batch-row-keyed
+    view rebuilt by the hook must still resolve "a"'s state at its new row;
+    a batch-row-keyed store would have lost it.
     """
     t = _talker()
 
@@ -170,11 +166,10 @@ def test_view_tracks_current_forward_batch_after_compaction():
 def test_ras_resample_reads_req_id_keyed_state():
     """RAS re-sampling must resolve state through the req_id key.
 
-    Under MRV2 ``_audio_state`` is keyed by req_id; an int batch-row lookup
-    (``.get(bi)``) always missed and silently disabled the repetition-aware
-    re-sampling — the anti-codebook-collapse guard V1 keeps. Here every
-    codebook samples the value that filled its 7-frame history, so RAS must
-    re-sample all of them from logits peaked at a different index.
+    ``_audio_state`` is keyed by req_id under MRV2, and RAS is the
+    anti-codebook-collapse guard V1 keeps. Here every codebook samples the
+    value that filled its 7-frame history, so RAS must re-sample all of
+    them from logits peaked at a different index.
     """
     t = _talker()
     audio_token_id = 3
@@ -236,9 +231,8 @@ _BIAS_CONFIG = SimpleNamespace(audio_bos_token_id=10, audio_token_id=11, audio_e
 def test_bias_forces_audio_eos_when_ramp_down_completed():
     """The MRV2 termination path must consume req_id-keyed ``should_terminate``.
 
-    The state dict is keyed by req_id under MRV2; the old int-row lookup
-    (``.get(i)``) always missed, so the LM token was never forced to
-    audio_eos and every request generated to the stage max_tokens cap.
+    The state dict is keyed by req_id under MRV2, so an int-row lookup never
+    finds the flag and the LM token is never forced to audio_eos.
     """
     t = _talker()
     t.config = _BIAS_CONFIG
@@ -264,9 +258,9 @@ def test_bias_keeps_forcing_audio_token_mid_span():
 def test_bias_resolves_rows_through_owning_request_in_mixed_step():
     """Mixed step where row i is not request i in the cu layout.
 
-    Prev tokens arrive per row; the decode row's state must be resolved
-    through its owning request id — with the old ``.get(row)`` lookup into
-    the req_id-keyed dict the ramp-down termination never fired.
+    Prev tokens arrive per row, and the decode row's state must be resolved
+    through its owning request id; an int-row lookup into the req_id-keyed
+    dict would never fire the ramp-down termination.
     """
     t = _talker()
     t.config = _BIAS_CONFIG
@@ -353,9 +347,9 @@ def _feedback_talker():
 def test_audio_feedback_resolves_owner_row_in_mixed_step():
     """The qsl owner walk replaces the flat-position state lookup.
 
-    Layout: "a" prefills 2 tokens (audio placeholder at pos 1), "b"/"c"
-    decode. The old pos==row lookup cross-injected: a's prompt placeholder
-    hit b's state, b's token hit c's state, and c's token missed entirely.
+    Layout: "a" prefills 2 tokens with the audio placeholder at pos 1, while
+    "b" and "c" decode. A positional lookup would cross-inject neighboring
+    requests' frames here.
     """
     t = _feedback_talker()
     frame_b = torch.full((8, 1), 1, dtype=torch.long)

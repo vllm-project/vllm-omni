@@ -41,10 +41,10 @@ SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 # stage on v1; non-CUDA platforms fall back to the v1 runner through the
 # deploy file's platforms section, so the plain-text param guards the shipped
 # selection. The v1 opt-out param keeps the documented CUDA escape hatch
-# (higgs_audio_v2_v1.yaml) alive: the owner-row feedback walk and the bias
+# higgs_audio_v2_v1.yaml alive: the owner-row feedback walk and the bias
 # walks differ per runner, and both are shipped paths. Under v2 the talker
 # delegates LM token sampling to the native staged sampler, so penalties and
-# logprobs stay in the request surface — unlike Higgs v3, whose owned sampler
+# logprobs stay in the request surface, unlike Higgs v3 whose owned sampler
 # narrows it.
 TEST_PARAMS = [
     pytest.param(
@@ -103,10 +103,9 @@ class TestHiggsAudioV2OnlineHappyPath:
     def test_pcm_streaming_client_abort(self, omni_server, online_client) -> None:
         """A client aborting mid-stream must not wedge the server.
 
-        Exiting the streaming context mid-iteration closes the connection
-        (client-side cancel). Guards request cleanup on the v1 runner and on
-        the MRV2 sampling hook alike. A follow-up request proves the server
-        survived.
+        Exiting the streaming context mid-iteration closes the connection.
+        Guards request cleanup on the v1 runner and on the MRV2 sampling
+        hook alike. A follow-up request proves the server survived.
         """
         long_text = (
             "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20

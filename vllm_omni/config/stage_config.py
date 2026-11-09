@@ -390,10 +390,9 @@ class StagePipelineConfig:
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
     # Sampling keys this stage's model_runner: v2 implementation does not
-    # support. Checked against ``default_sampling_params`` at deploy-merge time
-    # so an unsupported default fails at startup (with the v1 opt-out named)
-    # instead of on every request. Keys whose engine-default value is neutral
-    # (e.g. repetition_penalty=1.0) pass; any non-neutral value fails.
+    # support. Checked against ``default_sampling_params`` at deploy merge:
+    # a non-neutral default fails at startup with the v1 opt-out named; a
+    # value equal to the engine default passes.
     mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Declares the ``model_runner: v2`` + legacy-transport combination
     # validated for this stage, silencing the unvalidated-integration
@@ -1192,11 +1191,10 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
-# Engine-default (neutral) values for sampling params a v2 stage may list as
-# unsupported: a default equal to the engine default is a no-op and passes.
-# Unlisted keys have no scalar neutral; an empty value (None, [], {}) passes.
-# logprobs/prompt_logprobs stay unlisted: 0 still requests the sampled
-# token's logprob, and the request path rejects any explicit value.
+# Engine-default values for listed sampling keys: a default equal to these
+# is a no-op and passes. Unlisted keys have no scalar neutral; an empty
+# value passes. logprobs/prompt_logprobs stay unlisted: 0 still requests
+# the sampled token's logprob.
 _MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,

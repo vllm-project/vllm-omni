@@ -116,8 +116,8 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
-  # MRV2 is CUDA-only for now (#9387 Phase 3 owns the non-CUDA platforms):
-  # the other platforms fall back to the V1 runner and its shipped shape,
+  # MRV2 is CUDA-only; RFC #9387 Phase 3 owns the non-CUDA platforms. The
+  # other platforms fall back to the V1 runner and its shipped shape,
   # connector geometry included. compilation_config and codec_graph_* are
   # CUDA/v2-only and ignored on the fallbacks.
   rocm:
