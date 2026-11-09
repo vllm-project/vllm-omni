@@ -431,6 +431,7 @@ def _run(pipeline, conditioning, extra, *, num_outputs=1):
         num_outputs_per_prompt=num_outputs,
         lora_request=None,
         lora_scale=1.0,
+        attention_schedule=None,
     )
     pipeline._prepare_request_inputs = lambda _prompt, _sampling: pipeline._prepare_encoder_conditioning_inputs(
         conditioning, _sampling
@@ -595,6 +596,7 @@ def test_preencoded_multi_output_and_decoder_stage_outputs_are_trimmed():
                 num_outputs_per_prompt=1,
                 lora_request=None,
                 lora_scale=1.0,
+                attention_schedule=None,
             ),
         )
     )
@@ -613,6 +615,7 @@ def test_step_post_decode_keeps_the_real_tail_caches_and_trims():
             num_outputs_per_prompt=1,
             lora_request=None,
             lora_scale=1.0,
+            attention_schedule=None,
         ),
     )
     window_video = torch.full((1, 24, _video_t(141), LATENT_H, LATENT_W), 50.0)

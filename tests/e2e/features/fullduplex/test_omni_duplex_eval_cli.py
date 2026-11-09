@@ -378,16 +378,28 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
             pace=pace,
         )
 
+    # The reply's media timestamp is the local media clock when its delta is
+    # processed. At the realtime pace the delta lands before the drain
+    # padding advances the clock (0.8s, the clip's own duration); as fast as
+    # possible the first padded unit is already on the wire when the delta
+    # is read, so the reply is stamped one unit later (1.8s).
+    sentence_time = 0.8 if pace == "realtime" else 1.8
     assert json.loads(result.output.read_text(encoding="utf-8")) == {
-        "sentences": [{"sentence": "Done.", "start": 0.8, "end": 0.8}],
-        "chunks": [{"text": "Done.", "current_time": 0.8}],
+        "sentences": [{"sentence": "Done.", "start": sentence_time, "end": sentence_time}],
+        "chunks": [{"text": "Done.", "current_time": sentence_time}],
     }
     meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True
     assert meta["drain_timeout"] is None
     assert meta["unit_ms"] == 1000
     assert meta["clock"] == ("media" if pace == "realtime" else "invalid")
-    assert len([event for event in received if event["type"] == "input_audio_buffer.append"]) == 1
+    # The clip is the wire before the commit; the drain padding that follows
+    # it streams zeroed units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    assert len([event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]) == 1
     assert "duplex_request_metrics" not in meta
     assert result.request_metrics
     assert result.request_metrics[0]["sample_id"] == "sample"
@@ -478,7 +490,14 @@ async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detectio
             expected_pcm += b"\0\0"
         else:
             expected_pcm = expected_pcm[:-2]
-    appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
+    # The clip is the wire before the commit (server VAD sends no commit and
+    # streams the whole clip): the drain padding after it streams zeroed
+    # units by design and is not part of the clip.
+    commit_at = next(
+        (index for index, event in enumerate(received) if event["type"] == "input_audio_buffer.commit"),
+        len(received),
+    )
+    appends = [event for event in received[:commit_at] if event["type"] == "input_audio_buffer.append"]
     assert b"".join(base64.b64decode(event["audio"]) for event in appends) == expected_pcm
     sent_frames = []
     pending_images = []
@@ -521,16 +540,21 @@ async def test_generate_finishes_a_silent_session_on_the_post_commit_listen(tmp_
     appended = []
 
     async def handler(websocket):
+        committed = False
         async for raw in websocket:
             event = json.loads(raw)
             if event["type"] == "session.update":
                 await websocket.send(json.dumps({"type": "session.created"}))
             elif event["type"] == "input_audio_buffer.append":
-                appended.append(base64.b64decode(event["audio"]))
+                # The clip is the wire before the commit; the zeroed drain
+                # padding that follows it is not part of the clip.
+                if not committed:
+                    appended.append(base64.b64decode(event["audio"]))
                 # A decision for an earlier unit does not end the session.
                 listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "input_audio_buffer.commit":
+                committed = True
                 await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                 await websocket.send(json.dumps(listen))
             elif event["type"] == "session.close":

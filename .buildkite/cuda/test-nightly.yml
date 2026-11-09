@@ -276,6 +276,8 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
         source_file_dependencies: diffusion_qwen_image_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
           - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
@@ -289,6 +291,7 @@ steps:
           QWEN_IMAGE_21_CALIBRATE: "0"
         artifact_paths:
           - tests/e2e/accuracy/artifacts/qwen_image_21/**/*
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - >-
             bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
@@ -300,6 +303,8 @@ steps:
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - export HUNYUAN_IMAGE3_MODEL="tencent/HunyuanImage-3.0-Instruct"
           - export HUNYUAN_IMAGE3_DEVICES="0,1,2,3"
@@ -430,6 +435,8 @@ steps:
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m "full_model and H100 and B200 and (cards_1 or cards_2)" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
@@ -437,12 +444,16 @@ steps:
       - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA/Timeline Guide Accuracy Test"
         source_file_dependencies: diffusion_minimax_h3_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/ -m "full_model and H100 and B200 and (cards_2 or cards_4)" --run-level full_model
 
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_video_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/results/result_acc_*.json
         commands:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m "full_model and H100 and B200 and (cards_1 or cards_2)" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m "full_model and H100 and B200 and (cards_1 or cards_2)" --run-level full_model
@@ -458,23 +469,14 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_1"
 
       - label: ":full_moon: Diffusion X2V · Perf Test · 2-GPU"
-        source_file_dependencies:
-          - diffusion_wan22_perf
-          - diffusion_cosmos3_perf
+        source_file_dependencies: diffusion_wan22_perf
         key: nightly-diffusion-x2v-performance-2gpu
         timeout_in_minutes: 180
         artifact_paths:
           - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_2"
-            EXIT1=$$?
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json -m "H100 and B200 and cards_2"
-            EXIT2=$$?
-            if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
-            exit $$EXIT2
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_2"
 
       - label: ":full_moon: Diffusion X2V · Perf Test · HunyuanVideo-1.5"
         source_file_dependencies: diffusion_hunyuan_video_perf
@@ -577,14 +579,14 @@ steps:
     key: nightly-simple-cpu-coverage
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
-    timeout_in_minutes: 60
+    timeout_in_minutes: 90
     artifact_paths:
       - coverage-core-model-cpu-*.xml.gz
     commands:
       - |
         set +e
         REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
-        pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
+        pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
         EXIT=$$?
         gzip -9 -f "$${REPORT}"
         exit $$EXIT

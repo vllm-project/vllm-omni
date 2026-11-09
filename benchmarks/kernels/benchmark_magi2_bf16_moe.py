@@ -291,7 +291,7 @@ def main():
     if not has_gpu:
         print(json.dumps({"status": "skip", "reason": "No visible CUDA/MUSA device"}))
         return
-    import vllm_omni.diffusion.models.magi2.fused_moe_kernels as kernels
+    import vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels as kernels
     from vllm_omni.platforms import current_omni_platform
 
     platform = "musa" if current_omni_platform.is_musa() else "cuda"

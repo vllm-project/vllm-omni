@@ -42,6 +42,12 @@ class CPUAttention(nn.Module):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
         ).transpose(1, 2)
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
+    def effective_attention(self):
+        return self, self.attn_backend, None
+
 
 @pytest.fixture
 def cpu_layers(monkeypatch):
@@ -722,6 +728,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         num_outputs_per_prompt=1,
         lora_request=None,
         lora_scale=1.0,
+        attention_schedule=None,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)
