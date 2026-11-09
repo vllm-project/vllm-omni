@@ -111,9 +111,9 @@ def suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             "@pytest.mark.skip(reason='synthetic platform skip')\ndef test_skip(): pass\n" if name == "a" else ""
         )
         (directory / f"test_{name}.py").write_text(
-            "from pathlib import Path\nimport pytest\npytestmark = [pytest.mark.core_model, pytest.mark.cpu]\n"
+            "from pathlib import Path\nimport os\nimport pytest\npytestmark = [pytest.mark.core_model, pytest.mark.cpu]\n"
             "@pytest.fixture(scope='module')\ndef shared():\n"
-            "    with Path('fixtures.txt').open('a') as stream: stream.write(__name__ + '\\n')\n"
+            "    with Path(f'fixture-{__name__}-{os.getpid()}.txt').open('x') as stream: stream.write(__name__)\n"
             "    return object()\n"
             "@pytest.mark.parametrize('value', [1, 2])\ndef test_case(shared, value): pass\n"
             "@pytest.mark.omni\ndef test_omni(): assert False\n" + skipped_case,
@@ -121,6 +121,12 @@ def suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         )
     write_profile(tmp_path / "profile.json", {node("a", "test_case[1]"): 10.0, node("removed"): 99999.0})
     return tmp_path
+
+
+def fixture_modules(suite: Path) -> list[str]:
+    # Separate files avoid concurrent append races on Windows; repeated fixture
+    # owners still produce duplicate module names (or fail exclusive creation).
+    return sorted(path.read_text() for path in suite.glob("fixture-*.txt"))
 
 
 def run_pytest(suite: Path, *args: str) -> subprocess.CompletedProcess:
@@ -180,7 +186,7 @@ def test_executed_partitions_match_filtered_baseline(suite: Path, count: int) ->
         owners.update({n: index for n in selected})
     assert set(owners) == nodes
     assert all(plan == plans[0] for plan in plans)
-    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == [f"test_{name}" for name in "acdefgh"]
+    assert fixture_modules(suite) == [f"test_{name}" for name in "acdefgh"]
 
 
 def test_skip_outcome_matches_unsharded_execution(suite: Path) -> None:
@@ -261,17 +267,17 @@ def test_unsafe_configuration_fails_before_execution(suite: Path, extra: tuple[s
 def test_xdist_guard_and_default_fixture_grouping(suite: Path) -> None:
     guarded = run_pytest(suite, "-p", "xdist", "-n", "2", *partition_args(0, "plan.json"))
     assert guarded.returncode == 4, guarded.stdout + guarded.stderr
-    assert not (suite / "fixtures.txt").exists()
+    assert not fixture_modules(suite)
     normal = run_pytest(suite, "-p", "xdist", "-n", "2", "--dist=loadgroup")
     assert normal.returncode == 0, normal.stdout + normal.stderr
-    assert sorted((suite / "fixtures.txt").read_text().splitlines()) == [f"test_{name}" for name in "abcdefgh"]
+    assert fixture_modules(suite) == [f"test_{name}" for name in "abcdefgh"]
 
 
 def test_collection_error_is_not_hidden(suite: Path) -> None:
     (suite / "tests/model_executor/test_broken.py").write_text("raise RuntimeError('collection failed')\n")
     result = run_pytest(suite, *partition_args(0, "plan.json"))
     assert result.returncode == 2, result.stdout + result.stderr
-    assert not (suite / "fixtures.txt").exists()
+    assert not fixture_modules(suite)
 
 
 def test_bad_scope_and_artifact_overwrite_fail(suite: Path) -> None:
