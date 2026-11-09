@@ -1786,3 +1786,60 @@ async def test_reuse_query_with_audio_matches_legacy_prompt():
     assert reuse.mm_processor_kwargs[0] == {"use_audio_in_video": True}
     assert reuse.mm_processor_kwargs[1] == {"use_audio_in_video": True}
     assert legacy.mm_processor_kwargs[0] == {"use_audio_in_video": True}
+
+
+class HistoryRecordingHandler(QwenOmniStreamingVideoHandler):
+    """Keeps the session history but no prompt content, so only the handler can retain frames."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.history: list[dict[str, Any]] = []
+
+    async def _preprocess_to_engine_prompt(self, request):
+        return {"prompt": "p"}
+
+    def create_message_history(self, config):
+        return self.history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_caching", [False, True], ids=["legacy", "incremental"])
+async def test_history_does_not_keep_evicted_frames(monkeypatch, prefix_caching):
+    decoded_images: dict[bytes, weakref.ReferenceType[Image.Image]] = {}
+    original_to_thread = asyncio.to_thread
+
+    async def recording_to_thread(function, *args, **kwargs):
+        result = await original_to_thread(function, *args, **kwargs)
+        if function is video_stream_base._decode_frame_bytes:
+            decoded_images[args[0]] = weakref.ref(result)
+        return result
+
+    monkeypatch.setattr(video_stream_base.asyncio, "to_thread", recording_to_thread)
+    engine = RecordingReuseEngine()
+    engine.engine.stage_vllm_configs[0].cache_config.enable_prefix_caching = prefix_caching
+    handler = HistoryRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "modalities": ["text"], "max_frames": 1, "enable_frame_filter": False})
+    frame_a = _make_jpeg(255, 0, 0)
+    frame_b = _make_jpeg(0, 255, 0)
+    try:
+        for index, (frame, text) in enumerate([(frame_a, "first"), (frame_b, "second")], start=1):
+            # With max_frames=1, frame B evicts frame A before the second turn.
+            ws.put({"type": "video.frame", "data": _b64(frame)})
+            assert await _poll(lambda frame=frame: frame in decoded_images)
+            ws.put({"type": "video.query", "text": text, "audio_data": _b64(b"\x01\x00\x02\x00")})
+            assert await _poll(lambda index=index: ws.sent_types().count("response.text.done") == index)
+        assert await _poll(lambda: len(handler.history) == 4)
+
+        gc.collect()
+        assert decoded_images[frame_a]() is None
+        assert handler.history == [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "ok"},
+        ]
+    finally:
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=5.0)

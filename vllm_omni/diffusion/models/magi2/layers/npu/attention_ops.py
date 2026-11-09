@@ -45,8 +45,8 @@ def varlen_attention_with_sink(
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError("query and key cumulative-length arrays must contain the same batch count")
 
-    actual_q = [int(length) for length in cu_seqlens_q.detach().cpu().tolist()[1:]]
-    actual_kv = [int(length) for length in cu_seqlens_k.detach().cpu().tolist()[1:]]
+    actual_q = cu_seqlens_q.tolist()[1:]
+    actual_kv = cu_seqlens_k.tolist()[1:]
     learnable_sink = None
     if sink is not None and sink.numel() > 0:
         if sink.ndim != 2 or sink.shape[-1] != q.shape[1]:
