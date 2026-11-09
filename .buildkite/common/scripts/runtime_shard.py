@@ -33,7 +33,9 @@ SHARD_FLAGS = "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKIT
 PLUGIN_MODULE = "pytest_file_timings"
 PLUGIN_FLAG = f"-p {PLUGIN_MODULE}"
 SCRIPTS_DIR = ".buildkite/common/scripts"
-PYTHONPATH_EXPORT = f'export PYTHONPATH="{SCRIPTS_DIR}${{PYTHONPATH:+:$PYTHONPATH}}"'
+# `$$` is required. Buildkite interpolates `$` before the shell runs, and
+# `${PYTHONPATH:+...}` is parsed as an offset, which rejects `+`.
+PYTHONPATH_EXPORT = f'export PYTHONPATH="{SCRIPTS_DIR}$${{PYTHONPATH:+:$$PYTHONPATH}}"'
 ARTIFACT_PATHS = ["timings/jobs/*.json"]
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _SHELL_EXPAND_ARG = re.compile(r"^(?:--(?:num-shards|shard-id)=)?\${1,2}[A-Za-z_][A-Za-z0-9_]*$")

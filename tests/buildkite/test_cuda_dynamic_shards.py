@@ -163,6 +163,7 @@ def test_uploader_keeps_one_simple_test_job_without_timings(monkeypatch: pytest.
     text = "\n".join(step["commands"])
     assert PLUGIN_MODULE in text
     assert ".buildkite/common/scripts" in text
+    assert "$${PYTHONPATH:+:$$PYTHONPATH}" in text
     assert NUM_SHARDS not in text
     assert SHARD_ID not in text
 
