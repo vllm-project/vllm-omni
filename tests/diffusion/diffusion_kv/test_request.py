@@ -46,6 +46,8 @@ def test_request_exposes_native_request_and_diffusion_semantics() -> None:
     assert request.num_computed_tokens == 0
     assert request.block_hashes == []
     assert request.kv_contexts == ()
+    assert request.atomic_cache_spans == ()
+    assert request.cache_dependencies == ()
     assert request.skip_reading_prefix_cache is True
     assert request.shared_prefix_boundary == 0
     assert request.status is RequestStatus.WAITING
@@ -94,6 +96,45 @@ def test_changed_multimodal_identity_changes_the_block_hash() -> None:
     second.build_block_hashes(BLOCK_SIZE, hash_function)
 
     assert first.block_hashes != second.block_hashes
+
+
+def test_cache_dependency_activates_at_its_exact_token_boundary() -> None:
+    hash_function = get_hash_fn_by_name("sha256")
+    first = _request(
+        prefix_len=8,
+        seq_len=12,
+        cache_token_ids=range(8),
+        atomic_cache_spans=((1, 5),),
+        cache_dependencies=((1, "image-old"),),
+    )
+    second = _request(
+        prefix_len=8,
+        seq_len=12,
+        cache_token_ids=range(8),
+        atomic_cache_spans=((1, 5),),
+        cache_dependencies=((1, "image-new"),),
+    )
+
+    first.build_block_hashes(1, hash_function)
+    second.build_block_hashes(1, hash_function)
+
+    assert first.block_hashes[0] == second.block_hashes[0]
+    assert first.block_hashes[1] != second.block_hashes[1]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error", "message"),
+    [
+        ({"atomic_cache_spans": ((2, 4), (3, 5))}, ValueError, "atomic_cache_spans"),
+        ({"atomic_cache_spans": ((2, 5),), "prefix_len": 4}, ValueError, "atomic_cache_spans"),
+        ({"atomic_cache_spans": ([1, 2],)}, TypeError, "atomic_cache_spans"),
+        ({"cache_dependencies": ((4, "image"),)}, ValueError, "cache_dependencies"),
+        ({"cache_dependencies": ((1, ""),)}, TypeError, "cache_dependencies"),
+    ],
+)
+def test_request_rejects_invalid_atomic_cache_metadata(overrides, error, message: str) -> None:
+    with pytest.raises(error, match=message):
+        _request(**overrides)
 
 
 @pytest.mark.parametrize(
