@@ -984,7 +984,7 @@ def test_single_stage_generate_without_num_frames_keeps_default(test_client, moc
     assert captured[0].num_frames == 81
 
 
-def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens(glm_multistage_test_client):  
+def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens(glm_multistage_test_client):
     response = glm_multistage_test_client.post(
         "/v1/images/generations",
         json={

@@ -60,6 +60,7 @@ def _client(engine) -> TestClient:
         [BaseModelPath(name="depth-anything/Video-Depth-Anything-Small", model_path="vda")]
     )
     app.state.args = Namespace(default_sampling_params=None, max_generated_image_size=None)
+    app.state.supported_tasks = "x2v"
     return TestClient(app)
 
 
