@@ -239,6 +239,7 @@ def test_collective_rpc_add_lora_routes_through_typed_client_helper(invoke_with_
         assert result is True
         add_lora.assert_awaited_once()
         delivered = add_lora.await_args
+        assert delivered is not None
         assert (delivered.args or (delivered.kwargs.get("lora_request"),))[0] is request
         client.collective_rpc_async.assert_not_awaited()
 
