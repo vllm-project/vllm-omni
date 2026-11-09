@@ -12,12 +12,48 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _CosyVoice3RejectionSampler
 from vllm_omni.model_executor.models.cosyvoice3.dspark import UNIFIED_MASK_TOKEN_ID, converted_config
 from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("num_draft_tokens", [0, 7])
+def test_verification_log_requires_successful_native_draft_sampling(monkeypatch, num_draft_tokens):
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+    output = object()
+    native_call = MagicMock(return_value=output)
+    monkeypatch.setattr(RejectionSampler, "__call__", native_call)
+    log = MagicMock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3.logger.debug", log)
+    verifier = object.__new__(_CosyVoice3RejectionSampler)
+    logits = torch.zeros(1, 3)
+    batch = SimpleNamespace(num_draft_tokens=num_draft_tokens)
+    draft_logits, invalid_drafts = object(), object()
+
+    assert verifier(logits, batch, draft_logits, invalid_drafts) is output
+    native_call.assert_called_once_with(logits, batch, draft_logits, invalid_drafts)
+    if num_draft_tokens:
+        log.assert_called_once_with("CosyVoice3 Talker is verifying draft codes")
+        verifier(logits, batch, draft_logits, invalid_drafts)
+        assert log.call_count == 2  # Warmup must not suppress subsequent request-time evidence.
+    else:
+        log.assert_not_called()
+
+
+def test_verification_log_does_not_claim_success_when_native_sampling_fails(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+    monkeypatch.setattr(RejectionSampler, "__call__", MagicMock(side_effect=RuntimeError("verification failed")))
+    log = MagicMock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3.logger.debug", log)
+    verifier = object.__new__(_CosyVoice3RejectionSampler)
+    with pytest.raises(RuntimeError, match="verification failed"):
+        verifier(torch.zeros(1, 3), SimpleNamespace(num_draft_tokens=7))
+    log.assert_not_called()
 
 
 def test_capture_layers_match_converted_checkpoint_conventions():

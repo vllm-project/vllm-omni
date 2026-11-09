@@ -40,6 +40,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
@@ -80,6 +81,15 @@ _QWEN2_STACKED_SHARDS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
+
+
+class _CosyVoice3RejectionSampler(RejectionSampler):
+    def __call__(self, logits, input_batch, draft_logits=None, invalid_drafts=None):
+        output = super().__call__(logits, input_batch, draft_logits, invalid_drafts)
+        if input_batch.num_draft_tokens > 0:
+            # Startup warmup also verifies drafts; keep request-time evidence visible.
+            logger.debug("CosyVoice3 Talker is verifying draft codes")
+        return output
 
 
 def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
@@ -1300,8 +1310,6 @@ class CosyVoice3Model(
         # conditioning from the encoder call to its batch row instead.
         self._mrv2_encoded_conditioning = OrderedDict()
         if getattr(self, "_dspark_config", None) is not None:
-            from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
-
             if not cosyvoice3_standard_sampling(self.config):
                 from vllm_omni.model_executor.models.cosyvoice3.dspark import (
                     ras_probabilities,
@@ -1324,7 +1332,7 @@ class CosyVoice3Model(
                 self._dspark_config.num_speculative_tokens,
                 "standard" if cosyvoice3_standard_sampling(self.config) else "ras-exact-verification",
             )
-            return sampler, RejectionSampler(sampler, self._dspark_config, sampler.req_states.device)
+            return sampler, _CosyVoice3RejectionSampler(sampler, self._dspark_config, sampler.req_states.device)
         return None
 
     def _full_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
