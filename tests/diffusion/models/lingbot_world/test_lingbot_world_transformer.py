@@ -1200,6 +1200,37 @@ def test_timestep_projection_is_staged_into_one_static_buffer_per_shape() -> Non
 
 @pytest.mark.cpu
 @torch.no_grad()
+def test_packed_timestep_projection_preserves_block_output():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    block = model.blocks[0]
+    hidden = torch.randn(1, 4, model.dim)
+    text = torch.randn(1, 3, model.dim)
+    camera = torch.randn_like(hidden)
+    projection = torch.randn(1, 4, 6, model.dim)
+
+    def run(value, packed):
+        return block(
+            hidden,
+            text,
+            value,
+            camera,
+            self_cache=_cache(module, model).self_attention[0],
+            cross_cache=None,
+            current_start=0,
+            sink_tokens=0,
+            update_cache=False,
+            rotary_emb=None,
+            timestep_projection_packed=packed,
+        )[0]
+
+    torch.testing.assert_close(
+        run(projection, False), run(projection.transpose(1, 2).contiguous(), True), rtol=0, atol=0
+    )
+
+
+@pytest.mark.cpu
+@torch.no_grad()
 def test_block_condition_cache_reuses_pre_sp_projections_without_changing_output():
     module = attention_tests._load_module()
     model = _tiny_model(module, num_layers=1).eval()

@@ -617,6 +617,9 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("lingbot_cache_block_conditions must be a boolean")
         npu_host_lengths = model_config.get("lingbot_npu_host_lengths", False)
         npu_fused_rmsnorm = model_config.get("lingbot_npu_fused_rmsnorm", False)
+        npu_fused_adaln = model_config.get("lingbot_npu_fused_adaln", False)
+        if any(type(option) is not bool for option in (npu_fused_adaln)):
+            raise ValueError("LingBot NPU fusion options must be booleans")
         self._lingbot_npu_host_timestep = model_config.get("lingbot_npu_host_timestep", False)
         if type(self._lingbot_npu_host_timestep) is not bool:
             raise ValueError("lingbot_npu_host_timestep must be boolean")
@@ -712,11 +715,19 @@ class LingBotWorldCausalDMDPipeline(
             quant_config=quant_config,
             prefix="transformer",
         )
-        if npu_host_lengths or npu_fused_rmsnorm or cache_block_conditions:
+        if any(
+            (
+                npu_host_lengths,
+                npu_fused_rmsnorm,
+                cache_block_conditions,
+                npu_fused_adaln,
+            )
+        ):
             self.transformer.configure_npu_optimizations(
                 host_lengths=npu_host_lengths,
                 fused_rmsnorm=npu_fused_rmsnorm,
                 cache_block_conditions=cache_block_conditions,
+                fused_adaln=npu_fused_adaln,
             )
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
