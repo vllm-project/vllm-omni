@@ -9,12 +9,12 @@ No request dictionary holds a view into a mutable slot or CUDA graph buffer.
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.buffer_utils as buffer_utils
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState

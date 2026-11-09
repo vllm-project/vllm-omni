@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -504,12 +504,6 @@ class OmniServeCommand(CLISubcommand):
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
-        )
-        omni_config_group.add_argument(
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
@@ -667,10 +661,22 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
+        )
+        omni_config_group.add_argument(
             "--lora-scale",
             type=float,
             default=None,
-            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+            help=(
+                "Multiplier on top of a startup PEFT LoRA's own alpha/rank scaling; "
+                "effective strength = lora_scale * lora_alpha / r. Pass the same "
+                "value the reference framework uses (e.g. LightX2V's --lora-scale), "
+                "not the pre-multiplied scale * alpha / rank. Distilled LoRAs are "
+                "fused at their checkpoint scale."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
@@ -870,6 +876,17 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
+        )
+
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
+            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
+            "with null end meaning the actual sequence end. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters

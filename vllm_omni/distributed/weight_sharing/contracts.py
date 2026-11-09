@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU-only contracts for persistent, rank-paired CUDA weight sharing.
+"""CPU-only contracts for persistent, rank-paired device weight sharing.
 
-Storage IDs identify PyTorch storages, not CUDA allocations. Each storage is
+Storage IDs identify PyTorch storages, not device allocations. Each storage is
 reduced once per session and imported at most once, even when allocation handles
 are equal. None of these descriptors contains tensor data or Python callables.
 """
@@ -174,12 +174,12 @@ class StorageLease(Protocol):
     def close(self) -> None: ...
 
 
-class CudaIpcCodec(Protocol):
-    """All methods execute on the session's CUDA owner thread.
+class IpcCodec(Protocol):
+    """All methods execute on the session's device owner thread.
 
     The backend validates the spec before inspect and the manifest before
     make_views. inspect validates the provider runtime; validate_runtime does
-    so for the consumer before importing. synchronize only waits for the GPU.
+    so for the consumer before importing. synchronize only waits for the device.
     """
 
     def inspect(self, bindings: Mapping[str, object], spec: WeightSpec, context: SessionContext) -> PreparedWeights: ...
@@ -199,6 +199,10 @@ class CudaIpcCodec(Protocol):
     def weak_storage(self, carrier: object) -> StorageLease: ...
 
     def cancel_unconsumed(self, descriptor: StorageExport, device_index: int) -> None: ...
+
+
+# Compatibility for consumers of the original CUDA-named protocol.
+CudaIpcCodec = IpcCodec
 
 
 @dataclass(frozen=True)
@@ -227,7 +231,7 @@ class SessionSnapshot:
 class CloseResult:
     """CLOSED is local completion; only a provider can confirm peer release.
 
-    A consumer's receipt may be relayed again without repeating CUDA cleanup.
+    A consumer's receipt may be relayed again without repeating device cleanup.
     The caller must deliver it before releasing the provider's resources.
     """
 

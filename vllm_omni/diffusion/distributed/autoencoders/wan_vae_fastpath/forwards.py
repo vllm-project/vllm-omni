@@ -272,6 +272,15 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 _PROBE_SEED = 0
+# One Gaussian draw is not a bitwise proof. On sm_90 with cuDNN 9.24, implicit
+# spatial padding and an explicit pad are each deterministic, and fp32 matches,
+# but bf16/fp16 still differ by one ulp on a minority of inputs. Seed 0 can
+# match every element (fp16 2x2 with 32 channels, bf16 6x10 with a cached
+# frame) while the next seed does not; that false accept is then reused for
+# every later activation of the shape. Eight fixed seeds caught every such
+# shape exercised by the lossless decoder tests. Trials stay sequential so a
+# probe still holds one input, the reference copy, and two outputs.
+_PROBE_TRIALS = 8
 
 
 def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) -> torch.Tensor:
@@ -286,28 +295,33 @@ def _equal_on_random_operands(
     reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference_input: Callable[[torch.Tensor], torch.Tensor],
 ) -> bool:
-    """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
+    """Compare two convolution formulations on several seeded stand-ins for ``x`` and ``weight``.
 
     Agreement on the real operands proves little: all-zero activations or
-    weights give the same bytes under any kernel. Which kernel cuDNN runs
-    depends only on the verdict key's metadata, never on values, so a match on
-    random data is what makes a verdict reusable for every later input and
-    weight update; it is also the only comparison needed. A private generator
-    leaves the global RNG streams untouched.
+    weights give the same bytes under any kernel. cuDNN picks the kernel from
+    the verdict key's metadata, but two deterministic low-precision kernels
+    can still disagree by an ulp on some inputs, so every one of
+    ``_PROBE_TRIALS`` probes has to match before the verdict is reused for a
+    later input or weight update. A private generator leaves the global RNG
+    streams untouched.
 
     ``reference`` convolves ``reference_input(x)`` (the pre-padded or
-    channels-first copy). The probe input is drawn twice from the same
+    channels-first copy). Each probe input is drawn twice from the same
     generator state, so each formulation's input is freed before the other's
-    is created; callers probe before running the real convolution. The first
-    call for a shape then holds at most one probe input, the reference copy
-    and the two probe outputs, no more than comparing real operands did.
+    is created; callers probe before running the real convolution. Trials are
+    sequential, so the first call for a shape holds at most one probe input,
+    the reference copy and the two probe outputs.
     """
-    generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
-    probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
-    state = generator.get_state()
-    reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
-    generator.set_state(state)
-    return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
+    fan_in_std = weight[0].numel() ** -0.5
+    for seed in range(_PROBE_SEED, _PROBE_SEED + _PROBE_TRIALS):
+        generator = torch.Generator(device=x.device).manual_seed(seed)
+        probe_weight = _random_like(weight, generator, std=fan_in_std)
+        state = generator.get_state()
+        reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
+        generator.set_state(state)
+        if not _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out):
+            return False
+    return True
 
 
 def _conv_with_spatial_padding(
@@ -321,10 +335,10 @@ def _conv_with_spatial_padding(
 
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
-    but is only bit-identical if cuDNN selects the same kernel for both
-    formulations. Exact paths compare both on seeded random operands for each
-    (conv, shape) before running the selected formulation; later calls reuse
-    the verdict until it is evicted (see :func:`_equal_on_random_operands`).
+    but is only bit-identical when the two formulations agree on every probe in
+    :func:`_equal_on_random_operands`. The first call for each (conv, shape)
+    compares both before running the real convolution once with the selected
+    formulation; later calls reuse the verdict until it is evicted.
     Internal channels-last decoder convolutions skip this bitwise check under
     their tolerance-based contract.
     """

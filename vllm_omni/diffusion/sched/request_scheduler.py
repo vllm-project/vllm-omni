@@ -7,6 +7,7 @@ import json
 from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
 from vllm_omni.diffusion.data import uses_rank_local_dp_concurrency
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.sched.interface import (
 )
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import AttentionScheduleConfig
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 # Derived and request-owned fields must be resolved separately from the bulk
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
 ) - {
+    "attention_schedule",
+    "attention_schedule_explicit",
     "condition_key",
     "flow_shift",
     "lora_int_id",
@@ -87,8 +91,15 @@ def uses_text_encoder_allgather(config: object) -> bool:
     return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
-def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-    """Build the compatibility key shared by scheduling and DP dispatch."""
+def build_request_batch_sampling_params_key(
+    request: OmniDiffusionRequest, attention_schedule_config: AttentionScheduleConfig | None = None
+) -> RequestBatchSamplingParamsKey:
+    """Build the compatibility key shared by scheduling and DP dispatch.
+
+    ``attention_schedule_config`` is the service's ``diffusion_attention_schedule``. The key carries
+    the request's resolved schedule and whether the request sent it, so a request that inherits the
+    default and one that sends the same ranges explicitly stay in separate batches.
+    """
     sampling = request.sampling_params
     # LoRA identity is optional on sampling params (and on test stubs).
     lora_request = getattr(sampling, "lora_request", None)
@@ -110,6 +121,8 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
         )
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
+    key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
@@ -178,7 +191,9 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        key = build_request_batch_sampling_params_key(request)
+        key = build_request_batch_sampling_params_key(
+            request, getattr(self.od_config, "diffusion_attention_schedule", None)
+        )
         if uses_rank_local_dp_concurrency(self.od_config):
             # Serialize once before the request enters the queue. Invalid
             # extra_args then fail this submission, rather than schedule()

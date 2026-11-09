@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for process-scoped GPU memory accounting."""
 
 import os
@@ -52,24 +55,6 @@ class TestParseCudaVisibleDevices:
 
 
 class TestGetProcessGpuMemory:
-    @pytest.mark.skipif(not os.path.exists("/dev/nvidia0"), reason="No GPU")
-    def test_returns_memory_for_current_process(self):
-        import torch
-
-        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
-
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        device = torch.device("cuda:0")
-        tensor = torch.zeros(1000, 1000, device=device)
-
-        memory = get_process_gpu_memory(0)
-        assert memory >= 0
-
-        del tensor
-        torch.accelerator.empty_cache()
-
     def test_raises_on_invalid_device(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 

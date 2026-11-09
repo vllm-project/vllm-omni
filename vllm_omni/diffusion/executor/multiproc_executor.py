@@ -531,7 +531,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # same collective schedule, including shape, CFG, denoise steps,
             # output count, and LoRA settings. Two default (None) step counts
             # are valid and resolve identically inside the same pipeline.
-            compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
+            # add_request() already resolved each attention schedule against
+            # this service config and rejected invalid ones at submission.
+            attention_schedule_config = self.od_config.diffusion_attention_schedule
+            compatibility_keys = [
+                build_request_batch_sampling_params_key(nr.req, attention_schedule_config) for nr in new_reqs
+            ]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
                     "Rank-local DP concurrency requires compatible shape, CFG, "

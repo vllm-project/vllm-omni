@@ -480,13 +480,14 @@ def _make_request_executor(monkeypatch, prompts, component="text_encoder", allga
     executor._finalizer = Mock()
     executor.od_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=len(prompts)),
+        diffusion_attention_schedule=None,
         diffusion_offload_config={
             "mode": "layer",
             "components": [component],
             "layer_options": {component: {"weight_transfer": "allgather" if allgather else "rank-local"}},
         },
     )
-    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", lambda req: ())
+    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", lambda req, config=None: ())
     requests = []
     for index, prompt in enumerate(prompts):
         request_id = str(index)
@@ -519,6 +520,7 @@ def _make_hsdp_request_executor(monkeypatch, prompts):
     executor, scheduled = _make_request_executor(monkeypatch, prompts, allgather=False)
     executor.od_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=8, hsdp_data_parallel=True),
+        diffusion_attention_schedule=None,
     )
     return executor, scheduled
 
@@ -545,6 +547,29 @@ def test_hsdp_data_parallel_execute_batch_skips_pipeline_batching(monkeypatch):
 
     executor.execute_request.assert_called_once_with(scheduled)
     executor.collective_rpc.assert_not_called()
+
+
+def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatch):
+    """The wave check must build the scheduler's key, which resolves each request's schedule.
+
+    Without the service config, explicit ranges would be resolved against no profiles and rejected,
+    failing a wave the scheduler formed.
+    """
+    executor, scheduled = _make_request_executor(monkeypatch, ["first", "second"])
+    service = object()
+    executor.od_config.diffusion_attention_schedule = service
+    received: list[object] = []
+
+    def _recording_key(req, attention_schedule_config=None):
+        received.append(attention_schedule_config)
+        return ()
+
+    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", _recording_key)
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc = Mock(return_value=[{"dp_rank": rank, "output": out} for rank, out in enumerate(results)])
+    executor.execute_request(scheduled)
+
+    assert received == [service, service]
 
 
 @pytest.mark.parametrize("allgather", [False, True])
