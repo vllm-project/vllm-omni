@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -504,6 +505,38 @@ def resolve_multiview_uploads(
     return resolved
 
 
+def contain_multiview_local_paths(extra: Mapping[str, Any], allowed_local_media_path: str) -> None:
+    """Keep client-named server files under the server's ``--allowed-local-media-path``.
+
+    Without that flag, HTTP clients upload media as ``input_references`` instead,
+    as for other local media in vLLM. Uploads become server paths after this check.
+    """
+    multiview = extra.get("multiview")
+    views = multiview.get("views") if isinstance(multiview, Mapping) else None
+    named = [
+        view.get(field)
+        for view in (views if isinstance(views, list) else ())
+        if isinstance(view, Mapping)
+        for field in ("control_path", "control", "vision_path", "vision")
+    ]
+    lidar = extra.get("lidar")
+    if isinstance(lidar, Mapping):
+        named += [lidar.get("control_path"), lidar.get("condition_path")]
+    # Validation rejects non-string media values; only strings can name a server file.
+    paths = [path for path in named if isinstance(path, str)]
+    if not paths:
+        return
+    if not allowed_local_media_path:
+        raise ValueError(
+            "Cosmos3 multiview server-local paths require the server's --allowed-local-media-path; "
+            "upload the media as input_references instead."
+        )
+    base = os.path.join(os.path.realpath(allowed_local_media_path), "")
+    for path in paths:
+        if not os.path.realpath(path).startswith(base):
+            raise ValueError(f"Cosmos3 multiview path {path!r} is outside --allowed-local-media-path.")
+
+
 async def admit_multiview_uploads(
     extra_params: Mapping[str, Any] | None,
     *,
@@ -511,6 +544,7 @@ async def admit_multiview_uploads(
     num_uploads: int,
     persist: Callable[[int, bool], Awaitable[str]],
     sampling_frame_rates: Mapping[str, Any] | None = None,
+    allowed_local_media_path: str = "",
 ) -> dict[str, Any]:
     """Persist multipart ``input_references`` and resolve the manifest to local paths.
 
@@ -520,10 +554,12 @@ async def admit_multiview_uploads(
     cleanup when this raises. The LiDAR control and condition are numeric
     uploads, checked structurally as soon as they are stored.
     ``sampling_frame_rates`` must agree with the manifest's rate aliases.
+    Client-named paths must lie under ``allowed_local_media_path``.
     Manifest problems raise ``ValueError`` or ``TypeError``.
     """
     extra = extra_params or {}
     reject_multiview_negative_fields({"negative_prompt": negative_prompt}, "request")
+    contain_multiview_local_paths(extra, allowed_local_media_path)
     lidar_indexes = multiview_lidar_upload_indexes(extra)
     paths: list[str] = []
     for index in range(num_uploads):

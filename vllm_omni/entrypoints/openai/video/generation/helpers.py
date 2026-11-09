@@ -688,6 +688,7 @@ def _control_upload_suffix(
 
 
 async def _admit_multiview_uploads(
+    handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
     input_references: list[UploadFile],
     resources: VideoRequestResources,
@@ -697,7 +698,7 @@ async def _admit_multiview_uploads(
     Runs for every multiview request, with or without uploads, so manifest errors
     fail here instead of in the asynchronous job. The model-specific rules live in
     ``admit_multiview_uploads``; this wrapper supplies upload persistence, the
-    request-level frame rate and error mapping.
+    request-level frame rate, the server's local-media allowlist and error mapping.
     """
 
     async def persist(index: int, numeric_lidar: bool) -> str:
@@ -717,6 +718,7 @@ async def _admit_multiview_uploads(
             sampling_frame_rates={"fps": request.fps},
             num_uploads=len(input_references),
             persist=persist,
+            allowed_local_media_path=handler.allowed_local_media_path,
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, detail=str(exc)) from exc
@@ -1309,7 +1311,7 @@ async def _parse_video_form(
                 )
             ):
                 raise HTTPException(400, detail="Multiview requests cannot be combined with generic reference fields.")
-            await _admit_multiview_uploads(request, input_references, resources)
+            await _admit_multiview_uploads(handler, request, input_references, resources)
             return request, handler, effective_model_name, None, None, None, resources, None
 
         h3_control = handler.is_minimax_h3

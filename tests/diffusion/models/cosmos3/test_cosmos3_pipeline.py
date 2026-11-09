@@ -4759,6 +4759,52 @@ def test_admit_multiview_request_checks_request_frame_rate(fps: float | None, ac
             asyncio.run(admit)
 
 
+@pytest.mark.parametrize(
+    ("view_path", "lidar_path", "allowed", "match"),
+    [
+        ("media/front.mp4", "media/lidar.safetensors", True, None),
+        ("media/front.mp4", None, False, r"require the server's --allowed-local-media-path"),
+        ("outside.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/../outside.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media-sibling/front.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/escape.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/front.mp4", "outside.safetensors", True, "outside --allowed-local-media-path"),
+    ],
+    ids=["inside", "no_allowlist", "outside", "dot_dot", "prefix_sibling", "symlink", "lidar_outside"],
+)
+def test_admit_multiview_contains_client_named_paths(
+    tmp_path, view_path: str, lidar_path: str | None, allowed: bool, match: str | None
+) -> None:
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "escape.mp4").symlink_to(tmp_path / "outside.mp4")
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        raise AssertionError("nothing to persist")
+
+    view = {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_path": str(tmp_path / view_path)}
+    extra: dict[str, Any] = {"multiview": {"views": [view]}, "wsm": {}}
+    if lidar_path is not None:
+        extra["lidar"] = {"control_path": str(tmp_path / lidar_path)}
+    admit = admit_multiview_uploads(
+        extra,
+        negative_prompt=None,
+        num_uploads=0,
+        persist=persist,
+        allowed_local_media_path=str(media) if allowed else "",
+    )
+
+    if match is None:
+        assert asyncio.run(admit)["multiview"]["views"] == [view]
+    else:
+        with pytest.raises(ValueError, match=match):
+            asyncio.run(admit)
+
+
 def test_admit_multiview_uploads_rejects_before_and_after_persisting(tmp_path) -> None:
     import asyncio
 

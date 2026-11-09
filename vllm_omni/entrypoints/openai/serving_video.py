@@ -194,10 +194,13 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
+        allowed_local_media_path: str = "",
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        # Contains client-named server files, such as multiview media paths.
+        self.allowed_local_media_path = allowed_local_media_path
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
@@ -385,11 +388,13 @@ class OmniOpenAIServingVideo:
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
+        allowed_local_media_path: str = "",
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,
             model_name=model_name,
             stage_configs=stage_configs,
+            allowed_local_media_path=allowed_local_media_path,
         )
 
     def shutdown(self) -> None:

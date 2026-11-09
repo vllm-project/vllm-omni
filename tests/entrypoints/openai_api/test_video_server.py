@@ -2904,6 +2904,46 @@ def test_cosmos3_multiview_admission_rejects_before_generation(
     generate.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("allowed", "inside", "message"),
+    [
+        (False, True, "require the server's --allowed-local-media-path"),
+        (True, False, "outside --allowed-local-media-path"),
+        (True, True, None),
+    ],
+    ids=["no-allowlist", "outside-allowlist", "inside-allowlist"],
+)
+def test_cosmos3_multiview_local_paths_require_allowlist(
+    test_client, mocker: MockerFixture, tmp_path, allowed, inside, message
+):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    media = tmp_path / "media"
+    media.mkdir()
+    if allowed:
+        handler.allowed_local_media_path = str(media)
+    control_path = str((media if inside else tmp_path) / "front.mp4")
+    generate = mocker.patch.object(
+        handler,
+        "generate_video_bytes",
+        return_value=EncodedVideoResult(video_bytes=b"mp4", stage_durations={}, peak_memory_mb=0.0),
+    )
+    extra_params = {"multiview": {"views": [{**_COSMOS3_T2V_VIEW, "control_path": control_path}]}, "wsm": {}}
+
+    response = test_client.post(
+        "/v1/videos/sync", data={"prompt": "Driving.", "extra_params": json.dumps(extra_params)}
+    )
+
+    if message is None:
+        assert response.status_code == 200
+        request = generate.call_args.args[0]
+        assert request.extra_params["multiview"]["views"][0]["control_path"] == control_path
+    else:
+        assert response.status_code == 400
+        assert message in response.json()["detail"]
+        generate.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
