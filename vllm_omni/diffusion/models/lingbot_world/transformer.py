@@ -580,6 +580,7 @@ class LingBotAttentionBlock(nn.Module):
         self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.npu_fused_adaln = False
         self.npu_fused_residual = False
+        self.npu_fused_mxfp8_ffn = False
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
@@ -755,7 +756,13 @@ class LingBotAttentionBlock(nn.Module):
             hidden_states = hidden_states + attention_output
 
         normalized = self._adaln(self.norm2, hidden_states, scale_ffn, shift_ffn, num_frames, tokens_per_frame)
-        ffn_output = self.ffn(normalized)
+        ffn_output = None
+        if self.npu_fused_mxfp8_ffn and get_tensor_model_parallel_world_size() == 1:
+            from .npu_ffn import fused_mxfp8_ffn
+
+            ffn_output = fused_mxfp8_ffn(normalized, self.ffn[0], self.ffn[2])
+        if ffn_output is None:
+            ffn_output = self.ffn(normalized)
         hidden_states = self._gated_residual(hidden_states, ffn_output, gate_ffn, tokens_per_frame)
         return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
@@ -1070,6 +1077,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cache_block_conditions: bool = False,
         fused_adaln: bool = False,
         fused_residual: bool = False,
+        fused_mxfp8_ffn: bool = False,
     ) -> None:
         """Enable experimental providers without changing checkpoint parameters.
 
@@ -1084,6 +1092,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 cache_block_conditions,
                 fused_adaln,
                 fused_residual,
+                fused_mxfp8_ffn,
             )
         ):
             raise ValueError("LingBot NPU optimization options must be booleans")
@@ -1093,6 +1102,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             block.self_attn.npu_host_lengths = host_lengths
             block.npu_fused_adaln = fused_adaln
             block.npu_fused_residual = fused_residual
+            block.npu_fused_mxfp8_ffn = fused_mxfp8_ffn
         for module in self.modules():
             if isinstance(module, _LingBotRMSNorm):
                 module.npu_fused = fused_rmsnorm
