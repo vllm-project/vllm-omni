@@ -54,12 +54,16 @@ search path. This backend does not build a repository C++/AscendC extension;
 Triton uses its normal JIT toolchain.
 
 The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
-`ring_degree = 1`, and a Ulysses group containing all WORLD ranks in the same
-order within one HCCS domain. Every rank must issue matching exchanges on one
-stream. A publication barrier precedes peer reads and a reuse barrier follows
-them. Outputs own their storage; one growable staging workspace is reused
+`ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
+WORLD ranks in the same order within one HCCS domain. Every rank must issue
+matching exchanges on one stream. A publication barrier precedes peer reads
+and a reuse barrier follows them. Outputs own their storage; one growable staging workspace is reused
 across layers. Worker shutdown must clear it collectively before destroying
 the process group.
+
+The NPU attention factory rejects Ulysses × AllGather-KV when this option is
+enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
+The same topology remains available through the standard communication path.
 
 ---
 

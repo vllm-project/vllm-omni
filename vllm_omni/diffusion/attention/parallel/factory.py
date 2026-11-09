@@ -60,8 +60,16 @@ def build_parallel_attention_strategy(
     if ulysses_a2a_permute and current_omni_platform.is_npu():
         if not cfg.enforce_eager:
             raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
-        if getattr(p, "ulysses_mode", "strict") != "strict" or ulysses_degree <= 1 or ring_degree != 1:
-            raise ValueError("NPU ulysses_a2a_permute requires strict, pure Ulysses with ulysses_degree > 1")
+        if (
+            getattr(p, "ulysses_mode", "strict") != "strict"
+            or ulysses_degree <= 1
+            or ring_degree != 1
+            or allgather_degree != 1
+        ):
+            raise ValueError(
+                "NPU ulysses_a2a_permute requires strict, pure Ulysses with "
+                "ulysses_degree > 1, ring_degree = 1 and allgather_degree = 1"
+            )
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:

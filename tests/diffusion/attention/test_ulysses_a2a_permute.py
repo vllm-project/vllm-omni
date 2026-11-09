@@ -82,6 +82,7 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         ({"enforce_eager": False}, "enforce_eager"),
         ({"ulysses_mode": "advanced_uaa"}, "strict, pure Ulysses"),
         ({"ring_degree": 2}, "strict, pure Ulysses"),
+        ({"allgather_degree": 2}, "strict, pure Ulysses"),
         ({"ulysses_degree": 1}, "strict, pure Ulysses"),
     ],
 )

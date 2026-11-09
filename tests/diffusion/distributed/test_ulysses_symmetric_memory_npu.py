@@ -48,7 +48,6 @@ _BENCHMARK_SHAPES = [
 def npu_world():
     import torch_npu  # noqa: F401
 
-    assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), "Submit device work through npu run"
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(minutes=5))
     try:
