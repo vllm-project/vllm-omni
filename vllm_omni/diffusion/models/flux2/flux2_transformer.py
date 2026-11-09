@@ -39,6 +39,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
@@ -1001,14 +1002,16 @@ class Flux2Transformer2DModel(nn.Module):
         # One packed table per forward for the fused QK RMSNorm + RoPE in
         # every block (double: joint text/image op; single: joint sequence).
         # SP applies RoPE per stream/shard and keeps the eager chain.
-        qk_norm_rope_table = pack_qk_norm_rope_table(
-            *concat_rotary_emb,
-            hidden_states.shape[0],
-            dtype=hidden_states.dtype,
-            head_dim=self.config.attention_head_dim,
-            sequence_parallel_size=sp_size,
-            cuda_rms_norm=True,
-        )
+        qk_norm_rope_table = None
+        if hidden_states.shape[0] * concat_rotary_emb[0].shape[0] >= fused_qk_norm_rope_min_tokens(0):
+            qk_norm_rope_table = pack_qk_norm_rope_table(
+                *concat_rotary_emb,
+                hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                head_dim=self.config.attention_head_dim,
+                sequence_parallel_size=sp_size,
+                cuda_rms_norm=True,
+            )
         # Never mutate the caller-owned dict: rebind to a copy with (or
         # without) this forward's table.
         if qk_norm_rope_table is not None:
