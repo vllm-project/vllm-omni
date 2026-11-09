@@ -46,6 +46,7 @@ def _cancellable(monkeypatch):
     scheduler._omits_kv_transfer_cache = {}
     scheduler._connector_finished = lambda req: (False, None)
     scheduler.encoder_cache_manager = SimpleNamespace(free=lambda req: None)
+    scheduler._pending_encoder_input_ids = {}
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
     scheduler._should_transfer_kv_for_request = lambda rid: False
