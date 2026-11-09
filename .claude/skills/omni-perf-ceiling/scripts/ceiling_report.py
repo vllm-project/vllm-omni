@@ -43,20 +43,30 @@ STAGE is the first stage the term gates (default 0):
 - ``--fixed-bound``: work every request adds beyond its audio (Thinker prefill,
   encoders). It lengthens the critical path and adds device work.
 - ``--fill-bound``: latency before STAGE can start whose work is already in
-  the per-audio terms (first Talker chunk before Code2Wav).
+  the per-audio terms (first Talker chunk before Code2Wav). ``@out`` marks the
+  last stage's work on the first packet (first Code2Wav chunk).
 
 Each request then satisfies ``RTF_r >= a / d_r + b``. The report prints the
 aggregate RTF floor (``a / mean(d) + b``), the mean RTF floor (per request), and
-the measured ``a`` and ``b`` solved from mean and aggregate RTF.
+the measured ``a`` and ``b`` solved from mean and aggregate RTF. The same terms
+bound first-token latency (terms gating stage 0) and first-packet latency (all
+terms), compared with the bench's mean TTFT and AUDIO_TTFP.
 
-The bounds cover kernel work and launch latency only, not host scheduling,
-inter-stage transfer or queueing.
+Audits: ``--kv-capacity STAGE=KV_CACHE_TOKENS,TOKENS_PER_REQUEST[,BLOCK]``
+warns when a stage's KV cache cannot hold C requests; ``--series A,B,...``
+lists cells of one configuration and warns when throughput, aggregate RTF,
+TTFT or TTFP falls as C rises.
+
+Rows of one stage are summed roofline by roofline, so each flag must cover
+kernels no other flag of that stage covers. The bounds cover kernel work and
+launch latency only, not host scheduling, inter-stage transfer or queueing.
 """
 
 import argparse
 import csv
 import datetime as dt
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -254,7 +264,10 @@ def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
         "mean_audio_rtf": float(result["mean_audio_rtf"]),
         "p50_audio_rtf": float(result["median_audio_rtf"]),
         "p99_audio_rtf": percentile(result, "audio_rtf", 99.0),
-        "mean_audio_ttfp_ms": float(result.get("mean_audio_ttfp_ms", 0.0)),
+        "mean_ttft_ms": float(result.get("mean_ttft_ms") or 0.0),
+        "p50_ttft_ms": float(result.get("median_ttft_ms") or 0.0),
+        "mean_audio_ttfp_ms": float(result.get("mean_audio_ttfp_ms") or 0.0),
+        "p50_audio_ttfp_ms": float(result.get("median_audio_ttfp_ms") or 0.0),
         "mean_audio_duration_s": mean_audio_s,
         # Ratio of means; E2EL ends at the last audio packet for audio requests.
         "aggregate_rtf": mean_e2el_s / mean_audio_s if mean_audio_s else None,
@@ -286,6 +299,7 @@ def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
 
 
 BOUND_CLASSES = ("compute", "memory", "launch")
+OUTPUT_STAGE = "out"
 
 
 def parse_bound(raw: str) -> tuple[str, str | None, list[str]]:
@@ -307,7 +321,10 @@ def alpha_s(peaks: dict, mode: str) -> float:
     return float(latency[mode]) * 1e-6
 
 
-def stage_order(stage: str | None) -> int:
+def stage_order(stage: str | None) -> float:
+    """Position a term gates; ``out`` is the first audio packet, after every stage."""
+    if stage == OUTPUT_STAGE:
+        return math.inf
     return int(stage) if stage and stage.isdigit() else 0
 
 
@@ -337,29 +354,22 @@ def request_terms(raws: list[str], peaks: dict, bw: float, batch: int, adds_work
     return terms
 
 
-def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gpus: int) -> dict:
-    """End-to-end RTF floors at batch = cell concurrency.
+def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int) -> dict[str, dict]:
+    """Per-stage seconds per audio second at ``batch``.
 
-    Per audio second, each stage's device time is ``max(compute, memory)``
-    (roofline) and its serial time in its own process is ``max(device, launch)``.
-    Per request, fixed terms (prefill) add work and latency, fill terms (first
-    chunk before a downstream stage can start) add latency only. Each floor has
-    the form ``RTF_r >= a / d_r + b``:
-
-    - shared device: ``a = C * W / N``, ``b = C * sum device / N``;
-    - stage j path: ``a = sum of request latencies gating stages <= j``,
-      ``b = C * serial_j``.
-
-    Aggregate RTF is bounded by the largest ``a / mean(d) + b``. Mean RTF is
-    bounded per request, where the shared-device floor only holds at C = 1.
+    Every flag is one row: a group of kernels that runs on the stage's stream
+    without overlapping the stage's other rows. The device floor is the sum of
+    each row's roofline, ``sum max(compute, memory)``, which is at least the
+    stage-level ``max(sum compute, sum memory)``. Rows must not share kernels.
     """
-    bw = float(peaks["copy_bandwidth_gbs"]) * 1e9
-    batch = cell["concurrency"]
     terms: dict[str, dict] = {}
 
-    def term(name: str, stage: str | None) -> dict:
-        entry = terms.setdefault(name, {"stage": None, **dict.fromkeys(BOUND_CLASSES, 0.0)})
+    def row(name: str, stage: str | None, compute: float, memory: float) -> dict:
+        entry = terms.setdefault(name, {"stage": None, "device": 0.0, **dict.fromkeys(BOUND_CLASSES, 0.0)})
         entry["stage"] = stage or entry["stage"]
+        entry["compute"] += compute
+        entry["memory"] += memory
+        entry["device"] += max(compute, memory)
         return entry
 
     for raw in specs["decode"]:
@@ -367,16 +377,50 @@ def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gp
         weight_gib, tokens_per_s = float(values[0]), float(values[1])
         kv_gib_per_seq = float(values[2]) if len(values) > 2 else 0.0
         step_s = (weight_gib + batch * kv_gib_per_seq) * 2**30 / bw
-        term(name, stage)["memory"] += step_s / batch * tokens_per_s
+        row(name, stage, 0.0, step_s / batch * tokens_per_s)
     for raw in specs["compute"]:
         name, stage, values = parse_bound(raw)
-        entry = term(name, stage)
-        entry["compute"] += float(values[0]) / float(peaks["matmul_tflops"][values[1]])
-        if len(values) > 2:
-            entry["memory"] += float(values[2]) * 2**30 / bw
+        flops_s = float(values[0]) / float(peaks["matmul_tflops"][values[1]])
+        bytes_s = float(values[2]) * 2**30 / bw if len(values) > 2 else 0.0
+        row(name, stage, flops_s, bytes_s)
     for raw in specs["launch"]:
         name, stage, (kernels_per_step, steps_per_audio_s, mode) = parse_bound(raw)
-        term(name, stage)["launch"] += alpha_s(peaks, mode) * float(kernels_per_step) * float(steps_per_audio_s) / batch
+        launch_s = alpha_s(peaks, mode) * float(kernels_per_step) * float(steps_per_audio_s) / batch
+        row(name, stage, 0.0, 0.0)["launch"] += launch_s
+    for entry in terms.values():
+        entry["serial"] = max(entry["device"], entry["launch"])
+        if entry["launch"] > entry["device"]:
+            entry["bound"] = "launch"
+        else:
+            entry["bound"] = "compute" if entry["compute"] >= entry["memory"] else "memory"
+    return terms
+
+
+def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gpus: int) -> dict:
+    """End-to-end RTF, TTFT and TTFP floors for one cell.
+
+    Per audio second, each stage's device time is the sum of its rows'
+    rooflines and its serial time in its own process is ``max(device, launch)``.
+    Per request, fixed terms (prefill) add work and latency, fill terms (first
+    chunk before a downstream stage, or before the first packet for ``@out``)
+    add latency only. Each RTF floor has the form ``RTF_r >= a / d_r + b``:
+
+    - shared device: ``a = C * W / N``, ``b = C * sum device(C) / N``
+      (work conservation; aggregate only above C = 1);
+    - stage j throughput: ``a = 0``, ``b = C * serial_j(C)`` (one process runs
+      at most C sequences per step; aggregate only above C = 1);
+    - stage j path: ``a = sum of request latencies gating stages <= j``,
+      ``b = serial_j(1)`` (one request's critical path; a step never runs
+      faster than at batch 1, so it holds per request at any C).
+
+    Aggregate RTF is bounded by the largest ``a / mean(d) + b``, mean RTF by
+    the per-request mean of the largest path floor. TTFT is bounded by the
+    latencies gating stage 0, TTFP by every per-request latency.
+    """
+    bw = float(peaks["copy_bandwidth_gbs"]) * 1e9
+    batch = cell["concurrency"]
+    terms = stage_terms(specs, peaks, bw, batch)
+    single = terms if batch == 1 else stage_terms(specs, peaks, bw, 1)
     per_request = request_terms(specs["fixed"], peaks, bw, batch, True) + request_terms(
         specs["fill"], peaks, bw, batch, False
     )
@@ -384,29 +428,33 @@ def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gp
         return cell
 
     measured = measured_stage_g(cell)
-    for entry in terms.values():
-        entry["device"] = max(entry["compute"], entry["memory"])
-        entry["serial"] = max(entry["device"], entry["launch"])
-        entry["bound"] = max(BOUND_CLASSES, key=entry.get)
+    for name, entry in terms.items():
+        entry["serial_1"] = single[name]["serial"]
         entry["measured_g"] = measured.get(entry["stage"]) if entry["stage"] is not None else None
         entry["pct_of_sol"] = entry["device"] / entry["measured_g"] if entry["measured_g"] and entry["device"] else None
     device_total = sum(entry["device"] for entry in terms.values())
     work_s = sum(t["work"] for t in per_request)
 
-    floors: dict[str, tuple[float, float]] = {}
+    floors: dict[str, dict] = {}
+
+    def floor(key: str, fixed: float, rate: float, per_request_scope: bool) -> None:
+        floors[key] = {"fixed_s": fixed, "rate": rate, "per_request": per_request_scope or batch == 1}
+
     if device_total or work_s:
-        floors["shared device"] = (batch * work_s / num_gpus, batch * device_total / num_gpus)
+        floor("shared device", batch * work_s / num_gpus, batch * device_total / num_gpus, False)
     for name, entry in terms.items():
         order = stage_order(entry["stage"])
         gate_s = sum(t["latency"] for t in per_request if stage_order(t["stage"]) <= order)
-        floors[f"stage {name} path"] = (gate_s, batch * entry["serial"])
-    if not terms:
-        floors["request path"] = (sum(t["latency"] for t in per_request), 0.0)
+        if batch > 1:
+            floor(f"stage {name} throughput", 0.0, batch * entry["serial"], False)
+        floor(f"stage {name} path", gate_s, entry["serial_1"], True)
+    if per_request:
+        floor("first packet", sum(t["latency"] for t in per_request), 0.0, True)
 
     mean_d = cell["mean_audio_duration_s"]
-    aggregate = {key: fixed / mean_d + rate for key, (fixed, rate) in floors.items()}
+    aggregate = {key: f["fixed_s"] / mean_d + f["rate"] for key, f in floors.items()}
     binding = max(aggregate, key=aggregate.get)
-    per_request_floors = [v for key, v in floors.items() if key != "shared device" or batch == 1]
+    per_request_floors = [(f["fixed_s"], f["rate"]) for f in floors.values() if f["per_request"]]
     durations = cell.get("request_audio_s") or []
     if per_request_floors and durations:
         cell["rtf_bound_mean"] = sum(
@@ -415,7 +463,7 @@ def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gp
 
     cell["bound_terms"] = terms
     cell["request_terms"] = per_request
-    cell["bound_floors"] = {key: {"fixed_s": fixed, "rate": rate} for key, (fixed, rate) in floors.items()}
+    cell["bound_floors"] = floors
     cell["g_bound"] = {name: entry["device"] for name, entry in terms.items()}
     cell["g_bound_total"] = device_total
     cell["bound_binding"] = binding
@@ -425,7 +473,64 @@ def physical_bounds(cell: dict, peaks: dict, specs: dict[str, list[str]], num_gp
         cell["pct_of_sol"] = cell["rtf_bound"] / cell["aggregate_rtf"]
     if cell.get("rtf_bound_mean"):
         cell["pct_of_sol_mean"] = cell["rtf_bound_mean"] / cell["mean_audio_rtf"]
+
+    ttft_terms = [t for t in per_request if stage_order(t["stage"]) == 0]
+    if ttft_terms:
+        cell["ttft_terms"] = [t["name"] for t in ttft_terms]
+        cell["ttft_bound_ms"] = sum(t["latency"] for t in ttft_terms) * 1000.0
+        if cell.get("mean_ttft_ms"):
+            cell["ttft_pct_of_sol"] = cell["ttft_bound_ms"] / cell["mean_ttft_ms"]
+    if per_request:
+        cell["ttfp_terms"] = [t["name"] for t in per_request]
+        cell["ttfp_bound_ms"] = sum(t["latency"] for t in per_request) * 1000.0
+        if cell.get("mean_audio_ttfp_ms"):
+            cell["ttfp_pct_of_sol"] = cell["ttfp_bound_ms"] / cell["mean_audio_ttfp_ms"]
     return cell
+
+
+def kv_capacity(raws: list[str]) -> dict[str, int]:
+    """``STAGE=KV_CACHE_TOKENS,TOKENS_PER_REQUEST[,BLOCK]``: requests one stage's KV cache holds.
+
+    vLLM allocates whole blocks, so a request takes ``ceil(tokens / block)``
+    blocks; ``KV_CACHE_TOKENS`` is the ``GPU KV cache size`` startup log line.
+    """
+    capacity = {}
+    for raw in raws:
+        stage, _, values = raw.partition("=")
+        fields = values.split(",")
+        kv_tokens, tokens = int(float(fields[0])), float(fields[1])
+        block = int(fields[2]) if len(fields) > 2 else 16
+        capacity[stage] = kv_tokens // (math.ceil(tokens / block) * block)
+    return capacity
+
+
+def series_warnings(cells: list[dict], series: list[str]) -> list[str]:
+    """Laws a concurrency sweep of one configuration must obey.
+
+    Raising C in a closed loop cannot lower aggregate RTF, audio throughput or
+    first-packet latency beyond noise; a violation means the cells differ in
+    more than C (warm-up, cache state, configuration) or the run thrashed.
+    """
+    by_name = {c["name"]: c for c in cells}
+    warnings = []
+    for raw in series:
+        names = raw.split(",")
+        missing = [n for n in names if n not in by_name]
+        if missing:
+            raise SystemExit(f"--series {raw!r}: unknown cells {missing}")
+        sweep = sorted((by_name[n] for n in names), key=lambda c: c["concurrency"])
+        for low, high in zip(sweep, sweep[1:]):
+            pair = f"{low['name']} (C {low['concurrency']}) -> {high['name']} (C {high['concurrency']})"
+            for key, label in (
+                ("audio_throughput", "audio throughput"),
+                ("aggregate_rtf", "aggregate RTF"),
+                ("mean_ttft_ms", "mean TTFT"),
+                ("mean_audio_ttfp_ms", "mean TTFP"),
+            ):
+                a, b = low.get(key), high.get(key)
+                if a and b and b < 0.95 * a:
+                    warnings.append(f"{pair}: {label} fell from {a:.3f} to {b:.3f}; the cells are not one sweep")
+    return warnings
 
 
 def fmt(value, digits: int = 3) -> str:
@@ -433,10 +538,31 @@ def fmt(value, digits: int = 3) -> str:
 
 
 def fmt_pct(value) -> str:
-    return "-" if value is None else f"{value:.0%}"
+    if value is None:
+        return "-"
+    return f"{value:.1%}" if value < 0.1 else f"{value:.0%}"
 
 
-def render(cells: list[dict]) -> str:
+def render_latency(cells: list[dict]) -> list[str]:
+    if not any(c.get("mean_ttft_ms") or c.get("mean_audio_ttfp_ms") for c in cells):
+        return []
+    lines = [
+        "",
+        "| Cell | C | Mean TTFT (ms) | P50 TTFT | TTFT bound | TTFT % of SOL | Mean TTFP (ms) | P50 TTFP "
+        "| TTFP bound | TTFP % of SOL |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for c in cells:
+        lines.append(
+            f"| {c['name']} | {c['concurrency']} | {fmt(c['mean_ttft_ms'], 1)} | {fmt(c['p50_ttft_ms'], 1)} "
+            f"| {fmt(c.get('ttft_bound_ms'), 1)} | {fmt_pct(c.get('ttft_pct_of_sol'))} "
+            f"| {fmt(c['mean_audio_ttfp_ms'], 1)} | {fmt(c['p50_audio_ttfp_ms'], 1)} "
+            f"| {fmt(c.get('ttfp_bound_ms'), 1)} | {fmt_pct(c.get('ttfp_pct_of_sol'))} |"
+        )
+    return lines
+
+
+def render(cells: list[dict], extra_warnings: list[str]) -> str:
     lines = [
         "| Cell | C | Done/Fail | Mean RTF | P50 | P99 | Aggregate RTF | C/X | Little residual "
         "| Audio X (s/s) | GPU busy | RTF if no idle | Aggregate RTF bound | % of SOL | Mean RTF bound "
@@ -451,6 +577,7 @@ def render(cells: list[dict]) -> str:
             f"| {fmt(c.get('gpu_busy_share'), 2)} | {fmt(c.get('rtf_floor_no_idle'))} | {fmt(c.get('rtf_bound'))} "
             f"| {fmt_pct(c.get('pct_of_sol'))} | {fmt(c.get('rtf_bound_mean'))} | {fmt_pct(c.get('pct_of_sol_mean'))} |"
         )
+    lines += render_latency(cells)
     for c in cells:
         if "measured_fixed_s" in c:
             lines.append("")
@@ -492,12 +619,16 @@ def render(cells: list[dict]) -> str:
                 )
                 lines.append(
                     f"  {name}{stage}: compute {e['compute']:.4f}, memory {e['memory']:.4f}, "
-                    f"launch {e['launch']:.4f} -> {e['bound']} bound{measured}"
+                    f"device {e['device']:.4f}, launch {e['launch']:.4f} -> {e['bound']} bound; "
+                    f"serial at batch 1 {e['serial_1']:.4f}{measured}"
                 )
             if "g_total" in c:
                 lines.append(f"  measured g_total {c['g_total']:.4f} vs device bound {c['g_bound_total']:.4f}")
         for t in c.get("request_terms") or []:
-            stage = "" if t["stage"] is None else f" (gates stage {t['stage']})"
+            if t["stage"] == OUTPUT_STAGE:
+                stage = " (gates first packet)"
+            else:
+                stage = "" if t["stage"] is None else f" (gates stage {t['stage']})"
             lines.append(
                 f"  per request, {t['kind']} {t['name']}{stage}: latency {t['latency'] * 1000:.1f} ms, "
                 f"device work {t['work'] * 1000:.2f} ms"
@@ -508,7 +639,8 @@ def render(cells: list[dict]) -> str:
             )
             for key, f in floors.items():
                 mark = "  <- binding" if key == c["bound_binding"] else ""
-                lines.append(f"  {key}: a {f['fixed_s'] * 1000:.1f} ms, b {f['rate']:.4f}{mark}")
+                scope = "per request" if f["per_request"] else "aggregate only"
+                lines.append(f"  {key} ({scope}): a {f['fixed_s'] * 1000:.1f} ms, b {f['rate']:.4f}{mark}")
             fixed_floor = max(f["fixed_s"] for f in floors.values())
             rate_floor = max(f["rate"] for f in floors.values())
             lines.append(
@@ -522,12 +654,42 @@ def render(cells: list[dict]) -> str:
                     f"{fixed_floor * 1000:.1f} ms; measured b {c['measured_rate']:.3f} vs largest floor b "
                     f"{rate_floor:.4f}"
                 )
-    warnings = [
+        terms_by_name = {t["name"]: t for t in c.get("request_terms") or []}
+        for metric, key, measured in (("TTFT", "ttft", "mean_ttft_ms"), ("TTFP", "ttfp", "mean_audio_ttfp_ms")):
+            if f"{key}_bound_ms" not in c:
+                continue
+            parts = " + ".join(f"{n} {terms_by_name[n]['latency'] * 1000:.1f}" for n in c[f"{key}_terms"])
+            lines.append(
+                f"{metric} bound ({c['name']}): {parts} = {c[f'{key}_bound_ms']:.1f} ms; "
+                f"measured mean {fmt(c.get(measured), 1)} ms, {fmt_pct(c.get(f'{key}_pct_of_sol'))} of SOL"
+            )
+        for stage, capacity in (c.get("kv_capacity") or {}).items():
+            lines.append(f"KV capacity ({c['name']}): stage {stage} holds {capacity} requests at C {c['concurrency']}")
+    warnings = list(extra_warnings)
+    warnings += [
         f"{c['name']}: Little residual {c['little_residual']:+.1%}; concurrency was not held"
         for c in cells
         if abs(c.get("little_residual") or 0.0) > 0.10
     ]
     warnings += [f"{c['name']}: {c['failed']} failed requests" for c in cells if c["failed"]]
+    for c in cells:
+        for metric, key, measured in (("TTFT", "ttft", "mean_ttft_ms"), ("TTFP", "ttfp", "mean_audio_ttfp_ms")):
+            if (c.get(f"{key}_pct_of_sol") or 0.0) > 1.05:
+                warnings.append(
+                    f"{c['name']}: {metric} bound {c[f'{key}_bound_ms']:.1f} ms is above measured mean "
+                    f"{c[measured]:.1f} ms; a per-request term overcounts"
+                )
+        if c["mean_ttft_ms"] and c["mean_audio_ttfp_ms"] and c["mean_audio_ttfp_ms"] < c["mean_ttft_ms"]:
+            warnings.append(
+                f"{c['name']}: mean TTFP {c['mean_audio_ttfp_ms']:.1f} ms is below mean TTFT "
+                f"{c['mean_ttft_ms']:.1f} ms; audio cannot precede the first Thinker token, check the timers"
+            )
+        for stage, capacity in (c.get("kv_capacity") or {}).items():
+            if capacity < c["concurrency"]:
+                warnings.append(
+                    f"{c['name']}: stage {stage} KV cache holds {capacity} requests, below C {c['concurrency']}; "
+                    "the cell measures queueing or preemption, not compute"
+                )
     warnings += [
         f"{c['name']}: utilisation samples carry no timestamp; busy share covers the whole sample "
         "file, not the measured window"
@@ -610,8 +772,20 @@ def main() -> int:
         "--fill-bound",
         action="append",
         default=[],
-        help="NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]] per request on the critical path before STAGE, "
-        "whose work is already in the per-audio terms (first chunk)",
+        help="NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]] per request on the critical path before STAGE "
+        "(or before the first packet for @out), whose work is already in the per-audio terms (first chunk)",
+    )
+    parser.add_argument(
+        "--kv-capacity",
+        action="append",
+        default=[],
+        help="STAGE=KV_CACHE_TOKENS,TOKENS_PER_REQUEST[,BLOCK]; warns when a stage's KV cache holds fewer than C",
+    )
+    parser.add_argument(
+        "--series",
+        action="append",
+        default=[],
+        help="NAME,NAME,...: cells of one configuration at rising C; checks the sweep is monotone",
     )
     parser.add_argument("--num-gpus", type=int, default=1, help="devices shared by all stages")
     parser.add_argument("--json", help="write the ledger to this path")
@@ -649,7 +823,11 @@ def main() -> int:
         }
         cells = [physical_bounds(c, peaks, specs, args.num_gpus) for c in cells]
 
-    print(render(cells))
+    capacity = kv_capacity(args.kv_capacity)
+    for cell in cells:
+        if capacity:
+            cell["kv_capacity"] = capacity
+    print(render(cells, series_warnings(cells, args.series)))
     if args.json:
         Path(args.json).write_text(json.dumps(cells, indent=2) + "\n")
     return 0

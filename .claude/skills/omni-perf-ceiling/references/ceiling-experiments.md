@@ -87,8 +87,9 @@ in the result JSON (stage `num_tokens_out` over stage-2 `audio_duration_s`):
 
 `@STAGE` is the stage id used by `--stage-util` or `--pmon`; with it the
 report prints each stage's measured `g_i` beside its bound and the % of SOL.
-Terms with the same name add up per class (CFM and vocoder above), and the
-stage's floor is the larger of its compute and memory sums. KV GiB per
+Each flag is one row, a group of kernels; the stage's device floor is the sum
+of each row's `max(compute, memory)` (CFM and vocoder above are two rows), so
+rows of one stage must not cover the same kernels. KV GiB per
 sequence is the KV cache at the mean context length of the workload (layers x
 2 x KV heads x head dim x bytes x tokens); omit it for short contexts. Use
 `graph` launch latency for steps that replay a captured graph at the cell's
@@ -102,8 +103,14 @@ Each is `TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]` per request, gating `@STAGE`:
 ```bash
   --fixed-bound thinker_prefill@0=<2 * thinker_params * uncached_tokens / 1e12>,bf16,<thinker_weight_gib> \
   --fill-bound thinker_first_token@1=0,bf16,<thinker_weight_gib> \
-  --fill-bound talker_first_chunk@2=0,bf16,<codec_chunk_frames * talker_weight_gib>
+  --fill-bound talker_first_chunk@2=0,bf16,<codec_chunk_frames * talker_weight_gib> \
+  --fill-bound code2wav_cfm_first@out=<cfm_tflop_per_audio_s * chunk_audio_s>,tf32 \
+  --fill-bound code2wav_vocoder_first@out=<vocoder_tflop_per_audio_s * chunk_audio_s>,fp32
 ```
+
+The same terms give the TTFT bound (terms gating `@0`) and the TTFP bound (all
+terms); `@out` marks Code2Wav's work on the first chunk, which only the first
+packet waits for. `chunk_audio_s` is `codec_chunk_frames / codec_tokens_per_audio_s`.
 
 - Prefill FLOPs are `2 * params * tokens` for the dense part; add attention
   and encoder FLOPs when the prompt carries audio or images. Use uncached
@@ -119,7 +126,30 @@ MiniCPM-o 4.5 turn on L20X, as a worked example: Thinker 14.1 GiB bf16
 (`7.57e9` params), mean input 137.9 tokens with the shortest at 130 and block
 size 16, so at least 9.9 uncached tokens, `2 * 7.57e9 * 9.9 = 0.149 TFLOP`;
 `codec_chunk_frames: 25` with a 0.648 GiB Talker gives `16.2` GiB for the
-first chunk.
+first chunk. At 24.6 codec tokens per audio second that chunk is 1.016 audio
+seconds, so Code2Wav's first-chunk work is `0.1653 * 1.016 = 0.168` TFLOP TF32
+(flow model) and `0.0306 * 1.016 = 0.0311` TFLOP FP32 (vocoder). The TTFP
+bound is `3.5 + 3.5 + 4.0 + 0.4 + 0.6 = 12.1` ms against 186 ms measured at C1.
+
+Audit the sweep and admission alongside:
+
+```bash
+  --series c1,c16,c64 \
+  --kv-capacity 0=<thinker GPU KV cache size tokens>,<max prompt + output tokens> \
+  --kv-capacity 1=<talker GPU KV cache size tokens>,<max talker prompt + codec tokens>
+```
+
+`--series` names cells of one configuration; the report warns when throughput,
+aggregate RTF, TTFT or TTFP falls as C rises. KV cache tokens come from each
+stage's `GPU KV cache size` startup line; output tokens per stage from
+`num_tokens_out` in `request_stage_metrics`.
+
+An analytical per-op planner for LLMs (for example
+[HuggingArch](https://github.com/shenh10/HuggingArch)) can supply the
+Thinker's per-op FLOPs and bytes for prefill and decode rows. Take its counts,
+not its times: it prices them with data-sheet peaks and a fixed launch
+constant, while this ledger uses the measured peaks. It does not cover audio
+stages.
 
 Count kernels per step from one short nsys capture of the stage, in a run
 that produces no timing numbers:
@@ -219,6 +249,8 @@ host.
 - Mixed output modes: a single-file engine and a streaming engine differ in
   work per request.
 - Profilers on: never report profiler-enabled latency or throughput.
+- Reading TTFT or TTFP % of SOL at high C: the bound carries no queueing, so the
+  gap there is admission and waiting; judge latency headroom at C1.
 - Bounds without arithmetic: a bound column that cannot be recomputed from the
   report's substituted formulas is not evidence.
 - Shared hosts: record other processes on the device; GPU utilisation from

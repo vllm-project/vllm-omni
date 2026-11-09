@@ -1,6 +1,6 @@
 ---
 name: omni-perf-ceiling
-description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF or first-audio latency at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured, configuration-envelope, and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
+description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF, TTFT or first-audio latency (AUDIO_TTFP) at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured, configuration-envelope, and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
 ---
 
 # Omni Performance Ceiling
@@ -12,7 +12,8 @@ numbers per target, not one:
 2. **Envelope**: the best value over configuration-only changes (capacity,
    graph budgets, batch knobs, MRv2/V1, MPS, placement), plus any existence
    proof (another engine or the reference implementation on the same
-   hardware, workload, and output mode).
+   hardware, workload, and output mode). This is a deployment envelope, not
+   the fastest kernel per op across libraries.
 3. **Bound**: a physical floor derived from per-stage work and measured
    device peaks.
 
@@ -24,7 +25,8 @@ headroom. Report both, per stage.
 Fill in what is not already known; the `omni-perf-opt` first questions apply.
 In addition, fix:
 
-- Target cells, for example `AUDIO_RTF` at concurrency 1 and 64.
+- Target cells, for example `AUDIO_RTF` at concurrency 1 and 64, and TTFT or
+  `AUDIO_TTFP` at concurrency 1.
 - RTF definition: per-request mean (`mean_audio_rtf`) or aggregate
   (sum of generation time over sum of audio). They differ under load.
 - Output mode: streaming chunks or a single final audio. Streaming adds
@@ -65,6 +67,12 @@ under load, queueing. So `aggregate RTF = b + a / mean(d)` and
 short utterances weigh more. Report the measured and bound `a` and `b`
 separately: they move with different levers.
 
+First-token and first-packet latency are the head of `a`. TTFT is bounded by
+the work before the Thinker's first token (encoders, prefill on uncached
+tokens); TTFP adds every hand-off before the first audio packet (Thinker steps
+the Talker needs, the first codec chunk, Code2Wav on that chunk). The floor
+has no queueing term, so judge it at concurrency 1.
+
 ## Workflow
 
 1. **Freeze the workload and commands.** Use the `omni-perf-opt`
@@ -75,7 +83,10 @@ separately: they move with different levers.
    `max_num_seqs`, session caps (`max_sessions` for duplex), and per-stage
    graph batch limits must be at least the target concurrency. Otherwise the
    high-concurrency cell measures queueing, not compute. Read startup logs
-   for graph capture budgets and eager fallbacks at the target batch.
+   for graph capture budgets and eager fallbacks at the target batch. Check
+   KV capacity at the workload too (`--kv-capacity`): each stage's
+   `GPU KV cache size` divided by its largest request's tokens must be at
+   least the target concurrency.
 
 3. **Measure the cells.** Warm up with at least `C` requests, then run
    `10 x C` (minimum 128) prompts per cell with `--print-stage`,
@@ -89,7 +100,9 @@ separately: they move with different levers.
    derives aggregate RTF, per-stage time shares, GPU idle share, and the
    implied throughput floor. A Little's-law mismatch above 10% means the run
    did not hold concurrency (ramp, failures, or too few prompts); fix that
-   before reading anything else.
+   before reading anything else. Pass `--series` with the cells of one
+   configuration: throughput, aggregate RTF, TTFT and TTFP must not fall as C
+   rises, and a cell that breaks this is not part of the sweep.
 
 5. **Attribute device time per stage.** Pick one:
    - one device per stage (`*_3gpu.yaml`): per-device utilisation is the
@@ -112,16 +125,20 @@ separately: they move with different levers.
    (eager and graph replay). Give each stage three terms: compute (FLOPs per
    audio second from `FlopCounterMode` or analytic counts), memory (weights
    plus KV read per decode step, or bytes moved), and launch (kernels per step
-   times steps per audio second, at the stage's eager or graph mode). The
-   stage floor is `max(compute, memory)` on the device and `max(device,
-   launch)` in its own process; the larger term names the stage's bound class.
+   times steps per audio second, at the stage's eager or graph mode). Split a
+   stage into kernel groups with different bound classes, one flag each; the
+   stage floor is `sum over groups of max(compute, memory)` on the device and
+   `max(device, launch)` in its own process; the larger term names the
+   stage's bound class.
    Write each term's formula with the numbers substituted so it can be
    re-checked, and state which inputs are measured and which analytic.
    Then add the per-request terms: `--fixed-bound` for work every request
    adds (Thinker prefill on uncached tokens, encoders) and `--fill-bound` for
    latency before a downstream stage can start (first Thinker step before the
-   Talker, the first codec chunk before Code2Wav). The report turns them into
-   aggregate and mean RTF floors of the form `a / d + b`.
+   Talker, the first codec chunk before Code2Wav, and `@out` for Code2Wav on
+   that chunk). The report turns them into aggregate and mean RTF floors of
+   the form `a / d + b`, a TTFT floor (terms gating stage 0) and a TTFP floor
+   (all terms).
 
 8. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
    flags so `ceiling_report.py` joins each term to that stage's measured
@@ -159,6 +176,10 @@ separately: they move with different levers.
 - Bound the RTF the target names. The aggregate floor uses `mean(d)`; the
   mean floor uses each request's `d` and, above C = 1, only the per-request
   critical path, so it can sit below the aggregate floor.
+- Per request, a stage streams no faster than at batch 1; a floor that
+  assumes every step is full (`C * serial(C)`) bounds the aggregate only.
+- TTFT and TTFP floors carry no queueing. Quote their % of SOL at C1; above
+  it, name the gap as queueing and scheduling, not kernels.
 - Report the regime for each cell. Do not extrapolate a high-concurrency
   RTF from low-concurrency runs, or the reverse.
 - A cell whose throughput is still rising with concurrency is not saturated;
@@ -181,6 +202,8 @@ separately: they move with different levers.
 | RTF C1 (mean / aggregate) | | | | | |
 | RTF C64 (mean / aggregate) | | | | | |
 | Audio throughput C64 (audio-s/s) | | | | | |
+| TTFT C1 (ms, mean) | | | | | |
+| AUDIO_TTFP C1 (ms, mean) | | | | | |
 
 ## Setup
 - vllm-omni <sha>, vllm <ver>, <GPU>, driver
@@ -201,6 +224,15 @@ separately: they move with different levers.
 | C1 | | | | | |
 | C<high> | | | | | |
 
+## First-packet path (C1)
+| Term | Gates | Latency floor (ms) | Formula |
+|------|-------|--------------------|---------|
+| Thinker prefill | stage 0 (TTFT) | | |
+| Thinker steps before Talker | stage 1 | | |
+| First codec chunk | stage 2 | | |
+| Code2Wav first chunk | first packet | | |
+| **TTFP floor** / measured | | | |
+
 ## Bound arithmetic
 [Per stage: each term's formula with numbers substituted, its source
 (measured peak, checkpoint, result JSON, FLOP counter, analytic), and any
@@ -208,7 +240,8 @@ term left "not bounded: <reason>"]
 
 ## Checks
 - Little's law: C / audio_throughput vs aggregate RTF
-- Admission: stage capacities >= C; graph fallbacks at C
+- Admission: stage capacities and KV capacity >= C; graph fallbacks at C
+- Sweep: throughput, aggregate RTF, TTFT and TTFP monotone in C
 - Quality: <metric> within run-to-run variance, or not measured
 
 ## Not measured
