@@ -400,7 +400,7 @@ class OrchestratorBase:
     tracer: Tracer | None = None
     _dit_load_state: DitLoadState | None = None
     _dit_load_aware: bool = False
-    _dit_load_fail_count: dict[tuple[int, int], int] = {}
+    _dit_load_fail_count: dict[tuple[int, int], int] | None = None
 
     def __init__(
         self,
@@ -484,6 +484,9 @@ class OrchestratorBase:
 
     # [OmniDTPS] Min interval between DiT-load polls per replica.
     _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
+    # [OmniDTPS] Consecutive poll failures before evicting a DiT replica's
+    # load data. Filters transient hiccups; 5 × 0.1s interval ≈ 0.5s.
+    _DIT_LOAD_EVICT_THRESHOLD: int = 5
 
     def _init_metrics_state(
         self,
@@ -1308,7 +1311,7 @@ class OrchestratorBase:
             # to avoid flapping on transient network hiccups.
             key = (stage_id, replica_id)
             self._dit_load_fail_count[key] = self._dit_load_fail_count.get(key, 0) + 1
-            if self._dit_load_fail_count[key] >= 5:
+            if self._dit_load_fail_count[key] >= self._DIT_LOAD_EVICT_THRESHOLD:
                 removed = state.remove(stage_id, replica_id)
                 if removed:
                     await self._push_dit_load_to_ar(state)
@@ -1455,19 +1458,30 @@ class OrchestratorBase:
                     for replica_id in pool.available_replica_ids():
                         try:
                             output = pool.poll_diffusion_output(replica_id)
-                            # [OmniDTPS] Poll DiT load inside the try block so
-                            # that update/remove/push failures don't kill the
-                            # poller task, mirroring the legacy loop's guard.
-                            if self._dit_load_aware:
-                                await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                         except EngineDeadError as e:
                             await ready_q.put(("error", stage_id, replica_id, e))
                             continue
-                        if output is None:
-                            continue
-                        await ready_q.put(("diffusion", stage_id, replica_id, output))
-                        self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
-                        got = True
+                        if output is not None:
+                            await ready_q.put(("diffusion", stage_id, replica_id, output))
+                            self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
+                            got = True
+                        # [OmniDTPS] Poll DiT load after output is enqueued, in
+                        # its own try/except so DTPS errors never drop outputs
+                        # or kill the poller task.
+                        if self._dit_load_aware:
+                            try:
+                                await self._poll_dit_load_throttled(
+                                    stage_id,
+                                    pool,
+                                    replica_id,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[Orchestrator] _poll_dit_load_throttled failed for stage-%s rep-%s",
+                                    stage_id,
+                                    replica_id,
+                                    exc_info=True,
+                                )
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
                 raise
