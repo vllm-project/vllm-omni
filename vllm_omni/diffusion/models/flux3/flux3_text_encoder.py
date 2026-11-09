@@ -47,7 +47,7 @@ class Flux3TextEncoder(nn.Module):
 
     Args:
         text_encoder: a loaded ``Qwen3VLForConditionalGeneration``.
-        tokenizer: the matching tokenizer.
+        processor: the matching ``AutoProcessor``.
         context_in_dim: width of ``ctx`` expected by the DiT ``txt_in`` layer.
         vec_in_dim: width of the zero ``vector`` tensor, or ``None`` when the DiT
             has no pooled-vector input projection.
