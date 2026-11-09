@@ -1118,23 +1118,56 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             mask = mask & joint_key_valid.view(batch_size, 1, 1, -1)
         return mask.contiguous()
 
+    @staticmethod
+    def _build_flex_metadata(spans: list[tuple[int, int]], valid_tokens: torch.Tensor | None) -> AttentionMetadata:
+        """Publish local prefill geometry and a request-owned mask cache.
+
+        Each invocation owns its request cache, shared by the layer metadata
+        copies. MindIE consumes token validity when constructing its sparse mask.
+        """
+        from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import NPU_FLEX_VALID_TOKENS
+
+        metadata = AttentionMetadata(full_attn_spans=[spans])
+        metadata.extra["npu_flex_attention"] = True
+        metadata.extra["_npu_flex_cache"] = {}
+        if valid_tokens is not None:
+            metadata.extra[NPU_FLEX_VALID_TOKENS] = valid_tokens
+        return metadata
+
     def _resolve_attn_path(
         self,
         attn_path_hint: str,
         has_padding: bool,
         sp_padding: bool,
+        device_type: str,
     ) -> str:
-        r"""Choose between the piecewise-span and dense-mask attention paths.
+        r"""Choose the default piecewise path, dense-mask baseline, or opt-in NPU FlexAttention.
 
-        Returns one of `"piecewise"` (block-causal via `full_attn_spans`), `"mask"` (dense 4D mask)
-        or `"key_padding"` (no block-causal structure — `causal_block=False` or KV-cache decode).
+        Returns `"piecewise"` (block-causal via `full_attn_spans`), `"mask"` (dense 4D mask),
+        `"flex"` (CATLASS DSL NPU prefill), or `"key_padding"` (no block-causal structure).
         """
+        if attn_path_hint == "flex":
+            if device_type != "npu":
+                raise ValueError("attn_path='flex' requires NPU prefill.")
+            if not self.causal_block:
+                raise ValueError("attn_path='flex' requires causal_block=True.")
+            # Only explicit NPU Flex loads this optional API. Check dependencies
+            # before the backend: without MindIE automatic selection picks SDPA.
+            from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import load_mindie_flex_runtime
+
+            load_mindie_flex_runtime()
+            backend = self.transformer_blocks[0].attn.attn.attn_backend
+            if backend is None or backend.get_name() != "FLASH_ATTN":
+                raise ValueError("attn_path='flex' requires the FLASH_ATTN backend on NPU.")
+            return "flex"
         if not self.causal_block:
             return "key_padding"
         if attn_path_hint in ("piecewise", "mask"):
             return attn_path_hint
         if attn_path_hint != "auto":
-            raise ValueError(f"Unknown attn_path hint {attn_path_hint!r}; expected 'auto', 'piecewise' or 'mask'.")
+            raise ValueError(
+                f"Unknown attn_path hint {attn_path_hint!r}; expected 'auto', 'piecewise', 'mask' or 'flex'."
+            )
         if has_padding or sp_padding:
             return "mask"
         backend = self.transformer_blocks[0].attn.attn.attn_backend
@@ -1172,7 +1205,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 `(batch_size, text_sequence_length)` bool marking valid text tokens. Padded positions are excluded
                 from attention.
             attention_kwargs (dict, *optional*): Extra options. Recognized key: `attn_path` — `"auto"` (default),
-                `"piecewise"` or `"mask"` to force the block-causal attention implementation.
+                `"piecewise"`, `"mask"`, or `"flex"` to force the block-causal attention implementation.
             kv_cache (list of dict, *optional*): One dict per block, keyed by CFG branch (`"cond"`/`"uncond"`).
                 Empty dicts prefill the text and condition-image keys and values; populated dicts switch to decode,
                 where only the target image's tokens are recomputed. Requires `causal_condition`.
@@ -1201,6 +1234,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             raise ValueError("All samples in a batch must share the same img_mask layout.")
 
         sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
+        if attn_path_hint == "flex" and sp_active:
+            raise ValueError("attn_path='flex' does not support sequence parallelism; set sequence_parallel_size=1.")
         ctx = get_forward_context() if is_forward_context_available() else None
         if sp_active and ctx is not None:
             # The prefix is replicated across SP ranks for the Ulysses joint mechanism.
@@ -1245,6 +1280,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
             geometry = self._geometry_for_request(kv_cache, img_mask, signature)
         self.sequence_prepare._request_geometry = geometry
+        use_npu_flex = attn_path_hint == "flex" and hidden_states.device.type == "npu"
+        if use_npu_flex:
+            from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import load_mindie_flex_runtime
+
+            load_mindie_flex_runtime().check_flex_attention_device(hidden_states.device)
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
             hidden_states, txt_hidden_states, layout, img_mask, is_decode
         )
@@ -1350,12 +1390,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             if joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         else:
-            attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
+            if attn_path_hint == "flex" and batch_size != 1:
+                raise ValueError("attn_path='flex' requires single-sample prefill.")
+            attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0, hidden_states.device.type)
             if kv_cache is not None:
                 cache_write_len = prefix_len
-            if attn_path == "piecewise":
+            if attn_path in ("piecewise", "flex"):
                 spans = self._build_full_attn_spans(image_ids)
-                attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
+                if attn_path == "flex":
+                    attn_metadata = self._build_flex_metadata(spans, joint_key_valid)
+                else:
+                    attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
             elif attn_path == "mask":
                 attn_metadata = AttentionMetadata(
                     attn_mask=self._build_block_causal_mask(

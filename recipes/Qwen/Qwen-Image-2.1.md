@@ -528,6 +528,45 @@ unless noted; 4× NVIDIA H200):
   (keeping 25% overlap) and decoding retried, down to 128px tiles. Tile sizes
   are not yet exposed as engine arguments.
 
+## Optional NPU FlexAttention
+
+Qwen-Image-2.1 integrates the shared
+[MindIE-SD NPU FlexAttention adapter](../../docs/user_guide/diffusion/attention_backends/npu_flex_attention.md).
+The instructions below describe the optional integration configuration; they
+do not add device-qualified model results.
+
+The model uses piecewise spans by default on NPU when its backend and padding
+permit, and otherwise constructs a dense mask:
+
+| Internal path | Prefill implementation |
+| --- | --- |
+| auto (default) | Piecewise spans when supported; otherwise an explicit mask |
+| piecewise | FA Score with piecewise spans |
+| mask | FA Score with a dense block-causal mask |
+| flex | MindIE-SD CATLASS DSL FlexAttention |
+
+To enable Flex, set `QwenImage21Pipeline._DEFAULT_ATTN_PATH = "flex"` in
+`vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py` and use the
+`FLASH_ATTN` backend. This source setting applies to full-pipeline and step
+execution. Tests calling the transformer directly can pass
+`attention_kwargs={"attn_path": "flex"}` in code.
+
+The current integration uses one BF16 sample without attention quantization
+on Ascend 950, with head dimension 128. Disable sequence parallelism
+(`ulysses_degree=ring_degree=allgather_degree=1`). Qwen image spans define
+bidirectional blocks within its otherwise causal prefill sequence. Later
+decode steps with cached prefix KV use the existing attention implementation.
+
+For model validation, compare T2I and multi-reference I2I against the `mask`
+path with identical inputs and seed. Run at least two denoising steps for
+prefix-KV reuse, covering padded and unpadded requests. Measure first-use
+compilation, mask construction, steady-state attention and end-to-end latency
+separately. The CPU model routing tests are:
+
+```bash
+pytest -q tests/diffusion/models/qwen_image_21/test_transformer_numerics.py -m 'core_model and cpu' --run-level=core_model
+```
+
 ## NPU performance defaults
 
 Qwen-Image-2.1 enables the following optimizations automatically on eligible

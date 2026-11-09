@@ -7,9 +7,200 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    "device,attention_device",
+    [
+        pytest.param("cpu", "cpu", marks=pytest.mark.cpu),
+        pytest.param("cpu", "npu", marks=pytest.mark.cpu),
+        pytest.param("cuda", "cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
+)
+@pytest.mark.parametrize("attn_path", [None, "auto", "piecewise", "mask", "flex"])
+def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_path):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", lambda: None)
+    seen = []
+
+    class CaptureBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SimpleNamespace(
+                attn=SimpleNamespace(
+                    attn_backend=SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+                )
+            )
+
+        def forward(self, hidden_states, attn_metadata, **kwargs):
+            seen.append(attn_metadata)
+            return hidden_states
+
+    class SequencePrepare:
+        def __call__(self, hidden_states, text, layout, img_mask, is_decode):
+            return text, hidden_states, text.new_zeros(2, 1), hidden_states.new_zeros(2, 1)
+
+        @staticmethod
+        def expand_image_pad_mask(mask):
+            return mask
+
+    # Exercise the real model forward and metadata selection without weights.
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = None
+    model.causal_block = True
+    model.causal_condition = False
+    model.txt_in = torch.nn.Identity()
+    model.sequence_prepare = SequencePrepare()
+    model.time_text_embed = lambda timestep, hidden_states: timestep
+    model.modulation = torch.nn.Identity()
+    model.transformer_blocks = torch.nn.ModuleList([CaptureBlock()])
+    model.norm_out = lambda hidden_states, *args: hidden_states
+    model.proj_out = torch.nn.Identity()
+
+    if attention_device == "npu":
+        # Exercise NPU routing with CPU tensors and no model weights.
+        resolve_attn_path = model._resolve_attn_path
+        monkeypatch.setattr(
+            model,
+            "_resolve_attn_path",
+            lambda hint, padding, sp_padding, device_type: resolve_attn_path(hint, padding, sp_padding, "npu"),
+        )
+
+    hidden = torch.ones(1, 2, 4, device=device)
+    text = torch.zeros_like(hidden)
+    inputs = dict(
+        hidden_states=hidden,
+        encoder_hidden_states=text,
+        timestep=hidden.new_zeros(1),
+        img_shapes=[[(1, 1, 2)]],
+        img_mask=torch.tensor([[False, False, True, True]], device=device),
+        attention_kwargs=None if attn_path is None else {"attn_path": attn_path},
+        return_dict=False,
+    )
+    if attn_path == "flex" and attention_device != "npu":
+        with pytest.raises(ValueError, match="NPU prefill"):
+            model(**inputs)
+        return
+    output = model(**inputs)[0]
+    assert len(seen) == 1
+
+    for metadata in seen:
+        if attn_path == "mask":
+            assert metadata.full_attn_spans is None
+            expected = torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, True, True, True],
+                    [True, True, True, True],
+                ],
+                device=device,
+            )[None, None]
+            torch.testing.assert_close(metadata.attn_mask, expected)
+        else:
+            assert metadata.full_attn_spans == [[(2, 4)]]
+            assert metadata.attn_mask is None
+        if attn_path == "flex":
+            assert metadata.extra == {
+                "npu_flex_attention": True,
+                "_npu_flex_cache": {},
+            }
+        else:
+            assert metadata.extra == {}
+    torch.testing.assert_close(output, torch.cat([text, hidden], dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "hint,padding,sp_padding,supports_spans,backend_name,expected",
+    [
+        ("auto", False, False, True, "FLASH_ATTN", "piecewise"),
+        ("auto", True, False, True, "FLASH_ATTN", "mask"),
+        ("auto", False, True, True, "FLASH_ATTN", "mask"),
+        ("auto", False, False, False, "SDPA", "mask"),
+        ("mask", False, False, True, "FLASH_ATTN", "mask"),
+        ("flex", False, False, True, "FLASH_ATTN", "flex"),
+        ("flex", True, False, True, "FLASH_ATTN", "flex"),
+        ("flex", False, False, True, "SDPA", None),
+        ("invalid", False, False, True, "FLASH_ATTN", None),
+    ],
+)
+def test_npu_prefill_path_contract(monkeypatch, hint, padding, sp_padding, supports_spans, backend_name, expected):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", lambda: None)
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = True
+    backend = SimpleNamespace(supports_piecewise_spans=supports_spans, get_name=lambda: backend_name)
+    model.transformer_blocks = [SimpleNamespace(attn=SimpleNamespace(attn=SimpleNamespace(attn_backend=backend)))]
+    if expected is None:
+        with pytest.raises(ValueError):
+            model._resolve_attn_path(hint, padding, sp_padding, "npu")
+    else:
+        assert model._resolve_attn_path(hint, padding, sp_padding, "npu") == expected
+
+
+@pytest.mark.cpu
+def test_flex_dependency_error_precedes_automatic_sdpa_selection(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = True
+
+    def unavailable():
+        raise ImportError("MindIE-SD with FlexAttention is required")
+
+    monkeypatch.setattr(npu_flex_attention, "load_mindie_flex_runtime", unavailable)
+    with pytest.raises(ImportError, match="MindIE-SD"):
+        model._resolve_attn_path("flex", False, False, "npu")
+
+
+@pytest.mark.cpu
+def test_flex_is_rejected_when_block_causal_attention_is_disabled():
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = False
+    with pytest.raises(ValueError, match="causal_block"):
+        model._resolve_attn_path("flex", False, False, "npu")
+    assert model._resolve_attn_path("auto", False, False, "npu") == "key_padding"
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("ulysses_degree,ring_degree", [(2, 1), (1, 2), (2, 2)])
+def test_flex_rejects_sequence_parallelism_before_preparing_shards(ulysses_degree, ring_degree):
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_condition = False
+    model.parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    hidden = torch.zeros(1, 2, 4)
+    with pytest.raises(ValueError, match="does not support sequence parallelism"):
+        model(
+            hidden_states=hidden,
+            encoder_hidden_states=hidden,
+            timestep=torch.zeros(1),
+            img_shapes=[[(1, 1, 2)]],
+            img_mask=torch.tensor([[False, False, True, True]]),
+            attention_kwargs={"attn_path": "flex"},
+        )
+
+
+@pytest.mark.cpu
+def test_flex_prefill_metadata_keeps_validity_and_request_isolation():
+    validity = torch.tensor([[True, True, True, True, False]])
+    first = transformer.QwenImage21Transformer2DModel._build_flex_metadata([(0, 5)], validity)
+    second = transformer.QwenImage21Transformer2DModel._build_flex_metadata([(0, 5)], validity)
+    assert first.full_attn_spans == [[(0, 5)]]
+    assert first.attn_mask is None
+    assert first.extra["npu_flex_valid_tokens"] is validity
+    assert first.extra["_npu_flex_cache"] is not second.extra["_npu_flex_cache"]
 
 
 @pytest.mark.parametrize(
