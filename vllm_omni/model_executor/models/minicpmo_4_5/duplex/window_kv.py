@@ -800,6 +800,14 @@ class MiniCPMO45DuplexWorkerHelper:
     """Worker-side KV cache rotation and position metadata helper for MiniCPM-o 4.5 duplex."""
 
     @classmethod
+    def get_reanchor_parameters(cls, runner: Any) -> tuple[int, int | None, torch.Tensor]:
+        """Resolve the same cache geometry for startup validation and rotation."""
+        block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+        model_config = getattr(runner, "model_config", None)
+        head_dim = model_config.get_head_size() if model_config is not None else None
+        return block_size, head_dim, cls.get_rope_inv_freq(runner)
+
+    @classmethod
     def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
         inv_freq = getattr(runner, "_duplex_inv_freq", None)
         if inv_freq is None:
@@ -952,11 +960,8 @@ class MiniCPMO45DuplexWorkerHelper:
                 assert_uniform_position_shift(positions, plan.moved_from)
 
             if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
-                inv_freq = cls.get_rope_inv_freq(runner)
-                model_config = getattr(runner, "model_config", None)
-                head_dim = model_config.get_head_size() if model_config is not None else None
+                block_size, head_dim, inv_freq = cls.get_reanchor_parameters(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
-                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
                 # Layers share their KV group's table; on MRv2 each lookup is a device read.
                 group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):
