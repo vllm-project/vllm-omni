@@ -558,6 +558,22 @@ class AudioCrossAttention(WanS2VCrossAttention):
     pass
 
 
+def _quantize_audio_injector(quant_config: QuantizationConfig | None) -> bool:
+    """Whether the audio injector cross-attentions take the DiT's quant config.
+
+    Default: only online MXFP8 (a BF16 checkpoint quantized at load), where the injector's q/k/v/out GEMMs over
+    every noisy token are the largest S2V-only cost. Pre-quantized checkpoints carry no injector scales, and
+    other methods are unmeasured here, so they keep a BF16 injector.
+    VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1 / =0 forces it on / off.
+    """
+    if quant_config is None:
+        return False
+    forced = os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR")
+    if forced is not None:
+        return forced == "1"
+    return quant_config.get_name() == "mxfp8" and not getattr(quant_config, "is_checkpoint_mxfp8_serialized", True)
+
+
 class WanS2VAudioInjectLayer(nn.Module):
     """One audio injection: AdaIN/LayerNorm over the noisy tokens, then cross-attention to the frame audio tokens.
 
@@ -1378,9 +1394,7 @@ class WanS2VTransformer3DModel(nn.Module):
             enable_adain=enable_adain,
             adain_dim=dim,
             need_adain_ont=adain_mode != "attn_norm",
-            # Opt-in: the injector's q/k/v/out GEMMs in the DiT's quantization. Off by default: pre-quantized
-            # checkpoints carry no injector scales, and the audio injector drives lip sync.
-            quant_config=quant_config if os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", "0") == "1" else None,
+            quant_config=quant_config if _quantize_audio_injector(quant_config) else None,
         )
         self.adain_mode = adain_mode
         # Parameter-free; listed in _repeated_blocks so regional compile covers the audio injection too.
