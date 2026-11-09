@@ -764,7 +764,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
     (
         "ROCm · Entrypoints GPU Coverage (R2-02)",
         AMD_READY_PIPELINE,
-        "NonBlocking",
+        "Blocking",
         3,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
@@ -855,13 +855,13 @@ _R2_02_LABEL = "ROCm · Entrypoints GPU Coverage (R2-02)"
 _R2_02_JUNIT_MESSAGE = "Expected exactly 3 executed entrypoint GPU tests"
 
 
-def test_r2_02_entrypoint_execution_guard_stays_nonblocking() -> None:
-    """Collection of three nodes is not a pass; blocking waits on MI300 evidence."""
+def test_r2_02_entrypoint_execution_guard_is_blocking() -> None:
+    """The blocking job requires three executed tests and clean teardown."""
     step = _find_step(_R2_02_LABEL, AMD_READY_PIPELINE)
     commands = step["commands"]
     joined = "\n".join(commands)
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["timeout_in_minutes"] == 30
     assert step["artifact_paths"] == ["artifacts/rocm-r2-02/**/*"]
@@ -3334,7 +3334,7 @@ def test_qwen3_omni_ready_selects_eight_core_model_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_2"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 25
     assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-ready/**/*"]
     assert "test_qwen3_omni_thinking.py" not in command
@@ -4082,8 +4082,8 @@ def _hardware_decorator(source: str, function_name: str) -> str:
     return head.rsplit("@hardware_test", 1)[1]
 
 
-def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
-    """READY adds one NonBlocking MI300 job for the one-card ROCm smoke.
+def test_drama3_ready_requires_one_blocking_text_to_audio_node() -> None:
+    """READY requires one Blocking MI300 job for the one-card ROCm smoke.
 
     CUDA uses one card and NPU uses two, so ``hardware_test`` keeps a separate
     ROCm item. The server param id is ``drama_3`` and the platform id is ``rocm``.
@@ -4094,7 +4094,7 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 40
     assert step["artifact_paths"] == ["artifacts/rocm-drama3-ready/**/*"]
     assert "timeout 30m" in command
@@ -4143,7 +4143,7 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
         .split("\ndef ", 1)[0]
     )
 
-    assert ready["grade"] == "NonBlocking"
+    assert ready["grade"] == "Blocking"
     assert _marker_expressions(ready) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
