@@ -30,7 +30,7 @@ them take turns. For my slot j, written by pred and read by me:
 
 At the same time I am the writer of succ's slots, and run steps 2 and 3 against succ.
 
-Slots. Each rank owns one symmetric buffer of shape [2 slots][K, V][B, S_local, H, D], which is
+Slots. Each rank owns one symmetric buffer of shape ``[2 slots][K, V][B, S_local, H, D]``, which is
 4 x B*S*H*D elements: 387 MB per GPU at Wan2.2 720p in bf16. It stays allocated across calls
 (the workspace only grows). Attention alternates between the two slots, and each block is
 forwarded out of the slot it arrived in, so nothing is staged:
@@ -59,13 +59,13 @@ So it forwards a slot only after that slot has arrived and this rank has read it
 overlaps attention s.
 
 Signal pad. Every symmetric buffer comes with a small array of 32-bit flag words that is mapped
-into every peer, like the data. Word [channel][src] of rank X's pad means "flag ``channel``,
+into every peer, like the data. Word ``[channel][src]`` of rank X's pad means "flag ``channel``,
 sent to X by rank ``src``". The two calls used here launch one-warp kernels that spin, that is,
 busy-wait on an atomic compare-and-swap:
 
-- ``put_signal(dst, ch)`` waits until dst's word [ch][me] is 0, then sets it to 1. A pending
+- ``put_signal(dst, ch)`` waits until dst's word ``[ch][me]`` is 0, then sets it to 1. A pending
   message is never overwritten.
-- ``wait_signal(src, ch)`` waits until my word [ch][src] is 1, then clears it, which consumes
+- ``wait_signal(src, ch)`` waits until my word ``[ch][src]`` is 1, then clears it, which consumes
   the message.
 
 A spinning kernel holds back everything queued after it on its stream. That is how one GPU
