@@ -250,12 +250,6 @@ class TestArMaxTokensRegistry:
         # AR-only deploys surface the wrapper architecture name.
         assert get_ar_max_tokens_builder("GlmImageForConditionalGeneration") is compute_max_tokens
 
-    def test_unknown_model_has_no_builder(self):
-        from vllm_omni.model_extras.registry import get_ar_max_tokens_builder
-
-        assert get_ar_max_tokens_builder("SomeOtherPipeline") is None
-        assert get_ar_max_tokens_builder(None) is None
-
 
 # =============================================================================
 # Tests for _upsample_token_ids

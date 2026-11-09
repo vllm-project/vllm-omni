@@ -96,6 +96,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_omni.model_executor.models.glm_image.prompt import grid_token_layout
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -441,18 +442,11 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
             )
 
-        factor = 32
-        target_h = (target_h // factor) * factor
-        target_w = (target_w // factor) * factor
-        token_h = target_h // factor
-        token_w = target_w // factor
-
-        ratio = token_h / token_w if token_w > 0 else 1.0
-        small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-        small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-
+        # Same preview-grid construction as HF's processor; both go through
+        # grid_token_layout so the served budget and the prompt grid agree.
+        layout = grid_token_layout(target_h, target_w)
         return torch.tensor(
-            [[1, token_h, token_w], [1, small_token_h, small_token_w]],
+            [[1, layout.token_h, layout.token_w], [1, layout.small_token_h, layout.small_token_w]],
             dtype=torch.long,
         )
 
@@ -2424,13 +2418,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             target_h = kwargs.get("target_h")
             target_w = kwargs.get("target_w")
             if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
-                factor = 32
-                token_h = target_h // factor
-                token_w = target_w // factor
-                ratio = token_h / token_w if token_w > 0 else 1.0
-                small_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-                small_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-                image_grid_thw = [[1, token_h, token_w], [1, small_h, small_w]]
+                layout = grid_token_layout(target_h, target_w)
+                image_grid_thw = [
+                    [1, layout.token_h, layout.token_w],
+                    [1, layout.small_token_h, layout.small_token_w],
+                ]
 
             # Try to parse from kwargs (passed from processor)
             hf_config_arg = kwargs.get("hf_config")
@@ -2493,10 +2485,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             target_h = kwargs.get("target_h")
             target_w = kwargs.get("target_w")
             if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
-                factor = 32
-                token_h = target_h // factor
-                token_w = target_w // factor
-                image_grid_thw = list(image_grid_thw) + [[1, token_h, token_w]]
+                layout = grid_token_layout(target_h, target_w)
+                image_grid_thw = list(image_grid_thw) + [[1, layout.token_h, layout.token_w]]
             else:
                 # Parse target grids from prompt tokens or use defaults
                 parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)

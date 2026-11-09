@@ -367,10 +367,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "GlmImagePipeline": {
         # AR generation budget: preview + target + 1 tokens (i2i: target + 1),
         # the count the reference implementation truncates at. ar2diffusion
-        # slices the same counts, and _grid_token_layout keeps the two in
-        # sync. Under the linear decode positions (#9305) EOS arrives late or
-        # never, so serving caps each request with this builder instead of
-        # letting every request run to the deploy-YAML max_tokens ceiling.
+        # slices the same counts, and grid_token_layout keeps the budget, the
+        # parser, and the model's processor and M-RoPE grids in sync. Serving
+        # caps each request with this builder so AR generation stops at the
+        # reference's truncation budget instead of the deploy-YAML ceiling.
         "ar_max_tokens_builder": glm_image_ar_max_tokens,
     },
 }

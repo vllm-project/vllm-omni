@@ -347,7 +347,7 @@ class TestGetMropeInputPositions:
         mrope_grid = torch.tensor([source_grid, target_grid], dtype=torch.long)
         input_tokens = [100, 101, 16384] + [167855] * 4 + [16385, 16384]
 
-        positions, _ = model.get_mrope_input_positions(input_tokens, mrope_image_grid_thw=mrope_grid)
+        positions, delta = model.get_mrope_input_positions(input_tokens, mrope_image_grid_thw=mrope_grid)
         seq_len = len(input_tokens)
         total_decode = 8 * 8 + 1  # target grid + EOS
         assert positions.shape == (3, seq_len + total_decode)
@@ -355,6 +355,8 @@ class TestGetMropeInputPositions:
         start = decode[0, 0].item()
         assert decode[:, :3].tolist() == [[start] * 3, [start] * 3, [start, start + 1, start + 2]]
         assert decode[:, -1].tolist() == [start + 8] * 3
+        # The reference returns zeros unconditionally (t2i and i2i alike).
+        assert delta == 0
 
     def test_t2i_1024_default_grids(self, model):
         """t2i with default 1024x1024 grids when no explicit target size."""
