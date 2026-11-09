@@ -518,9 +518,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             registered = DiffusionModelRegistry.models.get(model_class_name)
             pipeline_class_name = registered.class_name if registered is not None else None
         require_attention_schedule_pipeline(pipeline_class_name, model_class_name)
-        role = resolve_diffusion_stage_role(
-            getattr(self.od_config, "stage_role", None), getattr(self.od_config, "model_stage", None)
-        ).value
+        role = resolve_diffusion_stage_role(self.od_config.stage_role, self.od_config.model_stage).value
         if not stage_runs_denoising(model_class_name, role):
             raise ValueError(
                 f"diffusion_attention_schedule is set on stage {self.od_config.stage_id} ({model_class_name}, "

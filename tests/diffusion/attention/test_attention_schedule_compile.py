@@ -649,6 +649,17 @@ def test_op_metadata_round_trips_layouts_and_scalar_extras():
 
 
 @pytest.mark.parametrize(
+    "ints",
+    [[0, 192, 3, 8], [0, 192, 3, 8, 8, 1, 2, 5, 3, 8], [0, 192, 3, 8, 8, 1, 2, 5, 3, 8, 8, 9]],
+    ids=["short", "one-short", "one-long"],
+)
+def test_op_metadata_rejects_an_integer_count_that_does_not_match_the_spec(ints):
+    spec = "M;Liig;Xids=l2;Xpreserve_vsa_all_blocks=b1;Xvalid_kv_length=i;Xvsa_dit_seq_shape=t3"
+    with pytest.raises(RuntimeError, match=f"does not match {len(ints)} integers"):
+        layer_mod._decode_scheduled_op_metadata(None, spec, ints)
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         AttentionMetadata(extra={"gate_compress": torch.ones(1)}),

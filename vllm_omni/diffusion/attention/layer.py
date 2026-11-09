@@ -116,16 +116,10 @@ def _promote_marked_paged_default(
     returned unchanged.
     """
     if scheduler_paged_kv and paged_kv_cache_role is not None and spec is None and not backend_cls.supports_paged_kv:
-        # FLASH_ATTN is an Omni selector, not a device-specific kernel.
-        # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
-        # attention on NPU. A platform may legitimately default dense
-        # attention to CUDNN/SDPA (for example when optional dense FA
-        # extras are absent), but a paged layer must advertise the
-        # capability so the Worker can register its native cache view.
-        # Load that selector from the registry: this is not a user-explicit
-        # dense FLASH_ATTN request, so skip platform explicit-backend
-        # validation (Blackwell would otherwise require CuTe FA4). Formal
-        # paged execution still delegates to vLLM's native paged backend.
+        # FLASH_ATTN is the only selector that advertises paged KV; see
+        # docs/design/feature/diffusion_paged_kv_cache.md#platform-matrix. It comes from the registry
+        # because the user did not request it, so the platform's explicit-backend check (CuTe FA4 on
+        # Blackwell) does not apply.
         return DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
     return backend_cls
 
@@ -315,6 +309,13 @@ def _decode_scheduled_op_metadata(
     if spec == _NO_METADATA_SPEC:
         return None
     layout_codes, extra_codes = _parse_scheduled_op_spec(spec)
+    # Check the count first, so a short list raises this error instead of StopIteration.
+    layout_count = 0
+    if layout_codes is not None:
+        layout_count = layout_codes[:2].count("i") + (3 if layout_codes[2] == "g" else 0)
+    expected = layout_count + sum(count for _, _, count in extra_codes)
+    if len(ints) != expected:
+        raise RuntimeError(f"scheduled attention metadata spec {spec!r} does not match {len(ints)} integers")
     values = iter(ints)
     video_layout = None
     if layout_codes is not None:
@@ -334,8 +335,6 @@ def _decode_scheduled_op_metadata(
         else:
             items = [next(values) for _ in range(count)]
             extra[key] = tuple(items) if kind[0] == "t" else items
-    if next(values, None) is not None:
-        raise RuntimeError(f"scheduled attention metadata spec {spec!r} does not match {len(ints)} integers")
     return AttentionMetadata(attn_mask=attn_mask, extra=extra, video_layout=video_layout)
 
 

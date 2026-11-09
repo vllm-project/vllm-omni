@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
@@ -53,6 +54,7 @@ def _pipeline():
         parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_schedule=None,
     )
     pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
@@ -609,7 +611,7 @@ def _scheduled_state(request_id: str, step_index: int, total_steps: int, latent:
     state = _state(request_id, step_index)
     # Step k has timestep (total_steps - k) * 100, normalized by num_train_timesteps=1000.
     state.timesteps = torch.arange(total_steps, 0, -1, dtype=torch.float32) * 100.0
-    state.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+    state.scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
     state.latents = torch.full((1, 1), latent)
     state.extra[_STEP_MODEL_KWARGS].update(
         {
@@ -660,6 +662,16 @@ def test_scheduled_step_requests_run_separately_with_their_own_progress(monkeypa
     ]
     torch.testing.assert_close(out, torch.tensor([[10.0], [20.0]]))
     assert after == (None, 99, 0.9, None)
+
+
+def test_scheduled_step_rejects_a_scheduler_it_cannot_normalize(monkeypatch):
+    pipeline = _recording_step_pipeline(monkeypatch, [])
+    state = _scheduled_state("req-a", 2, 8, 1.0)
+    state.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+
+    with _denoise_context(_STEP_SCHEDULE):
+        with pytest.raises(RuntimeError, match="needs a current timestep and a flow-matching scheduler"):
+            pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_scheduled_step_restores_context_when_second_request_fails(monkeypatch):

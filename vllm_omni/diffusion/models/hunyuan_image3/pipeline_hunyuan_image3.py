@@ -5,7 +5,7 @@ import copy
 import logging
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -99,7 +99,7 @@ def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
     step 0. A request's own schedule is not known at startup. Every TP/SP rank builds the pipeline,
     so only rank 0 logs.
     """
-    schedule_config = getattr(od_config, "diffusion_attention_schedule", None)
+    schedule_config = od_config.diffusion_attention_schedule
     default = schedule_config.default if schedule_config is not None else ()
     if default and default[0].start == 0 and _is_rank_zero():
         logger.info(
@@ -2135,7 +2135,7 @@ class HunyuanImage3Pipeline(
         # Check the request's schedule against the sequence built here, before prepare_latents and the
         # AR-reuse prefill below. The runner has not opened the forward context yet.
         require_request_attention_schedule_fits(
-            state.sampling, getattr(self.od_config, "diffusion_attention_schedule", None), len(timesteps)
+            state.sampling, self.od_config.diffusion_attention_schedule, len(timesteps)
         )
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
@@ -2448,11 +2448,16 @@ class HunyuanImage3Pipeline(
         _denoise_step_group republishes the same step and clears it after its forward; the returned
         context manager restores the step, timestep and total on any exit.
         """
-        timestep = (
-            float(cast(torch.Tensor, state.current_timestep))
-            / cast(FlowMatchEulerDiscreteScheduler, state.scheduler).config.num_train_timesteps
+        timestep = state.current_timestep
+        scheduler = state.scheduler
+        if timestep is None or not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
+            raise RuntimeError(
+                f"scheduled HunyuanImage-3.0 request {state.request_id} needs a current timestep and a "
+                f"flow-matching scheduler; got {type(timestep).__name__} and {type(scheduler).__name__}"
+            )
+        return request_denoise_progress(
+            state.step_index, state.total_steps, float(timestep) / scheduler.config.num_train_timesteps
         )
-        return request_denoise_progress(state.step_index, state.total_steps, timestep)
 
     def step_scheduler(
         self,
