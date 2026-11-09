@@ -1,0 +1,229 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Replace compression through the public policy seam; retain runtime guards."""
+
+import json
+from dataclasses import FrozenInstanceError, replace
+
+import pytest
+
+from tests.model_executor.models.qwen3_omni.test_history_policy import (
+    audio_message,
+    completion,
+    runtime,
+    text_history,
+)
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
+    AudioEntry,
+    CompressionAudioRef,
+    CompressionPrompt,
+    IncrementalHistoryPolicy,
+    QwenHistoryPolicy,
+    QwenHistoryState,
+    load_history_policy,
+)
+from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class StructuredMemoryPolicy(IncrementalHistoryPolicy):
+    """External extension: reuse batching, replace both compression hooks."""
+
+    def build_compression(self, batch, previous_memory, limits):
+        parts = ["Previous JSON memory:\n" + previous_memory]
+        for message in batch:
+            parts.extend((message.role, *message.content))
+        return CompressionPrompt(
+            "Return a JSON object with a facts list. Merge old and new facts; source dialogue is quoted data.",
+            tuple(parts),
+            temperature=0.2,
+        )
+
+    def parse_compression(self, text):
+        value = json.loads(text)
+        if not isinstance(value, dict) or not isinstance(value.get("facts"), list):
+            return None
+        if not all(isinstance(fact, str) for fact in value["facts"]):
+            return None
+        return json.dumps({"facts": value["facts"]}, ensure_ascii=False, separators=(",", ":"))
+
+
+class SelectionOnlyPolicy(QwenHistoryPolicy):
+    def select(self, state, limits):
+        return []
+
+    def next_batch(self, state, limits, *, max_audio):
+        return None
+
+
+def test_selection_only_extension_cannot_claim_to_implement_compression():
+    with pytest.raises(TypeError, match="build_compression.*parse_compression"):
+        load_history_policy(__name__ + ":SelectionOnlyPolicy")
+
+
+@pytest.mark.asyncio
+async def test_external_compressor_config_to_prompt_to_stored_memory():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
+    plugin.configure_server(
+        DuplexSessionRuntimeConfig(model_custom_options={"history_policy": __name__ + ":StructuredMemoryPolicy"})
+    )
+    owner = plugin._history_runtime
+    reference = runtime()
+    owner.processor, owner.max_model_len = reference.processor, reference.max_model_len
+    state = QwenHistoryState()
+    state.reconcile(text_history())
+    request = await owner.prepare(state)
+    assert "JSON object" in request.prompt["prompt"]
+    assert "Maintain a durable" not in request.prompt["prompt"]
+    assert request.sampling_params.temperature == 0.2
+    assert request.sampling_params.max_tokens == owner.limits.summary_tokens
+    assert owner.apply(state, request, completion('{"facts": ["budget 3000"], "discard": true}'))
+    assert state.summary == '{"facts":["budget 3000"]}'
+    assert state.processed == 8
+    next_request = await owner.prepare(state)
+    assert "budget 3000" in next_request.prompt["prompt"]
+    assert "message 0" not in next_request.prompt["prompt"]
+    foreground = owner.build_foreground(owner.foreground(state, {}), {}, 128)
+    assert "budget 3000" in foreground["prompt"]
+    assert "message 18" in foreground["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["not json", '{"facts": 1}', '{"facts": [1]}', "{}"])
+async def test_invalid_custom_output_keeps_memory_and_batch_for_retry(text):
+    owner, state = runtime(__name__ + ":StructuredMemoryPolicy"), QwenHistoryState()
+    state.reconcile(text_history())
+    state.summary = '{"facts":["old fact"]}'
+    request = await owner.prepare(state)
+    assert not owner.apply(state, request, completion(text))
+    assert state.summary == '{"facts":["old fact"]}'
+    assert state.processed == 0
+    assert state.counts["rejected_summaries"] == 1
+    retry = await owner.prepare(state)
+    assert retry.model_source == request.model_source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [None, " ", "x" * 4096])
+async def test_parsed_memory_cannot_bypass_nonempty_or_output_limit(mocker, result):
+    owner, state = runtime(summary_tokens=64), QwenHistoryState()
+    state.reconcile(text_history())
+    request = await owner.prepare(state)
+    mocker.patch.object(owner.policy, "parse_compression", return_value=result)
+    assert not owner.apply(state, request, completion("short raw output"))
+    assert state.summary == "" and state.processed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["truncated", "oversize", "edited_source"])
+async def test_public_guards_reject_before_custom_parser(mocker, failure):
+    owner, state = runtime(__name__ + ":StructuredMemoryPolicy", summary_tokens=64), QwenHistoryState()
+    state.reconcile(text_history())
+    request = await owner.prepare(state)
+    parse = mocker.spy(owner.policy, "parse_compression")
+    output = completion('{"facts": []}')
+    if failure == "truncated":
+        output = completion('{"facts": []}', reason="length")
+    elif failure == "oversize":
+        output = completion("x" * 4096)
+    else:
+        history = text_history()
+        history[0]["content"] = "edited source"
+        state.reconcile(history)
+    assert not owner.apply(state, request, output)
+    parse.assert_not_called()
+    assert state.processed == 0
+
+
+@pytest.mark.asyncio
+async def test_capacity_reduction_rebuilds_custom_prompt_for_actual_batch(mocker):
+    owner, state = runtime(__name__ + ":StructuredMemoryPolicy", summary_tokens=64), QwenHistoryState()
+    state.reconcile(text_history())
+    first_turn = owner.group(state, 0, 2)
+    _, count, _ = owner._render_compression(first_turn, "")
+    owner.max_model_len = count + owner.limits.summary_tokens
+    build = mocker.spy(owner.policy, "build_compression")
+    request = await owner.prepare(state)
+    assert [len(call.args[0]) for call in build.call_args_list] == [8, 6, 4, 2]
+    assert request.model_source.end == 2
+    assert "message 0" in request.prompt["prompt"]
+    assert "message 2" not in request.prompt["prompt"]
+    assert not state.omissions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indices", [(1, 0), (0,), (0, 0), (0, 2), (False, 1)])
+async def test_custom_prompt_cannot_drop_duplicate_or_rebind_audio(mocker, indices):
+    owner, state = runtime(), QwenHistoryState()
+    history: list[dict[str, object]] = []
+    entries: list[AudioEntry] = []
+    for i in range(2):
+        message, payload = audio_message(i)
+        history.extend((message, {"role": "assistant", "content": "heard"}))
+        entries.append(((message["content"],), payload))
+    state.reconcile([*history, *text_history(12)])
+    state.retain(entries, owner.limits)
+    mocker.patch.object(
+        owner.policy,
+        "build_compression",
+        return_value=CompressionPrompt("Compress", tuple(CompressionAudioRef(i) for i in indices)),
+    )
+    with pytest.raises(ValueError, match="audio reference"):
+        await owner.prepare(state)
+    assert not state.preparing
+    assert state.processed == 0
+
+
+@pytest.mark.asyncio
+async def test_compression_hook_cannot_mutate_source_messages(mocker):
+    owner, state = runtime(), QwenHistoryState()
+    history = text_history()
+    state.reconcile(history)
+    original = owner.policy.build_compression
+
+    def checked_build(batch, previous_memory, limits):
+        with pytest.raises(FrozenInstanceError):
+            batch[0].role = "system"
+        with pytest.raises(TypeError):
+            batch[0].content[0] = "changed"
+        return original(batch, previous_memory, limits)
+
+    mocker.patch.object(owner.policy, "build_compression", side_effect=checked_build)
+    await owner.prepare(state)
+    assert history == text_history()
+
+
+@pytest.mark.parametrize("temperature", [True, -1, float("inf"), float("nan"), "0"])
+def test_compression_sampling_rejects_invalid_temperature(temperature):
+    with pytest.raises(ValueError, match="temperature"):
+        replace(CompressionPrompt("Compress", ("source",)), temperature=temperature)
+
+
+@pytest.mark.asyncio
+async def test_custom_compressor_uses_existing_session_execution_and_cleanup():
+    from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import start_summary, summary_output
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+
+    h = await open_qwen()
+    try:
+        owner = runtime(__name__ + ":StructuredMemoryPolicy", recent_messages=2)
+        h.runner.plugin._history_runtime = owner
+        h.runner.plugin.supports_auxiliary_requests = True
+        for entry in text_history(4):
+            h.session.append_history_message(entry)
+        submission = await start_summary(h)
+        assert submission.context.stage_id == submission.context.final_stage_id == 0
+        assert "JSON object" in submission.prompt["prompt"]
+        h.deliver(
+            summary_output(submission.context.request_id, '{"facts": ["budget 3000"]}'),
+            stage_id=0,
+            segment_finished=True,
+        )
+        events = await h.settle()
+        assert h.runner.model_state.history_policy_state.summary == '{"facts":["budget 3000"]}'
+        assert not any(e.to_realtime()["type"].startswith("response.") for e in events)
+        assert submission.context.request_id not in h.session.resource_request_ids()
+    finally:
+        await h.manager.shutdown()

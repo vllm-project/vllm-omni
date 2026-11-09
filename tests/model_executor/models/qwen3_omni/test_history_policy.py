@@ -377,7 +377,7 @@ def test_external_policy_is_loadable_without_modifying_plugin():
 def test_policy_rejects_images_tools_and_leaves_default_capabilities_intact():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     assert plugin.capabilities(max_sessions=1).supports_image_input
-    plugin.configure_server(DuplexSessionRuntimeConfig(model_options={"history_policy": "incremental"}))
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "incremental"}))
     assert not plugin.capabilities(max_sessions=1).supports_image_input
     with pytest.raises(DuplexRuntimeConfigError, match="tools"):
         plugin.validate_client_extra_body({"realtime_tools": [{"name": "refund"}]})

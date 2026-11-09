@@ -359,15 +359,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
         """Load trusted server history settings before binding the model processor."""
-        options = dict(runtime_config.model_options)
-        name = options.pop("history_policy", "recent")
-        limits = options.pop("history_limits", {})
-        if options or not isinstance(name, str) or not isinstance(limits, dict):
-            raise DuplexRuntimeConfigError("Invalid Qwen server model_options")
-        if self._history_configuration == (name, limits):
+        custom_options = dict(runtime_config.model_custom_options)
+        policy_name = custom_options.pop("history_policy", "recent")
+        history_limits = custom_options.pop("history_limits", {})
+        if custom_options or not isinstance(policy_name, str) or not isinstance(history_limits, dict):
+            raise DuplexRuntimeConfigError("Invalid Qwen server model_custom_options")
+        if self._history_configuration == (policy_name, history_limits):
             return
-        self._history_runtime = QwenHistoryRuntime(name, limits)
-        self._history_configuration = (name, dict(limits))
+        self._history_runtime = QwenHistoryRuntime(policy_name, history_limits)
+        self._history_configuration = (policy_name, dict(history_limits))
         self.supports_auxiliary_requests = self._history_runtime.policy is not None
 
     def auxiliary_policy(

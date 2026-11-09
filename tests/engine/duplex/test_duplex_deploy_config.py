@@ -17,6 +17,30 @@ from vllm_omni.config.stage_config import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_model_custom_options_round_trip_through_deploy_yaml(tmp_path):
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  model_custom_options:\n    history_policy: incremental\nstages: []\n",
+        encoding="utf-8",
+    )
+    config = load_deploy_config(deploy_path).duplex_session
+    assert config.model_custom_options == {"history_policy": "incremental"}
+
+
+def test_old_model_options_name_is_rejected_instead_of_silently_disabling_policy(tmp_path):
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  model_options:\n    history_policy: incremental\nstages: []\n", encoding="utf-8"
+    )
+    with pytest.raises(TypeError, match="model_options"):
+        load_deploy_config(deploy_path)
+
+
+def test_model_custom_options_requires_mapping():
+    with pytest.raises(ValueError, match="model_custom_options"):
+        DuplexSessionRuntimeConfig(model_custom_options=[])
+
+
 def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> None:
     deploy_path = tmp_path / "duplex.yaml"
     deploy_path.write_text("duplex_session: {}\nstages: []\n", encoding="utf-8")

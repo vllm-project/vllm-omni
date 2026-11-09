@@ -101,7 +101,7 @@ without calibration release stopped output immediately.
 ## Experimental Qwen history policy
 
 Qwen can opt into a bounded history policy through server-owned
-`duplex_session.model_options`. `recent` preserves the default clipping path;
+`duplex_session.model_custom_options`. `recent` preserves the default clipping path;
 `bounded_recent` provides an equal-context/media-budget clipping control;
 `incremental` folds older text and original audio into a bounded text memory.
 Model-specific selection, source retention, prompt construction and validation
@@ -115,8 +115,46 @@ A missing source records an omission and does not block later work. Media
 eligibility is independent of the recent text window. Original Session records
 are retained, so this policy does not bound total Session storage.
 
-External policies inherit the `QwenHistoryPolicy` ABC; incomplete implementations
-fail at server initialization. Selection is stateless and may be cached while
+External policies inherit `QwenHistoryPolicy` and supply four methods:
+
+| Method | Decision |
+| --- | --- |
+| `select(state, limits)` | Original whole turns offered to the next foreground request; the runtime adds stored memory and fits the actual input. |
+| `next_batch(state, limits, *, max_audio)` | Next unprocessed prefix to compress, or `None`. |
+| `build_compression(batch, previous_memory, limits)` | Compression instructions, quoted source layout and temperature for a private Thinker request. |
+| `parse_compression(text)` | Complete replacement memory, or rejection of the model output. |
+
+For example, an extension can reuse incremental selection/batching while
+replacing free-form summaries with a validated JSON fact list. Compression
+instructions and result interpretation belong to the policy. The runtime owns
+PCM binding, Qwen processing, actual token limits and committing valid results;
+`SessionMemoryRuntime` still owns submission, cancellation and retry. The
+extension does not implement a second model-execution loop.
+
+Compression builders run in the joined CPU preparation worker on frozen
+`CompressionMessage` values. Text and batch-local `CompressionAudioRef` indices
+replace borrowed Session objects and raw PCM. Every audio reference must appear
+once in source order in the returned `CompressionPrompt`. If a batch must shrink
+to fit context, the builder runs again on that actual smaller batch. Parsers
+run on the Session loop and must be small and nonblocking. Both hooks are
+stateless, perform no I/O and must not retain input material. Selection hooks
+receive Session-owned state under a read-only contract; server-loaded Python
+extensions are trusted code, not a sandbox.
+
+Before invoking the parser, the runtime rejects stale, empty, truncated or
+overlong model output. It also bounds the parsed text before committing memory
+and source progress together. A parser can return `None` or raise `ValueError`
+to reject malformed output without advancing progress. Memory remains bounded
+text (including serialized JSON), inserted as reference data in foreground
+input. The interface uses the same Qwen Thinker; it does not support external
+summarization services, arbitrary retrieval stores or mid-session switching.
+
+The configuration field is `model_custom_options`; the draft's former
+`model_options` spelling is rejected during deployment loading. Deployments
+using that spelling must rename it. Default `recent` behavior is unchanged.
+
+Incomplete implementations fail at server initialization. Selection is
+stateless and may be cached while
 the Session history revision, memory generation and retained-media revision are
 unchanged. Source checks still run before submitting or applying a summary.
 Audio compression uses the renderer's effective per-request audio count and a
