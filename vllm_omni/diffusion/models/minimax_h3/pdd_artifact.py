@@ -23,10 +23,10 @@ from vllm.distributed import (
 )
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
-from vllm.lora.lora_weights import PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.model_executor.models.utils import WeightsMapper
 
+from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 
 # ---------------------------------------------------------------------------
@@ -37,8 +37,6 @@ _PDD_RANK = 64
 _PDD_ALPHA = 64.0
 _PDD_NUM_STEPS = 32
 _PDD_BLOCK_SIZE = 4
-_PDD_NFE = _PDD_NUM_STEPS // _PDD_BLOCK_SIZE  # 8
-_PDD_SIGMA_POINTS = _PDD_NFE + 1  # 9 sigma points -> 8 Euler steps
 _PDD_VIDEO_SHIFT = 12.0
 _PDD_AUDIO_SHIFT = 3.0
 _PDD_HIDDEN_SIZE = 5376
@@ -47,7 +45,6 @@ _PDD_AUDIO_OUT_DIM = 32
 _PDD_TIME_EMBED_DIM = 2688
 _PDD_ATTENTION_INNER_SIZE = 7168
 _PDD_FFN_HIDDEN_SIZE = 14336
-_PDD_FINAL_ADALN_OUT = 2 * _PDD_HIDDEN_SIZE  # final_layer.adaln_proj: expand_ratio=2, modality_num=1
 _PDD_BLOCK_ADALN_OUT = 18 * _PDD_HIDDEN_SIZE  # DiT block adaln: expand_ratio=6 * modality_num=3
 _PDD_LORA_DOWN_SUFFIX = ".lora_down"
 _PDD_LORA_UP_SUFFIX = ".lora_up"
@@ -581,19 +578,10 @@ def _validate_and_convert_tensors(
 
 
 def _pack_pdd_fc1(lora_model: LoRAModel) -> None:
-    """Pack fused gate/up LoRA for mlp.fc1, same as turbo."""
-    for module_name, weights in tuple(lora_model.loras.items()):
-        if not module_name.endswith(".mlp.fc1"):
-            continue
-        gate_b, up_b = weights.lora_b.chunk(2, dim=0)
-        lora_model.loras[module_name] = PackedLoRALayerWeights(
-            module_name=module_name,
-            rank=weights.rank,
-            lora_alphas=[weights.lora_alpha, weights.lora_alpha],
-            lora_a=[weights.lora_a, weights.lora_a],
-            lora_b=[gate_b.contiguous(), up_b.contiguous()],
-            scaling=[weights.scaling, weights.scaling],
-        )
+    """Use the shared H3 gate/up packing contract, retaining the PDD entry point."""
+    from .lora import _pack_h3_turbo_fc1
+
+    _pack_h3_turbo_fc1(lora_model)
 
 
 # ---------------------------------------------------------------------------
@@ -603,12 +591,12 @@ def _pack_pdd_fc1(lora_model: LoRAModel) -> None:
 
 def _validate_pdd_head_replacement(transformer: nn.Module) -> None:
     if getattr(getattr(transformer, "arch", None), "pdd_steps", None) is not None:
-        raise ValueError("Alibaba PDD adapters cannot replace FastH3 Omni checkpoint heads")
+        raise OmniClientError("Alibaba PDD adapters cannot replace FastH3 Omni checkpoint heads")
     # Check both projections before replacing either. The manager retains LoRA
     # wrappers after eviction and would otherwise bind a detached projection.
     for name in ("video_out", "audio_out"):
         if isinstance(getattr(transformer.final_layer, name), BaseLayerWithLoRA):
-            raise ValueError(
+            raise OmniClientError(
                 "Alibaba PDD cannot replace final projections already wrapped for generic PEFT LoRA "
                 f"({name}); use separate workers for PDD and generic final-projection adapters."
             )
@@ -734,15 +722,5 @@ __all__ = [
     "PDDConfig",
     "PDDParallelHead",
     "PDDVariant",
-    "PDD_NFE",
-    "PDD_SIGMA_POINTS",
-    "PDD_VIDEO_SHIFT",
-    "PDD_AUDIO_SHIFT",
     "load_minimax_h3_pdd_lora",
 ]
-
-# Public schedule constants for the pipeline's validation paths.
-PDD_NFE = _PDD_NFE
-PDD_SIGMA_POINTS = _PDD_SIGMA_POINTS
-PDD_VIDEO_SHIFT = _PDD_VIDEO_SHIFT
-PDD_AUDIO_SHIFT = _PDD_AUDIO_SHIFT

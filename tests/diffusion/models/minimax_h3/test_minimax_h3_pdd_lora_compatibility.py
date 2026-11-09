@@ -19,6 +19,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3 import pdd_artifact_lifecycle as lifecycle
 from vllm_omni.diffusion.models.minimax_h3.pdd_artifact import PDDAdapter, PDDConfig, PDDParallelHead
 from vllm_omni.diffusion.models.minimax_h3.pdd_artifact_lifecycle import MiniMaxH3PDDLifecycleMixin
+from vllm_omni.errors import OmniClientError, client_error_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -123,17 +124,23 @@ def _manager(pipeline, target, monkeypatch):
     return manager, calls
 
 
-@pytest.mark.parametrize("wrapped_name", ["video_out", "audio_out"])
-def test_pdd_install_rejects_generic_wrapper_before_replacing_either_head(wrapped_name):
+@pytest.mark.parametrize("existing_head", ["video_out", "audio_out", "checkpoint"])
+def test_pdd_install_rejects_competing_heads_before_replacing_either_head(existing_head):
     pipeline = _Pipeline()
     layer = pipeline.transformer.final_layer
-    setattr(layer, wrapped_name, _GenericHead(getattr(layer, wrapped_name)))
+    message = "generic PEFT LoRA"
+    if existing_head == "checkpoint":
+        pipeline.transformer.arch.pdd_steps = 32
+        message = "checkpoint heads"
+    else:
+        setattr(layer, existing_head, _GenericHead(getattr(layer, existing_head)))
     before = _snapshot(pipeline.transformer)
     cfg = PDDConfig()
 
-    with pytest.raises(ValueError, match="generic PEFT LoRA"):
+    with pytest.raises(OmniClientError, match=message) as exc:
         PDDAdapter(cfg, _PDD_ID, *cfg.plans()).install_heads(pipeline.transformer)
 
+    assert client_error_metadata(exc.value) == (400, "BadRequestError")
     _assert_unchanged(pipeline.transformer, before)
 
 
@@ -153,9 +160,10 @@ def test_generic_head_activation_cannot_bypass_pdd_guard_or_reset_current_state(
     manager._active_adapter_id, manager._suspended_adapter_id = active, suspended
     scales = dict(manager._adapter_scales)
 
-    with pytest.raises(ValueError, match="Generic PEFT LoRA"):
+    with pytest.raises(OmniClientError, match="Generic PEFT LoRA") as exc:
         manager._activate_adapter(_GENERIC_ID, 1.0)
 
+    assert client_error_metadata(exc.value) == (400, "BadRequestError")
     assert (manager._active_adapter_id, manager._suspended_adapter_id) == (active, suspended)
     assert manager._active_scale == 1.0
     assert manager._adapter_scales == scales
@@ -204,7 +212,7 @@ def test_rejected_pdd_load_preserves_head_objects_and_metadata(already_registere
     before = _snapshot(pipeline.transformer)
     monkeypatch.setattr(lifecycle, "load_minimax_h3_pdd_lora", lambda **kwargs: (object(), object(), cfg, {}, {}))
 
-    with pytest.raises(ValueError, match="generic PEFT LoRA"):
+    with pytest.raises(OmniClientError, match="generic PEFT LoRA") as exc:
         pipeline._load_pdd_lora_adapter(
             lora_request=SimpleNamespace(lora_int_id=_PDD_ID),
             lora_path="unused-synthetic-artifact",
@@ -212,6 +220,7 @@ def test_rejected_pdd_load_preserves_head_objects_and_metadata(already_registere
             unsupported_offload_mode=None,
         )
 
+    assert client_error_metadata(exc.value) == (400, "BadRequestError")
     assert pipeline._pdd_adapters == metadata[0]
     assert pipeline._pdd_adapter_ids == metadata[1]
     assert pipeline._pdd_active_adapters == metadata[2]

@@ -125,12 +125,15 @@ which are bounded by 9 internal sigma points, video shift 12, audio shift 3, and
 PDD requires the default Euler sampler (omit `sampler` or set it to `euler`).
 Requests selecting `res_multistep` are rejected because the fused heads were
 distilled for Euler updates.
+PDD also rejects `latent_refine`, `long_video_mode=continuation` and
+`continue_from`; use the base model for those modes.
 
 Use `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` for `ref2va` and
 `MiniMax-H3-FL2VA-Acc-8Step.safetensors` for `t2va`/`fl2va`. These artifacts
 have separate task-specific DiT weights; the loader rejects a task mismatch.
 Download the desired published artifact into `PDD_DIR` and start the server
-with dynamic LoRA enabled (`--enable-lora --max-lora-rank 64`). The artifact
+with `--lora-backend peft` (the default), selecting the adapter through the
+request's `lora` field. The artifact
 path in a request is a path on the **server**, even when the client runs on
 another machine. Keep the published filename so the loader can identify the
 task-specific artifact.
@@ -174,7 +177,7 @@ vllm serve "${MODEL}" --omni --host 127.0.0.1 --port 8000 \
   --vae-patch-parallel-size 8 --vae-parallel-mode tile --vae-use-tiling \
   --diffusion-quantization-config '{"transformer":{"method":"fp8"},"text_encoder":null}' \
   --diffusion-attention-backend FLASH_ATTN --enforce-eager \
-  --lora-backend peft --enable-lora --max-lora-rank 64 \
+  --lora-backend peft \
   --init-timeout 3600 --stage-init-timeout 3600
 ```
 

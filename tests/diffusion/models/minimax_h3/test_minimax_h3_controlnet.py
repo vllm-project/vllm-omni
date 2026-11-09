@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
@@ -212,6 +213,8 @@ def test_control_stream_matches_reference_and_never_injects_audio(cpu_layers):
     model.load_weights(weights.items())
     # Platform norm/rope dispatch is selected at construction; force native CPU implementations.
     for module in model.modules():
+        if isinstance(module, LinearBase) and module.quant_method is not None:
+            module.quant_method.process_weights_after_loading(module)
         if hasattr(module, "forward_native"):
             module._forward_method = module.forward_native
     hidden = torch.randn(5, 8, generator=torch.Generator().manual_seed(3)).bfloat16()
@@ -352,6 +355,8 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
     model.controlnet = MiniMaxH3ControlNet(arch, (0, 1))
     model.controlnet.load_weights(original_weights(arch).items())
     for module in model.modules():
+        if isinstance(module, LinearBase) and module.quant_method is not None:
+            module.quant_method.process_weights_after_loading(module)
         if hasattr(module, "forward_native"):
             module._forward_method = module.forward_native
     kwargs = {
@@ -715,6 +720,8 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
+        lora_request=None,
+        lora_scale=1.0,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)

@@ -98,7 +98,7 @@ class MiniMaxH3PDDLifecycleMixin:
                 # Match the manager's full, component-relative and leaf lookup.
                 candidates = (f"{component}.final_layer.{name}", f"final_layer.{name}", name)
                 if any(lora_model.get_lora(candidate) is not None for candidate in candidates):
-                    raise ValueError(
+                    raise OmniClientError(
                         "Generic PEFT LoRA targeting "
                         f"{component}.final_layer.{name} cannot run with Alibaba PDD heads; "
                         "use separate workers for PDD and generic final-projection adapters."

@@ -3195,6 +3195,8 @@ class MiniMaxH3Pipeline(
         has_pdd_lora = self._has_active_pdd_lora(sampling)
         if turbo_spec is not None and has_pdd_lora:
             raise OmniClientError("MiniMax-H3 Turbo and PDD acceleration adapters cannot be active simultaneously")
+        if has_pdd_lora and (continuation is not None or extra.get("continue_from") is not None):
+            raise OmniClientError("MiniMax H3 PDD does not support continuation or continue_from; use the base model")
         task = self._resolve_task(
             conditioning.task,
             turbo_spec=turbo_spec,

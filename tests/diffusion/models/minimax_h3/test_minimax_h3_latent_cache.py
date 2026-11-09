@@ -424,11 +424,31 @@ def _pipeline(*, load_vae_decoder=True):
 
 
 def _run(pipeline, conditioning, extra, *, num_outputs=1):
-    sampling = SimpleNamespace(extra_args=extra, quality=None, seed=7, num_outputs_per_prompt=num_outputs)
+    sampling = SimpleNamespace(
+        extra_args=extra,
+        quality=None,
+        seed=7,
+        num_outputs_per_prompt=num_outputs,
+        lora_request=None,
+        lora_scale=1.0,
+    )
     pipeline._prepare_request_inputs = lambda _prompt, _sampling: pipeline._prepare_encoder_conditioning_inputs(
         conditioning, _sampling
     )
     return pipeline.forward(SimpleNamespace(prompts=["prompt"], sampling_params=sampling)).output
+
+
+@pytest.mark.parametrize("extra", [{"long_video_mode": "continuation"}, {"continue_from": "previous"}])
+def test_pdd_rejects_continuation_before_loading_heads(monkeypatch, extra):
+    pipeline, _, _ = _pipeline()
+    monkeypatch.setattr(pipeline, "_has_active_pdd_lora", lambda _sampling: True)
+
+    def unexpected_pdd_validation(*args, **kwargs):
+        pytest.fail("unsupported continuation must fail before validating or installing PDD heads")
+
+    monkeypatch.setattr(pipeline, "_validate_pdd_sampling", unexpected_pdd_validation)
+    with pytest.raises(OmniClientError, match="PDD.*continuation"):
+        _run(pipeline, _conditioning("ref2va", 124), extra)
 
 
 def test_chained_requests_combine_continuation_with_every_task_and_lock_source():
@@ -569,7 +589,12 @@ def test_preencoded_multi_output_and_decoder_stage_outputs_are_trimmed():
         SimpleNamespace(
             prompts=["p"],
             sampling_params=SimpleNamespace(
-                extra_args={"continue_from": "b"}, quality=None, seed=7, num_outputs_per_prompt=1
+                extra_args={"continue_from": "b"},
+                quality=None,
+                seed=7,
+                num_outputs_per_prompt=1,
+                lora_request=None,
+                lora_scale=1.0,
             ),
         )
     )
@@ -582,7 +607,12 @@ def test_step_post_decode_keeps_the_real_tail_caches_and_trims():
     context = pipeline._prepare_encoder_conditioning_inputs(
         _conditioning("ref2va", 141),
         SimpleNamespace(
-            extra_args={"continue_from": "a", "latent_cache_key": "b"}, quality=None, seed=1, num_outputs_per_prompt=1
+            extra_args={"continue_from": "a", "latent_cache_key": "b"},
+            quality=None,
+            seed=1,
+            num_outputs_per_prompt=1,
+            lora_request=None,
+            lora_scale=1.0,
         ),
     )
     window_video = torch.full((1, 24, _video_t(141), LATENT_H, LATENT_W), 50.0)
