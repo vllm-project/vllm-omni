@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Backward-compatible import path for shared merged LoRA layer wrappers."""
 
-from .base_linear import DiffusionBaseLinearLayerWithLoRA
-from .column_parallel_linear import (
+from vllm_omni.lora.layers import (
+    DiffusionBaseLinearLayerWithLoRA,
     DiffusionColumnParallelLinearWithLoRA,
     DiffusionMergedColumnParallelLinearWithLoRA,
     DiffusionMergedQKVParallelLinearWithLoRA,
     DiffusionQKVParallelLinearWithLoRA,
+    DiffusionReplicatedLinearWithLoRA,
+    DiffusionRowParallelLinearWithLoRA,
 )
-from .replicated_linear import DiffusionReplicatedLinearWithLoRA
-from .row_parallel_linear import DiffusionRowParallelLinearWithLoRA
 
 __all__ = [
     "DiffusionBaseLinearLayerWithLoRA",
-    "DiffusionReplicatedLinearWithLoRA",
     "DiffusionColumnParallelLinearWithLoRA",
     "DiffusionMergedColumnParallelLinearWithLoRA",
-    "DiffusionRowParallelLinearWithLoRA",
-    "DiffusionQKVParallelLinearWithLoRA",
     "DiffusionMergedQKVParallelLinearWithLoRA",
+    "DiffusionQKVParallelLinearWithLoRA",
+    "DiffusionReplicatedLinearWithLoRA",
+    "DiffusionRowParallelLinearWithLoRA",
 ]

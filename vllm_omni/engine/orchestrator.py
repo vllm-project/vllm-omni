@@ -3291,6 +3291,7 @@ class OrchestratorBase:
         submit_kwargs: DiffusionSubmitKwargs | None = None,
         params_override: OmniSamplingParams | None = None,
         pinned_replica_id: int | None = None,
+        requested_replica_id: int | None = None,
     ) -> None:
         """Submit requests built from the source stage's output to the receiver stage."""
         if req_state.yield_stage_id == source_stage_id:
@@ -3306,6 +3307,8 @@ class OrchestratorBase:
             return
         to_pool = self.stage_pools[receiver_stage_id]
         update_kwargs: dict[str, Any] = {"pinned_replica_id": pinned_replica_id}
+        if requested_replica_id is not None:
+            update_kwargs["requested_replica_id"] = requested_replica_id
         if submit_kwargs is not None:
             update_kwargs["submit_kwargs"] = submit_kwargs
         initial_kwargs = dict(update_kwargs)
@@ -3758,8 +3761,8 @@ class Orchestrator(OrchestratorBase):
         """Fail the request if it can't be submitted to `stage_id`; return whether it failed."""
         if not self.stage_pools[stage_id].live_replica_ids():
             # The stage lost all replicas between the HTTP-layer errored check and
-            # dispatch. Runs before request state / running counter registration,
-            # so the helper's cleanup is a no-op here.
+            # dispatch. Request-state cleanup is a no-op before registration,
+            # but binding cleanup still releases any explicit-route reservation.
             await self._fail_request_dead_stage(req_id, stage_id)
             return True
         if is_run_request and self.async_chunk:
@@ -3778,6 +3781,18 @@ class Orchestrator(OrchestratorBase):
         except ValueError as exc:
             await self._fail_request_client_error(req_id, receiver_stage_id, str(exc))
             return
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[receiver_stage_id].reserve_requested_replica(req_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    req_id,
+                    receiver_stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(req_id, receiver_stage_id, is_run_request=True):
             return
 
@@ -3817,6 +3832,7 @@ class Orchestrator(OrchestratorBase):
                 already_submitted=False,
                 t_submit_start=_time.perf_counter(),
                 submit_kwargs=msg.submit_kwargs,
+                requested_replica_id=msg.requested_replica_id,
             ),
             req_id=req_id,
             stage_id=receiver_stage_id,
@@ -3847,6 +3863,18 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
             return
 
@@ -3933,8 +3961,10 @@ class Orchestrator(OrchestratorBase):
             expected_replica_id = None
             if stage_id != 0:
                 _t_preprocess = _time.perf_counter()
+                preprocessing_started = False
                 try:
                     expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
+                    preprocessing_started = True
                     prompt = await self._build_entry_stage_request(
                         request_id,
                         stage_id,
@@ -3945,6 +3975,21 @@ class Orchestrator(OrchestratorBase):
                     )
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, stage_id)
+                    return
+                except OmniClientError as exc:
+                    if preprocessing_started:
+                        await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
+                    # Preserve request-scoped metadata both when preselection
+                    # revalidates a disappeared explicit replica and when the
+                    # input processor raises another OmniClientError.
+                    logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        str(exc),
+                        status_code=exc.status_code,
+                        error_type=exc.error_type,
+                    )
                     return
                 except (ValueError, VLLMClientError) as exc:
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
@@ -3966,6 +4011,7 @@ class Orchestrator(OrchestratorBase):
                     prompt,
                     prompt_text=msg.output_prompt_text,
                     expected_replica_id=expected_replica_id,
+                    requested_replica_id=msg.requested_replica_id,
                 ),
                 req_id=request_id,
                 stage_id=stage_id,
@@ -4067,6 +4113,10 @@ class Orchestrator(OrchestratorBase):
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
+                # The parent has already been admitted when this FIFO message
+                # is handled. Inherit its active binding so an explicit parent
+                # route also colocates every CFG companion without giving the
+                # companion a separate caller-selected route.
                 affinity_request_id=parent_id,
                 **route_kwargs,
             )
