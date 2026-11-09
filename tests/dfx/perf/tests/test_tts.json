@@ -501,13 +501,11 @@
         "dataset_path": "benchmarks/build_dataset/seed_tts_design",
         "num_prompts": [
           80,
-          128,
           128
         ],
         "max_concurrency": [
           8,
-          16,
-          64
+          16
         ],
         "seed_tts_locale": "en",
         "extra_body": {
@@ -519,41 +517,57 @@
           "H100": {
             "median_audio_ttfp_ms": [
               33.4549,
-              36.392,
-              114.5276
+              36.392
             ],
             "median_audio_rtf": [
               0.1122,
-              0.134,
-              0.2614
+              0.134
             ],
             "audio_throughput": [
               68.8888,
-              114.687,
-              214.7879
+              114.687
             ],
             "request_throughput": [
               15.1764,
-              25.9533,
-              48.6876
+              25.9533
             ],
             "mean_e2el_ms": [
               505.5975,
-              591.5199,
-              1183.4333
+              591.5199
             ],
             "mean_audio_ttfp_ms": [
               37.131,
-              43.8621,
-              143.9237
+              43.8621
             ],
             "mean_audio_rtf": [
               0.1119,
-              0.1344,
-              0.2698
+              0.1344
             ]
           }
         }
+      },
+      {
+        "name": "throughput_c64_n1024",
+        "task": "voice_design",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-design",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_design",
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "task_type": "VoiceDesign",
+          "language": "English"
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "num_prompts": [
+          1024
+        ],
+        "max_concurrency": [
+          64
+        ],
+        "num_warmups": 64,
+        "baseline": {}
       },
       {
         "task": "voice_design",
