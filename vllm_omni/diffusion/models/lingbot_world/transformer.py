@@ -579,6 +579,7 @@ class LingBotAttentionBlock(nn.Module):
         self.dim = dim
         self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.npu_fused_adaln = False
+        self.npu_fused_residual = False
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
@@ -658,6 +659,20 @@ class LingBotAttentionBlock(nn.Module):
         normalized = norm(hidden.float()).unflatten(1, (num_frames, tokens_per_frame))
         return (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden.dtype)
 
+    def _gated_residual(self, hidden, update, gate, tokens_per_frame, *, scale=None, shift=None):
+        if self.npu_fused_residual and hidden.device.type == "npu":
+            from .npu_modulation import residual_camera
+
+            result = residual_camera(hidden, update, gate, tokens_per_frame, scale=scale, shift=shift)
+            if result is not None:
+                return result
+        grid = hidden.unflatten(1, (gate.shape[1], tokens_per_frame))
+        update_grid = update.unflatten(1, (gate.shape[1], tokens_per_frame))
+        result = (grid + update_grid * gate).flatten(1, 2).to(hidden.dtype)
+        if scale is not None:
+            result = ((1 + scale) * result + shift).to(hidden.dtype)
+        return result
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -725,14 +740,13 @@ class LingBotAttentionBlock(nn.Module):
                 **projection_kwargs,
             )
             if lease is None:
-                hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-                hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
-                hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
                 if camera_scale is None:
                     camera_scale, camera_shift = (
                         self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
                     )
-                hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+                hidden_states = self._gated_residual(
+                    hidden_states, attention_output, gate_msa, tokens_per_frame, scale=camera_scale, shift=camera_shift
+                )
                 cross_normalized = self.norm3(hidden_states)
             else:
                 _, hidden_states, cross_normalized = lease.consume()
@@ -741,9 +755,8 @@ class LingBotAttentionBlock(nn.Module):
             hidden_states = hidden_states + attention_output
 
         normalized = self._adaln(self.norm2, hidden_states, scale_ffn, shift_ffn, num_frames, tokens_per_frame)
-        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-        ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
-        hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
+        ffn_output = self.ffn(normalized)
+        hidden_states = self._gated_residual(hidden_states, ffn_output, gate_ffn, tokens_per_frame)
         return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
 
@@ -1056,6 +1069,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         fused_rmsnorm: bool = False,
         cache_block_conditions: bool = False,
         fused_adaln: bool = False,
+        fused_residual: bool = False,
     ) -> None:
         """Enable experimental providers without changing checkpoint parameters.
 
@@ -1069,7 +1083,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 fused_rmsnorm,
                 cache_block_conditions,
                 fused_adaln,
-                fused_mxfp8_ffn,
+                fused_residual,
             )
         ):
             raise ValueError("LingBot NPU optimization options must be booleans")
@@ -1078,7 +1092,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         for block in self.blocks:
             block.self_attn.npu_host_lengths = host_lengths
             block.npu_fused_adaln = fused_adaln
-
+            block.npu_fused_residual = fused_residual
         for module in self.modules():
             if isinstance(module, _LingBotRMSNorm):
                 module.npu_fused = fused_rmsnorm
