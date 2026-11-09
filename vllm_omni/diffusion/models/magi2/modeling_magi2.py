@@ -104,8 +104,10 @@ class Magi2Attention(nn.Module):
         # send buffer, so the compiled projection stores them in send order,
         # and output() receives the attention output in the same head shards.
         ulysses_size = get_magi2_ulysses_group().world_size if current_omni_platform.is_musa() else 1
-        divisible = self.num_heads_q % ulysses_size == 0 and self.num_heads_kv % ulysses_size == 0
-        self.ulysses_head_shards = ulysses_size if divisible else 1
+        # ``_validate_native_topology`` and ``scatter_heads_gather_seqlen`` both
+        # require the head counts to divide, so no fallback is needed here; a
+        # clamped degree would also desync ``head_shard_output`` from ``project()``.
+        self.ulysses_head_shards = ulysses_size
         self.sinks = nn.Parameter(torch.empty(config.attention_sink_tokens, self.num_heads_q, dtype=torch.float32))
         if self.tp_group.world_size > 1:
             self.sinks.checkpoint_weight_transform = self._shard_sinks
@@ -136,7 +138,7 @@ class Magi2Attention(nn.Module):
             disable_kv_quant=True,
             custom_attention=Magi2PackedAttentionKernel(
                 config.attention_softcap,
-                head_shard_output=current_omni_platform.is_musa(),
+                head_shard_output=self.ulysses_head_shards > 1,
             ),
         )
 

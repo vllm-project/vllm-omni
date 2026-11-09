@@ -8,7 +8,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from torch._inductor.utils import run_and_get_code
 from torch.fx.experimental.symbolic_shapes import is_concrete_int
 
 from tests.helpers.mark import hardware_test
@@ -546,6 +545,10 @@ def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchange
 
 
 def _compiled_triton_kernels(fn, *args, dynamic):
+    # Private Inductor API, imported at call time: this module is collected by the
+    # CUDA CPU shard on every PR, so a renamed symbol must fail one test, not the shard.
+    from torch._inductor.utils import run_and_get_code
+
     torch._dynamo.reset()
     compiled = torch.compile(fn, fullgraph=True, dynamic=dynamic, options={"emulate_precision_casts": True})
     with torch.inference_mode(), torch._inductor.config.patch(force_disable_caches=True):
@@ -579,7 +582,9 @@ def test_real_musa_dynamic_compile_indexes_head_shards_without_runtime_division(
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "musa,world_size,expected",
-    [(False, 4, 1), (True, 1, 1), (True, 4, 4), (True, 8, 8), (True, 3, 1)],
+    # ``world_size=3`` is rejected by the pipeline validator, but construction
+    # itself must not clamp: the degree is taken as requested.
+    [(False, 4, 1), (True, 1, 1), (True, 4, 4), (True, 8, 8), (True, 3, 3)],
 )
 def test_projection_packs_head_shards_on_musa(monkeypatch, musa, world_size, expected):
     monkeypatch.setattr(modeling_magi2, "current_omni_platform", SimpleNamespace(is_musa=lambda: musa))
