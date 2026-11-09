@@ -3311,16 +3311,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if self._vae_output_storage_may_be_reused():
             src = src.clone()
         host = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+        device_module = torch.get_device_module(src.device)
         if self._audio_copy_stream is None:
-            self._audio_copy_stream = torch.cuda.Stream(device=src.device)
+            self._audio_copy_stream = device_module.Stream(device=src.device)
         copy_stream = self._audio_copy_stream
-        copy_stream.wait_stream(torch.cuda.current_stream(src.device))
-        with torch.cuda.stream(copy_stream):
+        copy_stream.wait_stream(device_module.current_stream(src.device))
+        with device_module.stream(copy_stream):
             host.copy_(src, non_blocking=True)
             src.record_stream(copy_stream)
             event = None
             if self._delayed_audio_copy_use_events:
-                event = torch.cuda.Event()
+                event = device_module.Event()
                 event.record(copy_stream)
         state.pending_audio_copies.append(_PendingAudioCopy(host=host, event=event, source=src, async_copy=True))
 
