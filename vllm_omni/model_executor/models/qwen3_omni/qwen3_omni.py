@@ -259,6 +259,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         if self.model_stage == "thinker":
             self.use_async_omni_output = True
+            self.supports_async_speculative_payload = True
             # MRv2: the Talker's prompt ends with the first generated token's
             # embedding; publishing it with the prefill output lets the first
             # Thinker->Talker chunk leave one decode step earlier.

@@ -395,11 +395,34 @@ runtime conditions hold:
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
-| Speculative decoding is disabled | Speculative output state is not included in this deferred path |
+| Speculative decoding is disabled, or both the method and model payload contract are supported | `_supports_async_speculative_payload()` checks the method and `supports_async_speculative_payload` capability explicitly |
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
 | Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns. Eager postprocess sees the scheduled slice (`None, None` combined tensors), not the prefix-cache-merged full prompt; it must only consume the tail |
 
 These checks are evaluated per stage on runners based on `GPUARModelRunner`.
+The Qwen3-Omni Thinker declares `supports_async_speculative_payload`.
+The current implementation explicitly permits DFlash; other speculative methods
+remain disabled until their payload contracts are validated. This path
+requires async chunks, prefix caching disabled, no model postprocess, and no
+full-payload accumulation. The execution thread snapshots target input IDs before
+drafting and pairs them with this forward's captured layer-0 embeddings. With
+k valid samples, the first k verifier input rows are the previous replacement
+or bonus plus k-1 accepted drafts. Rejected input rows are masked out before
+asynchronous copies; the background builder applies the same mask to IDs and
+embeddings. No extra embedding lookup or TP collective is performed. The newly
+sampled replacement/bonus is handed off after its next target forward.
+
+These payloads set `meta.consumed_input_span` alongside `meta.decode_span`.
+The connector derives the consumed span's start from the scheduler's output
+history and current kept token delta, checks token identity, and clips both IDs
+and rows at the scheduler's EOS/length boundary. It preserves the existing
+handoff convention that the last token of a finished non-resumable request is
+excluded from speech. The first consumed token completes the held prefill;
+subsequent rows use explicit decode ranges. This requires no request-local
+pending sample or send-offset state. Routing is captured on the execution
+thread; connector cancellation still controls which payloads can be sent.
+The synchronous speculative path retains committed-ID embedding lookup.
+
 An unsupported combination does not prevent serving; it only falls back to
 synchronous output construction for that stage. CUDA and ROCm are the validated
 platforms. XPU inherits `GPUARModelRunner`, and MUSA selects `GPUARWorker`, so

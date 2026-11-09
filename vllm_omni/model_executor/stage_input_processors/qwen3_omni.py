@@ -580,16 +580,30 @@ def thinker2talker_async_chunk(
                 f"Committed token/embedding mismatch for request {request_id}: "
                 f"ids={len(committed_ids)} rows={thinker_emb.shape[0]}"
             )
-        # The scheduler may cut a verifier result at EOS or the length limit.
-        if new_token_ids is not None:
-            scheduled_count = len(_token_id_list(new_token_ids)) + (chunk_id == 0)
-            committed_ids = committed_ids[:scheduled_count]
-            thinker_emb = thinker_emb[:scheduled_count]
         output_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
-        token_start = max(0, len(output_ids) - len(committed_ids)) if output_ids else 0
-        if is_finished and not getattr(request, "resumable", False):
-            committed_ids = committed_ids[:-1]
-            thinker_emb = thinker_emb[:-1]
+        consumed_input_span = bool(payload_meta.get("consumed_input_span", False))
+        if consumed_input_span:
+            if new_token_ids is None:
+                raise RuntimeError("Consumed input spans require the scheduler's token delta")
+            # The previous tail precedes this step's newly sampled tokens.
+            # Use the scheduler's kept delta, which may end early at EOS/length.
+            token_start = max(0, len(output_ids) - len(_token_id_list(new_token_ids)) - 1)
+            token_limit = len(output_ids) - (is_finished and not getattr(request, "resumable", False))
+            expected = output_ids[token_start : max(token_start, min(token_start + len(committed_ids), token_limit))]
+            if committed_ids[: len(expected)] != expected:
+                raise RuntimeError(f"Consumed token/embedding span does not match scheduler output for {request_id}")
+            committed_ids = expected
+            thinker_emb = thinker_emb[: len(expected)]
+        else:
+            # The scheduler may cut a verifier result at EOS or the length limit.
+            if new_token_ids is not None:
+                scheduled_count = len(_token_id_list(new_token_ids)) + (chunk_id == 0)
+                committed_ids = committed_ids[:scheduled_count]
+                thinker_emb = thinker_emb[:scheduled_count]
+            token_start = max(0, len(output_ids) - len(committed_ids)) if output_ids else 0
+            if is_finished and not getattr(request, "resumable", False):
+                committed_ids = committed_ids[:-1]
+                thinker_emb = thinker_emb[:-1]
         if not committed_ids:
             return None
         token_end = token_start + len(committed_ids)

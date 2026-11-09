@@ -136,6 +136,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     minimax_h3_prepared_reference_videos: str
     decode_span: bool
     committed_token_count: int
+    consumed_input_span: bool
 
 
 class OmniPayload(TypedDict, total=False):
@@ -270,6 +271,7 @@ class MetaStruct(_StructBase):
     duplex_perf_chunk: list[int] | None = None
     decode_span: bool | None = None
     committed_token_count: int | None = None
+    consumed_input_span: bool | None = None
 
 
 class OmniPayloadStruct(_StructBase):

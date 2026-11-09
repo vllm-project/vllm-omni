@@ -72,12 +72,8 @@ def test_first_speculative_delta_seeds_prefill_sampled_token() -> None:
     runner = object.__new__(GPUARModelRunner)
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner._pending_full_payload_send = {
-        "r1": ({}, {}, {"hidden_states.layer_0": 3}, object())
-    }
-    runner.requests = {
-        "r1": SimpleNamespace(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11])
-    }
+    runner._pending_full_payload_send = {"r1": ({}, {}, {"hidden_states.layer_0": 3}, object())}
+    runner.requests = {"r1": SimpleNamespace(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11])}
     scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={"r1": [4, 5, 6]})
 
     assert runner._get_speculative_committed_token_ids("r1", 0, scheduler_output, [[11, 12]]) == [10, 11, 12]
@@ -292,3 +288,175 @@ def test_async_decode_span_metadata_survives_payload_wire_round_trip() -> None:
     assert restored["meta"]["committed_token_count"] == 2
     assert restored["ids"]["output"] == [11, 12]
     assert torch.equal(restored["embed"]["decode"], payload["embed"]["decode"])
+
+
+def _async_speculative_runner():
+    runner = object.__new__(GPUARModelRunner)
+    runner.requests = {rid: SimpleNamespace(output_token_ids=[-1]) for rid in ("r1", "r2")}
+    runner.input_batch = SimpleNamespace(vocab_size=100)
+
+    def embed_input_ids(input_ids):
+        assert bool(((input_ids >= 0) & (input_ids < 100)).all())
+        return input_ids.float().unsqueeze(-1)
+
+    runner.model = SimpleNamespace(embed_input_ids=embed_input_ids)
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("samples", "expected"),
+    [([11, -1, -1], [10]), ([11, 12, -1], [10, 11]), ([11, 12, 13], [10, 11, 12]), ([-1, -1, -1], [])],
+)
+def test_async_speculative_reuses_only_consumed_forward_rows(samples, expected):
+    runner = _async_speculative_runner()
+    runner.model.embed_input_ids = lambda **kwargs: pytest.fail("extra embedding lookup")
+    scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"r1": [11, 12]}, num_scheduled_tokens={"r1": 3})
+    payloads = runner._prepare_async_speculative_payloads(
+        scheduler,
+        torch.tensor([samples]),
+        ["r1"],
+        [],
+        input_token_ids=torch.tensor([10, 11, 12]),
+        input_embeddings=torch.tensor([[100.0], [110.0], [120.0]]),
+        query_start_loc_cpu=[0, 3],
+    )
+    resolved = runner._resolve_async_speculative_payloads(payloads, 100)["r1"]
+    assert resolved[0] == expected
+    assert resolved[1].flatten().tolist() == [float(x * 10) for x in expected]
+
+
+def test_async_speculative_captured_rows_follow_batch_offsets_and_discard_mask():
+    runner = _async_speculative_runner()
+    scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"r2": [21, 22]}, num_scheduled_tokens={"r1": 2, "r2": 3})
+    args = dict(
+        input_token_ids=torch.tensor([1, 2, 20, 21, 22]),
+        input_embeddings=torch.arange(5.0).view(-1, 1),
+        query_start_loc_cpu=[0, 2, 5],
+    )
+    payloads = runner._prepare_async_speculative_payloads(
+        scheduler, torch.tensor([[3, -1, -1], [21, 23, -1]]), ["r1", "r2"], [], **args
+    )
+    resolved = runner._resolve_async_speculative_payloads(payloads, 100)
+    assert set(resolved) == {"r2"}
+    assert resolved["r2"][0] == [20, 21]
+    assert resolved["r2"][1].flatten().tolist() == [2.0, 3.0]
+    assert (
+        runner._prepare_async_speculative_payloads(
+            scheduler, torch.tensor([[3, -1, -1], [21, 23, -1]]), ["r1", "r2"], [1], **args
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("finished", "history", "delta", "captured", "expected"),
+    [
+        (False, [10, 11, 12, 99], [12, 99], [11, 12], [11, 12]),
+        (True, [10, 11, 12, 99], [12, 99], [11, 12, 99], [11, 12]),
+        (True, [10, 11, 12], [12], [11, 12, 13], [11]),
+    ],
+)
+def test_consumed_input_processor_tracks_scheduler_clipping(finished, history, delta, captured, expected):
+    manager = SimpleNamespace(
+        put_req_chunk={"r1": 1},
+        request_payload={},
+        config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))),
+    )
+    request = SimpleNamespace(
+        external_req_id="r1",
+        output_token_ids=history,
+        prompt_token_ids=[1],
+        all_token_ids=[1] + history,
+        additional_information=None,
+        resumable=False,
+    )
+    payload = {
+        "hidden_states": {"layers": {0: torch.tensor(captured).float().view(-1, 1)}},
+        "meta": {"decode_span": True, "consumed_input_span": True, "committed_token_count": len(captured)},
+        "ids": {"output": captured},
+    }
+    output = thinker2talker_async_chunk(manager, payload, request, is_finished=finished, new_token_ids=delta)
+    assert output.ids.output == expected
+    assert output.embed.decode.flatten().tolist() == expected
+    assert output.embed.decode_token_start == 1
+    assert output.embed.decode_token_end == 1 + len(expected)
+
+
+def test_async_speculative_cpu_payload_does_not_run_model_embedding():
+    runner = _async_speculative_runner()
+    runner.device = torch.device("cpu")
+
+    def unexpected_lookup(*args, **kwargs):
+        pytest.fail("background builder must not execute model embedding")
+
+    runner.model.embed_input_ids = unexpected_lookup
+    prepared = torch.tensor([[11.0], [12.0]])
+    output = runner._build_omni_pooler_payload(
+        rid="r1",
+        idx=0,
+        start=0,
+        end=3,
+        hidden_states_cpu=None,
+        req_hidden_states_cpu=None,
+        combined_hidden_states=None,
+        combined_multimodal_outputs=None,
+        mm_cpu={"hidden_states.layer_24": torch.ones(3, 1)},
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        hidden_seq_len=3,
+        scheduled_seq_len=3,
+        committed_token_ids=[11, 12],
+        committed_token_embeddings=prepared,
+    )
+    assert output["ids"]["output"] == [11, 12]
+    assert torch.equal(output["hidden_states.layer_0"], prepared)
+    assert "hidden_states.layer_24" not in output
+
+
+def test_consumed_input_first_span_completes_held_prefill_without_reembedding():
+    manager = SimpleNamespace(
+        put_req_chunk={"r1": 0},
+        request_payload={
+            "r1": {"embed": {"prefill": torch.tensor([[1.0], [2.0]])}, "hidden_states": {"output": torch.ones(2, 1)}}
+        },
+        config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))),
+    )
+    request = SimpleNamespace(
+        external_req_id="r1",
+        output_token_ids=[10, 11, 12],
+        prompt_token_ids=[1, 2],
+        additional_information=None,
+        resumable=False,
+    )
+    payload = {
+        "hidden_states": {"layers": {0: torch.tensor([[100.0], [110.0]])}},
+        "meta": {"decode_span": True, "consumed_input_span": True, "committed_token_count": 2},
+        "ids": {"output": [10, 11]},
+    }
+    restored = deserialize_payload(serialize_payload(payload))
+    output = thinker2talker_async_chunk(manager, restored, request, new_token_ids=[11, 12])
+    assert output.embed.prefill.flatten().tolist() == [1.0, 2.0, 100.0]
+    assert output.embed.decode.flatten().tolist() == [110.0]
+    assert output.ids.all == [1, 2, 10]
+
+
+def test_consumed_input_span_rejects_wrong_token_identity():
+    manager = SimpleNamespace(
+        put_req_chunk={"r1": 1},
+        request_payload={},
+        config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))),
+    )
+    request = SimpleNamespace(
+        external_req_id="r1",
+        output_token_ids=[10, 11, 12],
+        prompt_token_ids=[1],
+        additional_information=None,
+        resumable=False,
+    )
+    payload = {
+        "hidden_states": {"layers": {0: torch.tensor([[99.0]])}},
+        "meta": {"decode_span": True, "consumed_input_span": True, "committed_token_count": 1},
+        "ids": {"output": [99]},
+    }
+    with pytest.raises(RuntimeError, match="does not match scheduler"):
+        thinker2talker_async_chunk(manager, payload, request, new_token_ids=[12])

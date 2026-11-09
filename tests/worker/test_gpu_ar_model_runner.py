@@ -705,6 +705,27 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
+@pytest.mark.parametrize(
+    "has_config,is_dflash,model_support,expected",
+    [
+        (False, False, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, True, True, True),
+    ],
+)
+def test_async_speculative_payload_requires_method_and_model_support(has_config, is_dflash, model_support, expected):
+    runner = _make_async_output_runner()
+    runner.speculative_config = SimpleNamespace(use_dflash=lambda: is_dflash) if has_config else None
+    runner.model.supports_async_speculative_payload = model_support
+    runner.model.use_async_omni_output = True
+    runner.use_async_scheduling = True
+    runner._should_accumulate_full_payload_output = lambda: False
+    assert runner._supports_async_speculative_payload() is expected
+    if has_config:
+        assert runner._should_use_async_omni_output() is expected
+
+
 @pytest.mark.parametrize("ming3", [False, True])
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch, ming3):
     runner = _make_async_output_runner(engine_output_type="latent")
@@ -2191,13 +2212,27 @@ def test_query_metadata_lifetime_matches_materialization_mode(snapshot):
         assert offsets.tolist() == [0, 9, 3]
 
 
-def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
+@pytest.mark.parametrize("dflash", [False, True])
+def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dflash):
     """Delay the real builder until offsets, batch IDs and counts are reused."""
 
     runner = _make_async_output_runner()
     runner.use_async_scheduling = True
     runner.speculative_config = None
     runner.model.use_async_omni_output = True
+    if dflash:
+        runner.speculative_config = SimpleNamespace(
+            use_dflash=lambda: True,
+            use_eagle=lambda: False,
+            uses_draft_model=lambda: False,
+            uses_extract_hidden_states=lambda: False,
+        )
+        mocker.patch.object(runner, "_input_fits_in_drafter", return_value=False)
+        mocker.patch.object(runner, "finalize_kv_connector")
+        runner.model.supports_async_speculative_payload = True
+        runner.model.embed_input_ids = lambda input_ids: input_ids.float().unsqueeze(-1)
+        mocker.patch.object(runner, "_should_accumulate_full_payload_output", return_value=False)
+        mocker.patch.object(runner, "_get_or_create_omni_payload_copy_stream", return_value=None)
     runner.broadcast_pp_output = False
     runner.kv_connector_output = None
     runner.device = torch.device("cpu")
@@ -2211,11 +2246,27 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     scheduler = SchedulerOutput.make_empty()
     scheduler.num_scheduled_tokens = {"r1": 1, "r2": 2}
     scheduler.total_num_scheduled_tokens = 3
+    if dflash:
+        scheduler.scheduled_spec_decode_tokens = {"r1": [1], "r2": [2]}
     hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([6, 7, 8]))
+    captured = torch.tensor([[60.0], [70.0], [80.0]])
     runner.execute_model_state = ExecuteModelState(
-        scheduler, None, None, None, hidden, None, None, None, None, None, {}, None
+        scheduler,
+        None,
+        None,
+        None,
+        hidden,
+        None,
+        None,
+        None,
+        None,
+        None,
+        {"hidden_states": {"layers": {0: captured}}},
+        None,
     )
-    sampler = SamplerOutput(sampled_token_ids=torch.tensor([[7], [8]]), logprobs_tensors=None)
+    sampled_ids = torch.tensor([[7, -1], [8, 9]]) if dflash else torch.tensor([[7], [8]])
+    sampler = SamplerOutput(sampled_token_ids=sampled_ids, logprobs_tensors=None)
     mocker.patch.object(runner, "_sample", return_value=sampler)
     mocker.patch.object(runner, "_update_states_after_model_execute")
     # Match upstream bookkeeping's ownership contract: these are already copies.
@@ -2260,12 +2311,25 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     scheduler.num_scheduled_tokens.clear()
     runner.input_batch.req_ids[:] = ["next-step"]
     runner.input_batch.req_id_to_index.clear()
+    if dflash:
+        sampler.sampled_token_ids.fill_(99)
+        runner.input_ids.gpu.fill_(99)
+        captured.fill_(99)
+        runner.requests.clear()
+        # Both request state and routing may change while the output waits.
+        runner._resolve_pooler_payload_req_ids.side_effect = AssertionError("read live routing")
     output = constructor.call_args.kwargs["model_runner_output_builder"]()
 
     assert output.req_ids == ["r1", "r2"]
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
-    torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
-    torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
+    if dflash:
+        assert output.inter_stage_outputs[0]["ids.output"].tolist() == [6]
+        assert output.inter_stage_outputs[1]["ids.output"].tolist() == [7, 8]
+        assert output.inter_stage_outputs[0]["hidden_states.layer_0"].flatten().tolist() == [60.0]
+        assert output.inter_stage_outputs[1]["hidden_states.layer_0"].flatten().tolist() == [70.0, 80.0]
+    else:
+        torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
+        torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
 
 
 def test_shutdown_drops_cached_sampled_token_override(mocker):

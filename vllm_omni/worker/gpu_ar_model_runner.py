@@ -1085,6 +1085,53 @@ class GPUARModelRunner(
             committed.insert(0, int(output_ids[0]))
         return committed
 
+    def _prepare_async_speculative_payloads(
+        self,
+        scheduler_output: SchedulerOutput,
+        sampled_token_ids: torch.Tensor,
+        req_ids: list[str],
+        invalid_req_indices: list[int],
+        *,
+        input_token_ids: torch.Tensor,
+        input_embeddings: torch.Tensor,
+        query_start_loc_cpu: Any,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Select consumed verifier inputs without another embedding lookup.
+
+        For k kept samples the target consumed the previous tail plus k-1
+        accepted drafts. The new replacement/bonus is consumed next round.
+        IDs and layer-0 rows must describe this forward, before drafting or
+        another execute_model can overwrite the runner's input buffers.
+        """
+        invalid = set(invalid_req_indices)
+        payloads = {}
+        for idx, rid in enumerate(req_ids):
+            if idx in invalid or not scheduler_output.scheduled_spec_decode_tokens.get(rid):
+                continue
+            start = int(query_start_loc_cpu[idx])
+            width = int(scheduler_output.num_scheduled_tokens[rid])
+            samples = sampled_token_ids[idx]
+            count = ((samples >= 0) & (samples < self.input_batch.vocab_size)).sum()
+            positions = torch.arange(width, device=input_token_ids.device)
+            ids = torch.where(positions < count, input_token_ids[start : start + width], -1)
+            payloads[rid] = {
+                "ids": ids,
+                "embeddings": input_embeddings[start : start + width],
+            }
+        return payloads
+
+    @staticmethod
+    def _resolve_async_speculative_payloads(
+        payloads: dict[str, dict[str, torch.Tensor]], vocab_size: int
+    ) -> dict[str, tuple[list[int], torch.Tensor]]:
+        """Filter CPU snapshots with the same row mask for IDs and embeddings."""
+        result = {}
+        for rid, payload in payloads.items():
+            ids = payload["ids"]
+            valid = (ids >= 0) & (ids < vocab_size)
+            result[rid] = (ids[valid].tolist(), payload["embeddings"][valid].contiguous())
+        return result
+
     def _build_omni_pooler_payload(
         self,
         *,
@@ -1103,6 +1150,8 @@ class GPUARModelRunner(
         scheduled_seq_len: int,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
         committed_token_ids: list[int] | None = None,
+        committed_token_embeddings: torch.Tensor | None = None,
+        consumed_input_span: bool = False,
     ) -> dict[str, object]:
 
         has_speculative_token_delta = committed_token_ids is not None
@@ -1140,7 +1189,9 @@ class GPUARModelRunner(
             # rows.  The fallback preserves compatibility with other Omni
             # models that have not implemented the optional adapter.
             materialize = getattr(self.model, "materialize_thinker_token_embeddings", None)
-            if callable(materialize):
+            if committed_token_embeddings is not None:
+                token_embeds = committed_token_embeddings
+            elif callable(materialize):
                 token_embeds = materialize(committed_token_ids or [])
             else:
                 token_ids = torch.as_tensor(committed_token_ids or [], dtype=torch.long, device=self.device)
@@ -1159,6 +1210,8 @@ class GPUARModelRunner(
                 "decode_span": True,
                 "committed_token_count": len(committed_token_ids or []),
             }
+            if consumed_input_span:
+                payload["meta"]["consumed_input_span"] = True
             payload["ids"] = {"output": list(committed_token_ids or [])}
 
         # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
@@ -2050,11 +2103,32 @@ class GPUARModelRunner(
         )
         return inter_stage_outputs, multimodal_outputs
 
+    def _supports_async_speculative_payload(self) -> bool:
+        """Check both the speculative method and the model payload contract.
+
+        Preparation is method-neutral, but only DFlash's committed-token
+        semantics have been integrated so far. Other methods must opt in
+        here after their token and embedding contracts are validated.
+        """
+        spec_config = self.speculative_config
+        return (
+            spec_config is not None
+            and spec_config.use_dflash()
+            and self._runner_model_omni_flag("supports_async_speculative_payload")
+        )
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
         if self.speculative_config is not None:
-            return False
+            if not (
+                self._supports_async_speculative_payload()
+                and self._async_chunk
+                and self.omni_prefix_cache is None
+                and not self._runner_model_omni_flag("has_postprocess")
+                and not self._should_accumulate_full_payload_output()
+            ):
+                return False
 
         model_config = getattr(self, "model_config", None)
         if model_config is None:
@@ -2200,11 +2274,17 @@ class GPUARModelRunner(
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
+        prepared_speculative_payloads: dict[str, tuple[list[int], torch.Tensor]] | None = None,
+        payload_routing: tuple[str, list[str]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
 
-        engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        engine_output_type, downstream_req_ids = (
+            payload_routing
+            if payload_routing is not None
+            else self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        )
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -2317,6 +2397,16 @@ class GPUARModelRunner(
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
+                    prepared = (
+                        prepared_speculative_payloads.get(rid) if prepared_speculative_payloads is not None else None
+                    )
+                    committed_ids = None
+                    if prepared is not None:
+                        committed_ids = prepared[0]
+                    elif prepared_speculative_payloads is None:
+                        committed_ids = self._get_speculative_committed_token_ids(
+                            rid, idx, scheduler_output, valid_sampled_token_ids
+                        )
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
                         idx=idx,
@@ -2332,12 +2422,9 @@ class GPUARModelRunner(
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
                         restored_mm=restored_mm,
-                        committed_token_ids=self._get_speculative_committed_token_ids(
-                            rid,
-                            idx,
-                            scheduler_output,
-                            valid_sampled_token_ids,
-                        ),
+                        committed_token_ids=committed_ids,
+                        committed_token_embeddings=prepared[1] if prepared is not None else None,
+                        consumed_input_span=prepared is not None,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -2426,6 +2513,16 @@ class GPUARModelRunner(
             prefix_cache_step_id,
         ) = self.execute_model_state
         self.execute_model_state = None
+
+        # Preserve the target input IDs before the drafter can reuse buffers.
+        # Layer 0 is already an independent capture of this forward's inputs.
+        captured_input_ids = None
+        captured_input_embeddings = None
+        captured_query_start_loc = None
+        if self._should_use_async_omni_output() and self._supports_async_speculative_payload():
+            captured_input_ids = self.input_ids.gpu[: scheduler_output.total_num_scheduled_tokens].clone()
+            captured_input_embeddings = flatten_payload(multimodal_outputs)["hidden_states.layer_0"]
+            captured_query_start_loc = self._get_query_start_loc_cpu(snapshot=True)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2599,6 +2696,30 @@ class GPUARModelRunner(
         self.kv_connector_output = None
 
         use_async_omni_output = self._should_use_async_omni_output()
+        speculative_payload_snapshot = None
+        payload_routing = None
+        if use_async_omni_output and self._supports_async_speculative_payload():
+            assert captured_input_ids is not None
+            assert captured_input_embeddings is not None
+            assert captured_query_start_loc is not None
+            prepared = self._prepare_async_speculative_payloads(
+                scheduler_output,
+                sampler_output.sampled_token_ids,
+                req_ids_output_copy,
+                invalid_req_indices,
+                input_token_ids=captured_input_ids,
+                input_embeddings=captured_input_embeddings,
+                query_start_loc_cpu=captured_query_start_loc,
+            )
+            speculative_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
+                prepared,
+                copy_stream=self._get_or_create_omni_payload_copy_stream(),
+                pin_memory=is_pin_memory_available(),
+            )
+            output_type, downstream_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+            invalid_ids = {req_ids_output_copy[idx] for idx in invalid_req_indices}
+            payload_routing = (output_type, [rid for rid in downstream_ids if rid not in invalid_ids])
+        vocab_size_snapshot = self.input_batch.vocab_size
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             num_scheduled_tokens_np = np.array(
@@ -2661,6 +2782,12 @@ class GPUARModelRunner(
         restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
 
         def output_builder() -> OmniModelRunnerOutput:
+            prepared_speculative_payloads = None
+            if speculative_payload_snapshot is not None:
+                speculative_payload_snapshot.wait()
+                prepared_speculative_payloads = self._resolve_async_speculative_payloads(
+                    speculative_payload_snapshot.payload, vocab_size_snapshot
+                )
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
@@ -2691,6 +2818,8 @@ class GPUARModelRunner(
                     postprocess_already_applied=omni_postprocess_already_applied,
                     prefix_cache_step_id=prefix_cache_step_id,
                     restored_mm=restored_mm_snapshot,
+                    prepared_speculative_payloads=prepared_speculative_payloads,
+                    payload_routing=payload_routing,
                 )
             output.omni_connector_output = omni_connector_output
             if sampling_feedback is not None:
