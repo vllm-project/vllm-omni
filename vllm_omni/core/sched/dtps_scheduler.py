@@ -198,8 +198,9 @@ class DTPSScheduler:
             inflight_running = sum(1 for r in running if not self._request_is_ar_only(r))
         self._dit_phase(inflight_running)
 
-        # Fall back to FCFS when the DiT load snapshot is stale or empty
-        # (all DiT replicas unresponsive) — avoid scheduling on stale data.
+        # When the DiT load snapshot is stale or empty (all DiT replicas
+        # unresponsive), skip reordering: existing requests keep the last
+        # DTPS priority order, and new arrivals append in FCFS order.
         snap = self._dit_load_snapshot
         if snap is not None and not snap.get("fresh", False):
             return

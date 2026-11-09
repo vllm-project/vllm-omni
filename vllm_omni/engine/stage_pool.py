@@ -1659,6 +1659,10 @@ class StagePool:
             for request_id in request_ids:
                 watermarker.discard_request_state(request_id)
 
+    # [OmniDTPS] Timeout for AR load-update RPC. A timeout cancels the push
+    # for that replica; the next push only happens on the next poll cycle.
+    _DIT_LOAD_PUSH_TIMEOUT_S: float = 0.5
+
     async def poll_dit_load(self, replica_id: int) -> tuple[int, int, list[str], list[str]] | None:
         """Query one DiT replica's ``(waiting, running, waiting_ids, running_ids)``."""
         raw_client = self.clients[replica_id]
@@ -1713,11 +1717,12 @@ class StagePool:
             try:
                 await asyncio.wait_for(
                     call_utility("omni_update_dit_load", payload),
-                    timeout=0.5,
+                    timeout=self._DIT_LOAD_PUSH_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "[StagePool] push_dit_load timed out (0.5s) for stage=%s replica=%s",
+                logger.debug(
+                    "[StagePool] push_dit_load timed out (%ss) for stage=%s replica=%s",
+                    self._DIT_LOAD_PUSH_TIMEOUT_S,
                     self.stage_id,
                     replica_id,
                 )
