@@ -547,6 +547,15 @@ def test_keep_steps_rejects_latent_offload_features(monkeypatch: pytest.MonkeyPa
     with pytest.raises(OmniClientError, match="latent refine/upscale"):
         pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), _sampling(keep_steps=2))
 
+    pipeline = _validation_pipeline()
+    monkeypatch.setattr(
+        pipeline_minimax_h3,
+        "require_request_attention_schedule_fits",
+        lambda sampling, schedule, num_steps: SimpleNamespace(),
+    )
+    with pytest.raises(OmniClientError, match="attention_schedule"):
+        pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), _sampling(keep_steps=2))
+
 
 # ---------------------------------------------------------------------------
 # Encoder wire

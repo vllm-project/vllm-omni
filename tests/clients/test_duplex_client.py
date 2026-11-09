@@ -390,6 +390,29 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
 
 
 @pytest.mark.asyncio
+async def test_get_session_stats_times_out_when_send_stalls():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+        original_send = sock.send
+
+        async def hang(_raw: str) -> None:
+            await asyncio.Event().wait()
+
+        sock.send = hang
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError, match="sending session.stats"):
+            await client.get_session_stats(timeout_s=0.05)
+        assert asyncio.get_running_loop().time() - started < 1.0
+        sock.send = original_send
+        close_task = asyncio.create_task(client.close())
+        await _drain(lambda: "session.close" in sock.sent_types())
+        sock.feed(SESSION_CLOSED)
+        await close_task
+
+
+@pytest.mark.asyncio
 async def test_resync_required_drops_resume_credential():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)

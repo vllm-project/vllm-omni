@@ -354,3 +354,65 @@ def test_same_step_sink_cache_lifetime_and_attention_window(history):
     for state in states:
         state.end_request("A")
         assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_same_step_all_live_history_versions_fit_capacity(groups):
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=24,
+            num_denoise_steps=4,
+            step_replicas=4,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=2 * groups,
+        )
+    )
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=2,
+        num_kv_heads=1,
+        head_size=4,
+        block_size=4,
+        max_chunk_tokens=4,
+        max_history_chunks=18,
+    )
+    states = []
+    for rank in range(plan.world):
+        cache = NoisyKVCache(
+            spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=groups,
+            max_batch_size=2,
+            step_replicas=4,
+            layer_offset=2 * (rank % groups),
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        for req in ("A", "B"):
+            state.begin_request(req, plan, chunk_tokens=4)
+        states.append(state)
+    peaks = {rank: [0] * spec.num_layers for rank in range(plan.world)}
+    for tick in range(plan.num_ticks):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is not None:
+                contexts = state.prepare(tuple((req, task) for req in ("A", "B")))
+                assert all(context[0].seq_len == (len(plan.sources(task, rank)) + 1) * 4 for context in contexts)
+        for transfer in plan.transfers(tick):
+            for req in ("A", "B"):
+                key = (req, *transfer.version)
+                source = states[transfer.src].cache.pool
+                target = states[transfer.dst].cache.pool
+                target.alloc(key)
+                target.copy_into(key, source.tensor_dict(key, 1))
+        for rank, state in enumerate(states):
+            for layer in range(spec.num_layers):
+                live = state.cache.capacity - len(state.cache.pool.free[layer])
+                peaks[rank][layer] = max(peaks[rank][layer], live)
+                assert live <= state.cache.capacity
+            state.evict(tick)
+    for rank, state in enumerate(states):
+        assert not state.cache.pool.keys
+        assert all(peak > 0 for peak in peaks[rank])
