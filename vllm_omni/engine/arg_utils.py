@@ -464,7 +464,9 @@ class OmniEngineArgs(EngineArgs):
         needs_connector = bool(
             self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
         )
-        validate_worker_omni_connector(self.worker_cls, needs_connector)
+        validate_worker_omni_connector(
+            self.worker_cls, needs_connector, use_v2_model_runner=bool(self.use_v2_model_runner)
+        )
         _map_offload_config(self)
         _set_lmcache_env(self)
         super().__post_init__()
