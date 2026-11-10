@@ -53,7 +53,7 @@ def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
     """
     if runner_cls is not GPUARModelRunner or not _is_mammoth_moda2_vllm_config(vllm_config):
         return runner_cls
-    from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import (
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import (
         MammothGPUARModelRunner,
     )
 

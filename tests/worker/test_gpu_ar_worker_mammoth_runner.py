@@ -10,10 +10,10 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.cudagraph.moe_routing_compat import ensure_moe_specialty_runner_compatible
-from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import MammothGPUARModelRunner
 from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import (
     _enable_moe_routing_cudagraph_specialize,
 )
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import MammothGPUARModelRunner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_ar_worker import (
     _is_mammoth_moda2_vllm_config,

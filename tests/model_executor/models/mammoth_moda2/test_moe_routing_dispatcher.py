@@ -121,7 +121,7 @@ def test_routing_ids_ignore_padding_and_stale_cpu_under_async() -> None:
 
 
 def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
-    from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import MammothGPUARModelRunner
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import MammothGPUARModelRunner
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
     base = BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True)

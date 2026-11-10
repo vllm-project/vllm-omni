@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MammothModa2 AR runner: MoE specialty capture/replay lives here (#9865).
+"""Bridge from Mammoth AR runner hooks into ``moe_cudagraph`` (#9865 / #9911).
 
-Shared ``OmniGPUModelRunner`` / ``GPUARModelRunner`` only expose thin hooks so
-non-Mammoth models keep an unchanged capture path. All classify / select /
-warmup detail stays under ``mammoth_moda2``.
+``MammothGPUARModelRunner`` is a thin ``GPUARModelRunner`` subclass that
+forwards classify / select / warmup hooks. Shared Omni runners keep no-op /
+fail-fast hooks only; non-Mammoth capture paths stay unchanged.
 """
 
 from __future__ import annotations
