@@ -423,6 +423,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             self.encoder_cache = None
 
         self._publish_shared_backbone_if_configured()
+        # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
+        # V2 does not use the V1 MoE annotate/select hooks, so this is the
+        # fail-fast for Mammoth FULL + use_v2_model_runner mismatches (#9911).
+        from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+            ensure_moe_specialty_runner_compatible,
+        )
+
+        ensure_moe_specialty_runner_compatible(self)
 
     def reload_weights(self, *args: Any, **kwargs: Any) -> None:
         """Preserve upstream reload arguments, but reject updates to shared weights."""

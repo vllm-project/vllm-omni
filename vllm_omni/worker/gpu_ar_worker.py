@@ -48,6 +48,8 @@ def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
     MammothModa2 MoE specialty capture/replay lives on
     ``MammothGPUARModelRunner`` so shared ``OmniGPUModelRunner`` stays a thin
     hook. Custom ``model_runner_cls`` overrides and V2 runners are left alone.
+    Specialty/flag mismatches are checked after ``load_model`` (the flag is
+    set during Mammoth model ``__init__``), not here at ``init_device``.
     """
     if runner_cls is not GPUARModelRunner or not _is_mammoth_moda2_vllm_config(vllm_config):
         return runner_cls
@@ -56,37 +58,6 @@ def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
     )
 
     return MammothGPUARModelRunner
-
-
-def _moe_routing_specialize_enabled_on_config(vllm_config) -> bool:
-    compilation_config = getattr(vllm_config, "compilation_config", None)
-    return bool(getattr(compilation_config, "cudagraph_specialize_moe_routing", False))
-
-
-def _warn_moe_specialty_runner_mismatch_once(vllm_config, runner_cls) -> None:
-    """Surface flag-on / wrong-runner mismatches before capture expands keys."""
-    if not _moe_routing_specialize_enabled_on_config(vllm_config):
-        return
-    from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import (
-        MammothGPUARModelRunner,
-    )
-
-    if isinstance(runner_cls, type) and issubclass(runner_cls, MammothGPUARModelRunner):
-        return
-    # One warning per process is enough; capture hooks will raise if replay
-    # is attempted without specialty support.
-    if getattr(_warn_moe_specialty_runner_mismatch_once, "_warned", False):
-        return
-    _warn_moe_specialty_runner_mismatch_once._warned = True  # type: ignore[attr-defined]
-    logger.warning(
-        "cudagraph_specialize_moe_routing is enabled but AR runner is %s, "
-        "not MammothGPUARModelRunner. The MoE dispatcher will still expand "
-        "BLEND/ALL_UND/ALL_GEN capture keys, but specialty annotate/replay "
-        "hooks are no-ops on this runner — capture will fail fast when those "
-        "hooks run. Check model_type/architectures, use_v2_model_runner, and "
-        "model_runner_cls.",
-        getattr(runner_cls, "__name__", runner_cls),
-    )
 
 
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
@@ -194,12 +165,10 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
                 stage_id,
                 model_stage,
             )
-            _warn_moe_specialty_runner_mismatch_once(self.vllm_config, OmniARModelRunner)
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
             runner_cls = resolve_gpu_ar_model_runner_cls(self.vllm_config, self.model_runner_cls)
-            _warn_moe_specialty_runner_mismatch_once(self.vllm_config, runner_cls)
             self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:

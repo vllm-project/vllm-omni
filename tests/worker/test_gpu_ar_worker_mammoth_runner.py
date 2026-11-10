@@ -6,12 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import MammothGPUARModelRunner
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+    ensure_moe_specialty_runner_compatible,
+)
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_ar_worker import (
     _is_mammoth_moda2_vllm_config,
-    _warn_moe_specialty_runner_mismatch_once,
     resolve_gpu_ar_model_runner_cls,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -62,22 +65,120 @@ def test_resolve_gpu_ar_model_runner_cls_respects_custom_runner_cls():
     assert resolve_gpu_ar_model_runner_cls(cfg, CustomARRunner) is CustomARRunner
 
 
-def test_warn_moe_specialty_runner_mismatch_once_for_non_mammoth(caplog):
-    _warn_moe_specialty_runner_mismatch_once._warned = False  # type: ignore[attr-defined]
-    cfg = _vllm_config(model_type="qwen2", specialize=True)
-    with caplog.at_level("WARNING"):
-        _warn_moe_specialty_runner_mismatch_once(cfg, GPUARModelRunner)
-        _warn_moe_specialty_runner_mismatch_once(cfg, GPUARModelRunner)
-    matches = [r for r in caplog.records if "cudagraph_specialize_moe_routing is enabled" in r.getMessage()]
-    assert len(matches) == 1
+def test_ensure_moe_specialty_compatible_raises_for_non_mammoth_after_flag_set():
+    """Flag is normally set during model ``__init__`` inside ``load_model``."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+        ensure_moe_specialty_runner_compatible(runner)
 
 
-def test_warn_moe_specialty_runner_mismatch_skipped_for_mammoth(caplog):
-    _warn_moe_specialty_runner_mismatch_once._warned = False  # type: ignore[attr-defined]
-    cfg = _vllm_config(model_type="mammoth_moda2", specialize=True)
-    with caplog.at_level("WARNING"):
-        _warn_moe_specialty_runner_mismatch_once(cfg, MammothGPUARModelRunner)
-    assert not any("cudagraph_specialize_moe_routing is enabled" in r.getMessage() for r in caplog.records)
+def test_ensure_moe_specialty_compatible_allows_mammoth_runner():
+    runner = object.__new__(MammothGPUARModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    ensure_moe_specialty_runner_compatible(runner)
+
+
+def test_ensure_moe_specialty_compatible_rejects_v2_runner_when_flag_on():
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as V2OmniGPUModelRunner
+
+    runner = object.__new__(V2OmniGPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+        ensure_moe_specialty_runner_compatible(runner)
+
+
+def test_ensure_moe_specialty_compatible_noop_when_flag_off():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=False)
+    ensure_moe_specialty_runner_compatible(runner)
+
+
+def test_v1_load_model_ensures_compat_after_model_sets_flag(monkeypatch):
+    """``load_model`` must check after super() — when Mammoth flips the flag."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(weight_sharing=None)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=False)
+    order: list[str] = []
+
+    def _super_load(self, *args, **kwargs):
+        order.append("super")
+        self.compilation_config.cudagraph_specialize_moe_routing = True
+
+    def _ensure(self):
+        order.append("ensure")
+        ensure_moe_specialty_runner_compatible(self)
+
+    monkeypatch.setattr(GPUModelRunner, "load_model", _super_load)
+    monkeypatch.setattr(OmniGPUModelRunner, "_ensure_moe_specialty_runner_compatible", _ensure)
+    for name in (
+        "_snapshot_prefix_cache_model_policy",
+        "_maybe_enable_output_token_ids_for_model_sampler",
+        "_init_talker_mtp",
+        "_prewarm_attention_capture_workspaces",
+        "_report_model_local_kv",
+        "_warn_unexposed_stage_hooks",
+    ):
+        monkeypatch.setattr(OmniGPUModelRunner, name, lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+        OmniGPUModelRunner.load_model(runner)
+    assert order == ["super", "ensure"]
+
+
+def test_v2_load_model_calls_ensure_after_publish(monkeypatch):
+    from vllm_omni.worker_v2 import omni_model_runner as v2_mod
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as V2OmniGPUModelRunner
+
+    runner = object.__new__(V2OmniGPUModelRunner)
+    runner._weight_share_backend = None
+    runner.use_aux_hidden_state_outputs = False
+    runner._model_returns_tuple = False
+    runner.model = SimpleNamespace(has_preprocess=False)
+    runner.supports_mm_inputs = False
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    order: list[str] = []
+
+    class _Activate:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *args):
+            return False
+
+    runner.jit_warmup_registry = SimpleNamespace(activate=lambda: _Activate())
+
+    def _super_load(self, *args, **kwargs):
+        order.append("super")
+
+    def _ensure(r):
+        order.append("ensure")
+        ensure_moe_specialty_runner_compatible(r)
+
+    monkeypatch.setattr(v2_mod, "init_omni_model_state", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(V2OmniGPUModelRunner, "_configure_cudagraph_output_contract", lambda self: None)
+    monkeypatch.setattr(V2OmniGPUModelRunner, "_publish_shared_backbone_if_configured", lambda self: None)
+    monkeypatch.setattr(V2OmniGPUModelRunner, "_adopt_model_logits_vocab", lambda self, model: None, raising=False)
+
+    # Patch the upstream module that V2 temporarily rebinds during load_model.
+    import vllm.v1.worker.gpu.model_runner as _mr_module
+
+    monkeypatch.setattr(_mr_module, "init_model_state", lambda *a, **k: None, raising=False)
+
+    # Resolve super().load_model to a stub via the immediate GPU parent if present.
+    for cls in V2OmniGPUModelRunner.__mro__[1:]:
+        if "load_model" in vars(cls):
+            monkeypatch.setattr(cls, "load_model", _super_load)
+            break
+
+    with patch(
+        "vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph.ensure_moe_specialty_runner_compatible",
+        _ensure,
+    ):
+        with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+            V2OmniGPUModelRunner.load_model(runner)
+    assert "ensure" in order
+    assert order.index("super") < order.index("ensure")
 
 
 def test_base_moe_hooks_fail_fast_when_specialize_enabled():
@@ -96,28 +197,3 @@ def test_base_moe_hooks_remain_noop_when_specialize_disabled():
     batch_desc = object()
     assert OmniGPUModelRunner._annotate_moe_routing_batch_descriptor(runner, batch_desc, num_tokens=1) is batch_desc
     assert OmniGPUModelRunner._select_moe_replay_batch_descriptor(runner, object(), batch_desc, 1) is batch_desc
-
-
-def test_init_device_constructs_resolved_mammoth_runner():
-    """Exercise the same resolve → construct sequence ``init_device`` uses."""
-    from vllm_omni.worker import gpu_ar_worker as worker_mod
-
-    cfg = _vllm_config(model_type="mammoth_moda2")
-    runner_cls = resolve_gpu_ar_model_runner_cls(cfg, GPUARModelRunner)
-    assert runner_cls is MammothGPUARModelRunner
-
-    created: list[type] = []
-
-    def _fake_init(self, vllm_config, device):
-        created.append(type(self))
-        self.vllm_config = vllm_config
-        self.device = device
-
-    with patch.object(MammothGPUARModelRunner, "__init__", _fake_init):
-        runner = runner_cls(cfg, "cuda:0")
-        worker_mod._warn_moe_specialty_runner_mismatch_once(
-            _vllm_config(model_type="mammoth_moda2", specialize=True),
-            type(runner),
-        )
-
-    assert created == [MammothGPUARModelRunner]

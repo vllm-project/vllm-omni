@@ -152,14 +152,11 @@ def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
     unchanged = MammothGPUARModelRunner._select_moe_replay_batch_descriptor(runner, CUDAGraphMode.FULL, base, 1)
     assert unchanged == base
 
-    # Shared base hook stays a no-op when specialize is off; when on it fails
-    # fast so mismatched runners cannot silently keep BLEND after extra capture.
+    # Shared base hook stays a no-op when specialize is off (fail-fast when on
+    # is covered in tests/worker/test_gpu_ar_worker_mammoth_runner.py).
     shared = object.__new__(OmniGPUModelRunner)
     shared.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=False)
     assert OmniGPUModelRunner._select_moe_replay_batch_descriptor(shared, CUDAGraphMode.FULL, base, 1) is base
-    shared.compilation_config.cudagraph_specialize_moe_routing = True
-    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
-        OmniGPUModelRunner._select_moe_replay_batch_descriptor(shared, CUDAGraphMode.FULL, base, 1)
 
 
 def test_ar_execute_model_retargets_replay_descriptor() -> None:

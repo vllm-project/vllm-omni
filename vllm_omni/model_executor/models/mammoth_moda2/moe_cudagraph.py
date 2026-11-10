@@ -161,6 +161,31 @@ def moe_routing_specialize_enabled(runner: object) -> bool:
     return bool(getattr(getattr(runner, "compilation_config", None), "cudagraph_specialize_moe_routing", False))
 
 
+def runner_supports_moe_routing_specialty(runner: object) -> bool:
+    """True when this runner implements mask-keyed MoE capture/replay."""
+    return bool(getattr(type(runner), "supports_moe_routing_specialty", False))
+
+
+def ensure_moe_specialty_runner_compatible(runner: object) -> None:
+    """Fail after model load if specialty graphs are enabled on a no-op runner.
+
+    ``cudagraph_specialize_moe_routing`` is normally set during Mammoth model
+    ``__init__`` (inside ``load_model``). Checking here — after that load —
+    covers both V1 and V2 runners; init-time worker checks see the flag as
+    still unset on the shipped FULL preset.
+    """
+    if not moe_routing_specialize_enabled(runner):
+        return
+    if runner_supports_moe_routing_specialty(runner):
+        return
+    raise RuntimeError(
+        "cudagraph_specialize_moe_routing is enabled but "
+        f"{type(runner).__name__} does not implement MoE specialty "
+        "capture/replay. Use MammothGPUARModelRunner for MammothModa2 "
+        "FULL AR stages, or disable cudagraph_specialize_moe_routing."
+    )
+
+
 def find_gen_vocab_start_index(runner: object) -> int | None:
     cursor = getattr(runner, "model", None)
     # Mammoth pipeline wraps AR as ``model.ar.language_model``.
