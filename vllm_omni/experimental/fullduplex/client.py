@@ -489,6 +489,30 @@ class RealtimeDuplexClient:
                 await asyncio.sleep(max(0.0, started_at + audio_end_ms / 1000 - time.monotonic()))
         return frames_sent
 
+    async def append_silence(self, duration_ms: int) -> None:
+        """Append one zeroed PCM16 unit, e.g. drain padding after a commit.
+
+        The same ``input_audio_buffer.append`` event shape ``stream_av_units``
+        sends — ``duration_ms``/``audio_end_ms`` included, ``_media_clock_ms``
+        advanced — so the server's step loop keeps stepping on it as if the
+        clip were still streaming.
+        """
+        duration_ms = max(0, int(duration_ms))
+        if duration_ms == 0:
+            return
+        self._media_clock_ms += duration_ms
+        silence = bytes(round(PCM16_SAMPLE_RATE * duration_ms / 1000) * PCM16_BYTES_PER_SAMPLE)
+        await self.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(silence).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": self._media_clock_ms,
+            }
+        )
+
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
 

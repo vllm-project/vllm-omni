@@ -234,6 +234,12 @@ def dynamic_library_paths() -> list[Path]:
     try:
         torch_distribution = importlib.metadata.distribution("torch")
         candidates.append(Path(torch_distribution.locate_file("torch/lib")))
+        torch_site_packages = Path(torch_distribution.locate_file(""))
+        candidates.extend(
+            sorted(
+                {library.parent for library in torch_site_packages.glob("_rocm_sdk_*/lib/*/lib/librocm-openblas.so.*")}
+            )
+        )
     except importlib.metadata.PackageNotFoundError:
         pass
     candidates.extend((Path("/opt/rocm/lib"), Path("/opt/rocm/lib64")))
