@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import torch
@@ -16,15 +16,23 @@ from safetensors import safe_open
 _DIFFUSERS_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 _KNOWN_TEMPORAL_DECODE_PROTOCOLS = frozenset({"released-segment-prepadding-v3"})
 _KNOWN_TILE_LAYOUTS = frozenset({"native"})
+_H3_CLIP_LENGTH = 17
+_H3_TOKEN_DROP = 3
 
 
 @dataclass(frozen=True)
 class H3LiteDecodeProfile:
-    """Decoder tiling contract read from a Diffusers LightVAE ``decode_config.json``.
+    """Decoder tiling contract for the 26-layer LightVAE release.
 
-    Only the decoder geometry is consumed; image/encoder tiling stays on the
-    official VAE. ``tile_size``/``tile_overlap`` are in pixel space, matching the
-    native decoder's ``decoder_tile_size``/``decoder_tile_overlap_min``.
+    The release uses an anisotropic, frame-kind-aware geometry:
+    ``tile_size``/``short_axis_overlap`` on the short spatial axis,
+    ``long_axis_tile``/``long_axis_overlap`` on the long axis, and
+    ``image_tile_size``/``image_long_axis_tile`` for a single image frame.
+    Values are in pixel space and are applied by the native decoder adapter.
+
+    ``tile_overlap`` is the release's base/legacy overlap. It is used when a
+    per-axis override is absent and when the official VAE config is the
+    fallback source.
     """
 
     tile_size: int | None = None
@@ -32,7 +40,10 @@ class H3LiteDecodeProfile:
     long_axis_tile: int | None = None
     short_axis_overlap: int | None = None
     long_axis_overlap: int | None = None
+    image_tile_size: int | None = None
+    image_long_axis_tile: int | None = None
     image_context_tokens: int | None = None
+    image_context_output_phase: int | None = None
     tile_layout: str | None = None
     temporal_decode_protocol: str | None = None
 
@@ -45,13 +56,15 @@ class H3LiteDecoderCheckpoint:
     decode_profile: H3LiteDecodeProfile | None = None
 
 
-def resolve_h3_lightvae_decoder_path(additional: Mapping[str, object]) -> str | None:
+def resolve_h3_lightvae_decoder_path(additional: Mapping[str, object] | None) -> str | None:
     """Resolve a LightVAE decoder path.
 
     The value is either a compact 12-layer ``.safetensors`` file or a
     26-layer Diffusers directory. ``vae_path`` and ``vae_decoder_path`` are
     aliases for framework integrations that expose a generic VAE path.
     """
+    if not additional:
+        return None
     present = [key for key in ("vae_path", "lightvae_decoder_path", "vae_decoder_path") if key in additional]
     if not present:
         return None
@@ -98,7 +111,7 @@ def _validate_config(config: dict[str, object]) -> tuple[int, ...]:
             or (field == "latents_std" and any(x <= 0 for x in values))
         ):
             raise ValueError(f"LightVAE {field} does not match latent_channels")
-    for field, expected in (("clip_length", 17), ("token_drop", 3)):
+    for field, expected in (("clip_length", _H3_CLIP_LENGTH), ("token_drop", _H3_TOKEN_DROP)):
         if config.get(field) != expected:
             raise ValueError(f"LightVAE {field} must be {expected}")
     return tuple(kept)
@@ -153,11 +166,14 @@ def _read_compact_file(path: Path) -> tuple[dict[str, object], tuple[int, ...], 
         kept = _validate_config(config)
         state = {}
         for name in handle.keys():
-            if name.startswith(("decoder.", "post_quant_conv.")):
-                tensor = handle.get_tensor(name)
-                if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-                    raise ValueError(f"{path}: unsupported or quantized tensor {name}")
-                state[name] = tensor
+            if name in ("latents_mean", "latents_std"):
+                continue
+            if not name.startswith(("decoder.", "post_quant_conv.")):
+                raise ValueError(f"{path}: unsupported checkpoint tensor {name}")
+            tensor = handle.get_tensor(name)
+            if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                raise ValueError(f"{path}: unsupported or quantized tensor {name}")
+            state[name] = tensor
     return config, kept, state
 
 
@@ -184,10 +200,68 @@ def _diffusers_shards(path: Path) -> list[Path]:
     return shards
 
 
-def _read_decode_profile(path: Path) -> H3LiteDecodeProfile | None:
+def _validate_profile_int(path: Path, field: str, value: object, *, allow_zero: bool) -> int | None:
+    if value is None:
+        return None
+    low = 0 if allow_zero else 1
+    if type(value) is not int or value < low:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{path}: {field} must be a {qualifier} integer")
+    return value
+
+
+def _profile_from_official_config(path: Path, raw: Mapping[str, object]) -> H3LiteDecodeProfile | None:
+    """Build a fallback profile from the official H3 VAE config.
+
+    The official component stores ``vae_tile_size`` / ``vae_tile_overlap_min``
+    in ``config.json``. Accept the legacy ``tile_size`` names too so a caller
+    can point ``vae_path`` at either the component directory or a converted
+    config. If the config does not contain tiling fields, return ``None`` and
+    let the native loader keep its own defaults.
+    """
+    tile = raw.get("vae_tile_size", raw.get("tile_size"))
+    overlap = raw.get("vae_tile_overlap_min", raw.get("tile_overlap_min"))
+    if tile is None and overlap is None:
+        return None
+    tile = _validate_profile_int(path, "vae_tile_size", tile, allow_zero=False)
+    overlap = _validate_profile_int(path, "vae_tile_overlap_min", overlap, allow_zero=True)
+    if tile is None or overlap is None:
+        return None
+    return H3LiteDecodeProfile(
+        tile_size=tile,
+        tile_overlap=overlap,
+        long_axis_tile=tile,
+        short_axis_overlap=overlap,
+        long_axis_overlap=overlap,
+        image_tile_size=tile,
+        image_long_axis_tile=tile,
+        tile_layout="native",
+    )
+
+
+def _merge_profile(
+    primary: H3LiteDecodeProfile,
+    fallback: H3LiteDecodeProfile | None,
+) -> H3LiteDecodeProfile:
+    if fallback is None:
+        return primary
+    values = {
+        field.name: getattr(primary, field.name)
+        if getattr(primary, field.name) is not None
+        else getattr(fallback, field.name)
+        for field in fields(H3LiteDecodeProfile)
+    }
+    return replace(primary, **values)
+
+
+def _read_decode_profile(
+    path: Path,
+    *,
+    fallback: H3LiteDecodeProfile | None = None,
+) -> H3LiteDecodeProfile | None:
     decode_path = path / "decode_config.json"
     if not decode_path.is_file():
-        return None
+        return fallback
     try:
         with open(decode_path) as f:
             raw = json.load(f)
@@ -197,14 +271,7 @@ def _read_decode_profile(path: Path) -> H3LiteDecodeProfile | None:
         raise ValueError(f"{path}: decode_config.json must be an object")
 
     def _int_field(name: str, *, allow_zero: bool) -> int | None:
-        value = raw.get(name)
-        if value is None:
-            return None
-        low = 0 if allow_zero else 1
-        if type(value) is not int or value < low:
-            qualifier = "non-negative" if allow_zero else "positive"
-            raise ValueError(f"{path}: decode_config.json {name} must be a {qualifier} integer")
-        return value
+        return _validate_profile_int(path, f"decode_config.json {name}", raw.get(name), allow_zero=allow_zero)
 
     protocol = raw.get("temporal_decode_protocol")
     if protocol is not None and protocol not in _KNOWN_TEMPORAL_DECODE_PROTOCOLS:
@@ -213,16 +280,20 @@ def _read_decode_profile(path: Path) -> H3LiteDecodeProfile | None:
     if tile_layout is not None and tile_layout not in _KNOWN_TILE_LAYOUTS:
         raise ValueError(f"{path}: unsupported tile_layout {tile_layout!r}")
 
-    return H3LiteDecodeProfile(
+    profile = H3LiteDecodeProfile(
         tile_size=_int_field("student_tile_size", allow_zero=False),
         tile_overlap=_int_field("student_tile_overlap", allow_zero=True),
         long_axis_tile=_int_field("student_long_axis_tile", allow_zero=False),
         short_axis_overlap=_int_field("student_short_axis_overlap", allow_zero=True),
         long_axis_overlap=_int_field("student_long_axis_overlap", allow_zero=True),
+        image_tile_size=_int_field("image_tile_size", allow_zero=False),
+        image_long_axis_tile=_int_field("image_long_axis_tile", allow_zero=False),
         image_context_tokens=_int_field("image_context_tokens", allow_zero=False),
+        image_context_output_phase=_int_field("image_context_output_phase", allow_zero=True),
         tile_layout=tile_layout,
         temporal_decode_protocol=protocol,
     )
+    return _merge_profile(profile, fallback)
 
 
 def _read_diffusers_directory(
@@ -262,7 +333,7 @@ def _read_diffusers_directory(
         "latents_std": raw.get("latents_std"),
         "clip_length": raw.get("clip_length"),
         "token_drop": raw.get("token_drop"),
-        "kept_layers": list(range(student_num_layers)),
+        "kept_layers": raw.get("kept_layers", list(range(student_num_layers))),
     }
     kept = _validate_config(config)
     state: dict[str, torch.Tensor] = {}
@@ -279,7 +350,8 @@ def _read_diffusers_directory(
                 state[name] = tensor
     if not state:
         raise ValueError(f"{path}: no decoder or post_quant_conv tensors found")
-    return config, kept, state, _read_decode_profile(path)
+    official_profile = _profile_from_official_config(path, raw)
+    return config, kept, state, _read_decode_profile(path, fallback=official_profile)
 
 
 def convert_h3_lite_decoder_state_dict(
