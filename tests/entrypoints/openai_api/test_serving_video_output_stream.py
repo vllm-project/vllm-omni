@@ -151,10 +151,6 @@ def _build_test_app(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
         return_value=[OmniDiffusionSamplingParams()],
     )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_default_sampling_params_list",
-        return_value=[OmniDiffusionSamplingParams()],
-    )
 
     handler = OmniStreamingVideoOutputHandler(
         engine_client=engine_client,
@@ -328,7 +324,8 @@ class TestStreamingVideoOutputWebSocket:
             streaming_chunks=[],
             mock_generate=mock_generate,
         )
-        engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(quality="high")]
+        defaults = OmniDiffusionSamplingParams(quality="high", extra_args={"stage_default": "keep"})
+        engine_client.default_sampling_params_list = [defaults]
         request_data = handler._coerce_request_data(
             {
                 "type": "session.start",
@@ -340,6 +337,10 @@ class TestStreamingVideoOutputWebSocket:
         _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
 
         assert sampling_params.quality == "high"
+        sampling_params.extra_args["stage_default"] = "mutated"
+        _prompt, next_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        assert next_params.extra_args["stage_default"] == "keep"
+        assert defaults.extra_args == {"stage_default": "keep"}
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""
@@ -664,10 +665,6 @@ def _build_handler_for_async_tests(
     )
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
-        return_value=[OmniDiffusionSamplingParams()],
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_default_sampling_params_list",
         return_value=[OmniDiffusionSamplingParams()],
     )
 

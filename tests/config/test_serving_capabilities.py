@@ -111,6 +111,10 @@ def test_declarations_preserve_existing_metadata_overrides_and_defaults():
         get_diffusion_model_metadata("Wan22VACEPipeline").serving_capabilities.get("video_generation").support
         == "supported"
     )
+    assert (
+        resolve_pipeline_config("moss_image").serving_capabilities
+        is get_diffusion_model_metadata("MOSSImagePipeline").serving_capabilities
+    )
 
 
 def test_selected_pipeline_variant_controls_speech_support():
@@ -124,6 +128,16 @@ def test_selected_pipeline_variant_controls_speech_support():
         assert _profile(declaration, "chat", "audio_response").support == expected
         # Both Omni variants use chat; the speech adapter rejects talker-only TTS.
         assert declaration.get("speech").support == "unsupported"
+
+
+def test_lfm3_text_deployment_does_not_advertise_the_omitted_codec():
+    full = resolve_pipeline_config("lfm3_omni").serving_capabilities
+    text = resolve_pipeline_config("lfm3_omni_text").serving_capabilities
+    assert full.get("speech").support == "supported"
+    assert _profile(full, "chat", "audio_response").support == "unknown"
+    assert text.get("speech").support == "unsupported"
+    assert _profile(text, "chat", "audio_response").support == "unsupported"
+    assert _profile(text, "chat", "text_response").support == "supported"
 
 
 def test_missing_plugin_declaration_is_unknown_and_partial_stays_partial():

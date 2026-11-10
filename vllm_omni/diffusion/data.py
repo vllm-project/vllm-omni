@@ -1395,6 +1395,9 @@ class OmniDiffusionConfig:
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
+        # Parsed before the 'full' check, which needs the normalized value: a schedule without
+        # profiles parses to None.
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1411,6 +1414,10 @@ class OmniDiffusionConfig:
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
                     }[offload_strategy]
                 )
+            if self.diffusion_attention_schedule is not None:
+                # The scheduled_attention op and its eager fallback are tested only under
+                # regional compilation.
+                incompatible_features.append("diffusion_attention_schedule profiles")
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1475,7 +1482,6 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
         validate_kv_cache_dtype_vs_attention_specs(
             self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
         )
@@ -2519,7 +2525,7 @@ def parse_attention_schedule_config(
     """Normalize service config without initializing backends or reading env vars.
 
     A config without profiles can never select a candidate (its default must then be empty), so it
-    is returned as None: no schedule, and no attention layer prepares candidates.
+    is returned as None: no schedule, and no compile boundary on the attention layers.
     """
     if value is None:
         return None

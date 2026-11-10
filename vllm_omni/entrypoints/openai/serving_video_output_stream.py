@@ -30,7 +30,6 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import math
 import time
@@ -55,6 +54,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest,
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -920,7 +920,7 @@ class OmniStreamingVideoOutputHandler:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = self._resolve_default_sampling_params()
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
         gen_params.streaming_buffer_seconds = request.streaming_buffer_seconds
         if request.streaming_pacing is not None and request.streaming_pacing.enabled:
             gen_params.streaming_max_output_bytes = request.streaming_pacing.max_output_bytes
@@ -995,13 +995,6 @@ class OmniStreamingVideoOutputHandler:
                 detail="image_reference must resolve to an image.",
             )
         return media_data
-
-    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
-        default_sampling_params_list = self._engine_client.default_sampling_params_list
-        for params in default_sampling_params_list:
-            if isinstance(params, OmniDiffusionSamplingParams):
-                return copy.deepcopy(params)
-        return OmniDiffusionSamplingParams()
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:

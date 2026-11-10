@@ -202,6 +202,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self, capability: SupportsARDiffusionNoisyKV, *, available_bytes: int | None = None
     ) -> None:
         """Allocate the Noisy KV pool. Does not select how requests are executed."""
+        if self.ar_diffusion_kv_config.superpage_tokens:
+            raise ValueError("superpage_tokens is incompatible with noisy KV")
         spec = capability.ar_diffusion_noisy_kv_spec()
         stage_cfg = self._stage_config()
         step_replicas = cfg_step_replicas(stage_cfg)
@@ -280,13 +282,33 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         memory_bytes = self._available_memory_bytes() if available_bytes is None else available_bytes
         if spec.segmented is not None:
             memory_bytes = self._segmented_all_rank_min(memory_bytes)
+        block_size = paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame)
+        visibility_block_size = block_size
+        if config.superpage_tokens:
+            from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import _resolve_fa_version
+
+            page = config.superpage_tokens
+            if (
+                page > 0
+                and page % block_size == 0
+                and paging_block_size(page) == page
+                and _resolve_fa_version(spec.head_size) in (3, 4)
+            ):
+                block_size = page
+            else:
+                logger.warning(
+                    "Disabling superpage_tokens=%s: requires legal pages divisible by %s and FA3/FA4", page, block_size
+                )
+                config = dataclasses.replace(config, superpage_tokens=0)
+                self.ar_diffusion_kv_config = config
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame),
+            block_size=block_size,
+            visibility_block_size=visibility_block_size,
             max_model_len=spec.max_model_len,
             available_bytes=memory_bytes,
             kv_branches=spec.kv_branches,
