@@ -18,10 +18,7 @@ from tests.diffusion.attention.test_attention_schedule_candidates import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import (
-    AttentionScheduleRange,
-    require_attention_schedule_fits,
-)
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -33,6 +30,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
+    begin_scheduled_denoise,
     get_forward_context,
     is_forward_context_available,
 )
@@ -146,9 +144,7 @@ class _PublishingRequestPipeline(DenoiseProgressMixin):
         if total is None:
             total = batch.requests[0].sampling_params.num_inference_steps
         self._select("encode")
-        schedule = get_forward_context().attention_schedule
-        if schedule:
-            require_attention_schedule_fits(schedule, total)
+        begin_scheduled_denoise(total)
         for step in range(total):
             self.record_denoise_step(step, total_steps=total)
             if step == self.fail_step:
@@ -218,6 +214,21 @@ def test_request_runner_failure_or_cancel_does_not_leak_into_next_request(attent
     ]
 
 
+def test_request_runner_serves_an_inherited_default_longer_than_the_sequence(attention_env, runner_platform):
+    service = AttentionScheduleConfig(
+        profiles=_service().profiles, default=[{"start": 0, "end": 6, "profile": "dense"}]
+    )
+    config = _runner_config(service)
+    layer = attention_env.build(config)
+    pipeline = _PublishingRequestPipeline(layer, actual_steps=4)
+    runner = _make_runner(pipeline, config)
+
+    output = DiffusionModelRunner.execute_model(runner, _request("req-a", steps=8))
+
+    assert output.error is None
+    assert [name for _phase, name in _names(layer, pipeline.selected)] == ["base", *["dense"] * 4, "base"]
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_request_runner_returns_400_for_actual_schedule_bounds(attention_env, runner_platform, batch_size):
     config = _runner_config(_service())
@@ -269,7 +280,16 @@ class _StartupMemoryProfiler:
         return False
 
 
-def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_class_name="MiniMaxH3Pipeline"):
+def _load_model(
+    monkeypatch,
+    pipeline,
+    *,
+    schedule,
+    cache_backend=None,
+    model_class_name="MiniMaxH3Pipeline",
+    stage_role=None,
+    model_stage=None,
+):
     """Run the real load_model with the loader, memory profiler, offload and cache factory replaced."""
 
     class _Loader:
@@ -292,6 +312,8 @@ def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_cl
         cache_backend=cache_backend,
         cache_config={},
         model_class_name=model_class_name,
+        stage_role=stage_role,
+        model_stage=model_stage,
         enforce_eager=True,
         streaming_output=False,
         diffusion_attention_schedule=schedule,
@@ -314,4 +336,58 @@ def test_startup_rejects_profiles_with_cache_backend_when_default_is_empty(monke
     with pytest.raises(ValueError, match="cache_backend='tea_cache'"):
         _load_model(
             monkeypatch, _StartupPublishingPipeline(), schedule=_profiles_only_service(), cache_backend="tea_cache"
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_role", "model_stage", "role"),
+    [
+        ("encode", "text_encode", "encode"),
+        ("decode", "decode", "decode"),
+        (None, "text_encode", "encode"),
+        (None, "vae_decode", "decode"),
+    ],
+    ids=["eg-egd-encode", "egd-decode", "legacy-text-encode", "legacy-vae-decode"],
+)
+def test_startup_rejects_profiles_on_a_stage_without_denoising(monkeypatch, stage_role, model_stage, role):
+    """The global schedule flag reaches every stage, including the Wan2.2 EG/EGD encode and decode stages."""
+    with pytest.raises(ValueError, match=rf"role '{role}'.*runs no denoising.*only on the denoising stage"):
+        _load_model(
+            monkeypatch,
+            _StartupPublishingPipeline(),
+            schedule=_service(),
+            model_class_name="WanPipeline",
+            stage_role=stage_role,
+            model_stage=model_stage,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_role", "model_stage"),
+    [("denoise", "denoise"), ("denoise_decode", "dit"), ("full", "diffusion"), (None, None)],
+    ids=["egd-denoise", "eg-denoise-decode", "single-stage", "unset"],
+)
+def test_startup_accepts_profiles_on_a_denoising_wan_stage(monkeypatch, stage_role, model_stage):
+    pipeline = _StartupPublishingPipeline()
+
+    runner = _load_model(
+        monkeypatch,
+        pipeline,
+        schedule=_service(),
+        model_class_name="WanPipeline",
+        stage_role=stage_role,
+        model_stage=model_stage,
+    )
+
+    assert runner.pipeline is pipeline
+
+
+def test_startup_keeps_the_unsupported_model_error_on_the_h3_decode_stage(monkeypatch):
+    with pytest.raises(ValueError, match="Unsupported diffusion_attention_schedule: model 'MiniMaxH3DecoderPipeline'"):
+        _load_model(
+            monkeypatch,
+            _StartupPublishingPipeline(),
+            schedule=_service(),
+            model_class_name="MiniMaxH3DecoderPipeline",
+            model_stage="vae_decode",
         )
