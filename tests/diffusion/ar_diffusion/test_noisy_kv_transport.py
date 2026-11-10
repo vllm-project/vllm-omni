@@ -10,7 +10,13 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Cell, CellSchedule, Inflight, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    Cell,
+    CellSchedule,
+    Inflight,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -153,8 +159,8 @@ def _sink_pipeline_worker(
     fixed_shape: bool = False,
     device_kind: str = "cpu",
 ) -> None:
-    from vllm_omni.experimental.ar_diffusion import cell_executor
-    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
         ARDiffusionCellContext,
         CellAdapter,
         CellRunSpec,
