@@ -178,9 +178,7 @@ errors and cancellation stop the run rather than becoming model-quality scores.
 
 Set `history_policy: your_package.policy:YourPolicy`. The server imports the
 class with a no-argument constructor. Clients cannot supply this import path.
-The deployment field is `duplex_session.model_custom_options`. Rename the
-former draft field `model_options`; it now fails deployment loading rather
-than silently using the default policy.
+The deployment field is `duplex_session.model_custom_options`.
 
 Inherit `QwenHistoryPolicy` in `duplex/history_policy.py` and implement:
 

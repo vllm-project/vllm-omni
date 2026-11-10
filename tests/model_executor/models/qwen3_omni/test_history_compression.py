@@ -117,6 +117,31 @@ async def test_parsed_memory_cannot_bypass_nonempty_or_output_limit(mocker, resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("result", [123, {"facts": []}, ["fact"]])
+async def test_invalid_parser_type_is_counted_and_keeps_batch_retryable(mocker, caplog, result):
+    owner, state = runtime(), QwenHistoryState()
+    history = text_history()
+    state.reconcile(history)
+    state.summary = "previous memory"
+    request = await owner.prepare(state)
+    assert owner.policy_for(state, history, 1) is not None
+    parser = mocker.patch.object(owner.policy, "parse_compression", return_value=result)
+
+    assert not owner.apply(state, request, completion())
+    assert state.counts["rejected_summaries"] == 1
+    assert state.summary == "previous memory" and state.processed == 0
+    assert state.policy_cache_key is None
+    assert "parse_compression must return text or None" in caplog.text
+    retry = await owner.prepare(state)
+    assert retry.model_source == request.model_source
+
+    parser.return_value = "valid replacement memory"
+    assert owner.apply(state, retry, completion())
+    assert state.summary == "valid replacement memory" and state.processed == 8
+    assert state.counts["rejected_summaries"] == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["truncated", "oversize", "edited_source"])
 async def test_public_guards_reject_before_custom_parser(mocker, failure):
     owner, state = runtime(__name__ + ":StructuredMemoryPolicy", summary_tokens=64), QwenHistoryState()

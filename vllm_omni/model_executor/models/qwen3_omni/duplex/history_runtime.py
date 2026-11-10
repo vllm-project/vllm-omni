@@ -497,7 +497,9 @@ class QwenHistoryRuntime:
             state.counts["rejected_summaries"] += 1
             return False
         if memory is not None and not isinstance(memory, str):
-            raise TypeError("History policy parse_compression must return text or None")
+            logger.warning("History policy parse_compression must return text or None; got %s", type(memory).__name__)
+            state.counts["rejected_summaries"] += 1
+            return False
         memory = (memory or "").strip()
         if not memory or len(self.processor.tokenizer(text=[memory])["input_ids"][0]) > self.limits.summary_tokens:
             state.counts["rejected_summaries"] += 1

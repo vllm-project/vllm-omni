@@ -149,9 +149,8 @@ text (including serialized JSON), inserted as reference data in foreground
 input. The interface uses the same Qwen Thinker; it does not support external
 summarization services, arbitrary retrieval stores or mid-session switching.
 
-The configuration field is `model_custom_options`; the draft's former
-`model_options` spelling is rejected during deployment loading. Deployments
-using that spelling must rename it. Default `recent` behavior is unchanged.
+The server-owned configuration field is `duplex_session.model_custom_options`.
+Default `recent` behavior is unchanged.
 
 Incomplete implementations fail at server initialization. Selection is
 stateless and may be cached while
@@ -175,7 +174,7 @@ responses. Worker logging does not mutate Session state.
 The prototype accepts only text/audio when selected. The default policy
 retains existing image/tool support. Implementation, configuration, evaluation
 scope and commands are in the
-[history experiment guide](../../benchmarks/duplex_history/README.md).
+[history experiment guide](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/duplex_history/README.md).
 
 ## Architecture
 
