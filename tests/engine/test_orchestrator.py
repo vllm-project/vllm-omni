@@ -4164,6 +4164,62 @@ _PAUSE_MESSAGE = "Generation is paused. Please retry after it resumes."
 
 
 @pytest.mark.asyncio
+async def test_input_identity_survives_speaking_unit_decode_but_not_next_segment(mocker):
+    pools = _build_stage_pools([[FakeStageClient()]])
+    mocker.patch.object(pools[0], "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    orchestrator.stage_pools = pools
+    state = OrchestratorRequestState(request_id="speaking", session_owned=True)
+    state.streaming.enabled = True
+    orchestrator.request_states[state.request_id] = state
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    mocker.patch.object(
+        orchestrator, "_apply_raw_terminal_stage_finish", new_callable=mocker.AsyncMock, return_value=False
+    )
+    key = "meta.duplex_input_item_id_utf8"
+    identity = torch.tensor(list(b"committed-input"), dtype=torch.uint8)
+
+    async def deliver(metadata, *, finished=False, pooling=None):
+        raw = EngineCoreOutputs(
+            outputs=[
+                OmniEngineCoreOutput(
+                    request_id=state.request_id,
+                    new_token_ids=[1],
+                    multimodal_output=metadata,
+                    pooling_output=pooling,
+                    is_segment_finished=finished,
+                )
+            ]
+        )
+        await orchestrator._process_llm_stage_outputs(0, 0, raw, set())
+        return state.streaming.segment(0).output_metadata
+
+    prefill = await deliver({key: identity, "latent": torch.ones(16, 8)})
+    assert set(prefill) == {key}  # Do not retain the model's activation buffer.
+    assert (await deliver({}))[key] is identity
+    assert (await deliver({}, finished=True))[key] is identity
+    assert key not in await deliver({}, finished=True)  # A later unit cannot reuse it.
+
+    # A batched step republishes this decoding row's buffer payload, which
+    # may be empty or describe a later append; the unit keeps its identity.
+    await deliver({key: identity})
+    cleared = torch.empty(0, dtype=torch.uint8)
+    later = torch.tensor(list(b"later-input"), dtype=torch.uint8)
+    assert (await deliver({key: cleared}))[key] is identity
+    assert (await deliver({key: later}, finished=True))[key] is identity
+    # The next unit starts a new segment and may clear the identity.
+    assert (await deliver({key: cleared}, finished=True))[key] is cleared
+
+    # MRv2 Thinkers keep the identity off the client channel.
+    assert (await deliver(None, pooling={key: later, "latent": torch.ones(16, 8)}, finished=True))[key] is later
+
+
+@pytest.mark.asyncio
 async def test_raw_stage_error_prefers_request_error_message(mocker):
     pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient()]])
     for pool in pools:

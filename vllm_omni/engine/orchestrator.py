@@ -1065,10 +1065,27 @@ class OrchestratorBase:
             # Only streaming requests maintain the per-stage segment snapshot.
             if req_state.streaming.enabled:
                 raw_mm = self._completion_multimodal_output(eco, None)
+                output_metadata = dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}
+                # Prefill identifies the consumed input, but a speaking unit
+                # finishes on a later decode step that may carry no metadata.
+                # Retain only this small identity within the current segment;
+                # never retain activations or inherit it across a boundary.
+                # Batched steps republish every row's current buffer payload,
+                # so the first identity of a segment wins over later ones.
+                # MRv2 Thinkers carry it only in pooling_output.
+                input_key = "meta.duplex_input_item_id_utf8"
+                previous_segment = req_state.streaming.segment(stage_id)
+                input_item_id = None if previous_segment.finished else previous_segment.output_metadata.get(input_key)
+                if input_item_id is None:
+                    for channel in (raw_mm, getattr(eco, "pooling_output", None)):
+                        if isinstance(channel, dict) and (input_item_id := channel.get(input_key)) is not None:
+                            break
+                if input_item_id is not None:
+                    output_metadata[input_key] = input_item_id
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
                     finished=segment_finished,
                     token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
-                    output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                    output_metadata=output_metadata,
                 )
                 req_state.streaming.new_prompt_len_snapshot = getattr(
                     eco,

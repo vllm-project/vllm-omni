@@ -41,9 +41,11 @@ Input replay uses the real-time clock and 1 FPS. Warmups and request-based
 readiness probes are disabled; the server fixture waits for startup.
 MiniCPM uses its bundled `assets/HT_ref_audio.wav`. The benchmark parameters
 and accuracy reference must select the same 66 IDs: 30 RTD and 36 PR samples.
-Sessions use the `soundtrack` mix (`duplex_eval_mix`): the instruction audio is
-overlaid on the clip's own audio track. The accuracy config records the mix its
-thresholds were measured with. The guard rejects a benchmark with another mix,
+Sessions use the `question` mix (`duplex_eval_mix`): video frames and the
+dataset's instruction audio are streamed without the clip's own audio track.
+This configuration does not test understanding of the clip's original audio;
+use a separate `soundtrack` run for audio-dependent tasks. The accuracy config
+records the selected CI mix. The guard rejects a benchmark with another mix,
 and any score file whose response metadata records a different mix. Metadata
 without a mix counts as `question`.
 
@@ -134,8 +136,10 @@ the same judge, protocol and 66 IDs. The RTD thresholds allow approximately
 10.7% and 16% below that run's content and temporal scores. For the 36 PR
 samples, a threshold of 0.28 requires at least 11 successes: 10/36 is
 approximately 0.2778, so one fewer success than the reference fails. The
-`soundtrack` reference, which completed and judged all 66 sessions, meets the
-same thresholds with the same one-sample PR margin, so they are unchanged.
+thresholds remain unchanged when selecting `question` for CI. The table records
+historical runs, not validation of the current revision; in particular, the
+L20X soundtrack run used a 128,000-token judge context rather than the current
+65,536-token context.
 Later runs compare against these checked-in
 values; changing the thresholds requires an explicit configuration update.
 The CUDA and NPU jobs share these thresholds. H100/B200 and NPU validation,

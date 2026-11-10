@@ -94,6 +94,8 @@ class DuplexCapabilities:
     supports_model_native_turn_policy: bool = False
     supports_external_turn_signal: bool = True
     supports_client_commit: bool = True
+    #: Native input units carry their committed item id back when consumed.
+    supports_input_processing_ack: bool = False
     supports_barge_in: bool = True
     supports_playback_ack: bool = True
     supports_input_append: bool = False
@@ -153,6 +155,7 @@ class DuplexCapabilities:
             "supports_model_native_turn_policy": self.supports_model_native_turn_policy,
             "supports_external_turn_signal": self.supports_external_turn_signal,
             "supports_client_commit": self.supports_client_commit,
+            "supports_input_processing_ack": self.supports_input_processing_ack,
             "supports_barge_in": self.supports_barge_in,
             "supports_playback_ack": self.supports_playback_ack,
             "supports_input_append": self.supports_input_append,

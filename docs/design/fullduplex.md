@@ -407,6 +407,18 @@ for queue updates and the final validity check before delivery.
   resumable responses also defer video-only commits. If response creation is
   disabled on the commit, a later explicit `response.create` must drain the
   held prefixes before submitting the terminal payload.
+- **Input acceptance and consumption are distinct.** A native commit with
+  `processing_required: true` acknowledges queue acceptance. The model carries
+  the committed input item identity through Stage0; after that unit finishes,
+  the session publishes `input.processed` with the same item and epoch and its
+  listen decision. An old queued unit's listen cannot acknowledge the new
+  input. The orchestrator retains the prefill identity until the same segment's
+  terminal decode output, without carrying activations or crossing a segment
+  boundary. The benchmark waits for this identity before ending the clip, including
+  under cold compilation, and never forces a response to satisfy the barrier.
+  Models opt in through `supports_input_processing_ack`; commits without a
+  distinct submitted item do not advertise the barrier. Cancellation fences
+  consumption events by epoch like other session outputs.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
