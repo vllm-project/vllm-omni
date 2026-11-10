@@ -5,6 +5,7 @@
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
 
@@ -32,8 +33,10 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        # Avoid requiring a compatible prebuilt vLLM activation kernel on HIP.
-        return self.forward_native(x)
+        # Opt-in: avoid requiring a compatible prebuilt vLLM activation kernel on HIP.
+        if envs.VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS:
+            return self.forward_native(x)
+        return self.forward_cuda(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type != "npu":

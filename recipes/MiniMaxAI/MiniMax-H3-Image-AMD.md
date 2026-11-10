@@ -8,11 +8,12 @@ other hardware profiles were not validated by this run.
 
 ## Runtime and model preparation
 
-Use a checkout containing the ROCm `RMSNorm.forward_hip` and
-`SiluAndMul.forward_hip` native fallbacks. These avoid precompiled vLLM kernels
-that failed with `hipErrorInvalidImage` in the tested runtime. The overrides
-apply to these shared diffusion operators on ROCm; other diffusion models
-were not qualified by the MiniMax-H3-Image benchmark.
+Set `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` to run the shared diffusion
+`RMSNorm` and `SiluAndMul` in PyTorch on ROCm. This avoids precompiled vLLM
+kernels that failed with `hipErrorInvalidImage` in the tested runtime. The
+setting is off by default and applies to every diffusion model in the
+process; other diffusion models were not qualified by the MiniMax-H3-Image
+benchmark. A vLLM build with kernels for your GPU arch does not need it.
 
 The tested runtime was the locally available image
 `rocm/vllm-omni:438155621484248827a30256e679cb4c84f544fb`:
@@ -100,6 +101,7 @@ docker run -d --name minimax-h3-image-amd \
   -e PYTHONPATH=/workspace \
   -e HIP_VISIBLE_DEVICES=4,5,6,7 \
   -e PYTORCH_ROCM_ARCH=gfx950 \
+  -e VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1 \
   -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e VLLM_ROCM_USE_AITER=1 \
   -e VLLM_ROCM_USE_SKINNY_GEMM=0 \
@@ -197,7 +199,7 @@ client validation and persistence. Warmups are excluded from both metrics.
 
 The following results were measured with source revision
 `2174c09df5ec21bbf11f96becbcd2d6c7babcf75` plus the two Docker-only native
-HIP overrides now represented in source, using the runtime and flags above.
+HIP overrides (now `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1`), using the runtime and flags above.
 They document that tested deployment, rather than qualification of every
 subsequent source revision.
 

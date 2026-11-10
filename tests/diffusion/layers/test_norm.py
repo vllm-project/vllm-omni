@@ -829,10 +829,11 @@ def test_rmsnorm_fused_native_parity_custom_weight():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("with_residual", [False, True])
 def test_rmsnorm_hip_avoids_precompiled_cuda_kernel(
-    mocker: MockerFixture, dtype: torch.dtype, with_residual: bool
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, with_residual: bool
 ) -> None:
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
+    monkeypatch.setenv("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", "1")
     cuda_forward = mocker.patch.object(RMSNorm, "forward_cuda", side_effect=AssertionError("unsupported fused kernel"))
     norm = RMSNorm(128, eps=1e-5, dtype=dtype)
     with torch.no_grad():
@@ -854,3 +855,16 @@ def test_rmsnorm_hip_avoids_precompiled_cuda_kernel(
         output = result
     torch.testing.assert_close(output, expected)
     assert output.dtype == dtype
+
+
+@pytest.mark.cpu
+def test_rmsnorm_hip_uses_cuda_path_by_default(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    monkeypatch.delenv("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", raising=False)
+    sentinel = torch.zeros(1)
+    cuda_forward = mocker.patch.object(RMSNorm, "forward_cuda", return_value=sentinel)
+    x = torch.randn(2, 16)
+
+    assert RMSNorm(16).forward_hip(x) is sentinel
+    cuda_forward.assert_called_once_with(x, None)

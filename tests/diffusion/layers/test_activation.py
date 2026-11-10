@@ -56,6 +56,7 @@ def test_silu_and_mul_hip_avoids_precompiled_cuda_kernel(monkeypatch: pytest.Mon
     def unsupported_cuda(self: SiluAndMul, x: torch.Tensor) -> torch.Tensor:
         raise AssertionError("unsupported fused kernel")
 
+    monkeypatch.setenv("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", "1")
     monkeypatch.setattr(SiluAndMul, "forward_cuda", unsupported_cuda)
     packed = torch.randn(17, 256, generator=torch.Generator().manual_seed(42), dtype=dtype)
     gate, up = packed.chunk(2, dim=-1)
@@ -63,3 +64,12 @@ def test_silu_and_mul_hip_avoids_precompiled_cuda_kernel(monkeypatch: pytest.Mon
     output = SiluAndMul().forward_hip(packed)
     torch.testing.assert_close(output, F.silu(gate) * up)
     assert output.dtype == dtype
+
+
+@pytest.mark.cpu
+def test_silu_and_mul_hip_uses_cuda_path_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", raising=False)
+    sentinel = torch.zeros(1)
+    monkeypatch.setattr(SiluAndMul, "forward_cuda", lambda self, x: sentinel)
+
+    assert SiluAndMul().forward_hip(torch.randn(2, 8)) is sentinel

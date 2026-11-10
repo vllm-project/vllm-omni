@@ -61,6 +61,9 @@ EXCLUDED_MODELS = [
     "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Needs the full MiniMax-H3-Image checkpoint (126 GiB); covered by
+    # tests/diffusion/models/minimax_h3/test_minimax_h3_image*.py.
+    "MiniMaxH3ImagePipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
