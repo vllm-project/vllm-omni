@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """WebSocket client for streaming text-input TTS.
 
 Connects to the /v1/audio/speech/stream endpoint, sends text incrementally
@@ -28,6 +31,12 @@ Usage:
     python streaming_speech_client.py \
         --text "नमस्ते। कैसे हो?" \
         --split-granularity sentence
+
+    # Stream WAV output; binary frames form one continuous WAV byte stream
+    python streaming_speech_client.py \
+        --text "Hello world. How are you?" \
+        --stream-audio \
+        --response-format wav
 
     # Receive JSON sidecar chunks with word-level timestamps
     python streaming_speech_client.py \
@@ -360,7 +369,7 @@ def main():
     parser.add_argument(
         "--stream-audio",
         action="store_true",
-        help="Receive one or more PCM chunks per sentence (requires --response-format pcm)",
+        help="Receive one or more audio chunks per sentence (requires --response-format pcm or wav)",
     )
     parser.add_argument(
         "--word-timestamps",
