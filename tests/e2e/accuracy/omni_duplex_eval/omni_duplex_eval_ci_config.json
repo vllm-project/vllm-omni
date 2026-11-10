@@ -2,6 +2,7 @@
   "dataset": "Hothan/Omni-DuplexEval",
   "dataset_revision": null,
   "protocol_pin": "ca3c122b4d4bf67afd6b18ea5e724b4561bdde48",
+  "mix": "soundtrack",
   "sample_ids_per_split": {
     "RTD_world_knowledge": [
       "360",
@@ -88,12 +89,9 @@
       "270"
     ]
   },
-  "judge": {
-    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-    "base_url": "http://127.0.0.1:8001",
-    "base_url_env": "VLLM_DUPLEX_EVAL_JUDGE_URL",
-    "video_mode": "video_url",
-    "fps": 2,
-    "eval_workers": 4
+  "baseline": {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28
   }
 }

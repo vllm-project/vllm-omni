@@ -29,6 +29,40 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("sample_rate", [32000, np.int32(32000), np.int64(32000)])
+def test_extract_audio_preserves_integer_sample_rate(sample_rate):
+    audio = np.zeros((1000, 2), dtype=np.float32)
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate",
+        images=[],
+        multimodal_output={"audio": audio, "metadata": {"audio": {"sample_rate": sample_rate}}},
+    )
+    extracted, rate = OmniStreamingVideoOutputHandler._extract_audio_output(result)
+    assert extracted is audio
+    assert rate == 32000 and isinstance(rate, int)
+
+
+@pytest.mark.parametrize("sample_rate", [0, -32000, True, 32000.5, "32000"])
+def test_extract_audio_rejects_invalid_sample_rate(sample_rate):
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate",
+        images=[],
+        multimodal_output={
+            "audio": np.zeros((1000, 2), dtype=np.float32),
+            "metadata": {"audio": {"sample_rate": sample_rate}},
+        },
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        OmniStreamingVideoOutputHandler._extract_audio_output(result)
+
+
+def test_extract_audio_keeps_missing_rate_unspecified():
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate", images=[], multimodal_output={"audio": np.zeros((1000, 2), dtype=np.float32)}
+    )
+    assert OmniStreamingVideoOutputHandler._extract_audio_output(result)[1] is None
+
+
 def _fake_video_frames(num_frames: int = 2) -> list[np.ndarray]:
     return [np.full((4, 4, 3), fill_value=i, dtype=np.uint8) for i in range(num_frames)]
 
@@ -64,7 +98,9 @@ def _build_test_app(
     class FakeStreamingVideoEncoder:
         encode_calls: list[int] = []
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = len(self.encode_calls)
             self.encode_calls.append(idx)
@@ -414,6 +450,50 @@ class TestStreamingVideoOutputWebSocket:
         engine_client.abort.assert_not_called()
         engine_client.submit_interaction_async.assert_not_called()
 
+    def test_zero_stable_frames_deliver_positions_and_control_acknowledgement(self, mocker: MockerFixture):
+        async def mock_generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[np.empty((0, 4, 4, 3), dtype=np.uint8)],
+                final_output_type="video",
+                finished=False,
+                multimodal_output={
+                    "metadata": {
+                        "stream": {
+                            "generation_chunk_index": 0,
+                            "frame_start": 0,
+                            "generated_raw_frames": 4,
+                            "generated_frames": 1,
+                            "withheld_frames": 1,
+                            "completed_event_ids": ["camera-off"],
+                        }
+                    }
+                },
+            )
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws", images=[_fake_video_frames(1)], final_output_type="video", finished=True
+            )
+
+        app, _handler, engine = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[(b"", False), (b"video", True)],
+            mock_generate=mock_generate,
+            final_chunk=b"trailer",
+        )
+        with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:
+            ws.send_json({"type": "session.start", "prompt": "A forest."})
+            assert ws.receive_json()["type"] == "video.start"
+            metadata, chunk = _receive_video_chunk(ws)
+            assert chunk == b"" and metadata["byte_length"] == metadata["num_frames"] == 0
+            assert metadata["generation_chunk_index"] == metadata["frame_start"] == 0
+            assert metadata["generated_raw_frames"] == 4
+            assert metadata["generated_frames"] == metadata["withheld_frames"] == 1
+            assert metadata["completed_event_ids"] == ["camera-off"]
+            assert _receive_video_chunk(ws)[1] == b"video"
+            assert _receive_video_chunk(ws)[1] == b"trailer"
+            assert ws.receive_json()["stopped"] is False
+        engine.abort.assert_not_called()
+
     def test_streaming_session_emits_final_encoder_delta_before_done(self, mocker: MockerFixture):
         """A non-empty encoder close delta is delivered as the final binary chunk."""
 
@@ -538,7 +618,9 @@ def _build_handler_for_async_tests(
         def __init__(self) -> None:
             self.encode_calls = 0
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = self.encode_calls
             self.encode_calls += 1
@@ -1580,6 +1662,8 @@ async def test_video_abort_passes_deadline_to_rpc_waiter(mocker: MockerFixture):
     client.request_states = {"internal": state}
     client.abort = partial(AsyncOmni.abort, client)
     client._abort = partial(AsyncOmniBase._abort, client)
+    client._pending_submits = {}
+    client._settle_pending_submits = partial(AsyncOmniBase._settle_pending_submits, client)
     engine = mocker.Mock(spec=OmniEngineBase)
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()

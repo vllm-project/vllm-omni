@@ -193,7 +193,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
+      microphoneUploadEnabled, flushCapture, setPttHeld, toggleMute, awaitQueue: () => audioChain,
       capture(samples = [100, 200]) { pendingCapture.push(new Int16Array(samples)); },
       setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
       state() { return { running, connectionReady, assistantActive, pttHeld, turnSubmitted, visionTurnLocked }; }
@@ -863,6 +863,53 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA shows one bubble per item and keeps repeated syllables', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const said = '哎，你看到我吗？';
+  const reply = '看到了，我正盯着你呢。';
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u3',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: '哈哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', delta: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', transcript: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.done',
+    item: { id: 'item_a1', role: 'assistant', content: [{ type: 'output_audio', transcript: reply }] },
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio.delta', text: reply, audio: '', response_id: 'a1',
+  });
+  const turns = [...app.elements.get('conversation').children];
+  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, said, '哈哈', '哈哈哈', reply]);
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
   const app = shell('aura-ptt', 'manual', { realPlayback: true });
   await app.ui.startSession();
@@ -1179,4 +1226,62 @@ test('JoyAI camera and PTT profiles keep their existing speech-start handling', 
   for (const config of [{}, { speechInput: true, turnMode: 'manual' }]) {
     assert.equal(profiles['joyai-turn'](config).mapEvent(speech).kind, 'ignore');
   }
+});
+
+
+test('MiniCPM muted microphone sends each fresh camera frame without audio or commit', async () => {
+  const app = shell('minicpm-native');
+  await app.ui.startSession();
+  app.ui.capture();
+  app.ui.flushCapture();
+  app.ui.capture();
+  app.ui.setPendingFrame('PRE_MUTE');
+  app.ui.toggleMute();
+  const audioSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(audioSamples, 16000, 'mute closes the open 1 s unit with silence');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['PRE_MUTE']);
+  app.ui.setPendingFrame('VISION1');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1), {
+    type: 'input_audio_buffer.append', video_frames: ['VISION1'],
+  });
+  const count = app.sockets[0].sent.length;
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count, 'no repeated frame or empty append');
+  app.ui.setPendingFrame('VISION2');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['VISION2']);
+  app.ui.toggleMute();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count + 1, 'old captured audio was discarded');
+  app.ui.capture();
+  app.ui.setPendingFrame('OMNI');
+  app.ui.flushCapture();
+  assert.equal(typeof app.sockets[0].sent.at(-1).audio, 'string');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['OMNI']);
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.commit'), false);
+  const sentBeforeBoundaryMute = app.sockets[0].sent.length;
+  app.ui.toggleMute();
+  app.ui.toggleMute();
+  const unitSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(unitSamples % 16000, 0, 'a second mute also lands on a unit boundary');
+  app.ui.toggleMute();
+  assert.equal(
+    app.sockets[0].sent.length,
+    sentBeforeBoundaryMute + 1,
+    'muting on a unit boundary sends no extra silence',
+  );
+});
+
+test('muted Qwen manual profile does not send MiniCPM frame-only input', async () => {
+  const app = shell('qwen3-turn');
+  await app.ui.startSession();
+  app.ui.toggleMute();
+  app.ui.setPendingFrame('FRAME');
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
 });

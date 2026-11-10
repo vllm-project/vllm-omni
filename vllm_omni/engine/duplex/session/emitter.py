@@ -263,14 +263,15 @@ class SessionEmitter:
                 deferred_overlap_payload = model_state.audio_buffer.flush(
                     chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                 )
-                if model_state.committed_audio_payload is not None:
+                prior_committed = model_state.mergeable_committed_audio()
+                if prior_committed is not None:
                     if deferred_overlap_payload is not None:
                         deferred_overlap_payload = overlap_policy.merge_audio_payloads(
-                            model_state.committed_audio_payload,
+                            prior_committed,
                             deferred_overlap_payload,
                         )
                     else:
-                        deferred_overlap_payload = model_state.committed_audio_payload
+                        deferred_overlap_payload = prior_committed
                 if self.auto_responds() and deferred_overlap_payload is not None:
                     deferred_overlap_payload = dict(deferred_overlap_payload)
                     deferred_overlap_payload["force_listen"] = False
@@ -294,12 +295,9 @@ class SessionEmitter:
                     self.emit_events(discard_pending_input_audio(self._projector, session.overlap_speech_ms))
 
         session.reset_overlap_speech()
-        if (
-            can_promote_overlap
-            and model_state.deferred_response_create
-            and model_state.committed_audio_payload is not None
-        ):
-            deferred_overlap_payload = model_state.committed_audio_payload
+        mergeable = model_state.mergeable_committed_audio()
+        if can_promote_overlap and model_state.deferred_response_create and mergeable is not None:
+            deferred_overlap_payload = mergeable
             model_state.deferred_response_create = False
             model_state.input_since_commit = False
             model_state.speech_since_commit = False

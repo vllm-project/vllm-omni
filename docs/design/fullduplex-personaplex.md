@@ -15,7 +15,7 @@ selected by `PipelineConfig.duplex_plugin`. The serving path is:
        plugin.plan_append: one 80 ms frame -> one resumable Stage 0 append
   -> PersonaPlex Talker (Stage 0, lockstep temporal transformer + depformer)
   -> streaming PersonaPlex Code2Wav (Stage 1, Mimi)
-  -> plugin.data_plane: cumulative audio/text -> deltas
+  -> plugin.data_plane: DELTA audio passed through, cumulative text sliced -> deltas
   -> response.output_audio.delta + response.output_audio_transcript.delta
 ```
 
@@ -71,7 +71,11 @@ capability payload derives `supports_multi_session` /
 Engine policy:
 
 - `configure_sampling_params`: Stage 0 greedy (`temperature=0`, `top_k=1`,
-  `max_tokens=1`), other stages untouched.
+  `max_tokens=1`); the final stage (Code2Wav) gets
+  `output_kind=RequestOutputKind.DELTA` on a clone of its defaults. Any stage
+  in between is untouched. The Code2Wav request lives for the whole session,
+  and CUMULATIVE output would make the output processor re-concatenate every
+  earlier waveform on each 80 ms frame.
 - `plan_append`: validates exactly one 1920-sample 24 kHz `pcm_f32le` frame
   (through `model_executor/common/duplex/payload.py`) and reserves one
   scheduler slot per frame plus, on the first append of an epoch (`seq == 1`),
@@ -180,9 +184,19 @@ final raw code frame needed to de-delay the next chunk.
 ### Data-plane projector
 
 `PersonaPlexDataPlaneSession` is the `CumulativeAudioTextDataPlane` of
-`model_executor/common/duplex/data_plane.py` with a 24 kHz default rate. It
-keeps one audio/text cursor per request so cumulative Stage 1 output cannot
-replay old audio, and yields one internal result per new suffix:
+`model_executor/common/duplex/data_plane.py` with a 24 kHz default rate and
+`audio_output_is_delta = True`. Because Code2Wav runs with DELTA output, each
+Stage 1 output already carries only the new audio, so the projector passes it
+through instead of slicing it against a sample cursor. In DELTA mode the
+output processor does not consolidate, so audio from several engine steps can
+arrive together as a list of chunks; the projector joins them into one
+waveform before it counts and encodes the samples.
+
+Text keeps the cumulative path: one text cursor per request, and only the new
+suffix is emitted. Stage 1 runs with `skip_tokenizer_init` and its outputs
+carry only `model_outputs` and `sr`, so in practice the text is empty and no
+transcript deltas are sent. The projector yields one internal result per new
+chunk:
 
 ```python
 {
@@ -239,8 +253,8 @@ conversational turn boundary.
   restart and late finish of a superseded request.
 - `tests/engine/duplex/test_session_runner_personaplex.py`: the session
   runner with the real plugin -- one submission per frame, prefill on the
-  first append only, half frames buffered, wrong rate refused, cumulative
-  Code2Wav output projected as 24 kHz deltas, cancel restarting the epoch,
+  first append only, half frames buffered, wrong rate refused, DELTA
+  Code2Wav output passed through as 24 kHz deltas, cancel restarting the epoch,
   close aborting the request.
 - `tests/model_executor/executor_common/`: the shared toolbox (PCM helpers, payload
   validation, fixed-frame buffer, cumulative data plane, request-output

@@ -8,7 +8,7 @@ from tests.helpers.mark import hardware_marks
 
 pytestmark = [
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
     pytest.mark.tts,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
