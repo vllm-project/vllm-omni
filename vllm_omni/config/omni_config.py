@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
@@ -834,6 +835,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
+    diffusion_attention_schedule: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
@@ -983,6 +985,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             TransformerConfig,
             VideoOutputTransportConfig,
             build_attention_config,
+            parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
@@ -1060,7 +1063,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
@@ -2423,6 +2429,33 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
+        sampling_defaults = cli_overrides.get("default_sampling_params")
+        if isinstance(sampling_defaults, str):
+            sampling_defaults = json.loads(sampling_defaults)
+        for stage_key, overrides in (sampling_defaults or {}).items():
+            try:
+                stage_id = int(stage_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
+                ) from exc
+            if stage_id not in pipeline_stage_ids:
+                logger.warning(
+                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
+                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
+                )
+                continue
+            if stage_id not in deploy_by_id:
+                stage_deploy = StageDeployConfig(stage_id=stage_id)
+                deploy.stages.append(stage_deploy)
+                deploy_by_id[stage_id] = stage_deploy
+            stage_deploy = deploy_by_id[stage_id]
+            defaults = stage_deploy.default_sampling_params or {}
+            merged = {**defaults, **overrides}
+            if "extra_args" in overrides:
+                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
+            stage_deploy.default_sampling_params = merged
         update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 
