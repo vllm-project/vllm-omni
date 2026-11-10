@@ -35,3 +35,37 @@ def test_request_key_stringifies_int_ids():
     # Engine ids may arrive as ints; keys must be strings so every dict
     # lookup agrees on one representation.
     assert _request_key({"req_id": 11}, 0) == "11"
+
+
+def _decode_preprocess_is_identity(k_frames):
+    """Evaluate the flag the way the wrapper and the runner read it.
+
+    ``minicpmo_4_5_omni.py`` copies it with ``bool(getattr(talker, ...))`` and
+    the model state resolves it with ``bool(getattr(model, ...))``; both go
+    through normal attribute access, i.e. through the property's ``fget``.
+    """
+    import types
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    prop = MiniCPMO45OmniTTSForConditionalGeneration.__dict__[
+        "mrv2_decode_preprocess_is_identity"
+    ]
+    fake = types.SimpleNamespace(_k_step_frames=k_frames)
+    return bool(prop.__get__(fake, MiniCPMO45OmniTTSForConditionalGeneration))
+
+
+def test_decode_preprocess_is_identity_for_single_frame():
+    # K=1: the runner's embedding already wrote the real codec token and
+    # preprocess_decode_batch_mrv2 early-returns, so decode rows can be
+    # skipped entirely by the model state.
+    assert _decode_preprocess_is_identity(1) is True
+    assert _decode_preprocess_is_identity(0) is True
+
+
+def test_decode_preprocess_is_not_identity_for_kstep():
+    # K>1: decode rows carry K-step placeholder codes that must be
+    # re-embedded from the previous real codec frame every step.
+    assert _decode_preprocess_is_identity(8) is False

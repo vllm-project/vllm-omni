@@ -1829,8 +1829,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     # counts and penalty histories stay on the device. MRv2 derives these
     # directly from runner state rather than the model-owned V1 codec slots.
 
-    #: Decode rows need no per-row preprocess beyond the runner's embedding.
-    mrv2_decode_preprocess_is_identity = False
+    @property
+    def mrv2_decode_preprocess_is_identity(self) -> bool:
+        """K<=1 decode rows need no model-side preprocess.
+
+        With one frame per step the runner's ``embed_input_ids`` already wrote
+        the real codec token, and ``preprocess_decode_batch_mrv2`` early-returns
+        the inputs unchanged, so the runner can skip decode rows entirely (no
+        per-row info build, no batched call). K>1 rows carry K-step placeholder
+        codes that must be re-embedded from the previous real codec frame, so
+        they are not identity.
+        """
+        return int(getattr(self, "_k_step_frames", 0) or 0) <= 1
 
     @property
     def logits_vocab_size(self) -> int:
