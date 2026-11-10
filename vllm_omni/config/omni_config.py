@@ -249,6 +249,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
+    shutdown_timeout: float
     additional_config: dict[str, Any]
     distributed_executor_backend: Any
     worker_cls: str
@@ -637,6 +638,8 @@ class OmniStageConnectorConfig:
 @config
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
+
+    shutdown_timeout: float | None = Field(default=None, ge=0)
 
     cuda_mps: bool = False
 
