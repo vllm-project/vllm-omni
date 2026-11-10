@@ -1063,6 +1063,8 @@ def test_startup_validation_rejects_vsa_candidate_on_self_attention_without_gate
             layer_mod.validate_attention_schedule_candidates(attention, config)
     else:
         assert layer_mod.validate_attention_schedule_candidates(attention, config) == 1
+
+
 class _StubGraphedForward:
     """Stands in for the platform graph class: always on, records the step calls."""
 
