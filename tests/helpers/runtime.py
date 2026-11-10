@@ -9,7 +9,6 @@ this module re-exports them for backward-compatible imports.
 
 import ctypes
 import errno
-import io
 import os
 import socket
 import subprocess
@@ -17,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -206,7 +206,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        self._server_log = io.StringIO()
+        # Bounded ring buffer: only the last lines are kept for failure errors.
+        self._server_log_lines: deque[str] = deque(maxlen=60)
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -276,9 +277,9 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Pipe child output into memory so early-exit RuntimeErrors can include
-        # the traceback without writing a temp file (and without PIPE deadlock).
-        self._server_log = io.StringIO()
+        # Drain child output into a bounded ring buffer so early-exit errors can
+        # include a traceback without unbounded memory or a temp file.
+        self._server_log_lines = deque(maxlen=60)
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -289,13 +290,13 @@ class OmniServer:
             bufsize=1,
         )
         assert self.proc.stdout is not None
-        log_buf = self._server_log
+        log_lines = self._server_log_lines
         stdout = self.proc.stdout
 
         def _drain_stdout() -> None:
             try:
                 for line in stdout:
-                    log_buf.write(line)
+                    log_lines.append(line)
             except Exception:
                 pass
 
@@ -469,14 +470,13 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
-    def _server_log_tail(self, lines: int = 60) -> str:
+    def _server_log_tail(self) -> str:
         if self._server_log_thread is not None:
             self._server_log_thread.join(timeout=2)
-        content = self._server_log.getvalue().splitlines(keepends=True)
-        if not content:
+        if not self._server_log_lines:
             return ""
         return "\n=== Last {} lines of OmniServer log ===\n{}".format(
-            lines, "".join(content[-lines:]) or "<empty>"
+            len(self._server_log_lines), "".join(self._server_log_lines)
         )
 
     def __enter__(self):
