@@ -51,6 +51,7 @@ from tests.dfx.conftest import (
     resolve_pytest_marks,
     resource_label_for_filename,
 )
+from tests.dfx.perf.baseline_gate import assert_baseline_within_tolerance
 from tests.helpers.runtime import get_open_port
 
 
@@ -880,10 +881,21 @@ def run_benchmark(
 def assert_result(
     result: dict[str, Any],
     num_prompts: int,
+    *,
+    check_baseline: bool = False,
+    hardware: str | None = None,
 ) -> None:
-    """Assert that the expected number of requests completed."""
+    """Assert that the expected number of requests completed.
+
+    When ``check_baseline`` is set, metrics in the current hardware bucket must
+    stay within 20% of the sweep-resolved baseline in the worse direction.
+    """
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
+    if check_baseline:
+        label = hardware if isinstance(hardware, str) and hardware else result.get("Hardware")
+        baseline = result.get("baseline")
+        assert_baseline_within_tolerance(result, baseline if isinstance(baseline, dict) else None, label)
 
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
@@ -1005,7 +1017,7 @@ def _iter_sweep_runs(params: dict[str, Any]) -> list[dict[str, Any]]:
     paired_benchmark_params,
     indirect=["diffusion_server", "benchmark_params"],
 )
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, pytestconfig: pytest.Config):
     """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
@@ -1053,4 +1065,9 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
             print(f"\n  Aggregated results: {_aggregated_result_file_for_source(str(source))}")
         print("=" * 60)
 
-        assert_result(result, sweep_run["num_prompts"])
+        assert_result(
+            result,
+            sweep_run["num_prompts"],
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+            hardware=hardware_json_value(get_runtime_resource_label()),
+        )

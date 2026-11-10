@@ -22,6 +22,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
+from tests.dfx.perf.baseline_gate import assert_baseline_within_tolerance
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -544,7 +545,18 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         ), "Omni-DuplexEval accuracy coverage is incomplete"
 
 
-def assert_result(result, params, num_prompt) -> None:
+def _baseline_for_check(result: dict, params: dict) -> dict:
+    """Prefer the sweep-resolved map stored on the result over the config lists."""
+    recorded = result.get("baseline")
+    if isinstance(recorded, dict):
+        return recorded
+    configured = params.get("baseline")
+    if isinstance(configured, dict):
+        return configured
+    return {}
+
+
+def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     if params.get("dataset_name") == "omni-duplex-eval":
@@ -587,6 +599,12 @@ def assert_result(result, params, num_prompt) -> None:
         assert (
             isinstance(mean_tpot_ms, int | float) and not isinstance(mean_tpot_ms, bool) and math.isfinite(mean_tpot_ms)
         ), "TPOT baseline is configured, but mean_tpot_ms is not finite"
+    if check_baseline:
+        assert_baseline_within_tolerance(
+            result,
+            _baseline_for_check(result, params),
+            hardware if isinstance(hardware, str) else None,
+        )
     expected_audio_turns = params.get("expected_duplex_audio_turns_per_session")
     if expected_audio_turns is not None:
         session_metrics = result.get("duplex_session_metrics")
@@ -606,7 +624,7 @@ def assert_result(result, params, num_prompt) -> None:
     paired_benchmark_params,
     indirect=["omni_server", "benchmark_params"],
 )
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, pytestconfig: pytest.Config):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
@@ -730,7 +748,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+        assert_result(
+            result,
+            {**params, **_aggregate_accuracy_params_for_test(test_name)},
+            num_prompt,
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+        )
 
     # concurrency test
     for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
@@ -750,4 +773,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+        assert_result(
+            result,
+            {**params, **_aggregate_accuracy_params_for_test(test_name)},
+            num_prompt,
+            check_baseline=pytestconfig.getoption("assert_baseline"),
+        )

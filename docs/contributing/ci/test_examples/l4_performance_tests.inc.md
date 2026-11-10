@@ -215,7 +215,7 @@ You can add any benchmark running parameters you need here. For all optional par
 
 1. Change the --xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
 2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
-3. Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
+3. Optionally add a `baseline` object. If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds. With `--assert-baseline`, each metric in the bucket for the machine that ran the case must stay within 20% of that baseline in the worse direction: throughput and QPS fail when they drop below 80% of the baseline, and latency, memory, and real-time factor fail when they rise above 120%. A bucket for a different device is recorded and not compared. CUDA and NPU perf jobs pass this flag; AMD jobs do not until that hardware has its own baseline.
 4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
 5. Image/video generation cases (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path, put width/height/steps/frames in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
 6. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
@@ -226,6 +226,6 @@ You can add any benchmark running parameters you need here. For all optional par
 | num_prompts     | int / array   | Yes      | 10, [10, 20, 30]     | Number of requests (scalar or sweep) |
 | request_rate    | float / array | No       | 0.5, [0.5, 1, inf]   | Queries per second (QPS mode)        |
 | max_concurrency | int / array   | No       | 1, [1, 2, 3]         | Max in-flight requests               |
-| baseline        | object        | No       | see below            | Optional hardware-nested thresholds  |
+| baseline        | object        | No       | see below            | Hardware-nested reference; `--assert-baseline` applies the 20% gate |
 
-`num_prompts`, `request_rate`, and `max_concurrency` accept scalars or arrays; single values expand to match sweep length. QPS and concurrency modes are mutually exclusive. `baseline` top-level keys must be hardware pytest markers from `pyproject.toml`; metric names and values are free-form (scalars or sweep-aligned lists). Omit `baseline` to run without threshold assertions.
+`num_prompts`, `request_rate`, and `max_concurrency` accept scalars or arrays; single values expand to match sweep length. QPS and concurrency modes are mutually exclusive. `baseline` top-level keys must be hardware pytest markers from `pyproject.toml`; metric names and values are free-form (scalars or sweep-aligned lists). Omit `baseline` to run without threshold assertions. Pass `--assert-baseline` to enforce the 20% regression gate described above.
