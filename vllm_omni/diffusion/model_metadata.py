@@ -16,6 +16,19 @@ class DiffusionModelMetadata:
     # persisted upload through ``extra_args[control_type]["control_path"]``.
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
+    # Whether this integration is eligible to become the implicit Scheduler-owned
+    # paged KV default. An omitted ``diffusion_kv_mode`` selects paged execution
+    # for an eligible model once the implicit default is enabled and the runtime
+    # configuration is compatible. Declare it only when the model's paged path
+    # has the parity evidence RFC #9192 requires: an explicit ``paged_scheduler``
+    # request is validated on its own, so setting this flag is what promotes the
+    # model on the flip.
+    paged_kv_default_eligible: bool = False
+    # BlockTable row capacity one public request needs on the paged path. For a
+    # CFG pipeline this is the number of conditional/unconditional branches. It
+    # is used when the deployment does not set
+    # ``diffusion_kv_max_rows_per_request`` explicitly.
+    paged_kv_max_rows_per_request: int | None = None
     final_output_type: str | None = None
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
     # noise masks for latent initialization. Unknown pipelines must remain
@@ -85,6 +98,13 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+        # Reference paged integration (request mode, CUDA and Ascend). One row
+        # per CFG branch: guidance on produces the conditional and
+        # unconditional rows. This declares the default candidate; the implicit
+        # default itself stays behind the gate until the RFC #9192 parity
+        # evidence lands.
+        paged_kv_default_eligible=True,
+        paged_kv_max_rows_per_request=2,
     ),
     # Shared by the Base (text-to-image) and Edit (TI2I) checkpoints, which use
     # the same ``BooguImagePipeline`` class. Text-to-image requests simply carry
