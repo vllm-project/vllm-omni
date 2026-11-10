@@ -139,6 +139,11 @@ EXCLUDED_MODELS = [
     # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
     # endpoint tests.
     "VideoDepthAnythingPipeline",
+    # Covered by the dedicated e2e harnesses
+    # tests/e2e/offline_inference/test_flux3.py and
+    # tests/e2e/online_serving/test_flux3.py (FLUX3_MODEL_PATH) instead of the
+    # common tiny-model suite.
+    "Flux3Pipeline",
 ]
 
 
