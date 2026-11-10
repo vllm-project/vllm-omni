@@ -1512,8 +1512,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
-        request_id = info_dict.get("request_id")
-        request_id = str(info_dict.get("req_id", "0") if request_id is None else request_id)
+        # Single key helper for every per-request mapping in this file
+        # (audio states, condition states, codec device-state rows): MRv2
+        # buffers always carry ``req_id`` (engine id), V1 buffers carry
+        # ``request_id``; both resolve to the same engine-side id per runner.
+        request_id = _request_key(info_dict, 0)
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
@@ -2641,29 +2644,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             assert head_logits_all is not None
             projection_index = projection_indices[index]
             frame_logits = head_logits_all[projection_index : projection_index + 1]
-            # While min_tokens censors the stop id, latch the stop request and
-            # honour it on the first frame that lifts the floor. The latch stays
-            # on device, so padding never buys a new sentence.
-            latch = self._codec_stop_latch(request_id, frame_logits)
-            if step == 0:
-                # A fresh codec segment must not inherit the stop request of
-                # the segment before it.
-                latch.zero_()
-            if step < min_tokens and not eos_window_masked:
-                _hot_id = frame_logits[0].argmax()
-                _stop_hit = _hot_id == int(self._codec_eos_id)
-                for _stop_id in _codec_stop_ids(state):
-                    _stop_hit = _stop_hit | (_hot_id == int(_stop_id))
-                latch.bitwise_or_(_stop_hit)
-            if step == min_tokens and not eos_window_masked:
-                if bool(latch):
-                    # Lift the stop id above every other code this frame rather
-                    # than flattening the rest: if something still censors the
-                    # stop id below, the lift goes with it and this frame
-                    # samples exactly as it does today, instead of choosing
-                    # among a vocab of tied scores.
-                    frame_logits = frame_logits.clone()
-                    frame_logits[0, int(self._codec_eos_id)] += 1.0e4
+            # min_tokens is enforced per frame by the boundary samplers below
+            # (same semantics as the single-frame path's ``mask_eos_rows``):
+            # while ``step < min_tokens`` the stop ids are censored, and on the
+            # first frame past the floor the model decides again on its own.
+            # There is deliberately no cross-frame stop latch here.
             if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -3051,26 +3036,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
         return device_state, device_inputs, device_states
 
-    def _codec_stop_latch(self, request_id: str, logits: torch.Tensor) -> torch.Tensor:
-        """Per-request record of "the model asked to stop", a device scalar.
-
-        ``prepare_codec_logits`` censors the codec stop ids until ``min_tokens``,
-        so a Talker that already finished its sentence cannot stop, and nothing
-        downstream remembers that it tried.  This record keeps that request
-        until the floor lifts.  It is a device tensor updated in place, so a
-        censored frame costs one argmax and no host sync; the caller reads it
-        once, on the frame that releases the floor.
-        """
-        latches = getattr(self, "_request_codec_stop_latches", None)
-        if latches is None:
-            latches = {}
-            self._request_codec_stop_latches = latches
-        latch = latches.get(request_id)
-        if latch is None or latch.device != logits.device:
-            latch = torch.zeros((), dtype=torch.bool, device=logits.device)
-            latches[request_id] = latch
-        return latch
-
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -3262,9 +3227,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         for request_id in getattr(self, "_deferred_cleanup_ids", ()):
             request_audio_states.pop(request_id, None)
             request_condition_states.pop(request_id, None)
-            stop_latches = getattr(self, "_request_codec_stop_latches", None)
-            if isinstance(stop_latches, dict):
-                stop_latches.pop(request_id, None)
             if isinstance(codec_device_states, dict):
                 codec_device_states.pop(request_id, None)
             if isinstance(codec_device_inputs, dict):
@@ -3586,7 +3548,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     getattr(getattr(self, "vllm_config", None), "scheduler_config", None), "max_num_seqs", 4096
                 )
                 codec_state = self._device_codec_state = CodecState(device, self._num_audio_tokens, capacity=capacity)
-            rows = [(str(infos[index].get("request_id", index)), state, code) for index, state, code in gpu_rows]
+            # Key codec device-state rows through the shared helper so the row
+            # identity matches the engine-side id used by the release path
+            # (``on_requests_finished``). MRv2 buffers carry ``req_id`` only;
+            # keying on ``request_id`` would silently fall back to the batch
+            # row index, which is reused whenever a slot is recycled and would
+            # never be released (the release path receives engine ids).
+            rows = [(_request_key(infos[index], index), state, code) for index, state, code in gpu_rows]
             if (
                 len(gpu_groups) == len(gpu_rows)
                 and all(group is gpu_groups[0][0] for group, _ in gpu_groups)

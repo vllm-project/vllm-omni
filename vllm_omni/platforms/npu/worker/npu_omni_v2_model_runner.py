@@ -309,16 +309,38 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         uniform = bool(widths) and len(set(widths)) == 1
         width = widths[0] if uniform else 0
         prefill = bool(getattr(input_batch, "has_prefill", False))
-        if prefill or not uniform or len(infos) != len(spans) or width < 2 or width > MINICPMO_TALKER_FRAMES_MAX:
+        if prefill:
+            # Single forward is the correct path for prefill steps (the frame
+            # loop only replays booked decode rows).
             self._kstep_decline_logs = getattr(self, "_kstep_decline_logs", 0) + 1
             if self._kstep_decline_logs <= 5:
                 logger.warning(
-                    "[kstep] frame loop declined: prefill=%s uniform=%s infos=%d spans=%d width=%d",
-                    prefill,
-                    uniform,
+                    "[kstep] frame loop declined (prefill step): infos=%d spans=%d width=%d",
                     len(infos),
                     len(spans),
                     width,
+                )
+            return None
+        if not uniform or len(infos) != len(spans):
+            # K-step-armed decode step the frame loop cannot run. Falling back
+            # to a single forward would sample one frame from the last row of
+            # each span and report one stop row for K booked positions,
+            # silently corrupting both the codec stream and the scheduler's
+            # accounting; V1 raises in the same situation.
+            raise RuntimeError(
+                "[kstep] multi-token decode step cannot run through the frame "
+                f"loop: uniform={uniform} infos={len(infos)} spans={len(spans)} width={width}"
+            )
+        if width < 2 or width > MINICPMO_TALKER_FRAMES_MAX:
+            # Uniform spans outside the K-step window: one-token decode rows or
+            # warmup/sizing batches booked at prompt length. A single forward
+            # is the correct (and only) path here.
+            self._kstep_decline_logs = getattr(self, "_kstep_decline_logs", 0) + 1
+            if self._kstep_decline_logs <= 5:
+                logger.warning(
+                    "[kstep] frame loop declined (width outside K window): width=%d max=%d",
+                    width,
+                    MINICPMO_TALKER_FRAMES_MAX,
                 )
             return None
         # One replay per booked row. A width below the configured K would leave
@@ -329,8 +351,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # bookkeeping do not address non-existent token ids.
         try:
             input_batch.vocab_size = 2
-        except Exception:
-            pass
+        except AttributeError:
+            if not getattr(self, "_kstep_vocab_warned", False):
+                self._kstep_vocab_warned = True
+                logger.warning("[kstep] input_batch has no vocab_size; skipping stop-row vocab sync")
 
         if run_model is None:
 
