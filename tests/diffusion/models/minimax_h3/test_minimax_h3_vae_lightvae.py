@@ -323,10 +323,7 @@ def test_invalid_teacher_indices_are_rejected(lite_checkpoint_factory, kept):
 
 @pytest.mark.parametrize("kept", [[0], [3], [0, 3]])
 def test_kept_layers_accept_boundary_indices(lite_checkpoint_factory, kept):
-    state = {
-        f"decoder.transformer_blocks.{index}.scale1": torch.ones(4)
-        for index in range(len(kept))
-    }
+    state = {f"decoder.transformer_blocks.{index}.scale1": torch.ones(4) for index in range(len(kept))}
     state["post_quant_conv.weight"] = torch.ones(2, 2, 1, 1, 1)
     checkpoint = _api().read_h3_lite_decoder_checkpoint(
         lite_checkpoint_factory(changes={"kept_layers": kept}, state=state)
@@ -343,9 +340,7 @@ def test_compact_decoder_depth_boundaries(lite_checkpoint_factory, depth):
     changes = {"decoder_num_layers": depth}
     if type(depth) is int and depth == 1:
         changes["kept_layers"] = [0]
-        checkpoint = _api().read_h3_lite_decoder_checkpoint(
-            lite_checkpoint_factory(changes=changes, state=state)
-        )
+        checkpoint = _api().read_h3_lite_decoder_checkpoint(lite_checkpoint_factory(changes=changes, state=state))
         assert checkpoint.kept_layers == (0,)
     else:
         with pytest.raises(ValueError, match="decoder_num_layers"):
@@ -456,10 +451,7 @@ def lite_directory_factory(tmp_path):
         config.update(config_changes or {})
         (component / "config.json").write_text(json.dumps(config), encoding="utf-8")
         if state is None:
-            state = {
-                f"decoder.transformer_blocks.{index}.scale1": torch.ones(2)
-                for index in range(student_layers)
-            }
+            state = {f"decoder.transformer_blocks.{index}.scale1": torch.ones(2) for index in range(student_layers)}
             state["post_quant_conv.weight"] = torch.ones(1)
         if shards == 1:
             save_file(state, component / "diffusion_pytorch_model.safetensors")
@@ -729,9 +721,7 @@ def test_apply_decode_profile_rejects_non_multiple_tile():
             self.decoder_tile_overlap_min = 64
 
     with pytest.raises(ValueError, match="multiple of the spatial ratio"):
-        _api("native").apply_h3_lite_decode_profile(
-            _Model(), _api().H3LiteDecodeProfile(tile_size=7, tile_overlap=0)
-        )
+        _api("native").apply_h3_lite_decode_profile(_Model(), _api().H3LiteDecodeProfile(tile_size=7, tile_overlap=0))
 
 
 def test_apply_decode_profile_rejects_token_window_mismatch():
@@ -760,6 +750,4 @@ def test_path_aliases_are_mutually_exclusive(tmp_path):
     assert api.resolve_h3_lightvae_decoder_path({"vae_path": path}) == path
     assert api.resolve_h3_lightvae_decoder_path({"vae_decoder_path": path}) == path
     with pytest.raises(ValueError, match="use only one"):
-        api.resolve_h3_lightvae_decoder_path(
-            {"vae_path": path, "lightvae_decoder_path": path}
-        )
+        api.resolve_h3_lightvae_decoder_path({"vae_path": path, "lightvae_decoder_path": path})
