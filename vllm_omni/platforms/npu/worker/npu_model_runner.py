@@ -20,7 +20,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
-from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
+from vllm_ascend.worker.v1.model_runner import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -33,9 +33,9 @@ logger = init_logger(__name__)
 
 
 if is_310p():
-    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
+    from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
 else:
-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
 
 class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
