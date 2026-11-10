@@ -16,7 +16,11 @@ Usage:
       --warmup 3 --iters 30 --out e2e_fp32.json
 
 Reports p50/p95/min/max over --iters round trips, plus the device-level memory
-high-water mark sampled from nvidia-smi during the run.
+high-water mark sampled from nvidia-smi during the run. nvidia-smi reads the GPU
+of the machine this client runs on, so it measures the server only when both
+share that GPU. When no sample succeeds (no nvidia-smi, an NVML error, a remote
+server's GPU), the peak is reported as null with the last sampling error, never
+as 0.
 """
 
 from __future__ import annotations
@@ -52,12 +56,23 @@ def make_obs(*, views: int, prompt: str, session_id: str, rng: np.random.Generat
 
 
 class MemorySampler(threading.Thread):
-    """Poll nvidia-smi at 5 Hz; report the high-water mark in MiB."""
+    """Poll nvidia-smi at 5 Hz; report the high-water mark in MiB.
+
+    ``peak_mib`` stays ``None`` until a sample succeeds, so a run in which every
+    sample failed reports no measurement rather than 0. Failed samples are
+    counted, and the last failure is kept to explain a missing peak.
+    """
+
+    SAMPLE_TIMEOUT_S = 5.0
+    POLL_INTERVAL_S = 0.2
 
     def __init__(self, gpu_index: int = 0) -> None:
         super().__init__(daemon=True)
         self.gpu_index = gpu_index
-        self.peak_mib = 0
+        self.peak_mib: int | None = None
+        self.samples_ok = 0
+        self.samples_failed = 0
+        self.last_error: str | None = None
         self._stop_evt = threading.Event()
 
     def run(self) -> None:
@@ -69,15 +84,23 @@ class MemorySampler(threading.Thread):
         ]
         while not self._stop_evt.is_set():
             try:
-                out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                self.peak_mib = max(self.peak_mib, int(out.stdout.strip().splitlines()[0]))
-            except Exception:  # noqa: BLE001 - sampling is best effort
-                pass
-            self._stop_evt.wait(0.2)
+                # check=True: a nonzero exit (an NVML error) is a failed sample.
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=self.SAMPLE_TIMEOUT_S, check=True)
+                used_mib = int(out.stdout.strip().splitlines()[0])
+            except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+                # Missing binary, nonzero exit or timeout, unparsable or empty output.
+                self.samples_failed += 1
+                stderr = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else ""
+                self.last_error = f"{type(exc).__name__}: {exc}" + (f" ({stderr})" if stderr else "")
+            else:
+                self.samples_ok += 1
+                self.peak_mib = used_mib if self.peak_mib is None else max(self.peak_mib, used_mib)
+            self._stop_evt.wait(self.POLL_INTERVAL_S)
 
     def stop(self) -> None:
         self._stop_evt.set()
-        self.join(timeout=5)
+        # Longer than one sample's timeout, so a sample in flight can finish.
+        self.join(timeout=2 * self.SAMPLE_TIMEOUT_S)
 
 
 def main() -> int:
@@ -102,6 +125,7 @@ def main() -> int:
     session_id = str(uuid.uuid4())
     uri = f"ws://{args.host}:{args.port}{OPENPI_PATH}"
 
+    sampler: MemorySampler | None = None
     conn = ws_client.connect(uri, compression=None, max_size=None, ping_interval=300, ping_timeout=3600)
     try:
         metadata = msgpack_numpy.unpackb(conn.recv())
@@ -140,10 +164,16 @@ def main() -> int:
             dt, shape = one_round_trip()
             samples.append(dt)
             shapes.add(shape)
-        sampler.stop()
     finally:
+        # Also on a failed request, so the sampling thread never outlives the run.
+        if sampler is not None:
+            sampler.stop()
         conn.close()
 
+    peak_mib = sampler.peak_mib
+    memory_error = None if peak_mib is not None else (sampler.last_error or "no nvidia-smi sample was taken")
+    if memory_error is not None:
+        print(f"WARNING: device memory peak unavailable, no nvidia-smi sample succeeded: {memory_error}")
     issue_order = list(samples)
     samples.sort()
     result = {
@@ -158,8 +188,11 @@ def main() -> int:
         "min_ms": round(samples[0], 2),
         "max_ms": round(samples[-1], 2),
         "mean_ms": round(statistics.fmean(samples), 2),
-        "device_peak_mib": sampler.peak_mib,
-        "device_peak_gib": round(sampler.peak_mib / 1024.0, 3),
+        # null when no nvidia-smi sample succeeded: unavailable, not 0.
+        "device_peak_mib": peak_mib,
+        "device_peak_gib": None if peak_mib is None else round(peak_mib / 1024.0, 3),
+        "device_memory_samples": {"ok": sampler.samples_ok, "failed": sampler.samples_failed},
+        "device_memory_error": memory_error,
         "metadata": {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in dict(metadata).items()},
     }
     print(json.dumps(result, indent=1))

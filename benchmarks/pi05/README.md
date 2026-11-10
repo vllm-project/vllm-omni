@@ -4,7 +4,7 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 
 | Script | Measures | Needs |
 | --- | --- | --- |
-| `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi`. | A running server |
+| `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi` on the client's machine, or `null` with the sampling error when no sample succeeds. | A running server |
 | `bench_pi05.py` | Model-level `sample_actions` latency and output shape over a batch size × camera-view sweep, with no serving stack. Writes `pi05_sweep.csv` and `pi05_sweep.md`. | A GPU and the checkpoint |
 
 ## Client E2E latency
@@ -20,6 +20,9 @@ vllm serve lerobot/pi05_base --omni --port 8000 --deploy-config vllm_omni/deploy
 
 python benchmarks/pi05/e2e_latency_pi05.py --host 127.0.0.1 --port 8000 --views 3 --warmup 3 --iters 30 --out e2e.json
 ```
+
+The device memory peak comes from `nvidia-smi` on the machine that runs the client, so run the client on the server's machine to measure the server.
+When no sample succeeds (no `nvidia-smi`, an NVML error), `device_peak_mib` and `device_peak_gib` are `null` and `device_memory_error` gives the reason.
 
 ## Model-level latency
 
