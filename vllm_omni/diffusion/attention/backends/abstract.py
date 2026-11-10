@@ -235,6 +235,23 @@ class PackedPaddingMetadata:
     cu_seqlens_k: torch.Tensor
 
 
+@dataclass(frozen=True)
+class DenoiseProgress:
+    """Read-only progress for one packed document, including its host-side Q length.
+
+    ``timestep`` is the model adapter's normalized descending noise time for
+    this evaluation; it can change within one sampler step (e.g. Heun).
+    Entries follow packed document order. ``sequence_length`` describes Q;
+    it does not replace ``AttentionMetadata.extra``'s independent Q/KV
+    boundaries or ``packed_padding``'s valid-token layout.
+    """
+
+    sequence_length: int
+    step_index: int
+    timestep: float
+    total_steps: int
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -292,6 +309,7 @@ class AttentionMetadata:
     cross_kv_rows_validated: bool = False
     cross_query_mask: torch.Tensor | None = None
     cross_pair_mask_validated: bool = False
+    denoise_progress: tuple[DenoiseProgress, ...] | None = None
 
     @classmethod
     def for_cross_kv_mask(cls, mask: torch.Tensor, *, kv_slice: slice | None = None) -> "AttentionMetadata":

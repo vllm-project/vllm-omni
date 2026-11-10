@@ -468,12 +468,11 @@ class TrtllmAttentionImpl(AttentionImpl):
     def set_layer_calibration(self, a: float, b: float) -> None:
         self.skip = replace(self.skip, a=a, b=b)
 
-    def _resolve_skip_factor(self, seqlen: int) -> float | None:
+    def _resolve_skip_factor(self, seqlen: int, timestep: float | None = None) -> float | None:
         if not self.skip.enabled:
             return None
 
-        timestep = None
-        if self.skip.gated:
+        if self.skip.gated and timestep is None:
             from vllm_omni.diffusion.forward_context import get_forward_context
 
             timestep = getattr(get_forward_context(), "denoise_timestep", None)
@@ -603,6 +602,37 @@ class TrtllmAttentionImpl(AttentionImpl):
                 "another backend via --diffusion-attention-backend."
             )
 
+        progress = attn_metadata.denoise_progress if attn_metadata is not None else None
+        timestep = None
+        if progress and self.skip.enabled and self.skip.gated:
+            if (
+                query.shape[0] != 1
+                or key.shape[0] != 1
+                or value.shape[:2] != key.shape[:2]
+                or any(p.sequence_length <= 0 for p in progress)
+            ):
+                raise ValueError("Denoise progress requires a single physical packed batch with positive Q lengths")
+            if packed_padding is not None:
+                # This layout contains one real document and an optional unused
+                # tail. Keep the original padding metadata and let the existing
+                # path trim Q/KV and zero-fill the output. Padding has no gate.
+                lengths = tuple(p.sequence_length for p in progress)
+                real_length = packed_padding.q_length
+                if lengths not in ((real_length,), (real_length, query.shape[1] - real_length)):
+                    raise ValueError("Denoise progress must match packed-padding Q boundaries")
+                progress = progress[:1]
+            elif sum(p.sequence_length for p in progress) != query.shape[1]:
+                raise ValueError("Denoise progress must cover the packed Q sequence")
+            timestep = max(p.timestep for p in progress)
+            gates = {p.timestep > self.skip.disabled_until_timestep for p in progress}
+            if len(gates) > 1:
+                # The kernel takes one skip factor. Keep the DiT batched, but
+                # evaluate documents independently when their gate decisions differ.
+                if not has_packed_metadata:
+                    raise ValueError("Mixed denoise gates require explicit packed Q/KV boundaries")
+                assert attn_metadata is not None
+                return self._forward_mixed_gate(query, key, value, attn_metadata)
+
         physical_batch, q_len, num_q_heads, head_dim = query.shape
         kv_len, num_kv_heads = key.shape[1], key.shape[2]
         device = query.device
@@ -662,7 +692,7 @@ class TrtllmAttentionImpl(AttentionImpl):
         bmm1_scale = self.softmax_scale
         bmm2_scale = 1.0
 
-        _skip_factor = self._resolve_skip_factor(max_kv_len)
+        _skip_factor = self._resolve_skip_factor(max_kv_len, timestep)
 
         sage_q_sf = sage_k_sf = sage_v_sf = None
         sage_q_block_size = sage_k_block_size = 0
@@ -708,3 +738,61 @@ class TrtllmAttentionImpl(AttentionImpl):
             padded_out[: out.shape[0]] = out
             out = padded_out
         return out.reshape(physical_batch, q_len, num_q_heads, head_dim)
+
+    def _forward_mixed_gate(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Split by the original Q/KV boundaries, preserving per-call metadata.
+
+        Only this eager fallback reads packed offsets on the host. Progress
+        supplies Q lengths and timesteps, not a replacement KV layout. Fields
+        owned by the outer attention/parallel layer remain on the copied
+        metadata; this backend continues to ignore unknown extension fields.
+        """
+        extra = metadata.extra
+        cuq, cuk = extra["cu_seqlens_q"], extra["cu_seqlens_k"]
+        if cuq.ndim != 1 or cuk.ndim != 1 or cuq.numel() != cuk.numel() or cuq.numel() < 2:
+            raise ValueError("Mixed denoise gates require matching one-dimensional packed Q/KV boundaries")
+        if cuq.dtype != torch.int32 or cuk.dtype != torch.int32:
+            raise ValueError("Mixed denoise gates require int32 packed Q/KV boundaries")
+        if cuq.device != query.device or cuk.device != key.device:
+            raise ValueError("Packed Q/KV boundaries must be on the corresponding tensor device")
+        q_bounds, kv_bounds = cuq.tolist(), cuk.tolist()
+        if q_bounds[0] != 0 or kv_bounds[0] != 0 or q_bounds[-1] != query.shape[1] or kv_bounds[-1] != key.shape[1]:
+            raise ValueError("Packed Q/KV boundaries must cover all tokens starting at zero")
+        # Match the ordinary packed path's optional empty alignment tail.
+        while len(q_bounds) > 2 and q_bounds[-1] == q_bounds[-2] and kv_bounds[-1] == kv_bounds[-2]:
+            q_bounds.pop()
+            kv_bounds.pop()
+        q_lengths = [end - start for start, end in zip(q_bounds, q_bounds[1:])]
+        kv_lengths = [end - start for start, end in zip(kv_bounds, kv_bounds[1:])]
+        progress = metadata.denoise_progress
+        assert progress is not None
+        if q_lengths != [p.sequence_length for p in progress] or any(length <= 0 for length in kv_lengths):
+            raise ValueError("Denoise progress must match packed Q boundaries with nonempty corresponding KV documents")
+
+        outputs = []
+        for i, p in enumerate(progress):
+            q_start, q_end = q_bounds[i : i + 2]
+            kv_start, kv_end = kv_bounds[i : i + 2]
+            # Rebase the original tensors without modifying caller-owned state.
+            local_extra = dict(extra)
+            local_extra.update(
+                cu_seqlens_q=cuq[i : i + 2] - cuq[i],
+                cu_seqlens_k=cuk[i : i + 2] - cuk[i],
+                max_seqlen_q=q_end - q_start,
+                max_seqlen_k=kv_end - kv_start,
+            )
+            if "valid_kv_length" in extra:
+                local_extra["valid_kv_length"] = max(0, min(extra["valid_kv_length"] - kv_start, kv_end - kv_start))
+            local_metadata = replace(metadata, extra=local_extra, denoise_progress=(p,))
+            outputs.append(
+                self.forward_cuda(
+                    query[:, q_start:q_end], key[:, kv_start:kv_end], value[:, kv_start:kv_end], local_metadata
+                )
+            )
+        return torch.cat(outputs, dim=1)

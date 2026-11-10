@@ -201,6 +201,12 @@ A pipeline that does not publish `t` stays dense whenever
 `disabled_until_timestep > 0` is set, and logs a warning once. Pipelines
 publish it through `DenoiseProgressMixin.record_denoise_step`.
 
+H3 also publishes per-document progress for packed requests, including each
+Heun model evaluation. Requests at different timesteps remain batched when
+their gate decisions agree. When they fall on opposite sides of the cutoff,
+TRTLLM evaluates the attention documents separately because its kernel accepts
+one skip factor per call; the rest of the DiT forward remains batched.
+
 ## SAGE quantization
 
 SAGE quantization runs both attention matrix multiplications in low precision:
