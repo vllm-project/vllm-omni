@@ -21,7 +21,7 @@ import vllm_omni.diffusion.cuda_graph as cuda_graph_mod
 import vllm_omni.diffusion.distributed.utils as dist_utils
 import vllm_omni.diffusion.graph as graph_mod
 from vllm_omni.diffusion.cuda_graph import GraphedForward, copy_into
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, SkipSoftmaxSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, SkipSoftmaxSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.graph import (
     DENOISE_GRAPH_MAX_ENTRIES,
@@ -200,6 +200,15 @@ _GATED_SKIP_SOFTMAX = AttentionSpec(
         ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, None),
         ({"diffusion_attention_config": AttentionConfig(default=_GATED_SKIP_SOFTMAX)}, None),
         ({"diffusion_attention_config": AttentionConfig(per_role={"self": _GATED_SKIP_SOFTMAX})}, None),
+        (
+            {
+                "diffusion_attention_schedule": AttentionScheduleConfig(
+                    profiles={"sparse": AttentionConfig()}, default=[{"start": 10, "end": None, "profile": "sparse"}]
+                )
+            },
+            None,
+        ),
+        ({"diffusion_attention_schedule": AttentionScheduleConfig(profiles={"sparse": AttentionConfig()})}, None),
         ({}, "pipeline-specific reason"),
     ],
 )

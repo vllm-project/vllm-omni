@@ -66,6 +66,9 @@ value. In these cases the runner is not built, a warning starting with
   block graphs.
 - `TRTLLM_ATTN` with `skip_softmax.disabled_until_timestep > 0`: attention
   changes with the timestep.
+- `diffusion_attention_schedule` profiles, even with an empty default schedule:
+  the attention profile is selected by step index, and requests can bring their
+  own ranges.
 - A cache backend (`cache_backend` other than `none`): it decides per step
   whether the transformer runs.
 - Any CPU offload strategy, including layerwise, distributed layerwise, and

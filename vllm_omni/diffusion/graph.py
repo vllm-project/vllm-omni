@@ -113,6 +113,9 @@ def _step_dependent_attention(od_config: Any) -> str | None:
         od_config, "diffusion_kv_cache_skip_step_indices", None
     ):
         return "diffusion_kv_cache_skip_steps makes KV quantization depend on the step index"
+    # Checked even with an empty default: requests can bring their own ranges.
+    if getattr(od_config, "diffusion_attention_schedule", None) is not None:
+        return "diffusion_attention_schedule selects the attention profile by step index"
     attention_config = getattr(od_config, "diffusion_attention_config", None)
     if attention_config is not None:
         specs = [attention_config.default, *attention_config.per_role.values()]
