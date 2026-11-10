@@ -163,7 +163,7 @@ In `DiffusionParallelConfig`:
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
-| `ulysses_a2a_backend` | str or None | `None` | Strict Ulysses exchange backend: `nccl`, `lsa` (SM-based fused transport), or `ce` (NVLink copy engines). `ce` requires the matching optional `fast-ulysses` wheel. |
+| `ulysses_a2a_backend` | str or None | `None` | Strict Ulysses exchange backend: `nccl` or `ce` (CUDA copy engines over peer-accessible symmetric memory). |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -171,15 +171,14 @@ In `DiffusionParallelConfig`:
 - Total sequence parallel size equals to `ulysses_degree × ring_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
-- `ulysses_a2a_backend="ce"` is for one NVLink-connected node. Install the `fast-ulysses` wheel matching the installed PyTorch and CUDA versions before starting workers; for CUDA 13, use `pip install fast-ulysses --index-url https://triple-mu.github.io/fast-ulysses/whl/cu13/` (use the `cu12/` index for CUDA 12). It is selected in the Omni attention path and does not require a worker extension.
+- `ulysses_a2a_backend="ce"` is for one NVLink-connected node with CUDA symmetric-memory support.
 
 The explicit backend takes precedence over the legacy `ulysses_a2a_permute` flag.
-Without an explicit backend, `ulysses_a2a_permute=True` selects LSA and the default
-selects NCCL. Explicit LSA and CE require `ulysses_degree > 1` and
-`ulysses_mode="strict"`. CE initialization checks that each Ulysses subgroup is
-on one host; the `fast-ulysses` runtime then requires that host's GPUs to be
-connected by the supported NVLink topology and raises an error if it cannot
-create the copy-engine group.
+Without an explicit backend, `ulysses_a2a_permute=True` selects CE for eligible
+strict layouts and the default selects NCCL. Explicit CE requires `ulysses_degree > 1` and
+`ulysses_mode="strict"`. All ranks of each CE Ulysses subgroup must be on one
+host with peer-accessible GPUs; CUDA symmetric-memory rendezvous establishes
+the peer mappings.
 
 Select CE for offline inference with:
 
@@ -197,33 +196,36 @@ The same option is available to the serving CLI and to stage deploy configs:
 vllm serve Qwen/Qwen-Image --omni --ulysses-degree 4 --ulysses-a2a-backend ce
 ```
 
-Workers initialize CE on their Ulysses process subgroup before loading the model,
-reuse its symmetric-memory resources for Q/K/V and output exchanges, and release
-them before destroying process groups at shutdown. In eager execution, CE uses
-distinct reusable symmetric output buffers for Q, K, V, and the reverse exchange
-to avoid copying each result out of the CE window. A cache miss during CUDA Graph
-capture or `torch.compile` uses the functional API instead, preserving output
-ownership and compiler alias semantics. End-to-end speedups depend on the model
-and workload.
+CE pushes the original Q/K/V shards together into peer-accessible symmetric
+outputs using `cudaMemcpy2DAsync` (or `cudaMemcpy3DAsync` for batched inputs).
+Remote copies use a transfer stream while the current stream copies the local
+shard. Stream-ordered barriers protect workspace reuse and wait for all writes.
+The results are copied into fresh local outputs, which remain valid across
+later exchanges, including under `torch.compile`.
 
-### Qwen-Image performance example
+CE caches a CUDA Graph for the latest eligible layout in each direction.
+Equal-shape Q/K/V inputs up to 5 MiB each share one staging allocation and
+one `torch.cat` copy. Other layouts and O use a 4 MiB limit per input tensor.
+Each call stages the current inputs, replays communication directly into the
+symmetric workspace, and returns a fresh output. The first call for a layout
+includes graph capture and warmup. Per device and subgroup, the latest Q/K/V
+and O plans retain at most 19 MiB of staging tensors combined; CUDA Graph
+metadata and allocator rounding add to this amount. For equal-size Q/K/V
+and O between 4 and 5 MiB, only Q/K/V use Graph, retaining at most 15 MiB
+after both plans have been updated. Larger inputs use direct CE.
+When captured by an outer CUDA Graph, CE records the direct copies without
+creating a nested graph or staging the inputs.
 
-We measured the complete Qwen-Image generation path with a 1536×1536 image, 20
-steps, BF16, FlashAttention, eager execution, Ulysses degree 2, and two
-NVLink-connected L20X GPUs. The measurement included text encoding, denoising,
-VAE decode, and CPU image return, while excluding model loading and warmup. LSA
-took 10.294 s and CE took 10.097 s in the trace-validated run, a reduction of
-about **1.9%**. The generated image pixels were bit-identical.
+Each device and Ulysses subgroup retains one grow-only workspace sized to
+`Q.nbytes + K.nbytes + V.nbytes` at the largest warmed-up shape. The reverse
+exchange reuses the same allocation. Copy plans retain only the latest layout
+per direction and are discarded with the workspace.
 
-The trace explains where that gain comes from: the complete communication
-window fell from 1219 ms with LSA to 976 ms with CE (about 20%), while the rest
-of the GPU work stayed similar. This version of Ulysses still waits for Q/K/V
-exchange before attention and for attention before the reverse exchange, so the
-measurement does not include communication-compute overlap. A future sharded
-attention implementation can use CE's independent copy engines with double
-buffering or chunked execution to overlap transfers with independent attention
-work; that is an expected follow-up opportunity rather than a claim about the
-current measurement.
+Workers release the shared workspace before destroying process groups.
+Warm up the maximum request shape before CUDA Graph capture; workspace growth
+during capture is rejected. Exchanges still precede attention or follow it in
+stream order, without communication-compute overlap. End-to-end speedups depend
+on the model and workload.
 
 ## Best Practices
 

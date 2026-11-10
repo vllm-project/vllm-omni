@@ -224,13 +224,13 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
+    """Use CE transport for eligible strict Ulysses exchanges unless a backend is explicit."""
 
     ulysses_a2a_backend: str | None = None
-    """Strict Ulysses transport: ``nccl``, ``lsa`` (SM), or ``ce`` (copy engines).
+    """Strict Ulysses transport: ``nccl`` or ``ce`` (copy engines).
 
-    When omitted, ``ulysses_a2a_permute`` selects LSA if true, NCCL otherwise.
-    CE requires the optional fast-ulysses package and a single NVLink node.
+    When omitted, ``ulysses_a2a_permute`` selects CE if true, NCCL otherwise.
+    CE uses CUDA copy engines and requires a single NVLink-connected node.
     """
 
     cfg_parallel_size: int = 1
@@ -313,13 +313,11 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
-        if self.ulysses_a2a_backend not in {None, "nccl", "lsa", "ce"}:
-            raise ValueError("ulysses_a2a_backend must be 'nccl', 'lsa', or 'ce'")
-        if self.ulysses_a2a_backend in {"lsa", "ce"}:
+        if self.ulysses_a2a_backend not in {None, "nccl", "ce"}:
+            raise ValueError("ulysses_a2a_backend must be 'nccl' or 'ce'")
+        if self.ulysses_a2a_backend == "ce":
             if self.ulysses_degree <= 1 or self.ulysses_mode != "strict":
-                raise ValueError(
-                    "Explicit LSA/CE Ulysses transport requires ulysses_degree > 1 and ulysses_mode='strict'"
-                )
+                raise ValueError("CE Ulysses transport requires ulysses_degree > 1 and ulysses_mode='strict'")
 
         # Validate HSDP configuration
         if self.use_hsdp:

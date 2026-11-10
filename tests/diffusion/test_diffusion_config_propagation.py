@@ -74,6 +74,7 @@ class TestParallelConfigPropagation:
             ({"ulysses_degree": 1, "ulysses_a2a_backend": "ce"}, "ulysses_degree > 1"),
             ({"ulysses_degree": 2, "ulysses_mode": "advanced_uaa", "ulysses_a2a_backend": "ce"}, "strict"),
             ({"ulysses_degree": 2, "ulysses_a2a_backend": "unknown"}, "must be"),
+            ({"ulysses_degree": 2, "ulysses_a2a_backend": "lsa"}, "must be"),
         ],
     )
     def test_unsupported_ulysses_a2a_backend_rejected(self, kwargs, message):

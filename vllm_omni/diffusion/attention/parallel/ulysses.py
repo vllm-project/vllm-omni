@@ -16,11 +16,6 @@ from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGr
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
-def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
-    """Whether the fused permute-free all-to-all applies (strict layout only)."""
-    return enabled and world_size > 1 and scatter_idx == 2 and gather_idx == 1
-
-
 def _ceil_div(n: int, d: int) -> int:
     return (n + d - 1) // d
 
@@ -194,40 +189,43 @@ class UlyssesParallelAttention:
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
-        self._ulysses_a2a_backend = ulysses_a2a_backend or ("lsa" if ulysses_a2a_permute else "nccl")
-        self._use_fused_a2a = _a2a_permute_enabled(
-            self._ulysses_a2a_backend in {"lsa", "ce"},
-            scatter_idx,
-            gather_idx,
-            sp_group.ulysses_world_size,
-        )
-        if self._ulysses_a2a_backend == "ce" and not self._use_fused_a2a:
+        if ulysses_a2a_backend not in {None, "nccl", "ce"}:
+            raise ValueError("ulysses_a2a_backend must be 'nccl' or 'ce'")
+        backend = ulysses_a2a_backend or ("ce" if ulysses_a2a_permute else "nccl")
+        self._use_ce = backend == "ce" and sp_group.ulysses_world_size > 1 and scatter_idx == 2 and gather_idx == 1
+        if ulysses_a2a_backend == "ce" and not self._use_ce:
             raise ValueError("CE Ulysses requires a strict 4D head/sequence exchange and ulysses_degree > 1")
-        if self._use_fused_a2a:
-            if self._ulysses_a2a_backend == "ce":
-                from vllm_omni.diffusion.distributed.ce_ulysses import initialize_ulysses_groups
+        if self._use_ce:
+            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
 
-                initialize_ulysses_groups(sp_group)
-            else:
-                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+            ensure_a2a_permute_available()
 
-                ensure_a2a_permute_available()
+    def _ce_output_exchange(self, tensor: torch.Tensor) -> torch.Tensor:
+        from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
-    def _fused_exchange(self, tensor: torch.Tensor, mode: int, slot: int = -1) -> torch.Tensor:
         world_size = self._sp_group.ulysses_world_size
         group_name = self._ulysses_pg.group_name
-        if self._ulysses_a2a_backend == "ce":
-            from vllm_omni.diffusion.distributed import ce_ulysses
-
-            # Compiled calls need independently owned outputs for compiler alias semantics.
-            slot = -1 if torch.compiler.is_compiling() else slot
-            result = ce_ulysses.ulysses_all_to_all_4d(tensor, group_name, world_size, mode, slot)
-        else:
-            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev, ulysses_qkv_fwd
-
-            result = (ulysses_qkv_fwd if mode == 0 else ulysses_o_rev)(tensor, group_name, world_size)
+        result = ulysses_o_rev(tensor, group_name, world_size)
         if self._use_sync:
             torch.accelerator.synchronize(tensor.device)
+        return result
+
+    def _ce_qkv_exchange(self, query, key, value):
+        from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_ce
+
+        p = self._sp_group.ulysses_world_size
+        inputs = (query, key, value)
+        packed = ulysses_qkv_ce(*inputs, self._ulysses_pg.group_name, p)
+        if query.shape == key.shape == value.shape:
+            b, s, h, d = query.shape
+            result = packed.view(3, b, s * p, h // p, d).unbind(0)
+        else:
+            result = tuple(
+                part.view(x.size(0), x.size(1) * p, x.size(2) // p, x.size(3))
+                for part, x in zip(packed.split([x.numel() for x in inputs]), inputs)
+            )
+        if self._use_sync:
+            torch.accelerator.synchronize(query.device)
         return result
 
     @property
@@ -389,10 +387,8 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            if self._use_fused_a2a:
-                query = self._fused_exchange(query, 0, slot=0)
-                key = self._fused_exchange(key, 0, slot=1)
-                value = self._fused_exchange(value, 0, slot=2)
+            if self._use_ce:
+                query, key, value = self._ce_qkv_exchange(query, key, value)
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -507,8 +503,8 @@ class UlyssesParallelAttention:
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
-            elif self._use_fused_a2a:
-                output_img = self._fused_exchange(output_img, 1, slot=3)
+            elif self._use_ce:
+                output_img = self._ce_output_exchange(output_img)
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -541,6 +537,6 @@ class UlyssesParallelAttention:
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
             )
-        if self._use_fused_a2a:
-            return self._fused_exchange(attn_output, 1, slot=3)
+        if self._use_ce:
+            return self._ce_output_exchange(attn_output)
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

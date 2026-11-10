@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Production Ulysses transports against an independent distributed reference.
+"""CE Ulysses transport against an independent distributed reference.
 
-Run through the shared GPU scheduler; each backend gets fresh worker processes.
+Run through the shared GPU scheduler with fresh worker processes.
 """
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -33,27 +32,30 @@ def _reference(x, mode, pg):
     return torch.cat(slices, dim=1 if mode == 0 else 2)
 
 
-def _worker(rank, init_method, backend):
-    from vllm_omni.diffusion.distributed import a2a_permute, ce_ulysses
+def _worker(rank, init_method, world_size=4):
+    from vllm_omni.diffusion.distributed import a2a_permute
 
     device = torch.device("cuda", rank)
     current_omni_platform.set_device(device)
-    init_distributed_environment(world_size=4, rank=rank, local_rank=rank, distributed_init_method=init_method)
-    initialize_model_parallel(data_parallel_size=1, sequence_parallel_size=4, ulysses_degree=4)
+    init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank, distributed_init_method=init_method)
+    initialize_model_parallel(data_parallel_size=1, sequence_parallel_size=world_size, ulysses_degree=world_size)
     try:
         group = get_sp_group()
-        strategy = UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_backend=backend)
+        strategy = UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_backend="ce")
         checks = 0
         torch.manual_seed(1234 + rank)
-        with torch.inference_mode():
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream), torch.inference_mode():
             for dtype in (torch.float16, torch.bfloat16):
                 for batch, sequence, heads in ((1, 17, 8), (2, 65, 16), (1, 33, 8), (1, 17, 8)):
                     # Strided inputs exercise the functional API's packing contract.
                     x = torch.randn(batch, sequence, heads, 128, device=device, dtype=dtype)[..., ::2]
-                    q, k, v, _, ctx = strategy.pre_attention(x, x + 1, x + 2, None)
+                    # CE groups Q/K/V while allowing fewer K/V heads (GQA).
+                    kv = x[:, :, :4]
+                    q, k, v, _, ctx = strategy.pre_attention(x, kv + 1, kv + 2, None)
                     torch.testing.assert_close(q, _reference(x, 0, group.ulysses_group), rtol=0, atol=0)
-                    torch.testing.assert_close(k, _reference(x + 1, 0, group.ulysses_group), rtol=0, atol=0)
-                    torch.testing.assert_close(v, _reference(x + 2, 0, group.ulysses_group), rtol=0, atol=0)
+                    torch.testing.assert_close(k, _reference(kv + 1, 0, group.ulysses_group), rtol=0, atol=0)
+                    torch.testing.assert_close(v, _reference(kv + 2, 0, group.ulysses_group), rtol=0, atol=0)
                     retained = q.clone()
                     arbitrary_output = torch.randn_like(q)
                     result = strategy.post_attention(arbitrary_output, ctx)
@@ -63,24 +65,29 @@ def _worker(rank, init_method, backend):
                     torch.testing.assert_close(q, retained, rtol=0, atol=0)
                     checks += 5
             # Full-graph Dynamo capture must keep the group-bound op opaque.
-            compiled_exchange = torch.compile(
-                lambda tensor, mode: strategy._fused_exchange(tensor, mode, slot=0),
-                backend="eager",
-                fullgraph=True,
-            )
-            output = compiled_exchange(x, 0)
-            torch.testing.assert_close(output, _reference(x, 0, group.ulysses_group), rtol=0, atol=0)
-            print(f"native {backend} rank={rank}: {checks + 1} exact reference/lifetime checks passed", flush=True)
+            compiled_exchange = torch.compile(strategy._ce_qkv_exchange, backend="eager", fullgraph=True)
+            for actual, source in zip(compiled_exchange(x, kv + 1, kv + 2), (x, kv + 1, kv + 2)):
+                torch.testing.assert_close(actual, _reference(source, 0, group.ulysses_group), rtol=0, atol=0)
+                checks += 1
+            # Capture without nesting the transport-local graph, then replay
+            # with new input values.
+            strategy._ce_qkv_exchange(x, kv + 1, kv + 2)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured_q, _, _ = strategy._ce_qkv_exchange(x, kv + 1, kv + 2)
+                captured_round_trip = strategy._ce_output_exchange(captured_q)
+            x.add_(1)
+            graph.replay()
+            torch.testing.assert_close(captured_q, _reference(x, 0, group.ulysses_group), rtol=0, atol=0)
+            torch.testing.assert_close(captured_round_trip, x, rtol=0, atol=0)
+            checks += 2
+            print(f"native CE rank={rank}: {checks} exact reference/lifetime checks passed", flush=True)
     finally:
-        ce_ulysses.clear_ulysses_groups()
         a2a_permute.clear_a2a_permute_workspaces()
         destroy_distributed_env()
 
 
-@pytest.mark.parametrize("backend", ["lsa", "ce"])
-def test_native_ulysses_transport(backend):
+def test_native_ulysses_transport(tmp_path):
     if torch.accelerator.device_count() < 4:
         pytest.skip("Requires four scheduler-allocated NVLink GPUs")
-    if backend == "ce":
-        pytest.importorskip("fast_ulysses")
-    torch.multiprocessing.spawn(_worker, args=(get_distributed_init_method(), backend), nprocs=4)
+    torch.multiprocessing.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=4)

@@ -309,24 +309,21 @@ class TestDiffusionWorkerShutdown:
         worker.model_runner = None
         events = []
         mocker.patch(
-            "vllm_omni.diffusion.distributed.ce_ulysses.clear_ulysses_groups", side_effect=lambda: events.append("ce")
-        )
-        mocker.patch(
             "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
-            side_effect=lambda: events.append("lsa"),
+            side_effect=lambda: events.append("workspace"),
         )
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
             side_effect=lambda: events.append("process_groups"),
         )
         worker.shutdown()
-        assert events == ["ce", "lsa", "process_groups"]
+        assert events == ["workspace", "process_groups"]
 
     def test_destroys_process_groups_after_transport_cleanup_error(self, mocker: MockerFixture):
         worker = DiffusionWorker.__new__(DiffusionWorker)
         worker.model_runner = None
         mocker.patch(
-            "vllm_omni.diffusion.distributed.ce_ulysses.clear_ulysses_groups",
+            "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
             side_effect=RuntimeError("collective cleanup failed"),
         )
         destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")

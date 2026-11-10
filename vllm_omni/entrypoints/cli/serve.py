@@ -545,17 +545,17 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
+                "Enable CUDA copy-engine Ulysses all-to-all over symmetric memory. "
                 "Only strict Ulysses layouts are eligible. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
             "--ulysses-a2a-backend",
-            choices=["nccl", "lsa", "ce"],
+            choices=["nccl", "ce"],
             default=None,
             help=(
-                "Strict Ulysses all-to-all transport: NCCL, SM/LSA, or copy engines (CE). "
-                "CE requires fast-ulysses and single-node NVLink. Overrides --ulysses-a2a-permute."
+                "Strict Ulysses all-to-all transport: NCCL or CUDA copy engines (CE). "
+                "CE requires single-node NVLink. Overrides --ulysses-a2a-permute."
             ),
         )
         omni_config_group.add_argument(
