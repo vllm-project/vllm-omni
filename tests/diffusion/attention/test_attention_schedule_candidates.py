@@ -147,6 +147,11 @@ def _make_config(
 @pytest.fixture
 def attention_env(monkeypatch):
     """Patch the layer module so Attention constructs against fake backends."""
+    # OmniDiffusionConfig.__post_init__ reads these into an empty AttentionConfig.
+    # Clear them so baseline stays PLATFORM_DEFAULT unless a test sets one explicitly
+    # (CI agents often export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA; see #10088).
+    monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
+    monkeypatch.delenv("DIFFUSION_ATTENTION_QUANT", raising=False)
     monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
     monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
     monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
