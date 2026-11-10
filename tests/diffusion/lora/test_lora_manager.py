@@ -1792,7 +1792,7 @@ def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
 def test_adapter_state_changes_invalidate_denoise_graphs(monkeypatch):
     """Captured denoise graphs froze the LoRA masks and scale, so every change of
     the active adapter must drop them; repeating the same adapter must not."""
-    import vllm_omni.diffusion.lora.manager as manager_mod
+    import vllm_omni.lora.manager as manager_mod
 
     reasons: list[str] = []
     monkeypatch.setattr(manager_mod, "invalidate_denoise_graphs", reasons.append)
