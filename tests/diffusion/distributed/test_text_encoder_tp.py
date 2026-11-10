@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 import torch
 from torch import nn
-from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+from transformers import (
+    Qwen2_5_VLConfig,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLConfig,
+    Qwen3VLForConditionalGeneration,
+)
 
 from vllm_omni.diffusion.distributed import text_encoder_tp
 from vllm_omni.diffusion.distributed.text_encoder_tp import (
@@ -62,15 +67,41 @@ def _tiny_qwen25_vl() -> Qwen2_5_VLForConditionalGeneration:
     return model
 
 
+def _tiny_qwen3_vl() -> Qwen3VLForConditionalGeneration:
+    """Qwen-Image-2.1's encoder family; its transformers config ships no TP plan."""
+    config = Qwen3VLConfig(
+        text_config=dict(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=64,
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 3, 3], "mrope_interleaved": True},
+        ),
+        vision_config=dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64),
+    )
+    torch.manual_seed(0)
+    model = Qwen3VLForConditionalGeneration(config).eval()
+    del model.model.visual
+    return model
+
+
+_ENCODERS = {"qwen2_5_vl": _tiny_qwen25_vl, "qwen3_vl": _tiny_qwen3_vl}
+
+
 def _last_hidden(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), output_hidden_states=True)
     return out.hidden_states[-1]
 
 
+@pytest.mark.parametrize("encoder", sorted(_ENCODERS))
 @pytest.mark.parametrize("tp_size", [2])
-def test_sharded_encoder_matches_unsharded(tp_size):
-    base = _tiny_qwen25_vl()
+def test_sharded_encoder_matches_unsharded(tp_size, encoder):
+    base = _ENCODERS[encoder]()
     input_ids = torch.randint(0, 128, (2, 9))
     expected = _last_hidden(base, input_ids)
 
@@ -111,6 +142,20 @@ def test_shard_layout():
     assert layer.mlp.down_proj.weight.shape == (64, 64)
     # Embeddings and norms stay replicated.
     assert model.model.language_model.embed_tokens.weight.shape == (128, 64)
+
+
+def test_qwen3_vl_uses_fallback_plan():
+    model = _tiny_qwen3_vl()
+    assert not getattr(model.config.get_text_config(decoder=True), "base_model_tp_plan", None)
+    model = shard_text_encoder(model, _ThreadGroup(2, 0, {}))
+    layer = model.model.language_model.layers[0]
+    assert layer.self_attn.q_proj.weight.shape == (32, 64)
+    assert layer.self_attn.k_proj.weight.shape == (16, 64)
+    assert isinstance(layer.self_attn.o_proj, RowShardedLinear)
+    assert layer.self_attn.o_proj.weight.shape == (64, 32)
+    assert isinstance(layer.mlp.down_proj, RowShardedLinear)
+    # Per-head q/k norms run on head_dim and stay replicated.
+    assert layer.self_attn.q_norm.weight.shape == (16,)
 
 
 def test_tp_size_must_divide_kv_heads():

@@ -28,6 +28,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -376,8 +377,14 @@ class QwenImage21Pipeline(
                 subfolder="text_encoder",
                 prefetch_list=qwen_subfolders,
                 local_files_only=local_files_only,
-            ).to(self.device)
+            )
+            # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+            self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(self.device)
         else:
+            if od_config.parallel_config.text_encoder_tp_size > 1:
+                raise ValueError(
+                    "Qwen-Image-2.1: --text-encoder-tp-size > 1 is not supported with a quantized text encoder"
+                )
             # Quantized path: build the HF model on meta, swap its nn.Linear
             # modules for vLLM quantizable linears, and stream the weights
             # through the pipeline loader (same integration as Z-Image). The

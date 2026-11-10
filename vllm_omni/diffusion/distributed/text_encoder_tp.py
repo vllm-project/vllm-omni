@@ -10,7 +10,8 @@ parallel layout.
 
 :func:`maybe_shard_text_encoder` shards such an encoder in place with the
 model's own ``base_model_tp_plan`` (the plan transformers ships for its
-``tp_plan="auto"`` support): ``colwise`` linears keep a slice of their output
+``tp_plan="auto"`` support; :data:`_FALLBACK_TP_PLANS` supplies it for text
+configs that ship none): ``colwise`` linears keep a slice of their output
 features and ``rowwise`` linears keep a slice of their input features and
 all-reduce their output.  Transformers attention reshapes projections with
 ``-1`` heads, so the attention modules work on the local heads unchanged.
@@ -38,6 +39,23 @@ from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
 from vllm_omni.diffusion.distributed.parallel_state import get_text_encoder_tp_group
 
 logger = init_logger(__name__)
+
+# Plans for text configs whose transformers class ships no ``base_model_tp_plan``,
+# keyed by ``model_type``. Qwen3-VL (Qwen-Image-2.1's encoder) uses the same
+# decoder-layer projection names as Qwen2.5-VL; its per-head q/k RMSNorms run on
+# ``head_dim`` and stay replicated.
+_QWEN_DECODER_TP_PLAN = {
+    "layers.*.self_attn.q_proj": "colwise",
+    "layers.*.self_attn.k_proj": "colwise",
+    "layers.*.self_attn.v_proj": "colwise",
+    "layers.*.self_attn.o_proj": "rowwise",
+    "layers.*.mlp.gate_proj": "colwise",
+    "layers.*.mlp.up_proj": "colwise",
+    "layers.*.mlp.down_proj": "rowwise",
+}
+_FALLBACK_TP_PLANS: dict[str, dict[str, str]] = {
+    "qwen3_vl_text": _QWEN_DECODER_TP_PLAN,
+}
 
 _COLWISE = "colwise"
 _ROWWISE = "rowwise"
@@ -94,7 +112,7 @@ def _find_tp_plan(model: nn.Module) -> tuple[dict[str, str], Any]:
         candidates.append(config.get_text_config(decoder=True))
     candidates.append(config)
     for cfg in candidates:
-        plan = getattr(cfg, "base_model_tp_plan", None)
+        plan = getattr(cfg, "base_model_tp_plan", None) or _FALLBACK_TP_PLANS.get(getattr(cfg, "model_type", None))
         if plan:
             return dict(plan), cfg
     raise ValueError(

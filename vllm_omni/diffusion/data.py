@@ -302,7 +302,7 @@ class DiffusionParallelConfig:
 
     - MiniMax-H3 shards its Qwen3-VL encoder across the first
       ``text_encoder_tp_size`` DiT ranks.
-    - Pipelines using ``maybe_shard_text_encoder`` (Qwen-Image family) shard a
+    - Pipelines using ``maybe_shard_text_encoder`` (Qwen-Image family, incl. Qwen-Image-2.1) shard a
       Hugging Face encoder with its ``base_model_tp_plan``; groups tile each
       data-parallel replica, so the size must divide the replica's rank count
       (world size / data_parallel_size).

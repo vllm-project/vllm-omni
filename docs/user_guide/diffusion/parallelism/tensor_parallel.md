@@ -88,16 +88,19 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 ## Text Encoder Tensor Parallelism
 
-`--text-encoder-tp-size N` (`DiffusionParallelConfig.text_encoder_tp_size`) shards the text encoder across groups of `N` DiT ranks. For pipelines that load a Hugging Face encoder (currently the Qwen-Image family: Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-Plus, Qwen-Image-Layered), the encoder is sharded with the model's own Transformers `base_model_tp_plan`: attention and MLP projections are split, embeddings and norms stay replicated.
+`--text-encoder-tp-size N` (`DiffusionParallelConfig.text_encoder_tp_size`) shards the text encoder across groups of `N` DiT ranks. For pipelines that load a Hugging Face encoder (currently the Qwen-Image family: Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-Plus, Qwen-Image-Layered, Qwen-Image-2.1), the encoder is sharded with the model's own Transformers `base_model_tp_plan`: attention and MLP projections are split, embeddings and norms stay replicated. Qwen3-VL (Qwen-Image-2.1's encoder) ships no plan in Transformers, so vLLM-Omni supplies the same decoder-layer plan as Qwen2.5-VL. A quantized Qwen-Image-2.1 text encoder is not sharded; `--text-encoder-tp-size > 1` raises with one.
 
 ```bash
 # Qwen-Image on 4x 32 GB GPUs without CPU offload
 vllm serve Qwen/Qwen-Image --omni --tensor-parallel-size 4 --text-encoder-tp-size 4
+
+# Qwen-Image-2.1 on 2x 32 GB GPUs without CPU offload
+vllm serve Qwen/Qwen-Image-2.1 --omni --tensor-parallel-size 2 --text-encoder-tp-size 2
 ```
 
 Constraints:
 
-- `N` must divide the number of ranks in one data-parallel replica (world size / `data_parallel_size`) and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}).
+- `N` must divide the number of ranks in one data-parallel replica (world size / `data_parallel_size`) and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}; Qwen-Image-2.1's Qwen3-VL: 32 heads, 8 KV heads, so `N` ∈ {1, 2, 4, 8}).
 - The groups tile each data-parallel replica (`[0..N-1], [N..2N-1], ...`) and never span replicas. Every rank gets the full encoder output, so no broadcast is needed.
 - MiniMax-H3 uses its own sharded Qwen3-VL encoder for this option; other pipelines ignore it.
 
