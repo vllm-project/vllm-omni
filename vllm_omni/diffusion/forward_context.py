@@ -13,7 +13,6 @@ from vllm.config import VllmConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
-    DenoiseProgress,
 )
 from vllm_omni.diffusion.attention.schedule import AttentionSchedule, select_attention_profile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -53,8 +52,6 @@ class ForwardContext:
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
-    # Per-document progress by attention role; scoped to the current model evaluation.
-    denoise_progress: dict[str, tuple[DenoiseProgress, ...]] = field(default_factory=dict)
     # Bound request schedule. None means unbound. () disables. A non-empty tuple
     # selects prepared profiles while a denoise step is published.
     attention_schedule: AttentionSchedule | None = None

@@ -8,8 +8,8 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import DenoiseProgress
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState
@@ -19,6 +19,8 @@ from .scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
 
 if TYPE_CHECKING:
     from .denoise_loop import MiniMaxH3DenoiseBranch
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3Model:
@@ -104,6 +106,48 @@ class MiniMaxH3ModelBatch:
         self.models = models
         self.packed_supported = packed_supported
 
+    def _unpacked_reason(
+        self, models: list[MiniMaxH3Model], *, pdd: bool, scheduled: bool, uniform_progress: bool
+    ) -> tuple[Callable[..., None], str] | None:
+        """Why these requests cannot share one packed forward, or None if they can."""
+        if pdd:
+            # PDD heads take one request-local step index per forward.
+            return logger.debug, "FastH3 Omni PDD executes requests separately with request-local step indices."
+        if len({id(m.transformer) for m in models}) > 1:
+            return logger.warning_once, "MiniMax H3 step batch contains requests for different task-specific DiTs."
+        if any("reference_kv_state" in m.branch.static_kwargs for m in models):
+            # Packed kwargs carry no per-request reference-KV state.
+            return logger.debug, "MiniMax H3 reference-KV requests run separately."
+        if scheduled and (not uniform_progress or len({m.attention_schedule for m in models}) > 1):
+            # A packed forward selects one attention profile from the published progress.
+            return (
+                logger.info_once,
+                "MiniMax H3 runs a scheduled step batch whose requests differ in progress or schedule "
+                "one request per forward, so each request selects attention at its own step.",
+            )
+        # Checked under the published progress: a scheduled step's selected
+        # profile, not the baseline, must isolate requests.
+        if self.packed_supported(models[0].transformer):
+            return None
+        from .minimax_h3_blocks import MiniMaxH3Attention
+
+        modules = getattr(models[0].transformer, "modules", None)
+        if callable(modules) and any(
+            getattr(getattr(module, "attention", None), "use_ring", False)
+            for module in modules()
+            if isinstance(module, MiniMaxH3Attention)
+        ):
+            return (
+                logger.warning_once,
+                "MiniMax H3 step batching is disabled when ring attention is active: the ring kernels ignore "
+                "packed cu_seqlens and would attend across request boundaries.",
+            )
+        return (
+            logger.warning_once,
+            "MiniMax H3 step batching needs every attention on a backend that isolates packed multi-document "
+            "cu_seqlens (see AttentionBackend.supports_multi_doc_packed_varlen).",
+        )
+
     def __call__(self, evaluations: Sequence[ModelEvaluation]):
         from .batched_packing import minimax_h3_batched_forward_kwargs
         from .denoise_loop import minimax_h3_publish_denoise_progress
@@ -119,37 +163,15 @@ class MiniMaxH3ModelBatch:
         minimax_h3_publish_denoise_progress(*(request_progress[0] if uniform_progress else (None, None, None)))
         context = get_forward_context() if is_forward_context_available() else None
         try:
-            # PDD heads take one request-local step index per forward, and the
-            # packed kwargs carry no per-request reference-KV state.
             pdd = getattr(getattr(models[0].transformer, "arch", None), "pdd_steps", None) is not None
-            # A packed forward under an attention schedule selects one profile
-            # from the published progress: one schedule and one progress only.
-            scheduled = context is not None and bool(getattr(context, "attention_schedule", None))
-            if len(models) > 1 and (
-                pdd
-                or len({id(m.transformer) for m in models}) > 1
-                or any("reference_kv_state" in m.branch.static_kwargs for m in models)
-                or (scheduled and (not uniform_progress or len({m.attention_schedule for m in models}) > 1))
-                # Checked under the published progress: a scheduled step's
-                # selected profile, not the baseline, must isolate requests.
-                or not self.packed_supported(models[0].transformer)
-            ):
-                return [self([e])[0] for e in evaluations]
+            if len(models) > 1:
+                scheduled = context is not None and bool(getattr(context, "attention_schedule", None))
+                reason = self._unpacked_reason(models, pdd=pdd, scheduled=scheduled, uniform_progress=uniform_progress)
+                if reason is not None:
+                    level, message = reason
+                    level(message + " Running %d requests one forward at a time.", len(models))
+                    return [self([e])[0] for e in evaluations]
             prepared = [m.prepare(e) for m, e in zip(models, evaluations, strict=True)]
-            if context is not None:
-                context.denoise_progress = {
-                    role: tuple(
-                        DenoiseProgress(length, e.state.step_index, e.sigmas[0], len(e.state.sigmas[0]) - 1)
-                        for m, e in zip(models, evaluations, strict=True)
-                        for length in (
-                            (m.branch.text_len,)
-                            if role == "minimax_h3.token_refiner"
-                            else (m.branch.used_len, m.branch.seq_len - m.branch.used_len)
-                        )
-                        if length
-                    )
-                    for role in ("minimax_h3.token_refiner", "self")
-                }
             if len(models) == 1:
                 _, rows, times, cond = prepared[0]
                 kwargs = models[0].branch.forward_kwargs(
@@ -189,6 +211,4 @@ class MiniMaxH3ModelBatch:
                 m.to_denoised(p, (v, a)) for m, p, v, a in zip(models, prepared, video_parts, audio_parts, strict=True)
             ]
         finally:
-            if context is not None:
-                context.denoise_progress = {}
             minimax_h3_publish_denoise_progress(None, None, None)

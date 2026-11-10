@@ -7,9 +7,9 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.sampler import EulerSampler
+from vllm_omni.diffusion.sampler import euler_eta0_step
 
-minimax_h3_euler_eta0_step = EulerSampler.step_denoised
+minimax_h3_euler_eta0_step = euler_eta0_step
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:

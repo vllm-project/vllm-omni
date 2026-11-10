@@ -447,11 +447,6 @@ class MiniMaxH3Attention(nn.Module):
                     extra["minimax_h3_reference_kv_video_layout"] = kv_video_layout
 
         metadata = AttentionMetadata(
-            denoise_progress=(
-                get_forward_context().denoise_progress.get(self.attention.role)
-                if is_forward_context_available()
-                else None
-            ),
             attn_mask=attn_mask,
             packed_padding=(
                 PackedPaddingMetadata(

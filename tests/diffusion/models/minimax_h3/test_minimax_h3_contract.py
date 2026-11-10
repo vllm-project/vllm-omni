@@ -1668,7 +1668,6 @@ def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatc
 
     class InactiveContext:
         sp_active = False
-        denoise_progress = {}
 
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True
@@ -1730,7 +1729,6 @@ def _fake_packed_attention(
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
-        role = "self"
 
         def __init__(self):
             super().__init__()
@@ -1749,18 +1747,8 @@ def _fake_packed_attention(
     return attention
 
 
-def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout(monkeypatch):
+def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
     """A batch's valid rows are block-diagonal, so no prefix can describe them."""
-    from vllm_omni.diffusion import forward_context as fc
-    from vllm_omni.diffusion.attention.backends.abstract import DenoiseProgress
-
-    progress = (
-        DenoiseProgress(5, 0, 1.0, 8),
-        DenoiseProgress(1, 0, 1.0, 8),
-        DenoiseProgress(5, 3, 0.4, 8),
-        DenoiseProgress(1, 3, 0.4, 8),
-    )
-    monkeypatch.setattr(fc, "_forward_context", fc.ForwardContext(denoise_progress={"self": progress}))
     attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=True)
     q = torch.randn(12, 2, 4)
 
@@ -1777,7 +1765,6 @@ def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout(monkeyp
 
     assert attention.attention.metadata.attn_mask is None
     assert attention.attention.metadata.extra["valid_kv_length"] == 12
-    assert attention.attention.metadata.denoise_progress is progress
 
 
 @pytest.mark.parametrize("backend_name", ["TORCH_SDPA", "FLASH_ATTN"])
