@@ -2039,12 +2039,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # stock sampler, whose penalty stage is the codec window.
             return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
         if self._k_step_frames > 0:
-            # Duplex with a stage-1 speculative_config is how the K-step count
-            # reaches the Talker (K > 0): the frame loop drives draft booking
-            # through the runner's _propose_draft_tokens and the per-frame
-            # boundary samplers, so no draft speculator is installed here and
-            # this combination must not raise.
-            return talker_sampler, None
+            session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+            if session_mode == "duplex":
+                # Duplex with a stage-1 speculative_config is how the K-step count
+                # reaches the Talker (K > 0): the frame loop drives draft booking
+                # through the runner's _propose_draft_tokens and the per-frame
+                # boundary samplers, so no draft speculator is installed here and
+                # this combination must not raise.
+                return talker_sampler, None
+            # A turn session cannot book the K-step frame loop's drafts (the
+            # booking lives in the duplex runner), so its draft codes would be
+            # sampled without verification -- fail closed like any other draft
+            # method.
         # Any other stage-1 draft method would verify draft rows without the
         # Talker's codec-window penalty and forced EOS (the same hazard
         # _check_v1_draft_method guards for the V1 runner): fail closed.

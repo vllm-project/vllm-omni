@@ -315,6 +315,12 @@ def test_ready_merge_timing_jobs_stay_identical() -> None:
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_unittest_subtests_do_not_duplicate_parent_timing(suite: Path, fails: bool) -> None:
+    # The runner derives subtest reports from SubtestReport.context, which
+    # pytest only emits for unittest subTests from 9.0 on; pytest 8 folds
+    # subTest results into the parent call report, so there is nothing to
+    # observe here yet.
+    if int(pytest.__version__.partition(".")[0]) < 9:
+        pytest.skip("per-subtest reports need pytest >= 9")
     result, directory = run_suite(
         suite,
         f"""
