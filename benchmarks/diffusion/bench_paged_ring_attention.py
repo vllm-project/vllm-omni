@@ -172,7 +172,6 @@ def _build_real_adapter(device: torch.device, max_seq_len: int, *, ulysses_degre
             max_num_batched_tokens=max_seq_len,
             max_num_blocks_per_group=[native_block_table.get_block_table_width(max_seq_len, _BLOCK_SIZE)],
             device=device,
-            kernel_block_sizes=kernel_block_sizes,
         )
 
     block_tables.append_block_ids(0, (tuple(range(num_blocks)),), overwrite=True)

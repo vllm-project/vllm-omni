@@ -87,6 +87,10 @@ class Attention(nn.Module):
         # attention remains dense and contributes no native KVCacheSpec.
         paged_kv_cache_role: str | None = None,
         paged_kv_cache_dtype: torch.dtype | None = None,
+        # Model-owned opt-in for the deliberately narrow Paged Ring MVP.
+        # The Worker fails closed at KV-layer registration when Ring is
+        # configured and a Scheduler-paged layer does not publish this flag.
+        supports_paged_ring: bool = False,
         # Model-owned kernel for architectures whose attention contract cannot
         # be represented by the generic backend interface (for example packed
         # varlen attention with learned sink logits). The shared Attention
@@ -141,6 +145,7 @@ class Attention(nn.Module):
             raise ValueError("paged_kv_cache_role must be non-empty when provided")
         self.paged_kv_cache_role = paged_kv_cache_role
         self.paged_kv_cache_dtype = paged_kv_cache_dtype
+        self.supports_paged_ring = supports_paged_ring
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
@@ -574,14 +579,23 @@ class Attention(nn.Module):
             raise NotImplementedError(
                 f"Diffusion paged KV requires an Omni backend with paged support; selected {backend_name}"
             )
-        is_paged_ring = (
-            use_paged_attention
-            and strategy is not self._no_parallel_strategy
-            and (
-                strategy.name == "ring"
-                or (self.use_ring and strategy.name == "ulysses")
-            )
-        )
+        is_paged_ring = False
+        paged_ring_degree: int | None = None
+        if use_paged_attention and strategy is not self._no_parallel_strategy and self.use_ring:
+            ring_runner = getattr(self, "ring_runner", None)
+            published_ring_layout = getattr(ring_runner, "paged_kv_ring_layout", None)
+            if published_ring_layout is not True:
+                raise RuntimeError(
+                    "Paged Ring runner did not publish its rank-local KV layout: "
+                    f"layout={published_ring_layout!r}"
+                )
+            paged_ring_degree = getattr(ring_runner, "paged_kv_sequence_parallel_degree", None)
+            if type(paged_ring_degree) is not int or paged_ring_degree <= 1:
+                raise RuntimeError(
+                    "Paged Ring runner did not publish a valid input sequence-sharding degree: "
+                    f"degree={paged_ring_degree!r}"
+                )
+            is_paged_ring = True
         if use_paged_attention and strategy is not self._no_parallel_strategy:
             strategy_name = strategy.name
             if strategy_name in ("ulysses", "ulysses_allgather_kv") and get_ulysses_mode(default="strict") != "strict":
@@ -596,13 +610,13 @@ class Attention(nn.Module):
                         "ulysses_degree * allgather_degree; "
                         f"got sp_padding_size={sp_padding_size}"
                     )
-            if is_paged_ring and strategy_name == "ulysses":
+            if is_paged_ring:
                 forward_ctx = get_forward_context() if is_forward_context_available() else None
                 sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
                 if sp_padding_size:
                     raise NotImplementedError(
-                        "Paged Ulysses + Ring currently requires the sequence "
-                        "length to be divisible by ulysses_degree * ring_degree; "
+                        "Paged Ring currently requires the sequence length to be "
+                        "divisible by its effective sequence-parallel degree; "
                         f"got sp_padding_size={sp_padding_size}"
                     )
 
@@ -613,6 +627,17 @@ class Attention(nn.Module):
             and attn_metadata is None
         ):
             attn_metadata = AttentionMetadata()
+        if is_paged_ring:
+            assert paged_adapter is not None
+            assert paged_ring_degree is not None
+            paged_adapter.validate_ring_sp_before_collective(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+                sequence_parallel_degree=paged_ring_degree,
+            )
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q

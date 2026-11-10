@@ -20,7 +20,10 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+    FlashAttentionImpl,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
@@ -51,7 +54,9 @@ _LAYER_NAME = "model.layers.0.attn"
 _NUM_HEADS = 8
 _HEAD_SIZE = 64
 _BLOCK_SIZE = 16
-_GLOBAL_TOKENS = 16
+_GLOBAL_TOKENS = 48
+_PHYSICAL_BLOCKS = (6, 4, 2)
+_NUM_CACHE_BLOCKS = max(_PHYSICAL_BLOCKS) + 1
 
 
 class _SmokeAttention(nn.Module):
@@ -111,8 +116,8 @@ def _build_real_adapter(device: torch.device, *, ulysses_degree: int):
 
     canonical_spec = native_layer.spec
     kv_cache_config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])],
+        num_blocks=_NUM_CACHE_BLOCKS,
+        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, _NUM_CACHE_BLOCKS, [_LAYER_NAME])],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=[_LAYER_NAME],
@@ -138,13 +143,12 @@ def _build_real_adapter(device: torch.device, *, ulysses_degree: int):
             block_sizes=[_BLOCK_SIZE],
             max_num_reqs=1,
             max_num_batched_tokens=_GLOBAL_TOKENS,
-            max_num_blocks_per_group=[native_block_table.get_block_table_width(1, _BLOCK_SIZE)],
+            max_num_blocks_per_group=[native_block_table.get_block_table_width(_GLOBAL_TOKENS, _BLOCK_SIZE)],
             device=device,
-            kernel_block_sizes=kernel_block_sizes,
         )
 
-    # Use a non-zero physical block to exercise logical-to-physical slots.
-    block_tables.append_block_ids(0, ([3],), overwrite=True)
+    # Descending, non-contiguous physical blocks exercise boundary crossings.
+    block_tables.append_block_ids(0, (_PHYSICAL_BLOCKS,), overwrite=True)
     block_tables.apply_staged_writes()
     adapter = DiffusionPagedAttentionAdapter(
         vllm_config=vllm_config,
@@ -164,18 +168,17 @@ def _build_real_adapter(device: torch.device, *, ulysses_degree: int):
 def _build_omni_attention(
     diffusion_layer,
     strategy,
+    *,
+    paged: bool,
     ring_runner=None,
 ) -> Attention:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
     layer._explicit_cross_contract = False
-    layer._scheduler_paged_kv = True
+    layer._scheduler_paged_kv = paged
     layer.prefix = _LAYER_NAME
-    layer.paged_kv_cache_role = "primary"
-    layer.attn_backend = SimpleNamespace(
-        supports_paged_kv=True,
-        get_name=lambda: "FLASH_ATTN",
-    )
+    layer.paged_kv_cache_role = "primary" if paged else None
+    layer.attn_backend = FlashAttentionBackend
     layer.attention = FlashAttentionImpl(
         num_heads=_NUM_HEADS,
         head_size=_HEAD_SIZE,
@@ -189,6 +192,11 @@ def _build_omni_attention(
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: strategy
     layer._with_kv_cache_dtype = lambda metadata: metadata
+    layer._has_custom_attention = False
+    layer.allow_fp32_fallback = False
+    layer.backend_explicit = True
+    layer.sdpa_fallback = None
+    layer.attn_spec = None
     return layer
 
 
@@ -228,10 +236,7 @@ def _worker(
         )
         ring_runner = None
         if ring_degree > 1:
-            ring_runner = RingParallelAttention(
-                sp_group,
-                attn_backend_pref="sdpa",
-            )
+            ring_runner = RingParallelAttention(sp_group)
 
             if ulysses_degree > 1:
                 strategy = UlyssesParallelAttention(
@@ -258,9 +263,16 @@ def _worker(
             )
         else:
             strategy = AllGatherKVParallelAttention(sp_group)
-        attention = _build_omni_attention(
+        paged_attention = _build_omni_attention(
             diffusion_layer,
             strategy,
+            paged=True,
+            ring_runner=ring_runner,
+        )
+        dense_attention = _build_omni_attention(
+            diffusion_layer,
+            strategy,
+            paged=False,
             ring_runner=ring_runner,
         )
         batch = adapter.prepare_batch(
@@ -275,7 +287,7 @@ def _worker(
         )
 
         torch.manual_seed(20261025)
-        qkv = torch.randn(
+        first_qkv = torch.randn(
             3,
             1,
             _GLOBAL_TOKENS,
@@ -284,63 +296,98 @@ def _worker(
             dtype=torch.float16,
             device=device,
         )
-        global_query, global_key, global_value = qkv.unbind(0)
+        second_qkv = torch.randn_like(first_qkv)
         local_tokens = _GLOBAL_TOKENS // world_size
         local_slice = slice(local_rank * local_tokens, (local_rank + 1) * local_tokens)
-        query = global_query[:, local_slice].contiguous()
-        key = global_key[:, local_slice].contiguous()
-        value = global_value[:, local_slice].contiguous()
 
-        global_expected = (
-            F.scaled_dot_product_attention(
-                global_query.transpose(1, 2),
-                global_key.transpose(1, 2),
-                global_value.transpose(1, 2),
-                is_causal=False,
-                scale=diffusion_layer.softmax_scale,
+        def prepare_case(qkv):
+            global_query, global_key, global_value = qkv.unbind(0)
+            local_qkv = tuple(
+                tensor[:, local_slice].contiguous()
+                for tensor in (global_query, global_key, global_value)
             )
-            .transpose(1, 2)
-            .contiguous()
-        )
-        expected = global_expected[:, local_slice]
+            global_expected = (
+                F.scaled_dot_product_attention(
+                    global_query.transpose(1, 2),
+                    global_key.transpose(1, 2),
+                    global_value.transpose(1, 2),
+                    is_causal=False,
+                    scale=diffusion_layer.softmax_scale,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            return (global_key, global_value), local_qkv, global_expected[:, local_slice]
 
-        # None exercises layer.py's metadata construction for AllGather query ranges.
+        _, first_local_qkv, first_expected = prepare_case(first_qkv)
+        second_global_kv, second_local_qkv, second_expected = prepare_case(second_qkv)
+
+        # The second pass rewrites the same Scheduler slots, as a denoising
+        # step would. Dense and paged paths share the same parallel strategy
+        # and Ring kernel.
         with set_forward_context(), adapter.activate(batch):
-            actual = attention._forward_impl(query, key, value, attn_metadata=None).clone()
+            first_dense = dense_attention._forward_impl(
+                *first_local_qkv,
+                attn_metadata=None,
+            ).clone()
+            first_paged = paged_attention._forward_impl(
+                *first_local_qkv,
+                attn_metadata=None,
+            ).clone()
+            second_dense = dense_attention._forward_impl(
+                *second_local_qkv,
+                attn_metadata=None,
+            ).clone()
+            second_paged = paged_attention._forward_impl(
+                *second_local_qkv,
+                attn_metadata=None,
+            ).clone()
         current_omni_platform.synchronize()
 
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        assert tuple(actual.shape) == (1, local_tokens, _NUM_HEADS, _HEAD_SIZE)
-        assert batch.slot_mappings.tolist() == [list(range(3 * _BLOCK_SIZE, 3 * _BLOCK_SIZE + _GLOBAL_TOKENS))]
-        key_cache, value_cache = native_layer.kv_cache.transpose(1, 2).split(_HEAD_SIZE, dim=-1)
+        torch.testing.assert_close(first_paged, first_expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(second_paged, second_expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(first_paged, first_dense, rtol=3e-4, atol=3e-4)
+        torch.testing.assert_close(second_paged, second_dense, rtol=3e-4, atol=3e-4)
+        assert tuple(second_paged.shape) == (1, local_tokens, _NUM_HEADS, _HEAD_SIZE)
+
+        expected_slots = [
+            slot
+            for block_id in _PHYSICAL_BLOCKS
+            for slot in range(block_id * _BLOCK_SIZE, (block_id + 1) * _BLOCK_SIZE)
+        ]
+        assert batch.slot_mappings.tolist() == [expected_slots]
+
+        local_heads = _NUM_HEADS // ulysses_degree
+        head_start = sp_group.ulysses_rank * local_heads
+        head_slice = slice(head_start, head_start + local_heads)
+        second_global_key, second_global_value = second_global_kv
+        expected_cache_key = second_global_key[:, :, head_slice].squeeze(0)
+        expected_cache_value = second_global_value[:, :, head_slice].squeeze(0)
+
+        key_cache, value_cache = native_layer.kv_cache.transpose(1, 2).split(
+            _HEAD_SIZE,
+            dim=-1,
+        )
+        actual_cache_key = torch.cat(
+            [key_cache[block_id] for block_id in _PHYSICAL_BLOCKS]
+        )[:_GLOBAL_TOKENS]
+        actual_cache_value = torch.cat(
+            [value_cache[block_id] for block_id in _PHYSICAL_BLOCKS]
+        )[:_GLOBAL_TOKENS]
+
         if ring_degree > 1:
             ring_tokens = _GLOBAL_TOKENS // ring_degree
             ring_start = sp_group.ring_rank * ring_tokens
             ring_slice = slice(ring_start, ring_start + ring_tokens)
+            if sp_group.ring_rank == 1:
+                assert ring_start % _BLOCK_SIZE == 8
+            actual_cache_key = actual_cache_key[ring_slice]
+            actual_cache_value = actual_cache_value[ring_slice]
+            expected_cache_key = expected_cache_key[ring_slice]
+            expected_cache_value = expected_cache_value[ring_slice]
 
-            local_heads = _NUM_HEADS // ulysses_degree
-            head_start = sp_group.ulysses_rank * local_heads
-            head_slice = slice(head_start, head_start + local_heads)
-
-            expected_cache_key = global_key[:, ring_slice, head_slice].squeeze(0)
-            expected_cache_value = global_value[:, ring_slice, head_slice].squeeze(0)
-
-            torch.testing.assert_close(
-                key_cache[3, ring_slice],
-                expected_cache_key,
-            )
-            torch.testing.assert_close(
-                value_cache[3, ring_slice],
-                expected_cache_value,
-            )
-        else:
-            local_heads = _NUM_HEADS // ulysses_degree
-            head_start = sp_group.ulysses_rank * local_heads
-            head_slice = slice(head_start, head_start + local_heads)
-            expected_cache_key = global_key[:, :, head_slice].squeeze(0)
-            expected_cache_value = global_value[:, :, head_slice].squeeze(0)
-            torch.testing.assert_close(key_cache[3, :_GLOBAL_TOKENS], expected_cache_key)
-            torch.testing.assert_close(value_cache[3, :_GLOBAL_TOKENS], expected_cache_value)
+        assert torch.equal(actual_cache_key, expected_cache_key)
+        assert torch.equal(actual_cache_value, expected_cache_value)
         dist.barrier(device_ids=[local_rank])
     finally:
         destroy_distributed_env()

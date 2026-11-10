@@ -142,9 +142,84 @@ def test_cache_layer_registration_allows_strict_ulysses_allgather_kv() -> None:
 
 
 @pytest.mark.parametrize(
+    ("ulysses_degree", "ring_degree", "expected_ulysses_degree"),
+    [
+        (1, 2, 1),
+        (2, 2, 2),
+    ],
+)
+def test_cache_layer_registration_allows_paged_ring(
+    monkeypatch: pytest.MonkeyPatch,
+    ulysses_degree: int,
+    ring_degree: int,
+    expected_ulysses_degree: int,
+) -> None:
+    backend, _, _ = _registration_backend(
+        _parallel_config(
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            ulysses_mode="strict",
+        )
+    )
+    layer = SimpleNamespace(
+        skip_sequence_parallel=False,
+        supports_paged_ring=True,
+    )
+    monkeypatch.setattr(model_runner_backend_module.current_omni_platform, "is_cuda", lambda: True)
+
+    assert backend._get_paged_attention_ulysses_degree(layer) == expected_ulysses_degree
+    backend._validate_paged_ring_startup("layer-0", layer)
+
+
+def test_cache_layer_registration_rejects_paged_ring_on_non_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, _, _ = _registration_backend(_parallel_config(ring_degree=2))
+    layer = SimpleNamespace(
+        skip_sequence_parallel=False,
+        supports_paged_ring=True,
+    )
+    monkeypatch.setattr(model_runner_backend_module.current_omni_platform, "is_cuda", lambda: False)
+
+    with pytest.raises(NotImplementedError, match="only CUDA"):
+        backend._validate_paged_ring_startup("layer-0", layer)
+
+
+def test_cache_layer_registration_rejects_paged_ring_without_model_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, _, _ = _registration_backend(
+        _parallel_config(ring_degree=2)
+    )
+    layer = SimpleNamespace(
+        skip_sequence_parallel=False,
+        attn_backend=SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN"),
+    )
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=8,
+        dtype=torch.float16,
+        non_causal=True,
+    )
+    monkeypatch.setattr(
+        model_runner_backend_module.current_omni_platform,
+        "get_diffusion_kv_block_tables_cls",
+        lambda: object,
+    )
+    monkeypatch.setattr(
+        model_runner_backend_module.current_omni_platform,
+        "build_diffusion_kv_attn_metadata",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(NotImplementedError, match="does not opt into.*supports_paged_ring=True"):
+        backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+
+
+@pytest.mark.parametrize(
     ("parallel_config", "message"),
     [
-        (_parallel_config(ring_degree=2), "Ring"),
         (
             _parallel_config(
                 ulysses_degree=2,

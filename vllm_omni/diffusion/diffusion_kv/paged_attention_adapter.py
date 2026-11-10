@@ -811,6 +811,124 @@ class DiffusionPagedAttentionAdapter:
         self._active_piecewise_native_metadata = tuple(metadata_by_segment)
         return self._active_piecewise_native_metadata
 
+    def validate_ring_sp_before_collective(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        omni_attn_metadata: AttentionMetadata | None,
+        sequence_parallel_degree: int,
+    ) -> None:
+        """Fail every rank consistently before Paged Ring collectives.
+
+        Range checks in ``prepare_ring_layer_context`` depend on the Ring rank
+        and therefore cannot safely reject malformed global geometry after a
+        peer has entered Ulysses or Ring communication.  This validation uses
+        only Scheduler-global state and equal-shaped pre-collective inputs.
+        """
+
+        if self._active_batch is None:
+            raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
+        try:
+            layer = self.layers[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
+
+        if not current_omni_platform.is_cuda():
+            raise NotImplementedError(
+                "Paged Ring MVP currently supports only CUDA's packed KV-cache layout"
+            )
+
+        kv_cache = getattr(layer, "kv_cache", None)
+        if not isinstance(kv_cache, torch.Tensor):
+            raise RuntimeError(
+                f"Native KV cache is not bound for diffusion layer {layer_name!r}"
+            )
+        native_impl = getattr(layer, "impl", None)
+        if not callable(getattr(native_impl, "do_kv_cache_update", None)):
+            raise RuntimeError(
+                f"Native attention implementation for {layer_name!r} cannot update the KV cache"
+            )
+        expected_content_size = layer.head_size + layer.head_size_v
+        if kv_cache.ndim != 4 or kv_cache.shape[-1] != expected_content_size:
+            raise NotImplementedError(
+                "Paged Ring MVP requires the packed CUDA KV-cache layout "
+                "[num_blocks, num_kv_heads, block_size, K+V]"
+            )
+        if kv_cache.device != key.device or key.device != value.device:
+            raise ValueError(
+                "Paged Ring KV cache, key, and value must be on the same device: "
+                f"cache={kv_cache.device}, key={key.device}, value={value.device}"
+            )
+
+        if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
+            raise ValueError(
+                "Paged Ring requires a sequence-parallel degree greater than one; "
+                f"got {sequence_parallel_degree!r}"
+            )
+
+        batch = self._active_batch
+        if len(batch.rows) != 1:
+            raise NotImplementedError("Paged Ring MVP currently supports one row per forward")
+
+        if omni_attn_metadata is not None:
+            if omni_attn_metadata.query_ranges is not None or omni_attn_metadata.kv_write_ranges is not None:
+                raise ValueError("Paged Ring ranges must be produced by the Ring runner")
+        full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        if full_attn_spans is not None:
+            raise NotImplementedError("Paged Ring MVP does not yet support piecewise attention")
+        if not bool(getattr(layer.spec, "non_causal", False)):
+            raise NotImplementedError("Paged Ring MVP currently supports only non-causal attention")
+
+        row = batch.rows[0]
+        if row.kv_start_pos != 0 or row.query_len != row.seq_len:
+            raise NotImplementedError("Paged Ring MVP currently supports only cold full-sequence KV writes")
+
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor.ndim < 2:
+                raise ValueError(
+                    f"Paged Ring requires {name} to expose a sequence dimension; "
+                    f"got shape={tuple(tensor.shape)}"
+                )
+            if tensor.shape[0] != 1:
+                raise NotImplementedError(
+                    "Paged Ring MVP currently supports one tensor row per forward; "
+                    f"{name}.shape={tuple(tensor.shape)}"
+                )
+
+        local_query_len = int(query.shape[1])
+        if int(key.shape[1]) != local_query_len or int(value.shape[1]) != local_query_len:
+            raise ValueError(
+                "Paged Ring requires aligned local Q/K/V sequence lengths before collectives: "
+                f"query={query.shape[1]}, key={key.shape[1]}, value={value.shape[1]}"
+            )
+
+        joint_tensors = ()
+        if omni_attn_metadata is not None:
+            joint_tensors = tuple(
+                tensor
+                for tensor in (
+                    omni_attn_metadata.joint_query,
+                    omni_attn_metadata.joint_key,
+                    omni_attn_metadata.joint_value,
+                )
+                if tensor is not None
+            )
+        if joint_tensors:
+            raise NotImplementedError("Paged Ring MVP does not yet support joint Q/K/V tensors")
+
+        expected_global_len = local_query_len * sequence_parallel_degree
+        if expected_global_len != row.query_len:
+            raise ValueError(
+                "Paged Ring local shard geometry does not match the Scheduler row: "
+                f"local_query_len={local_query_len}, "
+                f"sequence_parallel_degree={sequence_parallel_degree}, "
+                f"expected_global_len={expected_global_len}, "
+                f"row.query_len={row.query_len}. The sequence may have been padded."
+            )
+
     def prepare_ring_layer_context(
         self,
         layer_name: str,

@@ -124,7 +124,7 @@ class _FakeLayer:
         self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, _FakeNativeMetadata]] = []
         self.native_events: list[str] = []
         self.layer_name = "layer-0"
-        self.kv_cache = object()
+        self.kv_cache = torch.zeros(4, num_kv_heads, 4, self.head_size + self.head_size_v)
         self.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
         self.impl = _FakeNativeImpl(self)
 
@@ -327,6 +327,7 @@ def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch
 def test_ring_paged_context_selects_local_slot_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(adapter_module.current_omni_platform, "is_cuda", lambda: True)
     adapter, _, layer, _ = _make_adapter(
         monkeypatch,
         capacity=16,
@@ -359,6 +360,23 @@ def test_ring_paged_context_selects_local_slot_range(
     )
 
     with adapter.activate(batch):
+        adapter.validate_ring_sp_before_collective(
+            "layer-0",
+            key,
+            key,
+            value,
+            omni_attn_metadata=AttentionMetadata(),
+            sequence_parallel_degree=4,
+        )
+        with pytest.raises(ValueError, match="local shard geometry"):
+            adapter.validate_ring_sp_before_collective(
+                "layer-0",
+                key,
+                key,
+                value,
+                omni_attn_metadata=AttentionMetadata(),
+                sequence_parallel_degree=2,
+            )
         context = adapter.prepare_ring_layer_context(
             "layer-0",
             key,
@@ -380,6 +398,73 @@ def test_ring_paged_context_selects_local_slot_range(
     # Context preparation must not mutate the cache.
     assert layer.native_events == []
     assert layer.updates == []
+
+
+def test_ring_precollective_rejects_unsupported_platform_and_cache_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch, capacity=16)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=8,
+                seq_len=8,
+            )
+        ]
+    )
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with adapter.activate(batch):
+        monkeypatch.setattr(adapter_module.current_omni_platform, "is_cuda", lambda: False)
+        with pytest.raises(NotImplementedError, match="only CUDA"):
+            adapter.validate_ring_sp_before_collective(
+                "layer-0",
+                tensor,
+                tensor,
+                tensor,
+                omni_attn_metadata=AttentionMetadata(),
+                sequence_parallel_degree=4,
+            )
+
+        monkeypatch.setattr(adapter_module.current_omni_platform, "is_cuda", lambda: True)
+        valid_cache = layer.kv_cache
+        valid_impl = layer.impl
+        layer.kv_cache = None
+        with pytest.raises(RuntimeError, match="KV cache is not bound"):
+            adapter.validate_ring_sp_before_collective(
+                "layer-0",
+                tensor,
+                tensor,
+                tensor,
+                omni_attn_metadata=AttentionMetadata(),
+                sequence_parallel_degree=4,
+            )
+
+        layer.kv_cache = valid_cache
+        layer.impl = object()
+        with pytest.raises(RuntimeError, match="cannot update the KV cache"):
+            adapter.validate_ring_sp_before_collective(
+                "layer-0",
+                tensor,
+                tensor,
+                tensor,
+                omni_attn_metadata=AttentionMetadata(),
+                sequence_parallel_degree=4,
+            )
+
+        layer.impl = valid_impl
+        layer.kv_cache = torch.zeros(4, 2, 4, 7)
+        with pytest.raises(NotImplementedError, match="packed CUDA KV-cache layout"):
+            adapter.validate_ring_sp_before_collective(
+                "layer-0",
+                tensor,
+                tensor,
+                tensor,
+                omni_attn_metadata=AttentionMetadata(),
+                sequence_parallel_degree=4,
+            )
 
 
 def test_paged_adapter_preserves_strided_kv_for_platform_writer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1450,6 +1535,8 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
 
     class Strategy:
         name = "ring"
+        paged_kv_ring_layout = True
+        paged_kv_sequence_parallel_degree = 2
 
         def pre_attention(self, query, key, value, metadata):
             events.append("pre")
@@ -1471,6 +1558,24 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
             return output + 4
 
     class Adapter:
+        def validate_ring_sp_before_collective(
+            self,
+            layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            sequence_parallel_degree,
+        ):
+            events.append("validate")
+            assert layer_name == "layer-0"
+            assert sequence_parallel_degree == 2
+            assert isinstance(omni_attn_metadata, AttentionMetadata)
+            assert torch.equal(query, original)
+            assert torch.equal(key, original)
+            assert torch.equal(value, original)
+
         def prepare_ring_layer_context(
             self,
             layer_name,
@@ -1522,6 +1627,7 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
     )
     layer.attention = Backend()
     layer.use_ring = True
+    layer.ring_runner = strategy
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: strategy
     layer._with_kv_cache_dtype = lambda metadata: metadata
@@ -1548,6 +1654,7 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
         )
 
     assert events == [
+        "validate",
         "pre",
         "prepare",
         "materialize",
@@ -1574,6 +1681,9 @@ def test_omni_attention_composes_paged_ulysses_with_ring_runner() -> None:
             return output + 4
 
     class RingRunner:
+        paged_kv_ring_layout = True
+        paged_kv_sequence_parallel_degree = 4
+
         def with_paged_kv_ranges(self, query, key, value, metadata):
             events.append("ring_ranges")
             assert torch.equal(query, original + 1)
@@ -1584,6 +1694,24 @@ def test_omni_attention_composes_paged_ulysses_with_ring_runner() -> None:
             return metadata
 
     class Adapter:
+        def validate_ring_sp_before_collective(
+            self,
+            layer_name,
+            query,
+            key,
+            value,
+            *,
+            omni_attn_metadata,
+            sequence_parallel_degree,
+        ):
+            events.append("validate")
+            assert layer_name == "layer-0"
+            assert sequence_parallel_degree == 4
+            assert isinstance(omni_attn_metadata, AttentionMetadata)
+            assert torch.equal(query, original)
+            assert torch.equal(key, original)
+            assert torch.equal(value, original)
+
         def prepare_ring_layer_context(
             self,
             layer_name,
@@ -1653,6 +1781,7 @@ def test_omni_attention_composes_paged_ulysses_with_ring_runner() -> None:
         )
 
     assert events == [
+        "validate",
         "ulysses_pre",
         "ring_ranges",
         "prepare",
@@ -1807,7 +1936,10 @@ def test_omni_attention_rejects_paged_ulysses_ring_padding_before_collectives() 
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
     layer.use_ring = True
-    layer.ring_runner = object()
+    layer.ring_runner = SimpleNamespace(
+        paged_kv_ring_layout=True,
+        paged_kv_sequence_parallel_degree=4,
+    )
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: Strategy()
     tensor = torch.zeros(1, 2, 2, 4)
@@ -1815,9 +1947,118 @@ def test_omni_attention_rejects_paged_ulysses_ring_padding_before_collectives() 
     with (
         set_forward_context(),
         override_paged_kv_adapter(Adapter()),
-        pytest.raises(NotImplementedError, match="divisible.*ulysses_degree \\* ring_degree"),
+        pytest.raises(NotImplementedError, match="divisible by its effective sequence-parallel degree"),
     ):
         get_forward_context().sp_padding_size = 1
+        layer._forward_impl(tensor, tensor, tensor)
+
+
+def test_omni_attention_rejects_paged_pure_ring_padding_before_collectives() -> None:
+    class Strategy:
+        name = "ring"
+
+        def pre_attention(self, *_args, **_kwargs):
+            raise AssertionError("padding must fail before Ring collectives")
+
+    class Adapter:
+        def validate_ring_sp_before_collective(self, *_args, **_kwargs):
+            raise AssertionError("padding must fail before geometry validation")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.use_ring = True
+    layer.ring_runner = SimpleNamespace(
+        paged_kv_ring_layout=True,
+        paged_kv_sequence_parallel_degree=2,
+    )
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(Adapter()),
+        pytest.raises(NotImplementedError, match="divisible by its effective sequence-parallel degree"),
+    ):
+        get_forward_context().sp_padding_size = 1
+        layer._forward_impl(tensor, tensor, tensor)
+
+
+@pytest.mark.parametrize("strategy_name", ["ring", "ulysses"])
+def test_omni_attention_validates_paged_ring_geometry_before_collectives(
+    strategy_name: str,
+) -> None:
+    class Strategy:
+        name = strategy_name
+
+        def pre_attention(self, *_args, **_kwargs):
+            raise AssertionError("geometry must fail before sequence-parallel collectives")
+
+    class Adapter:
+        def validate_ring_sp_before_collective(self, *_args, **_kwargs):
+            raise ValueError("The sequence may have been padded")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.use_ring = True
+    layer.ring_runner = SimpleNamespace(
+        paged_kv_ring_layout=True,
+        paged_kv_sequence_parallel_degree=4,
+    )
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(Adapter()),
+        pytest.raises(ValueError, match="may have been padded"),
+    ):
+        layer._forward_impl(tensor, tensor, tensor)
+
+
+@pytest.mark.parametrize(
+    ("runner", "message"),
+    [
+        (SimpleNamespace(paged_kv_sequence_parallel_degree=2), "rank-local KV layout"),
+        (SimpleNamespace(paged_kv_ring_layout=True), "sequence-sharding degree"),
+    ],
+)
+def test_omni_attention_requires_explicit_paged_ring_capability(
+    runner,
+    message: str,
+) -> None:
+    class Strategy:
+        name = "ring"
+
+        def pre_attention(self, *_args, **_kwargs):
+            raise AssertionError("capability must fail before Ring collectives")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.use_ring = True
+    layer.ring_runner = runner
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(object()),
+        pytest.raises(RuntimeError, match=message),
+    ):
         layer._forward_impl(tensor, tensor, tensor)
 
 

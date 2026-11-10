@@ -1559,8 +1559,8 @@ def test_materialize_paged_ring_kv_gathers_noncontiguous_slots():
     backend = FlashAttentionImpl.__new__(FlashAttentionImpl)
     actual_key, actual_value = backend.materialize_paged_ring_kv(context)
 
-    torch.testing.assert_close(actual_key, key.unsqueeze(0))
-    torch.testing.assert_close(actual_value, value.unsqueeze(0))
+    assert torch.equal(actual_key, key.unsqueeze(0))
+    assert torch.equal(actual_value, value.unsqueeze(0))
     assert actual_key.is_contiguous()
     assert actual_value.is_contiguous()
 

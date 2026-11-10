@@ -116,6 +116,16 @@ class RingParallelAttention:
     def name(self) -> str:
         return "ring"
 
+    @property
+    def paged_kv_ring_layout(self) -> bool:
+        """Whether this runner publishes the Paged Ring placement contract."""
+        return True
+
+    @property
+    def paged_kv_sequence_parallel_degree(self) -> int:
+        """Input sequence-sharding degree before Ulysses/Ring communication."""
+        return self._sp_group.ulysses_world_size * self._sp_group.ring_world_size
+
     def with_paged_kv_ranges(
         self,
         query: torch.Tensor,
