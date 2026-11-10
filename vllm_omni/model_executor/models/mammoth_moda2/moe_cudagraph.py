@@ -28,11 +28,7 @@ from enum import IntEnum
 
 import torch
 
-from vllm_omni.cudagraph.moe_routing_compat import (  # noqa: F401
-    ensure_moe_specialty_runner_compatible,
-    moe_routing_specialize_enabled,
-    runner_supports_moe_routing_specialty,
-)
+from vllm_omni.cudagraph.moe_routing_compat import moe_routing_specialize_enabled
 
 
 class MoERoutingKey(IntEnum):
@@ -161,8 +157,6 @@ def capture_mask_for_routing_key(
 # ---------------------------------------------------------------------------
 # Runner-facing helpers (used by MammothGPUARModelRunner only)
 # ---------------------------------------------------------------------------
-# Flag / runner gates: ``vllm_omni.cudagraph.moe_routing_compat`` (re-exported
-# above so shared runners stay model-agnostic).
 
 
 def find_gen_vocab_start_index(runner: object) -> int | None:

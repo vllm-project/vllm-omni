@@ -86,7 +86,7 @@ def test_ensure_moe_specialty_compatible_raises_for_non_mammoth_after_flag_set()
     """Flag is normally set during model ``__init__`` inside ``load_model``."""
     runner = object.__new__(OmniGPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
-    with pytest.raises(RuntimeError, match="cudagraph_mode without FULL"):
+    with pytest.raises(RuntimeError, match=r"cudagraph_mode without FULL|MammothGPUARModelRunner"):
         ensure_moe_specialty_runner_compatible(runner)
 
 

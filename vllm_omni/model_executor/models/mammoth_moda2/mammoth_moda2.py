@@ -80,10 +80,11 @@ def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
 def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
     """Turn on mask-keyed FULL MoE graphs when the stage uses FULL capture (#9865).
 
-    Auto-enables for any cudagraph mode that includes FULL. An explicit
-    ``cudagraph_specialize_moe_routing=False`` set before model load is
-    honored as an opt-out (the attribute is otherwise absent on
-    ``CompilationConfig``).
+    Auto-enables for any cudagraph mode that includes FULL. An in-process
+    ``object.__setattr__(..., False)`` before model load is still honored as
+    an opt-out for tests / tooling; ``CompilationConfig`` forbids this key in
+    deploy YAML / ``--compilation-config`` JSON, so user-facing remediation is
+    V1 ``MammothGPUARModelRunner`` or a cudagraph mode without FULL.
     """
     compilation_config = vllm_config.compilation_config
     cg_mode = getattr(compilation_config, "cudagraph_mode", None)
