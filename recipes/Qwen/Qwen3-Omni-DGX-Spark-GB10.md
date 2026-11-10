@@ -227,6 +227,7 @@ print("No additional pip check findings compared with the base image.")
 CHECK
   echo "Build validated (not inference-qualified): $image"
   echo "Build context: $ctx"
+  printf 'Optional cleanup after retaining any needed logs: rm -rf -- %q\n' "$ctx"
 }
 
 if build_gb10_image; then
@@ -263,9 +264,9 @@ It is derived from the previous three-stage profile by removing the legacy
 `duplex_session.server_vad_model_path` block, which the Chat Completions workload
 does not need.
 
-The checked-in profile, including Stage 1 `seed: 42`, was mounted
-in the seed-42 verification container. The host and container SHA256
-checksums both returned:
+The seed-42 inference used the YAML profile before the explanatory
+comments added in this PR review. The host and container SHA256
+checksums for those tested bytes both returned:
 
 ```text
 1a1bff44d2e00412a501e567fac33d877b0c60c30875462e0055afaf39dec7c5
@@ -274,8 +275,14 @@ checksums both returned:
 The older text-request benchmark and first audio-input run used the profile
 with the VAD field, so do not present those measurements as clean-profile results.
 
-The SHA256 above identifies the checked-in profile, including Stage 1
-`seed: 42`. The previous SHA256
+The SHA256 above identifies the exact YAML bytes used during the
+2026-10-30 seed-42 inference, including Stage 1 `seed: 42`. The current
+checked-in file adds only explanatory YAML comments for the Talker seed
+and CUDA rotary override; the parsed configuration is unchanged. Its
+current file SHA256 is `44d8ea297828c5abd56425a919f026db7d896a15249e49ace05577b86a31f5b4`. The new file hash is not a claim
+that GPU inference was rerun after this documentation-only change.
+
+The previous SHA256
 
 `800a037b26fc37032d1b6ba3b825ad473ee6d7eb6f38c3ea4d356b713c4bb2d5`
 
@@ -286,12 +293,9 @@ identifiers. Earlier validation used `gb10-f1a6e7ce-repro-final` and
 `gb10-f1a6e7ce-closure-verified`. The independently rebuilt candidate
 uses `vllm-omni:gb10-repro-check-20261030132325-3382504`.
 
-The build script generates a timestamped candidate tag. Use the exact
-tag printed by the build when launching the candidate image. If a stable
-local alias is preferred, create one explicitly with:
-
-Set `CANDIDATE_IMAGE` to the exact timestamped tag printed by the
-build command, then create the stable alias:
+The build script generates a timestamped candidate tag. Use that exact
+tag to launch the image. If a stable local alias is preferred, set
+`CANDIDATE_IMAGE` to the printed tag and run:
 
 `CANDIDATE_IMAGE="<candidate-image-tag>"; docker image tag "$CANDIDATE_IMAGE" vllm-omni:gb10-f1a6e7ce-repro-final`
 
@@ -517,6 +521,34 @@ reduction in Talker degeneration rate.
 Times measure complete HTTP responses, not time to first audio.
 The original pre-seed qualification measurements above remain
 historical observations and must not be relabeled as seeded results.
+
+#### Fixed-input test method and retained output evidence
+
+The WAV-input comparisons reused a fixed, locally prepared input recording to
+control input content and encoding across the tested configurations. The WAV
+durations below measure the **generated audio outputs**, not the input fixture.
+Retained output WAVs were copied from the Spark host to WSL on 2026-10-30;
+WSL shell history records the source paths under `results/seed42/` and
+`results/repro-check-20261030/`. The original files are not committed here.
+
+| Run and output | WAV duration (s) | SHA256 of generated WAV |
+| --- | ---: | --- |
+| Seed-42, WAV request 1 | 3.496875 | `148fa0c87fe66fcb2c345defe528b3b490b3f6d44e932e6b1efda9e6fcc97723` |
+| Seed-42, WAV request 2 | 4.616875 | `472b39911bad85a215c865dcb95f209ccbb0eee8bddde8fe11e53f11a71a8b32` |
+| Rebuilt candidate, WAV request 1 | 4.296875 | `76d34c6ed2dc05504299b0800f2957242c8121b20fa5ade4e6e0be5de7bb8bd8` |
+| Rebuilt candidate, WAV request 2 | 3.976875 | `1be4a64bd45643660a16c41369cee736c189f091b529a34d308c9003a68fe61c` |
+
+These four retained files are 24 kHz, mono, 16-bit PCM WAV. Their observed
+frame-aligned durations occur in discrete increments; matching rounded
+durations alone cannot establish identical audio bytes or copied results.
+
+**Historical provenance limit:** The earlier pre-seed measurements above also
+report 3.497 s and 3.977 s. The original output WAVs and complete container
+logs for those specific older observations were not retained after the Spark
+host was reinstalled. Their independence and precise runtime provenance cannot
+be re-audited from the remaining files. The recorded historical observations
+are preserved as historical, not asserted to be newly reverified or
+byte-for-byte comparable with the retained seed-42/rebuilt WAVs.
 
 ## Notes
 

@@ -47,6 +47,9 @@ stages:
       from_stage_0: connector_of_shared_memory
 
     default_sampling_params:
+      # Match the canonical Qwen3-Omni Talker seed (#7474). Seedless Talker
+      # decoding can derail into incoherent speech (#6090); a fixed seed
+      # improves repeatability but does not guarantee audio correctness.
       seed: 42
       temperature: 0.9
       top_k: 50
@@ -78,6 +81,9 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  # Preserve the canonical Thinker rotary path. Compiled fused MRoPE can
+  # materially change Qwen3-Omni speech (#6090). Revalidate audio if
+  # changing or removing this custom_ops override.
   cuda:
     stages:
       - stage_id: 0
