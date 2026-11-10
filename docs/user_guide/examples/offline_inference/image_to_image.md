@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>.
 
-
 This example edits an input image with `Qwen/Qwen-Image-Edit` and `JoyAI-Image-Edit` using the `image_edit.py` CLI.
 
 ## Local CLI Usage
@@ -73,6 +72,7 @@ Key arguments:
 - `--output`: path to save the generated PNG.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
+- `--vae-patch-parallel-size`: number of GPUs for VAE patch/tile parallelism, covering both the input-image encode and the output decode. Requires `--vae-use-tiling`. See [`vae_parallelism`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism/vae_parallelism.md).
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 
