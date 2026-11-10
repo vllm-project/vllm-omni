@@ -1224,7 +1224,7 @@ def iter_omni_server(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import stage_config_path_for_run_level
+    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
 
     model_prefix = get_model_prefix()
     with omni_fixture_lock, _whisper_device_free_around():
@@ -1243,12 +1243,13 @@ def iter_omni_server(
             model = resolve_tiny_model_path(model)
         port = params.port
         server_args = list(params.server_args or [])
-        # Some tests pass the deploy YAML only as ``--deploy-config`` in
-        # server_args. Rewrite that file too; with no deploy YAML at all,
-        # stage_config_path_for_run_level fails while the CI runner env is set.
+        # Only the weekly runner override rewrites a deploy YAML that was passed
+        # solely as ``--deploy-config``. Regular CI leaves that argument untouched,
+        # including its load_format. With the env set and no deploy YAML at all,
+        # stage_config_path_for_run_level fails instead of staying on V1.
         deploy_arg_index = None
         deploy_path = params.stage_config_path
-        if deploy_path is None:
+        if deploy_path is None and _ci_model_runner_override() is not None:
             deploy_arg_index = _deploy_config_arg_index(server_args)
             if deploy_arg_index is not None:
                 deploy_path = _deploy_config_value(server_args, deploy_arg_index)
