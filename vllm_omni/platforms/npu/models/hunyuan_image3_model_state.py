@@ -12,11 +12,10 @@ from vllm.v1.attention.backends.utils import compute_mm_prefix_ranges
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
-from vllm_ascend.attention.attention_v1 import AscendMetadata
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendMetadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
-from vllm_omni.platforms.npu.attention.static_shape_backend import OmniStaticShapeAttentionBackendImpl
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 
@@ -56,7 +55,7 @@ def _prefix_queries(
     return queries
 
 
-class NPUHunyuanImage3AttentionImpl(OmniStaticShapeAttentionBackendImpl):
+class NPUHunyuanImage3AttentionImpl(AscendAttentionBackendImpl):
     """Add image-prefix queries to the existing Ascend cache and attention path."""
 
     def forward_fused_infer_attention(
@@ -160,7 +159,7 @@ class NPUHunyuanImage3ModelState(OmniModelState, AscendModelState):
             layer_metadata._omni_prefix_queries = queries
             if queries:
                 impl = self.vllm_config.compilation_config.static_forward_context[layer_name].impl
-                if type(impl) is OmniStaticShapeAttentionBackendImpl:
+                if type(impl) is AscendAttentionBackendImpl:
                     # Preserve the initialized cache/backend state. Ascend's
                     # quantized KV adapters use the same per-instance seam.
                     impl.__class__ = NPUHunyuanImage3AttentionImpl

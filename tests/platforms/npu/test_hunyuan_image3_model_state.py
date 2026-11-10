@@ -11,12 +11,12 @@ pytest.importorskip("torch_npu")
 
 import torch_npu
 from vllm.config import CUDAGraphMode
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import HunyuanImage3ForConditionalGeneration
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.platforms.npu.attention.static_shape_backend import OmniStaticShapeAttentionBackendImpl
 from vllm_omni.platforms.npu.models import hunyuan_image3_model_state
 from vllm_omni.platforms.npu.models.hunyuan_image3_model_state import (
     NPUHunyuanImage3AttentionImpl,
@@ -102,9 +102,7 @@ def test_prefix_attention_matches_dense_mask_without_changing_text_queries(mocke
         output.copy_(_attention(query, key, value, causal))
         return output
 
-    base = mocker.patch.object(
-        OmniStaticShapeAttentionBackendImpl, "forward_fused_infer_attention", side_effect=base_forward
-    )
+    base = mocker.patch.object(AscendAttentionBackendImpl, "forward_fused_infer_attention", side_effect=base_forward)
 
     def fused(**kwargs):
         assert "atten_mask" not in kwargs
@@ -134,7 +132,7 @@ def test_prefix_attention_delegates_plain_decode(mocker):
     impl = NPUHunyuanImage3AttentionImpl.__new__(NPUHunyuanImage3AttentionImpl)
     metadata = mocker.Mock(_omni_prefix_queries=[])
     base = mocker.patch.object(
-        OmniStaticShapeAttentionBackendImpl, "forward_fused_infer_attention", return_value=mocker.sentinel.output
+        AscendAttentionBackendImpl, "forward_fused_infer_attention", return_value=mocker.sentinel.output
     )
     fia = mocker.patch.object(torch_npu, "npu_fused_infer_attention_score")
     query = torch.zeros(1, 1, 1)
@@ -152,7 +150,7 @@ def test_prepare_attn_binds_local_backend_and_clears_prefix_queries_for_decode(m
     state.vllm_config = mocker.Mock()
     state.vllm_config.parallel_config.decode_context_parallel_size = 1
     state.pcp_context = None
-    impl = OmniStaticShapeAttentionBackendImpl.__new__(OmniStaticShapeAttentionBackendImpl)
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
     state.vllm_config.compilation_config.static_forward_context = {"attention": mocker.Mock(impl=impl)}
     batch = mocker.Mock(spec=AscendInputBatch)
     batch.is_dummy, batch.has_prefill, batch.num_reqs = False, True, 1
