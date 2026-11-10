@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import math
 import queue
 import threading
 import time
@@ -143,6 +144,7 @@ class OmniEngineBase:
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
         otlp_traces_endpoint: str | None = None,
+        cfg_companion_timeout: float = 600.0,
         **kwargs: Any,
     ) -> None:
         from vllm_omni.tracing import create_tracer_provider
@@ -167,6 +169,9 @@ class OmniEngineBase:
         self._watermark_config = watermark_config
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
+        self._cfg_companion_timeout_s = float(cfg_companion_timeout)
+        if not math.isfinite(self._cfg_companion_timeout_s) or self._cfg_companion_timeout_s <= 0:
+            raise ValueError(f"--cfg-companion-timeout must be finite and > 0, got {self._cfg_companion_timeout_s}")
 
         self._single_stage_id_filter: int | None = kwargs.get("stage_id")
 
@@ -497,6 +502,7 @@ class OmniEngineBase:
                 log_stats=self._log_stats,
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
+                cfg_companion_timeout=self._cfg_companion_timeout_s,
             )
             await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():

@@ -29,9 +29,11 @@ from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.errors import (
     OmniClientError,
+    OmniServerError,
     client_error_from_metadata,
     client_error_metadata,
     is_client_error_status,
+    raise_request_error_or,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -1099,6 +1101,22 @@ def test_non_fatal_client_error_raises_omni_client_error():
     assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
 
 
+def test_non_fatal_gateway_timeout_raises_omni_server_error():
+    base = _make_base()
+    msg = ErrorMessage(
+        error="CFG companion timed out",
+        status_code=504,
+        error_type="GatewayTimeoutError",
+    )
+
+    with pytest.raises(OmniServerError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.error_type == "GatewayTimeoutError"
+    assert str(exc_info.value) == "CFG companion timed out"
+
+
 _NON_400_CLIENT_ERRORS = [
     pytest.param(429, "RateLimitError", id="429-too-many-requests"),
     pytest.param(413, "PayloadTooLargeError", id="413-payload-too-large"),
@@ -1166,6 +1184,20 @@ def test_non_fatal_non_4xx_status_raises_runtime(status_code: int | None):
 
     assert not isinstance(exc_info.value, OmniClientError)
     assert str(exc_info.value) == "server side failure"
+
+
+def test_gateway_timeout_error_preserves_request_status():
+    with pytest.raises(OmniServerError) as exc_info:
+        raise_request_error_or(
+            "CFG companion timed out",
+            status_code=504,
+            error_type="GatewayTimeoutError",
+            fallback=RuntimeError,
+        )
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.error_type == "GatewayTimeoutError"
+    assert str(exc_info.value) == "CFG companion timed out"
 
 
 def _make_enqueue_client_error(

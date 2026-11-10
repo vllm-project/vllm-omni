@@ -95,6 +95,25 @@ payload schemas, public protocol rendering, connector transport, or semantic
 error classification. Those responsibilities belong to the stage runtime,
 I/O, entrypoint, connector, and error contracts.
 
+## CFG companion lifecycle
+
+When a parent reaches a stage boundary before its CFG companions, the
+orchestrator stores the parent output and starts one monotonic wait deadline.
+Repeated partial outputs update the stored payload without extending that
+deadline. A normal completion flushes the complete companion bundle through
+the existing routing path.
+
+If a companion reports an error, is aborted, or remains silent until the
+deadline, the tracker claims one parent-level terminal transition. The
+orchestrator emits one request-scoped error for the parent, aborts the full
+parent/companion bundle, and releases all request and transfer state
+idempotently. A late companion output or repeated cleanup cannot create a
+second terminal result.
+
+The wait is controlled by the positive finite `--cfg-companion-timeout`
+setting, which defaults to 600 seconds. The timeout detects missing progress;
+replica reconstruction and retry remain outside this lifecycle contract.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.

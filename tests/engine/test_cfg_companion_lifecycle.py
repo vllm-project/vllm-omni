@@ -110,6 +110,8 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch._pd_pair = None
     orch._running_counter = None
     orch._transfer_emitter = None
+    orch._cfg_companion_timeout_s = 1.0
+    orch._shutdown_event = asyncio.Event()
     return orch
 
 
@@ -342,3 +344,135 @@ async def test_parent_abort_still_expands_to_companions():
     assert not orch._cfg_tracker.is_companion("p__neg")
     aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
     assert {"p", "p__neg"} <= aborted
+
+
+@pytest.mark.asyncio
+async def test_expired_parent_emits_one_timeout_and_cleans_bundle():
+    now = [0.0]
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(clock=lambda: now[0])
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {"parent": True}, stage_id=0)
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+
+    await orch._reap_expired_cfg_parents(now=1.0)
+
+    msg = orch.output_async_queue.get_nowait()
+    assert isinstance(msg, ErrorMessage)
+    assert msg.request_id == "p"
+    assert msg.status_code == 504
+    assert msg.error_type == "GatewayTimeoutError"
+    assert "p__neg" in msg.error
+    assert orch.output_async_queue.empty()
+    assert "p" not in orch.request_states
+    assert not orch._cfg_tracker.has_companions("p")
+    aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
+    assert {"p", "p__neg"} <= aborted
+
+    now[0] = 2.0
+    await orch._reap_expired_cfg_parents()
+    assert orch.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_expired_parent_abort_error_does_not_stop_reaper(monkeypatch):
+    now = [0.0]
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(clock=lambda: now[0])
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {"parent": True}, stage_id=0)
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+
+    async def abort_fails(request_ids):
+        raise RuntimeError("replica disappeared during abort")
+
+    monkeypatch.setattr(orch.stage_pools[0], "abort_requests", abort_fails)
+    await orch._reap_expired_cfg_parents(now=1.0)
+
+    msg = orch.output_async_queue.get_nowait()
+    assert isinstance(msg, ErrorMessage)
+    assert msg.request_id == "p"
+    assert "p" not in orch.request_states
+    assert "p__neg" not in orch.request_states
+    assert not orch._cfg_tracker.is_terminal("p")
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_is_serialized(monkeypatch):
+    now = [0.0]
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(clock=lambda: now[0])
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {"parent": True}, stage_id=0)
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocking_abort(request_ids):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        orch.stage_pools[0].aborted.append(list(request_ids))
+
+    monkeypatch.setattr(orch.stage_pools[0], "abort_requests", blocking_abort)
+    timeout_task = asyncio.create_task(orch._reap_expired_cfg_parents(now=1.0))
+    await entered.wait()
+
+    abort_task = asyncio.create_task(orch._handle_abort(AbortRequestMessage(request_ids=["p"])))
+    await asyncio.sleep(0)
+    assert not abort_task.done()
+
+    release.set()
+    await asyncio.gather(timeout_task, abort_task)
+    assert "p" not in orch.request_states
+    assert "p__neg" not in orch.request_states
+
+
+@pytest.mark.asyncio
+async def test_cfg_reaper_loop_polls_until_shutdown(monkeypatch):
+    orch = _make_orchestrator()
+    orch._cfg_companion_reaper_interval_s = 0.001
+    calls = 0
+
+    async def reap_once():
+        nonlocal calls
+        calls += 1
+        orch._shutdown_event.set()
+        return 0
+
+    monkeypatch.setattr(orch, "_reap_expired_cfg_parents", reap_once)
+    await orch._cfg_companion_reaper_loop()
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_companion_error_maps_to_parent_once():
+    orch = _make_orchestrator()
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+    companion_error = SimpleNamespace(
+        request_id="p__neg",
+        error="companion failed",
+        error_status_code=503,
+        error_type="ServiceUnavailableError",
+    )
+
+    await orch._handle_stage_error(0, companion_error)
+    await orch._handle_stage_error(0, companion_error)
+
+    msg = orch.output_async_queue.get_nowait()
+    assert isinstance(msg, ErrorMessage)
+    assert msg.request_id == "p"
+    assert msg.error == "companion failed"
+    assert orch.output_async_queue.empty()
+    assert "p" not in orch.request_states
+    assert "p__neg" not in orch.request_states

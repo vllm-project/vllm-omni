@@ -93,6 +93,13 @@ unchanged by these rules.
 
 ## Deploy configuration schema
 
+### Orchestrator settings
+
+The top-level orchestrator accepts `--cfg-companion-timeout` as a positive
+finite number of seconds. It controls how long a deferred CFG parent waits for
+missing companion output before receiving a request-scoped 504 error. The
+default is `600` seconds.
+
 The new deploy schema lives under `vllm_omni/deploy/` and is paired with a frozen `PipelineConfig` registered by the model's `pipeline.py`. Each deploy YAML has these top-level fields:
 
 | Field | Type | Required | Default | Description |

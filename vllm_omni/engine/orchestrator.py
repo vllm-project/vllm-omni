@@ -15,6 +15,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
 import threading
@@ -379,6 +380,12 @@ class StreamingInputState:
         return segment if segment is not None else StreamingSegmentState()
 
 
+@dataclass
+class _CfgTerminalCleanupState:
+    event: asyncio.Event
+    succeeded: bool | None = None
+
+
 class OrchestratorBase:
     """Stage-management loop shared by the turn-based and duplex orchestrators.
 
@@ -397,6 +404,8 @@ class OrchestratorBase:
     _stat_logger: OmniPrometheusStatLogger | None = None
     collect_stage_metrics: bool = True
     tracer: Tracer | None = None
+    _cfg_companion_timeout_s: float = 600.0
+    _cfg_companion_reaper_interval_s: float = 1.0
 
     def __init__(
         self,
@@ -416,6 +425,7 @@ class OrchestratorBase:
         collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         tracer: Tracer | None = None,
+        cfg_companion_timeout: float = 600.0,
     ) -> None:
         self.tracer = tracer
         self.request_async_queue = request_async_queue
@@ -461,6 +471,10 @@ class OrchestratorBase:
         )
 
         self._cfg_tracker = CfgCompanionTracker()
+        self._cfg_companion_timeout_s = float(cfg_companion_timeout)
+        if not math.isfinite(self._cfg_companion_timeout_s) or self._cfg_companion_timeout_s <= 0:
+            raise ValueError(f"cfg_companion_timeout must be finite and > 0, got {self._cfg_companion_timeout_s}")
+        self._cfg_companion_reaper_interval_s = min(1.0, self._cfg_companion_timeout_s)
         self._stage_input_processors: dict[int, Any] = {}
         self._prompt_processing_lock = threading.RLock()
         self._stage_input_submission_locks: dict[int, asyncio.Lock] = {}
@@ -568,6 +582,12 @@ class OrchestratorBase:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        tasks.append(
+            asyncio.create_task(
+                self._cfg_companion_reaper_loop(),
+                name="orchestrator-cfg-companion-reaper",
+            )
+        )
         for index, coro in enumerate(self._background_tasks()):
             tasks.append(asyncio.create_task(coro, name=f"orchestrator-background-{index}"))
         if membership_watcher is not None:
@@ -623,6 +643,85 @@ class OrchestratorBase:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _cfg_companion_reaper_loop(self) -> None:
+        """Fail deferred CFG parents whose companion bundle stops progressing."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self._cfg_companion_reaper_interval_s,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    await self._reap_expired_cfg_parents()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[Orchestrator] CFG companion reaper iteration failed")
+
+    async def _reap_expired_cfg_parents(self, *, now: float | None = None) -> int:
+        """Emit one timeout error and clean each expired CFG parent bundle."""
+        expired = self._cfg_tracker.poll_expired(self._cfg_companion_timeout_s, now=now)
+        for parent_id, deferred in expired:
+            companion_ids = list(self._cfg_tracker.get_companion_request_ids(parent_id).values())
+            pending_companions = [
+                companion_id for companion_id in companion_ids if not self._cfg_tracker.is_companion_done(companion_id)
+            ]
+            pending_summary = ", ".join(pending_companions) or "<unknown>"
+            logger.error(
+                "[Orchestrator] CFG companion deadline exceeded for parent %s after %.3fs; pending=%s",
+                parent_id,
+                self._cfg_companion_timeout_s,
+                pending_companions,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=parent_id,
+                    stage_id=deferred["stage_id"],
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                    error_type="GatewayTimeoutError",
+                    error=(
+                        "CFG companion deadline exceeded after "
+                        f"{self._cfg_companion_timeout_s:g}s while waiting for "
+                        f"companion requests: {pending_summary}"
+                    ),
+                )
+            )
+        for parent_id, _ in expired:
+            try:
+                await self._cleanup_request_ids(
+                    [parent_id],
+                    abort=True,
+                    release_owners=True,
+                    trace_error="cfg_companion_timeout",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] CFG timeout abort failed for parent %s; continuing reaper cleanup",
+                    parent_id,
+                )
+                try:
+                    # The abort path may fail when a replica dies. Always
+                    # release local request state so one request cannot stop
+                    # the reaper or leave the parent pending forever; the
+                    # normal replica-death path owns eviction.
+                    await self._cleanup_request_ids(
+                        [parent_id],
+                        abort=False,
+                        release_owners=True,
+                        trace_error="cfg_companion_timeout_cleanup_failed",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "[Orchestrator] CFG timeout fallback cleanup failed for parent %s",
+                        parent_id,
+                    )
+        return len(expired)
 
     async def publish_stage_post_warmup_memory(self) -> None:
         if self._stat_logger is None:
@@ -1585,6 +1684,9 @@ class OrchestratorBase:
         """Route processed stage outputs produced by one stage poll."""
         pool = self.stage_pools[stage_id]
         for output in outputs:
+            if self._cfg_tracker.is_request_terminal(output.request_id):
+                logger.debug("[Orchestrator] Dropping late terminal CFG output for req=%s", output.request_id)
+                continue
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
                 logger.warning(
@@ -1614,6 +1716,20 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
+    def _claim_cfg_failure(self, request_id: str) -> str | None:
+        """Return the parent id for one CFG failure, claiming it once."""
+        if self._cfg_tracker.is_request_terminal(request_id):
+            return None
+        if self._cfg_tracker.is_companion(request_id):
+            if self._cfg_tracker.is_companion_done(request_id):
+                return None
+            parent_id = self._cfg_tracker.get_parent_id(request_id) or request_id
+        else:
+            parent_id = request_id
+        if self._cfg_tracker.has_companions(parent_id) and not self._cfg_tracker.claim_terminal(parent_id):
+            return None
+        return parent_id
+
     async def _handle_stage_error(
         self,
         stage_id: int,
@@ -1628,10 +1744,11 @@ class OrchestratorBase:
         ``request_id`` overrides ``output.request_id``, e.g. the request of a failed n > 1 sample.
         """
         request_id = request_id or output.request_id
-        if self._cfg_tracker.is_companion(request_id):
-            parent_id = self._cfg_tracker.get_parent_id(request_id) or request_id
-        else:
-            parent_id = request_id
+        if request_id not in self.request_states and not self._cfg_tracker.is_companion(request_id):
+            return
+        parent_id = self._claim_cfg_failure(request_id)
+        if parent_id is None:
+            return
         resolved_error_type: str | None
         if getattr(output, "mm_cache_miss_hashes", None):
             resolved_error_type = "ServiceUnavailableError"
@@ -1732,15 +1849,18 @@ class OrchestratorBase:
                 continue
             bound = pool.get_bound_replica_id(req_id)
             if bound == replica_id or not stage_has_live:
+                parent_id = self._claim_cfg_failure(req_id)
+                if parent_id is None or parent_id in failed_ids:
+                    continue
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error=str(error),
                         fatal=True,
-                        request_id=req_id,
+                        request_id=parent_id,
                         stage_id=stage_id,
                     )
                 )
-                failed_ids.append(req_id)
+                failed_ids.append(parent_id)
         # Use the shared cleanup path so the running counter, PD/CFG state, and
         # bindings across every stage pool are released (not just this pool).
         # abort=True stops the failed requests' in-flight work on surviving
@@ -1769,21 +1889,24 @@ class OrchestratorBase:
         and bindings across every stage pool; it is a no-op for a request that
         was never registered.
         """
+        parent_id = self._claim_cfg_failure(req_id)
+        if parent_id is None:
+            return
         logger.error(
             "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
-            req_id,
+            parent_id,
             stage_id,
         )
         await self.output_async_queue.put(
             ErrorMessage(
                 error=f"Stage-{stage_id} has no live replica",
                 fatal=True,
-                request_id=req_id,
+                request_id=parent_id,
                 stage_id=stage_id,
             )
         )
         await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=True,
             trace_error="engine_dead",
@@ -1805,17 +1928,20 @@ class OrchestratorBase:
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
         serving, then releases the request's state across every stage pool.
         """
+        parent_id = self._claim_cfg_failure(req_id)
+        if parent_id is None:
+            return
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
                 status_code=status_code,
                 error_type=error_type,
-                request_id=req_id,
+                request_id=parent_id,
                 stage_id=stage_id,
             )
         )
         await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=release_owners,
             trace_error=error_type or DEFAULT_CLIENT_ERROR_TYPE,
@@ -1965,6 +2091,92 @@ class OrchestratorBase:
         release_owners: bool = False,
         trace_error: str | None = None,
     ) -> list[OutputMessage]:
+        if not abort:
+            return await self._cleanup_request_ids_unlocked(
+                request_ids,
+                abort=abort,
+                release_owners=release_owners,
+                trace_error=trace_error,
+            )
+
+        # Claim a parent abort before the first await. The unlocked cleanup
+        # path also performs this check for callers that pass a raw companion.
+        for request_id in request_ids:
+            if self._cfg_tracker.get_parent_id(request_id) is None and self._cfg_tracker.has_companions(request_id):
+                self._cfg_tracker.claim_terminal(request_id)
+
+        parent_by_request = {request_id: self._cfg_cleanup_parent_id(request_id) for request_id in request_ids}
+        parent_ids = {
+            parent_id
+            for request_id, parent_id in parent_by_request.items()
+            if parent_id is not None
+            and (
+                self._cfg_tracker.is_terminal(parent_id)
+                or request_id == parent_id
+                or not self._cfg_tracker.is_companion_done(request_id)
+            )
+        }
+        if not parent_ids:
+            return await self._cleanup_request_ids_unlocked(
+                request_ids,
+                abort=abort,
+                release_owners=release_owners,
+                trace_error=trace_error,
+            )
+
+        cleanup_states: dict[str, _CfgTerminalCleanupState] = getattr(self, "_cfg_terminal_cleanup_states", {})
+        self._cfg_terminal_cleanup_states = cleanup_states
+        waiting = [(parent_id, cleanup_states[parent_id]) for parent_id in parent_ids if parent_id in cleanup_states]
+        if waiting:
+            await asyncio.gather(*(state.event.wait() for _, state in waiting))
+            succeeded = {parent_id for parent_id, state in waiting if state.succeeded}
+            remaining_ids = [request_id for request_id in request_ids if parent_by_request[request_id] not in succeeded]
+            if not remaining_ids:
+                return []
+            return await self._cleanup_request_ids(
+                remaining_ids,
+                abort=abort,
+                release_owners=release_owners,
+                trace_error=trace_error,
+            )
+
+        owned = {parent_id: _CfgTerminalCleanupState(asyncio.Event()) for parent_id in parent_ids}
+        cleanup_states.update(owned)
+        try:
+            result = await self._cleanup_request_ids_unlocked(
+                request_ids,
+                abort=abort,
+                release_owners=release_owners,
+                trace_error=trace_error,
+            )
+            for state in owned.values():
+                state.succeeded = True
+            return result
+        except BaseException:
+            for state in owned.values():
+                state.succeeded = False
+            raise
+        finally:
+            for parent_id, state in owned.items():
+                cleanup_states.pop(parent_id, None)
+                state.event.set()
+
+    def _cfg_cleanup_parent_id(self, request_id: str) -> str | None:
+        parent_id = self._cfg_tracker.get_parent_id(request_id)
+        if parent_id is not None:
+            return parent_id
+        if self._cfg_tracker.has_companions(request_id):
+            return request_id
+        return self._cfg_tracker.get_terminal_parent(request_id)
+
+    async def _cleanup_request_ids_unlocked(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool = False,
+        release_owners: bool = False,
+        trace_error: str | None = None,
+    ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
         CFG-aware: cleaning a parent releases its tracker state and pulls its
@@ -1986,12 +2198,25 @@ class OrchestratorBase:
 
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
+        if abort:
+            # Claim a CFG parent before the first cleanup await. This closes
+            # the race where a parent abort is followed by a late parent or
+            # companion output while stage abort RPCs are still in flight.
+            for request_id in cleanup_ids:
+                if self._cfg_tracker.get_parent_id(request_id) is None and self._cfg_tracker.has_companions(request_id):
+                    self._cfg_tracker.claim_terminal(request_id)
+        terminal_parents: set[str] = set()
         orphaned_parents: dict[str, str] = {}
         for rid in cleanup_ids:
             pid = self._cfg_tracker.get_parent_id(rid)
             if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
                 orphaned_parents.setdefault(pid, rid)
         for pid, cid in orphaned_parents.items():
+            terminal_parents.add(pid)
+            if not self._cfg_tracker.claim_terminal(pid):
+                batch.add(pid)
+                cleanup_ids.append(pid)
+                continue
             parent_state = self.request_states.get(pid)
             if parent_state is not None and parent_state.trace is not None:
                 parent_state.trace.fail("cfg_companion_lost")
@@ -2010,6 +2235,7 @@ class OrchestratorBase:
                 if cid not in batch:
                     batch.add(cid)
                     cleanup_ids.append(cid)
+        terminal_parents.update(rid for rid in cleanup_ids if self._cfg_tracker.is_terminal(rid))
         abort_outputs: list[OutputMessage] = []
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
@@ -2029,6 +2255,8 @@ class OrchestratorBase:
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
                 req_state.running_counter_registered = False
+        for parent_id in terminal_parents:
+            self._cfg_tracker.finalize_terminal(parent_id)
         return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
@@ -2238,6 +2466,9 @@ class OrchestratorBase:
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
+        if self._cfg_tracker.is_request_terminal(req_id):
+            logger.debug("[Orchestrator] Dropping late terminal CFG output for req=%s", req_id)
+            return
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
@@ -4083,7 +4314,14 @@ class Orchestrator(OrchestratorBase):
             )
             return
 
-        self._cfg_tracker.register_companion(parent_id, role, companion_id)
+        if not self._cfg_tracker.register_companion(parent_id, role, companion_id):
+            logger.info(
+                "[Orchestrator] Dropping CFG companion %s (role=%s): parent %s is terminal",
+                companion_id,
+                role,
+                parent_id,
+            )
+            return
 
         companion_state = OrchestratorRequestState(
             request_id=companion_id,

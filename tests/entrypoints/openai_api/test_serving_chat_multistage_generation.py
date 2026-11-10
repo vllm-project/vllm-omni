@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.errors import OmniServerError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -94,6 +95,85 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+@pytest.mark.asyncio
+async def test_chat_full_generator_preserves_cfg_timeout_status():
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    async def failed_results():
+        raise OmniServerError(
+            "CFG companion timed out",
+            status_code=504,
+            error_type="GatewayTimeoutError",
+        )
+        yield  # pragma: no cover - keeps this an async generator
+
+    serving_chat = object.__new__(OmniOpenAIServingChat)
+    response = await serving_chat.chat_completion_full_generator(
+        None,
+        failed_results(),
+        "req-timeout",
+        "model",
+        [],
+        None,
+        None,
+        None,
+    )
+
+    assert response.error.code == 504
+    assert response.error.type == "GatewayTimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_generator_preserves_cfg_timeout_status(monkeypatch):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    serving_chat = object.__new__(OmniOpenAIServingChat)
+    serving_chat.use_harmony = False
+    serving_chat.tool_call_id_type = None
+    serving_chat.parser_cls = None
+    serving_chat.enable_force_include_usage = False
+    serving_chat.enable_log_outputs = False
+    serving_chat.request_logger = None
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(serving_chat, "_should_stream_with_auto_tool_parsing", lambda request: False)
+
+    def create_streaming_error_response(message, **kwargs):
+        captured.update(message=message, **kwargs)
+        return "error-payload"
+
+    monkeypatch.setattr(serving_chat, "create_streaming_error_response", create_streaming_error_response)
+
+    async def failed_results():
+        raise OmniServerError(
+            "CFG companion timed out",
+            status_code=504,
+            error_type="GatewayTimeoutError",
+        )
+        yield  # pragma: no cover - keeps this an async generator
+
+    request = SimpleNamespace(modalities=["text"], n=None, tool_choice=None, stream_options=None)
+    frames = [
+        frame
+        async for frame in serving_chat.chat_completion_stream_generator(
+            request,
+            failed_results(),
+            "req-timeout",
+            "model",
+            [],
+            None,
+            None,
+        )
+    ]
+
+    assert captured == {
+        "message": "CFG companion timed out",
+        "err_type": "GatewayTimeoutError",
+        "status_code": 504,
+    }
+    assert frames == ["data: error-payload\n\n", "data: [DONE]\n\n"]
 
 
 @pytest.mark.parametrize("extra_body", [{}, {"bot_task": "think"}])

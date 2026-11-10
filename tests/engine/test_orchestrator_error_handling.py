@@ -650,6 +650,30 @@ async def test_handle_dead_replica_last_replica_fails_all_stage_requests() -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_dead_replica_fails_cfg_bundle_once() -> None:
+    """A dead replica shared by a parent and companion emits one parent error."""
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-parent")
+        _register_request(orchestrator, "req-parent-cfg")
+        orchestrator._cfg_tracker.register_companion("req-parent", "negative", "req-parent-cfg")
+        pool.select_replica_id("req-parent")
+        pool.select_replica_id("req-parent-cfg", affinity_request_id="req-parent")
+
+        await orchestrator._handle_dead_replica(0, 0, EngineDeadError("cfg replica dead"))
+
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage)
+        assert msg.request_id == "req-parent"
+        assert queues[1].async_q.empty()
+        assert orchestrator.request_states == {}
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
 async def test_fail_request_dead_stage_cleans_registered_request() -> None:
     """Direct helper test: a registered request failed against a dead stage gets
     a fatal ErrorMessage, its state and bindings are released, and its
