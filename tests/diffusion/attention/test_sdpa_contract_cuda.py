@@ -19,7 +19,6 @@ from vllm_omni.diffusion.attention.capabilities import (
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
 

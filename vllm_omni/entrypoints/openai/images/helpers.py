@@ -22,10 +22,13 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import io
+import ipaddress
 import json
+import socket
 from http import HTTPStatus
 from numbers import Integral
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import numpy as np
@@ -184,6 +187,22 @@ def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
     return fallback
 
 
+def _validate_url_not_ssrf(url: str) -> None:
+    """Raise ValueError when ``url`` resolves to a non-public host (SSRF guard)."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError("URL must have a host")
+    if parsed.hostname in {"localhost", "0.0.0.0"}:
+        raise ValueError("URL must target a public host")
+    try:
+        for info in socket.getaddrinfo(parsed.hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                raise ValueError("URL must target a public host")
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve URL host: {parsed.hostname}") from exc
+
+
 async def _load_input_images(
     inputs: list[str],
     *,
@@ -210,9 +229,10 @@ async def _load_input_images(
 
         # 2. URL
         elif isinstance(inp, str) and inp.startswith("http"):
+            _validate_url_not_ssrf(inp)
             async with httpx.AsyncClient(timeout=60) as client:
                 try:
-                    resp = await client.get(inp)
+                    resp = await client.get(inp)  # codeql[py/server-side-request-forgery]
                     resp.raise_for_status()
                     img = open_image(io.BytesIO(resp.content))
                     images.append(img)

@@ -76,11 +76,11 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     last_exc: OSError | None = None
     for _ in range(max_attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((host, 0))
+            s.bind((host, 0))  # codeql[py/bind-socket-all-network-interfaces]
             port = int(s.getsockname()[1])
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.bind((host, port))
+                probe.bind((host, port))  # codeql[py/bind-socket-all-network-interfaces]
         except OSError as exc:
             last_exc = exc
             if exc.errno == errno.EADDRINUSE:
