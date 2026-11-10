@@ -192,12 +192,15 @@ Important settings for this profile:
 
 ### Per-architecture settings and other layouts
 
-- VAE graph replay is a `gfx950` issue. On MI350X, keep
-  `--no-enable-cuda-graph-decode`: with graphs enabled, a request can remain
-  in VAE decode with the GPU at 100% utilization and never complete. On
-  MI325X (`gfx942`), graph decode stayed enabled for every MI325X measurement
-  below with no failures, so omit the flag there. On one GPU, decode at
-  4736 × 3552 took 1.0 s with graphs on MI325X and 4.9 s eager on MI350X.
+- VAE graph replay can hang on both `gfx950` and `gfx942`; keep
+  `--no-enable-cuda-graph-decode` on all AMD GPUs. With graphs enabled, a
+  request can remain in VAE decode with the GPU at 100% utilization and never
+  complete. On MI350X this happened within the first three requests. On MI325X
+  (`gfx942`) the measurements below ran with graphs enabled and never stalled,
+  but the recipe-site command (Ulysses 4, encoder TP 4) stalled on its fifth
+  request; with the flag, the same command completed 16 of 16. Eager decode is
+  slower: at 4736 × 3552 on one GPU, decode took 1.0 s with graphs on MI325X
+  and 4.9 s eager on MI350X.
 - For other GPU counts, set `--num-gpus N --usp N --ring 1` (Ulysses; the 56
   attention heads allow N = 2, 4 or 8) or `--num-gpus N
   --tensor-parallel-size N` (TP). Ulysses had the lowest measured latency
@@ -290,7 +293,7 @@ resolved offline from the local Hugging Face cache.
 
 | GPU | Runtime | Extra server flags |
 | --- | --- | --- |
-| MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on) |
+| MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on; for serving, add `--no-enable-cuda-graph-decode`, see above) |
 | MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with this checkout installed | `--no-enable-cuda-graph-decode` |
 
 Both used vLLM `0.33.0+rocm100`, PyTorch `2.13.0+rocm10.0.0`, Transformers
