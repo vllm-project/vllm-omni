@@ -135,8 +135,7 @@ def install_h3_lite_decoder(
     for name, tensor in converted.items():
         if tuple(tensor.shape) != expected_shapes[name]:
             raise ValueError(
-                f"H3 Lite tensor shape mismatch for {name}: "
-                f"{tuple(tensor.shape)} != {expected_shapes[name]}"
+                f"H3 Lite tensor shape mismatch for {name}: {tuple(tensor.shape)} != {expected_shapes[name]}"
             )
     # The official VAE config is the fallback for fields the release profile
     # does not override (and for a 26-layer directory with no decode_config).
@@ -334,8 +333,7 @@ def _lightvae_geometry(
     if frames == 1:
         image_tile = _profile_value(model, profile, "image_tile_size", "decoder_image_tile_size") or short
         image_long = (
-            _profile_value(model, profile, "image_long_axis_tile", "decoder_image_long_axis_tile")
-            or image_tile
+            _profile_value(model, profile, "image_long_axis_tile", "decoder_image_long_axis_tile") or image_tile
         )
         image_overlap = profile.tile_overlap if profile.tile_overlap is not None else short_overlap
         return image_tile, image_long, image_overlap, image_overlap
@@ -437,9 +435,7 @@ def lightvae_decoder_tile_count(model: nn.Module, latent: torch.Tensor) -> int |
         return None
     ratio = int(getattr(model, "vae_ratio", 1) or 1)
     height, width = int(latent.shape[-2]) * ratio, int(latent.shape[-1]) * ratio
-    tile_h, tile_w, overlap_h, overlap_w = _lightvae_geometry(
-        model, profile, int(latent.shape[2]), height, width
-    )
+    tile_h, tile_w, overlap_h, overlap_w = _lightvae_geometry(model, profile, int(latent.shape[2]), height, width)
     layout = profile.tile_layout or "native"
     rows, _, _ = _split_tiles_for_profile(model, height, tile_h, overlap_h, layout=layout)
     cols, _, _ = _split_tiles_for_profile(model, width, tile_w, overlap_w, layout=layout)
