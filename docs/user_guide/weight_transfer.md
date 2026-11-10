@@ -34,6 +34,14 @@ upstream backend support (`ipc`, `nccl`, and `sparse_nccl`). The diffusion path
 validated here is unquantized Qwen-Image using `ipc` and upstream layerwise reload.
 No separate apply-strategy setting is required.
 
+CUDA IPC handles contain serialized Python objects. For HTTP IPC updates and
+Python IPC updates to AR stages (including `omni_lora_ipc`), set
+`VLLM_ALLOW_INSECURE_SERIALIZATION=1` before creating the client and engine so
+the engine-core RPC can carry these handles. Use this opt-in only with trusted
+trainers and restrict access to weight-transfer endpoints; it permits
+pickle-based deserialization. The in-process diffusion path does not cross this
+AR RPC boundary.
+
 Other diffusion pipelines must explicitly enable `supports_weight_reload` after
 validating their loading contract. See the [design document](../design/feature/weight_transfer.md#diffusion-loading-contract).
 
@@ -95,7 +103,79 @@ await engine.finish_weight_update()
 
 - Lifecycle calls fan out to every stage with weight transfer enabled and **fail if any stage reports an error** — a failed HTTP call means the round failed, it never silently succeeds.
 - Each worker enforces the protocol state machine: `update_weights` before `start_weight_update`, or a second `start_weight_update` without `finish_weight_update`, are rejected.
-- Updates are not transactional. A failed update can leave partial values or meta tensors. Recreate the rollout after failure; resetting the update target does not restore the old weights.
+- Dense updates are not transactional. A failed update can leave partial values or meta tensors. Recreate the rollout after failure; resetting the update target does not restore the old weights.
+
+## Engine-side LoRA merge
+
+The experimental `omni_lora_ipc` backend accepts adapter-only updates and merges
+them into live dense weights at `finish_weight_update`. Generate requests without
+a `LoRARequest`. Runtime LoRA remains the default.
+
+For an unquantized Qwen-Image diffusion stage:
+
+```yaml
+lora_application: merged
+weight_transfer_config:
+  backend: omni_lora_ipc
+```
+
+For the Qwen3-Omni thinker, configure only the trainable AR stage:
+
+```yaml
+stages:
+  - stage_id: 0
+    enable_lora: false
+    weight_transfer_config:
+      backend: omni_lora_ipc
+```
+
+AR merge supports ordinary linear projections, including separate q/k/v and
+gate/up factors mapped into fused weights. Expert-routed MoE adapters and
+quantized target layers are rejected. Do not set `enable_lora` for AR merged mode;
+it uses the dense graph and has no Punica adapter slots in the forward.
+
+Initialize IPC normally. Build tensor payloads with upstream's IPC trainer, then
+attach adapter metadata to each chunk before calling the existing client's
+`update_weights` method:
+
+```python
+update_info = {
+    **ipc_update_info,
+    "peft_config": peft_config,
+    "lora_int_id": 1,
+}
+client.update_weights(update_info)
+```
+
+`ipc_update_info` is the upstream-produced IPC payload; `peft_config` is the
+adapter's PEFT configuration. Send checkpoint-layout named A/B tensors, not full
+merged model weights or already TP-sharded factors. Repeat the same configuration
+and ID on every chunk. The native in-process representation is
+`vllm_omni.lora.request.TensorLoRARequest` (`lora_tensors`, `peft_config`).
+`add_lora` remains the runtime-adapter API; hot merged updates use the session.
+
+Pause generation before start and resume only after finish succeeds. A malformed
+adapter session leaves the previous policy live; retry with a new session. This
+guarantee covers ranks within a stage. Configure one trainable stage per session;
+there is no atomic transaction spanning multiple stage engines. A chunk without
+`peft_config` starts a full-base session and discards the old adapter bank.
+
+The bank consumes an extra copy of targeted weights, with further temporary
+copies during commit. GPU graph replay, actor/rollout numerical correlation,
+Qwen-Image TP4 peak memory, and end-to-end step-time measurements are required
+before production training. No speedup is claimed without these measurements.
+
+Run the CPU regressions in a vLLM development environment:
+
+```bash
+pytest tests/diffusion/lora/test_merged_weights.py tests/diffusion/lora/test_merged_manager.py tests/diffusion/lora/test_merged_weight_transfer.py tests/model_executor/test_merged_lora.py -m 'core_model and cpu'
+```
+
+Run the graph-storage check on a supported CUDA/ROCm device:
+
+```bash
+pytest tests/diffusion/lora/test_merged_lora_graph.py -m core_model
+```
 
 ## Limitations
 

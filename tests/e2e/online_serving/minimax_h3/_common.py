@@ -141,6 +141,8 @@ def post_sync(
     client: OpenAIClientHandler,
     form_data: dict[str, str],
     files: Any = None,
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> bytes:
     """Submit one synchronous video request and return its MP4 body."""
     response = requests.post(
@@ -148,7 +150,7 @@ def post_sync(
         data=form_data,
         files=files,
         headers={"Accept": "video/mp4"},
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     response.raise_for_status()
     assert response.headers.get("content-type", "").startswith("video/mp4")
@@ -195,6 +197,27 @@ def run_ref2va(client: OpenAIClientHandler, seed: int) -> bytes:
         _h3_form("ref2va", seed),
         files=[("input_references", ("reference.jpg", io.BytesIO(_REF2VA_IMAGE), "image/jpeg"))],
     )
+
+
+def run_ref2va_video(
+    client: OpenAIClientHandler,
+    model: str,
+    reference: Path,
+    workload: dict[str, Any],
+) -> bytes:
+    """Submit a video-reference Ref2VA request with the benchmark workload."""
+    form = _h3_form("ref2va", workload["seed"])
+    form["model"] = model
+    for key in ("width", "height", "fps", "num_frames", "num_inference_steps", "seed", "flow_shift"):
+        form[key] = str(workload[key])
+    form["extra_params"] = workload["extra_params"]
+    with reference.open("rb") as video:
+        return post_sync(
+            client,
+            form,
+            files=[("input_references", (reference.name, video, "video/mp4"))],
+            timeout=3600,
+        )
 
 
 def fl2va_files() -> dict[str, tuple[str, io.BytesIO, str]]:

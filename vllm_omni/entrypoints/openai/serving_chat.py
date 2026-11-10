@@ -161,6 +161,7 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -1149,8 +1150,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
-            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
-            prompt_additional_information["speaker"] = [normalized]
+            set_prompt_speaker(engine_prompt, normalized)
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():
@@ -1463,6 +1463,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
 
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
@@ -2783,6 +2784,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         else (output.finish_reason if output.finish_reason else "stop")
                     ),
                     stop_reason=output.stop_reason,
+                    weight_versions=(
+                        getattr(output, "weight_versions", None) if request.return_weight_versions else None
+                    ),
                 )
                 choices.append(choice_data)
                 continue
@@ -2920,6 +2924,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ),
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                weight_versions=(getattr(output, "weight_versions", None) if request.return_weight_versions else None),
             )
             choices.append(choice_data)
 
