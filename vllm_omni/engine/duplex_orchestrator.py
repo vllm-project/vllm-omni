@@ -612,7 +612,20 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Carry the duplex session into the stage scheduler payload:
             # the stage runner's prefix-cache adapter binds this request
             # to its session from it (session-level prefix caching).
+            # The fence epoch identifies the session's history
+            # generation: a barge-in bumps it, and the manager
+            # invalidates the session's stored rows when a STARTED
+            # request arrives with a newer epoch.
             request.session_id = context.session_id
+            # Only the Omni subclass declares session_epoch: a bare
+            # EngineCoreRequest is a msgspec Struct and rejects an
+            # undeclared attribute assignment. Resumable submissions
+            # and non-resumable plugins always reach here as an Omni
+            # request; a bare one (e.g. a MiniCPM-o auxiliary submit
+            # with a plain prompt) simply carries no epoch and the
+            # manager skips the check — the pre-epoch behaviour.
+            if isinstance(request, OmniEngineCoreRequest):
+                request.session_epoch = context.fence.epoch
             mm_features = getattr(request, "mm_features", None)
             if mm_features is not None:
                 request_state.mm_features = mm_features

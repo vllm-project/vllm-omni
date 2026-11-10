@@ -38,6 +38,11 @@ class OmniNewRequestData(NewRequestData):
     # when the upstream NewRequestData has no session field. Empty
     # means no session, same as None.
     session_id: str | None = None
+    # Duplex history generation (DuplexFence.epoch) carried alongside
+    # session_id; None when the request carries no epoch (pre-epoch
+    # payloads). The prefix-cache manager invalidates the session's
+    # stored rows when a STARTED request arrives with a newer epoch.
+    session_epoch: int | None = None
 
     @classmethod
     def from_base(
@@ -52,6 +57,12 @@ class OmniNewRequestData(NewRequestData):
         # (inside base_data and explicitly) is a duplicate-kwarg error.
         base_session = base_data.pop("session_id", None)
         value = getattr(request, "session_id", None) or base_session
+        # Epoch is an int where 0 is valid: only None means absent,
+        # so this must not use `or` (unlike session_id above).
+        base_epoch = base_data.pop("session_epoch", None)
+        epoch_value = getattr(request, "session_epoch", None)
+        if epoch_value is None:
+            epoch_value = base_epoch
         return cls(
             **base_data,
             external_req_id=getattr(request, "external_req_id", None),
@@ -59,6 +70,7 @@ class OmniNewRequestData(NewRequestData):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
             session_id=str(value) if value else None,
+            session_epoch=epoch_value,
         )
 
     @classmethod
@@ -95,6 +107,8 @@ class OmniNewRequestData(NewRequestData):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
             session_id=str(request.session_id) if getattr(request, "session_id", None) else None,
+            # 0 is a valid epoch: pass through as-is, never `or`-fallback.
+            session_epoch=getattr(request, "session_epoch", None),
         )
 
 

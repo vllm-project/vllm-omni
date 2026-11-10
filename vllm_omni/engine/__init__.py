@@ -87,6 +87,12 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: PayloadSenderInfo | None = None
+    # Duplex history generation (DuplexFence.epoch) stamped by the
+    # orchestrator at submit time; None when the request did not come
+    # through the duplex path. The prefix-cache manager invalidates a
+    # session's stored rows when a STARTED request arrives with a
+    # newer epoch (a barge-in bumped it).
+    session_epoch: int | None = None
 
     @classmethod
     def from_request(
@@ -128,6 +134,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             resumable=request.resumable,
             external_req_id=request.external_req_id,
             session_id=request.session_id,
+            session_epoch=getattr(request, "session_epoch", None),
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,

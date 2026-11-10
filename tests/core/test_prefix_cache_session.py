@@ -341,3 +341,30 @@ def test_terminate_ephemeral_only_unbinds():
 def test_terminate_unknown_request_is_noop():
     store = SessionPrefixStore()
     assert store.terminate("no-such-req") is None
+
+
+def test_session_epoch_record_and_read():
+    """6b: the store records the history generation the manager hands it."""
+    store = SessionPrefixStore()
+    assert store.epoch_of("S") is None
+    store.set_epoch("S", 2)
+    assert store.epoch_of("S") == 2
+    store.set_epoch("S", 5)
+    assert store.epoch_of("S") == 5
+    # Epoch 0 is a valid generation (the fence default), not "absent".
+    store.set_epoch("S", 0)
+    assert store.epoch_of("S") == 0
+
+
+def test_session_epoch_survives_invalidate_but_not_drop():
+    """6b: invalidate keeps the generation (same session, fresh stream);
+    only drop forgets it."""
+    store = SessionPrefixStore()
+    store.append("S", "hidden", _rows(0, 3))
+    store.set_epoch("S", 1)
+    store.invalidate("S")
+    assert store.stored_tokens("S", "hidden") == 0
+    assert store.epoch_of("S") == 1
+    store.append("S", "hidden", _rows(0, 2))
+    store.drop("S")
+    assert store.epoch_of("S") is None

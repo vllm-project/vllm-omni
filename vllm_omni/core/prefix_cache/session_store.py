@@ -82,6 +82,12 @@ class SessionPrefixStore:
         # req -> whether the bound request is a long-lived resumable
         # duplex stage request (vs a one-shot ephemeral request).
         self._resumable: dict[ReqId, bool] = {}
+        # session -> history generation (DuplexFence.epoch) recorded by
+        # the manager on STARTED. The store never infers an epoch: only
+        # the manager writes it, and only drop() forgets it — an
+        # invalidate keeps the generation (the session continues under
+        # the same generation with a fresh stream).
+        self._epochs: dict[SessionId, int] = {}
         self._stored_bytes = 0
         self.refused_appends = 0
 
@@ -125,6 +131,21 @@ class SessionPrefixStore:
         """Session a request belongs to, or None when unbound."""
         with self._lock:
             return self._bindings.get(req_id)
+
+    def set_epoch(self, session_id: SessionId, epoch: int) -> None:
+        """Record the history generation a session's rows belong to.
+
+        The manager is the only writer (on STARTED, see
+        ``OmniPrefixCacheManager._check_session_epoch``); the store
+        never infers an epoch itself.
+        """
+        with self._lock:
+            self._epochs[session_id] = int(epoch)
+
+    def epoch_of(self, session_id: SessionId) -> int | None:
+        """History generation recorded for a session, or None when unknown."""
+        with self._lock:
+            return self._epochs.get(session_id)
 
     # ------------------------------------------------------------ stream
 
@@ -409,6 +430,8 @@ class SessionPrefixStore:
         Separate from ``invalidate`` because ``append_beyond`` already
         holds the lock when a fork is detected, and the lock is
         non-reentrant: calling ``invalidate`` there would deadlock.
+        The recorded epoch is generation identity, not stream content,
+        so an invalidate keeps it; only ``drop`` forgets it.
         """
         dropped = 0
         for entry in [e for e in self._segments if e[0] == session_id]:
@@ -419,9 +442,11 @@ class SessionPrefixStore:
         return dropped
 
     def drop(self, session_id: SessionId) -> int:
-        """End a session: invalidate its segments and unbind its requests."""
+        """End a session: invalidate its segments, unbind its requests,
+        and forget its recorded epoch."""
         dropped = self.invalidate(session_id)
         with self._lock:
+            self._epochs.pop(session_id, None)
             for req_id in [r for r, s in self._bindings.items() if s == session_id]:
                 del self._bindings[req_id]
                 self._resumable.pop(req_id, None)

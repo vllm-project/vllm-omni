@@ -477,6 +477,11 @@ class OmniPrefixCacheManager:
         # which thread later consumes the step.
         self._req_row_pos: dict[ReqId, int] = {}
         self._req_session_offset: dict[ReqId, int] = {}
+        # History generation (DuplexFence.epoch) per request, recorded
+        # at STARTED and popped when the request finishes or aborts —
+        # same lifecycle as the two position dicts above. The frozen
+        # per-request copy lives in _StepContext (see 8).
+        self._req_session_epoch: dict[ReqId, int] = {}
 
         # Append ordering across materialize (async builder) and
         # discard_step (engine thread). A step whose expected position
@@ -537,9 +542,11 @@ class OmniPrefixCacheManager:
 
         Intended to be called on any session-history mutation (edit,
         truncation, interruption), but that wiring is not in place:
-        no production path calls this method yet, so a history
-        mutation currently leaves stale rows servable until an
-        appending batch's content check catches the mismatch.
+        no production path calls this method yet. Barge-in mutations
+        are caught earlier — the manager invalidates on a fence-epoch
+        change at STARTED (see _check_session_epoch). Other mutations
+        still leave stale rows servable until an appending batch's
+        content check catches the mismatch.
         Bindings are kept: the session continues and later appends
         rebuild a fresh stream. Returns segments dropped.
         """
@@ -554,6 +561,31 @@ class OmniPrefixCacheManager:
         restart or an explicit call.
         """
         return self._session_store.drop(session_id)
+
+    def _check_session_epoch(self, session_id: str, epoch: int) -> None:
+        """Invalidate a session whose history generation moved on.
+
+        Called on STARTED, under _state_lock: the fence epoch stamped
+        on the request identifies the session's history generation
+        (a barge-in bumps it). A mismatch means the rows stored under
+        the old generation belong to a superseded history — drop them
+        so the new turn rebuilds from its pool-hit prefix instead of
+        serving stale rows. A first-seen session just records its
+        epoch; a request without an epoch never reaches here.
+        """
+        known = self._session_store.epoch_of(session_id)
+        if known is None:
+            self._session_store.set_epoch(session_id, epoch)
+            return
+        if known != epoch:
+            logger.info(
+                "session %s history generation moved %s -> %s; invalidating stored rows",
+                session_id,
+                known,
+                epoch,
+            )
+            self._session_store.invalidate(session_id)
+            self._session_store.set_epoch(session_id, epoch)
 
     @torch.inference_mode()
     def new_step_starts(self, step: PrefixCacheStep) -> None:
@@ -586,6 +618,7 @@ class OmniPrefixCacheManager:
                 tids, dtask = self._request_tasks.finish(req_id)
                 self._req_row_pos.pop(req_id, None)
                 self._req_session_offset.pop(req_id, None)
+                self._req_session_epoch.pop(req_id, None)
                 self._drop_pending_appends(req_id)
                 # A resumable session request's termination is the
                 # session-end signal: its private rows are dropped with
@@ -610,6 +643,9 @@ class OmniPrefixCacheManager:
                 req_id = event.req_id
                 if event.session_id is not None:
                     self._session_store.bind(req_id, event.session_id, resumable=event.resumable)
+                if event.session_id is not None and event.session_epoch is not None:
+                    self._check_session_epoch(event.session_id, event.session_epoch)
+                    self._req_session_epoch[req_id] = event.session_epoch
                 # The adapter alone classifies starts versus continuation or
                 # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)

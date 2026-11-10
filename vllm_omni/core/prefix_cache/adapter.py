@@ -46,6 +46,11 @@ class PrefixCacheRequestEvent:
     # carries it. Absent (None) means the manager serves the request
     # from the slot pool only; session features stay off for it.
     session_id: str | None = None
+    # Duplex history generation (DuplexFence.epoch) stamped by the
+    # orchestrator at submit time. None when the scheduler payload
+    # carries no epoch; the manager then skips the epoch check and
+    # the request behaves as before.
+    session_epoch: int | None = None
     # True when the request is a long-lived resumable duplex stage
     # request: its termination ends the session (the store drops the
     # session's rows); an ephemeral request's termination only unbinds.
@@ -185,6 +190,13 @@ class PrefixCacheSchedulerAdapter:
         return str(value) if value else None
 
     @staticmethod
+    def _session_epoch(data: Any) -> int | None:
+        # Tolerant read, same as _session_id — but 0 is a valid epoch
+        # (the fence default), so only None means absent.
+        value = getattr(data, "session_epoch", None)
+        return int(value) if value is not None else None
+
+    @staticmethod
     def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
         if blocks is None:
             return ()
@@ -246,6 +258,7 @@ class PrefixCacheSchedulerAdapter:
                     block_ids=blocks,
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     session_id=self._session_id(data),
+                    session_epoch=self._session_epoch(data),
                     resumable=bool(getattr(data, "resumable", False)),
                 )
             )

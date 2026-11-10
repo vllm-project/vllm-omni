@@ -523,7 +523,11 @@ history or ends.
   stamps `session_id` on the stage request at submit time, the
   `OmniNewRequestData` conversions carry it to the worker-side adapter
   (explicitly, not relying on the upstream payload shape), and the
-  adapter binds the STARTED event. Whether a stage request is
+  adapter binds the STARTED event. The orchestrator also stamps the
+  fence epoch (`session_epoch`) on the same request; the manager
+  compares it at STARTED and invalidates the session's stored rows
+  when a barge-in bumped the epoch, so a new turn never serves rows
+  from a superseded history. Whether a stage request is
   long-lived depends on the plugin: only plugins declaring
   `supports_core_resumable_request = True` (MiniCPM-o) resume a stage
   request across turns, so only there is FINISHED/ABORTED a

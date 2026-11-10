@@ -104,12 +104,15 @@ class FakeView:
 
 
 class FakeNewReq:
-    def __init__(self, req_id, num_computed_tokens=0, block_ids=None, session_id=None, resumable=False):
+    def __init__(
+        self, req_id, num_computed_tokens=0, block_ids=None, session_id=None, resumable=False, session_epoch=None
+    ):
         self.req_id = req_id
         self.num_computed_tokens = num_computed_tokens
         self.block_ids = block_ids
         self.session_id = session_id
         self.resumable = resumable
+        self.session_epoch = session_epoch
 
 
 class FakeSchedOut:
@@ -2178,7 +2181,19 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
 
 
 def run_session_step(
-    mgr, view, req_id, blocks, start_pos, sched, *, hit=0, session=None, offset=0, finished=(), resumable=False
+    mgr,
+    view,
+    req_id,
+    blocks,
+    start_pos,
+    sched,
+    *,
+    hit=0,
+    session=None,
+    offset=0,
+    finished=(),
+    resumable=False,
+    session_epoch=None,
 ):
     """One single-request step through the adapter (session-aware)."""
     view.order = [req_id]
@@ -2190,7 +2205,12 @@ def run_session_step(
     sched_out = FakeSchedOut(
         new_reqs=[
             FakeNewReq(
-                req_id, num_computed_tokens=hit, block_ids=[list(blocks)], session_id=session, resumable=resumable
+                req_id,
+                num_computed_tokens=hit,
+                block_ids=[list(blocks)],
+                session_id=session,
+                resumable=resumable,
+                session_epoch=session_epoch,
             )
         ],
         finished=list(finished),
@@ -2730,5 +2750,63 @@ def test_session_survives_ephemeral_request_finish():
         finish_session_request(mgr, "a")
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
         assert mgr._session_store.session_of("a") is None
+    finally:
+        mgr.shutdown()
+
+
+def test_session_epoch_change_invalidates_stored_rows():
+    """6b: a STARTED with a newer fence epoch drops the old generation's rows.
+
+    Turn 1 stores 8 rows under epoch 0; turn 2 arrives with epoch 1
+    (a barge-in bumped it) and no pool hit (rewritten history). The
+    STARTED check invalidates before any new rows append, so the new
+    turn rebuilds from its own rows instead of serving the superseded
+    history's prefix.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.epoch_of("S") == 0
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 0, 4, hit=0, session="S", session_epoch=1, finished=["a"])
+        # Invalidated at STARTED, before the new turn appends anything.
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        assert mgr._session_store.epoch_of("S") == 1
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 4
+    finally:
+        mgr.shutdown()
+
+
+def test_session_epoch_unchanged_keeps_stored_rows():
+    """6b: a STARTED with the same epoch must not disturb the stream."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", session_epoch=0, finished=["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.epoch_of("S") == 0
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+    finally:
+        mgr.shutdown()
+
+
+def test_session_epoch_absent_skips_check():
+    """6b: a request without an epoch (pre-epoch payload) behaves as before:
+    no invalidation, no epoch recorded."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.epoch_of("S") == 0
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
     finally:
         mgr.shutdown()

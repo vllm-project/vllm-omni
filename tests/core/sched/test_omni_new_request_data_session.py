@@ -62,6 +62,7 @@ except ModuleNotFoundError:  # pragma: no cover - vllm-less dev machines
         prompt_is_token_ids: object = None
         prefill_token_ids: object = None
         session_id: str | None = None
+        session_epoch: int | None = None
 
     @dataclass
     class CachedRequestData:  # noqa: D101 - stub only
@@ -128,11 +129,24 @@ class _Req:
     num_computed_tokens: int = 0
     lora_request: object = None
     session_id: str | None = None
+    session_epoch: int | None = None
 
 
 def test_from_request_carries_session_id():
     data = OmniNewRequestData.from_request(_Req(session_id="S"), ([0],))
     assert data.session_id == "S"
+
+
+def test_from_request_carries_session_epoch():
+    """6b: the epoch rides alongside the session id."""
+    data = OmniNewRequestData.from_request(_Req(session_id="S", session_epoch=2), ([0],))
+    assert data.session_epoch == 2
+
+
+def test_from_request_epoch_zero_is_kept():
+    """6b: 0 is a valid epoch (the fence default), not 'absent'."""
+    data = OmniNewRequestData.from_request(_Req(session_id="S", session_epoch=0), ([0],))
+    assert data.session_epoch == 0
 
 
 def test_from_request_empty_session_is_none():
@@ -160,3 +174,28 @@ def test_from_base_falls_back_to_payload_session():
     assert data.session_id == "OLD"
     data = OmniNewRequestData.from_base(base, None)
     assert data.session_id == "OLD"
+
+
+@_NO_PAYLOAD_SESSION
+def test_from_base_prefers_request_session_epoch_over_payload():
+    base = NewRequestData(req_id="r", session_id="OLD", session_epoch=7)
+    data = OmniNewRequestData.from_base(base, _Req(session_id="NEW", session_epoch=2))
+    assert data.session_epoch == 2
+
+
+@_NO_PAYLOAD_SESSION
+def test_from_base_falls_back_to_payload_session_epoch():
+    base = NewRequestData(req_id="r", session_id="OLD", session_epoch=7)
+    data = OmniNewRequestData.from_base(base, _Req(session_id=None, session_epoch=None))
+    assert data.session_epoch == 7
+    data = OmniNewRequestData.from_base(base, None)
+    assert data.session_epoch == 7
+
+
+@_NO_PAYLOAD_SESSION
+def test_from_base_request_epoch_zero_beats_payload():
+    """6b: request epoch 0 must beat a payload epoch — the `is None`
+    check, not `or`, decides the fallback."""
+    base = NewRequestData(req_id="r", session_id="OLD", session_epoch=7)
+    data = OmniNewRequestData.from_base(base, _Req(session_id="NEW", session_epoch=0))
+    assert data.session_epoch == 0
