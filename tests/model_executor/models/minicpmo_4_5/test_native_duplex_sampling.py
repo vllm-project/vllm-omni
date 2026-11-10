@@ -274,31 +274,49 @@ def test_explicit_force_listen_bypasses_only_soft_character_target(monkeypatch, 
     assert state.generated_tokens == []
 
 
+class _SentenceTokenizer(_CharTokenizer):
+    """Ids ending in 22 decode as a finished sentence; any other text is cut after 「正」."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        text_ids = [token for token in map(int, ids) if token not in self.all_special_ids]
+        if not text_ids:
+            return ""
+        if text_ids[-1] == 22:
+            return "正方形中间有一个数字十一。"
+        return "现在画面中出现的是一个绿色的正方形，正"
+
+
 @pytest.mark.parametrize("deferred", [False, True])
 def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferred):
-    """Issue 9828: <|turn_eos|> after 「正」 must not end the turn."""
+    """Issue 9828: <|turn_eos|> after 「正」 must not end the turn.
+
+    The second sample is the empty chunk after the hold. The turn tail is
+    still unfinished, so that <|turn_eos|> is held too.
+    """
     model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=True)
     model.max_speak_chars_per_chunk = 0
     state.current_turn_ended = False
     turn_eos = TOKEN_IDS["turn_eos_token_id"]
-
-    class OpenTokenizer(_CharTokenizer):
-        def decode(self, ids, skip_special_tokens=False):
-            return "现在画面中出现的是一个绿色的正方形，正"
-
-    model._minicpmo45_tokenizer_cache = OpenTokenizer()
+    model._minicpmo45_tokenizer_cache = _SentenceTokenizer()
+    model._record_minicpmo45_duplex_generation_token(0, 21)
+    assert state.open_turn_tail.endswith("正")
     md.output_token_ids[0] = [21]
+
     assert sample(turn_eos) == CHUNK_EOS
     assert state.current_turn_ended is False
     assert state.held_turn_ends == 1
-    assert state.generated_tokens == []
+    assert state.generated_tokens == [21]
+    assert state.open_turn_tail.endswith("正")
 
-    class ClosedTokenizer(_CharTokenizer):
-        def decode(self, ids, skip_special_tokens=False):
-            return "正方形中间有一个数字十一。"
+    # The next segment drops the chunk terminator, so its accepted text is empty.
+    md.output_token_ids[0] = []
+    assert sample(turn_eos) == CHUNK_EOS
+    assert state.current_turn_ended is False
+    assert state.held_turn_ends == 2
 
-    model._minicpmo45_tokenizer_cache = ClosedTokenizer()
-    md.output_token_ids[0] = [21, 22]
+    model._record_minicpmo45_duplex_generation_token(0, 22)
+    md.output_token_ids[0] = [CHUNK_EOS, 22]
     assert sample(turn_eos) == turn_eos
     assert state.current_turn_ended is True
     assert state.held_turn_ends == 0
+    assert state.open_turn_tail == ""
