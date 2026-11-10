@@ -4096,8 +4096,9 @@ def _t2v_multiview_pipeline(make_cosmos3_pipeline, num_views: int = 2):
         torch.zeros(1, 2, latent_t, 1, 1),
     )
     pipeline.diffuse_transfer = lambda **kwargs: kwargs["latents"]
-    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(
-        1, 3, num_views * _T2V_MULTIVIEW_FRAMES, 4, 4
+    pipeline._decode_outputs = lambda *args, **kwargs: (
+        torch.zeros(1, 3, num_views * _T2V_MULTIVIEW_FRAMES, 4, 4),
+        None,
     )
     _capture_tokenize_calls(pipeline)
     return pipeline
@@ -4182,8 +4183,12 @@ def test_multiview_condition_indexes_expand_per_view_local_frames(
         return prepare_latents(**kwargs)
 
     pipeline._prepare_multiview_latents = capture
-    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
-    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 16, 1, 1)
+    pipeline._encode_inputs = lambda *args, **kwargs: (
+        torch.zeros(1, 2, 16, 1, 1),
+        torch.zeros(1, 2, 16, 1, 1),
+        None,
+        None,
+    )
     views = [
         {**view, "control_path": f"control{index}.mp4"}
         | ({"vision_path": f"vision{index}.mp4"} if index in vision_views else {})
