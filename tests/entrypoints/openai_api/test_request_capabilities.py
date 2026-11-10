@@ -10,14 +10,18 @@ import pytest
 from pydantic import ValidationError
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_capabilities import _initialized_image_geometry, _route_request
-from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, TTSCapabilities
+from vllm_omni.entrypoints.openai.tts_adapters.audex import AudexAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.audex_tta import AudexTTAAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, SpeechServingContext, TTSCapabilities
 from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+from vllm_omni.entrypoints.openai.tts_adapters.gepard import GepardAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.kokoro import KokoroAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.minimax_music3 import MiniMaxMusic3Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
-from vllm_omni.request_capabilities import ImageGeometry, InputConstraint, RuntimeServingMetadata
+from vllm_omni.request_capabilities import ImageGeometry, InputConstraint, ParameterConstraint, RuntimeServingMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -142,7 +146,7 @@ def test_kokoro_uses_loaded_voices_and_does_not_promote_generic_language_default
     adapter = object.__new__(KokoroAdapter)
     adapter.capabilities = TTSCapabilities(supported_speakers=frozenset({"af_heart"}))
     request = adapter.get_request_constraints()
-    assert set(request.parameters["voice"].enum) == {"af_heart", "default"}
+    assert set(request.parameters["voice"].enum) == {"af_heart", "default", ""}
     assert "language" not in request.parameters
 
 
@@ -198,3 +202,87 @@ def test_kokoro_default_alias_requires_its_actual_target_voice():
     adapter = object.__new__(KokoroAdapter)
     adapter.capabilities = TTSCapabilities(supported_speakers=frozenset({"bf_emma"}))
     assert "default" not in adapter.get_request_constraints().parameters["voice"].enum
+
+
+@pytest.mark.parametrize(
+    "adapter_type,parameter,value,normalization",
+    [
+        (Qwen3TTSAdapter, "language", "english", "title"),
+        (KokoroAdapter, "voice", "AF_HEART", "lower"),
+        (GepardAdapter, "voice", "DEFAULT", "lower"),
+        (AudexAdapter, "voice", " DeFaUlT ", "strip_lower"),
+        (AudexTTAAdapter, "voice", " DeFaUlT ", "strip_lower"),
+        (MiniMaxMusic3Adapter, "voice", " DeFaUlT ", "strip_lower"),
+        (Yue2Adapter, "voice", " DeFaUlT ", "strip_lower"),
+    ],
+)
+def test_speech_enum_matching_follows_actual_adapter_validation(
+    monkeypatch, adapter_type, parameter, value, normalization
+):
+    adapter = object.__new__(adapter_type)
+    adapter.capabilities = TTSCapabilities(supported_speakers=frozenset({"af_heart"}), default_speaker="af_heart")
+    if adapter_type is Qwen3TTSAdapter:
+        adapter.ctx = SpeechServingContext(
+            server=SimpleNamespace(
+                engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace())),
+                uploaded_speakers={},
+                _get_available_speakers=lambda: {"af_heart"},
+            )
+        )
+    if adapter_type is KokoroAdapter:
+        monkeypatch.setattr("vllm_omni.entrypoints.openai.tts_adapters.kokoro.missing_g2p_package", lambda _: None)
+    kwargs = {parameter: value}
+    if adapter_type in (MiniMaxMusic3Adapter, Yue2Adapter):
+        kwargs["instructions"] = "acoustic folk"
+    request = OpenAICreateSpeechRequest(input="hello", **kwargs)
+    assert adapter.validate(request) is None
+    constraint = adapter.get_request_constraints().parameters[parameter]
+    assert constraint.enum_normalization == normalization
+
+
+@pytest.mark.parametrize("adapter_type", [AudexAdapter, AudexTTAAdapter, MiniMaxMusic3Adapter, Yue2Adapter])
+@pytest.mark.parametrize("voice", [None, "", "  ", "default", " DeFaUlT ", "invalid"])
+def test_placeholder_voice_enum_includes_the_accepted_empty_value(adapter_type, voice):
+    adapter = object.__new__(adapter_type)
+    kwargs = {"instructions": "acoustic folk"} if adapter_type in (MiniMaxMusic3Adapter, Yue2Adapter) else {}
+    accepted = adapter.validate(OpenAICreateSpeechRequest(input="hello", voice=voice, **kwargs)) is None
+    assert accepted == (voice != "invalid")
+    constraint = adapter.get_request_constraints().parameters["voice"]
+    assert constraint.enum_normalization == "strip_lower"
+    assert accepted == ((voice or "").strip().lower() in constraint.enum)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"type": "number", "enum": (1,)},
+        {"type": "string", "enum": None},
+        {"type": "string", "enum": (1,)},
+    ],
+)
+def test_enum_normalization_requires_a_string_enum(fields):
+    with pytest.raises(ValidationError):
+        ParameterConstraint(enum_normalization="lower", **fields)
+
+
+def test_enum_normalization_is_optional_and_serializes_without_changing_enum():
+    exact = ParameterConstraint(type="string", enum=("CustomVoice",))
+    assert "enum_normalization" not in exact.model_dump(exclude_none=True)
+    normalized = ParameterConstraint(type="string", enum=("English",), enum_normalization="title")
+    assert normalized.model_dump()["enum"] == ["English"]
+    assert normalized.model_dump()["enum_normalization"] == "title"
+    with pytest.raises(ValidationError):
+        ParameterConstraint.model_validate({"type": "string", "enum": ["English"], "enum_normalization": "future"})
+
+
+@pytest.mark.parametrize("adapter_type", [KokoroAdapter, GepardAdapter])
+@pytest.mark.parametrize("voice", [None, "", "  ", "default", "DEFAULT", " default ", "AF_HEART", "invalid"])
+def test_lowercase_voice_enums_preserve_each_adapters_empty_and_whitespace_policy(monkeypatch, adapter_type, voice):
+    adapter = object.__new__(adapter_type)
+    adapter.capabilities = TTSCapabilities(supported_speakers=frozenset({"af_heart"}))
+    if adapter_type is KokoroAdapter:
+        monkeypatch.setattr("vllm_omni.entrypoints.openai.tts_adapters.kokoro.missing_g2p_package", lambda _: None)
+    accepted = adapter.validate(OpenAICreateSpeechRequest(input="hello", voice=voice)) is None
+    constraint = adapter.get_request_constraints().parameters["voice"]
+    assert constraint.enum_normalization == "lower"
+    assert accepted == (voice is None or voice.lower() in constraint.enum)

@@ -92,8 +92,18 @@ HTTP route and a disabled WebSocket profile.
 | `inputs.<role>.min_count`, `max_count` | Optional inclusive counts. `min_count: 0` means optional; an omitted maximum is unknown. |
 | `required_any_of` | Every inner list requires at least one of its roles. All lists must be satisfied. |
 | `parameters.<name>` | Optional `support`, scalar `type`, `enum`, inclusive `minimum`/`maximum`, and `step`. These describe accepted inputs, not quality recommendations. |
+| `parameters.<name>.enum_normalization` | Optional string-enum comparison rule: `lower`, `title`, or `strip_lower`, matching the adapter's Python string normalization. Missing means exact comparison. |
 | `mask` | Native mask semantics and its relationship to source images. See below. |
 | `max_output_pixels` | Optional deployment limit from `--max-generated-image-size`, not a universal model resolution limit. |
+
+Apply `enum_normalization` to the supplied string and each enum candidate only
+for membership comparison; preserve the original request value. `strip_lower`
+removes surrounding whitespace before lowercasing. Unknown rules are unknown
+capability data, not permission to assume exact matching. Only string enums can
+declare this field. Qwen3-TTS language uses `title`; Kokoro and Gepard voices
+use `lower`; Audex and music placeholders use `strip_lower`. Empty placeholders
+are included only where the actual adapter accepts them. An accepted placeholder
+does not imply selectable voices.
 
 For example, CosyVoice3's `required_any_of` is
 `[["voice", "reference_audio"], ["voice", "reference_text"]]`: a registered voice
@@ -161,7 +171,7 @@ pipeline signature cannot accept it, rather than silently discarding it.
 | `image_generation` | The image route accepts positive dimensions and output format; it has no image/mask/separate-reference mapping. Declared model limits cannot be widened by the route. |
 | `video_generation` | HTTP reference roles remain separate from the WebSocket's single-image input. Neither route maps native Wan `last_image`, so the optional offline last-frame role is excluded on these routes. MAGI-2 declares 125 frames, 12.5 fps, 10 seconds and its two native resolution modes. Joint audio output remains in `outputs`; optional audio remains in `constraints.optional_outputs`. |
 | `speech` | Each TTS adapter owns its accepted reference, voice and instruction facts beside its request builder. Loaded voice enums include validated aliases such as Kokoro's `default` only when its target exists. Qwen language enums reflect actual input validation; the generic default language list is not promoted for other adapters. |
-| `speech` music/caption profiles | MiniMax Music3/YuE2 require lyrics and style instructions, permit only the placeholder `default` voice, and exclude ordinary TTS reference controls. Audex TTA takes captions. MOSS variants separately expose reference cloning, sound-effect descriptions or voice-design instructions. |
+| `speech` music/caption profiles | MiniMax Music3/YuE2 require lyrics and style instructions, accept an empty or `default` voice placeholder, and exclude ordinary TTS reference controls. Audex TTA takes captions. MOSS variants separately expose reference cloning, sound-effect descriptions or voice-design instructions. |
 | `audio_generation` | The diffusion audio handler maps a text caption and optional negative prompt. It has no lyrics/instruction pair, voice or reference-media mapping. |
 
 FLUX.3 declares image responses through chat, text-to-image generation, and

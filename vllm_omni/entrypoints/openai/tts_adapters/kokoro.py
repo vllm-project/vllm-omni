@@ -111,10 +111,11 @@ class KokoroAdapter(ARTTSAdapter):
             parameters["voice"] = ParameterConstraint(
                 support="supported",
                 type="string",
+                enum_normalization="lower",
                 enum=tuple(
                     sorted(
                         self.capabilities.supported_speakers
-                        | ({"default"} if DEFAULT_VOICE in self.capabilities.supported_speakers else set())
+                        | ({"", "default"} if DEFAULT_VOICE in self.capabilities.supported_speakers else set())
                     )
                 ),
             )

@@ -54,7 +54,13 @@ class GepardAdapter(ARTTSAdapter):
     request_constraints = speech_inputs(
         "voice", unsupported=("reference_audio", "reference_text", "instructions")
     ).model_copy(
-        update={"parameters": {"voice": ParameterConstraint(support="supported", type="string", enum=("default",))}}
+        update={
+            "parameters": {
+                "voice": ParameterConstraint(
+                    support="supported", type="string", enum=("default",), enum_normalization="lower"
+                )
+            }
+        }
     )
 
     name = "gepard"

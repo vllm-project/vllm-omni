@@ -53,9 +53,18 @@ class ParameterConstraint(RequestFact):
     support: RequestSupport = "unknown"
     type: Literal["string", "integer", "number", "boolean"] | None = None
     enum: tuple[Scalar, ...] | None = None
+    enum_normalization: Literal["lower", "title", "strip_lower"] | None = None
     minimum: float | None = None
     maximum: float | None = None
     step: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def string_enum_normalization(self) -> "ParameterConstraint":
+        if self.enum_normalization is not None and (
+            self.type != "string" or self.enum is None or any(not isinstance(value, str) for value in self.enum)
+        ):
+            raise ValueError("enum_normalization requires a string enum")
+        return self
 
 
 @validated_dataclass(frozen=True)

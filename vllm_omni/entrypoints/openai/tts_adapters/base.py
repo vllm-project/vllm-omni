@@ -53,7 +53,9 @@ def lyrics_request_constraints(
             support="supported", type="integer", minimum=min_tokens, maximum=max_tokens
         ),
         "speed": ParameterConstraint(support="supported", type="number", enum=(1.0,)),
-        "voice": ParameterConstraint(support="supported", type="string", enum=("default",)),
+        "voice": ParameterConstraint(
+            support="supported", type="string", enum=("", "default"), enum_normalization="strip_lower"
+        ),
         "language": ParameterConstraint(support="unsupported"),
     }
     if streaming is False:

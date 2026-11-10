@@ -179,6 +179,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         parameters["language"] = ParameterConstraint(
             support="supported",
             type="string",
+            enum_normalization="title",
             enum=tuple(sorted(self.capabilities.supported_languages)),
         )
         if variant is not None:
