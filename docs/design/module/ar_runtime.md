@@ -32,6 +32,17 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
+state transitions for Qwen3-Omni turn requests. Its connector must withhold
+successful receive completion until both GPU KV and request-local CPU captures
+are ready. A failed receive uses the explicitly configured `recompute` policy;
+the upstream `fail` default still terminates requests for other configurations.
+Restored captures are merged before output publication and consumed once per
+request attempt. External loads do not populate the worker's local prefix-cache
+slots, so local prefix caching remains disabled with this backend. See
+[KV offload configuration](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental)
+for configuration, scope, and validation limits.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
