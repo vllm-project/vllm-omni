@@ -1575,7 +1575,7 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
 
 
 @pytest.mark.slow
-def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
+def test_fused_kernels_serve_only_a_single_head_kv_cache_of_the_batch_size(tiny_model):
     """Calls the kernels do not cover run eagerly even once they are enabled."""
     backbone = tiny_model.paligemma_with_expert
     serve = modeling_pi05._fused_kernels_serve
@@ -1584,7 +1584,7 @@ def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model
     try:
         assert serve(backbone, cache, batch_size=1)
         assert not serve(backbone, cache, batch_size=2)
-        assert not serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
+        assert serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
         assert not serve(backbone, [], batch_size=1)
         backbone.fused_kernels = False
         assert not serve(backbone, cache, batch_size=1)

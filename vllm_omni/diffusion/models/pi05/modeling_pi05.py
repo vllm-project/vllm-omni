@@ -553,6 +553,7 @@ if HAS_TRITON:
         x_stride,
         rope_stride,
         kv_stride,
+        kv_batch_stride,
         NUM_HEADS: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         PROJ_DTYPE: tl.constexpr,
@@ -563,11 +564,13 @@ if HAS_TRITON:
     ):
         """Q/K/V projections of one head's column tile, Gemma's half-split RoPE on Q and K.
 
-        Program ``(m, n)`` covers rows ``m`` of head ``n // SPLITS`` (``NUM_HEADS``
+        Program ``(m, n, b)`` covers rows ``m`` of head ``n // SPLITS`` (``NUM_HEADS``
         query heads, then the key head, then the value head) and one
-        ``BLOCK_H`` tile of each half of it, which RoPE pairs. Q is stored
-        ``(NUM_HEADS, n_rows, HEAD_DIM)``, K and V to ``(n_rows, HEAD_DIM)`` rows
-        ``kv_stride`` apart: their ``Pi05KVCache`` slots.
+        ``BLOCK_H`` tile of each half of it, which RoPE pairs, for request ``b``.
+        The inputs hold the requests' ``n_rows`` rows back to back. Q is stored
+        ``(requests, NUM_HEADS, n_rows, HEAD_DIM)``, K and V to ``(n_rows, HEAD_DIM)``
+        rows ``kv_stride`` apart, a request's ``kv_batch_stride`` after the one
+        before: their ``Pi05KVCache`` slots.
 
         With ``FUSED_GEMM`` the projections are computed here from ``X`` and the
         weights ``WQ``/``WK``/``WV``. Without it ``WQ``/``WK``/``WV`` are the
@@ -581,6 +584,8 @@ if HAS_TRITON:
         cols = (tl.program_id(1) % SPLITS) * BLOCK_H + tl.arange(0, BLOCK_H)
         rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
         row_mask = rows[:, None] < n_rows
+        b = tl.program_id(2)
+        flat = b * n_rows + rows  # the request's rows among every request's
         if FUSED_GEMM:
             if head < NUM_HEADS:
                 w = WQ + head * HEAD_DIM * n_in
@@ -593,7 +598,7 @@ if HAS_TRITON:
             for k0 in range(0, n_in, BLOCK_K):
                 ks = k0 + tl.arange(0, BLOCK_K)
                 k_mask = ks < n_in
-                x = tl.load(X + rows[:, None] * x_stride + ks[None, :], mask=row_mask & k_mask[None, :], other=0.0)
+                x = tl.load(X + flat[:, None] * x_stride + ks[None, :], mask=row_mask & k_mask[None, :], other=0.0)
                 w_lo = tl.load(w + cols[None, :] * n_in + ks[:, None], mask=k_mask[:, None], other=0.0)
                 w_hi = tl.load(w + (cols[None, :] + HALF) * n_in + ks[:, None], mask=k_mask[:, None], other=0.0)
                 acc_lo = tl.dot(x, w_lo, acc_lo)
@@ -603,11 +608,11 @@ if HAS_TRITON:
             hi = _round(acc_hi, PROJ_DTYPE)
         else:
             if head < NUM_HEADS:
-                proj = WQ + head * HEAD_DIM + rows[:, None] * n_in + cols[None, :]
+                proj = WQ + head * HEAD_DIM + flat[:, None] * n_in + cols[None, :]
             elif head == NUM_HEADS:
-                proj = WK + rows[:, None] * HEAD_DIM + cols[None, :]
+                proj = WK + flat[:, None] * HEAD_DIM + cols[None, :]
             else:
-                proj = WV + rows[:, None] * HEAD_DIM + cols[None, :]
+                proj = WV + flat[:, None] * HEAD_DIM + cols[None, :]
             lo = tl.load(proj, mask=row_mask, other=0.0).to(tl.float32)
             hi = tl.load(proj + HALF, mask=row_mask, other=0.0).to(tl.float32)
 
@@ -615,7 +620,7 @@ if HAS_TRITON:
         if head <= NUM_HEADS:
             # ``q * cos + rotate_half(q) * sin``, each product and the sum
             # rounded as eager's three tensor ops round them.
-            rope = rows[:, None] * rope_stride + cols[None, :]
+            rope = flat[:, None] * rope_stride + cols[None, :]
             cos_lo = tl.load(COS + rope, mask=row_mask, other=0.0).to(tl.float32)
             cos_hi = tl.load(COS + rope + HALF, mask=row_mask, other=0.0).to(tl.float32)
             sin_lo = tl.load(SIN + rope, mask=row_mask, other=0.0).to(tl.float32)
@@ -623,15 +628,15 @@ if HAS_TRITON:
             rot_lo = _round(_round(lo * cos_lo, PROJ_DTYPE) + _round(-hi * sin_lo, PROJ_DTYPE), PROJ_DTYPE)
             rot_hi = _round(_round(hi * cos_hi, PROJ_DTYPE) + _round(lo * sin_hi, PROJ_DTYPE), PROJ_DTYPE)
             if head < NUM_HEADS:
-                q_out = Q_OUT + head * n_rows * HEAD_DIM + out_lo
+                q_out = Q_OUT + (b * NUM_HEADS + head) * n_rows * HEAD_DIM + out_lo
                 tl.store(q_out, rot_lo, mask=row_mask)
                 tl.store(q_out + HALF, rot_hi, mask=row_mask)
             else:
-                k_out = K_OUT + rows[:, None] * kv_stride + cols[None, :]
+                k_out = K_OUT + b * kv_batch_stride + rows[:, None] * kv_stride + cols[None, :]
                 tl.store(k_out, rot_lo, mask=row_mask)
                 tl.store(k_out + HALF, rot_hi, mask=row_mask)
         else:
-            v_out = V_OUT + rows[:, None] * kv_stride + cols[None, :]
+            v_out = V_OUT + b * kv_batch_stride + rows[:, None] * kv_stride + cols[None, :]
             tl.store(v_out, lo, mask=row_mask)
             tl.store(v_out + HALF, hi, mask=row_mask)
 
@@ -643,6 +648,7 @@ if HAS_TRITON:
         n_rows,
         n_keys,
         k_stride,
+        k_batch_stride,
         s_stride,
         scale,
         HEAD_DIM: tl.constexpr,
@@ -651,19 +657,25 @@ if HAS_TRITON:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        """``(Q Kᵀ) · scale`` for single-KV-head attention, heads flattened into rows."""
+        """``(Q Kᵀ) · scale`` for single-KV-head attention, heads flattened into rows.
+
+        Program ``(m, n, b)`` is request ``b``: its ``n_rows`` rows of ``Q`` and
+        ``S_OUT`` follow the request before, its keys are ``k_batch_stride`` on.
+        """
         rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
         keys = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        b = tl.program_id(2)
+        flat = b * n_rows + rows
         row_mask = rows[:, None] < n_rows
         key_mask = keys[None, :] < n_keys
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for d0 in range(0, HEAD_DIM, BLOCK_K):
             ds = d0 + tl.arange(0, BLOCK_K)
-            q = tl.load(Q + rows[:, None] * HEAD_DIM + ds[None, :], mask=row_mask, other=0.0)
-            k = tl.load(K + keys[None, :] * k_stride + ds[:, None], mask=key_mask, other=0.0)
+            q = tl.load(Q + flat[:, None] * HEAD_DIM + ds[None, :], mask=row_mask, other=0.0)
+            k = tl.load(K + b * k_batch_stride + keys[None, :] * k_stride + ds[:, None], mask=key_mask, other=0.0)
             acc = tl.dot(q, k, acc)
         scores = _round(_round(acc, SCORE_DTYPE) * scale, SCORE_DTYPE)
-        tl.store(S_OUT + rows[:, None] * s_stride + keys[None, :], scores, mask=row_mask & key_mask)
+        tl.store(S_OUT + flat[:, None] * s_stride + keys[None, :], scores, mask=row_mask & key_mask)
 
     @triton.jit
     def _masked_softmax_kernel(
@@ -671,8 +683,10 @@ if HAS_TRITON:
         MASK,
         n_keys,
         q_len,
+        n_rows,
         s_stride,
         mask_stride,
+        mask_batch_stride,
         scale,
         SCORE_DTYPE: tl.constexpr,
         SUM_DTYPE: tl.constexpr,
@@ -681,22 +695,26 @@ if HAS_TRITON:
     ):
         """``softmax([scores · scale] + mask)`` over one row, in float32, written back in place.
 
-        Row ``r`` is query token ``r % q_len`` of head ``r // q_len``; ``MASK`` is
-        the eager path's float attention mask, one row per query token.
-        ``HAS_SCALE`` applies the score scale here, for scores a GEMM left
-        unscaled.
+        Row ``r`` of request ``b``, whose ``n_rows`` rows follow the request
+        before, is query token ``r % q_len`` of head ``r // q_len``; ``MASK`` is
+        the eager path's float attention mask, one row per query token and
+        ``mask_batch_stride`` per request. ``HAS_SCALE`` applies the score scale
+        here, for scores a GEMM left unscaled.
         """
         row = tl.program_id(0)
+        b = tl.program_id(1)
         cols = tl.arange(0, BLOCK)
         valid = cols < n_keys
-        scores = tl.load(S + row * s_stride + cols, mask=valid, other=0.0).to(tl.float32)
+        s_row = S + (b * n_rows + row) * s_stride + cols
+        scores = tl.load(s_row, mask=valid, other=0.0).to(tl.float32)
         if HAS_SCALE:
             scores = _round(scores * scale, SCORE_DTYPE)
-        bias = tl.load(MASK + (row % q_len) * mask_stride + cols, mask=valid, other=0.0).to(tl.float32)
+        mask_row = MASK + b * mask_batch_stride + (row % q_len) * mask_stride + cols
+        bias = tl.load(mask_row, mask=valid, other=0.0).to(tl.float32)
         x = tl.where(valid, _round(scores + bias, SUM_DTYPE), -float("inf"))
         e = tldevice.exp(x - tl.max(x, axis=0))
         probs = tl.math.div_rn(e, tl.sum(e, axis=0))
-        tl.store(S + row * s_stride + cols, probs, mask=valid)
+        tl.store(s_row, probs, mask=valid)
 
     @triton.jit
     def _attn_values_kernel(
@@ -708,24 +726,32 @@ if HAS_TRITON:
         q_len,
         p_stride,
         v_stride,
+        v_batch_stride,
         out_stride,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        """``P V`` stored as ``(q_len, heads · HEAD_DIM)``, the layout ``o_proj`` reads."""
+        """``P V`` stored as ``(q_len, heads · HEAD_DIM)`` per request, the layout ``o_proj`` reads.
+
+        Program ``(m, n, b)`` is request ``b``: its rows of ``P`` and ``OUT``
+        follow the request before, its values are ``v_batch_stride`` on.
+        """
         rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
         ds = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+        b = tl.program_id(2)
+        flat = b * n_rows + rows
         row_mask = rows[:, None] < n_rows
         acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
         for k0 in range(0, n_keys, BLOCK_K):
             ks = k0 + tl.arange(0, BLOCK_K)
             k_mask = ks < n_keys
-            p = tl.load(P + rows[:, None] * p_stride + ks[None, :], mask=row_mask & k_mask[None, :], other=0.0)
-            v = tl.load(V + ks[:, None] * v_stride + ds[None, :], mask=k_mask[:, None], other=0.0)
+            p = tl.load(P + flat[:, None] * p_stride + ks[None, :], mask=row_mask & k_mask[None, :], other=0.0)
+            v = tl.load(V + b * v_batch_stride + ks[:, None] * v_stride + ds[None, :], mask=k_mask[:, None], other=0.0)
             acc = tl.dot(p, v, acc)
-        out = OUT + (rows % q_len)[:, None] * out_stride + (rows // q_len)[:, None] * HEAD_DIM + ds[None, :]
+        tokens = b * q_len + rows % q_len
+        out = OUT + tokens[:, None] * out_stride + (rows // q_len)[:, None] * HEAD_DIM + ds[None, :]
         tl.store(out, acc, mask=row_mask)
 
     @triton.jit
@@ -951,9 +977,14 @@ def _fused_qkv_rope(
     """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their cache slots.
 
     ``triton_gemm=False`` keeps the projections on cuBLAS, as eager runs them.
+    ``x``, ``cos`` and ``sin`` hold the requests' rows back to back; ``q_out`` is
+    ``(requests, heads, rows, head_dim)`` and ``k_out``/``v_out`` are ``(requests,
+    rows, head_dim)``. One request may leave out their leading dimension.
     """
-    n_rows, n_in = x.shape
-    num_heads, _, head_dim = q_out.shape
+    if q_out.dim() == 3:
+        q_out, k_out, v_out = q_out[None], k_out[None], v_out[None]
+    n_in = x.shape[1]
+    batch, num_heads, n_rows, head_dim = q_out.shape
     dtype = attn.q_proj.weight.dtype
     fused_gemm = triton_gemm and _triton_gemms(dtype)
     if fused_gemm:
@@ -963,7 +994,7 @@ def _fused_qkv_rope(
         n_in = weights[0].shape[1]
     tiles = _tiles("qkv", dtype) if fused_gemm else _EPILOGUE_TILES
     splits = head_dim // 2 // tiles.block_n
-    _qkv_rope_kernel[(triton.cdiv(n_rows, tiles.block_m), (num_heads + 2) * splits)](
+    _qkv_rope_kernel[(triton.cdiv(n_rows, tiles.block_m), (num_heads + 2) * splits, batch)](
         x,
         *weights,
         cos,
@@ -975,6 +1006,7 @@ def _fused_qkv_rope(
         n_in,
         x.stride(0),
         cos.stride(0),
+        k_out.stride(1),
         k_out.stride(0),
         NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
@@ -998,25 +1030,29 @@ def _fused_attention(
     scores: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    """Eager ``_attend`` for one KV head, into ``out`` as ``(q_len, heads · head_dim)``.
+    """Eager ``_attend`` for one KV head, into ``out`` as ``(requests · q_len, heads · head_dim)``.
 
-    ``q`` is ``(heads, q_len, head_dim)``, ``key``/``value`` are ``(n_keys,
-    head_dim)``, ``attention_mask`` is ``(q_len, ≥ n_keys)`` and ``scores`` is
-    ``(heads · q_len, n_keys)`` scratch, which the softmax overwrites.
+    ``q`` is ``(requests, heads, q_len, head_dim)``, ``key``/``value`` are
+    ``(requests, n_keys, head_dim)``, ``attention_mask`` is ``(requests, q_len,
+    ≥ n_keys)`` and ``scores`` is ``(requests · heads · q_len, n_keys)`` scratch,
+    which the softmax overwrites. One request may leave out the leading dimension.
     """
-    num_heads, q_len, head_dim = q.shape
-    n_rows, n_keys = num_heads * q_len, key.shape[0]
+    if q.dim() == 3:
+        q, key, value, attention_mask = q[None], key[None], value[None], attention_mask[None]
+    batch, num_heads, q_len, head_dim = q.shape
+    n_rows, n_keys = num_heads * q_len, key.shape[1]
     dtype = q.dtype
     fused_gemm = _triton_gemms(dtype)
 
     if fused_gemm:
         tiles = _tiles("scores", dtype)
-        _attn_scores_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_keys, tiles.block_n))](
+        _attn_scores_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_keys, tiles.block_n), batch)](
             q,
             key,
             scores,
             n_rows,
             n_keys,
+            key.stride(1),
             key.stride(0),
             scores.stride(0),
             scaling,
@@ -1030,13 +1066,16 @@ def _fused_attention(
             enable_fp_fusion=False,
         )
     else:
-        torch.matmul(q.view(n_rows, head_dim), key.t(), out=scores)
-    _masked_softmax_kernel[(n_rows,)](
+        for b in range(batch):
+            torch.matmul(q[b].view(n_rows, head_dim), key[b].t(), out=scores[b * n_rows : (b + 1) * n_rows])
+    _masked_softmax_kernel[(n_rows, batch)](
         scores,
         attention_mask,
         n_keys,
         q_len,
+        n_rows,
         scores.stride(0),
+        attention_mask.stride(1),
         attention_mask.stride(0),
         scaling,
         SCORE_DTYPE=_TL_DTYPES[dtype],
@@ -1048,7 +1087,7 @@ def _fused_attention(
     )
     if fused_gemm:
         tiles = _tiles("values", dtype)
-        _attn_values_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(head_dim, tiles.block_n))](
+        _attn_values_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(head_dim, tiles.block_n), batch)](
             scores,
             value,
             out,
@@ -1056,6 +1095,7 @@ def _fused_attention(
             n_keys,
             q_len,
             scores.stride(0),
+            value.stride(1),
             value.stride(0),
             out.stride(0),
             HEAD_DIM=head_dim,
@@ -1067,8 +1107,9 @@ def _fused_attention(
             enable_fp_fusion=False,
         )
     else:
-        values = torch.matmul(scores, value).view(num_heads, q_len, head_dim)
-        out.view(q_len, num_heads, head_dim).copy_(values.transpose(0, 1))
+        for b in range(batch):
+            values = torch.matmul(scores[b * n_rows : (b + 1) * n_rows], value[b]).view(num_heads, q_len, head_dim)
+            out[b * q_len : (b + 1) * q_len].view(q_len, num_heads, head_dim).copy_(values.transpose(0, 1))
 
 
 def _fused_linear_residual(
@@ -1175,8 +1216,8 @@ def _fused_final_head(
 
 
 def _adarms_modulation(norm: Pi05AdaRMSNorm, adarms_cond: torch.Tensor) -> torch.Tensor:
-    """``Pi05AdaRMSNorm``'s ``(scale | shift | gate)`` for batch 1, computed as it computes it."""
-    return norm.dense(adarms_cond.to(norm.dense.weight.dtype))[0]
+    """``Pi05AdaRMSNorm``'s ``(scale | shift | gate)`` of the first request, computed as batch 1 computes it."""
+    return norm.dense(adarms_cond[:1].to(norm.dense.weight.dtype))[0]
 
 
 def _fused_prefix_forward(
@@ -1266,7 +1307,7 @@ def _fused_denoise_forward(
     rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     adarms_modulations: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
+    """The suffix pass and output head of ``denoise_step`` with fused kernels.
 
     Per layer: AdaRMS norm, QKV projection + RoPE writing the suffix K/V
     behind the cached prefix, attention over the whole cache row, and the
@@ -1274,10 +1315,16 @@ def _fused_denoise_forward(
     AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
     Triton with what follows them fused in; in float32 they stay on cuBLAS and
     only what follows them is fused. Returns ``v_t``.
+
+    A batch runs as one launch per kernel over every request's rows. A row
+    reads its own request's K/V, mask and positions, and the AdaRMS
+    conditioning of the first request: the requests of a batch are at the same
+    timestep. In bfloat16 a request's rows are computed as they are alone.
     """
     expert = gemma_expert.model
-    x_in = suffix_embs[0]
-    seq_len, width = x_in.shape
+    batch, seq_len, width = suffix_embs.shape
+    n_rows = batch * seq_len
+    x_in = suffix_embs.reshape(n_rows, width)
     first_layer = expert.layers[0]
     proj_dtype = first_layer.self_attn.q_proj.weight.dtype
     num_heads = first_layer.self_attn.config.num_attention_heads
@@ -1286,19 +1333,21 @@ def _fused_denoise_forward(
     n_keys = prefix_len + seq_len
     device = x_in.device
 
-    hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
-    x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
-    q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
-    att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
-    mlp_hidden = torch.empty(seq_len, first_layer.mlp.gate_proj.out_features, dtype=proj_dtype, device=device)
+    hidden_states = torch.empty(n_rows, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
+    x_normed = torch.empty(n_rows, width, dtype=proj_dtype, device=device)
+    q = torch.empty(batch, num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
+    scores = torch.empty(batch * num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
+    att = torch.empty(n_rows, num_heads * head_dim, dtype=proj_dtype, device=device)
+    mlp_hidden = torch.empty(n_rows, first_layer.mlp.gate_proj.out_features, dtype=proj_dtype, device=device)
     cos, sin = expert.rotary_emb(x_normed, position_ids) if rotary_emb is None else rotary_emb
-    mask = attention_mask[0, 0]
+    cos, sin = cos.reshape(n_rows, -1), sin.reshape(n_rows, -1)
+    mask = attention_mask[:, 0]
 
     residual = x_in
     for layer_idx, layer in enumerate(expert.layers):
         attn = layer.self_attn
-        key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
+        # ``(requests, prefix + suffix, head_dim)``: each request's K/V row of the cache.
+        key, value = kv_cache.key[layer_idx, :, 0], kv_cache.value[layer_idx, :, 0]
 
         modulation = (
             _adarms_modulation(layer.input_layernorm, adarms_cond)
@@ -1306,7 +1355,7 @@ def _fused_denoise_forward(
             else adarms_modulations[2 * layer_idx, 0]
         )
         _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
+        _fused_qkv_rope(x_normed, attn, cos, sin, q, key[:, prefix_len:], value[:, prefix_len:])
         _fused_attention(q, key, value, mask, 1.0 / math.sqrt(head_dim), scores, att)
         _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
         residual = hidden_states
@@ -1322,23 +1371,24 @@ def _fused_denoise_forward(
             mlp_hidden, layer.mlp.down_proj, hidden_states, hidden_states, gate=modulation[2 * width :]
         )
 
-    v_t = torch.empty(1, seq_len, action_out_proj.out_features, dtype=action_out_proj.weight.dtype, device=device)
+    out_features = action_out_proj.out_features
+    v_t = torch.empty(batch, seq_len, out_features, dtype=action_out_proj.weight.dtype, device=device)
     modulation = (
         _adarms_modulation(expert.norm, adarms_cond) if adarms_modulations is None else adarms_modulations[-1, 0]
     )
-    _fused_final_head(hidden_states, expert.norm, modulation, action_out_proj, v_t[0])
+    _fused_final_head(hidden_states, expert.norm, modulation, action_out_proj, v_t.view(n_rows, out_features))
     return v_t
 
 
 def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_cache, batch_size: int) -> bool:
-    """Whether a call runs the fused kernels: they are enabled, and it is batch 1
-    on a single-KV-head ``Pi05KVCache`` in the action expert's K/V dtype. Any
-    other call runs eagerly, which also keeps eager's errors for bad caches."""
+    """Whether a call runs the fused kernels: they are enabled, and its batch has
+    a single-KV-head ``Pi05KVCache`` of its size in the action expert's K/V
+    dtype. Any other call runs eagerly, which also keeps eager's errors for bad
+    caches. The prefix pass serves batch 1 only, which its caller checks."""
     return (
         backbone.fused_kernels
-        and batch_size == 1
         and isinstance(kv_cache, Pi05KVCache)
-        and kv_cache.batch_size == 1
+        and kv_cache.batch_size == batch_size
         and kv_cache.key.shape[2] == 1
         and kv_cache.key.dtype == backbone.gemma_expert.model.layers[0].self_attn.k_proj.weight.dtype
     )
@@ -1897,6 +1947,7 @@ class Pi05ForActionPrediction(nn.Module):
         timestep: torch.Tensor,
         *,
         time_cond: torch.Tensor | None = None,
+        per_request: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the suffix: **action tokens only**, plus the AdaRMS condition.
 
@@ -1906,12 +1957,9 @@ class Pi05ForActionPrediction(nn.Module):
         action token opens a causal block and the rest attend bidirectionally
         within it.
         """
-        model_dtype = self.action_in_proj.weight.dtype
-        noisy_actions = noisy_actions.to(dtype=model_dtype)
-
         if time_cond is None:
             time_cond = self.embed_timestep(timestep)
-        action_emb = self.action_in_proj(noisy_actions)  # (B, H, W)
+        action_emb = self._project_actions(noisy_actions, per_request)  # (B, H, W)
 
         bsize, action_len = action_emb.shape[:2]
         pad_masks = torch.ones(bsize, action_len, dtype=torch.bool, device=action_emb.device)
@@ -1922,6 +1970,15 @@ class Pi05ForActionPrediction(nn.Module):
         att_masks[:1].fill_(1)
         att_masks = att_masks[None, :].expand(bsize, -1)
         return action_emb, pad_masks, att_masks, time_cond
+
+    def _project_actions(self, noisy_actions: torch.Tensor, per_request: bool = False) -> torch.Tensor:
+        """``action_in_proj`` of the noisy actions. ``per_request`` projects one
+        request at a time, as each has it alone: cuBLAS rounds a row of a
+        batched GEMM differently."""
+        noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+        if per_request:
+            return torch.cat([self.action_in_proj(actions) for actions in noisy_actions.split(1)])
+        return self.action_in_proj(noisy_actions)
 
     # ── Denoising step ───────────────────────────────────────────────
     def denoise_step(
@@ -1937,20 +1994,31 @@ class Pi05ForActionPrediction(nn.Module):
         """Apply one flow-matching denoising step: predict ``v_t`` from ``x_t``.
 
         Signature differs from π0's by exactly one argument: no ``state``. With
-        the fused kernels enabled, a batch-1 step runs the action expert and
-        its output head on them (``_fused_denoise_forward``).
+        the fused kernels enabled, a step runs the action expert and its output
+        head on them (``_fused_denoise_forward``); the requests of a batch must
+        then share ``timestep``, as the batches ``sample_actions`` forms do.
         """
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+        fused = (
+            _fused_kernels_serve(self.paligemma_with_expert, past_key_values, batch_size)
+            and past_key_values.fits(batch_size, prefix_len)
+            and past_key_values.suffix_len == x_t.shape[1]
+        )
+        # A fused batch embeds its timestep and its actions as each request
+        # does alone, so that its rows are the ones the requests have alone.
+        per_request = fused and batch_size > 1
         time_cond = None if step_data is None else step_data.time_cond
         adarms_modulations = None if step_data is None else step_data.modulations
         rotary_emb = None
+        if per_request and time_cond is None:
+            time_cond = self.embed_timestep(timestep[:1])
         if context is None:
             if time_cond is None:
                 suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(x_t, timestep)
             else:
                 suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(
-                    x_t, timestep, time_cond=time_cond
+                    x_t, timestep, time_cond=time_cond, per_request=per_request
                 )
             suffix_len = suffix_pad_masks.shape[1]
             prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
@@ -1963,7 +2031,7 @@ class Pi05ForActionPrediction(nn.Module):
             # Do not rebuild suffix masks just to discard them. The prepared
             # context contains every observation-dependent tensor needed by
             # all steps; prefix_pad_masks is used only for shape metadata here.
-            suffix_embs = self.action_in_proj(x_t.to(dtype=self.action_in_proj.weight.dtype))
+            suffix_embs = self._project_actions(x_t, per_request)
             suffix_len = suffix_embs.shape[1]
             if context.attention_mask.shape != (batch_size, 1, suffix_len, prefix_len + suffix_len):
                 raise ValueError("Pi0.5 denoise context does not match the request shape.")
@@ -1973,11 +2041,7 @@ class Pi05ForActionPrediction(nn.Module):
             position_ids = context.position_ids
             rotary_emb = (context.cos, context.sin)
 
-        if (
-            _fused_kernels_serve(self.paligemma_with_expert, past_key_values, batch_size)
-            and past_key_values.fits(batch_size, prefix_len)
-            and past_key_values.suffix_len == suffix_len
-        ):
+        if fused:
             return _fused_denoise_forward(
                 self.paligemma_with_expert.gemma_expert,
                 suffix_embs,

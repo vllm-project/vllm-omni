@@ -419,6 +419,44 @@ def test_attention_matches_eager_attend(dtype, part):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
+def test_batched_qkv_rope_and_attention_give_each_request_its_rows_alone(dtype):
+    """One launch over a batch reads each request's own K/V cache row, mask and
+    RoPE table: its Q, suffix K/V and attention output are the ones it has alone."""
+    batch, prefix = 3, 40
+    tokens, width, mlp_width = SHAPES["suffix"]
+    n_keys = prefix + tokens
+    attn = _proj_dtype_module(_randomize(GemmaAttention(_gemma_config(width, mlp_width), layer_idx=0), seed=21), dtype)
+    x = _randn(batch * tokens, width, dtype=dtype, seed=22)
+    cos = _randn(batch * tokens, HEAD_DIM, dtype=dtype, seed=23)
+    sin = _randn(batch * tokens, HEAD_DIM, dtype=dtype, seed=24)
+    key = _randn(batch, n_keys, HEAD_DIM, dtype=dtype, scale=2.0, seed=25)
+    value = _randn(batch, n_keys, HEAD_DIM, dtype=dtype, seed=26)
+    mask = torch.zeros(batch, tokens, n_keys, device=DEVICE)
+    for b in range(batch):  # every request hides a different part of its prefix
+        mask[b, :, : 7 * b] = M.OPENPI_ATTENTION_MASK_VALUE
+
+    def run(x, cos, sin, key, value, mask):
+        n = key.shape[0]
+        key, value = key.clone(), value.clone()
+        q = torch.empty(n, HEADS, tokens, HEAD_DIM, dtype=dtype, device=DEVICE)
+        scores = torch.empty(n * HEADS * tokens, n_keys, dtype=dtype, device=DEVICE)
+        out = torch.empty(n * tokens, HEADS * HEAD_DIM, dtype=dtype, device=DEVICE)
+        M._fused_qkv_rope(x, attn, cos, sin, q, key[:, prefix:], value[:, prefix:])
+        M._fused_attention(q, key, value, mask, 1.0 / math.sqrt(HEAD_DIM), scores, out)
+        return q, key, value, out.view(n, tokens, -1)
+
+    together = run(x, cos, sin, key, value, mask)
+    for b in range(batch):
+        rows = slice(b * tokens, (b + 1) * tokens)
+        alone = run(x[rows], cos[rows], sin[rows], key[b : b + 1], value[b : b + 1], mask[b : b + 1])
+        for got, want in zip(together, alone):
+            if M._triton_gemms(dtype):
+                assert torch.equal(got[b], want[0])
+            else:  # cuBLAS may round a row differently among the other requests' rows
+                torch.testing.assert_close(got[b], want[0], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 def test_final_head_matches_norm_and_action_out_proj(dtype):
     """The expert's final AdaRMS norm and ``action_out_proj``, both float32 in
     either layout, so ``dtype`` only names the layout."""
