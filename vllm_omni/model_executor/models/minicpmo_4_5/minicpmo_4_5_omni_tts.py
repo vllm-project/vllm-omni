@@ -2034,14 +2034,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         if spec_config is None:
             return talker_sampler, None
-        if not self._mrv2_turn_drafts():
-            # Any draft method, not only drafters that read Talker layers.
-            raise NotImplementedError(
-                "MiniCPM-o 4.5 Talker on model_runner: v2 verifies draft codes in turn sessions only; "
-                "remove the stage-1 speculative_config for duplex"
-            )
-        # Verification reuses the stock sampler, whose penalty stage is the codec window.
-        return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
+        if self._mrv2_turn_drafts():
+            # DSpark turn-session draft verification: verification reuses the
+            # stock sampler, whose penalty stage is the codec window.
+            return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
+        # Duplex with a stage-1 speculative_config is how the K-step count
+        # reaches the Talker (K > 0): the frame loop drives draft booking
+        # through the runner's _propose_draft_tokens and the per-frame
+        # boundary samplers, so no draft speculator is installed here and
+        # this combination must not raise.
+        return talker_sampler, None
 
     def _mrv2_turn_drafts(self) -> bool:
         """Whether this Talker can verify draft codes: turn sessions without the K-step loop.
