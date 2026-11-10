@@ -299,7 +299,7 @@ def test_ready_merge_timing_jobs_stay_identical() -> None:
             ]
         )
     assert jobs[0] == jobs[1]  # The combiner still deduplicates READY + MERGE.
-    assert len(jobs[0]) == 2
+    assert len(jobs[0]) == 4
     for step in jobs[0]:
         assert step["grade"] == "Blocking"
         assert step["artifact_paths"] == ["artifacts/amd-cpu-suites/**/*"]

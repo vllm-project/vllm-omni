@@ -10,10 +10,73 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tests.helpers.cpu_sharding import SUITE_MARKERS, duration_seconds, in_suite  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def junit_nodeid(classname: str, name: str) -> str:
+    parts = classname.split(".")
+    for length in range(len(parts), 0, -1):
+        module = "/".join(parts[:length]) + ".py"
+        if (ROOT / module).is_file():
+            return "::".join([module, *parts[length:], name])
+    raise ValueError(f"JUnit class does not resolve to a source module: {classname}")
+
+
+def profile_from_junit(paths: list[Path], suite: str, build_url: str, commit: str) -> dict:
+    """Import legacy pytest JUnit with its default total (setup/call/teardown) time."""
+    weights: dict[str, float] = {}
+    shards = []
+    for path in paths:
+        # Keep the original CI artifact names so completeness is verifiable.
+        prefix, index, separator, count = path.stem.split("-")
+        if prefix != "pytest" or separator != "of":
+            raise ValueError("Expected pytest-INDEX-of-COUNT.xml artifact names")
+        shards.append((int(index), int(count)))
+        root = ET.parse(path).getroot()
+        cases = root.findall(".//testcase")
+        if not cases or root.findall(".//failure") or root.findall(".//error"):
+            raise ValueError(f"Need complete successful JUnit artifacts: {path}")
+        for case in cases:
+            classname, name = case.get("classname", ""), case.get("name", "")
+            seconds = duration_seconds(float(case.attrib["time"]))
+            if not classname:
+                # pytest emits collection-level importorskip entries in every
+                # shard. These are not selected test nodes and have no phase cost.
+                if (
+                    case.find("skipped") is None
+                    or seconds != 0
+                    or not (ROOT / (name.replace(".", "/") + ".py")).is_file()
+                ):
+                    raise ValueError(f"Unrecognized collection result: {name}")
+                continue
+            node = junit_nodeid(classname, name)
+            if not in_suite(node, suite) or node in weights:
+                raise ValueError(f"Duplicate or out-of-suite JUnit node: {node}")
+            weights[node] = seconds
+    if not shards or not weights:
+        raise ValueError("No JUnit timing evidence")
+    count = shards[0][1]
+    if (
+        count < 1
+        or any(total != count for _, total in shards)
+        or sorted(index for index, _ in shards) != list(range(count))
+    ):
+        raise ValueError("Need exactly one successful JUnit artifact for every shard")
+    if not build_url or not commit:
+        raise ValueError("JUnit evidence requires a source build URL and commit")
+    return {
+        "schema_version": 1,
+        "suite": suite,
+        "sources": [{"build_url": build_url, "commit": commit}],
+        "timing_format": "pytest-junit-total",
+        "node_seconds": dict(sorted(weights.items())),
+    }
 
 
 def read_object(path: Path) -> dict:
@@ -124,17 +187,25 @@ def profile_from_artifacts(directories: list[Path], suite: str = "model-executor
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directories", type=Path, nargs="+", help="One artifact directory per successful source shard")
+    parser.add_argument("directories", type=Path, nargs="*", help="One artifact directory per successful source shard")
+    parser.add_argument("--junit", type=Path, nargs="+", help="Legacy JUnit artifacts; time must include all phases")
+    parser.add_argument("--source-build-url")
+    parser.add_argument("--source-commit")
     parser.add_argument("--suite", choices=SUITE_MARKERS, default="model-executor")
     parser.add_argument("--output", type=Path, required=True, help="New profile JSON path")
     args = parser.parse_args()
     try:
-        profile = profile_from_artifacts(args.directories, args.suite)
+        if args.junit:
+            if args.directories:
+                parser.error("Choose instrumented directories or legacy JUnit, not both")
+            profile = profile_from_junit(args.junit, args.suite, args.source_build_url, args.source_commit)
+        else:
+            profile = profile_from_artifacts(args.directories, args.suite)
         content = json.dumps(profile, indent=2, sort_keys=True, allow_nan=False) + "\n"
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", encoding="utf-8") as stream:
             stream.write(content)
-    except (OSError, ValueError, OverflowError) as error:
+    except (OSError, ValueError, OverflowError, ET.ParseError) as error:
         parser.error(str(error))
     print(f"Wrote {len(profile['node_seconds'])} node timings from {len(profile['sources'])} builds to {args.output}")
     return 0
