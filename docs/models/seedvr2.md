@@ -47,7 +47,7 @@ vllm serve "$MODEL_DIR" --omni \
   --num-gpus 1 --host 127.0.0.1 --port 8098
 
 curl --fail-with-body http://127.0.0.1:8098/v1/videos/sync \
-  -F 'prompt= ' \
+  --form-string 'prompt= ' \
   -F 'input_references=@input.mp4;type=video/mp4' \
   -F 'size=224x128' -F 'num_inference_steps=1' \
   -F 'guidance_scale=1' -F 'seed=7723' \
@@ -108,7 +108,7 @@ on by default; pass `extra_params={"color_correction_method":"wavelet"}` to choo
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8098/v1/videos/sync \
-  -F 'prompt= ' -F 'input_references=@input.mp4;type=video/mp4' \
+  --form-string 'prompt= ' -F 'input_references=@input.mp4;type=video/mp4' \
   -F 'size=224x128' -F 'num_inference_steps=1' -F 'guidance_scale=1' \
   -F 'seed=7723' -F 'extra_params={"color_correction_method":"wavelet"}' \
   --output restored.mp4
@@ -278,3 +278,20 @@ See the [RTX 5090 recipe](https://github.com/vllm-project/vllm-omni/blob/main/re
 input/output contract, complete serving command, and media checks. The local
 tests in `tests/diffusion/models/seedvr2/test_seedvr2_e2e.py` exercise the full
 3B pipeline, all colour modes, and HTTP restoration with USP 1 and 8.
+
+## Ascend NPU support
+
+SeedVR2 runs on Ascend NPUs without model-side changes. The DiT never requests
+the packed-varlen attention kernel, so every layer resolves to the portable
+grouped window SDPA path, and the RoPE and sinusoidal tables are computed in
+fp32, which avoids the NPU's missing float64 support. `--enforce-eager` is
+already mandatory, and the memory-budget model derives from the reported
+device memory, so serving works with the standard NPU launch.
+
+Validated on a single Atlas A2 (910B3, 64 GB) with the vllm-ascend 0.31.0
+image (vLLM 0.31.0, vllm-ascend 0.19.1rc2, CANN 9.1.0, torch 2.10, diffusers
+0.40.0): the native e2e in all four colour modes, the NPU module smoke tests in
+`tests/diffusion/models/seedvr2/test_seedvr2_npu.py` (random-weight NaDiT
+forward and causal-VAE round trip), and the long-video HTTP route at USP 1.
+Sequence parallelism above degree 1 is unvalidated on NPU; see the
+[Ascend NPU recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-NPU.md).

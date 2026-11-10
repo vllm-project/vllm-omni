@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     PersonaPlexMimiCodec,
     _MimiStreamingTransformer,
@@ -93,17 +94,15 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     codec = PersonaPlexMimiCodec.__new__(PersonaPlexMimiCodec)
     nn.Module.__init__(codec)
 
-    quantizer = mocker.Mock(spec=["encode", "decode"])
-    quantizer.encode.side_effect = lambda x, num_quantizers=8: torch.zeros(
-        num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
+    quantizer = mocker.Mock(spec=["encode"])
+    quantizer.encode.side_effect = lambda x, num_quantizers=None: torch.zeros(
+        8 if num_quantizers is None else num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
     )
-    quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
-    # The codec decodes through its own RVQ sum; route it to the stub.
-    codec._quantizer_decode = quantizer.decode
 
     codec.device = torch.device("cpu")
     codec.dtype = torch.float32
     codec.model = SimpleNamespace(quantizer=quantizer)
+    codec._dequantize = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
     codec._enc_stages = []
     codec._dec_stages = []
     codec._downsample = _make_passthrough_stage(mocker)
@@ -178,7 +177,7 @@ def test_ring_mixed_offsets_match_singleton_streams() -> None:
     assert not torch.equal(batched.end_offset[0], batched.end_offset[1])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
     batch_size, tokens, dim = 3, 2, 32
@@ -219,7 +218,7 @@ def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
 
 
 @pytest.mark.parametrize("kind", ["conv", "convtr"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_conv_carries_preserve_inactive_rows(kind: str) -> None:
     if kind == "conv":

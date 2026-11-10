@@ -27,6 +27,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    request_conditioning_cache,
+)
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -65,6 +69,41 @@ def optimized_scale(positive_flat, negative_flat):
     squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
     st_star = dot_product / squared_norm
     return st_star
+
+
+def _block_noise_cholesky_factor(
+    block_size: int,
+    gamma: float,
+    device: torch.device | str,
+) -> torch.Tensor:
+    # At the shipped gamma=1/3 and block_size=4 this covariance is singular.
+    # Its 1e-8 ridge is rounded away in float32, and Ascend's Cholesky kernel
+    # faults on the resulting zero pivot. Factor the tiny matrix on CPU in
+    # float64 for NPU so the ridge is representable, then transfer the factor.
+    use_npu_fallback = current_omni_platform.is_npu()
+    factor_device = torch.device("cpu") if use_npu_fallback else device
+    factor_dtype = torch.float64 if use_npu_fallback else torch.float32
+    eye = torch.eye(block_size, device=factor_device, dtype=factor_dtype)
+    cov = (
+        eye * (1 + gamma)
+        - torch.ones(
+            block_size,
+            block_size,
+            device=factor_device,
+            dtype=factor_dtype,
+        )
+        * gamma
+    )
+    cov += eye * 1e-8
+    try:
+        factor = torch.linalg.cholesky(cov)
+    except RuntimeError as exc:
+        if not use_npu_fallback or "requires compiling PyTorch with LAPACK" not in str(exc):
+            raise
+        # Some ROCm wheels omit LAPACK even though NumPy in the same image can
+        # factor this tiny CPU float64 matrix.
+        factor = torch.from_numpy(np.linalg.cholesky(cov.detach().numpy()))
+    return factor.to(device=device, dtype=torch.float32)
 
 
 def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
@@ -686,9 +725,23 @@ class HeliosPipeline(
         if len(states) != 1:
             raise ValueError("Helios step execution supports a single request, not a batched request.")
         state = states[0]
-        if state.extra["is_enable_stage2"]:
-            return self._denoise_stage2_step(state)
-        return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        cache = state.extra.get("helios_conditioning_cache")
+        if cache is None:
+            cache = HeliosConditioningCache(state.request_id)
+            state.extra["helios_conditioning_cache"] = cache
+        try:
+            with cache.activate():
+                if state.extra["is_enable_stage2"]:
+                    return self._denoise_stage2_step(state)
+                return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        except BaseException:
+            self.release_step_request(state)
+            raise
+
+    def release_step_request(self, state: StepRequestState) -> None:
+        cache = state.extra.pop("helios_conditioning_cache", None)
+        if cache is not None:
+            cache.close()
 
     def _denoise_stage1_step(
         self,
@@ -721,6 +774,7 @@ class HeliosPipeline(
             )[0]
             noise_uncond = self.transformer(
                 encoder_hidden_states=state.negative_prompt_embeds,
+                conditioning_branch="negative",
                 **transformer_kwargs,
             )[0]
             positive_flat = noise_pred.view(batch_size, -1)
@@ -738,6 +792,7 @@ class HeliosPipeline(
         negative_kwargs = (
             {
                 "encoder_hidden_states": state.negative_prompt_embeds,
+                "conditioning_branch": "negative",
                 **transformer_kwargs,
             }
             if state.do_true_cfg
@@ -775,7 +830,9 @@ class HeliosPipeline(
         }
         noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
         if state.do_true_cfg:
-            noise_uncond = self.transformer(encoder_hidden_states=state.negative_prompt_embeds, **transformer_kwargs)[0]
+            noise_uncond = self.transformer(
+                encoder_hidden_states=state.negative_prompt_embeds, conditioning_branch="negative", **transformer_kwargs
+            )[0]
             if extra["use_cfg_zero_star"]:
                 positive_flat = noise_pred.view(batch_size, -1)
                 negative_flat = noise_uncond.view(batch_size, -1)
@@ -921,6 +978,7 @@ class HeliosPipeline(
         state.chunk_index += 1
         finished = state.request_denoise_completed
         if finished:
+            self.release_step_request(state)
             self._current_timestep = None
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
@@ -933,6 +991,7 @@ class HeliosPipeline(
             finished=finished,
         )
 
+    @request_conditioning_cache
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -1392,6 +1451,7 @@ class HeliosPipeline(
 
                     noise_uncond = self.transformer(
                         encoder_hidden_states=negative_prompt_embeds,
+                        conditioning_branch="negative",
                         **transformer_kwargs,
                     )[0]
 
@@ -1413,6 +1473,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         negative_kwargs = {
                             "encoder_hidden_states": negative_prompt_embeds,
+                            "conditioning_branch": "negative",
                             **transformer_kwargs,
                         }
                     else:
@@ -1556,6 +1617,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         noise_uncond = self.transformer(
                             encoder_hidden_states=negative_prompt_embeds,
+                            conditioning_branch="negative",
                             **transformer_kwargs,
                         )[0]
 
@@ -1598,12 +1660,7 @@ class HeliosPipeline(
 
         device = generator.device if generator is not None else self.device
 
-        # Allocate directly on the execution device in float32 to use the device solver
-        # and avoid fp16/bf16 Cholesky on the covariance matrix.
-        eye = torch.eye(block_size, device=device, dtype=torch.float32)
-        cov = eye * (1 + gamma) - torch.ones(block_size, block_size, device=device, dtype=torch.float32) * gamma
-        cov += eye * 1e-8
-        L = torch.linalg.cholesky(cov)
+        L = _block_noise_cholesky_factor(block_size, gamma, device)
         block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
         z = torch.randn(block_number, block_size, generator=generator, device=device)
         noise = z @ L.T
@@ -1794,5 +1851,6 @@ class HeliosPipeline(
         return first_frame_latent.to(device=device, dtype=dtype), video_latents.to(device=device, dtype=dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.transformer.clear_cross_attention_cache()
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
