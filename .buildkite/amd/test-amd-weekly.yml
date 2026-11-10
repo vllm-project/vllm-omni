@@ -301,6 +301,14 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 195
         source_file_dependencies: omni_qwen2_5_omni_expansion
+        # Build #15565 exceeded OpenBLAS's compiled 192-thread metadata limit
+        # during evaluation, then segfaulted and held both GPUs until timeout.
+        # GPU inference dominates this job, so keep host math libraries bounded.
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
         artifact_paths:
           - artifacts/rocm-qwen25-omni-weekly/**/*
         commands:

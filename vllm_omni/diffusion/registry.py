@@ -367,6 +367,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
+    "Flux3Pipeline": (
+        "flux3",
+        "pipeline_flux3",
+        "Flux3Pipeline",
+    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -381,6 +386,12 @@ _DIFFUSION_MODELS = {
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
+    ),
+    # PAN 2 checkpoints are Modular Diffusers repositories: `modular_model_index.json` declares this class.
+    "PAN2ModularPipeline": (
+        "pan2",
+        "pipeline_pan2",
+        "PAN2Pipeline",
     ),
     "LingBotVideoPipeline": (
         "lingbot_video",
@@ -472,7 +483,6 @@ _DIFFUSION_MODELS = {
     ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
-
 
 DiffusionModelRegistry = _ModelRegistry(
     {
@@ -805,6 +815,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "PAN2ModularPipeline": "get_pan2_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
@@ -818,6 +829,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "Flux3Pipeline": "get_flux3_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
     "MOSSImagePipeline": "get_mossimage_post_process_func",
@@ -872,6 +884,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+    "Flux3Pipeline": "get_flux3_pre_process_func",
+    "PAN2ModularPipeline": "get_pan2_pre_process_func",
 }
 
 

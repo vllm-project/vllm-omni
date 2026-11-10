@@ -23,6 +23,7 @@ its ``build_parallel_knob_kwargs``), not a re-implemented copy. Invariant 3 is
 asserted directly against ``ar_grid_max_tokens`` itself.
 """
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -138,3 +139,46 @@ class TestARGridMaxTokens:
         assert ar_grid_max_tokens(0, 0) is None
         assert ar_grid_max_tokens(0, 64) is None
         assert ar_grid_max_tokens(64, 0) is None
+
+
+def test_documented_qwen21_attention_deploy_config_reaches_omni(monkeypatch, tmp_path):
+    """Parse the documented command and load its YAML without loading a model."""
+    import text_to_image as t2i
+
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    repo_root = Path(__file__).resolve().parents[3]
+    doc = (repo_root / "docs/user_guide/quantization/quantized_kvcache.md").read_text()
+    section = doc.split("### Qwen-Image-2.1 on Ascend", 1)[1].split("## Validation and Notes", 1)[0]
+    yaml_text = section.split("```yaml\n", 1)[1].split("```", 1)[0]
+    command = section.split("```bash\n", 1)[1].split("```", 1)[0]
+    deploy_path = tmp_path / "qwen21_mxfp8.yaml"
+    deploy_path.write_text(yaml_text)
+    monkeypatch.chdir(tmp_path)
+    argv = shlex.split(command.replace("\\\n", " "))
+    monkeypatch.setattr(sys, "argv", argv[1:])
+    generator = t2i.torch.Generator
+    monkeypatch.setattr(t2i.torch, "Generator", lambda **kwargs: generator(device="cpu"))
+
+    class ReachedOmniError(Exception):
+        pass
+
+    def capture_omni(**kwargs):
+        assert Path(kwargs["deploy_config"]).resolve() == deploy_path
+        runtime_kwargs = {key: value for key, value in kwargs.items() if key not in ("model", "deploy_config")}
+        runtime_kwargs["model_class_name"] = "QwenImage21Pipeline"
+        config = (
+            StageConfigFactory.create_typed_default_diffusion(
+                kwargs["model"], runtime_kwargs, deploy_config_path=kwargs["deploy_config"]
+            )
+            .stage_by_id(0)
+            .diffusion_config
+        )
+        assert config.diffusion_attention_config.default.backend == "FLASH_ATTN"
+        assert config.diffusion_kv_cache_dtype == "mxfp8"
+        assert config.diffusion_kv_cache_skip_step_indices == {0}
+        raise ReachedOmniError
+
+    monkeypatch.setattr(t2i, "Omni", capture_omni)
+    with pytest.raises(ReachedOmniError):
+        t2i.main()
