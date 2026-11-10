@@ -2480,9 +2480,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     stream_metrics = dict(stream_metrics or {})
                     stats = last_metrics if hasattr(last_metrics, "queued_ts") else None
                     stream_metrics.update(
-                        build_per_request_timing_metrics(stats, completion_tokens).model_dump(
-                            exclude_none=True
-                        )
+                        build_per_request_timing_metrics(stats, completion_tokens).model_dump(exclude_none=True)
                     )
                     if isinstance(last_metrics, Mapping):
                         stream_metrics.update(last_metrics)
@@ -2674,9 +2672,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stats = raw_stats if hasattr(raw_stats, "queued_ts") else None
             response_metrics = dict(response_metrics or {})
             response_metrics.update(
-                build_per_request_timing_metrics(stats, completion_tokens).model_dump(
-                    exclude_none=True
-                )
+                build_per_request_timing_metrics(stats, completion_tokens).model_dump(exclude_none=True)
             )
             if isinstance(raw_stats, Mapping):
                 response_metrics.update(raw_stats)
