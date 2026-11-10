@@ -122,7 +122,8 @@ def evaluate_sample(
         except ValueError as exc:
             parse_error = str(exc)
         _trace({"raw_response": raw_response, "error": parse_error})
-        if parsed is not None:
+        if parse_error is None:
+            assert parsed is not None
             return parsed
         # The judge can answer in prose instead of the required score JSON, or
         # with a malformed value in a field that is present; echo the offending
@@ -233,7 +234,7 @@ def evaluate_sample(
             # whole video is passed through (video_url mode): the judge answers
             # HTTP 400 "Input length (83158) exceeds model's maximum context
             # length (65536)" (#9089).  Degrade that single content call to the
-            # bounded frame-sample path instead of failing the whole run.
+            # frame-sample path instead of failing the whole run.
             if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
                 raise
             logger.warning(
@@ -343,7 +344,12 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
 
 
 def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+    """Sample the full video at approximately one frame every three seconds.
+
+    The count is not capped. The ``video_url`` overflow fallback sends this
+    whole list, so a long clip can exceed the judge context again. That second
+    error is not caught and fails the sample.
+    """
     if duration <= 0:
         return []
     times = []
@@ -351,11 +357,6 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
-    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
-    # coverage while bounding long clips to a safely portable frame count.
-    if len(times) > 16:
-        stride = (len(times) - 1) / 15
-        times = [times[round(i * stride)] for i in range(16)]
     return times
 
 

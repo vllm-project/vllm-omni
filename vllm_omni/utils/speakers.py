@@ -36,3 +36,12 @@ def validate_requested_speaker(speaker: str | None, supported_speakers: set[str]
     if supported_speakers and normalized not in supported_speakers:
         raise ValueError(f"Invalid speaker '{speaker}'. Supported: {', '.join(sorted(supported_speakers))}")
     return normalized
+
+
+def set_prompt_speaker(engine_prompt: dict[str, Any], speaker: str) -> None:
+    """Record a resolved speaker on the prompt's ``additional_information``."""
+    additional_information = engine_prompt.get("additional_information")
+    if not isinstance(additional_information, dict):
+        additional_information = {}
+        engine_prompt["additional_information"] = additional_information
+    additional_information["speaker"] = [speaker]
