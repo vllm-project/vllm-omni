@@ -364,16 +364,28 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # The K-step control head is two-wide (continue/stop). Keep the input
         # batch's vocab in sync so the rejection sampler and any top-k
         # bookkeeping do not address non-existent token ids.
-        if not hasattr(input_batch, "vocab_size"):
-            # Fail closed: with the attribute missing, downstream sampling
-            # would index the two-wide control logits with the full codec
-            # vocab. V1 raises on an unusable step; so do we.
-            raise RuntimeError(
-                "[kstep] input_batch has no vocab_size; cannot sync the "
-                "two-wide control head safely"
-            )
-        prev_vocab_size = input_batch.vocab_size
-        input_batch.vocab_size = 2
+        prev_vocab_size = None
+        had_vocab = True
+        try:
+            prev_vocab_size = input_batch.vocab_size
+        except AttributeError:
+            # V2 InputBatch carries no vocab_size field (the sampling vocab
+            # lives on model_config): there is nothing on the batch to sync
+            # and no reader to mislead. The two-wide control logits are
+            # consumed by the talker's device-side sampler stages, and the
+            # duplex K-step path installs no rejection speculator
+            # (mrv2_custom_sampler returns no speculator for K > 0). Raising
+            # here kills every real MRv2 deployment at the first decode step
+            # (observed on the 910B3 bench), so keep the original
+            # warn-once-and-skip semantics.
+            had_vocab = False
+            if not getattr(self, "_kstep_vocab_warned", False):
+                self._kstep_vocab_warned = True
+                logger.warning(
+                    "[kstep] input_batch has no vocab_size; skipping stop-row vocab sync"
+                )
+        else:
+            input_batch.vocab_size = 2
         # Arm the per-step K-step state: drafts and postprocess now follow
         # the frame-loop semantics until the next decline re-disarms them.
         self._kstep_ran_last = True
@@ -406,7 +418,8 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         finally:
             # Restore before the next step: a declined or non-K-step batch on
             # this runner must not see the two-wide control vocab.
-            input_batch.vocab_size = prev_vocab_size
+            if had_vocab:
+                input_batch.vocab_size = prev_vocab_size
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
         # K-step drafts are not predictions: they reserve the K-1 extra KV

@@ -111,15 +111,22 @@ def test_gate_passes_to_frame_loop(monkeypatch):
     assert ns._kstep_ran_last is True
 
 
-def test_vocab_size_missing_fails_closed():
-    # Without vocab_size, sampling would index the two-wide control logits
-    # with the full codec vocab; V1 semantics fail closed, so must we.
+def test_vocab_size_missing_skips_sync_and_runs(monkeypatch):
+    # V2 InputBatch carries no vocab_size field; the sync must skip (warn
+    # once) and the frame loop must still run - raising here killed real
+    # MRv2 deployments at the first decode step (910B3 bench, 04:12 crash).
+    import vllm_omni.platforms.npu.worker.talker_multiframe as multiframe
+
+    monkeypatch.setattr(multiframe, "run", lambda **kwargs: "frame-loop-output")
     spans = [(i * 8, (i + 1) * 8) for i in range(2)]
     infos = [{"req_id": str(i)} for i in range(2)]
     ns, input_batch, model_inputs = _make_runner(spans, infos)
     del input_batch.vocab_size
-    with pytest.raises(RuntimeError, match="no vocab_size"):
-        _run(ns, input_batch, model_inputs)
+    out = _run(ns, input_batch, model_inputs)
+    assert out == "frame-loop-output"
+    # The frame loop still ran and the per-step arm is set.
+    assert ns._kstep_ran_last is True
+    assert ns._kstep_vocab_warned is True
 
 
 def test_declined_step_disarms_kstep_state():
