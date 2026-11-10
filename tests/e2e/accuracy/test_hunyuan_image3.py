@@ -561,7 +561,6 @@ def _run_dit_model(
         with OmniRunner(
             model,
             deploy_config=deploy_config_path,
-            mode="text-to-image",
             trust_remote_code=True,
         ) as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
