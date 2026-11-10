@@ -188,6 +188,7 @@ steps:
           --ignore=tests/diffusion/models/pi05/test_pi05_units.py
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
@@ -196,10 +197,9 @@ steps:
           --durations=50
           --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
 
-    # Hash sharding put these five CPU cases on shard 2/5. Main builds 13600 and
+    # Hash sharding put these six CPU cases on shard 2/5. Main builds 13600 and
     # 13615 spent about 15 and 23 minutes on them. A separate job keeps that
-    # cost off the five-way critical path. The Wan sharded True-exact cell
-    # used to sit here; that node is no longer collected.
+    # cost off the five-way critical path.
     - label: "Simple · Diffusion Slow CPU Test"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -223,6 +223,7 @@ steps:
           pytest -sv
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'

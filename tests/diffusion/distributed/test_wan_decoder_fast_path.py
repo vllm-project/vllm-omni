@@ -206,10 +206,13 @@ def _sharded_worker(
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-# In-process matrix covers the dropped autocast×level cells. Sharded keeps
-# one exact path and one fused-under-bf16 path with real halo exchange and
-# persistent buffers.
-@pytest.mark.parametrize("autocast,level", [(False, "exact"), (True, "fused")])
+# (False, "fused") stays in the in-process matrix. Sharded keeps fp32 exact,
+# bf16 exact (the torch.equal check with param cast, halo exchange, and
+# persistent buffers; pinned to Slow CPU), and fused-under-bf16.
+@pytest.mark.parametrize(
+    "autocast,level",
+    [(False, "exact"), (True, "exact"), (True, "fused")],
+)
 def test_sharded_fast_path_on_every_rank(autocast: bool, level: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
