@@ -1131,7 +1131,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._enable_delayed_audio_copy = self._runtime_config.enable_delayed_audio_copy
         self._delayed_audio_copy_use_events = use_cuda_graph and self._runtime_config.delayed_audio_copy_use_events
         self._coalesce_audio_d2h = self._runtime_config.coalesce_audio_d2h
-        self._enable_batched_vae_decode = self._runtime_config.enable_batched_vae_decode
+        # The unified decode graph batches VAE decode itself; keep the legacy
+        # latent-cohort path off whenever that graph runs (#9738).
+        self._enable_batched_vae_decode = self._runtime_config.effective_batched_vae_decode(
+            use_cuda_graph=use_cuda_graph
+        )
         self._enable_batched_fsq_fusion = self._runtime_config.enable_batched_fsq_fusion
         self._batched_fsq_fusion_max_batch = self._runtime_config.batched_fsq_fusion_max_batch
         self._audio_copy_stream: torch.cuda.Stream | None = None
