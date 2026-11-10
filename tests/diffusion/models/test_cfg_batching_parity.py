@@ -263,7 +263,8 @@ def _wan_vace(od_config, g):
     def make(batch):
         latents, timestep = _randn(g, batch, 4, 3, 8, 8), torch.full((batch,), 500.0, device=g.device)
         # diffuse() passes the same VACE condition and attention_kwargs to both branches.
-        vace_context, attention_kwargs = _randn(g, batch, 8, 3, 8, 8), {}
+        vace_context = _randn(g, batch, 8, 3, 8, 8)
+        attention_kwargs: dict[str, object] = {}
         return [
             {
                 "hidden_states": latents,
@@ -295,10 +296,14 @@ CASES: dict[str, Callable] = {
 
 
 @pytest.fixture
-def diffusion_env(tmp_path):
+def diffusion_env(tmp_path, monkeypatch):
     device = _device()
     # fp32 keeps batch-1 vs batch-2 GEMM differences far below the tolerance;
-    # SDPA is the attention backend that takes fp32 everywhere.
+    # SDPA is the attention backend that takes fp32 everywhere. CUDA runs fp32
+    # cuDNN convs in TF32 by default (SDXL's UNet is mostly convs), so force
+    # IEEE fp32 for convs and matmuls.
+    monkeypatch.setattr(torch.backends.cudnn.conv, "fp32_precision", "ieee")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
     od_config = OmniDiffusionConfig.from_kwargs(
         dtype=DTYPE, diffusion_attention_config={"default": "TORCH_SDPA"}, linear_backend="TORCH"
     )
