@@ -2253,7 +2253,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self, request: Request, terminal: _MiniCPMO45TerminalRow, payload: object
     ) -> bool:
         """Restore the length stop once the final own row was returned."""
-        from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row, has_no_rows
+        from vllm_omni.model_executor.models.minicpmo_4_5.handoff import (
+            caches_turn_outputs,
+            ends_with_own_row,
+            has_no_rows,
+        )
 
         if not request.is_finished() and (
             request.num_computed_tokens < request.num_tokens or request.num_in_flight_tokens > 0
@@ -2265,12 +2269,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._minicpmo45_terminal_rows.pop(request.request_id, None)
         if request.is_finished():
             return True
-        # The stage-0 prefix cache drops rows it already delivered from a recompute
-        # (worker_v2/prefix_cache.py), so a recompute after the emitted own row is empty.
+        # The stage-0 output prefix cache drops rows it already delivered from a
+        # recompute, so a recompute after the emitted own row is empty. The worker
+        # runs it only with enable_prefix_caching (the same CacheConfig field as
+        # enable_caching) and the model's caches_turn_outputs opt-in
+        # (stage_prefix_cache_config, worker_v2/prefix_cache.py).
         trimmed_after_emit = (
             terminal.row_emitted
             and request.num_preemptions > 0
             and getattr(getattr(self, "kv_cache_manager", None), "enable_caching", False)
+            and caches_turn_outputs(getattr(self, "vllm_config", None))
             and has_no_rows(payload)
         )
         if request.num_computed_tokens == request.num_tokens and (

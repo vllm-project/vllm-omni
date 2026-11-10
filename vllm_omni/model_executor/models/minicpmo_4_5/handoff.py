@@ -59,3 +59,18 @@ def has_no_rows(payload: object) -> bool:
         return False
     rows = [payload.get(k) for k in ("latent_input_ids", "latent_positions", "latent")]
     return all(isinstance(v, torch.Tensor) and v.shape[0] == 0 for v in rows)
+
+
+def caches_turn_outputs(vllm_config: object) -> bool:
+    """Whether the turn-mode Thinker opts into the MRv2 stage output prefix cache.
+
+    The output cache refuses speculative decoding, so with a draft the Thinker
+    reuses native KV only. The model's opt-in and the scheduler's acceptance of
+    a trimmed recompute both read this, so they cannot disagree.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    return (
+        getattr(model_config, "model_stage", None) == "llm"
+        and getattr(model_config, "session_mode", None) == "turn"
+        and getattr(vllm_config, "speculative_config", None) is None
+    )

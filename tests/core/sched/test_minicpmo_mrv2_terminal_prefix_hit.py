@@ -28,7 +28,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
-from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
+from vllm_omni.model_executor.models.minicpmo_4_5 import handoff
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import caches_turn_outputs, ends_with_own_row
 from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -269,12 +270,19 @@ def test_recompute_after_the_emitted_own_row(prefix_caching, stale_row):
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
 
 
-@pytest.mark.parametrize("damage", ["stale_row_other_position", "empty_without_prefix_cache", "reused_request_id"])
-def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage):
+@pytest.mark.parametrize(
+    "damage", ["stale_row_other_position", "empty_without_prefix_cache", "empty_without_output_cache", "reused_request_id"]
+)
+def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage, monkeypatch):
     """The record is tied to the stop's token and position, to the prefix-cache trim, and to one request."""
     prefix_caching = damage != "empty_without_prefix_cache"
     scheduler = _scheduler(prefix_caching, num_spec=0)
-    runner = _TrimmingRunner(prefix_caching)
+    if damage == "empty_without_output_cache":
+        # Native KV caching on, output cache off (as with a stage-0 draft): no worker trim.
+        monkeypatch.setattr(handoff, "caches_turn_outputs", lambda vllm_config: False)
+        assert scheduler.kv_cache_manager.enable_caching
+    trims = prefix_caching and damage != "empty_without_output_cache"
+    runner = _TrimmingRunner(trims)
 
     def cycle(stale_row_ok):
         a = _request("A", PROMPT, 2)
@@ -291,14 +299,14 @@ def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage):
         _deliver(scheduler, terminal, {"A": (start, ids)}, {"A": [DRAFT_ID]})
         readmit = scheduler.schedule()
         booked = runner.rows(scheduler, readmit)["A"]
-        # Without the prefix cache nothing trims; force the empty ledger the rule must not accept there.
-        rows = booked if prefix_caching else (booked[0] + len(booked[1]), [])
+        # Without the worker trim, force the empty ledger the rule must not accept there.
+        rows = booked if trims else (booked[0] + len(booked[1]), [])
         _, finishes = _deliver(scheduler, readmit, {"A": rows}, {"A": [DRAFT_ID]})
         return finishes
 
     if damage == "stale_row_other_position":
         assert cycle(stale_row_ok=False) == [("A", FinishReason.ERROR)]
-    elif damage == "empty_without_prefix_cache":
+    elif damage in ("empty_without_prefix_cache", "empty_without_output_cache"):
         assert cycle(stale_row_ok=True) == [("A", FinishReason.ERROR)]
     else:
         # The first request's record must not carry over to a new request with the same id.
@@ -306,3 +314,17 @@ def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage):
         assert not scheduler._minicpmo45_terminal_rows
         assert cycle(stale_row_ok=False) == [("A", FinishReason.ERROR)]
     assert not scheduler.requests and not scheduler._minicpmo45_terminal_rows
+
+
+@pytest.mark.parametrize(
+    "stage,session,draft,expected",
+    [("llm", "turn", False, True), ("llm", "turn", True, False), ("llm", "duplex", False, False),
+     ("tts", "turn", False, False)],
+)  # fmt: skip
+def test_output_cache_opt_in(stage, session, draft, expected):
+    """The trimmed-recompute rule and the model's output-cache opt-in read the same predicate."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage=stage, session_mode=session),
+        speculative_config=_speculative_config() if draft else None,
+    )
+    assert caches_turn_outputs(config) is expected
