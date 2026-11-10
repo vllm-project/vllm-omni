@@ -371,7 +371,7 @@ the recorded adapter revisions; native GPU requalification is pending. Relative 
 | A2 | Native rolling PixelUMM decoder, preserving the `16a4c228` source contract | Native GPU precision and performance requalification pending |
 | A3 | Session-bound rolling decode, positions, empty stable metadata, normal final flush | Full cancellation/transport qualification |
 | A4 | Full/recent transactional retention; offline AR and normal realtime/typed output; 18/36 precision and 120+ second delivery | Remaining A4 service matrix, 72 precision, complete high-water accounting and broad W6/full-vs-recent quality |
-| B1–B9 | Basic SP/module offload; experimental window decoding, with a 385-frame SP2 screening at `c3689f0db` | Window decoding needs sustained, offload and SP4/SP8/SP16 qualification; media/kernel/attention/staging optimization, chunk residency/prefetch, encoder sharding, regional compile/graphs and sparsity |
+| B1–B9 | Basic SP/module offload; experimental window decoding | Window decoding needs real-model requalification, including sustained workloads, offload, and SP4/SP8/SP16; media/kernel/attention/staging optimization, chunk residency/prefetch, encoder sharding, regional compile/graphs and sparsity |
 | C1–C8 | Full/recent through AR state interfaces | CPU archival, other history sampling, KV/weight quantization, undo and pause/resume |
 | D1–D3 | Camera trajectory conditioning | Nomas-PE, official LoRA and browser camera UI |
 

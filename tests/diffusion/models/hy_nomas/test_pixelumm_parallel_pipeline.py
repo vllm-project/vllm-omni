@@ -74,6 +74,8 @@ def _pipeline_worker(rank, world_size, rendezvous):
                 pipeline.sp_size = world_size
                 pipeline.heads_num = 2 * world_size
                 pipeline.hidden_size = 8 * world_size
+                pipeline.in_channels = 32
+                pipeline.transformer.config.out_channels = 32
                 pipeline.decoder_parallel_mode = mode
                 pipeline.vae = make_decoder()
                 if mode == "window":

@@ -13,10 +13,20 @@ import torch.multiprocessing as mp
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from vllm.config import set_current_vllm_config
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import load_component_weights
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_distributed_env,
+    get_sp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_decoder
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
@@ -37,7 +47,7 @@ def _load_decoder(root: Path, device: torch.device):
                 for key in shard.keys():
                     yield key, shard.get_tensor(key)
 
-    load_component_weights(model, weights())
+    model.load_weights(weights())
     return model
 
 
@@ -45,13 +55,13 @@ def _run_stream(model, latent):
     session = model.create_streaming_decode_session()
     parts = []
     positions = []
-    for chunk, frames, final in ((latent[:, :, :7], 28, False), (latent[:, :, 7:], 29, True)):
+    for chunk, frames, final in ((latent[:, :, :7], 28, False), (latent[:, :, 7:], 49, True)):
         session.final_segment = final
         parts.append(session.push(chunk, pixel_frames=frames))
         positions.append(session.committed_pixel_frames)
     parts.append(session.finish())
     positions.append(session.committed_pixel_frames)
-    assert session.finished and positions[-1] == 57
+    assert session.finished and positions[-1] == 77
     return parts, positions
 
 
@@ -61,47 +71,62 @@ def _decode_worker(rank: int, rendezvous: str, root: str):
     dist.init_process_group(
         "nccl", init_method=rendezvous, rank=rank, world_size=2, device_id=device, timeout=timedelta(minutes=10)
     )
+    world_ready = False
     try:
-        model = _load_decoder(Path(root), device)
-        generator = torch.Generator().manual_seed(42)
-        latent = torch.randn((1, 32, 15, 8, 8), generator=generator, dtype=torch.bfloat16).to(device)
-        calls = []
-        hook = model.decoder.register_forward_hook(lambda *_: calls.append(1))
+        parallel = DiffusionParallelConfig(sequence_parallel_size=2, ulysses_degree=2)
+        config = OmniDiffusionConfig(model=root, dtype=torch.bfloat16, parallel_config=parallel, enforce_eager=True)
+        vllm_config = create_diffusion_vllm_config(device, config)
         with (
-            torch.inference_mode(),
-            sdpa_kernel(
-                [
-                    SDPBackend.CUDNN_ATTENTION,
-                    SDPBackend.FLASH_ATTENTION,
-                    SDPBackend.EFFICIENT_ATTENTION,
-                    SDPBackend.MATH,
-                ]
-            ),
+            set_forward_context(vllm_config=vllm_config, omni_diffusion_config=config),
+            set_current_vllm_config(vllm_config),
+            set_current_diffusion_config(config),
         ):
-            expected = model.decode(latent, pixel_frames=57).sample
-            assert len(calls) == 2
-            calls.clear()
-            expected_parts, expected_positions = _run_stream(model, latent)
-            dist.barrier()
-            model.configure_distributed_decode(dist.group.WORLD)
-            calls.clear()
-            actual = model.decode(latent, pixel_frames=57).sample
-            assert len(calls) == 1
-            actual_parts, actual_positions = _run_stream(model, latent)
-            dist.barrier()
-        hook.remove()
-        assert actual_positions == expected_positions
-        if rank == 0:
-            assert actual.shape[2] == 57 and sum(part.shape[2] for part in actual_parts if part.numel()) == 57
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            assert len(actual_parts) == len(expected_parts)
-            for part, expected_part in zip(actual_parts, expected_parts):
-                torch.testing.assert_close(part, expected_part, rtol=0, atol=0)
-        else:
-            assert actual.numel() == 0
-            assert all(part.numel() == 0 for part in actual_parts)
+            init_distributed_environment(world_size=2, rank=rank, local_rank=rank, backend="nccl")
+            world_ready = True
+            initialize_model_parallel(sequence_parallel_size=2, ulysses_degree=2, backend="nccl")
+            model = _load_decoder(Path(root), device)
+            generator = torch.Generator().manual_seed(42)
+            latent = torch.randn((1, 32, 20, 8, 8), generator=generator, dtype=torch.bfloat16).to(device)
+            calls = []
+            hook = model.decoder.register_forward_hook(lambda *_: calls.append(1))
+            with (
+                torch.inference_mode(),
+                sdpa_kernel(
+                    [
+                        SDPBackend.CUDNN_ATTENTION,
+                        SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.EFFICIENT_ATTENTION,
+                        SDPBackend.MATH,
+                    ]
+                ),
+            ):
+                expected = model.decode(latent, pixel_frames=77).sample
+                assert len(calls) == 3
+                calls.clear()
+                expected_parts, expected_positions = _run_stream(model, latent)
+                dist.barrier()
+                model.configure_distributed_decode(get_sp_group().ulysses_group)
+                calls.clear()
+                actual = model.decode(latent, pixel_frames=77).sample
+                assert len(calls) == (2 if rank == 0 else 1)
+                actual_parts, actual_positions = _run_stream(model, latent)
+                dist.barrier()
+            hook.remove()
+            assert actual_positions == expected_positions
+            if rank == 0:
+                assert actual.shape[2] == 77 and sum(part.shape[2] for part in actual_parts if part.numel()) == 77
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert len(actual_parts) == len(expected_parts)
+                for part, expected_part in zip(actual_parts, expected_parts):
+                    torch.testing.assert_close(part, expected_part, rtol=0, atol=0)
+            else:
+                assert actual.numel() == 0
+                assert all(part.numel() == 0 for part in actual_parts)
     finally:
-        dist.destroy_process_group()
+        if world_ready:
+            destroy_distributed_env()
+        elif dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @hardware_test(res={"cuda": ["H200", "B200"]}, num_cards=2)
