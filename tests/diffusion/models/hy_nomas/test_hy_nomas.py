@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -352,6 +353,44 @@ def test_nonempty_negative_prompt_is_rejected(negative_prompt):
 def test_negative_prompt_requires_string(negative_prompt):
     with pytest.raises(OmniClientError, match="negative_prompt must be a string"):
         normalize_request({"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams())
+
+
+def test_decode_chunk_matches_legacy_quantization():
+    """Decoded latents must reach the encoder as HWC uint8 the legacy formula produced."""
+    from contextlib import nullcontext
+
+    # b=1, c=1, t=2, h=1, w=2 of raw decoder samples in [-1, 1].
+    pixels = torch.tensor([-1.4, -0.2, 0.0, 0.6], dtype=torch.float32).reshape(1, 1, 2, 1, 2)
+
+    class Decoder:
+        final_segment = False
+
+        def push(self, latents, *, pixel_frames):
+            del latents, pixel_frames
+            return pixels
+
+        def finish(self):
+            return torch.empty((0,))
+
+    session = SimpleNamespace(decoder=Decoder(), height=1, width=2)
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(scaling_factor=1.0, shift_factor=None),
+        parameters=lambda: iter([torch.zeros(1, dtype=torch.float32)]),
+    )
+    pipeline._component_context = lambda module: nullcontext()
+    pipeline.sp_size = 1
+    pipeline.device = torch.device("cpu")
+
+    video = pipeline._decode_chunk(session, torch.zeros(1), pixel_frames=2, finish=False)
+
+    # (v * 0.5 + 0.5) -> clamp -> * 255 -> round-half-even -> uint8, laid out as HWC.
+    # -1.4 -> -0.2 -> 0 -> 0; -0.2 -> 0.4 -> 102; 0.0 -> 0.5 -> 127.5 -> 128; 0.6 -> 0.8 -> 204.
+    expected = np.array([[[[0], [102]]], [[[128], [204]]]], dtype=np.uint8)
+    assert video.dtype == np.uint8
+    assert video.shape == (2, 1, 2, 1)
+    assert video.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(video, expected)
 
 
 @pytest.fixture

@@ -538,7 +538,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session() if bound is not None else None,
+                self.vae.create_streaming_decode_session(to_cpu=False) if bound is not None else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:
@@ -872,6 +872,24 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.step_in_chunk += 1
         state.step_index += 1
 
+    @staticmethod
+    def _to_host(frames: torch.Tensor) -> np.ndarray:
+        """Return one quantized chunk as HWC uint8, staged through pinned memory.
+
+        A blocking ``.cpu()`` into pageable memory runs at roughly 2 GB/s.
+        Copying into a freshly allocated pinned buffer with a recorded event
+        reaches PCIe speed, and allocating per chunk leaves the returned array
+        the sole owner, so no lease or reuse protocol is needed.
+        """
+        if frames.device.type != "cuda":
+            return frames.cpu().numpy()
+        host = torch.empty(frames.shape, dtype=frames.dtype, pin_memory=True)
+        host.copy_(frames, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        done.synchronize()
+        return host.numpy()
+
     def _decode_chunk(
         self, session: HyNomasSession, latents: torch.Tensor, *, pixel_frames: int, finish: bool
     ) -> np.ndarray:
@@ -887,7 +905,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         pixels = torch.cat((pixels, tail), 2) if pixels.numel() else tail
             if pixels.numel():
                 pixels = (pixels * 0.5 + 0.5).clamp(0, 1)
-                video = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).cpu().numpy()
+                frames = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).contiguous()
+                video = self._to_host(frames)
             else:
                 video = np.empty((0, session.height, session.width, 3), dtype=np.uint8)
         except Exception as exc:

@@ -34,7 +34,7 @@ import json
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Callable, Iterator
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -830,6 +830,14 @@ class OmniStreamingVideoOutputHandler:
 
         progress.touch()
 
+    async def _run_encoder_call(self, call: Callable[[], Any]) -> Any:
+        """Run blocking codec work off the event loop.
+
+        Cancellation waits for the worker instead of abandoning it, so the
+        encoder is never closed while PyAV is still using it.
+        """
+        return await anyio.to_thread.run_sync(call, abandon_on_cancel=False)
+
     async def _stream_video_bytes(
         self,
         request: VideoGenerationRequest,
@@ -856,13 +864,16 @@ class OmniStreamingVideoOutputHandler:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                for chunk, metadata in self._encode_generation_result(result, request_id, encoder):
+                encoded = await self._run_encoder_call(
+                    lambda: list(self._encode_generation_result(result, request_id, encoder))
+                )
+                for chunk, metadata in encoded:
                     if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
                     yield (chunk, metadata)
 
             completed = True
-            final_chunk = encoder.close()
+            final_chunk = await self._run_encoder_call(encoder.close)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -878,6 +889,8 @@ class OmniStreamingVideoOutputHandler:
                 )
         finally:
             if not completed:
+                # Synchronous: an abandoned session finalizes this generator
+                # outside any awaited scope, so it must not schedule work.
                 encoder.close()
 
     def _encode_generation_result(

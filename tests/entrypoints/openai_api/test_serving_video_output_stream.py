@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import threading
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from starlette.testclient import TestClient
 from tests.helpers.media import generate_synthetic_image
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.video_api_utils import create_streaming_video_encoder
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -71,6 +73,45 @@ def _receive_video_chunk(ws) -> tuple[dict, bytes]:
     metadata = ws.receive_json()
     assert metadata["type"] == "video.chunk_metadata"
     return metadata, ws.receive_bytes()
+
+
+@pytest.mark.asyncio
+async def test_blocking_encoder_call_does_not_starve_event_loop() -> None:
+    """Codec work must yield so control/abort tasks can run concurrently."""
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+    started = threading.Event()
+    observed_by_event_loop = threading.Event()
+
+    async def observe_encoder_call() -> None:
+        await asyncio.to_thread(started.wait)
+        observed_by_event_loop.set()
+
+    def blocking_encode() -> bool:
+        started.set()
+        threading.Event().wait(0.05)
+        return observed_by_event_loop.is_set()
+
+    observer = asyncio.create_task(observe_encoder_call())
+    try:
+        assert await handler._run_encoder_call(blocking_encode)
+    finally:
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
+
+
+def test_offloaded_encoder_produces_identical_mp4_bytes() -> None:
+    """Moving PyAV off the event loop must not change the produced bytes."""
+    frames = np.random.default_rng(0).integers(0, 256, size=(4, 8, 8, 3), dtype=np.uint8)
+    direct_encoder = create_streaming_video_encoder(output_format="m4s", fps=24)
+    direct = direct_encoder.encode(frames) + direct_encoder.close()
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+
+    async def encode_off_loop() -> bytes:
+        encoder = create_streaming_video_encoder(output_format="m4s", fps=24)
+        chunk = await handler._run_encoder_call(lambda: encoder.encode(frames))
+        return chunk + await handler._run_encoder_call(encoder.close)
+
+    assert asyncio.run(encode_off_loop()) == direct
 
 
 def _build_test_app(
