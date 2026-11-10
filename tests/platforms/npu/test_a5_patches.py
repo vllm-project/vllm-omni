@@ -7,7 +7,7 @@ device detection, ``npu/models/qwen3_tts.py`` for the Qwen3-TTS
 patch). The tests load those modules from source with fake Qwen3-TTS
 dependencies, so they validate the patch contract without loading real model
 or NPU kernels. A5 device detection is exercised with a fake
-``vllm_ascend.utils`` module.
+``vllm_ascend.device.device_config`` module.
 """
 
 from __future__ import annotations
@@ -145,7 +145,6 @@ def test_is_a5_falls_back_false_without_is_950(monkeypatch: pytest.MonkeyPatch) 
     # Older vllm-ascend releases have no `is_950`; detection must fall back.
     vllm_ascend = _install_fake_module(monkeypatch, "vllm_ascend")
     vllm_ascend.__path__ = []
-    _install_fake_module(monkeypatch, "vllm_ascend.utils")
     device = _install_fake_module(monkeypatch, "vllm_ascend.device")
     device.__path__ = []
     _install_fake_module(monkeypatch, "vllm_ascend.device.device_config")
