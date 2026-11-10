@@ -695,7 +695,8 @@ def _decode_native_duplex_token_ids(
         return ""
 
 
-# Same sentence boundary Stage 0 uses when deciding whether to hold turn_eos.
+# Talker handoff sentence boundary. A finished sentence closes the turn-end
+# condition with <text_eos>; a cut-off tail keeps the boundary mask.
 _TURN_TEXT_TAIL_CHARS = MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS
 
 

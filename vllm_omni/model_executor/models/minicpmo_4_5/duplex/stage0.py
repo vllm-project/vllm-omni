@@ -99,16 +99,6 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
-    #: This unit already emitted a text token. Cleared when the unit closes.
-    turn_unit_has_text: bool = False
-    #: Consecutive units that tried to end the turn without emitting text.
-    textless_turn_end_units: int = 0
-    #: Text-token ids of the open turn, decoded together so a split character stays intact.
-    open_turn_token_ids: list[int] = field(default_factory=list)
-    #: Decoded tail of ``open_turn_token_ids``. The hold reads this and does not decode.
-    open_turn_tail: str = ""
-    #: How many turn_eos samples this turn has already held.
-    held_turn_ends: int = 0
 
 
 @dataclass(frozen=True, slots=True)

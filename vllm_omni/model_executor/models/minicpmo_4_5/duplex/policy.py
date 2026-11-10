@@ -98,15 +98,11 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
     DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     REPETITION_HISTORY_SIZE = 512
-    # Shared by Stage 0 and the Talker handoff. A tail that still ends with
-    # one of these, after closing quotes and brackets, has finished a sentence.
+    # Talker handoff. A tail that still ends with one of these, after closing
+    # quotes and brackets, has finished a sentence.
     SENTENCE_END_PUNCTUATION = "。！？.!?…"
     CLOSING_PUNCTUATION = "\"'”’」』）)】"
     TURN_TEXT_TAIL_CHARS = 16
-    # Per-chunk caps only emit chunk_eos, and force-listen requires the turn
-    # to have ended already, so neither releases a hold. Stop rewriting
-    # turn_eos after this many holds in one turn.
-    MAX_HELD_UNFINISHED_TURN_ENDS = 8
 
     @staticmethod
     def turn_text_ends_sentence(text: str) -> bool:
