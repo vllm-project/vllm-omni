@@ -247,7 +247,12 @@ def _decode_profile_updates(model: nn.Module, profile: H3LiteDecodeProfile | Non
             continue
         if ratio is not None and value % ratio:
             raise ValueError(f"H3 Lite {name}={value} must be a multiple of the spatial ratio {ratio}")
-        if name not in ("decoder_short_axis_overlap", "decoder_long_axis_overlap", "decoder_tile_overlap_min", "decoder_image_overlap"):
+        if name not in (
+            "decoder_short_axis_overlap",
+            "decoder_long_axis_overlap",
+            "decoder_tile_overlap_min",
+            "decoder_image_overlap",
+        ):
             if value <= 0:
                 raise ValueError(f"H3 Lite {name} must be positive")
         if value < 0:
@@ -328,7 +333,10 @@ def _lightvae_geometry(
         raise ValueError("H3 Lite profile is missing decoder tiling geometry")
     if frames == 1:
         image_tile = _profile_value(model, profile, "image_tile_size", "decoder_image_tile_size") or short
-        image_long = _profile_value(model, profile, "image_long_axis_tile", "decoder_image_long_axis_tile") or image_tile
+        image_long = (
+            _profile_value(model, profile, "image_long_axis_tile", "decoder_image_long_axis_tile")
+            or image_tile
+        )
         image_overlap = profile.tile_overlap if profile.tile_overlap is not None else short_overlap
         return image_tile, image_long, image_overlap, image_overlap
     if height < width:
@@ -339,7 +347,13 @@ def _lightvae_geometry(
     return short, short, overlap, overlap
 
 
-def _blend_tiles(model: nn.Module, previous: torch.Tensor, current: torch.Tensor, extent: int, dim: int) -> torch.Tensor:
+def _blend_tiles(
+    model: nn.Module,
+    previous: torch.Tensor,
+    current: torch.Tensor,
+    extent: int,
+    dim: int,
+) -> torch.Tensor:
     if extent <= 0:
         return current
     blend = getattr(model, "blend", None) or getattr(model, "_blend", None)
