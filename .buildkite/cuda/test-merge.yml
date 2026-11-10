@@ -190,13 +190,17 @@ steps:
 
       - label: "Diffusion · MiniMax-H3 L3 DLO DP2 and FastH3"
         source_file_dependencies: diffusion_minimax_h3_function
-        # Three pytest processes, three server lifecycles. FL2VA and Ref2VA
-        # share one DP2+DLO server (--task-type combined) and that process
-        # does not tear it down between the two tasks. Turbo LoRA (TP2) and
-        # FastH3 LoRA (HSDP/USP) stay separate processes: different layouts,
-        # and a DLO teardown can leave a stale resource_tracker /psm_* entry
-        # that strands the next collective. A per-process timeout still fails
-        # a hung regression instead of stalling the merge queue.
+        # Four pytest processes. FL2VA and Ref2VA share one DP2+DLO server
+        # (--task-type combined); that process does not tear it down between
+        # the two full waves. A separate process boots --task-type ref2va on
+        # the same DP2+DLO layout with --enforce-eager and one 512x288
+        # one-step wave, so the per-partition download, expected_partition
+        # check, and Ref2VA-on-self.transformer path stay live without a
+        # second full 1344x768 cold start. Turbo LoRA (TP2) and FastH3 LoRA
+        # (HSDP/USP) stay separate processes: different layouts, and a DLO
+        # teardown can leave a stale resource_tracker /psm_* entry that
+        # strands the next collective. A per-process timeout still fails a
+        # hung regression instead of stalling the merge queue.
         timeout_in_minutes: 150
         commands:
           - |
@@ -209,6 +213,7 @@ steps:
               export VLLM_TEST_MINIMAX_H3_FASTH3_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA", filename="dense-datafree/adapter_model.safetensors"))')
             fi
             timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va_ref2va.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_ref2va_partition.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
             timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_turbo_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
             timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_fasth3_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
         mirror_hardwares: h100_2
