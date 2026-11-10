@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared DAC codec construction for Fish Speech S2 Pro.
 
 Used by both the encoder (voice cloning, CPU) and the decoder (Stage 1, GPU).
@@ -6,11 +9,21 @@ Used by both the encoder (voice cloning, CPU) and the decoder (Stage 1, GPU).
 from __future__ import annotations
 
 import torch.nn as nn
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
+from torch.nn.utils.weight_norm import WeightNorm
 
 # Default DAC codec config matching s2-pro's modded_dac_vq.yaml.
 DAC_SAMPLE_RATE = 44100
 DAC_HOP_LENGTH = 2048  # 512 (decoder upsample) * 4 (quantizer upsample)
 DAC_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
+DAC_SEMANTIC_CODEBOOK_SIZE = 4096
+DAC_RESIDUAL_CODEBOOK_SIZE = 1024
+
+
+def dac_codebook_sizes() -> tuple[int, ...]:
+    """Entries of each codebook, in code order: the semantic one, then the residual ones."""
+    return (DAC_SEMANTIC_CODEBOOK_SIZE,) + (DAC_RESIDUAL_CODEBOOK_SIZE,) * (DAC_NUM_CODEBOOKS - 1)
 
 
 def build_dac_codec() -> nn.Module:
@@ -68,14 +81,14 @@ def build_dac_codec() -> nn.Module:
     )
     quantizer = DownsampleResidualVectorQuantize(
         input_dim=1024,
-        n_codebooks=9,
-        codebook_size=1024,
+        n_codebooks=DAC_NUM_CODEBOOKS - 1,
+        codebook_size=DAC_RESIDUAL_CODEBOOK_SIZE,
         codebook_dim=8,
         quantizer_dropout=0.0,
         downsample_factor=[2, 2],
         post_module=post_module,
         pre_module=pre_module,
-        semantic_codebook_size=4096,
+        semantic_codebook_size=DAC_SEMANTIC_CODEBOOK_SIZE,
     )
     codec = DAC(
         encoder_dim=64,
@@ -90,3 +103,23 @@ def build_dac_codec() -> nn.Module:
         transformer_general_config=_make_transformer_config,
     )
     return codec
+
+
+def bake_weight_norm(codec: nn.Module) -> int:
+    """Fold every weight norm (parametrized and legacy hook) into plain weights; returns the count.
+
+    The quantizer's legacy ``weight_norm`` recomputes ``weight`` from
+    ``weight_g`` / ``weight_v`` in a forward pre-hook, so until a forward runs
+    the ``weight`` attribute is stale; baking computes it from the loaded
+    parameters once.
+    """
+    baked = 0
+    for module in codec.modules():
+        parametrizations = getattr(module, "parametrizations", None)
+        for name in list(parametrizations.keys()) if parametrizations else []:
+            remove_parametrizations(module, name, leave_parametrized=True)
+            baked += 1
+        for hook in [h for h in module._forward_pre_hooks.values() if isinstance(h, WeightNorm)]:
+            remove_weight_norm(module, hook.name)
+            baked += 1
+    return baked

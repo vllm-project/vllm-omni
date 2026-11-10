@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for Qwen2.5-Omni embed_input_ids to verify embeddings are
 correctly assigned to audio/image/video token positions.
@@ -17,6 +17,8 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.multimodal.utils import set_mm_embedding_modality
+
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -83,35 +85,31 @@ def make_interleaved_seq(video_chunks: list[int], audio_chunks: list[int], text_
 class TestCheckInterleavedAudioVideo:
     def test_non_interleaved_audio_then_video(self):
         """Audio entirely before video -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 0, 4)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_non_interleaved_with_image(self):
         """Audio + image + video (the mixed_modalities case) -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 4, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_no_audio(self):
         """Video only -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(0, 0, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_interleaved(self):
         """V A V A interleaved -> True."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_interleaved_seq([4, 4], [3, 3])
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
 
 # ---------------------------------------------------------------------------

@@ -45,9 +45,8 @@ to the model's bundled duplex profile):
 
 Input WAVs must be mono 16 kHz PCM16; when a preset's session takes a
 different capture format (the PersonaPlex preset streams 24 kHz float32),
-the audio is converted before streaming. ``--ref-audio`` is required by the
-MiniCPM-o preset (without it the session is rejected with
-``ref_audio_required``). Outputs land in ``--output-dir`` as one WAV per
+the audio is converted before streaming. ``--ref-audio`` optionally overrides
+MiniCPM-o's model-bundled assistant voice. Outputs land in ``--output-dir`` as one WAV per
 response — ``response_1_cancelled.wav`` for a barged-in answer,
 ``response_1_completed.wav`` for one that finished — plus ``summary.json``.
 """
@@ -311,7 +310,7 @@ def main() -> int:
         default="minicpmo_4_5",
         help="per-model session preset from vllm_omni.clients.<model>",
     )
-    parser.add_argument("--ref-audio", help="reference voice WAV (the MiniCPM-o preset requires it)")
+    parser.add_argument("--ref-audio", help="optional reference voice WAV for the MiniCPM-o preset")
     parser.add_argument("--question-wav", required=True, help="mono 16 kHz PCM16 question")
     parser.add_argument("--interrupt-wav", required=True, help="mono 16 kHz PCM16 follow-up spoken mid-answer")
     parser.add_argument("--output-dir", default="./duplex_out")

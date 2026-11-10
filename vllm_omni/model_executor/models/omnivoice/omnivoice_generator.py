@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice Generator (Stage 0) - Iterative unmasking with Qwen3 backbone.
 
@@ -256,7 +256,7 @@ class OmniVoiceRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and x.is_cuda:
             return triton_rms_norm(x, self.weight, self.eps)
         variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
@@ -344,7 +344,7 @@ class OmniVoiceMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and gate_up.is_cuda:
             return self.down_proj(triton_swiglu(gate_up))
         gate, up = gate_up.chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
@@ -387,7 +387,7 @@ class OmniVoiceTransformerBlock(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif _TRITON_AVAILABLE:
+        elif _TRITON_AVAILABLE and hidden_states.is_cuda:
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,
                 residual,
@@ -401,7 +401,7 @@ class OmniVoiceTransformerBlock(nn.Module):
 
         hidden_states = self.self_attn(hidden_states, rope_table, attn_metadata)
 
-        if _TRITON_AVAILABLE:
+        if _TRITON_AVAILABLE and hidden_states.is_cuda:
             # Fused: (attn_out + residual) + RMSNorm in one kernel
             hidden_states, residual = triton_fused_add_rms_norm(
                 hidden_states,
@@ -968,6 +968,7 @@ class OmniVoiceGenerator(nn.Module):
         layer_penalty_factor: float = 5.0,
         position_temperature: float = 5.0,
         class_temperature: float = 0.0,
+        generators: list[torch.Generator] | None = None,
     ) -> torch.Tensor:
         """Run the full 32-step iterative unmasking generation.
 
@@ -987,6 +988,8 @@ class OmniVoiceGenerator(nn.Module):
             position_temperature: Gumbel temperature for position selection.
             class_temperature: Token sampling temperature; zero selects greedy
                 decoding.
+            generators: Optional persistent generator per request, overriding
+                seed to preserve random state across chunks.
 
         Returns:
             Packed generated audio tokens with shape
@@ -997,13 +1000,16 @@ class OmniVoiceGenerator(nn.Module):
         total_target_lens = sum(target_lens)
         mask_id = self.config.audio_mask_id
         num_codebooks = self.config.num_audio_codebook
-        seeds = seed if isinstance(seed, list) else [seed] * B
-        generators = [
-            torch.Generator(device=device).manual_seed(
-                request_seed if request_seed is not None else random.randint(0, 2**63 - 1)
-            )
-            for request_seed in seeds
-        ]
+        if generators is None:
+            seeds = seed if isinstance(seed, list) else [seed] * B
+            generators = [
+                torch.Generator(device=device).manual_seed(
+                    request_seed if request_seed is not None else random.randint(0, 2**63 - 1)
+                )
+                for request_seed in seeds
+            ]
+        elif len(generators) != B:
+            raise ValueError("generators must contain one generator per request")
 
         # Initialize all target tokens as [MASK]
         tokens = torch.full((1, num_codebooks, total_target_lens), mask_id, dtype=torch.long, device=device)

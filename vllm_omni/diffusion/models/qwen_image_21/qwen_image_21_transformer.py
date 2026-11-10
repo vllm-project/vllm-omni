@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import math
+import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -33,13 +34,26 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
+from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
+from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
+
+
+class QwenImage21KVCache(list[dict[str, dict[str, torch.Tensor]]]):
+    """Request prefix cache supporting weakrefs used by this transformer's geometry reuse.
+
+    Plain lists cannot be weak-referenced. This subclass lets dropping a request
+    release its geometry without retaining prefix tensors on the transformer.
+    """
+
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -88,8 +102,39 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
     Same contract as the reference `apply_rotary_emb_qwen(..., use_real=False)`:
     `x` is [B, S, H, D], `freqs` is the complex frequency tensor [S, D // 2].
     """
+    fused = rotary(x, freqs)
+    if fused is not None:
+        return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+
+
+# Hold the freqs object so its id cannot be recycled into a different table.
+_NPU_ROPE: dict[str, object] = {"freqs": None, "tables": None}
+
+
+def _npu_rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if _NPU_ROPE["freqs"] is freqs:
+        return _NPU_ROPE["tables"]  # type: ignore[return-value]
+    cos = torch.real(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    sin = torch.imag(freqs).float().repeat_interleave(2, dim=-1).unsqueeze(0).unsqueeze(2)
+    tables = (cos, sin)
+    _NPU_ROPE["freqs"] = freqs
+    _NPU_ROPE["tables"] = tables
+    return tables
+
+
+def _apply_qwen_image21_rotary_emb_npu(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Interleaved RoPE through ``npu_rotary_mul``.
+
+    Atlas A2 has no interleave mode on ``npu_apply_rotary_pos_emb``. The table
+    is reused only while the same freqs object is current.
+    """
+    import torch_npu
+
+    rot_cos, rot_sin = _npu_rope_tables(freqs)
+    rotated = torch_npu.npu_rotary_mul(x.float(), rot_cos, rot_sin, rotary_mode="interleave")
+    return rotated.to(dtype=x.dtype)
 
 
 def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -287,10 +332,27 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out",
         )
-        self.activation_fn = nn.SiLU()
+        self._npu_inplace_mlp = quant_config is None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(self.activation_fn(self.gate_layer(hidden_states)) * self.proj(hidden_states))
+    def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        if (
+            self._npu_inplace_mlp
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Both projections own their outputs. Preserve the BF16 rounding
+            # between SiLU and multiplication, including in the fused path.
+            from vllm_omni.diffusion.models.qwen_image_21.npu_fused_ops import can_fuse_swiglu, swiglu_inplace
+
+            if can_fuse_swiglu(hidden_states):
+                return self.out(swiglu_inplace(self.gate_layer(hidden_states), self.proj(hidden_states)))
+            activated = F.silu(self.gate_layer(hidden_states), inplace=True)
+            return self.out(activated.mul_(self.proj(hidden_states)))
+        return self.out(
+            silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states), _validated=_pointwise_validated)
+        )
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -478,11 +540,14 @@ class QwenImage21Attention(nn.Module):
             softmax_scale=1.0 / (dim_head**0.5),
             causal=False,
             num_kv_heads=self.num_kv_heads,
+            impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
         )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         if x.device.type == "cuda":
             return _apply_qwen_image21_rotary_emb(x, freqs)
+        if x.device.type == "npu":
+            return _apply_qwen_image21_rotary_emb_npu(x, freqs)
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
@@ -529,11 +594,16 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
-
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+        fused_qk = None
+        if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
+            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            query = self.norm_q(query).to(value.dtype)
+            key = self.norm_k(key).to(value.dtype)
+            query = self._apply_rotary_emb(query, freqs)
+            key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -662,10 +732,16 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        _pointwise_validated: bool = False,
     ) -> torch.Tensor:
-        mod1, mod2 = modulation.chunk(2, dim=-1)
-
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        if prepared_modulation is None:
+            mod1, mod2 = modulation.chunk(2, dim=-1)
+            img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+            img_gate1 = img_gate1.tanh()
+        else:
+            scale1, img_gate1, scale2, img_gate2 = prepared_modulation
+            img_modulated = self.img_norm1(hidden_states) * scale1
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -676,10 +752,40 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = hidden_states + img_gate1.tanh() * attn_output
+        use_inplace_residual = (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] == 1
+            and prepared_modulation is not None  # Only prepared in eager, non-graph execution.
+            and not sp_decode
+            and sp_prefix_len == 0
+            and not (is_forward_context_available() and get_forward_context().sp_active)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        )
+        if use_inplace_residual:
+            # Mutate only the fresh projection output, preserving input ownership
+            # and the BF16 rounding between multiplication and addition.
+            attn_output.mul_(img_gate1).add_(hidden_states)
+            hidden_states = attn_output
+        else:
+            hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-        hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
+        if prepared_modulation is None:
+            img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+            img_gate2 = img_gate2.tanh()
+        else:
+            img_modulated2 = self.img_norm2(hidden_states) * scale2
+        mlp_output = (
+            self.img_mlp(img_modulated2, _pointwise_validated=True)
+            if _pointwise_validated
+            else self.img_mlp(img_modulated2)
+        )
+        if use_inplace_residual:
+            mlp_output.mul_(img_gate2).add_(hidden_states)
+            hidden_states = mlp_output
+        else:
+            hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -721,8 +827,15 @@ class QwenImage21SequencePrepare(nn.Module):
             target image (sharded under SP via `_sp_plan`). In decode mode the prefix parts are empty.
         """
         batch_size = hidden_states.shape[0]
-        image_pad_mask = self.expand_image_pad_mask(img_mask[0])
-        rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+        geometry = getattr(self, "_request_geometry", None)
+        if geometry is not None and "image_pad_mask" in geometry:
+            image_pad_mask = geometry["image_pad_mask"]
+            rotary_emb = geometry["rotary_emb"]
+        else:
+            image_pad_mask = self.expand_image_pad_mask(img_mask[0])
+            rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+            if geometry is not None:
+                geometry.update(image_pad_mask=image_pad_mask, rotary_emb=rotary_emb)
 
         target_tokens = math.prod(img_shapes[-1])
         prefix_len = image_pad_mask.shape[0] - target_tokens
@@ -831,6 +944,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.patch_size = patch_size
@@ -839,6 +953,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.causal_block = causal_block
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
+        self._pointwise_contract_allowed = (
+            quant_config is None
+            and getattr(od_config, "lora_config", None) is None
+            and resolve_offload_strategy(od_config) == OffloadStrategy.NONE
+        )
 
         # Storage dtype for the cross-step prefix KV cache, from the supplementary
         # model-specific config entry `extras["prefix_kv_cache_dtype"]` (None = bf16/fp32
@@ -913,9 +1032,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # on this top-level module rather than on individual blocks; graphs
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
-        self.enable_cuda_graph_decode = (
-            getattr(od_config, "enable_cuda_graph_decode", True) and not od_config.enforce_eager
-        )
+        self._enforce_eager = bool(od_config.enforce_eager)
+        self.enable_cuda_graph_decode = getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager
+        # Ascend does not torch.compile this transformer. CUDA graph capture
+        # also refuses non-CUDA devices, so a default graph manager still
+        # executes eagerly on NPU. NZ eligibility uses this fact directly.
+        from vllm_omni.platforms import current_omni_platform
+
+        self._nz_runs_eager = current_omni_platform.is_npu() and not current_omni_platform.supports_torch_inductor()
         self._decode_graph_manager = (
             QwenImage21DecodeGraphManager(
                 self,
@@ -1104,6 +1228,23 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         else:
             txt_hidden_states = self.txt_in(encoder_hidden_states)
 
+        geometry = None
+        if (
+            kv_cache is not None
+            and batch_size == 1
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            signature = (
+                tuple(tuple(shape) for shape in layout),
+                cache_branch,
+                None if img_mask.is_inference() else img_mask._version,
+                None
+                if encoder_hidden_states_mask is None or encoder_hidden_states_mask.is_inference()
+                else encoder_hidden_states_mask._version,
+            )
+            geometry = self._geometry_for_request(kv_cache, img_mask, signature)
+        self.sequence_prepare._request_geometry = geometry
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
             hidden_states, txt_hidden_states, layout, img_mask, is_decode
         )
@@ -1126,8 +1267,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prefix_len = prefix_hidden_states.shape[1]
         sp_prefix_len = prefix_len if sp_active and not is_decode else 0
 
-        image_pad_mask = self.sequence_prepare.expand_image_pad_mask(img_mask[0])
-        _, target_token_mask = self.build_token_metadata(image_pad_mask, layout)
+        image_pad_mask = (
+            geometry["image_pad_mask"]
+            if geometry is not None
+            else self.sequence_prepare.expand_image_pad_mask(img_mask[0])
+        )
+        if geometry is not None and "token_metadata" in geometry:
+            image_ids, target_token_mask = geometry["token_metadata"]
+        else:
+            image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, layout)
+            if geometry is not None:
+                geometry["token_metadata"] = (image_ids, target_token_mask)
 
         timestep = timestep.to(hidden_states.dtype)
         if self.causal_condition:
@@ -1155,7 +1305,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # line up, in order, with the non-image positions of the vision-language sequence — the two are interleaved,
         # so the mask cannot be sliced off as a prefix.
         joint_key_valid = None
-        if encoder_hidden_states_mask is not None:
+        cached_key_valid = (
+            geometry is not None
+            and geometry.get("key_valid_mask_source") is encoder_hidden_states_mask
+            and "key_valid" in geometry
+            and geometry.get("sp_padding") == sp_padding
+        )
+        if cached_key_valid:
+            joint_key_valid = geometry["key_valid"]
+        elif encoder_hidden_states_mask is not None:
             joint_key_valid = torch.ones(
                 batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=hidden_states.device
             )
@@ -1163,18 +1321,28 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
             joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text_positions]
 
-        image_ids, _ = self.build_token_metadata(image_pad_mask, layout)
         full_seq_len = image_pad_mask.shape[0]
         padded_seq_len = full_seq_len + sp_padding
-        if sp_padding and joint_key_valid is None:
+        if not cached_key_valid and sp_padding and joint_key_valid is None:
             joint_key_valid = torch.ones(batch_size, full_seq_len, dtype=torch.bool, device=hidden_states.device)
-        if sp_padding:
+        if not cached_key_valid and sp_padding:
             joint_key_valid = F.pad(joint_key_valid, (0, sp_padding), value=False)
 
-        has_padding = joint_key_valid is not None and not bool(joint_key_valid.all())
+        has_padding = (
+            geometry["has_padding"]
+            if cached_key_valid
+            else joint_key_valid is not None and not bool(joint_key_valid.all())
+        )
         if not has_padding:
             # Match Diffusers and use the same mask-free dispatch in eager and graph decode.
             joint_key_valid = None
+        if geometry is not None and not cached_key_valid:
+            geometry.update(
+                key_valid=joint_key_valid,
+                key_valid_mask_source=encoder_hidden_states_mask,
+                has_padding=has_padding,
+                sp_padding=sp_padding,
+            )
         attn_metadata: AttentionMetadata | None = None
         cache_write_len: int | None = None
         if is_decode:
@@ -1197,6 +1365,42 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
+        prepared_modulation = None
+        pointwise_validated = False
+        if (
+            joint_hidden_states.device.type in {"cuda", "npu"}
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Successful graph replay returned above; prefill and graph fallback
+            # still use this eager block loop and can share modulation.
+            # The model shares one modulation across all blocks. Materialize
+            # its token selection/scale/tanh once per step, using the same ops.
+            scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
+            decode_broadcast = (
+                joint_hidden_states.device.type == "npu"
+                and joint_hidden_states.dtype == torch.bfloat16
+                and batch_size == 1
+                and is_decode
+                and not sp_active
+            )
+            if decode_broadcast:
+                scale1, gate1, scale2, gate2 = (value[:-1].unsqueeze(1) for value in (scale1, gate1, scale2, gate2))
+                prepared_modulation = (1 + scale1, gate1.tanh(), 1 + scale2, gate2.tanh())
+            else:
+                prepared_modulation = (
+                    1 + _select_modulation_rows(scale1, local_mask),
+                    _select_modulation_rows(gate1, local_mask).tanh(),
+                    1 + _select_modulation_rows(scale2, local_mask),
+                    _select_modulation_rows(gate2, local_mask).tanh(),
+                )
+            if getattr(self, "_pointwise_contract_allowed", False):
+                # Native unquantized linear/norm operations preserve dtype,
+                # device and dense row layout. Validate the shared gates once
+                # per step, instead of repeating it at every pointwise call.
+                pointwise_validated = pointwise_eligible(
+                    joint_hidden_states, prepared_modulation[1], prepared_modulation[3]
+                )
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
@@ -1210,6 +1414,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
+                prepared_modulation=prepared_modulation,
+                _pointwise_validated=pointwise_validated,
             )
 
         if (
@@ -1272,10 +1478,73 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         hidden_states = self.norm_out(hidden_states, temb, entry.target_token_mask)
         return self.proj_out(hidden_states)
 
+    def _geometry_for_request(self, kv_cache: list, img_mask: torch.Tensor, signature: tuple) -> dict | None:
+        # Caller-created plain lists keep the uncached path. Pipeline-owned
+        # lists are weak-referenceable, so step-mode cancellation or dropping a
+        # request cannot leave its prefix KV owned by the model singleton.
+        if not isinstance(kv_cache, QwenImage21KVCache):
+            return None
+        # The prefix layout is immutable for a request/CFG branch once its KV
+        # exists. Step execution rebuilds equivalent mask objects, so identity
+        # is not a validity key. Shapes, layout and mutation versions are.
+        key = (signature, tuple(img_mask.shape), img_mask.dtype, img_mask.device)
+        entries = getattr(kv_cache, "_geometry", None)
+        if entries is None:
+            entries = kv_cache._geometry = {}
+        branch = signature[1] if len(signature) > 1 else "cond"
+        previous = entries.get(branch)
+        if previous is None or previous[0] != key:
+            previous = entries[branch] = (key, {})
+        owner = getattr(self, "_request_geometry_owner", None)
+        if owner is None or owner[0]() is not kv_cache:
+            model_ref = weakref.ref(self)
+
+            def release_expired_request(owner_ref: weakref.ReferenceType) -> None:
+                model = model_ref()
+                owner = getattr(model, "_request_geometry_owner", None)
+                if model is not None and owner is not None and owner[0] is owner_ref:
+                    model.release_request_geometry()
+
+            self._request_geometry_owner = (weakref.ref(kv_cache, release_expired_request),)
+        return previous[1]
+
+    def release_request_geometry(self) -> None:
+        """Release request-owned metadata and prefix KV references after denoising."""
+        self._request_geometry_owner = None
+        self.sequence_prepare._request_geometry = None
+
     def release_captured_graphs(self) -> None:
         """Drop captured decode graphs and their static buffers (e.g. sleep mode)."""
         if self._decode_graph_manager is not None:
             self._decode_graph_manager.clear()
+        self.release_request_geometry()
+
+    @staticmethod
+    def _nz_weights_supported_for(od_config: OmniDiffusionConfig, quant_config: QuantizationConfig | None) -> bool:
+        # NZ conversion runs inside load_weights. Distilled LoRA fusion adds
+        # ND deltas in place afterwards, and HSDP shards or broadcasts the
+        # loaded parameters, so both must see the original ND storage.
+        return (
+            quant_config is None
+            and resolve_offload_strategy(od_config) == OffloadStrategy.NONE
+            and od_config.parallel_config.tensor_parallel_size == 1
+            and not od_config.parallel_config.use_hsdp
+            and not od_config.lora_path
+        )
+
+    def _automatic_nz_eligible(self) -> bool:
+        """Return whether automatic NZ conversion matches eager execution.
+
+        ``enable_cuda_graph_decode`` is not the eager signal. Capture is
+        CUDA-only, and Ascend does not torch.compile this transformer, so the
+        default NPU graph manager still runs eagerly. Sequence parallelism
+        stays excluded.
+        """
+        parallel = getattr(self, "parallel_config", None)
+        sequence_parallel_size = 1 if parallel is None else int(getattr(parallel, "sequence_parallel_size", 1) or 1)
+        if sequence_parallel_size != 1:
+            return False
+        return bool(getattr(self, "_enforce_eager", False) or getattr(self, "_nz_runs_eager", False))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1317,4 +1586,23 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         unloaded = sorted(set(params_dict) - set(loaded_params))
         if unloaded:
             logger.warning("Model parameters not loaded from checkpoint: %s", unloaded)
+        if self._nz_weights_supported and self._automatic_nz_eligible():
+            weights = [
+                module.weight
+                for module in self.modules()
+                if isinstance(module, (ColumnParallelLinear, RowParallelLinear, ReplicatedLinear))
+                and module.weight is not None
+                and module.weight.device.type == "npu"
+                and module.weight.dtype == torch.bfloat16
+                and module.weight.ndim == 2
+            ]
+            if weights:
+                import torch_npu
+
+                # Never change the process-wide internal-format setting.
+                # Skip conversion when internal formats are disabled.
+                if torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") == b"enable":
+                    for weight in weights:
+                        weight.data = torch_npu.npu_format_cast(weight.data, 29)
+                    logger.info("Qwen-Image 2.1 NZ weights: converted %d BF16 linear weights", len(weights))
         return loaded_params

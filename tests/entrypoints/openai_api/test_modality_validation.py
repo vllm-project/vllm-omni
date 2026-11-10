@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -28,6 +29,7 @@ def _make_serving_chat(output_modalities: list[str], stage_configs=None):
         output_modalities=output_modalities,
         errored=False,
         stage_configs=stage_configs or [],
+        resolve_entry_stage_id=lambda input_modalities: 0,
     )
     instance._diffusion_mode = False
     instance.models = MagicMock()
@@ -60,6 +62,44 @@ def _make_request(modalities):
     )
     req.modalities = modalities
     return req
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize(
+    "modalities", [{}, {"modalities": None}, {"modalities": ["text", "audio"]}, {"modalities": ["text"]}]
+)
+async def test_ming3_resolved_modalities_reach_output_kind_correction(mocker, async_chunk, modalities):
+    serving = _make_serving_chat(
+        ["text", "audio"],
+        stage_configs=[
+            {
+                "engine_args": {"model_arch": "BailingMoeV3AudioForConditionalGeneration", "model_stage": "thinker"},
+                "connector_config": {"async_chunk": async_chunk},
+            },
+            {"engine_args": {"model_arch": "BailingTalker2", "model_stage": "ming3_tts"}},
+        ],
+    )
+    mocker.patch.object(serving, "_maybe_get_adapters", return_value=None)
+    mocker.patch.object(serving, "_preprocess_chat", new=mocker.AsyncMock(return_value=([], [{}])))
+    mocker.patch.object(
+        serving, "_build_sampling_params_list_from_request", return_value=[SamplingParams(), SamplingParams()]
+    )
+    serving.request_logger = None
+    mocker.patch.object(serving, "chat_completion_stream_generator", return_value="stream")
+    serving.engine_client.generate = mocker.Mock()
+    request = ChatCompletionRequest(
+        model="test-model", messages=[{"role": "user", "content": "hello"}], stream=True, **modalities
+    )
+
+    assert await serving._create_chat_completion(request) == "stream"
+
+    params = serving.engine_client.generate.call_args.kwargs["sampling_params_list"]
+    assert request.modalities == (modalities.get("modalities") or ["text", "audio"])
+    assert params[0].output_kind is (
+        RequestOutputKind.FINAL_ONLY if "audio" in request.modalities and not async_chunk else RequestOutputKind.DELTA
+    )
+    assert params[1].output_kind is RequestOutputKind.DELTA
 
 
 @pytest.mark.asyncio

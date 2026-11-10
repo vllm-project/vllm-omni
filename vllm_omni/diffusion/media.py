@@ -41,6 +41,8 @@ class VideoTensorSpec:
     encoding: VideoTensorEncoding
     value_range: VideoValueRange
     color_model: VideoColorModel = VideoColorModel.RGB
+    # Opt in to historical decode-dtype denormalization (e.g. Cosmos3 bf16).
+    preserve_input_dtype: bool = False
 
 
 @dataclass(frozen=True, slots=True)

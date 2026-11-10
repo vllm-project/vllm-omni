@@ -70,11 +70,13 @@ def image_to_base64_data_url(image: Image.Image) -> str:
 
 def audio_to_base64_data_url(audio_np: np.ndarray, sample_rate: int) -> str:
     if audio_np.dtype != np.int16:
-        if audio_np.dtype in (np.float32, np.float64):
-            audio_np = np.clip(audio_np, -1.0, 1.0)
-            audio_np = (audio_np * 32767).astype(np.int16)
+        if np.issubdtype(audio_np.dtype, np.floating):
+            audio_f = np.clip(audio_np.astype(np.float64), -1.0, 1.0)
         else:
-            audio_np = audio_np.astype(np.int16)
+            # Integer PCM uses the full dtype range as full scale; pydub pads
+            # 24-bit sources to int32, so a bare astype(int16) would wrap.
+            audio_f = audio_np.astype(np.float64) / (1 << (np.iinfo(audio_np.dtype).bits - 1))
+        audio_np = np.clip(audio_f * 32768, -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     sf.write(buf, audio_np, sample_rate, format="WAV")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -128,6 +130,17 @@ def video_to_base64_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _pcm_to_float32(wav: np.ndarray) -> np.ndarray:
+    """Convert PCM samples to normalized float32.
+
+    Integer PCM uses the full dtype range as full scale (pydub pads 24-bit
+    uploads to int32); float input is already normalized.
+    """
+    if np.issubdtype(wav.dtype, np.integer):
+        return wav.astype(np.float32) / (1 << (np.iinfo(wav.dtype).bits - 1))
+    return wav.astype(np.float32)
+
+
 def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | None:
     """Normalize Gradio audio input to (np.ndarray mono float32, sample_rate).
 
@@ -169,7 +182,7 @@ def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | Non
         return None
     if audio_np.ndim > 1:
         audio_np = audio_np[:, 0]
-    return audio_np.astype(np.float32), sr
+    return _pcm_to_float32(audio_np), sr
 
 
 # ---------------------------------------------------------------------------

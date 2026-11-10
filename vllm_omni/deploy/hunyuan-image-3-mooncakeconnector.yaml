@@ -4,10 +4,6 @@ trust_remote_code: true
 
 stages:
   - stage_id: 0
-    is_comprehension: true
-    # Return AR text (including CoT) alongside the final image.
-    final_output: true
-    final_output_type: text
     num_replicas: 2
     devices: "0,1,2,3"
     tensor_parallel_size: 2
@@ -78,5 +74,3 @@ stages:
 edges:
   - from: 0
     to: 1
-    window_size: -1
-    max_inflight: 1

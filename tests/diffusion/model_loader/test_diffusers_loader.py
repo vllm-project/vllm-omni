@@ -170,15 +170,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
-    torchao_config = SimpleNamespace(
-        get_name=lambda: "torchao",
-        is_checkpoint_torchao_serialized=True,
-    )
+@pytest.mark.parametrize(
+    ("torchao_serialized", "suffix"),
+    [(True, ".bin"), (False, ".pth")],  # torchao checkpoints, and plain state dicts such as Video Depth Anything's
+)
+def test_pytorch_checkpoints_use_pytorch_iterator(mocker, torchao_serialized, suffix):
     loader = _make_loader_with_weights([])
-    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    if torchao_serialized:
+        torchao_config = SimpleNamespace(get_name=lambda: "torchao", is_checkpoint_torchao_serialized=True)
+        loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
     loader.load_config.pt_load_map_location = "cpu"
-    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    files = [f"/weights/model-10{suffix}", f"/weights/model-2{suffix}"]
     mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
     pt_iterator = mocker.patch.object(
         loader_module,
@@ -197,7 +199,7 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     weights = list(loader._get_weights_iterator(source))
 
     pt_iterator.assert_called_once_with(
-        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        [f"/weights/model-2{suffix}", f"/weights/model-10{suffix}"],
         loader.load_config.use_tqdm_on_load,
         "cpu",
     )
@@ -283,11 +285,16 @@ def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
     assert getattr(model, "lora_is_fused", False) is False
 
 
-def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
+@pytest.mark.parametrize(
+    ("lora_scale", "should_warn"),
+    [(1.0, False), ([1.0, 1.5], True)],
+)
+def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, should_warn, mocker):
+    warning = mocker.patch.object(loader_module.logger, "warning")
     cfg = SimpleNamespace(
         lora_backend=LoRABackend.DISTILL,
         lora_path="/path/to/lora.safetensors",
-        lora_scale=1.0,
+        lora_scale=lora_scale,
         dtype=torch.bfloat16,
         quantization_config=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -302,6 +309,10 @@ def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
 
     model.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
     assert getattr(model, "lora_is_fused", False) is True
+    if should_warn:
+        warning.assert_called_once_with("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+    else:
+        warning.assert_not_called()
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -629,6 +640,44 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diffusion_pytorch_model.safetensors"
+    save_file(
+        {
+            "proj_in.weight": torch.zeros(2, 2),
+            "audio_proj_in.weight": torch.ones(2, 2),
+            "transformer_blocks.0.audio_ff.weight": torch.full((2, 2), 2.0),
+            "transformer_blocks.0.audio_to_video_attn.weight": torch.full((2, 2), 3.0),
+        },
+        checkpoint,
+    )
+    od_config = SimpleNamespace(
+        enable_multithread_weight_load=True,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_args, **_kwargs: (tmp_path, [str(checkpoint)], True),
+    )
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+        weight_name_patterns=("audio_*", "transformer_blocks.*.audio_ff.*"),
+    )
+
+    weights = list(loader._get_weights_iterator(source))
+
+    assert [name for name, _tensor in weights] == [
+        "transformer.audio_proj_in.weight",
+        "transformer.transformer_blocks.0.audio_ff.weight",
+    ]
+
+
 def test_stream_online_quant_weights_offloads_layers_after_processing():
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,
@@ -674,6 +723,82 @@ def test_stream_online_quant_weights_offloads_layers_after_processing():
     with pytest.raises(StopIteration):
         next(streamed)
     assert events == ["first", "second"]
+
+
+def test_online_quant_finalizes_padded_layers_without_accumulating(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    resident: set[nn.Module] = set()
+    finalized: set[nn.Module] = set()
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _PaddedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 3, bias=False)
+            self.quant_method = _OnlineQuantMethod()
+            info = layerwise.get_layerwise_info(self)
+            info.load_numel_total = self.weight.numel()
+            info.load_numel = 4  # The checkpoint omits two padding elements.
+
+        def to(self, device):
+            assert device == "cpu"
+            assert self in finalized
+            resident.remove(self)
+            return super().to(device)
+
+    model = nn.Sequential(_PaddedLayer(), _PaddedLayer(), _PaddedLayer())
+
+    def finalize(module, model_config):
+        assert model_config is None
+        assert not resident, "previous deferred layer must be offloaded before the next"
+        resident.add(module)
+        finalized.add(module)
+        layerwise.get_layerwise_info(module).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    DiffusersPipelineLoader._finalize_online_quant_weights_to_cpu(model)
+    assert finalized == set(model)
+    assert not resident
+
+
+def test_online_quant_finalization_waits_for_buffered_weight_consumer(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _BufferedModel(nn.Module):
+        consumed = False
+
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2, bias=False)
+            self.layer.quant_method = SimpleNamespace(uses_meta_device=True)
+            layerwise.get_layerwise_info(self.layer).load_numel_total = 6
+
+        def load_weights(self, weights):
+            buffered = list(weights)
+            assert not self.consumed
+            assert len(buffered) == 1
+            self.layer.weight.data.copy_(buffered[0][1])
+            layerwise.get_layerwise_info(self.layer).load_numel = 4
+            self.consumed = True
+            return None
+
+    model = _BufferedModel()
+    loader = _make_loader_with_weights(["weight"])
+    finalized = []
+
+    def finalize(layer, model_config):
+        assert layer is model.layer and model_config is None
+        assert model.consumed, "iterator exhaustion does not mean the consumer finished"
+        finalized.append(layer)
+        layerwise.get_layerwise_info(layer).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
+    assert finalized == [model.layer]
 
 
 def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
@@ -757,6 +882,7 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
+        weight_transfer_config=None,
     )
 
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
@@ -1253,6 +1379,18 @@ def test_dlo_allgather_allows_unquantized_host_fallback():
     model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
 
     assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
+def test_dlo_allgather_rejects_configurable_online_fp8_blocks():
+    from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(OnlineBlockFp8LinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == (
+        "OnlineBlockFp8LinearMethod",
+    )
 
 
 def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
@@ -2064,6 +2202,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 

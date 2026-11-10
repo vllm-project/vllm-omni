@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """EVS (Efficient Video Sampling) frame pre-filter for streaming video input.
 
 Lightweight pixel-level similarity filter that runs before frames reach the
@@ -19,6 +19,7 @@ import io
 
 import numpy as np
 from PIL import Image
+from vllm.multimodal.image import open_image
 
 _DEFAULT_THRESHOLD = 0.95
 _DEFAULT_THUMBNAIL_SIZE = 64
@@ -108,7 +109,7 @@ class FrameSimilarityFilter:
     def _decode_and_resize(self, jpeg_bytes: bytes) -> np.ndarray:
         """Decode JPEG and resize to a small square thumbnail for fast
         comparison."""
-        img = Image.open(io.BytesIO(jpeg_bytes))
+        img = open_image(io.BytesIO(jpeg_bytes))
         img = img.resize(
             (self._thumbnail_size, self._thumbnail_size),
             Image.Resampling.BILINEAR,

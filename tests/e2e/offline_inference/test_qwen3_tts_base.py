@@ -15,7 +15,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 from vllm.platforms import current_platform
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
@@ -35,6 +35,8 @@ def get_cuda_graph_config():
     return modify_stage_config(
         get_deploy_config_path("qwen3_tts.yaml"),
         updates={
+            # Exercise the legacy runner explicitly; the bundled default is V2.
+            "model_runner": "v1",
             "async_chunk": False,
             "stages": {
                 0: {
@@ -58,6 +60,7 @@ tts_server_params = [
     pytest.param(
         (MODEL, get_cuda_graph_config()),
         id="no_cuda_graph",
+        marks=hardware_marks(res={"rocm": "MI325"}, num_cards=1),
     ),
     pytest.param(
         (MODEL, get_deploy_config_path("qwen3_tts_mrv2.yaml")),

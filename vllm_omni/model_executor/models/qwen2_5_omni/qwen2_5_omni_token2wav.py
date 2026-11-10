@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniBigVGANConfig,
     Qwen2_5OmniDiTConfig,
@@ -37,6 +36,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
+from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 
@@ -80,311 +80,6 @@ class Qwen2_5OmniDiTRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class TimeDelayNetBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        dilation,
-    ):
-        super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding="same",
-            padding_mode="reflect",
-        )
-        self.activation = nn.ReLU()
-
-    def forward(self, hidden_states: torch.Tensor):
-        return self.activation(self.conv(hidden_states))
-
-
-class Res2NetBlock(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
-        super().__init__()
-
-        in_channel = in_channels // scale
-        hidden_channel = out_channels // scale
-
-        self.blocks = nn.ModuleList(
-            [
-                TimeDelayNetBlock(
-                    in_channel,
-                    hidden_channel,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                )
-                for i in range(scale - 1)
-            ]
-        )
-        self.scale = scale
-
-    def forward(self, hidden_states):
-        outputs = []
-        for i, hidden_part in enumerate(torch.chunk(hidden_states, self.scale, dim=1)):
-            if i == 0:
-                output_part = hidden_part
-            elif i == 1:
-                output_part = self.blocks[i - 1](hidden_part)
-            else:
-                output_part = self.blocks[i - 1](hidden_part + output_part)
-            outputs.append(output_part)
-        output = torch.cat(outputs, dim=1)
-        return output
-
-
-class SqueezeExcitationBlock(nn.Module):
-    def __init__(self, in_channels, se_channels, out_channels):
-        super().__init__()
-
-        self.conv1 = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=se_channels,
-            kernel_size=1,
-            padding="same",
-            padding_mode="reflect",
-        )
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(
-            in_channels=se_channels,
-            out_channels=out_channels,
-            kernel_size=1,
-            padding="same",
-            padding_mode="reflect",
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, hidden_states):
-        hidden_states_mean = hidden_states.mean(dim=2, keepdim=True)
-
-        hidden_states_mean = self.relu(self.conv1(hidden_states_mean))
-        hidden_states_mean = self.sigmoid(self.conv2(hidden_states_mean))
-
-        return hidden_states * hidden_states_mean
-
-
-class AttentiveStatisticsPooling(nn.Module):
-    """This class implements an attentive statistic pooling layer for each channel.
-    It returns the concatenated mean and std of the input tensor.
-    """
-
-    def __init__(self, channels, attention_channels=128):
-        super().__init__()
-
-        self.eps = 1e-12
-        self.tdnn = TimeDelayNetBlock(channels * 3, attention_channels, 1, 1)
-        self.tanh = nn.Tanh()
-        self.conv = nn.Conv1d(
-            in_channels=attention_channels,
-            out_channels=channels,
-            kernel_size=1,
-            padding="same",
-            padding_mode="reflect",
-        )
-
-    def _length_to_mask(self, length, max_len=None, dtype=None, device=None):
-        """Creates a binary mask for each sequence.
-
-        Reference: https://discuss.pytorch.org/t/how-to-generate-variable-length-mask/23397/3  # noqa: E501
-
-        Arguments
-        ---------
-        length : torch.LongTensor
-            Containing the length of each sequence in the batch. Must be 1D.
-        max_len : int
-            Max length for the mask, also the size of the second dimension.
-        dtype : torch.dtype, default: None
-            The dtype of the generated mask.
-        device: torch.device, default: None
-            The device to put the mask variable.
-
-        Returns
-        -------
-        mask : tensor
-            The binary mask.
-        """
-
-        if max_len is None:
-            max_len = length.max().long().item()  # using arange to generate mask
-        mask = torch.arange(max_len, device=length.device, dtype=length.dtype).expand(
-            len(length), max_len
-        ) < length.unsqueeze(1)
-
-        mask = torch.as_tensor(mask, dtype=dtype, device=device)
-        return mask
-
-    def _compute_statistics(self, x, m, dim=2):
-        mean = (m * x).sum(dim)
-        std = torch.sqrt((m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(self.eps))
-        return mean, std
-
-    def forward(self, hidden_states):
-        seq_length = hidden_states.shape[-1]
-        lengths = torch.ones(hidden_states.shape[0], device=hidden_states.device)
-
-        # Make binary mask of shape [N, 1, L]
-        mask = self._length_to_mask(
-            lengths * seq_length,
-            max_len=seq_length,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        mask = mask.unsqueeze(1)
-
-        # Expand the temporal context of the pooling layer by allowing the
-        # self-attention to look at global properties of the utterance.
-        total = mask.sum(dim=2, keepdim=True)
-
-        mean, std = self._compute_statistics(hidden_states, mask / total)
-        mean = mean.unsqueeze(2).repeat(1, 1, seq_length)
-        std = std.unsqueeze(2).repeat(1, 1, seq_length)
-        attention = torch.cat([hidden_states, mean, std], dim=1)
-
-        # Apply layers
-        attention = self.conv(self.tanh(self.tdnn(attention)))
-
-        # Filter out zero-paddings
-        attention = attention.masked_fill(mask == 0, float("-inf"))
-
-        attention = F.softmax(attention, dim=2)
-        mean, std = self._compute_statistics(hidden_states, attention)
-        # Append mean and std of the batch
-        pooled_stats = torch.cat((mean, std), dim=1)
-        pooled_stats = pooled_stats.unsqueeze(2)
-
-        return pooled_stats
-
-
-class SqueezeExcitationRes2NetBlock(nn.Module):
-    """An implementation of building block in ECAPA-TDNN, i.e.,
-    TDNN-Res2Net-TDNN-SqueezeExcitationBlock.
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        res2net_scale=8,
-        se_channels=128,
-        kernel_size=1,
-        dilation=1,
-    ):
-        super().__init__()
-        self.out_channels = out_channels
-        self.tdnn1 = TimeDelayNetBlock(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            dilation=1,
-        )
-        self.res2net_block = Res2NetBlock(out_channels, out_channels, res2net_scale, kernel_size, dilation)
-        self.tdnn2 = TimeDelayNetBlock(
-            out_channels,
-            out_channels,
-            kernel_size=1,
-            dilation=1,
-        )
-        self.se_block = SqueezeExcitationBlock(out_channels, se_channels, out_channels)
-
-    def forward(self, hidden_state):
-        residual = hidden_state
-
-        hidden_state = self.tdnn1(hidden_state)
-        hidden_state = self.res2net_block(hidden_state)
-        hidden_state = self.tdnn2(hidden_state)
-        hidden_state = self.se_block(hidden_state)
-
-        return hidden_state + residual
-
-
-class ECAPA_TimeDelayNet(torch.nn.Module):
-    """An implementation of the speaker embedding model in a paper.
-    "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in
-    TDNN Based Speaker Verification" (https://huggingface.co/papers/2005.07143).
-    """
-
-    def __init__(self, config: Qwen2_5OmniDiTConfig):
-        super().__init__()
-        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
-            config.enc_dilations
-        ):
-            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
-        self.channels = config.enc_channels
-        self.blocks = nn.ModuleList()
-
-        # The initial TDNN layer
-        self.blocks.append(
-            TimeDelayNetBlock(
-                config.mel_dim,
-                config.enc_channels[0],
-                config.enc_kernel_sizes[0],
-                config.enc_dilations[0],
-            )
-        )
-
-        # SE-Res2Net layers
-        for i in range(1, len(config.enc_channels) - 1):
-            self.blocks.append(
-                SqueezeExcitationRes2NetBlock(
-                    config.enc_channels[i - 1],
-                    config.enc_channels[i],
-                    res2net_scale=config.enc_res2net_scale,
-                    se_channels=config.enc_se_channels,
-                    kernel_size=config.enc_kernel_sizes[i],
-                    dilation=config.enc_dilations[i],
-                )
-            )
-
-        # Multi-layer feature aggregation
-        self.mfa = TimeDelayNetBlock(
-            config.enc_channels[-1],
-            config.enc_channels[-1],
-            config.enc_kernel_sizes[-1],
-            config.enc_dilations[-1],
-        )
-
-        # Attentive Statistical Pooling
-        self.asp = AttentiveStatisticsPooling(
-            config.enc_channels[-1],
-            attention_channels=config.enc_attention_channels,
-        )
-
-        # Final linear transformation
-        self.fc = nn.Conv1d(
-            in_channels=config.enc_channels[-1] * 2,
-            out_channels=config.enc_dim,
-            kernel_size=1,
-            padding="same",
-            padding_mode="reflect",
-        )
-
-    def forward(self, hidden_states):
-        # Minimize transpose for efficiency
-        hidden_states = hidden_states.transpose(1, 2)
-
-        hidden_states_list = []
-        for layer in self.blocks:
-            hidden_states = layer(hidden_states)
-            hidden_states_list.append(hidden_states)
-
-        # Multi-layer feature aggregation
-        hidden_states = torch.cat(hidden_states_list[1:], dim=1)
-        hidden_states = self.mfa(hidden_states)
-
-        # Attentive Statistical Pooling
-        hidden_states = self.asp(hidden_states)
-
-        # Final linear transformation
-        hidden_states = self.fc(hidden_states)
-
-        hidden_states = hidden_states.squeeze(-1)
-        return hidden_states
-
-
 class DiTInputEmbedding(nn.Module):
     def __init__(self, config: Qwen2_5OmniDiTConfig):
         super().__init__()
@@ -392,7 +87,7 @@ class DiTInputEmbedding(nn.Module):
             config.mel_dim + config.enc_dim + config.enc_emb_dim + config.emb_dim,
             config.hidden_size,
         )
-        self.spk_encoder = ECAPA_TimeDelayNet(config)
+        self.spk_encoder = ECAPATimeDelayNet(config)
 
     def forward(
         self,
@@ -533,6 +228,81 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def block_sparse_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_size: int,
+    look_backward_block: int = 0,
+    look_ahead_block: int = 0,
+) -> torch.Tensor:
+    """Attention where each block of ``block_size`` queries attends to its own
+    block plus ``look_backward_block`` blocks before and ``look_ahead_block``
+    blocks after it.
+
+    This is equivalent to dense SDPA with the mask
+    ``(block_j - block_i >= -look_backward_block) & (block_j - block_i <= look_ahead_block)``,
+    but only computes the kept key blocks instead of materializing an (n, n)
+    mask for every layer. q/k/v and the result are ``(batch, heads, seq, dim)``.
+    """
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    num_blocks = -(-seq_len // block_size)
+    pad = num_blocks * block_size - seq_len
+    if pad:
+        query, key, value = (F.pad(t, (0, 0, 0, pad)) for t in (query, key, value))
+    blocked_shape = (batch_size, num_heads, num_blocks, block_size, head_dim)
+    query = query.view(blocked_shape)
+    key = key.view(blocked_shape)
+    value = value.view(blocked_shape)
+
+    # Some key is masked only when the last block is padded or a neighbour
+    # block is shifted past either end, both known from these Python ints, so
+    # the mask decision needs no device sync.
+    has_neighbours = look_backward_block > 0 or look_ahead_block > 0
+    key_valid = None
+    if pad or has_neighbours:
+        # key_valid[b, j] is False for padded positions (only in the last block).
+        key_valid = torch.ones(num_blocks, block_size, dtype=torch.bool, device=query.device)
+        if pad:
+            key_valid[-1, block_size - pad :] = False
+
+    if not has_neighbours:
+        # Own block only (most layers): attend to the blocked keys directly.
+        keys, values, valid = key, value, key_valid
+    else:
+        keys, values, valids = [], [], []
+        for offset in range(-look_backward_block, look_ahead_block + 1):
+            if offset == 0:
+                keys.append(key)
+                values.append(value)
+                valids.append(key_valid)
+                continue
+            # Key block i + offset for each query block i; blocks past either
+            # end are zero-filled and masked out.
+            shifted_key = torch.zeros_like(key)
+            shifted_value = torch.zeros_like(value)
+            valid = torch.zeros_like(key_valid)
+            if offset > 0:
+                shifted_key[:, :, : num_blocks - offset] = key[:, :, offset:]
+                shifted_value[:, :, : num_blocks - offset] = value[:, :, offset:]
+                valid[: num_blocks - offset] = key_valid[offset:]
+            else:
+                shifted_key[:, :, -offset:] = key[:, :, : num_blocks + offset]
+                shifted_value[:, :, -offset:] = value[:, :, : num_blocks + offset]
+                valid[-offset:] = key_valid[: num_blocks + offset]
+            keys.append(shifted_key)
+            values.append(shifted_value)
+            valids.append(valid)
+        keys = torch.cat(keys, dim=3)
+        values = torch.cat(values, dim=3)
+        valid = torch.cat(valids, dim=1)
+    # Every query block keeps at least its own block, so no row is fully masked.
+    mask = None if valid is None else valid.view(1, 1, num_blocks, 1, -1)
+
+    out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
+    return out.reshape(batch_size, num_heads, num_blocks * block_size, head_dim)[:, :, :seq_len]
+
+
 class DiTAttention(nn.Module):
     def __init__(self, config: Qwen2_5OmniDiTConfig, prefix: str = ""):
         super().__init__()
@@ -559,7 +329,9 @@ class DiTAttention(nn.Module):
         self,
         hidden_states,  # noised input x
         position_embeddings=None,  # rotary position embedding for x
-        attention_mask=None,
+        block_size: int | None = None,
+        look_backward_block: int = 0,
+        look_ahead_block: int = 0,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
@@ -579,19 +351,17 @@ class DiTAttention(nn.Module):
         cos, sin = position_embeddings
         query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attention_weights, _ = attention_interface(
-            self,
+        # The DiT only attends within a window of mel blocks, so run block
+        # sparse attention instead of a dense (n, n) masked SDPA.
+        attention_weights = block_sparse_attention(
             query,
             key,
             value,
-            attention_mask=attention_mask,
-            is_causal=False,
+            block_size=block_size,
+            look_backward_block=look_backward_block,
+            look_ahead_block=look_ahead_block,
         )
-
-        # mask. e.g. inference got a batch with different target durations,
-        # mask out the padding
-        attention_weights = attention_weights.reshape(batch_size, -1, self.heads * head_dim)
+        attention_weights = attention_weights.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
         attention_weights = attention_weights.to(query.dtype)
 
         # linear proj
@@ -613,7 +383,7 @@ class DiTDecoderLayer(nn.Module):
         self.ff = DiTMLP(dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout)
 
     def forward(
-        self, hidden_states, timestep, position_embeddings=None, block_diff=None
+        self, hidden_states, timestep, position_embeddings=None, block_size=None
     ):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, emb=timestep)
@@ -622,8 +392,9 @@ class DiTDecoderLayer(nn.Module):
         attn_output = self.attn(
             hidden_states=norm,
             position_embeddings=position_embeddings,
-            attention_mask=(block_diff >= -float(self.look_backward_block))
-            & (block_diff <= float(self.look_ahead_block)),
+            block_size=block_size,
+            look_backward_block=self.look_backward_block,
+            look_ahead_block=self.look_ahead_block,
         )
 
         # process attention output for input x
@@ -948,16 +719,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
 
-    def _create_block_diff(self, hidden_states):
-        batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-        block_indices = torch.arange(seq_len, device=hidden_states.device) // self.block_size  # [seq_length]
-
-        block_i = block_indices.unsqueeze(1)  # [seq_length, 1]
-        block_j = block_indices.unsqueeze(0)  # [1, seq_length]
-        block_diff = block_j - block_i  # (n, n)
-
-        return block_diff.expand(batch, self.num_attention_heads, seq_len, seq_len)
-
     def forward(
         self,
         hidden_states,
@@ -990,7 +751,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         # Compute positional encodings
         position_embeddings = self.rotary_embed(hidden_states)
-        blockwise_difference = self._create_block_diff(hidden_states)
 
         # Transformer blocks
         for transformer_block in self.transformer_blocks:
@@ -998,7 +758,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 hidden_states,
                 time_embedding,
                 position_embeddings=position_embeddings,
-                block_diff=blockwise_difference,
+                block_size=self.block_size,
             )
 
         hidden_states = self.norm_out(hidden_states, time_embedding)
