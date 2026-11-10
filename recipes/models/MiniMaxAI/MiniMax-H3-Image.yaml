@@ -12,20 +12,25 @@ meta:
   default_hardware: h200
   related_recipes:
     - MiniMaxAI/MiniMax-H3
-  # H200 and RTX PRO 6000 ran end to end (see their recipes). RTX PRO 6000 is a
-  # restricted profile and must be declared to appear in the picker.
+  # H200, RTX PRO 6000, MI325X and MI350X ran end to end (see their recipes).
+  # RTX PRO 6000 is a restricted profile and must be declared to appear in the
+  # picker.
   hardware:
     h200: verified
     rtx_pro_6000_2x: verified
     rtx_pro_6000_4x: verified
+    mi325x: verified
+    mi350x: verified
 
 model:
   model_id: "MiniMaxAI/MiniMax-H3-Image"
   min_vllm_version: "0.33.0"
-  docker_image: "vllm/vllm-omni:minimax-h3-image"
+  docker_image:
+    nvidia: "vllm/vllm-omni:minimax-h3-image"
+    amd: "vllm/vllm-omni:minimax-h3-image-rocm"
   install:
     docker:
-      note: "The image bundles vLLM 0.33.0 and vLLM-Omni with MiniMax-H3-Image support."
+      note: "The images bundle vLLM 0.33.0 and vLLM-Omni with MiniMax-H3-Image support (CUDA 13.0, or ROCm 10.0 for AMD)."
     pip:
       command: |
         uv venv --python 3.12 --seed && source .venv/bin/activate
@@ -74,7 +79,7 @@ omni:
         curl -s http://localhost:8000/v1/images/edits \
           -F model=MiniMaxAI/MiniMax-H3-Image \
           -F image=@cabin.png \
-          -F 'prompt=<Picture 1> is a cabin by a lake. Everything is preserved exactly; only the season changes to a snowy winter evening.' \
+          --form-string 'prompt=<Picture 1> is a cabin by a lake. Everything is preserved exactly; only the season changes to a snowy winter evening.' \
           -F size=2720x1536 \
           -F seed=42 \
           -F response_format=b64_json | jq -r '.data[0].b64_json' | base64 -d > edit.png
@@ -130,7 +135,25 @@ variants:
 
 compatible_strategies: []
 
-hardware_overrides: {}
+hardware_overrides:
+  # AMD Instinct runs the VAE tile decode eagerly. MI300X and MI355X share the
+  # MI325X (gfx942) and MI350X (gfx950) architectures (not measured).
+  mi300x:
+    extra_args:
+      - "--no-enable-cuda-graph-decode"
+    install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
+  mi325x:
+    extra_args:
+      - "--no-enable-cuda-graph-decode"
+    install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
+  mi350x:
+    extra_args:
+      - "--no-enable-cuda-graph-decode"
+    install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
+  mi355x:
+    extra_args:
+      - "--no-enable-cuda-graph-decode"
+    install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
 
 strategy_overrides: {}
 
@@ -205,8 +228,17 @@ guide: |
 
   Per-profile numbers and the correctness guard are in the in-repo recipe.
 
+  ## AMD Instinct
+
+  Use `vllm/vllm-omni:minimax-h3-image-rocm` (vLLM 0.33.0+rocm100, kernels for
+  `gfx942` and `gfx950`) with the default command plus
+  `--no-enable-cuda-graph-decode`, which runs the VAE tile decode eagerly.
+  MI325X and MI350X are verified; MI300X and MI355X share their architectures
+  but were not measured.
+
   ## References
 
   - [Model card](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
   - [H200 recipe with measurements](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-H200.md)
+  - [AMD Instinct recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md)
   - [MiniMax-H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3)
