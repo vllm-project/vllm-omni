@@ -129,11 +129,30 @@ def test_cache_layer_registration_resolves_platform_paged_hooks(monkeypatch: pyt
         backend.register_kv_cache_layers({"layer-0": (object(), Mock(spec=FullAttentionSpec))})
 
 
+def test_cache_layer_registration_allows_strict_ulysses_allgather_kv() -> None:
+    backend, _, _ = _registration_backend(
+        _parallel_config(
+            ulysses_degree=2,
+            allgather_degree=2,
+            ulysses_mode="strict",
+        )
+    )
+
+    assert backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=False)) == 2
+
+
 @pytest.mark.parametrize(
     ("parallel_config", "message"),
     [
         (_parallel_config(ring_degree=2), "Ring"),
-        (_parallel_config(allgather_degree=2), "AllGather-KV"),
+        (
+            _parallel_config(
+                ulysses_degree=2,
+                allgather_degree=2,
+                ulysses_mode="advanced_uaa",
+            ),
+            "strict Ulysses",
+        ),
         (_parallel_config(ulysses_degree=2, ulysses_mode="advanced_uaa"), "strict Ulysses"),
     ],
 )
@@ -142,6 +161,12 @@ def test_cache_layer_registration_rejects_unsupported_sp_modes(parallel_config, 
 
     with pytest.raises(NotImplementedError, match=message):
         backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=False))
+
+
+def test_cache_layer_registration_allows_plain_allgather_kv() -> None:
+    backend, _, _ = _registration_backend(_parallel_config(allgather_degree=2))
+
+    assert backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=False)) == 1
 
 
 def test_cache_layer_registration_ignores_sp_for_opted_out_layer() -> None:
