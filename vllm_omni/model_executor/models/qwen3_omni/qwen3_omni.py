@@ -491,9 +491,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         if not self.is_staged_run:
             return []
 
-        indices = [0]
+        indices: list[int] = []
         if accept_layer is not None:
-            indices.append(int(accept_layer))
+            indices.extend([0, int(accept_layer)])
 
         # DFlash consumes a concatenation of target hidden states from the
         # layers listed in its checkpoint.  The checkpoint ids refer to the
@@ -503,6 +503,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         if spec_config is not None and spec_config.use_dflash():
             draft_config = spec_config.draft_model_config
             dflash_config = getattr(draft_config.hf_config, "dflash_config", {})
+            # Speculative payloads need input embeddings even without a
+            # Talker hidden-layer tap. Non-speculative runs keep no capture.
+            indices.append(0)
             indices.extend(int(layer_id) + 1 for layer_id in dflash_config.get("target_layer_ids", ()))
 
         return sorted(set(indices))

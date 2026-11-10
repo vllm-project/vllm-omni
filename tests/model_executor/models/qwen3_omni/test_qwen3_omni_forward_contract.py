@@ -248,11 +248,22 @@ def test_combined_forward_staged_run_captures_and_returns_tuple():
     assert isinstance(out, tuple)
 
 
-def test_combined_forward_staged_run_without_accept_layer_still_captures_embeddings():
+def test_combined_forward_staged_run_without_accept_layer_returns_tensor():
     model = _make_combined(is_staged_run=True, accept_hidden_layer=None)
     out = model.forward(**_forward_args())
-    # Layer 0 supplies Talker embeddings independently of any hidden-layer tap.
-    assert model.thinker.received["capture_layer_indices"] == [0]
+    assert "capture_layer_indices" not in model.thinker.received
+    assert isinstance(out, torch.Tensor)
+
+
+@pytest.mark.parametrize("accept_layer, expected", [(None, [0, 2, 4]), (6, [0, 2, 4, 6])])
+def test_combined_forward_dflash_captures_embeddings_and_aux_layers(accept_layer, expected):
+    model = _make_combined(is_staged_run=True, accept_hidden_layer=accept_layer)
+    model.vllm_config.speculative_config = SimpleNamespace(
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+    out = model.forward(**_forward_args())
+    assert model.thinker.received["capture_layer_indices"] == expected
     assert model.thinker.received["return_hidden_states"] is True
     assert isinstance(out, tuple)
 
