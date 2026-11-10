@@ -184,7 +184,15 @@ class Offloader(Protocol):
         """Pure planning step: no large allocations, no model mutation, no hooks (step 4)."""
 
     def prepare_materialization(self, model: nn.Module, plan: PlacementPlan, storage: HostStorage) -> LoadTransaction:
-        """Acquire every capacity-bearing runtime resource before the first write (step 8)."""
+        """Admit device capacity and acquire the fixed-slot runtime resources (step 8).
+
+        Capacity admission happens here, together with the fixed-slot allocations the
+        plan implies: Transport ring buffers, AllGather shard slots, order-receive
+        buffers, overlays, copy/assembly streams and events, and the planned staging
+        buffers (RFC 04 section 4.1).  Commit may still allocate staging when
+        registration falls back to it; that late allocation stays inside the capacity
+        admitted here and raises ``CommitError`` on failure (RFC 04 section 4.3).
+        """
 
     def setup_compile(self, model: nn.Module, catalog: ComponentCatalog, runtime: OffloadRuntime) -> None:
         """Configure compilation targets after commit (step 12)."""
