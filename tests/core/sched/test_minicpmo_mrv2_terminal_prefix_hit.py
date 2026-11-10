@@ -271,7 +271,8 @@ def test_recompute_after_the_emitted_own_row(prefix_caching, stale_row):
 
 
 @pytest.mark.parametrize(
-    "damage", ["stale_row_other_position", "empty_without_prefix_cache", "empty_without_output_cache", "reused_request_id"]
+    "damage",
+    ["stale_row_other_position", "empty_without_prefix_cache", "empty_without_output_cache", "reused_request_id"],
 )
 def test_empty_recompute_is_accepted_only_after_this_rows_emission(damage, monkeypatch):
     """The record is tied to the stop's token and position, to the prefix-cache trim, and to one request."""
