@@ -157,3 +157,16 @@ def test_sdpa_dispatches_out_of_tree_platforms_to_torch_sdpa(monkeypatch):
         query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), scale=8**-0.5
     ).transpose(1, 2)
     torch.testing.assert_close(output, expected)
+
+
+def test_out_of_tree_platforms_reject_backends_without_forward_oot():
+    from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatform
+
+    class OutOfTreePlatform(UnspecifiedOmniPlatform):
+        _omni_enum = OmniPlatformEnum.OOT
+
+    OutOfTreePlatform.validate_diffusion_attn_backend("TORCH_SDPA")
+    with pytest.raises(ValueError, match="FLASH_ATTN diffusion attention backend does not implement forward_oot"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("FLASH_ATTN")
+    with pytest.raises(ValueError, match=r"such as TORCH_SDPA\.$"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("RAINFUSION_ATTN")

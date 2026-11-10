@@ -46,7 +46,8 @@ External platforms use `Operator.register_oot(Implementation)` before model
 construction and implement `forward_oot`. Overrides preserve the operator's
 constructor, parameters, and outputs; `forward_native` is the default fallback.
 Diffusion attention implementations dispatch external platforms to
-`forward_oot` the same way; `SDPAImpl` provides it.
+`forward_oot` the same way. Only `SDPAImpl` provides it so far; resolution
+rejects an explicitly selected backend whose implementation does not.
 
 ## Candidate invariants
 

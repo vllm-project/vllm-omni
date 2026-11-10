@@ -460,4 +460,7 @@ class AttentionImpl(ABC, Generic[T]):
         value: torch.Tensor,
         attn_metadata: T | None = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement forward_oot for out-of-tree platforms; "
+            "select a diffusion attention backend that does, such as TORCH_SDPA."
+        )
