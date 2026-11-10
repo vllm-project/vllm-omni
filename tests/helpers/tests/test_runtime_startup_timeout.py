@@ -3,6 +3,7 @@
 
 """Startup deadlines must be independent of system clock corrections."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -23,7 +24,10 @@ def startup_server(request, tmp_path, monkeypatch):
         # Exercise the wait-loop clock without reserving or inspecting real ports.
         monkeypatch.setattr(runtime.OmniServer, "_reserve_port", lambda self: None)
         monkeypatch.setattr(runtime.OmniServer, "_owns_listening_port", lambda self: True)
-        return runtime.OmniServer("fake-model", [])
+        server = runtime.OmniServer("fake-model", [])
+        # ``_start_server`` opens a temp log handle; close it after direct calls.
+        request.addfinalizer(server._close_server_log)
+        return server
 
     config = tmp_path / "stages.yaml"
     config.write_text("stages:\n  - stage_id: 0\n  - stage_id: 1\n")
@@ -92,3 +96,41 @@ def test_startup_deadline_ignores_wall_clock_changes(
             startup_server._start_server()
         assert first_probe_at is not None
         assert elapsed - first_probe_at == startup_timeout
+
+
+def test_omni_server_startup_failure_includes_log_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Early-exit RuntimeError must include the redirected serve subprocess log."""
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    monkeypatch.setattr(runtime.OmniServer, "_reserve_port", lambda self: None)
+
+    proc = MagicMock(spec=runtime.subprocess.Popen)
+    proc.pid = 4242
+    proc.poll.return_value = 1
+    captured: dict[str, object] = {}
+    killed: list[int] = []
+
+    def fake_popen(*_args, **kwargs):
+        captured["stdout"] = kwargs.get("stdout")
+        captured["stderr"] = kwargs.get("stderr")
+        log_fh = kwargs.get("stdout")
+        if log_fh is not None:
+            log_fh.write("line-before\nImportError: boom from child\n")
+            log_fh.flush()
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runtime.tempfile, "gettempdir", lambda: str(tmp_path))
+    server = runtime.OmniServer("fake-model", [], port=55555)
+    monkeypatch.setattr(server, "_kill_process_tree", lambda pid: killed.append(pid))
+
+    with pytest.raises(RuntimeError, match="ImportError: boom from child") as exc_info:
+        with server:
+            raise AssertionError("context body must not run after a failed enter")
+
+    message = str(exc_info.value)
+    assert "exited with code 1 before becoming ready" in message
+    assert "Last 60 lines of OmniServer log" in message
+    assert captured["stderr"] is runtime.subprocess.STDOUT
+    assert killed == [4242]
+    assert server._server_log_file is None
+    assert not (tmp_path / "omni_server_55555.log").exists()

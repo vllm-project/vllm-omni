@@ -205,6 +205,10 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
+        # Capture serve stdout/stderr so "exited before becoming ready" CI
+        # failures include the child traceback (mirrors OmniServerStageCli).
+        self._server_log_path: Path | None = None
+        self._server_log_file: Any | None = None
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -273,10 +277,19 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
+        # Redirect stdout+stderr to a temp file so early-exit RuntimeErrors can
+        # surface the child's last lines (Buildkite otherwise only shows the
+        # outer "exited before becoming ready" message).
+        log_path = Path(tempfile.gettempdir()) / f"omni_server_{self.port}.log"
+        self._server_log_path = log_path
+        log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in ``__exit__``
+        self._server_log_file = log_fh
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
         )
 
         max_wait = self.startup_timeout
@@ -285,13 +298,19 @@ class OmniServer:
         while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                raise RuntimeError(
+                    f"Server processes exited with code {ret} before becoming ready."
+                    f"{self._server_log_tail()}"
+                )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
                     ret = self.proc.poll()
                     if ret is not None:
-                        raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                        raise RuntimeError(
+                            f"Server processes exited with code {ret} before becoming ready."
+                            f"{self._server_log_tail()}"
+                        )
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(
@@ -300,7 +319,9 @@ class OmniServer:
                         )
                     return
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
+        raise RuntimeError(
+            f"Server failed to start within {max_wait} seconds{self._server_log_tail()}"
+        )
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -440,6 +461,64 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
+    def _server_log_tail(self, lines: int = 60) -> str:
+        """Return the last *lines* of the serve subprocess log for RuntimeErrors."""
+        log_path = self._server_log_path
+        if log_path is None or not log_path.exists():
+            return ""
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                content = f.readlines()
+            return "\n=== Last {} lines of OmniServer log ({}) ===\n{}".format(
+                lines, log_path, "".join(content[-lines:]) or "<empty>"
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            return f"\n<failed to read OmniServer log {log_path}: {exc}>"
+
+    def _dump_server_log_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
+        """Print OmniServer subprocess log head/tail so Buildkite retains it."""
+        log_path = self._server_log_path
+        if log_path is None or not log_path.exists():
+            return
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            print(f"[OmniServer] log read failed: {exc}", flush=True)
+            return
+        total = len(lines)
+        if total <= head_lines + tail_lines:
+            head_chunk = lines
+            tail_chunk: list[str] = []
+            elided = 0
+        else:
+            head_chunk = lines[:head_lines]
+            tail_chunk = lines[-tail_lines:]
+            elided = total - head_lines - tail_lines
+        print(f"\n=== OmniServer log HEAD ({log_path}) ===", flush=True)
+        print("".join(head_chunk).rstrip("\n"), flush=True)
+        if tail_chunk:
+            print(f"\n... [{elided} lines elided] ...", flush=True)
+            print(f"\n=== OmniServer log TAIL ({log_path}) ===", flush=True)
+            print("".join(tail_chunk).rstrip("\n"), flush=True)
+        print("=== end OmniServer log ===\n", flush=True)
+
+    def _close_server_log(self) -> None:
+        keep_logs = os.environ.get("VLLM_OMNI_KEEP_LOG", "").lower() in ("1", "true", "yes")
+        log_fh = self._server_log_file
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+            self._server_log_file = None
+        if not keep_logs and self._server_log_path is not None:
+            try:
+                self._server_log_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._server_log_path = None
+
     def __enter__(self):
         try:
             self._start_server()
@@ -452,9 +531,11 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
+            self._dump_server_log_for_debug()
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
+            self._close_server_log()
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
