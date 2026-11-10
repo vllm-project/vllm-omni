@@ -10,19 +10,20 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
     should_accumulate_full_payload_output,
 )
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
 
@@ -51,11 +52,14 @@ def _recv_poll_seconds() -> float:
 
 
 _RECV_POLL_S = _recv_poll_seconds()
+# Upper bound, in drain passes, on how long a missed request waits behind a burst.
+_RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
+    from vllm_omni.engine import AdditionalInformationPayload
 
 
 class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
@@ -188,13 +192,23 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return True
         return False
 
-    @staticmethod
-    def _get_local_tp_group() -> Any | None:
-        """Return the local TP group when tensor parallelism is initialized."""
+    def _get_local_tp_group(self) -> Any | None:
+        """Return the local TP group when tensor parallelism is initialized.
+
+        The group does not change after distributed init, and the receive
+        loop calls this on every poll. Cache a resolved group. A call made
+        before init returns None without caching, so a later call can succeed.
+        """
+        group = getattr(self, "_local_tp_group", None)
+        if group is not None:
+            return group
         try:
-            return get_tp_group()
+            group = get_tp_group()
         except Exception:
             return None
+        if group is not None:
+            self._local_tp_group = group
+        return group
 
     def _recv_ordinary_stage_result(
         self,
@@ -333,6 +347,30 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             logger.warning("Stage payload %s was not delivered; caller must validate inline fallback", get_key)
         return payload
 
+    def _return_stage_payload(
+        self,
+        req_id: str,
+        tags: Mapping[str, object] | AdditionalInformationPayload | None,
+        payload: OmniPayload,
+    ) -> bool:
+        """Keep the payload for the connector output instead of sending it if the tags ask for it."""
+        if not returns_stage_payload(tags):
+            return False
+        with self._lock:
+            self._run_stage_payloads[req_id] = OmniSerializer.serialize(payload)
+        return True
+
+    def _stage_full_payload_locked(self, req_id: str, payload: OmniPayload) -> None:
+        """Cache a received full payload for recv_full_payload_inputs() to publish."""
+        self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
+        # Publish full-payload readiness only after the aligned TP broadcast
+        # path in recv_full_payload_inputs() has materialized the payload on all
+        # local ranks. Publishing metadata / stage_recv from the background recv
+        # thread can let the scheduler observe a request before the payload is
+        # actually visible to the model thread.
+        self._full_payload_pending_broadcast_req_ids.add(req_id)
+        self._pending_load_reqs.pop(req_id, None)
+
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
@@ -432,6 +470,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.kv_sent_req_ids
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
+            or output.stage_payloads
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -784,6 +823,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if payload is None:
                 logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
+            # V1 request state only has decoded tags when the request carried some.
+            if self._return_stage_payload(req_id, getattr(request, "additional_information_cpu", None), payload):
+                continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
                 if isinstance(audio_codes, torch.Tensor):
@@ -855,6 +897,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return
             # Don't re-register if the finish sentinel was already received
             if request_id in self._chunk_stream_completed:
+                return
+            if isinstance(request.payload_sender_info, bytes):
+                # The payload came on the request: stage it as if fetched, on the rank that fetches.
+                if self.is_data_transfer_rank():
+                    self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
@@ -952,7 +999,20 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     def _recv_loop(self) -> None:
-        """Background thread: poll connector for incoming data."""
+        """Background thread: poll connector for incoming data.
+
+        Drain chunks that are already queued, then wait. A request that just
+        returned a chunk may already have the next one, so only those
+        requests are polled again. A miss means that chunk is not in the
+        connector yet; rescanning it opens a missing lock file and holds the
+        GIL against the model thread for the whole burst. Requests registered
+        during a burst join it on the next pass, and every
+        ``_RECV_DRAIN_REPOLL_PASSES`` passes the requests that missed are
+        polled again, so a long stream does not hold back another request's
+        first or next chunk. The wait is also the
+        recheck for a non-AR payload deferred until the scheduler takes the
+        previous one.
+        """
         _recv_poll_count = 0
         while not self._stop_event.is_set():
             snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
@@ -975,19 +1035,35 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     _recv_poll_count,
                 )
 
-            made_progress = self._poll_pending_requests_once(pending_ids)
+            known = set(pending_ids)
+            active = pending_ids
+            passes = 0
+            while active and not self._stop_event.is_set():
+                active = self._poll_pending_requests_once(active)
+                if not active:
+                    break
+                passes += 1
+                with self._lock:
+                    if passes % _RECV_DRAIN_REPOLL_PASSES == 0:
+                        polled = set(active)
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in polled]
+                    else:
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in known]
+                if joined:
+                    known.update(joined)
+                    active = [*active, *joined]
 
-            if not made_progress and not self._stop_event.is_set():
-                # Wait for a *new* arrival: existing future chunks may be
-                # blocked by scheduler ownership of the previous payload.
-                # A key-presence predicate would spin and compete for the
-                # GIL. Honor the configured readiness recheck interval.
-                wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
-                if generation is not None and callable(wait_for_change):
-                    wait_for_change(generation, timeout=_RECV_POLL_S)
-                else:
-                    self._work_available.wait(timeout=_RECV_POLL_S)
-                    self._work_available.clear()
+            if not self._stop_event.is_set():
+                self._wait_for_next_payload(generation)
+
+    def _wait_for_next_payload(self, generation: int | None) -> None:
+        """Block until a new payload arrives, or until the recheck interval."""
+        wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
+        if generation is not None and callable(wait_for_change):
+            wait_for_change(generation, timeout=_RECV_POLL_S)
+            return
+        self._work_available.wait(timeout=_RECV_POLL_S)
+        self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
 
@@ -1245,14 +1321,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             else:
                 engine_inputs = payload_data
             with self._lock:
-                self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
-                # Publish full-payload readiness only after the aligned TP broadcast
-                # path in recv_full_payload_inputs() has materialized the payload on all
-                # local ranks. Publishing metadata / stage_recv from the background recv
-                # thread can let the scheduler observe a request before the payload is
-                # actually visible to the model thread.
-                self._full_payload_pending_broadcast_req_ids.add(req_id)
-                self._pending_load_reqs.pop(req_id, None)
+                self._stage_full_payload_locked(req_id, engine_inputs)
             logger.debug(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
@@ -1489,7 +1558,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        # Stage zero has no upstream payload to fan out. In MRv2 its output
+        # is materialized only on the reply rank, so a receive-side collective
+        # here has no matching reader and eventually fills the TP SHM ring.
+        if self._stage_id > 0 and self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
@@ -1527,6 +1599,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     if ext_req_id != req_id:
                         self._send_side_request_payload.pop(req_id, None)
         self._chunk_ready_req_ids.update(newly_finished)
+        with self._lock:
+            stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1535,6 +1609,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            stage_payloads=stage_payloads,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1597,19 +1672,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._save_work_available.set()
         return True, completion
 
-    def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
-        """Poll one receiver pass and publish its ready requests as a cohort."""
-        made_progress = False
+    def _poll_pending_requests_once(self, pending_ids: list[str]) -> list[str]:
+        """Poll one pass and return requests that still have a stream open.
+
+        A request whose terminal chunk arrived in this pass is not returned,
+        so the drain does not poll it again. Ready requests are published as
+        one cohort.
+        """
+        ready: list[str] = []
         for req_id in pending_ids:
             if self._stop_event.is_set():
                 break
             try:
-                made_progress = self._poll_single_request(req_id, publish_ready=False) or made_progress
+                if self._poll_single_request(req_id, publish_ready=False):
+                    ready.append(req_id)
             except Exception:
                 logger.warning("Error receiving data for %s", req_id, exc_info=True)
-        if made_progress and self._async_chunk:
+        if ready and self._async_chunk:
             self.publish_omni_connector_output_to_sink()
-        return made_progress
+        if not ready:
+            return ready
+        with self._lock:
+            pending = self._pending_load_reqs
+            return [req_id for req_id in ready if req_id in pending]
 
     @staticmethod
     def _finish_marker_payload() -> OmniPayload:
@@ -1629,6 +1714,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             (request, payload if payload is not None else self._finish_marker_payload())
             for request, payload in entries
             if payload is not None or self._request_is_finished(request)
+        ]
+        # MRv2 request snapshots carry the serialized tags.
+        entries = [
+            (request, payload)
+            for request, payload in entries
+            if not self._return_stage_payload(request.req_id, request.additional_information, payload)
         ]
         if not entries:
             return 0

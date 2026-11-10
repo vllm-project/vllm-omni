@@ -621,8 +621,11 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
+    lora_application: str | None = None
     lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
@@ -630,6 +633,7 @@ class StageDeployConfig:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
@@ -738,8 +742,14 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Record per-turn stage work and emitted audio and answer the client's
+    # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
+    # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
+    collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.collect_stats, bool):
+            raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (
@@ -1162,9 +1172,8 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 # Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
 # adapt a platform worker, so an entry is removed only with the real integration.
 # NPU AR stages use the Ascend V2 runner (attention metadata and input state).
-_MRV2_UNSUPPORTED_PLATFORMS = {
-    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
-}
+# Platforms whose workers still force the V1 runner; XPU and NPU build the omni V2 runners.
+_MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
 def _apply_platform_overrides(

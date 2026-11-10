@@ -10,6 +10,61 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 if HAS_TRITON:
 
     @triton.jit
+    def _f32_add(left, right):
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            [left, right],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+    @triton.jit
+    def _f32_fma(left, right, acc):
+        return tl.inline_asm_elementwise(
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            [left, right, acc],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+    @triton.jit
+    def _fold_high_plus_low(values, half: tl.constexpr, heads_per_program: tl.constexpr):
+        # Shuffle-down by half the active width adds the high lane into the low lane.
+        view = tl.reshape(values, [2, half, heads_per_program])
+        lane = tl.arange(0, 2)[:, None, None]
+        high = tl.sum(tl.where(lane == 1, view, 0.0), axis=0)
+        low = tl.sum(tl.where(lane == 0, view, 0.0), axis=0)
+        return _f32_add(high, low)
+
+    @triton.jit
+    def _rms_sum_squares(values, heads_per_program: tl.constexpr):
+        """Sum squares in PyTorch's N=64 vectorized RMSNorm order.
+
+        Each group of four lanes is an ``fma.rn`` chain, matching one float4
+        thread. Groups then combine like a warp shuffle-down. ``tl.sum`` does
+        not keep that parenthesization.
+        """
+
+        dims = tl.arange(0, 64)[None, :]
+        chunk_ids = tl.arange(0, 16)[:, None]
+        chunks = tl.zeros([16, heads_per_program], dtype=tl.float32)
+        for group in tl.static_range(16):
+            acc = tl.zeros([heads_per_program], dtype=tl.float32)
+            for offset in tl.static_range(4):
+                val = tl.sum(tl.where(dims == group * 4 + offset, values, 0.0), axis=1)
+                acc = _f32_fma(val, val, acc)
+            chunks = tl.where(chunk_ids == group, acc[None, :], chunks)
+        stage = _fold_high_plus_low(chunks, 8, heads_per_program)
+        stage = _fold_high_plus_low(stage, 4, heads_per_program)
+        stage = _fold_high_plus_low(stage, 2, heads_per_program)
+        stage = _fold_high_plus_low(stage, 1, heads_per_program)
+        return tl.reshape(stage, [heads_per_program])
+
+    @triton.jit
     def _qk_rms_norm_rope_exact_kernel(
         q_ptr,
         k_ptr,
@@ -48,7 +103,7 @@ if HAS_TRITON:
         k_offsets = token * k_stride_token + heads[:, None] * k_stride_head + dims[None, :] * k_stride_dim
         x_ptrs = tl.where(qk_domain == 0, q_ptr + q_offsets, k_ptr + k_offsets)
         x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-        inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
+        inv_rms = tl.rsqrt(_rms_sum_squares(x, heads_per_program) / head_dim + eps)
         normalized = (x * inv_rms[:, None]).to(tl.float16)
 
         rotary_half = rotary_dim // 2
@@ -164,9 +219,9 @@ def try_qk_norm_rope_exact(
     sin = sin.reshape(tokens, sin.shape[-1])
     q_output = torch.empty_like(q)
     k_output = torch.empty_like(k)
-    # The first two launch dimensions are part of the exactness contract on
-    # the validated SM90 and SM103 targets: changing the warp-to-row mapping
-    # changes the FP32 RMS reduction order.
+    # The RMS sum is an explicit PyTorch vectorized-RMS parenthesization, so
+    # these launch dimensions no longer change its rounding. They stay fixed
+    # at the shape validated on SM90 and SM103.
     heads_per_program = 8
     grid = (tokens, triton.cdiv(heads, heads_per_program), 2)
     launch_args = {

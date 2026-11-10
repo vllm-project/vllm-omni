@@ -546,6 +546,7 @@ def test_followup_sends_only_codec_delta_without_ref_metadata():
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
     tm.put_req_chunk[rid] = 1
+    tm._qwen3_tts_emitted_frames = {rid: 10}
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
 

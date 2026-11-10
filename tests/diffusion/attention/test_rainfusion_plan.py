@@ -11,13 +11,16 @@ to the always-kept prefix segment before generating the block mask.
 """
 
 import dataclasses
+import json
 import sys
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
 import torch
 
+from tests.e2e.online_serving.minimax_h3.rainfusion_trace import Ref2VASparseTrace
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends import rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
@@ -132,6 +135,69 @@ def test_invalid_ref2va_video_spans_fall_back_to_dense():
         ),
     )
     assert make_impl()._resolve_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)) is None
+
+
+def test_ref2va_sparse_execution_guard(monkeypatch):
+    """Reject warmup and missing-layout dense fallbacks; accept a real sparse dispatch."""
+    impl = make_impl(start_step=2)
+    query = torch.zeros((1, 12000, 1, 1))
+    impl.dense_fallback.forward_npu = mock.Mock(return_value=query)
+    context = types.SimpleNamespace(denoise_step_idx=0, total_denoise_steps=8)
+    monkeypatch.setattr(rainfusion_attn, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(rainfusion_attn, "get_forward_context", lambda: context)
+    trace = Ref2VASparseTrace()
+    trace.observe("MINIMAX_H3_REF2VA_REQUEST_BEGIN")
+    monkeypatch.setattr(rainfusion_attn.logger, "info_once", lambda message, *args: trace.observe(message % args))
+    mindiesd = types.ModuleType("mindiesd")
+    sparse_calls = []
+
+    def sparse_attention(q, k, v, *, video_spans=None, **kwargs):
+        sparse_calls.append(video_spans)
+        return q
+
+    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=5000, latent_grid=(4, 16, 64), role="target"),
+        ),
+    )
+    metadata = AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)
+
+    assert impl.forward_npu(query, query, query, metadata) is query
+    context.denoise_step_idx = 2
+    assert impl.forward_npu(query, query, query, None) is query
+    assert impl.dense_fallback.forward_npu.call_count == 2
+    assert not sparse_calls
+    with pytest.raises(AssertionError, match="sparse execution was not observed"):
+        trace.assert_sparse_execution()
+
+    assert torch.equal(impl.forward_npu(query, query, query, metadata), query)
+    assert len(sparse_calls) == 1 and len(sparse_calls[0]) == 2
+    trace.assert_sparse_execution()
+
+
+def test_ref2va_video_request_includes_num_frames(tmp_path, monkeypatch):
+    from tests.e2e.online_serving.minimax_h3 import _common
+
+    config_path = Path(__file__).resolve().parents[2] / "dfx/perf/tests/test_minimax_h3_vllm_omni.json"
+    configs = json.loads(config_path.read_text(encoding="utf-8"))
+    config = next(item for item in configs if item["test_name"] == "test_minimax_h3_ref2va_rainfusion_laser_4npu_a3")
+    workload = config["benchmark_params"][0]["extra_body"]
+    reference = tmp_path / "reference.mp4"
+    reference.write_bytes(b"reference video")
+
+    def post_sync(client, form, files, *, timeout):
+        assert form["num_frames"] == str(workload["num_frames"])
+        assert form["extra_params"] == workload["extra_params"]
+        assert files[0][1][1].read() == b"reference video"
+        assert timeout == 3600
+        return b"output video"
+
+    monkeypatch.setattr(_common, "post_sync", post_sync)
+    assert _common.run_ref2va_video(None, "model", reference, workload) == b"output video"
 
 
 def test_validate_available_accepts_single_video_mindiesd(monkeypatch):
