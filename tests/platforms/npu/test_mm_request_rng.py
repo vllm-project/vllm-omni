@@ -23,6 +23,8 @@ def test_load_model_and_real_ascend_encoder_tag_requests(runner, make_request, m
     npu_runner = object.__new__(module.OmniNPUModelRunner)
     npu_runner.__dict__.update(runner.__dict__)
     npu_runner._mm_rng_provider = None
+    # Set in NPUModelRunner.__init__, which object.__new__ skips.
+    npu_runner.use_score_encoder_cache = False
     npu_runner.vllm_config = npu_runner.model_config = None
     mocker.patch.object(module.NPUModelRunner, "load_model", return_value=None)
     mocker.patch.object(module, "restore_native_rejection_sampler")

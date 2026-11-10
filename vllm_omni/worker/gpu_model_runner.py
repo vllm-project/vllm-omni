@@ -146,8 +146,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._has_lmcache = False
 
     def shutdown(self) -> None:
-        if self._mm_rng_provider is not None:
-            self._mm_rng_provider.clear()
+        mm_rng_provider = getattr(self, "_mm_rng_provider", None)
+        if mm_rng_provider is not None:
+            mm_rng_provider.clear()
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
