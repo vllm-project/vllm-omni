@@ -113,7 +113,7 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
 
 
 def test_output_remains_on_shared_output_path(mocker: MockerFixture):
-    raw_queue = queue.Queue()
+    raw_queue: queue.Queue[OutputMessage] = queue.Queue()
     raw_queue.put_nowait(
         OutputMessage(
             request_id="shared-path-request",
@@ -142,7 +142,7 @@ def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixtu
     request_q = SignallingQueue()
     request_q.put("queue-is-full")
     request_q.put_attempted.clear()
-    rpc_q = queue.Queue()
+    rpc_q: queue.Queue[CollectiveRPCResultMessage] = queue.Queue()
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
@@ -194,7 +194,11 @@ def test_shutdown_does_not_race_runtime_cleanup_with_live_orchestrator(mocker: M
     engine._runtime.shutdown.assert_not_called()
 
 
-def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixture):
+@pytest.mark.parametrize(
+    "replica_slots, expected_timeout",
+    [((), 30.0), (([None],), 30.0), (([object()],), 50.0), (([object(), None, object()], [object()] * 3), 130.0)],
+)
+def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixture, replica_slots, expected_timeout):
     engine = object.__new__(AsyncOmniEngine)
     engine._shutdown_called = False
     engine._weak_finalizer = None
@@ -205,10 +209,13 @@ def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixtur
     engine.orchestrator_thread = mocker.MagicMock()
     engine.orchestrator_thread.is_alive.side_effect = [True, False]
     engine._runtime = mocker.MagicMock()
+    engine._runtime.stage_pools = [SimpleNamespace(clients=clients) for clients in replica_slots]
 
     engine.shutdown()
 
-    engine.orchestrator_thread.join.assert_called_once()
+    engine.orchestrator_thread.join.assert_called_once_with(timeout=expected_timeout)
+    engine._runtime.shutdown.assert_called_once_with()
+    engine.shutdown()
     engine._runtime.shutdown.assert_called_once_with()
 
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -22,14 +23,14 @@ class OmniTransferAdapterBase:
         if not hasattr(self, "connector"):
             self.connector = None
         # Requests that are waiting to be polled
-        self._pending_load_reqs = deque()
+        self._pending_load_reqs: deque[Any] = deque()
         # Requests that have successfully retrieved data
-        self._finished_load_reqs = set()
+        self._finished_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
-        self._pending_save_reqs = deque()
+        self._pending_save_reqs: deque[dict[str, Any]] = deque()
         # Requests that have successfully saved data
-        self._finished_save_reqs = set()
+        self._finished_save_reqs: set[str] = set()
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
@@ -60,7 +61,7 @@ class OmniTransferAdapterBase:
             n = len(self._pending_load_reqs)
             any_success = False
             for _ in range(n):
-                if not self._pending_load_reqs:
+                if self.stop_event.is_set() or not self._pending_load_reqs:
                     break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
@@ -111,9 +112,9 @@ class OmniTransferAdapterBase:
         return failures
 
     def save_loop(self):
-        """Loop to send outgoing data."""
+        """Send queued data until shutdown, finishing only the in-flight send."""
         while not self.stop_event.is_set():
-            while self._pending_save_reqs:
+            while self._pending_save_reqs and not self.stop_event.is_set():
                 task = self._pending_save_reqs.popleft()
                 try:
                     self._send_single_request(task)
@@ -167,15 +168,23 @@ class OmniTransferAdapterBase:
         """Get finished loaded or saved requests"""
         raise NotImplementedError
 
-    def shutdown(self):
-        """Stop background loops and close the connector."""
+    def shutdown(self) -> None:
+        """Wait up to five seconds for I/O threads, then close if both stopped."""
         self.stop_event.set()
         with self._recv_cond:
             self._recv_cond.notify_all()
         with self._save_cond:
             self._save_cond.notify_all()
+        # An in-flight put may publish a new segment. Join both loops before
+        # closing the connector, sharing one budget rather than waiting twice.
+        deadline = time.monotonic() + 5.0
+        for thread in (self.recv_thread, self.save_thread):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self.recv_thread.is_alive() or self.save_thread.is_alive():
+            logger.warning("Transfer threads did not stop; leaving connector open to avoid closing it during I/O")
+            return
         if self.connector is not None:
             try:
                 self.connector.close()
             except Exception:
-                pass
+                logger.exception("Failed to close transfer connector during shutdown")
