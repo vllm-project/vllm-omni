@@ -53,6 +53,14 @@ The active `OmniPlatform` owns compatibility policy through
 - account for head size and other platform-visible constraints; and
 - return a qualified class path implementing `AttentionBackend`.
 
+Hub preflight and execution share the same version resolver. FlashAttention 2
+tries versions 1, 2, then 3 so Torch stable-ABI builds remain available when
+older per-Torch builds do not match. An explicit selection still fails when
+no compatible published build resolves.
+
+Explicit backend validation must avoid initializing unrelated runtimes. The
+cuDNN version probe belongs to automatic Blackwell fallback selection.
+
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
 
@@ -112,6 +120,16 @@ provider-specific sparse metadata, transport padding and execution. The cuDNN
 provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
+
+Qwen-Image-2.1 publishes a zero-based denoising index in
+`ForwardContext.denoise_step_idx` before running the transformer. Both CFG
+branches see the same index. In step execution, Qwen defers new first-step
+requests while a batch is decoding. The runner advances each scheduled request
+once per iteration, so requests admitted together share an index even if their
+total step counts differ. After prefix-length grouping, each transformer forward
+requires a common index. Mixed indices within a group raise a `ValueError`
+before step publication, including in native precision. On exit the pipeline restores the
+previous index directly, preserving the worker's paged-KV activation scope.
 
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
 For tile128 it expands the selected mask into 64-token compute blocks

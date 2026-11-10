@@ -60,7 +60,7 @@ def test_worker_base_selects_310p_worker() -> None:
 
 
 def test_model_runner_selects_310p_runner() -> None:
-    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+    from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310
 
     from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 

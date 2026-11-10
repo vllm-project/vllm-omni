@@ -481,12 +481,6 @@ def parse_args():
     )
     add_profiler_config_arg(parser)
     parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
         "--output-wav",
         default="output_audio",
         help="[Deprecated] Output wav directory (use --output-dir).",

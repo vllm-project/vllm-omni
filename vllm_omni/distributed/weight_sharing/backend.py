@@ -6,7 +6,7 @@ The trusted caller routes opaque metadata through its control plane, pairs ranks
 reports uncertain delivery/peer failures via mark_failed, and terminates poisoned
 sharing groups. This module starts no threads and performs no network I/O.
 Keep the backend alive until teardown; never replay a bundle into a replacement
-consumer. A lost RPC response is not evidence that CUDA resources were released.
+consumer. A lost RPC response is not evidence that device resources were released.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import msgspec
 from .contracts import (
     CloseResult,
     CompatibilityError,
-    CudaIpcCodec,
     ExportBundle,
+    IpcCodec,
     Limits,
     PreparedWeights,
     ProtocolError,
@@ -116,7 +116,7 @@ class _Consumer:
 
 @contextmanager
 def _storage_operation(control: _Control, storage_id: str) -> Iterator[None]:
-    """Track uncertain work without holding the CPU state lock across CUDA calls."""
+    """Track uncertain work without holding the CPU state lock across device calls."""
     with control.lock:
         control.active_storage_id = storage_id
     yield
@@ -124,11 +124,12 @@ def _storage_operation(control: _Control, storage_id: str) -> Iterator[None]:
         control.active_storage_id = None
 
 
-class TorchCudaIpcBackend:
+class TorchIpcBackend:
     """One backend per owner; session_status may be queried by other threads.
 
-    The codec is injectable for independent CPU tests. Production callers should
-    use the default TorchCudaIpcCodec, which rejects unsupported devices/ABIs.
+    The default codec is TorchCudaIpcCodec. Ascend callers inject
+    TorchNpuIpcCodec; both reject unsupported devices/ABIs. The codec owns device
+    operations while this backend owns the common session lifecycle.
     All mutations execute on the owner thread, including control-plane receipts
     and failure reports. No worker, scheduler or process manager is imported here.
     The caller authenticates/routes metadata; identity checks here prevent stale
@@ -147,7 +148,7 @@ class TorchCudaIpcBackend:
     Receipts can be delivered again; an import with an uncertain outcome cannot.
     """
 
-    def __init__(self, *, codec: CudaIpcCodec | None = None, limits: Limits | None = None):
+    def __init__(self, *, codec: IpcCodec | None = None, limits: Limits | None = None):
         if codec is None:
             from .torch_cuda_ipc_codec import TorchCudaIpcCodec
 
@@ -171,7 +172,7 @@ class TorchCudaIpcBackend:
         if record is None:
             raise WeightSharingError("unknown session", session_id=session_id)
         if owner and record.owner is not current_thread():
-            raise ThreadOwnershipError("CUDA resources belong to another thread", session_id=session_id)
+            raise ThreadOwnershipError("device resources belong to another thread", session_id=session_id)
         return record
 
     @staticmethod
@@ -189,7 +190,7 @@ class TorchCudaIpcBackend:
 
     @contextmanager
     def _poison_on_error(self, record: _Provider | _Consumer) -> Iterator[None]:
-        """Seal uncertain CUDA/transport failures; retain all resources for teardown."""
+        """Seal uncertain device/transport failures; retain all resources for teardown."""
         try:
             yield
         except BaseException as exc:
@@ -336,7 +337,7 @@ class TorchCudaIpcBackend:
                 raise CompatibilityError("invalid storage export descriptor")
 
     def open_import(self, payload: bytes, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights:
-        # Reject replay before touching CUDA; _register rechecks after preflight.
+        # Reject replay before touching the device; _register rechecks after preflight.
         with self._registry_lock:
             if context.identity.session_id in self._sessions:
                 raise WeightSharingError("session ID cannot be reused", session_id=context.identity.session_id)
@@ -401,7 +402,7 @@ class TorchCudaIpcBackend:
             record.result._tensors.clear()
             with control.lock:
                 carriers, record.carriers = record.carriers, {}
-            carriers.clear()  # Destroy CUDA owners outside the state lock.
+            carriers.clear()  # Destroy device owners outside the state lock.
             if any(not lease.expired() for lease in record.leases):
                 # Local aliases may be dropped later; the caller can retry close.
                 return CloseResult("HELD")
@@ -454,3 +455,7 @@ class TorchCudaIpcBackend:
                 active_storage_id=control.active_storage_id,
                 error=control.error,
             )
+
+
+# Preserve existing imports and the default CUDA codec without a second backend.
+TorchCudaIpcBackend = TorchIpcBackend

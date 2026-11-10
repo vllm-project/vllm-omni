@@ -16,7 +16,13 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-from tests.e2e.accuracy.helpers import assert_video_metadata, assert_video_similarity_metrics, probe_video
+from tests.e2e.accuracy.helpers import (
+    assert_video_metadata,
+    assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    probe_video,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
@@ -316,15 +322,38 @@ def test_sana_video_pipeline_matches_frozen_golden(
 
     metadata = probe_video(actual_path)
     assert_video_metadata(metadata, width=width, height=height, fps=16, frame_count=81)
-    assert_video_similarity_metrics(
-        label=f"sana_video_{variant}_{task}",
+    # The native prompt cross-attention uses vLLM-Omni Attention rather
+    # than Diffusers SDPA. Frozen stage checks prove exact inputs and
+    # scheduler state, while the BF16 backend reduction difference grows
+    # across CFG denoising. Calibrate only the affected 480p T2V case;
+    # its frozen result is 0.919861 SSIM / 28.7442 dB PSNR.
+    label = f"sana_video_{variant}_{task}"
+    ssim_threshold = SSIM_THRESHOLDS[(variant, task)]
+    psnr_threshold = 28.0
+    ssim, psnr = measure_video_similarity_metrics(
+        label=label,
         online_path=actual_path,
         offline_path=golden_path,
-        # The native prompt cross-attention uses vLLM-Omni Attention rather
-        # than Diffusers SDPA. Frozen stage checks prove exact inputs and
-        # scheduler state, while the BF16 backend reduction difference grows
-        # across CFG denoising. Calibrate only the affected 480p T2V case;
-        # its frozen result is 0.919861 SSIM / 28.7442 dB PSNR.
-        ssim_threshold=SSIM_THRESHOLDS[(variant, task)],
-        psnr_threshold=28.0,
+    )
+    write_accuracy_result(
+        model_id=label,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": ssim_threshold, "psnr": psnr_threshold},
+        extra={
+            "label": label,
+            "variant": variant,
+            "task": task,
+            "online_video": str(actual_path),
+            "offline_video": str(golden_path),
+        },
+    )
+    assert_video_similarity_metrics(
+        label=label,
+        online_path=actual_path,
+        offline_path=golden_path,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
