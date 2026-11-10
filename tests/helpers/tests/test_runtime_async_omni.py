@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Generator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -375,6 +376,51 @@ def test_iter_async_omni_defaults(fixture_env: list[bool]) -> None:
         next(gen)
 
 
+@pytest.mark.parametrize("extra_omni_kwargs", [None, {"enforce_eager": True}])
+def test_iter_async_omni_preserves_resolved_paths_and_kwargs(
+    fixture_env: list[bool], tmp_path: Path, extra_omni_kwargs: dict[str, Any] | None
+) -> None:
+    params = AsyncOmniParams(
+        model=str(tmp_path / "tiny-model"),
+        deploy_config=str(tmp_path / "generated.yaml"),
+        extra_omni_kwargs=extra_omni_kwargs,
+    )
+    lock = threading.Lock()
+    gen = iter_async_omni(_fake_request(None, diffusion=True), "core_model", lock, resolved_params=params)
+    runner = next(gen)
+
+    assert _FakeRunner.calls == [
+        {"model_name": params.model, "deploy_config": params.deploy_config, **(extra_omni_kwargs or {})}
+    ]
+    assert lock.locked()
+    assert fixture_env == [True]
+
+    gen.close()
+    assert runner.closed
+    assert not lock.locked()
+    assert fixture_env == [True, True]
+
+
+def test_async_omni_resolved_params_defaults_to_none(async_omni_resolved_params: AsyncOmniParams | None) -> None:
+    assert async_omni_resolved_params is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "async_omni_resolved_params",
+    [AsyncOmniParams(model="/prepared/tiny-model", deploy_config="/prepared/generated.yaml")],
+)
+async def test_function_fixture_accepts_resolved_params(
+    fixture_env: list[bool],
+    async_omni_resolved_params: AsyncOmniParams,
+    async_omni_runner_function: AsyncOmniRunner,
+) -> None:
+    assert isinstance(async_omni_runner_function, _FakeRunner)
+    assert _FakeRunner.calls == [
+        {"model_name": async_omni_resolved_params.model, "deploy_config": async_omni_resolved_params.deploy_config}
+    ]
+
+
 @pytest.mark.parametrize("param", [("org/model", None), ["org/model"], "org/model", None])
 def test_iter_async_omni_rejects_non_params(fixture_env: list[bool], param: Any) -> None:
     request = _fake_request(param, diffusion=False)
@@ -382,6 +428,13 @@ def test_iter_async_omni_rejects_non_params(fixture_env: list[bool], param: Any)
         del request.param
     with pytest.raises(ValueError, match="AsyncOmniParams"):
         next(iter_async_omni(request, "core_model", threading.Lock()))
+    assert _FakeRunner.calls == []
+
+
+def test_iter_async_omni_rejects_invalid_resolved_params(fixture_env: list[bool]) -> None:
+    params: Any = ("/prepared/tiny-model", "/prepared/generated.yaml")
+    with pytest.raises(ValueError, match="async_omni_resolved_params must return AsyncOmniParams"):
+        next(iter_async_omni(SimpleNamespace(), "core_model", threading.Lock(), resolved_params=params))
     assert _FakeRunner.calls == []
 
 
