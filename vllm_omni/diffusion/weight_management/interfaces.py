@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.weight_stack.components import ComponentCatalog
-    from vllm_omni.diffusion.weight_stack.host import (
+    from vllm_omni.diffusion.weight_management.components import ComponentCatalog
+    from vllm_omni.diffusion.weight_management.host import (
         Election,
         ElectionRecord,
         HostLayout,
@@ -37,10 +37,10 @@ if TYPE_CHECKING:
         MemoryRange,
         SharePlan,
     )
-    from vllm_omni.diffusion.weight_stack.loader import ExpectedManifest, FinalManifest, Preflight
-    from vllm_omni.diffusion.weight_stack.offload import PlacementPlan, Unit
-    from vllm_omni.diffusion.weight_stack.policy import OffloadPolicy
-    from vllm_omni.diffusion.weight_stack.startup import FaultPlan  # type: ignore[attr-defined]
+    from vllm_omni.diffusion.weight_management.loader import ExpectedManifest, FinalManifest, Preflight
+    from vllm_omni.diffusion.weight_management.offload import PlacementPlan, Unit
+    from vllm_omni.diffusion.weight_management.policy import OffloadPolicy
+    from vllm_omni.diffusion.weight_management.startup import FaultPlan  # type: ignore[attr-defined]
 
 
 class LoadState(enum.Enum):

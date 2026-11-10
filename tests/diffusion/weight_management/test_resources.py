@@ -9,8 +9,8 @@ import logging
 import pytest
 import torch
 
-from vllm_omni.diffusion.weight_stack.errors import LifecycleError
-from vllm_omni.diffusion.weight_stack.startup import ResourceKind, ResourceLedger
+from vllm_omni.diffusion.weight_management.errors import LifecycleError
+from vllm_omni.diffusion.weight_management.startup import ResourceKind, ResourceLedger
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 

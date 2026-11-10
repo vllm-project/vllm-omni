@@ -19,7 +19,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from vllm_omni.diffusion.weight_stack.errors import LifecycleError
+from vllm_omni.diffusion.weight_management.errors import LifecycleError
 
 logger = logging.getLogger(__name__)
 

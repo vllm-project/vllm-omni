@@ -15,7 +15,7 @@ from collections.abc import Mapping
 import pytest
 import torch
 
-from vllm_omni.diffusion.weight_stack.interfaces import (
+from vllm_omni.diffusion.weight_management.interfaces import (
     AllGatherGroup,
     AllGatherGroups,
     Elections,
@@ -382,18 +382,18 @@ import sys
 import vllm_omni  # noqa: F401
 
 baseline = set(sys.modules)
-from vllm_omni.diffusion.weight_stack import errors, interfaces  # noqa: F401
+from vllm_omni.diffusion.weight_management import errors, interfaces  # noqa: F401
 
 forbidden = (
     "torch.distributed",
     "vllm.config",
     "vllm_omni.diffusion.data",
-    "vllm_omni.diffusion.weight_stack.components",
-    "vllm_omni.diffusion.weight_stack.host",
-    "vllm_omni.diffusion.weight_stack.loader",
-    "vllm_omni.diffusion.weight_stack.offload",
-    "vllm_omni.diffusion.weight_stack.policy",
-    "vllm_omni.diffusion.weight_stack.startup",
+    "vllm_omni.diffusion.weight_management.components",
+    "vllm_omni.diffusion.weight_management.host",
+    "vllm_omni.diffusion.weight_management.loader",
+    "vllm_omni.diffusion.weight_management.offload",
+    "vllm_omni.diffusion.weight_management.policy",
+    "vllm_omni.diffusion.weight_management.startup",
 )
 loaded = sorted(
     name

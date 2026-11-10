@@ -8,7 +8,7 @@ import pickle
 
 import pytest
 
-from vllm_omni.diffusion.weight_stack.errors import (
+from vllm_omni.diffusion.weight_management.errors import (
     MAX_ERROR_MESSAGE_CHARS,
     STEP_ERROR_TYPES,
     AllocationError,
