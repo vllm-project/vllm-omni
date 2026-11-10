@@ -143,8 +143,12 @@ def test_is_a5_detects_a5_device(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_is_a5_falls_back_false_without_is_950(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_npu_init(monkeypatch)
     # Older vllm-ascend releases have no `is_950`; detection must fall back.
-    _install_fake_module(monkeypatch, "vllm_ascend")
+    vllm_ascend = _install_fake_module(monkeypatch, "vllm_ascend")
+    vllm_ascend.__path__ = []
     _install_fake_module(monkeypatch, "vllm_ascend.utils")
+    device = _install_fake_module(monkeypatch, "vllm_ascend.device")
+    device.__path__ = []
+    _install_fake_module(monkeypatch, "vllm_ascend.device.device_config")
 
     assert module.is_a5(torch.device("cuda")) is False
     assert module.is_a5() is False
