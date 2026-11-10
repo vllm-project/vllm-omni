@@ -1657,6 +1657,17 @@ class StagePool:
             for request_id in request_ids:
                 watermarker.discard_request_state(request_id)
 
+    def diffusion_output_waiter(self) -> Any | None:
+        """Awaitable wake-up for this pool's next diffusion output, if it has one.
+
+        Only a single-replica pool whose client queues outputs on the
+        orchestrator loop (the inline diffusion client) offers one. Any other
+        pool returns ``None`` and keeps the nowait-poll contract.
+        """
+        if self.num_replicas != 1 or not self.is_replica_available(0):
+            return None
+        return getattr(self.clients[0], "wait_diffusion_output", None)
+
     # ---- Stage-local control plane ----
 
     async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:

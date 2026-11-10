@@ -20,6 +20,7 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
@@ -130,6 +131,7 @@ class Omni(OmniBase):
     ) -> Generator[OmniRequestOutput, None, None]:
         active_reqs: set[str] = set()
         try:
+            _t_generate_enter = latency_trace.now_ns()
             sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
 
             if isinstance(prompts, str) or not isinstance(prompts, Sequence):
@@ -146,6 +148,7 @@ class Omni(OmniBase):
             req_final_stage_ids: dict[str, int] = {}
 
             for req_id, prompt in zip(request_ids, request_prompts):
+                latency_trace.mark(req_id, "engine_generate_enter", _t_generate_enter)
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
                 final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
@@ -176,6 +179,7 @@ class Omni(OmniBase):
                     final_stage_id=final_stage_id,
                     final_output_stage_ids=final_output_stage_ids,
                 )
+                latency_trace.mark(req_id, "engine_add_request_done")
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts
                 req_start_ts[req_id] = submit_ts
@@ -195,6 +199,7 @@ class Omni(OmniBase):
                 if req_id not in active_reqs:
                     logger.warning("[Omni] Received output for unknown/finished request_id=%s", req_id)
                     continue
+                latency_trace.mark(req_id, "engine_output_received")
 
                 self._check_engine_output_error(msg, req_id, stage_id)
 
@@ -208,7 +213,9 @@ class Omni(OmniBase):
                     wall_start_ts=wall_start_ts,
                     final_stage_id_for_e2e=req_final_stage_ids[req_id],
                 )
+                latency_trace.mark(req_id, "engine_result_processed")
                 if output_to_yield is not None:
+                    latency_trace.mark(req_id, "engine_generate_yield")
                     yield output_to_yield
 
                 if isinstance(msg, OutputMessage) and msg.finished:

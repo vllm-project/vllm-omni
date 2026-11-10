@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.omni_base import (
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils import latency_trace
 
 logger = init_logger(__name__)
 # A queued output wakes the final-output loop immediately; this wait only
@@ -263,6 +264,7 @@ class AsyncOmniBase(OmniBase):
 
         while True:
             result = await req_state.queue.get()
+            latency_trace.mark(request_id, "engine_output_received")
 
             if isinstance(result, ErrorMessage):
                 logger.error(
@@ -295,6 +297,7 @@ class AsyncOmniBase(OmniBase):
                 wall_start_ts,
                 final_stage_id_for_e2e,
             )
+            latency_trace.mark(request_id, "engine_result_processed")
 
             if output_to_yield:
                 # Set the external request ID back to the user yielded input
@@ -336,6 +339,8 @@ class AsyncOmniBase(OmniBase):
                         continue
 
                     for msg in msgs:
+                        if latency_trace.ENABLED:
+                            latency_trace.mark(getattr(msg, "request_id", None), "frontend_output_wakeup")
                         if time.monotonic() - last_yield >= _FINAL_OUTPUT_YIELD_INTERVAL_S:
                             await asyncio.sleep(0)
                             last_yield = time.monotonic()

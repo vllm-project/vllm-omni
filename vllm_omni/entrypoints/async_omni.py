@@ -43,6 +43,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, disable_watermarking
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils import latency_trace
 
 if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
@@ -213,6 +214,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
+        if latency_trace.ENABLED:
+            latency_trace.mark(external_request_id, f"@alias:{request_id}")
+            latency_trace.mark(request_id, "engine_generate_enter")
 
         # Wait until generation is resumed if the engine is paused. Non-streaming
         # generate holds an admission slot until add_request completes so sleep()
@@ -364,6 +368,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     # abort output; the results loop below drains it and the
                     # generator finishes as a normal aborted request.
                     logger.debug("[AsyncOmni] Submit for %s was revoked before admission", request_id)
+            latency_trace.mark(request_id, "engine_add_request_done")
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
@@ -388,6 +393,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 req_start_ts,
                 wall_start_ts,
             ):
+                latency_trace.mark(request_id, "engine_generate_yield")
                 yield output
                 metadata = (getattr(output, "multimodal_output", None) or {}).get("metadata", {})
                 stream = metadata.get("stream", {}) if isinstance(metadata, dict) else {}

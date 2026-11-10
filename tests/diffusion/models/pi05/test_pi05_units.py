@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.pi05.config import (
     load_lerobot_norm_stats,
     resolve_excluded_action_indices,
 )
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -384,6 +385,73 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     assert result.output["actions"].shape == (config.chunk_size, 7)
 
 
+class _GraphTarget:
+    """Stands in for the model: all ``_install_cuda_graphs`` touches are the
+    graph slot and the fused-kernel switch, whose calls ``events`` records."""
+
+    cuda_graphs = None
+
+    def __init__(self, events: list, fused_kernels_error: Exception | None = None):
+        self.events = events
+        self.fused_kernels_error = fused_kernels_error
+
+    def enable_fused_kernels(self):
+        if self.fused_kernels_error is not None:
+            raise self.fused_kernels_error
+        self.events.append("enable_fused_kernels")
+
+
+def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
+    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline._device = torch.device(device)
+    pipeline.model = _GraphTarget(events, fused_kernels_error)
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "enforce_eager,device,installed",
+    [
+        (True, "cuda", False),
+        (False, "cuda", True),
+        # No CUDA device: the knob asks for graphs, the pipeline stays eager.
+        (False, "cpu", False),
+        (True, "cpu", False),
+    ],
+)
+def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed, monkeypatch):
+    """The optimized path is the fused kernels with CUDA graphs captured over
+    them: the kernels are enabled first, then the graphs are captured at init
+    and installed. The eager baseline gets neither."""
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    pipeline = _graph_install_pipeline(device, events, monkeypatch)
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
+
+    assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
+    assert events == (["enable_fused_kernels", "capture"] if installed else [])
+
+
+def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
+    """``enforce_eager=False`` asks for the optimized path: kernels that cannot
+    run must stop startup rather than silently serve eagerly."""
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, fused_kernels_error=RuntimeError("no Triton"))
+
+    with pytest.raises(RuntimeError, match="enforce_eager") as excinfo:
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    assert "no Triton" in str(excinfo.value.__cause__)
+    assert events == []
+    assert pipeline.model.cuda_graphs is None
+
+
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
     """Fail loud: an unreproducible mode served anyway is silently wrong."""
     path = _write_lerobot_checkpoint(
@@ -641,6 +709,104 @@ def test_float_image_rejects_values_outside_lerobot_domain(bad, container):
         Pi05ImageProcessor(image_size=4).preprocess_single(image)
 
 
+def test_uint8_image_matches_torch_reference_bit_for_bit():
+    """The NumPy uint8 path must reproduce the Torch arithmetic and layout exactly.
+
+    uint8 has 256 values, so placing each of them in every channel checks the
+    conversion exhaustively rather than on a sample.
+    """
+    values = np.arange(256, dtype=np.uint8)
+    image = np.stack(
+        [np.tile(values, (4, 1)), np.tile(values[::-1], (4, 1)), np.tile(np.roll(values, 7), (4, 1))],
+        axis=-1,
+    )
+    reference = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32) / 255.0 * 2.0 - 1.0
+
+    out = Pi05ImageProcessor(image_size=4)._to_tensor(image)
+
+    assert out.dtype == reference.dtype
+    assert out.shape == reference.shape
+    # The device copy keeps these strides, and they select the convolution layout.
+    assert out.stride() == reference.stride()
+    assert out.contiguous().numpy().tobytes() == reference.contiguous().numpy().tobytes()
+
+
+def test_empty_image_matches_torch_reference():
+    out = Pi05ImageProcessor(image_size=8).make_empty_image()
+    reference = torch.full((1, 3, 8, 8), -1.0)
+
+    assert out.dtype == reference.dtype
+    assert out.stride() == reference.stride()
+    assert torch.equal(out, reference)
+
+
+def _all_uint8_values_frame(size: int = 16) -> np.ndarray:
+    """A ``size x size`` frame whose channels together hold every uint8 value."""
+    values = np.arange(256, dtype=np.uint8).reshape(16, 16)
+    frame = np.stack([values, values[::-1, ::-1], np.roll(values, 7)], axis=-1)
+    return np.ascontiguousarray(np.tile(frame, (size // 16, size // 16, 1)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The device conversion path needs a CUDA GPU.")
+def test_device_uint8_conversion_matches_host_path_bit_for_bit():
+    """The batched device conversion must equal the host path in values and strides."""
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import _uint8_frames_to_unit_range_on_device
+
+    device = torch.device("cuda")
+    frames = [
+        _all_uint8_values_frame(),
+        np.zeros((16, 16, 3), dtype=np.uint8),
+        np.full((16, 16, 3), 255, dtype=np.uint8),
+    ]
+    host = [Pi05ImageProcessor(image_size=16).preprocess_single(frame).to(device=device) for frame in frames]
+
+    out = _uint8_frames_to_unit_range_on_device(frames, device)
+
+    assert len(out) == len(host)
+    for got, want in zip(out, host):
+        assert got.dtype == want.dtype
+        assert got.shape == want.shape
+        assert got.stride() == want.stride()
+        assert got.cpu().contiguous().numpy().tobytes() == want.cpu().contiguous().numpy().tobytes()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The device conversion path needs a CUDA GPU.")
+@pytest.mark.parametrize("present", [(True, True, True), (True, False, True), (False, True, False)])
+def test_model_inputs_with_shared_constants_match_the_host_path(present):
+    """Cached constants and device conversion must not change any model input."""
+    from vllm_omni.diffusion.models.pi05 import processor_pi05
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import _ModelInputConstants
+
+    device = torch.device("cuda")
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3, image_resolution=(16, 16))
+    observation = {
+        "images": {key: _all_uint8_values_frame() for key, used in zip(_EXPECTED_CAMERA_ORDER, present) if used},
+        "state": np.linspace(-1.0, 1.0, 32, dtype=np.float32),
+        "prompt": "pick up the red block",
+    }
+
+    constants = _ModelInputConstants(16, device)
+    got = _assemble_model_inputs(observation, config, _FakeTokenizer(), device, None, constants)
+    original = processor_pi05._is_model_sized_uint8_frame
+    processor_pi05._is_model_sized_uint8_frame = lambda image, image_size: False
+    try:
+        want = _assemble_model_inputs(observation, config, _FakeTokenizer(), device, None)
+    finally:
+        processor_pi05._is_model_sized_uint8_frame = original
+
+    for got_group, want_group in zip(got[:2], want[:2]):
+        assert len(got_group) == len(want_group)
+        for got_tensor, want_tensor in zip(got_group, want_group):
+            assert got_tensor.dtype == want_tensor.dtype
+            assert got_tensor.shape == want_tensor.shape
+            assert got_tensor.stride() == want_tensor.stride()
+            assert torch.equal(got_tensor, want_tensor)
+    for got_tensor, want_tensor in zip(got[2:], want[2:]):
+        assert got_tensor.dtype == want_tensor.dtype
+        assert got_tensor.shape == want_tensor.shape
+        assert torch.equal(got_tensor, want_tensor)
+
+
 def test_resize_with_pad_pads_with_minus_one():
     out = resize_with_pad(torch.zeros(1, 3, 100, 200), 224, 224)
     assert out.shape == (1, 3, 224, 224)
@@ -858,6 +1024,145 @@ def test_sample_actions_uses_request_generator(tiny_model):
 
     assert torch.equal(first, repeated)
     assert not torch.equal(first, different)
+
+
+class _RecordingCUDAGraphs(Pi05CUDAGraphs):
+    """Records which ``sample_actions`` region runs through the graph path."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.calls: list[str] = []
+
+    def embed_prefix(self, *args, **kwargs):
+        self.calls.append("embed_prefix")
+        return super().embed_prefix(*args, **kwargs)
+
+    def prefix_forward(self, *args, **kwargs):
+        self.calls.append("prefix_forward")
+        return super().prefix_forward(*args, **kwargs)
+
+    def denoise_step(self, *args, **kwargs):
+        self.calls.append("denoise_step")
+        return super().denoise_step(*args, **kwargs)
+
+
+@pytest.mark.slow
+def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
+    """Once installed, every region goes through ``cuda_graphs`` (the denoise
+    step once per step), and falling back to eager reproduces the baseline bit
+    for bit. The real-checkpoint check is ``test_pi05_cuda_graph_parity.py``."""
+    model = tiny_model.eval()
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run():
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=3
+        )
+
+    graphs = _RecordingCUDAGraphs(model)
+    with torch.no_grad():
+        eager = run()
+        model.cuda_graphs = graphs
+        try:
+            optimized = run()
+        finally:
+            model.cuda_graphs = None
+
+    assert graphs.calls == ["embed_prefix", "prefix_forward"] + ["denoise_step"] * 3
+    assert torch.equal(optimized, eager)
+
+
+@pytest.mark.slow
+def test_cuda_graph_capture_failure_raises(tiny_model):
+    """``enforce_eager=False`` asks for the graph path: a failed capture must
+    stop startup rather than silently serve eagerly."""
+    assert tiny_model.kv_cache is None
+    with pytest.raises(RuntimeError, match="enforce_eager"):
+        Pi05CUDAGraphs(tiny_model).capture()
+
+
+@pytest.mark.slow
+def test_preallocated_kv_cache_is_rewritten_every_call():
+    """``sample_actions`` writes every K/V slot it reads before reading it, so
+    the preallocated cache reproduces a one-off cache bit for bit whatever an
+    earlier call left in it."""
+    model = _tiny_pi05_model().eval()
+    # AdaRMS ``dense`` is zero-initialized, which closes every expert gate and
+    # leaves the chunk independent of the K/V. Open the gates.
+    generator = torch.Generator().manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Pi05AdaRMSNorm) and module.dense is not None:
+            module.dense.weight.data.normal_(std=0.02, generator=generator)
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run(lang_tokens):
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang_tokens, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+
+    prompt = torch.zeros(1, 200, dtype=torch.long)
+    other_prompt = torch.ones(1, 200, dtype=torch.long)
+    with torch.no_grad():
+        one_off = run(prompt)
+        cache = model.new_kv_cache(batch_size=1)
+        assert cache.fits(1, 3 * 256 + 200)
+        cache.key.fill_(float("nan"))
+        cache.value.fill_(float("nan"))
+        model.kv_cache = cache
+        preallocated = run(prompt)
+        other = run(other_prompt)
+        after_other = run(prompt)
+
+    assert torch.isfinite(cache.key).all() and torch.isfinite(cache.value).all()
+    assert torch.equal(preallocated, one_off)
+    assert not torch.equal(other, one_off)
+    assert torch.equal(after_other, one_off)
+
+
+@pytest.mark.slow
+def test_forward_requires_a_kv_cache(tiny_model):
+    backbone = tiny_model.paligemma_with_expert
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[torch.zeros(1, 4, tiny_model.vlm_width), None], use_cache=True)
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
+
+
+@pytest.mark.slow
+def test_fused_kernels_are_off_until_enabled_and_need_cuda():
+    """The eager baseline never runs the fused kernels; enabling them on a
+    model they cannot serve raises and leaves it on the baseline. The kernels
+    themselves are ``test_pi05_fused_kernels.py``'s (CUDA)."""
+    model = _tiny_pi05_model()
+    assert model.paligemma_with_expert.fused_kernels is False
+    with pytest.raises(RuntimeError, match="not a CUDA device"):
+        model.enable_fused_kernels()
+    assert model.paligemma_with_expert.fused_kernels is False
+
+
+@pytest.mark.slow
+def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
+    """Calls the kernels do not cover run eagerly even once they are enabled."""
+    backbone = tiny_model.paligemma_with_expert
+    serve = modeling_pi05._fused_kernels_serve
+    cache = tiny_model.new_kv_cache(batch_size=1)
+    backbone.fused_kernels = True
+    try:
+        assert serve(backbone, cache, batch_size=1)
+        assert not serve(backbone, cache, batch_size=2)
+        assert not serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
+        assert not serve(backbone, [], batch_size=1)
+        backbone.fused_kernels = False
+        assert not serve(backbone, cache, batch_size=1)
+    finally:
+        backbone.fused_kernels = False
 
 
 # ----------------------------------------------------------------------------

@@ -41,6 +41,7 @@ from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams, disable_watermarking
 from vllm_omni.tracing import capture_trace_headers
+from vllm_omni.utils import latency_trace
 
 logger = init_logger(__name__)
 
@@ -580,6 +581,7 @@ class AsyncOmniEngine(OmniEngineBase):
         )
         try:
             self.request_queue.sync_q.put(msg)
+            latency_trace.mark(request_id, "engine_enqueued")
         except BaseException:
             for artifact_dir in msg.request_artifact_dirs or ():
                 shutil.rmtree(artifact_dir, ignore_errors=True)
@@ -786,6 +788,7 @@ class AsyncOmniEngine(OmniEngineBase):
         parent_enqueued = False
         try:
             await self.request_queue.async_q.put(msg)
+            latency_trace.mark(msg.request_id, "engine_enqueued")
             parent_enqueued = True
             for companion in companions:
                 await self.request_queue.async_q.put(companion)

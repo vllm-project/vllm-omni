@@ -285,6 +285,52 @@ def test_inline_returns_queued_output_before_engine_dead(client, mock_engine):
         client.get_diffusion_output_nowait()
 
 
+@pytest.mark.asyncio
+async def test_inline_wait_diffusion_output_returns_at_once_when_output_is_queued(client, mock_engine):
+    output = OmniRequestOutput.from_diffusion(request_id="req-queued", images=[])
+    client._publish_output(output)
+
+    await asyncio.wait_for(client.wait_diffusion_output(timeout=30.0), timeout=1.0)
+
+    assert client.get_diffusion_output_nowait() is output
+
+
+@pytest.mark.asyncio
+async def test_inline_wait_diffusion_output_wakes_when_output_is_published(client, mock_engine):
+    output = OmniRequestOutput.from_diffusion(request_id="req-late", images=[])
+    waiter = asyncio.create_task(client.wait_diffusion_output(timeout=30.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    client._publish_output(output)
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+    assert client.get_diffusion_output_nowait() is output
+
+
+@pytest.mark.asyncio
+async def test_inline_wait_diffusion_output_returns_after_timeout(client, mock_engine):
+    await asyncio.wait_for(client.wait_diffusion_output(timeout=0.01), timeout=1.0)
+
+    assert client.get_diffusion_output_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_inline_wait_diffusion_output_wakes_on_executor_failure_from_another_thread(client, mock_engine):
+    callback = mock_engine.executor.register_failure_callback.call_args.args[0]
+    waiter = asyncio.create_task(client.wait_diffusion_output(timeout=30.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    await asyncio.wait_for(waiter, timeout=1.0)
+    thread.join()
+
+    with pytest.raises(EngineDeadError, match="inline diffusion engine is dead"):
+        client.get_diffusion_output_nowait()
+
+
 def test_inline_check_health_marks_engine_dead(client, mock_engine):
     mock_engine.executor.check_health.side_effect = EngineDeadError()
 
