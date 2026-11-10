@@ -2,9 +2,18 @@
 
 This recipe serves the six-step
 [`MiniMaxAI/MiniMax-H3-Image`](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
-checkpoint through `POST /v1/images/generations`. The validated task is
-text-to-image on four AMD Instinct MI350X GPUs (`gfx950`). Image editing and
-other hardware profiles were not validated by this run.
+checkpoint through `POST /v1/images/generations` (text-to-image) and
+`POST /v1/images/edits` (image editing) on AMD Instinct GPUs. Two sets of
+results are documented:
+
+- The original four-MI350X (`gfx950`) text-to-image profile, with its
+  100-request benchmark ([Historical MI350X validation](#historical-mi350x-validation)).
+- Text-to-image and editing at the release's 4K sizes on MI325X (`gfx942`)
+  and MI350X (`gfx950`), on 1, 2, 4 and 8 GPUs with Ulysses or TP
+  ([Measured profiles on MI325X and MI350X](#measured-profiles-on-mi325x-and-mi350x)).
+
+MI300X shares MI325X's `gfx942` code path and MI355X shares MI350X's `gfx950`
+path; neither was measured.
 
 ## Runtime and model preparation
 
@@ -32,6 +41,52 @@ current source into the matching runtime. `PYTHONPATH` and the working
 directory both select that source, avoiding the image's older Omni checkout.
 An equivalent source-built ROCm runtime must be qualified separately; see the
 [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md).
+
+### Runtime per GPU architecture
+
+The per-commit `rocm/vllm-omni:<commit>` CI images build vLLM with
+`PYTORCH_ROCM_ARCH=gfx942`, so their vLLM extensions contain `gfx942` code
+objects only. Check an image with:
+
+```bash
+docker run --rm --entrypoint bash "$SERVER_IMAGE" -c \
+  'cd "$(python3 -c "import os, vllm; print(os.path.dirname(vllm.__file__))")" &&
+   strings -a _C.abi3.so | grep -o "amdgcn-amd-amdhsa--gfx9[0-9a-f]*" | sort | uniq -c'
+```
+
+| GPU | Runtime | Validated |
+| --- | --- | --- |
+| MI300X, MI325X (`gfx942`) | A `rocm/vllm-omni:<commit>` CI image with this checkout mounted, as below | MI325X: `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` |
+| MI350X, MI355X (`gfx950`) | The CI image profile below, which works around its `gfx942`-only kernels with `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` and `VLLM_ROCM_USE_SKINNY_GEMM=0` | MI350X, four GPUs, text-to-image |
+| MI350X, MI355X (`gfx950`) | The multi-arch `vllm/vllm-openai-rocm:v0.33.0` image (`gfx90a`, `gfx942`, `gfx950`, the base used by `docker/Dockerfile.rocm`) with this checkout installed | MI350X, 1–8 GPUs, text-to-image and editing |
+
+With a CI image on `gfx950`, startup fails with `hipErrorInvalidKernelFile` /
+`hipErrorInvalidImage` in any vLLM kernel that has no `gfx950` code object.
+The multi-arch image provides those kernels and needs neither
+`VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS` nor the skinny-GEMM override.
+Install this checkout into it without replacing its PyTorch or vLLM:
+
+```bash
+docker run -d --name minimax-h3-image-amd \
+  --device=/dev/kfd --device=/dev/dri \
+  --security-opt seccomp=unconfined --group-add video \
+  --ipc=host --network host --shm-size 64G \
+  -v "$SOURCE_DIR:/workspace" \
+  -v "$CACHE_ROOT:$CACHE_ROOT:ro" \
+  -v "$RUNTIME_DIR/model_index.local.json:$MODEL_DIR/model_index.json:ro" \
+  --entrypoint sleep vllm/vllm-openai-rocm:v0.33.0 infinity
+
+docker exec minimax-h3-image-amd bash -c '
+  pip freeze | grep -E "^(torch|torchvision|torchaudio|numpy)==" > /tmp/pins.txt
+  grep -v -E "^(cosmos-guardrail|openai-whisper|s3tokenizer|kernels)" \
+    /workspace/requirements/common.txt > /tmp/requirements.txt
+  pip install -r /tmp/requirements.txt -c /tmp/pins.txt
+  VLLM_OMNI_VERSION_OVERRIDE=0.0.0 pip install -e /workspace --no-deps --no-build-isolation'
+```
+
+The excluded packages are not used by MiniMax-H3-Image. Pip installs
+Transformers 5.19.0, matching the recorded versions above. Then start the
+server with `docker exec` and the `vllm serve` arguments shown below.
 
 From the repository root, set the host paths:
 
@@ -135,6 +190,20 @@ Important settings for this profile:
 - Precision is BF16, without quantization or offload. The image pipeline
   keeps its DiT eager and uses the released six-step PDD schedule.
 
+### Per-architecture settings and other layouts
+
+- VAE graph replay is a `gfx950` issue. On MI350X, keep
+  `--no-enable-cuda-graph-decode`: with graphs enabled, a request can remain
+  in VAE decode with the GPU at 100% utilization and never complete. On
+  MI325X (`gfx942`), graph decode stayed enabled for every MI325X measurement
+  below with no failures, so omit the flag there. On one GPU, decode at
+  4736 × 3552 took 1.0 s with graphs on MI325X and 4.9 s eager on MI350X.
+- For other GPU counts, set `--num-gpus N --usp N --ring 1` (Ulysses; the 56
+  attention heads allow N = 2, 4 or 8) or `--num-gpus N
+  --tensor-parallel-size N` (TP). Ulysses had the lowest measured latency
+  at every GPU count; TP uses less memory per GPU. One GPU needs no parallel
+  flags and holds the full model (about 112 GiB of weights).
+
 ## Generate an image
 
 Submit six inference steps or omit the step count to use the checkpoint's
@@ -160,6 +229,22 @@ The output PNG has the requested 1344×768 dimensions. The default
 `min_generation_area=4194304` policy generates on a 2720×1536 canvas and
 resizes the decoded image to the requested dimensions. Preserve both sizes
 when comparing measurements.
+
+## Edit an image
+
+Editing uses the multipart endpoint. Repeat the `image` part for more
+references; they are `<Picture 1>`, `<Picture 2>`, … in the prompt. The
+release example (`examples/` in the model repository) is:
+
+```bash
+curl --fail --silent --show-error \
+  http://127.0.0.1:8001/v1/images/edits \
+  -F "image=@picture1.png" \
+  -F "prompt=<prompt.edit.txt" \
+  -F size=4096x4096 -F seed=1234 -F generator_device=cpu \
+  -F response_format=b64_json -F output_format=png \
+  > edit-response.json
+```
 
 ## Benchmark
 
@@ -194,6 +279,93 @@ canvas metadata; it does not override inference settings. Delivery latency
 runs from POST submission through full response-body receipt, including
 queueing, generation, encoding, and base64 transfer. Throughput includes
 client validation and persistence. Warmups are excluded from both metrics.
+
+## Measured profiles on MI325X and MI350X
+
+Source `efecc3717` with `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS` unset (fused
+vLLM kernels), BF16, no offload, default encoder TP 1, prompt-embedding cache
+at its default. Image revision `7b3d20b4659f5d4b3ad7205daa008e47d6b1e868`; the
+text encoder used the same cached `FL2VA/text_encoder` weights as above,
+resolved offline from the local Hugging Face cache.
+
+| GPU | Runtime | Extra server flags |
+| --- | --- | --- |
+| MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on) |
+| MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with this checkout installed | `--no-enable-cuda-graph-decode` |
+
+Both used vLLM `0.33.0+rocm100`, PyTorch `2.13.0+rocm10.0.0`, Transformers
+5.19.0 and Diffusers 0.40.0, with `--diffusion-attention-backend FLASH_ATTN`
+and `--enable-diffusion-pipeline-profiler` for the stage split.
+
+Mean delivery latency of warm requests, one request at a time (three per
+cell, first excluded). Text-to-image uses the release prompt with seed 42;
+editing uses the release prompt and reference with seed 1234; all use
+`generator_device=cpu`. Delivery runs from POST to full response-body
+receipt, including base64 transfer; client-side decoding is excluded.
+
+| GPUs and layout | t2i 4736×3552 | edit 4096×4096 | t2i 6272×2688 | t2i 1024×1024 (2048² canvas) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × MI325X | 12.85 s | 15.46 s | 12.95 s | 2.66 s |
+| 2 × MI325X, Ulysses 2 | 9.11 s | 10.79 s | 9.25 s | 2.06 s |
+| 4 × MI325X, Ulysses 4 | 4.71 s | 5.45 s | 4.70 s | 1.12 s |
+| 4 × MI325X, TP 4 | 5.42 s | 6.33 s | 5.41 s | 1.27 s |
+| 8 × MI325X, Ulysses 8 (2174c09) | 2.32 s | 3.21 s | 2.31 s | 0.64 s |
+| 8 × MI325X, TP 8 (2174c09) | 3.02 s | 4.01 s | 3.74 s | 0.80 s |
+| 1 × MI350X | 12.81 s | 14.38 s | 12.71 s | 2.79 s |
+| 2 × MI350X, Ulysses 2 | 8.13 s | 9.20 s | 8.09 s | 1.80 s |
+| 4 × MI350X, Ulysses 4 | 3.91 s | 4.63 s | 3.90 s | 0.99 s |
+| 8 × MI350X, Ulysses 8 | 2.15 s | 2.55 s | 2.16 s | 0.61 s |
+| 8 × MI350X, TP 8 | 2.63 s | 3.04 s | 2.56 s | 0.79 s |
+
+The 8-GPU MI325X rows were measured at `2174c09` (with a local guard that
+skips the fused RMSNorm kernel for mixed weight/input dtypes) because GPUs
+0–3 were in use during the `efecc3717` run; at 1, 2 and 4 GPUs the two
+revisions agree within 2%.
+
+Stage split for text-to-image at 4736 × 3552, from the pipeline profiler
+(`_encode_text`, `_denoise`, `vae.decode_latent`; slowest rank).
+
+| GPUs and layout | text encode | denoise (6 steps) | VAE decode | delivery |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × MI325X | 0.06 s | 11.54 s | 1.06 s | 12.85 s |
+| 2 × MI325X, Ulysses 2 | 0.06 s | 8.30 s | 0.55 s | 9.11 s |
+| 4 × MI325X, Ulysses 4 | 0.06 s | 4.15 s | 0.29 s | 4.71 s |
+| 4 × MI325X, TP 4 | 0.05 s | 4.87 s | 0.29 s | 5.42 s |
+| 8 × MI325X, Ulysses 8 (2174c09) | 0.06 s | 1.90 s | 0.16 s | 2.32 s |
+| 8 × MI325X, TP 8 (2174c09) | 0.06 s | 2.61 s | 0.16 s | 3.02 s |
+| 1 × MI350X | 0.05 s | 7.56 s | 4.90 s | 12.81 s |
+| 2 × MI350X, Ulysses 2 | 0.04 s | 5.47 s | 2.29 s | 8.13 s |
+| 4 × MI350X, Ulysses 4 | 0.04 s | 2.33 s | 1.15 s | 3.91 s |
+| 8 × MI350X, Ulysses 8 | 0.04 s | 1.16 s | 0.62 s | 2.15 s |
+| 8 × MI350X, TP 8 | 0.04 s | 1.60 s | 0.67 s | 2.63 s |
+
+Throughput for text-to-image at 4096 × 4096 with concurrent requests:
+
+| GPUs and layout | Concurrency | Requests | Images/min | Mean delivery |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × MI325X | 2 | 4 | 4.7 | 22.39 s |
+| 1 × MI325X | 4 | 8 | 4.7 | 41.60 s |
+| 4 × MI325X, Ulysses 4 | 2 | 4 | 13.2 | 7.98 s |
+| 4 × MI325X, Ulysses 4 | 4 | 8 | 13.0 | 15.11 s |
+| 8 × MI325X, Ulysses 8 (2174c09) | 2 | 4 | 27.6 | 3.81 s |
+| 8 × MI325X, Ulysses 8 (2174c09) | 4 | 8 | 27.9 | 7.00 s |
+| 1 × MI350X | 2 | 4 | 4.9 | 21.45 s |
+| 1 × MI350X | 4 | 8 | 5.0 | 38.80 s |
+| 8 × MI350X, Ulysses 8 | 2 | 4 | 31.4 | 3.37 s |
+| 8 × MI350X, Ulysses 8 | 4 | 8 | 31.8 | 6.16 s |
+
+A server processes one image at a time, so concurrency adds queueing rather
+than throughput. For throughput, independent single-GPU servers are expected
+to scale per GPU (for example, about 8 × 4.9 ≈ 39 images/min per MI350X
+node); this was not measured. Every listed run completed with no failed
+requests. The first request after startup was within 0.15 s of the warm
+latency, because the server's startup dummy run absorbs compilation. Model
+loading took 112 GiB per server on one GPU, in about 38–46 s.
+
+Outputs were compared visually with the release examples and across GPUs
+and layouts: composition and edited content match, but pixels are not
+identical across hardware or layouts (edit PSNR 31–36 dB, text-to-image
+17–20 dB between configurations). These are not image-quality scores.
 
 ## Historical MI350X validation
 
