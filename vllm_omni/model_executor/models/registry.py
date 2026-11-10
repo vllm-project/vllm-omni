@@ -9,6 +9,7 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
@@ -344,6 +345,12 @@ _OMNI_MODELS = {
         "gepard",
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
+    ),
+    ## Kokoro-82M (hexgrad)
+    "KokoroForConditionalGeneration": (
+        "kokoro",
+        "modeling_kokoro",
+        "KokoroForConditionalGeneration",
     ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (

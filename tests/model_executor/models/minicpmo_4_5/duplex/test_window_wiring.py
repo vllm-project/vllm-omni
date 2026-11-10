@@ -1641,3 +1641,90 @@ def test_duplex_window_install_tolerates_missing_cache_or_model_config() -> None
     runner = SimpleNamespace(device=torch.device("cpu"))
     inv_freq = MiniCPMO45DuplexWorkerHelper.get_rope_inv_freq(runner)
     assert inv_freq is not None and inv_freq.shape == (64,)
+
+
+@pytest.mark.parametrize("container", [tuple, list])
+@pytest.mark.parametrize("flattened", [False, True])
+def test_split_kv_reanchor_updates_original_storage(container, flattened):
+    """Ascend split caches must update K in place and preserve V and sink."""
+    block_size, head_dim = 16, 8
+    inv_freq = torch.tensor([1.0, 0.1, 0.01, 0.001])
+    keys = torch.randn(4, block_size, 2, head_dim)
+    values = torch.randn_like(keys)
+    original = keys.clone()
+    original_values = values.clone()
+    cache = (
+        container((keys.view(4, block_size, -1), values.view(4, block_size, -1)))
+        if flattened
+        else container((keys, values))
+    )
+    plan = PositionReanchor(delta=16, moved_from=32, sink_blocks=1)
+    positions = torch.arange(32, 48)
+    expected = rotate_keys(original[1], 16, inv_freq)
+    touched = rotate_cached_keys(
+        cache,
+        block_ids=[0, 1, 2, 3],
+        positions=positions,
+        plan=plan,
+        inv_freq=inv_freq,
+        block_size=block_size,
+        head_dim=head_dim,
+    )
+    assert touched == 16
+    torch.testing.assert_close(keys[1], expected)
+    torch.testing.assert_close(keys[0], original[0])
+    torch.testing.assert_close(keys[2:], original[2:])
+    torch.testing.assert_close(values, original_values)
+
+
+def test_flattened_cache_rejects_partial_rotary():
+    with pytest.raises(ValueError, match="explicit head_dim and full rotary"):
+        rotate_cached_keys(
+            torch.zeros(4, 16, 32),
+            block_ids=[0, 1, 2, 3],
+            positions=torch.arange(32, 48),
+            plan=PositionReanchor(delta=16, moved_from=32, sink_blocks=1),
+            inv_freq=torch.ones(4),
+            block_size=16,
+            head_dim=16,
+        )
+
+
+def test_flattened_split_cache_noncontiguous_storage():
+    # Splitting the last axis of a combined allocation leaves gaps between rows,
+    # but splitting the head axis with view is still valid and must not copy.
+    storage = torch.randn(4, 16, 32)
+    keys, values = storage[..., :16], storage[..., 16:]
+    before = storage.clone()
+    assert not keys.is_contiguous()
+    frequencies = torch.ones(4)
+    rotate_cached_keys(
+        (keys, values),
+        block_ids=[0, 1, 2, 3],
+        positions=torch.arange(32, 48),
+        plan=PositionReanchor(delta=16, moved_from=32, sink_blocks=1),
+        inv_freq=frequencies,
+        block_size=16,
+        head_dim=8,
+    )
+    expected = rotate_keys(before[1, :, :16].view(16, 2, 8), 16, frequencies)
+    torch.testing.assert_close(keys[1].view(16, 2, 8), expected)
+    torch.testing.assert_close(values, before[..., 16:])
+    torch.testing.assert_close(keys[0], before[0, :, :16])
+
+
+@pytest.mark.parametrize("head_dim,rotary_dim,width", [(16, 8, 32), (8, 8, 17)])
+def test_flattened_layout_preflight_rejects_invalid_config(head_dim, rotary_dim, width):
+    validate = rotate_cached_keys.__globals__["flattened_key_cache_view"]
+    with pytest.raises(ValueError):
+        validate(torch.zeros(4, 16, width), 16, head_dim, rotary_dim)
+
+
+def test_flattened_layout_preflight_preserves_storage():
+    validate = rotate_cached_keys.__globals__["flattened_key_cache_view"]
+    storage = torch.randn(4, 16, 32)
+    key = storage[..., :16]
+    before = storage.clone()
+    view = validate(key, 16, 8, 8)
+    assert view.data_ptr() == key.data_ptr()
+    torch.testing.assert_close(storage, before)

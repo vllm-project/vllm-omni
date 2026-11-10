@@ -9,7 +9,11 @@ import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
 from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
-from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
+from vllm_omni.engine.duplex.realtime_events import (
+    RealtimeProjectionState,
+    project_internal_event,
+    retrieve_item_events,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,7 +41,10 @@ async def test_queued_response_creation_keeps_payload_and_byte_count(event_type,
     text = "Growing response. " * 512
     project_internal_event(state, {"type": event_type, "response_id": "r", delta_field: text})
     item = next(iter(state.conversation_items.values()))
-    assert item["content"][0][content_field] == text
+    # The stored copy is rebuilt lazily; retrieval materializes it on demand.
+    assert item["content"] == []
+    retrieved = retrieve_item_events(state, {"item_id": "item_r"})[0].to_realtime()
+    assert retrieved["item"]["content"][0][content_field] == text
     assert output.pending_bytes == byte_count
     delivered = [await output.get() for _ in events]
     assert [event.to_realtime() for event in delivered] == payloads

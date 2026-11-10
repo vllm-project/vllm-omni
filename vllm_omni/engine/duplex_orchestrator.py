@@ -23,6 +23,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -32,6 +33,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageRequestContext,
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
+    duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
@@ -45,6 +47,7 @@ from vllm_omni.engine.orchestrator import (
     build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -63,6 +66,10 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    # Session stats (RFC #8325): per stage, the chunks with spans since its last
+    # session output, and the chunk of its latest producing step.
+    pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
+    stage_output_chunks: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 class DuplexOrchestrator(Orchestrator, DuplexStagePort):
@@ -115,7 +122,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             model_config=model_config,
             admission_limit=admission_limit,
             log_stats=self.log_stats,
+            tracer=self.tracer,
         )
+
+    def duplex_stage_names(self) -> list[str]:
+        """Each stage's model role (``thinker``, ``talker``, ...) for session stats."""
+        names = []
+        for stage_id, pool in enumerate(self.stage_pools):
+            model_config = getattr(getattr(pool, "stage_vllm_config", None), "model_config", None)
+            name = getattr(model_config, "model_stage", None)
+            names.append(name if isinstance(name, str) and name else f"stage{stage_id}")
+        return names
 
     # ------------------------------------------------------------------ #
     # Template seams                                                     #
@@ -233,6 +250,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
+            perf_chunks=self._take_perf_chunks(req_state, stage_id),
         )
         return runner.on_stage_output(
             stage_id,
@@ -243,6 +261,60 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
+
+    def _collect_duplex_stage_work(
+        self,
+        stage_id: int,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        rows = stage_work_rows(eco.stage_work)
+        if not rows:
+            return
+        runner = self.session_manager.runners.get(req_state.session_id)
+        if runner is not None:
+            # Now, not with a later session output: the step may never produce one.
+            runner.on_stage_work([(stage_id, *row) for row in rows])
+        req_state.pending_perf_chunks.setdefault(stage_id, set()).update((row[0], row[1]) for row in rows)
+        # The recorder puts the producing step's chunk last.
+        req_state.stage_output_chunks[stage_id] = (rows[-1][0], rows[-1][1])
+
+    @staticmethod
+    def _take_perf_chunks(req_state: DuplexOrchestratorRequestState, stage_id: int) -> frozenset[tuple[int, int]]:
+        """The chunks a session output of ``stage_id`` finishes handling for.
+
+        Those with spans since the stage's last output, plus its producing chunk:
+        outputs and raw outputs need not pair one to one.
+        """
+        chunks = req_state.pending_perf_chunks.pop(stage_id, set())
+        output_chunk = req_state.stage_output_chunks.get(stage_id)
+        if output_chunk is not None:
+            chunks.add(output_chunk)
+        return frozenset(chunks)
+
+    def _annotate_next_stage_inputs(
+        self,
+        src_stage_id: int,
+        req_state: OrchestratorRequestState,
+        next_inputs: list[Any],
+    ) -> None:
+        """Carry the source step's chunk id into the forwarded duplex envelope (RFC #8325)."""
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        chunk = req_state.stage_output_chunks.get(src_stage_id)
+        if chunk is None:
+            return
+        for next_input in next_inputs:
+            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
+            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
+            if isinstance(buffer, dict) and isinstance(duplex, dict):
+                # Copy both levels: the stage-input processor may share them with bridge state.
+                next_input["model_intermediate_buffer"] = {
+                    **buffer,
+                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
+                }
 
     async def _report_duplex_session_request_error(
         self,
@@ -275,9 +347,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request
+        close_session = (
+            not duplex_is_auxiliary_request(req_id)
+            and self.plugin.capabilities(
+                max_sessions=self.duplex_session_config.max_sessions
+            ).supports_core_resumable_request
+        )
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
             runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
@@ -285,6 +360,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=close_session,
+            trace_error=type(exc).__name__,
         )
         return True
 
@@ -294,6 +370,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         abort: bool = False,
         release_owners: bool = False,
+        trace_error: str | None = None,
     ) -> list[OutputMessage]:
         if not request_ids:
             return []
@@ -315,7 +392,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
         try:
-            outputs = await super()._cleanup_request_ids(cleanup_ids, abort=abort)
+            outputs = await super()._cleanup_request_ids(
+                cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
+            )
         except BaseException:
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)
@@ -436,6 +515,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 raise StageUnavailableError(f"stage {context.stage_id}: pinned duplex replica is unavailable")
         request_state = self.request_states.get(context.request_id)
         if request_state is None:
+            session_trace = self.session_manager.session_traces.get(context.session_id)
             request_state = DuplexOrchestratorRequestState(
                 request_id=context.request_id,
                 prompt=None,
@@ -447,6 +527,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 session_id=context.session_id,
                 fence=context.fence,
                 config_generation=context.config_generation,
+                # Resumable stage resources survive turns, so their parent is the session.
+                trace=RequestTrace(self.tracer, context.request_id, session_trace.headers())
+                if self.tracer is not None and session_trace is not None
+                else None,
             )
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):

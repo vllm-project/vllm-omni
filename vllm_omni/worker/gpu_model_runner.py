@@ -56,6 +56,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Cadence of the K-step frame histogram. A short benchmark runs a few hundred
+# forwards, so the default would stay silent exactly where the histogram
+# matters; tests override it to sample the mix of folded and full steps.
+
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
@@ -81,6 +85,38 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
     return {key: value for key, value in kwargs.items() if key in accepted}
 
 
+def _build_prefill_token_mask(
+    prompt_lens: list[int] | np.ndarray,
+    num_computed_tokens: list[int] | np.ndarray,
+    num_scheduled_tokens: list[int],
+    device: torch.device,
+) -> bool | torch.Tensor:
+    """Mark scheduled prompt tokens without relying on query length.
+
+    This assumes each request's scheduled tokens are a contiguous range starting
+    at ``num_computed_tokens``, as guaranteed by the current vLLM scheduler. It
+    does not support sparse/non-contiguous token scheduling; such a scheduler
+    must provide an explicit token-position-aligned prefill mask instead. This
+    restriction concerns scheduling, not sparse model architectures such as MoE.
+    """
+    token_mask: list[bool] = []
+    for prompt_len, num_computed, num_scheduled in zip(
+        prompt_lens,
+        num_computed_tokens,
+        num_scheduled_tokens,
+        strict=True,
+    ):
+        num_prefill = min(max(prompt_len - num_computed, 0), num_scheduled)
+        token_mask.extend([True] * num_prefill)
+        token_mask.extend([False] * (num_scheduled - num_prefill))
+
+    if not any(token_mask):
+        return False
+    if all(token_mask):
+        return True
+    return torch.tensor(token_mask, dtype=torch.bool, device=device)
+
+
 class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
 
@@ -96,6 +132,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._omni_prefix_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._supports_prefill_token_mask = False
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
@@ -105,6 +142,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
+        # The encoder graph manager holds its graphs, their pool and the stage
+        # model; upstream drops it on ROCm only.
+        encoder_cudagraph_manager = getattr(self, "encoder_cudagraph_manager", None)
+        if encoder_cudagraph_manager is not None:
+            encoder_cudagraph_manager.clear()
+            self.encoder_cudagraph_manager = None
         super().shutdown()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
@@ -167,6 +210,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
+        group = getattr(self.vllm_config, "weight_sharing", None)
+        if getattr(group, "role", None) == "provider":
+            raise ValueError(
+                "weight sharing role='provider' requires the Model Runner V2 path; "
+                "the MRv1 runner cannot publish a shared backbone"
+            )
         super().load_model(*args, **kwargs)
         model = getattr(self, "model", None)
         override_fn = None
@@ -178,6 +227,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._snapshot_prefix_cache_model_policy(model)
         self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
+        self._supports_prefill_token_mask = bool(getattr(model, "supports_prefill_token_mask", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
@@ -1702,6 +1752,55 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         )
         return frozenset(handled or ()) if layout else frozenset()
 
+    def _embed_scheduled_input_ids_with_prefill_mask(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: int,
+        multimodal_embeddings: list[torch.Tensor],
+        is_multimodal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embed scheduled tokens with request-aware prefill validation."""
+        input_ids = self.input_ids.gpu[:num_scheduled_tokens]
+        req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        scheduled_tokens = [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in req_ids]
+        # A fully multimodal step with current placeholder tokens is handled by
+        # the placeholder rearrangement below and does not need a token-level
+        # mask. ``mm_features`` describes the whole request, though: a long
+        # multimodal prompt can have a later window containing only text tokens,
+        # so require a current multimodal token before skipping the mask.
+        # ``is_multimodal`` is the CPU-side mask from _gather_mm_embeddings, so
+        # this check adds no CUDA synchronization to the decode path. Mixed
+        # text/multimodal batches retain the mask for text-only request segments.
+        all_requests_multimodal = bool(req_ids) and all(bool(self.requests[req_id].mm_features) for req_id in req_ids)
+        has_current_multimodal_tokens = bool(is_multimodal.numel() and is_multimodal.any())
+        if all_requests_multimodal and has_current_multimodal_tokens:
+            prefill_token_mask = False
+        else:
+            prefill_token_mask = _build_prefill_token_mask(
+                self.input_batch.num_prompt_tokens[:num_reqs],
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                scheduled_tokens,
+                input_ids.device,
+            )
+
+        embedding_kwargs = {
+            "prefill_token_mask": prefill_token_mask,
+            "scheduled_token_counts": scheduled_tokens,
+        }
+        if multimodal_embeddings and getattr(self.model, "supports_embed_input_ids_query_start_loc", False):
+            # The batch has already been reordered. Read host-owned boundaries
+            # so model prompt rearrangement does not assume request order or
+            # introduce a GPU-to-host transfer on every decode step.
+            embedding_kwargs["query_start_loc"] = self.query_start_loc.cpu[: num_reqs + 1].tolist()
+
+        return self.model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            **embedding_kwargs,
+        )
+
     def _embed_multimodal_input_ids(self, num_scheduled_tokens, mm_embeds, is_mm_embed):
         embedding_kwargs = {}
         if mm_embeds and getattr(self.model, "supports_embed_input_ids_query_start_loc", False):
@@ -1753,7 +1852,19 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self._embed_multimodal_input_ids(num_scheduled_tokens, mm_embeds, is_mm_embed)
+            if self._supports_prefill_token_mask:
+                inputs_embeds_scheduled = self._embed_scheduled_input_ids_with_prefill_mask(
+                    scheduler_output,
+                    num_scheduled_tokens,
+                    mm_embeds,
+                    is_mm_embed,
+                )
+            else:
+                inputs_embeds_scheduled = self._embed_multimodal_input_ids(
+                    num_scheduled_tokens,
+                    mm_embeds,
+                    is_mm_embed,
+                )
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
@@ -1857,8 +1968,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
+            batch_preprocess_embeds = inputs_embeds
+            if getattr(self.model, "preprocess_batch_requires_stable_decode", False) and (
+                scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            ):
+                # Keep cleanup/prefetch hooks, but do not let a decode-only
+                # shortcut consume newly admitted or resumed requests.
+                batch_preprocess_embeds = None
             batch_filled_req_ids = self._maybe_run_batch_preprocess(
-                req_ids, preprocess_device, preprocess_input_ids, inputs_embeds, num_scheduled_tokens_np
+                req_ids, preprocess_device, preprocess_input_ids, batch_preprocess_embeds, num_scheduled_tokens_np
             )
 
             # Overlay custom prompt_embeds per request for the prompt portion;
@@ -2232,14 +2350,103 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 tails = self.query_start_loc.cpu[1 : count + 1].to(torch.long) - 1
                 if count and bool((tails >= 0).all()) and bool((tails < input_ids.numel()).all()):
                     cpu_input_tail_ids = self.input_ids.cpu.index_select(0, tails).tolist()
-            update_decode_metadata(
-                cpu_input_tail_ids=cpu_input_tail_ids,
-                input_ids=input_ids,
+            decode_meta_kwargs: dict[str, Any] = {
+                "cpu_input_tail_ids": cpu_input_tail_ids,
+                "input_ids": input_ids,
+                "positions": positions,
+                "inputs_embeds": inputs_embeds,
+                "omni_query_start_loc": model_kwargs_extra.get("omni_query_start_loc"),
+                "req_ids": self.input_batch.req_ids,
+            }
+            # CUDA-graph FULL replay skips Python model.forward, so per-step
+            # runtime payloads (e.g. MammothModa2 generated_len) must be
+            # refreshed here, outside capture. Models that opt into
+            # supports_omni_decode_step_metadata must not rely on Python
+            # forward to cache values later read from compute_logits.
+            # Always pass the key (even when None) so a step with no runtime
+            # info clears the previous batch's cache instead of leaving it.
+            decode_meta_kwargs["runtime_additional_information"] = model_kwargs_extra.get(
+                "runtime_additional_information"
+            )
+            decode_meta_kwargs["model_intermediate_buffer"] = model_kwargs_extra.get("model_intermediate_buffer")
+            update_decode_metadata(**decode_meta_kwargs)
+
+        # Talker multi-frame (K-step) decode: a decode step that schedules K
+        # positions per request runs K codec frames here, one replay each, using
+        # the same loop the NPU runner uses. Everything else -- prefill, a mixed
+        # step, another stage -- falls through to the ordinary single forward.
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+            # Falling through would sample one frame from the last row of each
+            # span and report one stop row for a step that needs one per
+            # position: wrong codec tokens and wrong scheduler accounting, both
+            # silently. The preceding gate log says which check refused.
+            raise RuntimeError(
+                "MiniCPM-o scheduled a multi-token decode step that the multi-frame "
+                "loop declined; see the preceding '[minicpmo] multi-frame Talker "
+                "decode not engaged' line"
+            )
+        if frames > 1:
+            from vllm.forward_context import get_forward_context
+
+            from vllm_omni.worker.talker_cuda_graph import begin_cuda_narrow_step
+
+            narrow = begin_cuda_narrow_step(
+                forward_context=get_forward_context(),
+                frames=frames,
                 positions=positions,
                 inputs_embeds=inputs_embeds,
-                omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
-                req_ids=self.input_batch.req_ids,
+                spans=model_kwargs_extra["request_token_spans"],
+                graph_owner=self,
             )
+
+            def run_model() -> Any:
+                try:
+                    # Bind the class explicitly: a zero-argument super() has no
+                    # __class__ cell inside this nested function. `narrow.context`
+                    # is None once a narrow step was restored (fused graph
+                    # declined); only a live step owns the one-query buffers.
+                    active = narrow is not None and narrow.context is not None
+                    return super(OmniGPUModelRunner, self)._model_forward(
+                        input_ids=None if active else input_ids,
+                        positions=narrow.positions if active else positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        **model_kwargs,
+                        **model_kwargs_extra,
+                    )
+                finally:
+                    finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
+                    if callable(finish_decode_step):
+                        finish_decode_step()
+
+            try:
+                model_output = talker_multiframe.run(
+                    model=self.model,
+                    run_model=run_model,
+                    after_forward=lambda: None,
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    frames=frames,
+                    model_kwargs=model_kwargs,
+                    model_kwargs_extra=model_kwargs_extra,
+                    narrow=narrow,
+                )
+            finally:
+                if narrow is not None:
+                    narrow.restore()
+            # The Talker's vLLM-level head is the two-wide continue/stop row
+            # while input_batch reports vocab_size=0; without the gate the
+            # rejection sampler drops every accepted token.
+            stop_rows = getattr(self.model, "batch_stop_logits", None)
+            talker_multiframe.ensure_stop_token_vocab(
+                self,
+                stop_rows if stop_rows is not None else model_output.text_hidden_states,
+            )
+            self._omni_last_model_output = model_output
+            return model_output
 
         try:
             model_output = super()._model_forward(
