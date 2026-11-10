@@ -122,6 +122,7 @@ def test_production_symmetric_memory_matches_hccl(npu_world):
         ulysses_world_size=dist.get_world_size(),
         ulysses_rank=dist.get_rank(),
         ring_world_size=1,
+        allgather_world_size=1,
     )
     strategies = [
         UlyssesParallelAttention(group, 2, 1, use_sync, ulysses_a2a_permute=True) for use_sync in (False, True)

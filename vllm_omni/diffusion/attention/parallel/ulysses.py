@@ -251,23 +251,21 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
-        if (
-            ulysses_a2a_permute
-            and current_omni_platform.is_npu()
-            and (
-                sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1 or (scatter_idx, gather_idx) != (2, 1)
+        if ulysses_a2a_permute:
+            from vllm_omni.diffusion.distributed.a2a_permute import (
+                ensure_a2a_permute_available,
+                validate_a2a_permute_config,
             )
-        ):
-            raise ValueError("NPU ulysses_a2a_permute requires pure Ulysses with scatter_idx=2, gather_idx=1")
-        if _a2a_permute_enabled(
-            ulysses_a2a_permute,
-            scatter_idx,
-            gather_idx,
-            sp_group.ulysses_world_size,
-        ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
 
-            ensure_a2a_permute_available()
+            validate_a2a_permute_config(
+                ulysses_degree=sp_group.ulysses_world_size,
+                ring_degree=sp_group.ring_world_size,
+                allgather_degree=sp_group.allgather_world_size,
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+            )
+            if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
+                ensure_a2a_permute_available()
 
     @property
     def enabled(self) -> bool:
@@ -296,8 +294,10 @@ class UlyssesParallelAttention:
                 K/V once per AllGather rank.
         """
         mode = get_ulysses_mode(default="strict")
-        if self._ulysses_a2a_permute and current_omni_platform.is_npu() and mode != "strict":
-            raise ValueError("NPU symmetric memory Ulysses currently supports only ulysses_mode='strict'")
+        if self._ulysses_a2a_permute:
+            from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
+
+            validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
         if attn_metadata is not None:

@@ -101,6 +101,40 @@ def _ensure_built() -> None:
         _BUILT = True
 
 
+def validate_a2a_permute_config(
+    *,
+    enforce_eager: bool | None = None,
+    ulysses_mode: str | None = None,
+    ulysses_degree: int | None = None,
+    ring_degree: int | None = None,
+    allgather_degree: int | None = None,
+    scatter_idx: int | None = None,
+    gather_idx: int | None = None,
+) -> None:
+    """Validate resolved NPU constraints without initializing the backend.
+
+    Only supplied values are checked: the factory supplies configuration,
+    direct strategy construction supplies initialized group sizes/layout,
+    and each forward supplies its current mode. Callers own context lookup.
+    """
+    if not current_omni_platform.is_npu():
+        return
+    if enforce_eager is False:
+        raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
+    if (
+        (ulysses_mode is not None and ulysses_mode != "strict")
+        or (ulysses_degree is not None and ulysses_degree <= 1)
+        or (ring_degree is not None and ring_degree != 1)
+        or (allgather_degree is not None and allgather_degree != 1)
+    ):
+        raise ValueError(
+            "NPU ulysses_a2a_permute requires strict, pure Ulysses with "
+            "ulysses_mode='strict', ulysses_degree > 1, ring_degree = 1 and allgather_degree = 1"
+        )
+    if (scatter_idx is not None and scatter_idx != 2) or (gather_idx is not None and gather_idx != 1):
+        raise ValueError("NPU ulysses_a2a_permute requires scatter_idx=2, gather_idx=1")
+
+
 def ensure_a2a_permute_available() -> None:
     """Check/build the platform backend during worker initialization."""
     if current_omni_platform.is_npu():

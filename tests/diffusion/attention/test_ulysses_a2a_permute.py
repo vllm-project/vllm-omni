@@ -9,6 +9,7 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import factory, ulysses
 from vllm_omni.diffusion.distributed import a2a_permute
+from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -21,12 +22,14 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
     calls = []
     platform = SimpleNamespace(is_npu=lambda: npu, synchronize=lambda: calls.append("sync"))
     monkeypatch.setattr(ulysses, "current_omni_platform", platform)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", platform)
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
     group = SimpleNamespace(
         ulysses_group=SimpleNamespace(group_name="ulysses"),
         ulysses_world_size=2,
         ulysses_rank=0,
         ring_world_size=1,
+        allgather_world_size=1,
     )
     monkeypatch.setattr(ulysses.dist, "get_world_size", lambda pg: 2)
     strategy = ulysses.UlyssesParallelAttention(group, 2, 1, use_sync, ulysses_a2a_permute=True)
@@ -84,28 +87,80 @@ def test_shared_a2a_routes_qkv_gate_and_reverse(monkeypatch, npu, joint, use_syn
         ({"ring_degree": 2}, "strict, pure Ulysses"),
         ({"allgather_degree": 2}, "strict, pure Ulysses"),
         ({"ulysses_degree": 1}, "strict, pure Ulysses"),
+        ({"scatter_idx": 1}, "scatter_idx=2, gather_idx=1"),
+        ({"gather_idx": 2}, "scatter_idx=2, gather_idx=1"),
     ],
 )
 def test_npu_backend_rejects_unsupported_config(monkeypatch, overrides, message):
     values = dict(ulysses_a2a_permute=True, ulysses_degree=2, ring_degree=1, ulysses_mode="strict")
     values.update(overrides)
     enforce_eager = values.pop("enforce_eager", True)
+    scatter_idx = values.pop("scatter_idx", 2)
+    gather_idx = values.pop("gather_idx", 1)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(**values),
         enforce_eager=enforce_eager,
     )
-    monkeypatch.setattr(factory, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
     monkeypatch.setattr(factory, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
     with pytest.raises(ValueError, match=message):
-        factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+        factory.build_parallel_attention_strategy(scatter_idx=scatter_idx, gather_idx=gather_idx, use_sync=False)
+
+
+@pytest.mark.parametrize(
+    "ulysses_size, ring_size, allgather_size, scatter_idx, gather_idx, message",
+    [
+        (1, 1, 1, 2, 1, "strict, pure Ulysses"),
+        (2, 2, 1, 2, 1, "strict, pure Ulysses"),
+        (2, 1, 2, 2, 1, "strict, pure Ulysses"),
+        (2, 1, 1, 1, 1, "scatter_idx=2, gather_idx=1"),
+        (2, 1, 1, 2, 2, "scatter_idx=2, gather_idx=1"),
+    ],
+)
+def test_direct_npu_strategy_validates_initialized_groups(
+    monkeypatch, ulysses_size, ring_size, allgather_size, scatter_idx, gather_idx, message
+):
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+
+    def unexpected():
+        pytest.fail("Invalid topology/layout must be rejected before dependency initialization")
+
+    monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", unexpected)
+    group = SimpleNamespace(
+        ulysses_group=object(),
+        ulysses_world_size=ulysses_size,
+        ring_world_size=ring_size,
+        allgather_world_size=allgather_size,
+    )
+    with pytest.raises(ValueError, match=message):
+        ulysses.UlyssesParallelAttention(group, scatter_idx, gather_idx, False, ulysses_a2a_permute=True)
+
+
+def test_npu_strategy_checks_each_forward_context_mode(monkeypatch):
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+    monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: None)
+    group = SimpleNamespace(ulysses_group=object(), ulysses_world_size=2, ring_world_size=1, allgather_world_size=1)
+    monkeypatch.setattr(factory, "get_sp_group", lambda: group)
+    monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 2)
+    config = SimpleNamespace(
+        enforce_eager=True,
+        parallel_config=SimpleNamespace(ulysses_a2a_permute=True, ulysses_degree=2, ulysses_mode="strict"),
+    )
+    with set_forward_context(omni_diffusion_config=config):
+        strategy = factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+    config.parallel_config.ulysses_mode = "advanced_uaa"
+    tensor = torch.empty(1, 4, 2, 16)
+    with set_forward_context(omni_diffusion_config=config):
+        with pytest.raises(ValueError, match="ulysses_mode='strict'"):
+            strategy.pre_attention(tensor, tensor, tensor, None)
 
 
 def test_cuda_backend_does_not_require_eager(monkeypatch):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(ulysses_a2a_permute=True, ulysses_degree=2), enforce_eager=False
     )
-    monkeypatch.setattr(factory, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
     monkeypatch.setattr(factory, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(factory, "get_forward_context", lambda: SimpleNamespace(omni_diffusion_config=config))
     monkeypatch.setattr(factory, "get_sp_group", lambda: object())
