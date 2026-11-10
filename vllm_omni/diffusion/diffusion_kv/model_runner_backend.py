@@ -187,9 +187,7 @@ class DiffusionKVModelRunnerBackend:
                 "only after validating its attention and KV-write contract"
             )
         if not current_omni_platform.is_cuda():
-            raise NotImplementedError(
-                "Paged Ring MVP currently supports only CUDA's packed KV-cache layout"
-            )
+            raise NotImplementedError("Paged Ring MVP currently supports only CUDA's packed KV-cache layout")
 
     def _get_paged_attention_ulysses_degree(self, layer: Any) -> int:
         if bool(getattr(layer, "skip_sequence_parallel", False)):

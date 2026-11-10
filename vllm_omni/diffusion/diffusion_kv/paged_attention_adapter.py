@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -27,6 +27,9 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
 )
 from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -837,25 +840,18 @@ class DiffusionPagedAttentionAdapter:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
 
         if not current_omni_platform.is_cuda():
-            raise NotImplementedError(
-                "Paged Ring MVP currently supports only CUDA's packed KV-cache layout"
-            )
+            raise NotImplementedError("Paged Ring MVP currently supports only CUDA's packed KV-cache layout")
 
         kv_cache = getattr(layer, "kv_cache", None)
         if not isinstance(kv_cache, torch.Tensor):
-            raise RuntimeError(
-                f"Native KV cache is not bound for diffusion layer {layer_name!r}"
-            )
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer_name!r}")
         native_impl = getattr(layer, "impl", None)
         if not callable(getattr(native_impl, "do_kv_cache_update", None)):
-            raise RuntimeError(
-                f"Native attention implementation for {layer_name!r} cannot update the KV cache"
-            )
+            raise RuntimeError(f"Native attention implementation for {layer_name!r} cannot update the KV cache")
         expected_content_size = layer.head_size + layer.head_size_v
         if kv_cache.ndim != 4 or kv_cache.shape[-1] != expected_content_size:
             raise NotImplementedError(
-                "Paged Ring MVP requires the packed CUDA KV-cache layout "
-                "[num_blocks, num_kv_heads, block_size, K+V]"
+                "Paged Ring MVP requires the packed CUDA KV-cache layout [num_blocks, num_kv_heads, block_size, K+V]"
             )
         if kv_cache.device != key.device or key.device != value.device:
             raise ValueError(
@@ -865,8 +861,7 @@ class DiffusionPagedAttentionAdapter:
 
         if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
             raise ValueError(
-                "Paged Ring requires a sequence-parallel degree greater than one; "
-                f"got {sequence_parallel_degree!r}"
+                f"Paged Ring requires a sequence-parallel degree greater than one; got {sequence_parallel_degree!r}"
             )
 
         batch = self._active_batch
@@ -889,13 +884,11 @@ class DiffusionPagedAttentionAdapter:
         for name, tensor in (("query", query), ("key", key), ("value", value)):
             if tensor.ndim < 2:
                 raise ValueError(
-                    f"Paged Ring requires {name} to expose a sequence dimension; "
-                    f"got shape={tuple(tensor.shape)}"
+                    f"Paged Ring requires {name} to expose a sequence dimension; got shape={tuple(tensor.shape)}"
                 )
             if tensor.shape[0] != 1:
                 raise NotImplementedError(
-                    "Paged Ring MVP currently supports one tensor row per forward; "
-                    f"{name}.shape={tuple(tensor.shape)}"
+                    f"Paged Ring MVP currently supports one tensor row per forward; {name}.shape={tuple(tensor.shape)}"
                 )
 
         local_query_len = int(query.shape[1])
@@ -953,11 +946,7 @@ class DiffusionPagedAttentionAdapter:
         query_ranges = getattr(omni_attn_metadata, "query_ranges", None)
         kv_write_ranges = getattr(omni_attn_metadata, "kv_write_ranges", None)
 
-        if (
-            not isinstance(query_ranges, tuple)
-            or len(query_ranges) != 1
-            or not isinstance(query_ranges[0], QueryRange)
-        ):
+        if not isinstance(query_ranges, tuple) or len(query_ranges) != 1 or not isinstance(query_ranges[0], QueryRange):
             raise ValueError("Paged Ring MVP requires one contiguous query range")
 
         if (
@@ -972,9 +961,7 @@ class DiffusionPagedAttentionAdapter:
 
         row = batch.rows[0]
         if row.kv_start_pos != 0 or row.query_len != row.seq_len:
-            raise NotImplementedError(
-                "Paged Ring MVP currently supports only cold full-sequence writes"
-            )
+            raise NotImplementedError("Paged Ring MVP currently supports only cold full-sequence writes")
 
         if not bool(getattr(layer.spec, "non_causal", False)):
             raise NotImplementedError("Paged Ring MVP currently supports only non-causal attention")
@@ -999,9 +986,7 @@ class DiffusionPagedAttentionAdapter:
         local_len = write_range.local_end - write_range.local_start
 
         if write_range.local_start != 0 or local_len != key_flat.shape[0]:
-            raise ValueError(
-                "Paged Ring KV-write range must cover the local K/V payload"
-            )
+            raise ValueError("Paged Ring KV-write range must cover the local K/V payload")
 
         global_end = write_range.global_start + local_len
         if write_range.global_start < 0 or global_end > row.seq_len:
@@ -1009,9 +994,7 @@ class DiffusionPagedAttentionAdapter:
 
         full_slot_mapping = batch.slot_mappings_by_layer.get(layer_name)
         if full_slot_mapping is None:
-            raise KeyError(
-                f"No native slot mapping was built for diffusion layer {layer_name!r}"
-            )
+            raise KeyError(f"No native slot mapping was built for diffusion layer {layer_name!r}")
 
         full_slot_mapping = full_slot_mapping.reshape(-1)[: batch.num_tokens]
         write_offset = write_range.global_start - row.kv_start_pos
@@ -1050,7 +1033,7 @@ class DiffusionPagedAttentionAdapter:
         # publishes query_ranges because Q remains local while K/V are global.
         asymmetric_layout = query_ranges is not None
 
-        if asymmetric_layout:
+        if query_ranges is not None:
             if len(batch.rows) != 1:
                 raise NotImplementedError("Paged AllGather-KV MVP currently supports one row per forward")
 
@@ -1086,7 +1069,7 @@ class DiffusionPagedAttentionAdapter:
             name="value",
         )
 
-        if asymmetric_layout:
+        if query_ranges is not None:
             if key_token_shape != value_token_shape:
                 raise ValueError(
                     "Paged AllGather-KV key/value write layouts must match: "
@@ -1224,7 +1207,7 @@ class DiffusionPagedAttentionAdapter:
             value_flat = value_flat.contiguous()
         # Asymmetric AllGather-KV uses local query metadata while preserving
         # the Scheduler-prepared global slot mapping for replicated KV writes.
-        if asymmetric_layout:
+        if query_ranges is not None:
             query_range = query_ranges[0]
             local_query_len = query_range.local_end - query_range.local_start
 

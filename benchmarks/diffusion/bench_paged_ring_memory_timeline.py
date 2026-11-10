@@ -28,17 +28,17 @@ from queue import SimpleQueue
 
 import torch
 import torch.distributed as dist
-from PIL import Image, ImageDraw, ImageFont
-from vllm.utils.network_utils import get_file_store_init_method
-
 from bench_paged_ring_attention import (
     _DTYPE,
     _HEAD_SIZE,
     _NUM_HEADS,
-    _SmokeAttention,
     _build_attention,
     _build_real_adapter,
+    _SmokeAttention,
 )
+from PIL import Image, ImageDraw, ImageFont
+from vllm.utils.network_utils import get_file_store_init_method
+
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRow
@@ -83,13 +83,13 @@ def _capture_trace(
         clear_history=True,
     )
     try:
-        baseline_bytes = torch.cuda.memory_allocated(device)
+        baseline_bytes = torch.accelerator.memory_allocated(device)
         start_us = time.time_ns() / 1_000.0
         output = fn()
         current_omni_platform.synchronize()
         forward_end_us = time.time_ns() / 1_000.0
         del output
-        final_bytes = torch.cuda.memory_allocated(device)
+        final_bytes = torch.accelerator.memory_allocated(device)
         snapshot = memory._snapshot()
     finally:
         memory._record_memory_history(enabled=None)
@@ -244,9 +244,7 @@ def _worker(
             worst_rank_curves.append(curve.cpu())
         median_curve = torch.stack(worst_rank_curves).median(dim=0).values.tolist()
 
-        baseline_bytes = statistics.median(
-            [curve[0].item() for curve in worst_rank_curves]
-        )
+        baseline_bytes = statistics.median([curve[0].item() for curve in worst_rank_curves])
         peak_bytes = max(median_curve)
         final_bytes = median_curve[-1]
         result = {

@@ -260,12 +260,12 @@ def _memory_forward(fn, device: torch.device) -> tuple[int, int]:
     """Return worst-rank absolute CUDA allocated and reserved peaks."""
     dist.barrier(device_ids=[device.index])
     current_omni_platform.synchronize()
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.reset_peak_memory_stats(device)
 
     output = fn()
     current_omni_platform.synchronize()
-    peak_allocated = torch.cuda.max_memory_allocated(device)
-    peak_reserved = torch.cuda.max_memory_reserved(device)
+    peak_allocated = torch.accelerator.max_memory_allocated(device)
+    peak_reserved = torch.accelerator.max_memory_reserved(device)
     del output
 
     peak_allocated, peak_reserved = _max_rank_values(
@@ -328,10 +328,10 @@ def _worker(
                     raise ValueError(f"seq_len={seq_len} must be divisible by world_size={world_size}")
 
                 gc.collect()
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 current_omni_platform.synchronize()
-                state_allocated_before = torch.cuda.memory_allocated(device)
-                state_reserved_before = torch.cuda.memory_reserved(device)
+                state_allocated_before = torch.accelerator.memory_allocated(device)
+                state_reserved_before = torch.accelerator.memory_reserved(device)
 
                 adapter, diffusion_layer, native_layer = _build_real_adapter(
                     device,
@@ -351,8 +351,8 @@ def _worker(
                     ring_runner=ring_runner,
                 )
                 current_omni_platform.synchronize()
-                state_allocated_after = torch.cuda.memory_allocated(device)
-                state_reserved_after = torch.cuda.memory_reserved(device)
+                state_allocated_after = torch.accelerator.memory_allocated(device)
+                state_reserved_after = torch.accelerator.memory_reserved(device)
                 paged_state_allocated, paged_state_reserved = _max_rank_values(
                     (
                         float(max(0, state_allocated_after - state_allocated_before)),
@@ -520,19 +520,15 @@ def _worker(
                     value,
                 )
                 gc.collect()
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 current_omni_platform.synchronize()
 
         if local_rank == 0:
             strategy_name = (
-                f"Ulysses({ulysses_degree}) x Ring({ring_degree})"
-                if ulysses_degree > 1
-                else f"Ring({ring_degree})"
+                f"Ulysses({ulysses_degree}) x Ring({ring_degree})" if ulysses_degree > 1 else f"Ring({ring_degree})"
             )
             print(f"\nDense vs paged {strategy_name} (worst-rank latency and CUDA memory)")
-            print(
-                "S       dense p50   paged p50   ratio   dense peak   paged peak   extra peak"
-            )
+            print("S       dense p50   paged p50   ratio   dense peak   paged peak   extra peak")
             for row in results:
                 extra_peak_mib = (
                     row["paged_median_peak_allocated_bytes"] - row["dense_median_peak_allocated_bytes"]

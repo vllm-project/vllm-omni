@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+
 from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed

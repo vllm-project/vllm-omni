@@ -414,9 +414,7 @@ class AttentionImpl(ABC, Generic[T]):
         """Materialize one paged KV shard for dense Ring execution."""
 
         del paged_ring_context
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support Paged Ring KV materialization"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support Paged Ring KV materialization")
 
     def forward_cuda(
         self,

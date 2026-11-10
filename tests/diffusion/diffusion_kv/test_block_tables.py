@@ -7,6 +7,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import numpy as np
@@ -188,9 +189,7 @@ def test_cache_layer_registration_rejects_paged_ring_on_non_cuda(
 def test_cache_layer_registration_rejects_paged_ring_without_model_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend, _, _ = _registration_backend(
-        _parallel_config(ring_degree=2)
-    )
+    backend, _, _ = _registration_backend(_parallel_config(ring_degree=2))
     layer = SimpleNamespace(
         skip_sequence_parallel=False,
         attn_backend=SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN"),
@@ -286,12 +285,12 @@ class _FakeBlockTables:
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
-        self.block_sizes = list(kwargs["block_sizes"])
-        self.max_num_reqs = int(kwargs["max_num_reqs"])
-        self.max_num_batched_tokens = int(kwargs["max_num_batched_tokens"])
-        self.cp_size = int(kwargs["cp_size"])
-        self.cp_rank = int(kwargs["cp_rank"])
-        self.cp_interleave = int(kwargs["cp_interleave"])
+        self.block_sizes = list(cast(list[int], kwargs["block_sizes"]))
+        self.max_num_reqs = cast(int, kwargs["max_num_reqs"])
+        self.max_num_batched_tokens = cast(int, kwargs["max_num_batched_tokens"])
+        self.cp_size = cast(int, kwargs["cp_size"])
+        self.cp_rank = cast(int, kwargs["cp_rank"])
+        self.cp_interleave = cast(int, kwargs["cp_interleave"])
         self.blocks_per_kv_block = [1] * len(self.block_sizes)
         self.block_tables = [_FakeStagedTable() for _ in self.block_sizes]
         self.num_blocks = _FakeNumBlocks(len(self.block_sizes), self.max_num_reqs)

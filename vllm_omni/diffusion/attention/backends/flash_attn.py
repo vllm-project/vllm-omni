@@ -609,40 +609,26 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         layer = getattr(paged_ring_context, "layer", None)
         if layer is None:
-            raise TypeError(
-                "paged_ring_context must expose a native diffusion attention layer"
-            )
+            raise TypeError("paged_ring_context must expose a native diffusion attention layer")
 
         kv_cache = getattr(layer, "kv_cache", None)
         if kv_cache is None:
-            raise RuntimeError(
-                f"Native KV cache is not bound for diffusion layer "
-                f"{layer.layer_name!r}"
-            )
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer.layer_name!r}")
 
         native_impl = getattr(layer, "impl", None)
         cache_update = getattr(native_impl, "do_kv_cache_update", None)
         if not callable(cache_update):
-            raise RuntimeError(
-                f"Native attention implementation for "
-                f"{layer.layer_name!r} cannot update the KV cache"
-            )
+            raise RuntimeError(f"Native attention implementation for {layer.layer_name!r} cannot update the KV cache")
 
         expected_content_size = layer.head_size + layer.head_size_v
-        if (
-            kv_cache.ndim != 4
-            or kv_cache.shape[-1] != expected_content_size
-        ):
+        if kv_cache.ndim != 4 or kv_cache.shape[-1] != expected_content_size:
             raise NotImplementedError(
-                "Paged Ring MVP requires the packed CUDA KV-cache layout "
-                "[num_blocks, num_kv_heads, block_size, K+V]"
+                "Paged Ring MVP requires the packed CUDA KV-cache layout [num_blocks, num_kv_heads, block_size, K+V]"
             )
 
         slot_mapping = paged_ring_context.slot_mapping
         if slot_mapping.ndim != 1:
-            raise ValueError(
-                "Paged Ring slot mapping must be one-dimensional"
-            )
+            raise ValueError("Paged Ring slot mapping must be one-dimensional")
 
         # Always write explicitly: unlike forward_paged(), the Ring path does not
         # call the native attention kernel that normally owns the fused cache write.
@@ -1391,11 +1377,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         self._warn_fa_deterministic_non_dense("piecewise-npu")
         logger.debug("Using piecewise NPU attention for mixed causal/full mask")
+        full_attn_spans = attn_metadata.full_attn_spans
+        assert full_attn_spans is not None
         return piecewise_attn(
             query,
             key,
             value,
-            attn_metadata.full_attn_spans,
+            full_attn_spans,
             self.softmax_scale,
             self._npu_piecewise_attn_func,
             query_ranges=attn_metadata.query_ranges,

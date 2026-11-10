@@ -7,6 +7,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock
 
 import numpy as np
@@ -443,7 +444,7 @@ def test_ring_precollective_rejects_unsupported_platform_and_cache_layout(
             )
 
         layer.kv_cache = valid_cache
-        layer.impl = object()
+        layer.impl = cast(Any, object())
         with pytest.raises(RuntimeError, match="cannot update the KV cache"):
             adapter.validate_ring_sp_before_collective(
                 "layer-0",
@@ -1597,9 +1598,7 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
             )
 
         def prepare_layer_context(self, *_args, **_kwargs):
-            raise AssertionError(
-                "Paged Ring must not use the native paged-attention path"
-            )
+            raise AssertionError("Paged Ring must not use the native paged-attention path")
 
     class Backend:
         def materialize_paged_ring_kv(self, context):
@@ -1610,9 +1609,7 @@ def test_omni_attention_routes_paged_ring_through_dense_ring_runner() -> None:
             )
 
         def forward_paged(self, _context):
-            raise AssertionError(
-                "Paged Ring must not call forward_paged"
-            )
+            raise AssertionError("Paged Ring must not call forward_paged")
 
     strategy = Strategy()
     layer = Attention.__new__(Attention)
@@ -1729,9 +1726,7 @@ def test_omni_attention_composes_paged_ulysses_with_ring_runner() -> None:
             return SimpleNamespace(key_write=key, value_write=value)
 
         def prepare_layer_context(self, *_args, **_kwargs):
-            raise AssertionError(
-                "Paged Ulysses+Ring must not use the native paged-attention path"
-            )
+            raise AssertionError("Paged Ulysses+Ring must not use the native paged-attention path")
 
     class Backend:
         def materialize_paged_ring_kv(self, context):
@@ -1739,9 +1734,7 @@ def test_omni_attention_composes_paged_ulysses_with_ring_runner() -> None:
             return context.key_write + 10, context.value_write + 20
 
         def forward_paged(self, _context):
-            raise AssertionError(
-                "Paged Ulysses+Ring must not call forward_paged"
-            )
+            raise AssertionError("Paged Ulysses+Ring must not call forward_paged")
 
     strategy = Strategy()
     layer = Attention.__new__(Attention)

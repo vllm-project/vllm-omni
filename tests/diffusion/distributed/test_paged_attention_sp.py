@@ -303,8 +303,7 @@ def _worker(
         def prepare_case(qkv):
             global_query, global_key, global_value = qkv.unbind(0)
             local_qkv = tuple(
-                tensor[:, local_slice].contiguous()
-                for tensor in (global_query, global_key, global_value)
+                tensor[:, local_slice].contiguous() for tensor in (global_query, global_key, global_value)
             )
             global_expected = (
                 F.scaled_dot_product_attention(
@@ -368,12 +367,8 @@ def _worker(
             _HEAD_SIZE,
             dim=-1,
         )
-        actual_cache_key = torch.cat(
-            [key_cache[block_id] for block_id in _PHYSICAL_BLOCKS]
-        )[:_GLOBAL_TOKENS]
-        actual_cache_value = torch.cat(
-            [value_cache[block_id] for block_id in _PHYSICAL_BLOCKS]
-        )[:_GLOBAL_TOKENS]
+        actual_cache_key = torch.cat([key_cache[block_id] for block_id in _PHYSICAL_BLOCKS])[:_GLOBAL_TOKENS]
+        actual_cache_value = torch.cat([value_cache[block_id] for block_id in _PHYSICAL_BLOCKS])[:_GLOBAL_TOKENS]
 
         if ring_degree > 1:
             ring_tokens = _GLOBAL_TOKENS // ring_degree
