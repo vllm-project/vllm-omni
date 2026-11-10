@@ -2841,6 +2841,47 @@ def test_pre_sharded_proxies_reject_duplicate_checkpoint_destinations(tmp_path, 
     read.assert_not_called()
 
 
+def _read_planned_proxy(tmp_path, mocker, entries):
+    from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, HSDPShardContext
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+
+    group = proxy_module._LoadGroup(
+        "block",
+        nn.Module(),
+        nn.Module(),
+        checkpoint_entries={f"block.{key}": (key, str(tmp_path / filename)) for key, filename in entries.items()},
+    )
+    mocker.patch.object(proxy_module, "prepare_hsdp_shard_context", return_value=HSDPShardContext({}))
+    mocker.patch.object(proxy_module, "shard_hsdp_module")
+    proxies, _ = proxy_module._load_checkpoint_shards(
+        [group], HSDPInferenceConfig(enabled=True), torch.device("cpu"), 1
+    )
+    return dict(proxies["block"].weights([f"block.{key}" for key in entries]))
+
+
+@pytest.mark.parametrize("planned", ["a.safetensors", "b.safetensors"])
+def test_pre_sharded_proxies_read_the_planned_file(tmp_path, mocker, planned):
+    # Same key, different values, same directory: the plan, not file order, picks the source.
+    values = {"a.safetensors": [1.0, 2.0], "b.safetensors": [91.0, 92.0]}
+    for filename, value in values.items():
+        save_file({"weight": torch.tensor(value)}, str(tmp_path / filename))
+
+    weights = _read_planned_proxy(tmp_path, mocker, {"weight": planned})
+
+    torch.testing.assert_close(weights["block.weight"], torch.tensor(values[planned]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("planned", ["a.safetensors", "b.safetensors"])
+def test_pre_sharded_proxies_reject_a_key_duplicated_in_planned_files(tmp_path, mocker, planned):
+    # Both files are planned (for different keys) and both store weight.
+    save_file({"weight": torch.ones(2), "a_only": torch.ones(2)}, str(tmp_path / "a.safetensors"))
+    save_file({"weight": torch.zeros(2), "b_only": torch.ones(2)}, str(tmp_path / "b.safetensors"))
+    entries = {"weight": planned, "a_only": "a.safetensors", "b_only": "b.safetensors"}
+
+    with pytest.raises(ValueError, match="must be stored once"):
+        _read_planned_proxy(tmp_path, mocker, entries)
+
+
 def test_pre_sharded_meta_check_ignores_non_dit_online_quant_layers():
     """An online-quantized encoder starts on meta and is loaded after the DiT groups."""
     model = nn.Module()

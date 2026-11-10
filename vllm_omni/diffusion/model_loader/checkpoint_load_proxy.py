@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ import torch
 from torch import nn
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.checkpoint import load as dcp_load
+from torch.distributed.checkpoint.filesystem import FileSystem
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
@@ -31,6 +33,44 @@ from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+
+class _PlannedFileSystem(FileSystem):
+    """List only the planned files rather than every file in the checkpoint directory."""
+
+    def __init__(self, files: Sequence[str]) -> None:
+        super().__init__()
+        self.files = list(files)
+
+    def ls(self, path: str | os.PathLike) -> list[str]:
+        del path
+        return list(self.files)
+
+
+class _PlannedFilesReader(HuggingFaceStorageReader):
+    """Read each checkpoint key from the file the load plan bound it to.
+
+    HuggingFaceStorageReader indexes every safetensors file in its directory, and a
+    key stored in several files resolves to the last one listed. An fp16 variant, a
+    consolidated copy or a file excluded by allow_patterns_overrides could then
+    silently replace the planned tensor.
+    """
+
+    def __init__(self, directory: Path, bindings: dict[str, str], thread_count: int) -> None:
+        super().__init__(str(directory), thread_count=thread_count)
+        self.bindings = bindings
+        self.fs = _PlannedFileSystem(sorted(set(bindings.values())))
+
+    def read_metadata(self) -> Metadata:
+        metadata = super().read_metadata()
+        for index, info in metadata.storage_data.items():
+            planned = self.bindings.get(index.fqn)
+            if planned is None:
+                continue
+            # A key listed in several files would resolve to whichever file is read last.
+            if info.relative_path != planned or len(metadata.state_dict_metadata[index.fqn].chunks) != 1:
+                raise ValueError(f"Checkpoint tensor {index.fqn!r} must be stored once, in its planned file {planned}")
+        return metadata
 
 
 class _CheckpointProxy(nn.Module):
@@ -160,12 +200,15 @@ def _load_checkpoint_shards(
     use_tqdm_on_load: bool = True,
 ) -> tuple[dict[str, _CheckpointProxy], HSDPShardContext]:
     """Allocate sharded checkpoint-layout proxies and bulk-read them with DCP."""
-    directories = {Path(filename).parent for group in groups for _, filename in group.checkpoint_entries.values()}
-    if not directories:
+    # Checkpoint key -> planned file, per directory.
+    bindings: dict[Path, dict[str, str]] = defaultdict(dict)
+    for group in groups:
+        for checkpoint_key, filename in group.checkpoint_entries.values():
+            bindings[Path(filename).parent][checkpoint_key] = filename
+    if not bindings:
         raise ValueError("No checkpoint entries belong to the discovered DiTs")
     readers = {
-        directory: HuggingFaceStorageReader(str(directory), thread_count=thread_count)
-        for directory in sorted(directories)
+        directory: _PlannedFilesReader(directory, files, thread_count) for directory, files in sorted(bindings.items())
     }
     checkpoint_metadata = {directory: reader.read_metadata() for directory, reader in readers.items()}
     proxies = {group.name: _CheckpointProxy(group.checkpoint_entries, checkpoint_metadata) for group in groups}
