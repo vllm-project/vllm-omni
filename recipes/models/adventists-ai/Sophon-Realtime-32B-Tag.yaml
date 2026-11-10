@@ -18,9 +18,7 @@ model:
   parameter_count: "34.3B"
   active_parameters: "34.3B"
   context_length: 0
-  base_args:
-    - "--omni"
-    - "--trust-remote-code"
+  base_args: []
   base_env: {}
 
 omni:
@@ -45,7 +43,7 @@ omni:
           }'
 
 dependencies:
-  - note: "The Sophon-Realtime plugin for vLLM-Omni (installs vLLM 0.30 + vLLM-Omni 0.30 and registers the model; `sophon-realtime serve` downloads the weights and starts the server with the right deploy config)."
+  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config."
     command: "uv pip install sophon-realtime"
 
 features: {}
@@ -71,7 +69,8 @@ guide: |
   VoiceBench 82.8, Big Bench Audio 81.8%, NVV-SuperBench 0.86 (zh) / 0.80 (en).
 
   **Out-of-tree model.** Sophon-Realtime is not built into vLLM-Omni. It is served through its own plugin package,
-  `sophon-realtime`, which pins vLLM 0.30.0 and vLLM-Omni 0.30.0 and registers the model architecture. A plain
+  `sophon-realtime`, which pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet) and
+  registers the model architecture. A plain
   `vllm serve ... --omni` on a stock vLLM-Omni install will not load it: install the plugin and start with
   `sophon-realtime serve` as shown below.
 
@@ -106,8 +105,6 @@ guide: |
   | 8 | 0.61 / 0.76 s |
   | 16 | 0.75 / 1.07 s |
 
-  For more speed and users per GPU, see the Flash build (0.31 s first audio, 40 users per GPU):
-  [adventists-ai/Sophon-Realtime-32B-Flash](https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash).
 
   ## References
 
