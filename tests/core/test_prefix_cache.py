@@ -2839,3 +2839,112 @@ def test_live_session_not_reaped_at_next_step():
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
     finally:
         mgr.shutdown()
+
+
+def test_step_context_freezes_session_epoch():
+    """8: _StepContext freezes the STARTED epoch; a later epoch change
+    does not rewrite it, and a request without an epoch freezes none."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        assert mgr._step_ctxs[s1].session_epochs == {"a": 0}
+        s2 = run_session_step(mgr, view, "a2", [0, 1], 0, 4, session="S", session_epoch=1, finished=["a"])
+        assert mgr._step_ctxs[s2].session_epochs == {"a2": 1}
+        assert mgr._step_ctxs[s1].session_epochs == {"a": 0}
+        s3 = run_session_step(mgr, view, "b", [0, 1], 0, 4, session="S")
+        assert mgr._step_ctxs[s3].session_epochs == {}
+    finally:
+        mgr.shutdown()
+
+
+def test_serve_gate_skips_superseded_session_rows():
+    """8: an old step's hit must not serve the new generation's rows.
+
+    Turn 1 stores 8 rows under epoch 0; an old step for "c" (hit 8,
+    frozen epoch 0) is saved but not materialized. Turn 2 (epoch 1)
+    stores 8 new rows (offset 1000), then a reuser overwrites the
+    pool blocks (offset 2000). Materializing the old step must fall
+    back to the pool (2000+ rows), not serve the new stream (1000+).
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s_old = run_session_step(mgr, view, "c", [0, 1, 2], 8, 4, hit=8, session="S", session_epoch=0)
+        s2 = run_session_step(
+            mgr, view, "a2", [0, 1, 2], 0, 8, session="S", session_epoch=1, offset=1000, finished=["a"]
+        )
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s3 = run_session_step(mgr, view, "b2", [0, 1, 2], 0, 12, offset=2000, finished=["a2"])
+        mgr.materialize(s3, ["b2"])
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 2000.0
+        outs = mgr.materialize(s_old, ["c"])
+        merged = outs.hidden_states["c"]
+        # Prefix comes from the pool (the reuser's 2000+ rows), not the
+        # new session stream (1000+ rows); tail is this step's own rows.
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("b2", 0, 8)) + 2000)
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("c", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
+def test_seed_gate_skips_superseded_stream_head():
+    """8: an old step's seeding must not plant its rows at the head of
+    the new (empty) stream.
+
+    Turn 1 stores 8 rows under epoch 0; an old step for "c" (hit 8,
+    frozen epoch 0) is saved but not materialized. Turn 2 (epoch 1)
+    invalidates the store and has not materialized yet, so the new
+    stream is empty. Materializing the old step must not seed the old
+    pool-hit prefix into it; the new turn can then append cleanly.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s_old = run_session_step(mgr, view, "c", [0, 1, 2], 8, 4, hit=8, session="S", session_epoch=0)
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 0, 4, session="S", session_epoch=1, finished=["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        outs = mgr.materialize(s_old, ["c"])
+        # Nothing seeded into the new stream, and the merge itself is
+        # still correct (pool prefix + this step's own rows).
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        merged = outs.hidden_states["c"]
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("c", 8, 12)))
+        # The new turn appends cleanly afterwards.
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 4
+    finally:
+        mgr.shutdown()
+
+
+def test_append_gate_skips_superseded_rows():
+    """8: an old step's append must not invalidate the new stream.
+
+    Turn 1 stores 8 rows under epoch 0; an old step for "c" (no hit,
+    frozen epoch 0) is saved but not materialized. Turn 2 (epoch 1)
+    stores 4 new rows (offset 1000). Materializing the old step must
+    skip its append: without the gate, the overlap check against the
+    new rows would mismatch and invalidate the whole new stream.
+    """
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        s_old = run_session_step(mgr, view, "c", [0, 1], 0, 4, session="S", session_epoch=0)
+        s2 = run_session_step(
+            mgr, view, "a2", [0, 1, 2], 0, 4, session="S", session_epoch=1, offset=1000, finished=["a"]
+        )
+        mgr.materialize(s2, ["a2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 4
+        outs = mgr.materialize(s_old, ["c"])
+        # New stream intact, and the old step's own merge is unaffected.
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 4
+        assert torch.equal(outs.hidden_states["c"], expected_rows(view.slots_for("c", 0, 4)))
+    finally:
+        mgr.shutdown()

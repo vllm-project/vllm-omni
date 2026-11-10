@@ -296,6 +296,14 @@ class _StepContext:
     # can belong to a new tenant after block reuse (A3).
     session_for_req: dict[ReqId, str] = field(default_factory=dict)
 
+    # History generation, frozen at publish alongside session_for_req:
+    # the fence epoch the request's turn belonged to at STARTED. The
+    # serve/seed/append gates compare it with the store's current
+    # generation; a step from a superseded generation must not serve,
+    # seed or append rows for the new one. Absent (no epoch recorded
+    # at STARTED) means no gate, as before.
+    session_epochs: dict[ReqId, int] = field(default_factory=dict)
+
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[TensorName] = field(default_factory=set)
     # Leftover mm copied to CPU at save (this-step deferred rows + mm
@@ -587,6 +595,23 @@ class OmniPrefixCacheManager:
             )
             self._session_store.invalidate(session_id)
             self._session_store.set_epoch(session_id, epoch)
+
+    def _session_epoch_mismatch(self, ctx: _StepContext, req_id: str, session_id: str) -> bool:
+        """True when the step's frozen epoch and the store's recorded
+        epoch are both known and disagree.
+
+        The frozen epoch is the generation the step's turn belonged to
+        at STARTED; the store's is the session's current generation.
+        A mismatch means an old step (e.g. a preemption-resumed step
+        from before a barge-in) must not serve, seed or append rows
+        for the new generation. Either side unknown means no gate:
+        pre-epoch payloads behave as before.
+        """
+        frozen = ctx.session_epochs.get(req_id)
+        if frozen is None:
+            return False
+        current = self._session_store.epoch_of(session_id)
+        return current is not None and current != frozen
 
     def _reap_idle_sessions(self, now_s: float | None = None) -> None:
         """Drop sessions idle longer than the configured TTL.
@@ -901,6 +926,12 @@ class OmniPrefixCacheManager:
                     hit = ctx.hits.get(req_id)
                     session_id = session_for_req.get(req_id)
                     if not hit or session_id is None:
+                        continue
+                    if self._session_epoch_mismatch(ctx, req_id, session_id):
+                        # The step belongs to a superseded generation:
+                        # the store's rows now describe the new history,
+                        # so skip the session serve and fall back to the
+                        # pool hit (left in hit_sources above).
                         continue
                     # Index read, not a 2-tuple unpack: upstream extended
                     # hits to (hit_upto, blocks, read_start), and this
@@ -1244,6 +1275,7 @@ class OmniPrefixCacheManager:
             session_for_req={
                 r: session_id for r in req_order if (session_id := self._session_store.session_of(r)) is not None
             },
+            session_epochs={r: epoch for r in req_order if (epoch := self._req_session_epoch.get(r)) is not None},
             trims=dict(self._trims),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
@@ -1763,6 +1795,12 @@ class OmniPrefixCacheManager:
             session_id = session_for_req.get(req_id)
             if not hit or session_id is None:
                 continue
+            if self._session_epoch_mismatch(ctx, req_id, session_id):
+                # Do not seed an old step's rows into the new stream's
+                # head: with an empty new stream, stored == 0 ==
+                # expected, and the old rows would land as the new
+                # generation's prefix.
+                continue
             # Index read, not a 2-tuple unpack: upstream extended hits
             # to (hit_upto, blocks, read_start); this works on both.
             hit_upto = hit[0]
@@ -1852,6 +1890,12 @@ class OmniPrefixCacheManager:
         for req_id in req_ids:
             session_id = session_for_req.get(req_id)
             if session_id is None:
+                continue
+            if self._session_epoch_mismatch(ctx, req_id, session_id):
+                # Skip the append instead of letting the overlap check
+                # invalidate the new stream: an old step's rows against
+                # the new generation mismatch and would destroy the new
+                # stream (correct but costly); skipping leaves it intact.
                 continue
             start, end = ctx.spans[req_id]
             if start == end:
