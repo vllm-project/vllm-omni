@@ -2060,6 +2060,7 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
 
 ## Additional resources
 
+- [NVIDIA Rubin recipe](MiniMax-H3-Rubin.md) — tested four-GPU offline setup and inference measurements
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)

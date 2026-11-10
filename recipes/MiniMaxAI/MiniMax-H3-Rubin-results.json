@@ -1,0 +1,1448 @@
+{
+  "schema_version": 1,
+  "validation_scope": "Four-GPU offline BF16 MiniMax-H3 inference. HTTP serving failed compatibility checks.",
+  "hardware": {
+    "gpu_count": 4,
+    "gpu_name": "NVIDIA VR NVL72",
+    "compute_capability": "10.7",
+    "memory_total_mib_per_gpu": 286524,
+    "driver": "620.69",
+    "cpu_architecture": "aarch64",
+    "gpu_power_limit_w": 2300,
+    "gpu_peer_topology": "NV36 between every pair",
+    "allocated_host_memory_gib": 512,
+    "allocated_cpu_threads": 32,
+    "omp_num_threads": 8
+  },
+  "vllm_omni_commit": "7467d4b59f4290334aae8f84777e989e1cb1bbeb",
+  "source_archive_sha256": "7032048e5b71fdc8b141b9a62de4f32cd64b5297a93eec0b8f208c438c236aa9",
+  "runtime_source_patches": [],
+  "build_note": "Installed from the pinned GitHub source archive; only the package version label was overridden for this archive build.",
+  "container_image": {
+    "tag": "vllm/vllm-openai:cu134-nightly-1648fefab91204f3b15bf8062217316f07f2c4bb",
+    "index_digest": "sha256:bec82f0f8415716ccee67dc06d7d0064a9834682a5dc1c972bb422a79f7d535d",
+    "platforms": [
+      {
+        "architecture": "amd64",
+        "digest": "sha256:dea741d34c458eeee2ea7010580e7dd865ddb83d9c0c4c4d3770bd6d9e63c611"
+      },
+      {
+        "architecture": "arm64",
+        "digest": "sha256:4f4c2f746b03a1a4d0a16086c6d6fd3ddecc5f59749787bb1715bc538b199dec"
+      }
+    ]
+  },
+  "runtime": {
+    "torch": "2.16.0.dev20261009+cu134",
+    "vllm": "0.33.0rc1.dev992+g1648fefab.d20261107.cu134",
+    "triton": "3.8.0+git3f6e4113",
+    "flashinfer_python": "0.7.3",
+    "nccl_distribution": "2.32.3",
+    "nccl_build_headers": "2.30.7",
+    "nccl_runtime": "2.32.3",
+    "transformers": "5.19.0",
+    "diffusers": "0.40.0",
+    "accelerate": "1.12.0",
+    "vllm_omni": "0.33.0+g7467d4b5.rubin",
+    "python": "3.12.3",
+    "av": "19.0.2",
+    "huggingface_hub": "1.33.0",
+    "numpy": "2.2.6",
+    "pillow": "13.0.0",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.23.3",
+    "nvidia_cudnn_cu13": "9.26.0.51"
+  },
+  "model_revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+  "measurement_method": {
+    "api": "Omni.generate",
+    "generation_wall_time_includes": [
+      "generation",
+      "worker-side MP4 encoding",
+      "output transfer"
+    ],
+    "generation_wall_time_excludes": [
+      "model initialization",
+      "warmups in summaries",
+      "output validation"
+    ],
+    "memory_sampling_interval_ms": 500,
+    "memory_source": "nvidia-smi memory.used",
+    "video_codec_options": {
+      "crf": "0",
+      "preset": "ultrafast"
+    },
+    "preencode_mp4": true,
+    "audio_flow_shift": 3.0,
+    "flow_shift": 12,
+    "precision": "BF16",
+    "concurrency": 1,
+    "num_gpus": 4,
+    "tensor_parallel_size": 1,
+    "ulysses_degree": 4,
+    "text_encoder_tp_size": 4,
+    "vae_patch_parallel_size": 4,
+    "vae_parallel_mode": "tile"
+  },
+  "profiles": {
+    "offline-ref2va-trtllm-eager": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+      "trust_remote_code": true,
+      "task_type": "ref2va",
+      "num_gpus": 4,
+      "tensor_parallel_size": 1,
+      "ulysses_degree": 4,
+      "ring_degree": 1,
+      "text_encoder_tp_size": 4,
+      "vae_patch_parallel_size": 4,
+      "vae_parallel_mode": "tile",
+      "vae_use_tiling": true,
+      "cfg_parallel_size": 1,
+      "diffusion_attention_backend": "TRTLLM_ATTN",
+      "enforce_eager": true,
+      "flow_shift": 12,
+      "enable_diffusion_pipeline_profiler": true,
+      "init_timeout": 1200,
+      "stage_init_timeout": 1200
+    },
+    "offline-sdpa-eager": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+      "trust_remote_code": true,
+      "task_type": "fl2va",
+      "num_gpus": 4,
+      "tensor_parallel_size": 1,
+      "ulysses_degree": 4,
+      "ring_degree": 1,
+      "text_encoder_tp_size": 4,
+      "vae_patch_parallel_size": 4,
+      "vae_parallel_mode": "tile",
+      "vae_use_tiling": true,
+      "cfg_parallel_size": 1,
+      "diffusion_attention_backend": "TORCH_SDPA",
+      "enforce_eager": true,
+      "flow_shift": 12,
+      "enable_diffusion_pipeline_profiler": true,
+      "init_timeout": 1200,
+      "stage_init_timeout": 1200
+    },
+    "offline-trtllm-compiled": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+      "trust_remote_code": true,
+      "task_type": "fl2va",
+      "num_gpus": 4,
+      "tensor_parallel_size": 1,
+      "ulysses_degree": 4,
+      "ring_degree": 1,
+      "text_encoder_tp_size": 4,
+      "vae_patch_parallel_size": 4,
+      "vae_parallel_mode": "tile",
+      "vae_use_tiling": true,
+      "cfg_parallel_size": 1,
+      "diffusion_attention_backend": "TRTLLM_ATTN",
+      "enforce_eager": false,
+      "flow_shift": 12,
+      "enable_diffusion_pipeline_profiler": true,
+      "init_timeout": 1200,
+      "stage_init_timeout": 1200
+    },
+    "offline-trtllm-eager": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+      "trust_remote_code": true,
+      "task_type": "fl2va",
+      "num_gpus": 4,
+      "tensor_parallel_size": 1,
+      "ulysses_degree": 4,
+      "ring_degree": 1,
+      "text_encoder_tp_size": 4,
+      "vae_patch_parallel_size": 4,
+      "vae_parallel_mode": "tile",
+      "vae_use_tiling": true,
+      "cfg_parallel_size": 1,
+      "diffusion_attention_backend": "TRTLLM_ATTN",
+      "enforce_eager": true,
+      "flow_shift": 12,
+      "enable_diffusion_pipeline_profiler": true,
+      "init_timeout": 1200,
+      "stage_init_timeout": 1200
+    },
+    "offline-trtllm-eager-full": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "revision": "0919fb684102ef115126612f3fbb84d1027e7317",
+      "trust_remote_code": true,
+      "task_type": "fl2va",
+      "num_gpus": 4,
+      "tensor_parallel_size": 1,
+      "ulysses_degree": 4,
+      "ring_degree": 1,
+      "text_encoder_tp_size": 4,
+      "vae_patch_parallel_size": 4,
+      "vae_parallel_mode": "tile",
+      "vae_use_tiling": true,
+      "cfg_parallel_size": 1,
+      "diffusion_attention_backend": "TRTLLM_ATTN",
+      "enforce_eager": true,
+      "flow_shift": 12,
+      "enable_diffusion_pipeline_profiler": true,
+      "init_timeout": 1200,
+      "stage_init_timeout": 1200
+    }
+  },
+  "initialization": {
+    "offline-ref2va-trtllm-eager": {
+      "initialization_wall_s": 365.014032578998
+    },
+    "offline-sdpa-eager": {
+      "initialization_wall_s": 366.7364753949805
+    },
+    "offline-trtllm-compiled": {
+      "initialization_wall_s": 367.49379011802375
+    },
+    "offline-trtllm-eager": {
+      "initialization_wall_s": 364.2465420750086
+    },
+    "offline-trtllm-eager-full": {
+      "initialization_wall_s": 367.94165213700035
+    }
+  },
+  "hardware_checks": [
+    {
+      "rank": 1,
+      "gpu": "NVIDIA VR NVL72",
+      "nccl_runtime": 23203,
+      "bf16_matmul": "passed",
+      "all_reduce": "passed",
+      "all_to_all": "passed"
+    },
+    {
+      "rank": 3,
+      "gpu": "NVIDIA VR NVL72",
+      "nccl_runtime": 23203,
+      "bf16_matmul": "passed",
+      "all_reduce": "passed",
+      "all_to_all": "passed"
+    },
+    {
+      "rank": 0,
+      "gpu": "NVIDIA VR NVL72",
+      "nccl_runtime": 23203,
+      "bf16_matmul": "passed",
+      "all_reduce": "passed",
+      "all_to_all": "passed"
+    },
+    {
+      "rank": 2,
+      "gpu": "NVIDIA VR NVL72",
+      "nccl_runtime": 23203,
+      "bf16_matmul": "passed",
+      "all_reduce": "passed",
+      "all_to_all": "passed"
+    }
+  ],
+  "compile_checks": "torch.compile sin(x)+x passed on all four GPUs in the pinned image",
+  "compilation_observation": {
+    "profile": "offline-trtllm-compiled",
+    "regional_modules": 52,
+    "warning": "torch._dynamo hit config.recompile_limit (8)",
+    "guard": "self.layer_index == 7",
+    "interpretation": "Compilation was requested, but some graphs fall back to eager; this is not a fully compiled profile."
+  },
+  "http_compatibility_failures": [
+    {
+      "image": {
+        "tag": "vllm/vllm-openai:cu134-nightly",
+        "index_digest": "sha256:78d6583c2d9c63d69e4250733eb0aacaa30d9afd4f867b65f1b7f1f51e20da4a",
+        "platforms": [
+          {
+            "digest": "sha256:a6535c1e44c6e042b7bca8ff04c4a51d1bd4b0170cc4685a2057103cfb5da79b",
+            "platform": {
+              "architecture": "arm64",
+              "os": "linux"
+            }
+          },
+          {
+            "digest": "sha256:add45b1f420be02ef8e66a7eb47c69547596e7f6cd5ed43c5ac5d9b08ba99975",
+            "platform": {
+              "architecture": "amd64",
+              "os": "linux"
+            }
+          }
+        ]
+      },
+      "base_runtime": {
+        "torch": "2.16.0.dev20261009+cu134",
+        "vllm": "0.33.0rc1.dev1030+gcf5cea2da.d20261108.cu134",
+        "triton": "3.8.0+git3f6e4113",
+        "flashinfer_python": "0.7.3",
+        "nccl_distribution": "2.32.3",
+        "nccl_build_headers": "2.30.7",
+        "nccl_runtime": "2.32.3"
+      },
+      "failure": "Omni import: VllmConfig.use_v2_model_runner was removed in vLLM cf5cea2da."
+    },
+    {
+      "image": {
+        "tag": "vllm/vllm-openai:cu134-nightly-1648fefab91204f3b15bf8062217316f07f2c4bb",
+        "index_digest": "sha256:bec82f0f8415716ccee67dc06d7d0064a9834682a5dc1c972bb422a79f7d535d",
+        "platforms": [
+          {
+            "architecture": "amd64",
+            "digest": "sha256:dea741d34c458eeee2ea7010580e7dd865ddb83d9c0c4c4d3770bd6d9e63c611"
+          },
+          {
+            "architecture": "arm64",
+            "digest": "sha256:4f4c2f746b03a1a4d0a16086c6d6fd3ddecc5f59749787bb1715bc538b199dec"
+          }
+        ]
+      },
+      "failure": "HTTP AsyncOmni cannot instantiate because checkpoint_prepare/checkpoint_restore/checkpoint_state are abstract; offline Omni avoids EngineClient."
+    }
+  ],
+  "summaries": [
+    {
+      "profile": "offline-ref2va-trtllm-eager",
+      "task": "ref2va",
+      "requests": 3,
+      "median_generation_wall_s": 21.460981426003855,
+      "min_generation_wall_s": 21.40042253001593,
+      "max_generation_wall_s": 21.475572151015513,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.040589330320168905,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03569251766505962,
+        "MiniMaxH3Pipeline.diffuse": 20.172328864010826,
+        "MiniMaxH3Pipeline.encode_prompt": 0.0586972376719738,
+        "queue_wait_ms": 0.1287179960248371,
+        "stage_0_gen_ms": 21445.128281911213
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99885.0,
+        "1": 99661.0,
+        "2": 99661.0,
+        "3": 99659.0
+      }
+    },
+    {
+      "profile": "offline-sdpa-eager",
+      "task": "t2va",
+      "requests": 3,
+      "median_generation_wall_s": 110.03877497900976,
+      "min_generation_wall_s": 110.03847195900744,
+      "max_generation_wall_s": 110.04751981998561,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009256246557924896,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03103172332824518,
+        "MiniMaxH3Pipeline.diffuse": 108.87356835832664,
+        "MiniMaxH3Pipeline.encode_prompt": 0.029838315337353077,
+        "queue_wait_ms": 0.13517734866278866,
+        "stage_0_gen_ms": 110041.011095047
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99205.0,
+        "1": 98769.0,
+        "2": 98769.0,
+        "3": 98769.0
+      }
+    },
+    {
+      "profile": "offline-trtllm-compiled",
+      "task": "fl2va",
+      "requests": 1,
+      "median_generation_wall_s": 21.529365355992923,
+      "min_generation_wall_s": 21.529365355992923,
+      "max_generation_wall_s": 21.529365355992923,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.044388191017787904,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.034949371009133756,
+        "MiniMaxH3Pipeline.diffuse": 20.261806227994384,
+        "MiniMaxH3Pipeline.encode_prompt": 0.05564616099582054,
+        "queue_wait_ms": 0.1542990212328732,
+        "stage_0_gen_ms": 21528.786182403564
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100591.0,
+        "1": 100391.0,
+        "2": 100391.0,
+        "3": 100391.0
+      }
+    },
+    {
+      "profile": "offline-trtllm-compiled",
+      "task": "t2va",
+      "requests": 3,
+      "median_generation_wall_s": 19.834050267003477,
+      "min_generation_wall_s": 19.83286540597328,
+      "max_generation_wall_s": 19.896158215997275,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009830729977693409,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03513532033927428,
+        "MiniMaxH3Pipeline.diffuse": 18.656158952003654,
+        "MiniMaxH3Pipeline.encode_prompt": 0.030392139674707625,
+        "queue_wait_ms": 0.12914599695553383,
+        "stage_0_gen_ms": 19853.79083951314
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99517.0,
+        "1": 99179.0,
+        "2": 99179.0,
+        "3": 99179.0
+      }
+    },
+    {
+      "profile": "offline-trtllm-eager-full",
+      "task": "fl2va",
+      "requests": 1,
+      "median_generation_wall_s": 21.535417687991867,
+      "min_generation_wall_s": 21.535417687991867,
+      "max_generation_wall_s": 21.535417687991867,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.03972898700158112,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.0355985970236361,
+        "MiniMaxH3Pipeline.diffuse": 20.266968337993603,
+        "MiniMaxH3Pipeline.encode_prompt": 0.054287767998175696,
+        "queue_wait_ms": 0.14183501480147243,
+        "stage_0_gen_ms": 21534.854412078857
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100673.0,
+        "1": 100373.0,
+        "2": 100373.0,
+        "3": 100373.0
+      }
+    },
+    {
+      "profile": "offline-trtllm-eager-full",
+      "task": "t2va",
+      "requests": 3,
+      "median_generation_wall_s": 19.810530721006216,
+      "min_generation_wall_s": 19.777485909988172,
+      "max_generation_wall_s": 19.848928183986573,
+      "mean_stage_durations": {
+        "MiniMaxH3Pipeline._encode_local_media": 0.0018378859967924654,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03577964300833022,
+        "MiniMaxH3Pipeline.diffuse": 18.614150559335638,
+        "MiniMaxH3Pipeline.encode_prompt": 0.029841354679471504,
+        "queue_wait_ms": 0.12631333083845675,
+        "stage_0_gen_ms": 19811.7577234904
+      },
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99599.0,
+        "1": 99163.0,
+        "2": 99163.0,
+        "3": 99163.0
+      }
+    }
+  ],
+  "requests": [
+    {
+      "label": "full-warmup",
+      "utc": "2026-11-10T00:54:37.212807+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "ref2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 21.650410422007553,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.05805122700985521,
+        "MiniMaxH3Pipeline._encode_local_media": 0.04163014798541553,
+        "MiniMaxH3Pipeline.diffuse": 20.37059848898207,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.04413345499779098,
+        "queue_wait_ms": 0.22422400070354342,
+        "stage_0_gen_ms": 21649.695873260498
+      },
+      "worker_peak_memory_mb": 92134.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99883.0,
+        "1": 99659.0,
+        "2": 99659.0,
+        "3": 99657.0
+      },
+      "mp4_sha256": "4cecbf8069914b59e07e2f51c92b022433fabafa4b1c17d397a277b82fb11d1b",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.007859607713860082
+      },
+      "validation": "passed",
+      "profile": "offline-ref2va-trtllm-eager",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "ref2va-1",
+      "utc": "2026-11-10T00:55:00.596972+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "ref2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 21.40042253001593,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.05746036799973808,
+        "MiniMaxH3Pipeline._encode_local_media": 0.039418214990291744,
+        "MiniMaxH3Pipeline.diffuse": 20.139831330016023,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03553100398858078,
+        "queue_wait_ms": 0.1276319962926209,
+        "stage_0_gen_ms": 21399.90186691284
+      },
+      "worker_peak_memory_mb": 92136.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99885.0,
+        "1": 99661.0,
+        "2": 99661.0,
+        "3": 99659.0
+      },
+      "mp4_sha256": "4cecbf8069914b59e07e2f51c92b022433fabafa4b1c17d397a277b82fb11d1b",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.007859607713860082
+      },
+      "validation": "passed",
+      "profile": "offline-ref2va-trtllm-eager",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "ref2va-2",
+      "utc": "2026-11-10T00:55:23.489295+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "ref2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 21.475572151015513,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.05897557100979611,
+        "MiniMaxH3Pipeline._encode_local_media": 0.043021024990594015,
+        "MiniMaxH3Pipeline.diffuse": 20.18497508400469,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03580876599880867,
+        "queue_wait_ms": 0.1288719940930605,
+        "stage_0_gen_ms": 21475.032567977905
+      },
+      "worker_peak_memory_mb": 92136.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99885.0,
+        "1": 99661.0,
+        "2": 99661.0,
+        "3": 99659.0
+      },
+      "mp4_sha256": "4cecbf8069914b59e07e2f51c92b022433fabafa4b1c17d397a277b82fb11d1b",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.007859607713860082
+      },
+      "validation": "passed",
+      "profile": "offline-ref2va-trtllm-eager",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "ref2va-3",
+      "utc": "2026-11-10T00:55:46.381509+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "ref2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 21.460981426003855,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.05965577400638722,
+        "MiniMaxH3Pipeline._encode_local_media": 0.03932875097962096,
+        "MiniMaxH3Pipeline.diffuse": 20.192180178011768,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.0357377830077894,
+        "queue_wait_ms": 0.1296499976888299,
+        "stage_0_gen_ms": 21460.450410842896
+      },
+      "worker_peak_memory_mb": 92136.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99885.0,
+        "1": 99661.0,
+        "2": 99661.0,
+        "3": 99659.0
+      },
+      "mp4_sha256": "4cecbf8069914b59e07e2f51c92b022433fabafa4b1c17d397a277b82fb11d1b",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.007859607713860082
+      },
+      "validation": "passed",
+      "profile": "offline-ref2va-trtllm-eager",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "smoke",
+      "utc": "2026-11-10T00:54:31.200775+00:00",
+      "width": 672,
+      "height": 384,
+      "steps": 2,
+      "duration": 4,
+      "fps": 24,
+      "seed": 1101,
+      "task": "ref2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 5.220360938023077,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 1.1812730809906498,
+        "MiniMaxH3Pipeline._encode_local_media": 0.8400286599935498,
+        "MiniMaxH3Pipeline.diffuse": 1.282869117014343,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 1.0695015559904277,
+        "queue_wait_ms": 0.25903998175635934,
+        "stage_0_gen_ms": 5219.540596008301
+      },
+      "worker_peak_memory_mb": 88780.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 96477.0,
+        "1": 96477.0,
+        "2": 96477.0,
+        "3": 96477.0
+      },
+      "mp4_sha256": "fdddc9e205b8f3a8033305a211fc13d6c6e4abae6188746941c1377be99fb892",
+      "media": {
+        "video_frames": 107,
+        "duration_s": 4.458333,
+        "audio_rms": 0.016756207970214827
+      },
+      "validation": "passed",
+      "profile": "offline-ref2va-trtllm-eager",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "full-warmup",
+      "utc": "2026-11-10T00:12:52.814471+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 110.23932172200875,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.032615009986329824,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009512979886494577,
+        "MiniMaxH3Pipeline.diffuse": 109.05175580800278,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.04072858300060034,
+        "queue_wait_ms": 0.18176299636252224,
+        "stage_0_gen_ms": 110238.61622810364
+      },
+      "worker_peak_memory_mb": 91842.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99205.0,
+        "1": 98769.0,
+        "2": 98769.0,
+        "3": 98769.0
+      },
+      "mp4_sha256": "1959a4746a37209affbf987a48a1107f17e6fb027b597024577ca7b5e8bdd66f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006529574658109676
+      },
+      "validation": "passed",
+      "profile": "offline-sdpa-eager"
+    },
+    {
+      "label": "smoke",
+      "utc": "2026-11-10T00:12:43.394161+00:00",
+      "width": 672,
+      "height": 384,
+      "steps": 2,
+      "duration": 4,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 8.794958548998693,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 1.3119285959983245,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0010894480219576508,
+        "MiniMaxH3Pipeline.diffuse": 2.1768943469796795,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 3.812906576000387,
+        "queue_wait_ms": 0.2440029929857701,
+        "stage_0_gen_ms": 8794.126033782959
+      },
+      "worker_peak_memory_mb": 88300.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 95495.0,
+        "1": 95451.0,
+        "2": 95451.0,
+        "3": 95535.0
+      },
+      "mp4_sha256": "2eb8f3cc5935dd5c787e9751f41aa43ecd3d0f5b4842c9edaa87d65f5f6331da",
+      "media": {
+        "video_frames": 107,
+        "duration_s": 4.458333,
+        "audio_rms": 0.003914638361449113
+      },
+      "validation": "passed",
+      "profile": "offline-sdpa-eager"
+    },
+    {
+      "label": "t2va-1",
+      "utc": "2026-11-10T00:14:44.728614+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 110.03847195900744,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029257453978061676,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009060189768206328,
+        "MiniMaxH3Pipeline.diffuse": 108.87107955798274,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.031009879981866106,
+        "queue_wait_ms": 0.13537201448343694,
+        "stage_0_gen_ms": 110037.84513473511
+      },
+      "worker_peak_memory_mb": 91842.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99205.0,
+        "1": 98769.0,
+        "2": 98769.0,
+        "3": 98769.0
+      },
+      "mp4_sha256": "1959a4746a37209affbf987a48a1107f17e6fb027b597024577ca7b5e8bdd66f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006529574658109676
+      },
+      "validation": "passed",
+      "profile": "offline-sdpa-eager"
+    },
+    {
+      "label": "t2va-2",
+      "utc": "2026-11-10T00:16:36.148349+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 110.03877497900976,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029459437006153166,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009389079932589084,
+        "MiniMaxH3Pipeline.diffuse": 108.87124278699048,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.031036047002999112,
+        "queue_wait_ms": 0.12362201232463121,
+        "stage_0_gen_ms": 110038.22660446167
+      },
+      "worker_peak_memory_mb": 91842.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99205.0,
+        "1": 98769.0,
+        "2": 98769.0,
+        "3": 98769.0
+      },
+      "mp4_sha256": "1959a4746a37209affbf987a48a1107f17e6fb027b597024577ca7b5e8bdd66f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006529574658109676
+      },
+      "validation": "passed",
+      "profile": "offline-sdpa-eager"
+    },
+    {
+      "label": "t2va-3",
+      "utc": "2026-11-10T00:18:27.617510+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 110.04751981998561,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.030798055027844384,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009319469972979277,
+        "MiniMaxH3Pipeline.diffuse": 108.8783827300067,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03104924299987033,
+        "queue_wait_ms": 0.14653801918029785,
+        "stage_0_gen_ms": 110046.96154594421
+      },
+      "worker_peak_memory_mb": 91842.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99205.0,
+        "1": 98769.0,
+        "2": 98769.0,
+        "3": 98769.0
+      },
+      "mp4_sha256": "1959a4746a37209affbf987a48a1107f17e6fb027b597024577ca7b5e8bdd66f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006529574658109676
+      },
+      "validation": "passed",
+      "profile": "offline-sdpa-eager"
+    },
+    {
+      "label": "fl2va",
+      "utc": "2026-11-10T00:37:32.086104+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "fl2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 21.529365355992923,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.05564616099582054,
+        "MiniMaxH3Pipeline._encode_local_media": 0.044388191017787904,
+        "MiniMaxH3Pipeline.diffuse": 20.261806227994384,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.034949371009133756,
+        "queue_wait_ms": 0.1542990212328732,
+        "stage_0_gen_ms": 21528.786182403564
+      },
+      "worker_peak_memory_mb": 92840.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100591.0,
+        "1": 100391.0,
+        "2": 100391.0,
+        "3": 100391.0
+      },
+      "mp4_sha256": "7d680f48bd89725d222e23da54df5f3338bcd2165acde76a421d8b54973e960f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.0048834203044327805
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled",
+      "reference_image": {
+        "source_profile": "offline-trtllm-compiled",
+        "sha256": "f7265b80d685a3bed2debe8a33135d71922f59ea9a30c7b40f92a88ad9a1c04a",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "fl2va-warmup",
+      "utc": "2026-11-10T00:37:07.277458+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "fl2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 23.488868346001254,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 1.7572280789900105,
+        "MiniMaxH3Pipeline._encode_local_media": 0.29372595102177,
+        "MiniMaxH3Pipeline.diffuse": 20.269437754992396,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03557794200605713,
+        "queue_wait_ms": 0.1296869886573404,
+        "stage_0_gen_ms": 23488.272190093994
+      },
+      "worker_peak_memory_mb": 92840.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100591.0,
+        "1": 100391.0,
+        "2": 100391.0,
+        "3": 100391.0
+      },
+      "mp4_sha256": "7d680f48bd89725d222e23da54df5f3338bcd2165acde76a421d8b54973e960f",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.0048834203044327805
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled",
+      "reference_image": {
+        "source_profile": "offline-trtllm-compiled",
+        "sha256": "f7265b80d685a3bed2debe8a33135d71922f59ea9a30c7b40f92a88ad9a1c04a",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "full-warmup",
+      "utc": "2026-11-10T00:35:41.875402+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 19.99996320900391,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.028840126004070044,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009766980074346066,
+        "MiniMaxH3Pipeline.diffuse": 18.739395320997573,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.04517406999366358,
+        "queue_wait_ms": 0.1803539926186204,
+        "stage_0_gen_ms": 19999.303817749023
+      },
+      "worker_peak_memory_mb": 92154.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99517.0,
+        "1": 99179.0,
+        "2": 99179.0,
+        "3": 99179.0
+      },
+      "mp4_sha256": "3944914b48a2f95d43418639cdd40ec285b04b77c046ecdc86eabba54a7836c8",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006192356734044831
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled"
+    },
+    {
+      "label": "smoke",
+      "utc": "2026-11-10T00:35:30.501226+00:00",
+      "width": 672,
+      "height": 384,
+      "steps": 2,
+      "duration": 4,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 10.972321129986085,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.7623956350143999,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0010902909853029996,
+        "MiniMaxH3Pipeline.diffuse": 7.781607888988219,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 1.5476528089784551,
+        "queue_wait_ms": 0.3336709924042225,
+        "stage_0_gen_ms": 10971.435546875
+      },
+      "worker_peak_memory_mb": 88612.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 95681.0,
+        "1": 95721.0,
+        "2": 95721.0,
+        "3": 95721.0
+      },
+      "mp4_sha256": "51c8b237723d8d75e16a108efd8c41035c37e9bc76ef4576d60124856e96c418",
+      "media": {
+        "video_frames": 107,
+        "duration_s": 4.458333,
+        "audio_rms": 0.00423667894375059
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled"
+    },
+    {
+      "label": "t2va-1",
+      "utc": "2026-11-10T00:36:03.215164+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.834050267003477,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029579651018138975,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009151209960691631,
+        "MiniMaxH3Pipeline.diffuse": 18.633766509999987,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.034922814986202866,
+        "queue_wait_ms": 0.13501898501999676,
+        "stage_0_gen_ms": 19833.417892456055
+      },
+      "worker_peak_memory_mb": 92154.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99517.0,
+        "1": 99179.0,
+        "2": 99179.0,
+        "3": 99179.0
+      },
+      "mp4_sha256": "3944914b48a2f95d43418639cdd40ec285b04b77c046ecdc86eabba54a7836c8",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006192356734044831
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled"
+    },
+    {
+      "label": "t2va-2",
+      "utc": "2026-11-10T00:36:24.519652+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.83286540597328,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.03169302802416496,
+        "MiniMaxH3Pipeline._encode_local_media": 0.000912982999579981,
+        "MiniMaxH3Pipeline.diffuse": 18.636789790005423,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03500687101040967,
+        "queue_wait_ms": 0.1260110002476722,
+        "stage_0_gen_ms": 19832.33332633972
+      },
+      "worker_peak_memory_mb": 92154.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99517.0,
+        "1": 99179.0,
+        "2": 99179.0,
+        "3": 99179.0
+      },
+      "mp4_sha256": "3944914b48a2f95d43418639cdd40ec285b04b77c046ecdc86eabba54a7836c8",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006192356734044831
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled"
+    },
+    {
+      "label": "t2va-3",
+      "utc": "2026-11-10T00:36:45.830541+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.896158215997275,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029903739981818944,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0011211149976588786,
+        "MiniMaxH3Pipeline.diffuse": 18.697920556005556,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03547627502121031,
+        "queue_wait_ms": 0.1264080055989325,
+        "stage_0_gen_ms": 19895.621299743652
+      },
+      "worker_peak_memory_mb": 92154.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99517.0,
+        "1": 99179.0,
+        "2": 99179.0,
+        "3": 99179.0
+      },
+      "mp4_sha256": "3944914b48a2f95d43418639cdd40ec285b04b77c046ecdc86eabba54a7836c8",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006192356734044831
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-compiled"
+    },
+    {
+      "label": "smoke",
+      "utc": "2026-11-10T00:27:23.399837+00:00",
+      "width": 672,
+      "height": 384,
+      "steps": 2,
+      "duration": 4,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 45.412059484020574,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.7640297239995562,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0010825679928530008,
+        "MiniMaxH3Pipeline.diffuse": 42.19792623500689,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 1.5488998880027793,
+        "queue_wait_ms": 0.281550019280985,
+        "stage_0_gen_ms": 45411.22341156006
+      },
+      "worker_peak_memory_mb": 88694.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 95707.0,
+        "1": 95705.0,
+        "2": 95705.0,
+        "3": 95705.0
+      },
+      "mp4_sha256": "2969cd8ef698ed69a19512aeb5068ba70aa02d41e6465ddab483fb3a9f69078d",
+      "media": {
+        "video_frames": 107,
+        "duration_s": 4.458333,
+        "audio_rms": 0.004030442107195316
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager"
+    },
+    {
+      "label": "fl2va",
+      "utc": "2026-11-10T00:47:05.495567+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "fl2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 21.535417687991867,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.054287767998175696,
+        "MiniMaxH3Pipeline._encode_local_media": 0.03972898700158112,
+        "MiniMaxH3Pipeline.diffuse": 20.266968337993603,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.0355985970236361,
+        "queue_wait_ms": 0.14183501480147243,
+        "stage_0_gen_ms": 21534.854412078857
+      },
+      "worker_peak_memory_mb": 92922.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100673.0,
+        "1": 100373.0,
+        "2": 100373.0,
+        "3": 100373.0
+      },
+      "mp4_sha256": "670228e45e9c2abf4e56f424b0faacaecfcfb0086fba645688131bda3609ebc7",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.00609231327502137
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "fl2va-warmup",
+      "utc": "2026-11-10T00:46:41.674940+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "fl2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 22.194893488980597,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.4631148979824502,
+        "MiniMaxH3Pipeline._encode_local_media": 0.296886797004845,
+        "MiniMaxH3Pipeline.diffuse": 20.26671774298302,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.035273576009785756,
+        "queue_wait_ms": 0.12781700934283435,
+        "stage_0_gen_ms": 22194.369077682495
+      },
+      "worker_peak_memory_mb": 92922.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 100673.0,
+        "1": 100373.0,
+        "2": 100373.0,
+        "3": 100373.0
+      },
+      "mp4_sha256": "670228e45e9c2abf4e56f424b0faacaecfcfb0086fba645688131bda3609ebc7",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.00609231327502137
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full",
+      "reference_image": {
+        "source_profile": "offline-trtllm-eager-full",
+        "sha256": "996fd69be6ab1ed47d06ed301a723eda0c5c27c260a624015e27ac209f51b971",
+        "description": "First decoded frame of the source profile T2VA run 1."
+      }
+    },
+    {
+      "label": "full-warmup",
+      "utc": "2026-11-10T00:45:16.294929+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 19.903238413011422,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.02865182198002003,
+        "MiniMaxH3Pipeline._encode_local_media": 0.002316100988537073,
+        "MiniMaxH3Pipeline.diffuse": 18.685153912985697,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.04396323100081645,
+        "queue_wait_ms": 0.16757601406425238,
+        "stage_0_gen_ms": 19902.60910987854
+      },
+      "worker_peak_memory_mb": 92236.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99599.0,
+        "1": 99163.0,
+        "2": 99163.0,
+        "3": 99163.0
+      },
+      "mp4_sha256": "ac52a2ceafd6e410942fe9967bdd1fe4150cebdbd06e100ac04a25a28dd3c246",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006146364075012938
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full"
+    },
+    {
+      "label": "smoke",
+      "utc": "2026-11-10T00:45:10.921744+00:00",
+      "width": 672,
+      "height": 384,
+      "steps": 2,
+      "duration": 4,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": true,
+      "generation_wall_s": 4.68341184098972,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.7491397200210486,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0010931330034509301,
+        "MiniMaxH3Pipeline.diffuse": 1.4870462249964476,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 1.554621719988063,
+        "queue_wait_ms": 0.1759830047376454,
+        "stage_0_gen_ms": 4682.657718658447
+      },
+      "worker_peak_memory_mb": 88694.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 96057.0,
+        "1": 96013.0,
+        "2": 96013.0,
+        "3": 96013.0
+      },
+      "mp4_sha256": "2969cd8ef698ed69a19512aeb5068ba70aa02d41e6465ddab483fb3a9f69078d",
+      "media": {
+        "video_frames": 107,
+        "duration_s": 4.458333,
+        "audio_rms": 0.004030442107195316
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full"
+    },
+    {
+      "label": "t2va-1",
+      "utc": "2026-11-10T00:45:37.619673+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.777485909988172,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029433156014420092,
+        "MiniMaxH3Pipeline._encode_local_media": 0.0009659570059739053,
+        "MiniMaxH3Pipeline.diffuse": 18.579564265994122,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03539626201381907,
+        "queue_wait_ms": 0.12576999142766,
+        "stage_0_gen_ms": 19776.8714427948
+      },
+      "worker_peak_memory_mb": 92236.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99599.0,
+        "1": 99163.0,
+        "2": 99163.0,
+        "3": 99163.0
+      },
+      "mp4_sha256": "ac52a2ceafd6e410942fe9967bdd1fe4150cebdbd06e100ac04a25a28dd3c246",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006146364075012938
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full"
+    },
+    {
+      "label": "t2va-2",
+      "utc": "2026-11-10T00:45:58.920966+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.810530721006216,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.029570795013569295,
+        "MiniMaxH3Pipeline._encode_local_media": 0.002289045980433002,
+        "MiniMaxH3Pipeline.diffuse": 18.612269311997807,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03582198001095094,
+        "queue_wait_ms": 0.12060400331392884,
+        "stage_0_gen_ms": 19810.00852584839
+      },
+      "worker_peak_memory_mb": 92236.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99599.0,
+        "1": 99163.0,
+        "2": 99163.0,
+        "3": 99163.0
+      },
+      "mp4_sha256": "ac52a2ceafd6e410942fe9967bdd1fe4150cebdbd06e100ac04a25a28dd3c246",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006146364075012938
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full"
+    },
+    {
+      "label": "t2va-3",
+      "utc": "2026-11-10T00:46:20.228938+00:00",
+      "width": 1344,
+      "height": 768,
+      "steps": 50,
+      "duration": 5,
+      "fps": 24,
+      "seed": 1101,
+      "task": "t2va",
+      "prompt": "A small robot walks along a quiet beach at sunrise, with soft footsteps and synchronized ocean waves.",
+      "warmup": false,
+      "generation_wall_s": 19.848928183986573,
+      "stage_durations": {
+        "MiniMaxH3Pipeline.encode_prompt": 0.03052011301042512,
+        "MiniMaxH3Pipeline._encode_local_media": 0.002258655003970489,
+        "MiniMaxH3Pipeline.diffuse": 18.65061810001498,
+        "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.03612068700022064,
+        "queue_wait_ms": 0.13256599777378142,
+        "stage_0_gen_ms": 19848.393201828003
+      },
+      "worker_peak_memory_mb": 92236.0,
+      "sampled_peak_memory_mib_by_gpu": {
+        "0": 99599.0,
+        "1": 99163.0,
+        "2": 99163.0,
+        "3": 99163.0
+      },
+      "mp4_sha256": "ac52a2ceafd6e410942fe9967bdd1fe4150cebdbd06e100ac04a25a28dd3c246",
+      "media": {
+        "video_frames": 124,
+        "duration_s": 5.175,
+        "audio_rms": 0.006146364075012938
+      },
+      "validation": "passed",
+      "profile": "offline-trtllm-eager-full"
+    }
+  ],
+  "numerical_comparisons": [
+    {
+      "video_psnr_db": {
+        "y": 29.15854,
+        "u": 39.168419,
+        "v": 42.071029,
+        "aggregate": 30.758618
+      },
+      "audio_samples_per_channel": {
+        "baseline": 165888,
+        "candidate": 165888
+      },
+      "audio_rms_ratio": 0.9483553000430088,
+      "audio_sample_rmse": 0.0018716103234068496,
+      "audio_stft_magnitude_cosine": 0.989480487277443,
+      "method": "Aligned decoded H.264 PSNR in native pixel format; mono-averaged audio STFT, Hann 1024, hop 256, no alignment search.",
+      "baseline_profile": "offline-sdpa-eager",
+      "candidate_profile": "offline-trtllm-compiled"
+    },
+    {
+      "video_psnr_db": {
+        "y": 26.603313,
+        "u": 36.196526,
+        "v": 39.007012,
+        "aggregate": 28.186263
+      },
+      "audio_samples_per_channel": {
+        "baseline": 165888,
+        "candidate": 165888
+      },
+      "audio_rms_ratio": 0.941311555015181,
+      "audio_sample_rmse": 0.0019247857488297623,
+      "audio_stft_magnitude_cosine": 0.9874950024752226,
+      "method": "Aligned decoded H.264 PSNR in native pixel format; mono-averaged audio STFT, Hann 1024, hop 256, no alignment search.",
+      "baseline_profile": "offline-sdpa-eager",
+      "candidate_profile": "offline-trtllm-eager-full"
+    }
+  ]
+}
