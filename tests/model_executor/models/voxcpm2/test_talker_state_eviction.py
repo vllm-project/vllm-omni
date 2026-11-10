@@ -370,11 +370,20 @@ class TestStateEvictionContract:
         talker._precompute_stop_flags_for_audio_collect(states)
 
         side_stream = talker._stop_mask_stream
+        copy_done = states[0].pending_stop_mask_event
         assert isinstance(side_stream, _FakeStream)
         assert device_module.entered == [side_stream]
+        # The side stream waits on a fork event recorded on the current stream
+        # before it reads the stop logits.
+        (fork,) = side_stream.waited
+        assert isinstance(fork, _FakeEvent)
+        assert fork.recorded_on is None
+        assert fork is not copy_done
+        assert calls.record_stream == [side_stream, side_stream]
         assert calls.pinned == [True]
         assert calls.non_blocking == [True]
-        assert [state.pending_stop_mask_event.recorded_on for state in states] == [side_stream, side_stream]
+        assert [state.pending_stop_mask_event for state in states] == [copy_done, copy_done]
+        assert copy_done.recorded_on is side_stream
         assert talker._should_stop_from_cached_logits(states[0]) is True
         assert talker._should_stop_from_cached_logits(states[1]) is False
 
