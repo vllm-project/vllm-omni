@@ -785,6 +785,29 @@ def test_profiler_step_advances_schedule_and_skips_warmup(fake_config, fake_prof
     assert wrapper.profiler.step_calls == 4
 
 
+def test_profiler_step_stops_session_once_schedule_cycle_exhausted(fake_config, fake_profiler_factory, monkeypatch):
+    fake_config.wait_iterations = 1
+    fake_config.warmup_iterations = 2
+    fake_config.active_iterations = 3
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+    stops: list[int] = []
+    monkeypatch.setattr(wrapper, "stop", lambda: stops.append(1))
+
+    results = [wrapper._profiler_step() for _ in range(6)]
+    # wait+warmup-1 non-active steps then 3 active steps exhaust the
+    # repeat=1 cycle; the next call must stop the session instead of
+    # advancing the profiler past RECORD_AND_SAVE.
+    assert results == [False, False, True, True, True, False]
+    assert wrapper.profiler.step_calls == 5
+    assert stops == [1]
+
+
 def test_start_rebuilds_profiler_and_resets_warmup_with_schedule(fake_config, fake_profiler_factory, monkeypatch):
     fake_config.warmup_iterations = 2
     monkeypatch.setattr(profiler_mod.torch.cuda, "is_available", lambda: False)

@@ -87,6 +87,15 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._uses_schedule = self._schedule is not None
         self._initial_warmup_steps_remaining = self._schedule_warmup_steps(profiler_config)
         self._warmup_steps_remaining = self._initial_warmup_steps_remaining
+        # step() calls the repeat=1 cycle consumes: every wait and warmup
+        # step plus the active steps (start() already consumed schedule
+        # step 0 on platforms whose formula subtracts it). Past this budget
+        # a further profiler.step() would run the profiler past
+        # RECORD_AND_SAVE, which torch / torch_npu may reject.
+        self._schedule_cycle_steps = (
+            self._initial_warmup_steps_remaining + profiler_config.active_iterations if self._uses_schedule else 0
+        )
+        self._schedule_steps_consumed = 0
         self.profiler = self._create_profiler(profiler_config, activities)
 
     def _rank(self) -> int:
@@ -132,10 +141,20 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """Advance the schedule when one is configured.
 
         Warmup steps record nothing and do not count toward max_iterations,
-        matching vLLM's TorchProfilerWrapper.
+        matching vLLM's TorchProfilerWrapper. Once the repeat=1 cycle is
+        exhausted the session stops itself: a further profiler.step() would
+        run the profiler past RECORD_AND_SAVE, which torch / torch_npu may
+        reject, and no further data would be recorded anyway.
         """
         if self._uses_schedule:
+            if self._schedule_steps_consumed >= self._schedule_cycle_steps:
+                logger.info_once(
+                    "Profiler schedule cycle (wait + warmup + active) exhausted; stopping the profiling session."
+                )
+                self.stop()
+                return False
             self.profiler.step()
+            self._schedule_steps_consumed += 1
             if self._warmup_steps_remaining > 0:
                 self._warmup_steps_remaining -= 1
                 return False
@@ -477,6 +496,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             # second session, so rebuild it the way vLLM's wrapper does.
             self.profiler = self._create_profiler(self.profiler_config, self._activities)
             self._warmup_steps_remaining = self._initial_warmup_steps_remaining
+            self._schedule_steps_consumed = 0
         self.profiler.start()
 
     def _stop(self) -> None:

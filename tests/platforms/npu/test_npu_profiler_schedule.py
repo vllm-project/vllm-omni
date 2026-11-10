@@ -92,7 +92,12 @@ def test_npu_profiler_forwards_torch_npu_schedule(monkeypatch, tmp_path):
 
 def test_npu_profiler_builds_schedule_from_wait_alone(monkeypatch, tmp_path):
     recorded = _install_fake_torch_npu(monkeypatch)
-    _build_wrapper(tmp_path, wait_iterations=1)
+    wrapper = _build_wrapper(tmp_path, wait_iterations=1, active_iterations=1)
 
     assert recorded["schedule_kwargs"]["wait"] == 1
     assert recorded["schedule_kwargs"]["warmup"] == 0
+    # torch_npu's start() does not consume schedule step 0, so the single
+    # wait step remains a non-active step() (the torch/CUDA formula gives 0).
+    assert wrapper._initial_warmup_steps_remaining == 1
+    # The repeat=1 cycle consumes wait + warmup + active step() calls.
+    assert wrapper._schedule_cycle_steps == 2
