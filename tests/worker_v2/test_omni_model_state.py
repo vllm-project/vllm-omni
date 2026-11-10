@@ -25,6 +25,18 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _m
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_prepare_attn_omits_unused_model_metadata(monkeypatch):
+    state = object.__new__(OmniModelState)
+    output = {"ascend": object()}
+
+    def prepare_without_model_metadata(self, *args, for_capture=False, ubatch_idx=0):
+        return output
+
+    monkeypatch.setattr(DefaultModelState, "prepare_attn", prepare_without_model_metadata)
+    batch = InputBatch.__new__(InputBatch)
+    assert state.prepare_attn(batch, CUDAGraphMode.NONE, (), None, [], None) is output
+
+
 def test_prepare_attn_forwards_release_model_specific_metadata():
     state = object.__new__(OmniModelState)
     metadata = object()

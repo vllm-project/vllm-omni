@@ -126,6 +126,37 @@ def _from_pipeline_key(
     )
 
 
+@pytest.mark.parametrize("pipeline_key", ["hunyuan_image3_ar", "hunyuan_image_3_moe"])
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_hunyuan_ar_runner_selection(pipeline_key, runner):
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    deploy = _load_default_deploy(pipeline)
+    deploy.stages[0].model_runner = runner
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert stages[0].yaml_engine_args["use_v2_model_runner"] is (runner == "v2")
+    assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
+    if len(stages) > 1:
+        assert stages[1].stage_type == "diffusion"
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+@pytest.mark.parametrize(
+    "deploy_name,pipeline_key",
+    [
+        ("hunyuan_image3_ar.yaml", "hunyuan_image3_ar"),
+        ("hunyuan_image_3_moe.yaml", "hunyuan_image_3_moe"),
+        ("hunyuan-image-3-mooncakeconnector.yaml", "hunyuan_image_3_moe"),
+    ],
+)
+def test_hunyuan_ar_defaults_to_mrv2(platform, deploy_name, pipeline_key):
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / deploy_name), platform=platform)
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert stages[0].yaml_engine_args["use_v2_model_runner"] is True
+    assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 8192
+    assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs

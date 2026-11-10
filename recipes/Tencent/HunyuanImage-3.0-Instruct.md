@@ -70,6 +70,16 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+### AR Model Runner V2
+
+CUDA and NPU deployments use Model Runner V2 by default on AR stage 0 in
+`hunyuan_image3_ar.yaml` and `hunyuan_image_3_moe.yaml`. The Mooncake KV
+connector deployment also selects Model Runner V2 for AR.
+
+The AR sampler preserves comprehension token blocking, image-generation stage
+transitions, and greedy aspect-ratio selection using MRv2's device-side
+token history. Speculative decoding must be disabled for this stage.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
@@ -139,7 +149,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +162,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +176,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \

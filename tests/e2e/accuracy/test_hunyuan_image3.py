@@ -82,11 +82,15 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-# Comma-separated logical CUDA device ids per stage: split visible GPUs (0..n-1), first half -> AR, second -> DiT.
+# Logical device IDs per stage. CUDA uses two devices for AR and two for DiT.
 
 
 def _default_ar_dit_devices() -> tuple[str, str]:
-    """First floor(n/2) logical devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
+    """Use two devices per CUDA stage and split visible devices on other platforms."""
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_cuda():
+        return "0,1", "2,3"
     n = torch.accelerator.device_count()
     if n < 2:
         return "0,1", "2,3"
@@ -191,6 +195,7 @@ _DEPLOY_CONFIG = {
     "stages": [
         {
             "stage_id": 0,
+            "model_runner": "v2",
             "is_comprehension": False,
             "final_output": True,
             "final_output_type": "text",
@@ -198,7 +203,7 @@ _DEPLOY_CONFIG = {
             "gpu_memory_utilization": 0.95,
             "enforce_eager": True,
             "trust_remote_code": True,
-            "max_num_batched_tokens": 32768,
+            "max_num_batched_tokens": 8192,
             "devices": AR_DEVICES,
             "tensor_parallel_size": AR_TP_SIZE,
             "hf_overrides": {
@@ -328,7 +333,13 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
+    with OmniRunner(
+        MODEL_PATH,
+        deploy_config=deploy_config_path,
+        trust_remote_code=True,
+        stage_init_timeout=1200,
+        init_timeout=3000,
+    ) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -590,7 +601,7 @@ def _run_dit_model(
             torch.accelerator.empty_cache()
 
 
-@hardware_test(res={"cuda": "H200"}, num_cards=8)
+@hardware_test(res={"cuda": "H200"}, num_cards=4)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
     reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",

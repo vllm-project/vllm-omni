@@ -355,6 +355,11 @@ class OmniModelState(DefaultModelState):
             # FA3's captured GQA layout must match the runtime AOT schedule.
             # Keep explicit bounds (e.g. varlen decode) and runtime metadata.
             input_batch = replace(input_batch, max_query_len=input_batch.num_tokens)
+        # Ascend's state can predate this optional upstream keyword.
+        # Its absence has the same meaning as None for ordinary attention.
+        model_specific_kwargs: dict[str, Any] = {}
+        if model_specific_attn_metadata is not None:
+            model_specific_kwargs["model_specific_attn_metadata"] = model_specific_attn_metadata
         return super().prepare_attn(
             input_batch,
             cudagraph_mode,
@@ -364,7 +369,7 @@ class OmniModelState(DefaultModelState):
             kv_cache_config,
             for_capture=for_capture,
             ubatch_idx=ubatch_idx,
-            model_specific_attn_metadata=model_specific_attn_metadata,
+            **model_specific_kwargs,
         )
 
     @staticmethod

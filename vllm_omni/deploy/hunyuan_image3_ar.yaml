@@ -7,12 +7,13 @@ async_chunk: false
 
 stages:
   - stage_id: 0
+    model_runner: v2
     max_num_seqs: 1
     gpu_memory_utilization: 0.75
     trust_remote_code: true
     enforce_eager: true
     enable_prefix_caching: false
-    max_num_batched_tokens: 32768
+    max_num_batched_tokens: 8192
     devices: "0,1,2,3"
     tensor_parallel_size: 4
     hf_overrides:
@@ -38,6 +39,7 @@ platforms:
   xpu:
     stages:
       - stage_id: 0
+        model_runner: v1
         gpu_memory_utilization: 0.95
         devices: "0,1,2,3,4,5,6,7"
         tensor_parallel_size: 8

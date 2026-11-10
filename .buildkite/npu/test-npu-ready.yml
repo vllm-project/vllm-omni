@@ -17,6 +17,7 @@ steps:
           - >-
             pytest -s -v
             tests/platforms/npu/test_qwen3_omni_model_state.py
+            tests/platforms/npu/test_hunyuan_image3_model_state.py
             tests/platforms/npu/test_npu_generation_v2.py
             tests/platforms/npu/test_code2wav_graph_wrapper.py
             -m 'core_model and cpu'

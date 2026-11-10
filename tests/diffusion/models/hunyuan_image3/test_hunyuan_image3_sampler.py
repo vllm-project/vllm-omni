@@ -5,6 +5,7 @@ ratio restriction, comprehension blocking)."""
 
 import pytest
 import torch
+from vllm.config import VllmConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,6 +31,8 @@ EOI = 113
 class FakeSamplerModel:
     """Minimal stub that replicates the sampler-relevant attributes of
     HunyuanImage3ForConditionalGeneration without loading real weights."""
+
+    vllm_config: VllmConfig
 
     def __init__(self, *, is_comprehension: bool = False):
         self._is_comprehension = is_comprehension
@@ -57,7 +60,7 @@ class FakeSamplerModel:
         self._blocked_token_ids: set[int] = {BOI, EOI, SIZE_TOKEN, CFG, IMG_TOK, TIMESTEP, JOINT_SEP}
         self._blocked_token_ids.update(self._all_ratio_ids)
         self._blocked_token_ids_tensor = None
-        self._sampler = None
+        self._sampler: _RecordingSampler | None = None
 
     # Bind the real methods from the model class.
     from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
@@ -68,6 +71,7 @@ class FakeSamplerModel:
     _apply_ratio_restriction = _Real._apply_ratio_restriction
     _row_is_comprehension = staticmethod(_Real._row_is_comprehension)
     sample = _Real.sample
+    mrv2_custom_sampler = _Real.mrv2_custom_sampler
 
 
 class FakeTokenEmbedding:
@@ -332,3 +336,124 @@ class TestPerRequestTaskMode:
         assert logits[0, 50].item() == 7.0  # tagged row: comprehension
         assert logits[1, RECAPTION].item() == 0  # missing entry: generation
         assert logits[1, 50].item() == min_score
+
+
+class TestMRv2Sampler:
+    @staticmethod
+    def _make_sampler(mocker, model, histories, extra_args=None):
+        from vllm.sampling_params import SamplingParams
+
+        from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
+
+        num_reqs = len(histories)
+        # A prompt ending in a trigger must not activate generation rules.
+        prompt = [1, END_OF_RECAPTION]
+        all_tokens = torch.zeros(num_reqs, max(map(len, histories)) + len(prompt) + 8, dtype=torch.int32)
+        for slot, history in enumerate(histories):
+            tokens = prompt + history
+            all_tokens[slot, : len(tokens)] = torch.tensor(tokens)
+        base_sampler = mocker.Mock(side_effect=lambda logits, input_batch: logits)
+        base_sampler.req_states.prompt_len.gpu = torch.full((num_reqs,), len(prompt), dtype=torch.int32)
+        base_sampler.req_states.all_token_ids.gpu = all_tokens
+        sampler = HunyuanImage3ARSampler(base_sampler, model)
+        for slot in range(num_reqs):
+            sampler.add_request(slot, SamplingParams(extra_args=extra_args[slot] if extra_args else None))
+        batch = mocker.Mock()
+        batch.idx_mapping = torch.arange(num_reqs)
+        batch.seq_lens = torch.tensor([len(prompt) + len(history) for history in histories], dtype=torch.int32)
+        batch.num_reqs = num_reqs
+        return sampler, batch
+
+    @pytest.mark.parametrize("is_comprehension", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("extra_ratios", [False, True])
+    def test_matches_v1_constraints(self, mocker, is_comprehension, dtype, extra_ratios):
+        model = FakeSamplerModel(is_comprehension=is_comprehension)
+        if not extra_ratios:
+            model._ratio_other_slices = []
+            model._all_ratio_ids = set(range(RATIO_START, RATIO_END + 1))
+        histories = [
+            [],
+            [END_OF_THINK],
+            [END_OF_THINK, RECAPTION],
+            [END_OF_RECAPTION],
+            [END_OF_RECAPTION, ANSWER],
+            [END_OF_RECAPTION, ANSWER, BOI],
+            [END_OF_RECAPTION, ANSWER, BOI, SIZE_TOKEN],
+            [END_OF_RECAPTION, 50, BOI],
+            [RATIO_START],
+            [RATIO_OTHER_END],
+            [END_OF_RECAPTION, ANSWER, END_OF_THINK],
+            [50, 51],
+        ]
+        extra_args: list[dict[str, str] | None] = [None] * len(histories)
+        histories += histories
+        extra_args += [{"ar_task_mode": "comprehension"}] * len(extra_args)
+        sampler, batch = self._make_sampler(mocker, model, histories, extra_args)
+        logits = torch.randn(len(histories), 300, dtype=dtype)
+        model._sampler = _RecordingSampler()
+        expected = model.sample(logits.clone(), _metadata(histories), extra_args)
+        actual = sampler(logits, batch)
+        torch.testing.assert_close(actual, expected)
+        sampler.base_sampler.assert_called_once()
+
+    def test_reordered_slots_and_reused_slot(self, mocker):
+        from vllm.sampling_params import SamplingParams
+
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(
+            mocker, model, [[END_OF_THINK], [END_OF_RECAPTION]], [{"ar_task_mode": "comprehension"}, None]
+        )
+        batch.idx_mapping = torch.tensor([1, 0])
+        logits = sampler(torch.ones(2, 300), batch)
+        assert logits[0].argmax().item() == ANSWER
+        assert logits[1, 50].item() == 1
+
+        sampler.add_request(0, SamplingParams())
+        logits = sampler(torch.ones(2, 300), batch)
+        assert logits[0, ANSWER].item() == 0
+        assert logits[1, RECAPTION].item() == 0
+        assert logits[:, 50].tolist() == [torch.finfo(logits.dtype).min] * 2
+
+    def test_chunked_prefill_ignores_prompt_triggers(self, mocker):
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[], []])
+        batch.seq_lens = torch.tensor([1, 2])
+        logits = torch.randn(2, 300)
+        torch.testing.assert_close(sampler(logits.clone(), batch), logits)
+
+    def test_device_history_after_resume(self, mocker):
+        from vllm.sampling_params import SamplingParams
+
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[END_OF_RECAPTION, ANSWER, BOI]])
+        # Re-registration after preemption reconstructs from MRv2 history.
+        sampler.add_request(0, SamplingParams())
+        logits = sampler(torch.ones(1, 300), batch)
+        assert logits.argmax().item() == SIZE_TOKEN
+
+    def test_sampling_does_not_read_device_scalars(self, mocker, monkeypatch):
+        model = FakeSamplerModel()
+        sampler, batch = self._make_sampler(mocker, model, [[SIZE_TOKEN], [END_OF_THINK]])
+
+        def fail_read(*args, **kwargs):
+            raise AssertionError("MRv2 constraints must keep token history on device")
+
+        monkeypatch.setattr(torch.Tensor, "item", fail_read)
+        monkeypatch.setattr(torch.Tensor, "tolist", fail_read)
+        monkeypatch.setattr(torch.Tensor, "cpu", fail_read)
+        sampler(torch.ones(2, 300), batch)
+
+    def test_model_registers_sampler(self, mocker):
+        model = FakeSamplerModel()
+        model.vllm_config = mocker.Mock(speculative_config=None)
+        base_sampler, _ = self._make_sampler(mocker, model, [[]])
+        registered, rejection = model.mrv2_custom_sampler(base_sampler.base_sampler)
+        assert registered.base_sampler is base_sampler.base_sampler
+        assert rejection is None
+
+    def test_speculative_decoding_rejected(self, mocker):
+        model = FakeSamplerModel()
+        model.vllm_config = mocker.Mock(speculative_config=object())
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            model.mrv2_custom_sampler(mocker.Mock())
