@@ -33,6 +33,13 @@ def _output_path() -> Path:
     return OUTPUT_DIR / f"{name}.json"
 
 
+def _parallel_job() -> int | None:
+    raw = os.environ.get("BUILDKITE_PARALLEL_JOB", "").strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
 def _write() -> None:
     if not _timings:
         return
@@ -44,6 +51,8 @@ def _write() -> None:
         "build_number": os.environ.get("BUILDKITE_BUILD_NUMBER", ""),
         "step_key": os.environ.get("BUILDKITE_STEP_KEY", ""),
         "label": os.environ.get("BUILDKITE_LABEL", ""),
+        "parallel_job": _parallel_job(),
+        "queue": os.environ.get("BUILDKITE_AGENT_META_DATA_QUEUE", "").strip(),
         "file_seconds": {key: round(value, 3) for key, value in sorted(_timings.items())},
     }
     _output_path().write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

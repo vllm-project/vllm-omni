@@ -87,6 +87,21 @@ def load_shard_timings() -> dict[str, dict[str, float]] | None:
     return parsed or None
 
 
+def load_step_queues() -> dict[str, str]:
+    """Agent queue recorded for each step label, if the profile has one."""
+    raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
+    if not raw:
+        return {}
+    path = Path(raw)
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    queues = payload.get("step_queues") if isinstance(payload, dict) else None
+    if not isinstance(queues, dict):
+        return {}
+    return {base_label(str(label)): str(queue) for label, queue in queues.items() if queue}
+
+
 def plan_shard_count(
     weights: list[float],
     budget_seconds: float,
@@ -169,6 +184,11 @@ def apply_automatic_shard(
     except (TypeError, ValueError):
         budget_seconds = 0.0
     step_timings = None if not timings else timings.get(base_label(label))
+    recorded_queue = load_step_queues().get(base_label(label), "")
+    step_queue = str((step.get("agents") or {}).get("queue") or "")
+    if step_timings is not None and recorded_queue and step_queue and recorded_queue != step_queue:
+        log(f"automatic-shard: {label!r} ignores timings recorded on {recorded_queue}")
+        step_timings = None
     weights = _measured_weights(files, step_timings)
     count = 1 if weights is None else plan_shard_count(weights, budget_seconds)
     measured = 0 if weights is None else len(weights)

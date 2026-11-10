@@ -450,8 +450,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 `automatic_shard: true` does not reserve a pool when the YAML is uploaded.
 
-- **Fallback:** no profile for that step means one job. The step still writes `timings/jobs/<job>-<pid>.json`. Two pytest processes in one job keep both files; durations for the same file are summed.
-- **Profile:** the pipeline's merge step stores a per-step p80 in `timings/merged.json`, taken from raw job files of the latest 20 `passed` or `finished` `main` builds. A previous merged file is not an observation. Failed and running builds are excluded. The label key drops a ` · Shard N/M` suffix, so one step does not use another step's time for the same path.
+- **Fallback:** no profile for that step means one job. The step still writes `timings/jobs/<job>-<pid>.json`. Two pytest processes in one job keep both files; durations for the same file are summed. Hash shards of one build sum their slices of a file, and a retry of the same shard index keeps the max.
+- **Profile:** planning reads raw `timings/jobs` from the latest 20 `passed` or `finished` builds. Ready excludes `main` and uses pull-request builds; merge stays on `main`. Each job records its agent queue; a step ignores a profile recorded on a different queue. A previous merged file is not an observation. Failed and running builds are excluded. The label key drops a `· Shard N/M` suffix, so one step does not use another step's time for the same path.
 - **Plan:** a greedy estimate of how many jobs fit `timeout_in_minutes`, at most 4. pytest-shard then hashes collected node ids, so the count is not a packed assignment of the measured files. One file already over the budget does not add shards. A file with no measurement adds no weight, so a newly added path stays in the one-job plan until a passed build records it.
 - **Overrides:** `VLLM_OMNI_SHARD_TIMINGS` selects a local profile. `VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD=1` skips the history download.
 

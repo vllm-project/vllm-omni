@@ -2,7 +2,7 @@
 # Uploaded by Upload Ready Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
 #
 # Directory sweeps set `automatic_shard: true`. The uploader reads a per-step
-# profile from the last 20 passed main builds' raw `timings/jobs` artifacts
+# profile from the last 20 passed non-main builds of this pipeline
 # (or VLLM_OMNI_SHARD_TIMINGS). It uses that as a greedy estimate of how many
 # jobs fit `timeout_in_minutes`. pytest-shard then hashes collected tests, so
 # the bins are not packed by those measured files. No profile means one job:

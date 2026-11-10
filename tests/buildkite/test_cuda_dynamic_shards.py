@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,7 @@ def _skip_timing_download(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "1")
     monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
     upload_pipeline_mod._shard_timings_prepared = False
+    upload_pipeline_mod._shard_timings_pipeline = None
 
 
 def _leaves(steps: list) -> list[dict]:
@@ -164,6 +166,29 @@ def test_merge_build_observations_uses_p80() -> None:
     assert merged["tests/a_test.py"] == round(percentile([10, 20, 30, 40, 100], 0.8), 3)
 
 
+def _job_timing(
+    path: Path,
+    *,
+    job_id: str,
+    label: str,
+    file_seconds: Mapping[str, float],
+    parallel_job: int | None = None,
+    queue: str = "",
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "label": label,
+                "parallel_job": parallel_job,
+                "queue": queue,
+                "file_seconds": file_seconds,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_different_jobs_take_the_max_per_file(tmp_path: Path) -> None:
     a = tmp_path / "a.json"
     b = tmp_path / "b.json"
@@ -176,6 +201,31 @@ def test_different_jobs_take_the_max_per_file(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert build_step_observations([a, b]) == {"Simple Test": {"tests/a_test.py": 9}}
+
+
+def test_hash_shards_sum_slices_and_retries_keep_the_max(tmp_path: Path) -> None:
+    files = {
+        "tests/buildkite/test_cuda_dynamic_shards.py": 500,
+        "tests/buildkite/test_upload_pipeline.py": 500,
+    }
+    retry = {name: 400 for name in files}
+    _job_timing(
+        tmp_path / "s0.json", job_id="s0", label="Simple Test", file_seconds=files, parallel_job=0, queue="l4-k8s"
+    )
+    _job_timing(
+        tmp_path / "s0-retry.json",
+        job_id="s0-retry",
+        label="Simple Test",
+        file_seconds=retry,
+        parallel_job=0,
+        queue="l4-k8s",
+    )
+    _job_timing(
+        tmp_path / "s1.json", job_id="s1", label="Simple Test", file_seconds=files, parallel_job=1, queue="l4-k8s"
+    )
+    observed = build_step_observations(sorted(tmp_path.glob("*.json")))
+    assert observed["Simple Test"] == {name: 1000 for name in files}
+    assert plan_shard_count(list(observed["Simple Test"].values()), budget_seconds=1500) == 2
 
 
 def test_two_invocations_in_one_job_keep_both_measurements(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,6 +316,118 @@ def test_api_history_rejects_a_non_passed_entry(monkeypatch: pytest.MonkeyPatch)
         )
 
     assert list_recent_build_ids(branch="main", limit=20, fetch=fetch) == [("good", "7")]
+
+
+def test_ready_history_excludes_main_passed_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
+    monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
+    monkeypatch.setenv("BUILDKITE_API_TOKEN", "token")
+
+    def fetch(url: str, token: str | None = None) -> str:
+        assert token == "token"
+        assert "branch=" not in url
+        assert "state=passed" in url
+        return json.dumps(
+            [
+                {"id": "main-build", "number": 3, "state": "passed", "branch": "main"},
+                {"id": "failed-pr", "number": 2, "state": "failed", "branch": "ready-pr"},
+                {"id": "ready-pr", "number": 1, "state": "passed", "branch": "ready-pr"},
+            ]
+        )
+
+    assert list_recent_build_ids(branch="", limit=20, exclude_branches={"main"}, fetch=fetch) == [("ready-pr", "1")]
+
+
+def test_ready_plans_simple_test_from_non_main_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    files = {
+        "tests/buildkite/test_cuda_dynamic_shards.py": 500.0,
+        "tests/buildkite/test_upload_pipeline.py": 500.0,
+    }
+    upload_pipeline_mod._shard_timings_prepared = False
+    monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", raising=False)
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    seen_branch = ""
+    seen_excluded: frozenset[str] = frozenset()
+
+    def list_ids(
+        *,
+        branch: str = "",
+        limit: int = 0,
+        current_build_id: str = "",
+        exclude_branches: frozenset[str] | set[str] = frozenset(),
+        **_kwargs: object,
+    ) -> list[tuple[str, str]]:
+        nonlocal seen_branch, seen_excluded
+        del limit, current_build_id, _kwargs
+        seen_branch = branch
+        seen_excluded = frozenset(exclude_branches)
+        return [("ready-pr", "42")]
+
+    def download(build_id: str, dest: Path) -> list[Path]:
+        assert build_id == "ready-pr"
+        jobs = dest / "timings" / "jobs"
+        jobs.mkdir(parents=True)
+        for index in (0, 1):
+            _job_timing(
+                jobs / f"shard-{index}.json",
+                job_id=f"shard-{index}",
+                label="Simple Test",
+                file_seconds=files,
+                parallel_job=index,
+                queue="l4-k8s",
+            )
+        _job_timing(
+            jobs / "shard-0-retry.json",
+            job_id="shard-0-retry",
+            label="Simple Test",
+            file_seconds={name: 400 for name in files},
+            parallel_job=0,
+            queue="l4-k8s",
+        )
+        return []
+
+    monkeypatch.setattr("merge_shard_timings.list_recent_build_ids", list_ids)
+    monkeypatch.setattr("merge_shard_timings.download_build_timings", download)
+    profile = upload_pipeline_mod.ROOT / "timings" / "upload-profile.json"
+    try:
+        rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+        assert seen_branch == ""
+        assert seen_excluded == frozenset({"main"})
+        step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+        assert step["parallelism"] == 2
+    finally:
+        profile.unlink(missing_ok=True)
+        try:
+            profile.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_ready_ignores_timings_recorded_on_another_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    files = ["tests/buildkite/test_cuda_dynamic_shards.py", "tests/buildkite/test_upload_pipeline.py"]
+    profile = tmp_path / "timings.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "steps": {"Simple Test": {name: 1000 for name in files}},
+                "step_queues": {"Simple Test": "mithril-h100-pool"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(profile))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if leaf.get("label") == "Simple Test")
+    assert "parallelism" not in step
 
 
 def test_shard_flags_expand_to_numeric_argv(tmp_path: Path) -> None:

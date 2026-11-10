@@ -25,8 +25,9 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
-    tries to build a per-step profile from recent passed main ``timings/jobs``
-    artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). That profile is a greedy
+    tries to build a per-step profile from recent passed ``timings/jobs``
+    artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). Ready excludes ``main`` and uses
+    pull-request builds; merge stays on ``main``. That profile is a greedy
     estimate of how many jobs fit ``timeout_in_minutes``; pytest-shard then
     hashes collected tests, so the bins are not packed by those measured files.
     With no profile the step stays one job and still records ``timings/jobs/*.json``.
@@ -628,6 +629,14 @@ def _get_step_label(step: dict[str, Any]) -> str:
 
 
 _shard_timings_prepared = False
+_shard_timings_pipeline: Path | None = None
+
+
+def _history_selection(pipeline_path: Path | None) -> tuple[str, frozenset[str]]:
+    """Ready uses non-main PR builds; merge keeps main."""
+    if pipeline_path is not None and pipeline_path.name == "test-ready.yml":
+        return "", frozenset({"main"})
+    return "main", frozenset()
 
 
 def _ensure_shard_timings_env() -> None:
@@ -641,8 +650,14 @@ def _ensure_shard_timings_env() -> None:
     if os.environ.get("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "").strip() in {"1", "true", "yes"}:
         return
     output = ROOT / "timings" / "upload-profile.json"
+    branch, exclude_branches = _history_selection(_shard_timings_pipeline)
     try:
-        path = prepare_profile_from_history(output, include_local=False)
+        path = prepare_profile_from_history(
+            output,
+            branch=branch,
+            exclude_branches=exclude_branches,
+            include_local=False,
+        )
     except Exception as exc:  # noqa: BLE001 - planning must not fail the upload
         _log(f"automatic-shard: timing download skipped ({exc})")
         return
@@ -754,6 +769,8 @@ def _render_test_pipeline(
     # Validate MIRROR_HW once up front. Per-step skip must not run for typos
     # (e.g. b20o), or a pipeline can shrink to leftover CPU-only steps and
     # still upload successfully.
+    global _shard_timings_pipeline
+    _shard_timings_pipeline = pipeline_path
     _get_mirror_hw_selector()
     steps = doc.get("steps")
     if not isinstance(steps, list):
