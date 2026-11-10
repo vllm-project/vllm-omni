@@ -1,0 +1,3 @@
+nvidia-cudnn-cu13==9.25.1.1 \
+    --hash=sha256:195199e8c7f8bca0c366ea675dd2441a406646cf95a98bcda66c999d57dd1f26 \
+    --hash=sha256:6ed974d46b1b5fd123c0d9ff031c857142aa94257c6df41c40f6b5fd11a01d50

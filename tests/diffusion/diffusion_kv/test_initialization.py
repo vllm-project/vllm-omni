@@ -62,6 +62,7 @@ def _od_config(**overrides):
         diffusion_kv_max_rows_per_request=4,
         max_num_seqs=1,
         max_num_batched_tokens=64,
+        lora_application="runtime",
         num_gpus=1,
     )
     values.update(overrides)

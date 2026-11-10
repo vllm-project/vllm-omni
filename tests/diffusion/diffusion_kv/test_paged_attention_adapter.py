@@ -1113,8 +1113,10 @@ def test_forward_rejects_padded_full_kv(monkeypatch: pytest.MonkeyPatch) -> None
         adapter.prepare_layer_context("layer-0", query, full_kv, full_kv)
 
 
+@pytest.mark.parametrize("fail_forward", [False, True])
 def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    fail_forward: bool,
 ) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     metadata = DiffusionPagedAttentionMetadata(
@@ -1131,10 +1133,21 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
     )
     runtime = DiffusionPagedAttentionRuntime(adapter, metadata)
 
-    with set_forward_context(paged_kv_runtime=runtime), runtime.activate():
+    expected_error = pytest.raises(RuntimeError, match="forward failed") if fail_forward else nullcontext()
+    with expected_error, set_forward_context(paged_kv_runtime=runtime), runtime.activate():
+        initial_batch = adapter._active_batch
+        assert initial_batch is None
+        assert Attention._active_paged_kv_adapter() is None
+        set_forward_context_denoise_step_idx(None)
+        inactive_batch = adapter._active_batch
+        assert inactive_batch is None
+
         set_forward_context_denoise_step_idx(0)
         assert Attention._active_paged_kv_adapter() is adapter
         assert adapter._active_batch.rows == metadata.prefill_rows
+        prefill_batch = adapter._active_batch
+        set_forward_context_denoise_step_idx(0)
+        assert adapter._active_batch is prefill_batch
 
         set_forward_context_denoise_step_idx(1)
         assert Attention._active_paged_kv_adapter() is adapter
@@ -1144,8 +1157,14 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
         set_forward_context_denoise_step_idx(2)
         assert Attention._active_paged_kv_adapter() is adapter
         assert adapter._active_batch is denoise_batch
+        set_forward_context_denoise_step_idx(None)
+        assert adapter._active_batch is denoise_batch
+        if fail_forward:
+            raise RuntimeError("forward failed")
 
     assert adapter._active_batch is None
+    with pytest.raises(RuntimeError, match="already closed"):
+        runtime.ensure_active(1)
 
 
 def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) -> None:
