@@ -120,7 +120,65 @@ def test_qwen3_omni_plans_npu_shapes_from_connector_config(extra, streaming, exp
     )
     steady = 50 if streaming else 325
     shapes = model._plan_npu_code2wav_graph_shapes(streaming)
-    assert shapes == [*((1, window) for window in expected_start), *((rows, steady) for rows in range(1, 5))]
+    if streaming:
+        assert shapes == [*((1, window) for window in expected_start), *((rows, steady) for rows in range(1, 5))]
+    else:
+        assert shapes == [(rows, frames) for rows in range(1, 5) for frames in (300, 325)]
+
+
+def test_non_streaming_startup_plan_bounds_activation_size():
+    from unittest.mock import Mock
+
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
+    from vllm_omni.platforms.npu.models.code2wav_graph import MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
+
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.vllm_config = Mock()
+    model.vllm_config.scheduler_config.max_num_seqs = 64
+    shapes = model._plan_npu_code2wav_graph_shapes(False)
+    assert (16, 325) not in shapes  # #10090 failed before capturing this shape.
+    assert max(rows for rows, _ in shapes) == MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
+    assert len(shapes) <= 32
+    for rows in range(1, MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE + 1):
+        assert (rows, 300) in shapes
+        assert (rows, 325) in shapes
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+@pytest.mark.parametrize("with_lengths", [False, True])
+def test_non_streaming_split_preserves_audio_and_limits_eager_tail(monkeypatch, graphs, with_lengths):
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeCode2WavConfig
+
+    from vllm_omni.model_executor.models.qwen3_omni import qwen3_omni_code2wav
+    from vllm_omni.platforms.npu.models import code2wav_graph
+
+    class BoundedDecoder(qwen3_omni_code2wav.Qwen3OmniMoeCode2Wav):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.config = Qwen3OmniMoeCode2WavConfig(num_quantizers=1)
+            self.total_upsample = 4
+            self._cudagraph_enabled = graphs
+            self._cudagraph_wrapper = NPUGraphDecoderWrapper(self, 1) if graphs else None
+            self.calls = []
+
+        def forward(self, codes, *, graph_safe_mask=False):
+            self.calls.append(tuple(codes.shape))
+            return codes[:, :1].float().repeat_interleave(4, dim=-1)[..., :-1]
+
+    decoder = BoundedDecoder()
+    codes = torch.arange(7 * 13).reshape(7, 1, 13)
+    lengths = [13, 7, 11, 4, 13, 8, 12] if with_lengths else None
+    monkeypatch.setattr(qwen3_omni_code2wav.current_omni_platform, "is_npu", lambda: False)
+    expected = decoder.chunked_decode(codes, chunk_size=5, left_context_size=2, seq_token_counts=lengths)
+    decoder.calls.clear()
+    monkeypatch.setattr(qwen3_omni_code2wav.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(code2wav_graph, "MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE", 3)
+    actual = decoder.chunked_decode(codes, chunk_size=5, left_context_size=2, seq_token_counts=lengths)
+    assert len(actual) == len(expected) == 7
+    assert {shape[0] for shape in decoder.calls} == {1, 3}
+    assert {shape[-1] for shape in decoder.calls} == {5, 7}  # Includes uncaptured tail.
+    for wave, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(wave, reference, rtol=0, atol=0)
 
 
 def test_codec_captures_npu_graphs_before_enabling(monkeypatch):

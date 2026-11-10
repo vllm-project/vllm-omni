@@ -483,6 +483,28 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.code2wav_graph import MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
+
+            if codes.shape[0] > MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE:
+                # Keep temporal chunking and short-output trimming unchanged.
+                # Bound eager execution too: uncaptured tail windows and an
+                # enforce_eager deployment need the same activation limit.
+                return [
+                    wav
+                    for start in range(0, codes.shape[0], MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE)
+                    for wav in self.chunked_decode(
+                        codes[start : start + MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE],
+                        chunk_size=chunk_size,
+                        left_context_size=left_context_size,
+                        seq_token_counts=(
+                            seq_token_counts[start : start + MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE]
+                            if seq_token_counts is not None
+                            else None
+                        ),
+                    )
+                ]
+
         # Use CUDA graph wrapper for chunk-level decode when available
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
