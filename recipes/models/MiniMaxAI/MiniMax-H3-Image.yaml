@@ -136,10 +136,8 @@ variants:
 compatible_strategies: []
 
 hardware_overrides:
-  # VAE CUDA-graph decode can hang on ROCm: 4736x3552 stalled on the third
-  # request on MI350X (gfx950) and on the fifth on MI325X (gfx942), with the
-  # GPUs busy in the graph-replayed tile decode. Eager decode completed every
-  # request. MI300X and MI355X share these architectures (not measured).
+  # AMD Instinct runs the VAE tile decode eagerly. MI300X and MI355X share the
+  # MI325X (gfx942) and MI350X (gfx950) architectures (not measured).
   mi300x:
     extra_args:
       - "--no-enable-cuda-graph-decode"
@@ -234,9 +232,9 @@ guide: |
 
   Use `vllm/vllm-omni:minimax-h3-image-rocm` (vLLM 0.33.0+rocm100, kernels for
   `gfx942` and `gfx950`) with the default command plus
-  `--no-enable-cuda-graph-decode`. VAE graph replay can hang on both `gfx942`
-  and `gfx950`. MI325X and MI350X are verified; MI300X and MI355X share their
-  architectures but were not measured.
+  `--no-enable-cuda-graph-decode`, which runs the VAE tile decode eagerly.
+  MI325X and MI350X are verified; MI300X and MI355X share their architectures
+  but were not measured.
 
   ## References
 
