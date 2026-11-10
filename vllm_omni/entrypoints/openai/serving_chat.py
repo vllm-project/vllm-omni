@@ -984,9 +984,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 # The AR stage index does not depend on the request size;
                 # only the extra_args write below does. Size-less multistage
-                # requests still cap their AR budget — the cap resolves the
-                # processor's default grid itself. Single-stage engines have
-                # no AR stage to cap.
+                # requests still cap their AR budget — the registered
+                # builder resolves the absent size to the model's default
+                # grid. Single-stage engines have no AR stage to cap.
                 comprehension_idx = (
                     None if is_single_stage_diffusion(self.engine_client) else self._get_comprehension_stage_index()
                 )

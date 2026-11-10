@@ -41,6 +41,9 @@ def test_cap_passes_sizeless_request_to_builder(monkeypatch):
     sp = SimpleNamespace(max_tokens=4353)
     chat._cap_ar_stage_max_tokens(None, [sp], 0, None, None)
     assert captured["args"] == (None, None, False)
+    # Only checks the write-back: the builder's return value lands on the
+    # AR stage budget. The real 1281/1025 values are pinned by the registry
+    # test below.
     assert sp.max_tokens == 1281
 
 
