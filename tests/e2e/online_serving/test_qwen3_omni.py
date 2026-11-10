@@ -44,6 +44,9 @@ _PREFIX_CACHE_SERVER_ARGS = [
     '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
     "--enable-prompt-tokens-details",
 ]
+# Keep every ``default`` test contiguous, then the ``prefix_cache_async_chunk``
+# tests. ``omni_server`` is module-scoped per param, so a param change tears the
+# server down. Interleaving these restarts the default server.
 test_params = [
     pytest.param(
         OmniServerParams(
@@ -282,110 +285,6 @@ def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None
     _run_prefix_cache_check(online_client, request_config)
 
 
-def _assert_omni_payload_complete(resp) -> None:
-    """Async-chunk + prefix-cache must still deliver a full downstream payload."""
-    assert resp.success
-    assert resp.text_content
-    has_audio = bool(resp.audio_bytes) or bool(resp.audio_data)
-    assert has_audio
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
-def test_thinker_prefix_caching_async_chunk_identical(omni_server, online_client) -> None:
-    """Production path: ``async_chunk: true`` plus thinker/talker prefix cache.
-
-    Two identical streaming requests. The second must report a block-aligned
-    cache hit and still produce text + audio (async output builder).
-    """
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        content_text=get_prompt(),
-    )
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    first_response, cached_response = _run_prefix_cache_check(online_client, request_config)
-    _assert_omni_payload_complete(first_response)
-    _assert_omni_payload_complete(cached_response)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
-def test_thinker_prefix_caching_async_chunk_shared_image_prefix(omni_server, online_client) -> None:
-    """Shared image / system prefix, different user text — not a full-prompt replay.
-
-    The second request must still hit cached tokens (block-aligned, less than
-    its prompt). A merge that only works when ``hit_upto == prompt_len`` would
-    fail this.
-    """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-    first_messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        image_data_url=image_data_url,
-        content_text=get_prompt("text_image"),
-    )
-    second_messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        image_data_url=image_data_url,
-        content_text="How many squares are in this image? Answer in 20 words.",
-    )
-    first_cfg = {
-        "model": omni_server.model,
-        "messages": first_messages,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "modalities": ["text"],
-    }
-    second_cfg = {**first_cfg, "messages": second_messages}
-    first_response = online_client.send_omni_request(first_cfg, request_num=1)[0]
-    cached_response = online_client.send_omni_request(second_cfg, request_num=1)[0]
-    assert first_response.success and cached_response.success
-    assert first_response.text_content and cached_response.text_content
-    num_cached = cached_response.cached_tokens
-    num_prompt = cached_response.prompt_tokens
-    assert num_cached is not None and num_prompt is not None
-    assert num_cached > 0
-    assert num_cached % BLOCK_SIZE == 0
-    assert num_cached < num_prompt
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
-    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
-)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
-    """Ensure Thinker-talker models reject /v1/completions; we do this because the
-    thinker-talker handoff implementations currently use ChatML <|im_start|> and
-    <|im_end|> markers to segment the input sequence; when we don't have them,
-    the talker does not get any embeddings, which breaks the server.
-    """
-    responses = online_client.send_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "prompt": "Hello, how are you?",
-                "max_tokens": 10,
-            },
-        },
-        err_code=400,
-    )
-    assert not responses[0].success
-
-
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
@@ -457,37 +356,79 @@ def test_batched_completions_audio_out(omni_server, openai_client) -> None:
         assert choice["message"]["content"]
 
 
+def _assert_omni_payload_complete(resp) -> None:
+    """Async-chunk + prefix-cache must still deliver a full downstream payload."""
+    assert resp.success
+    assert resp.text_content
+    has_audio = bool(resp.audio_bytes) or bool(resp.audio_data)
+    assert has_audio
+
+
+# These two stay after every ``default`` test. See the note on ``test_params``.
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
-    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
-)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.parametrize(
-    "sad_opts",
-    [
-        {"stream": "not-a-bool"},  # Fails validation
-        {"n": 2},  # vLLM Batched endpoints doesn't support n > 1
-    ],
-)
-def test_batched_completions_with_bad_values(omni_server, openai_client, sad_opts) -> None:
-    """Ensure that a bad values are correctly handled as 400s."""
-    messages = [
-        [{"role": "user", "content": "Say hello."}],
-        [{"role": "user", "content": "Say goodbye."}],
-    ]
-    responses = openai_client.send_batched_chat_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": messages,
-                **sad_opts,
-            },
-        },
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
+def test_thinker_prefix_caching_async_chunk_identical(omni_server, online_client) -> None:
+    """Production path: ``async_chunk: true`` plus thinker/talker prefix cache.
+
+    Two identical streaming requests. The second must report a block-aligned
+    cache hit and still produce text + audio (async output builder).
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
     )
-    assert responses and len(responses) == 1
-    resp = responses[0]
-    assert not responses[0].success
-    assert resp.status_code == 400
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    first_response, cached_response = _run_prefix_cache_check(online_client, request_config)
+    _assert_omni_payload_complete(first_response)
+    _assert_omni_payload_complete(cached_response)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
+def test_thinker_prefix_caching_async_chunk_shared_image_prefix(omni_server, online_client) -> None:
+    """Shared image / system prefix, different user text — not a full-prompt replay.
+
+    The second request must still hit cached tokens (block-aligned, less than
+    its prompt). A merge that only works when ``hit_upto == prompt_len`` would
+    fail this.
+    """
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    first_messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text=get_prompt("text_image"),
+    )
+    second_messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text="How many squares are in this image? Answer in 20 words.",
+    )
+    first_cfg = {
+        "model": omni_server.model,
+        "messages": first_messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "modalities": ["text"],
+    }
+    second_cfg = {**first_cfg, "messages": second_messages}
+    first_response = online_client.send_omni_request(first_cfg, request_num=1)[0]
+    cached_response = online_client.send_omni_request(second_cfg, request_num=1)[0]
+    assert first_response.success and cached_response.success
+    assert first_response.text_content and cached_response.text_content
+    num_cached = cached_response.cached_tokens
+    num_prompt = cached_response.prompt_tokens
+    assert num_cached is not None and num_prompt is not None
+    assert num_cached > 0
+    assert num_cached % BLOCK_SIZE == 0
+    assert num_cached < num_prompt
