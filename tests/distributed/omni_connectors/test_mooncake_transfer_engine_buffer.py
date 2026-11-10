@@ -15,8 +15,10 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     BufferAllocator,
     ManagedBuffer,
+    MooncakeTransferEngineConnector,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerde
 
 # CPU cases opt in below. The CUDA pool smokes use hardware_test instead.
 pytestmark = [pytest.mark.parallel, pytest.mark.core_model]
@@ -305,3 +307,42 @@ class TestMooncakePackedPayloadSmoke:
         assert decoded["layer_blocks"]["value_cache"][0].is_cuda
         assert torch.equal(decoded["layer_blocks"]["key_cache"][0].cpu(), key_tensor.cpu())
         assert torch.equal(decoded["layer_blocks"]["value_cache"][0].cpu(), value_tensor.cpu())
+
+
+@pytest.mark.cpu
+def test_put_non_raw_payload_copies_reusable_encode_buffer():
+    connector = object.__new__(MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector.can_put = True
+    connector._put_lock = threading.Lock()
+    connector._encode_buffer = threading.local()
+    connector._serde = OmniSerde()
+    connector.allocator = BufferAllocator(total_size=4096, alignment=64)
+    connector.pool = torch.zeros(4096, dtype=torch.uint8)
+    connector.base_ptr = connector.pool.data_ptr()
+    connector._local_buffers = {}
+    connector._local_buffers_lock = threading.Lock()
+    connector._metrics = {"puts": 0, "bytes_transferred": 0, "errors": 0}
+    connector.host = "127.0.0.1"
+    connector.zmq_port = 1
+
+    payload = {"text": "hello" * 100}
+    ok, size, metadata = connector._put_impl("key-1", payload)
+    assert ok
+    assert size > 0
+    assert metadata is not None
+    assert metadata["is_fast_path"] is False
+
+    src_addrs, lengths, holder, _should_release, _is_fast_path, _created = connector._local_buffers["key-1"]
+    assert src_addrs[0] == connector.base_ptr
+    assert lengths[0] == size
+    assert isinstance(holder, ManagedBuffer)
+    assert holder.size == size
+    copied = bytes(holder.tensor.cpu().numpy())
+    assert OmniSerde().deserialize(copied) == payload
+
+    ok, _size, _metadata = connector._put_impl("key-2", {"text": "world" * 200})
+    assert ok
+    copied_after = bytes(holder.tensor.cpu().numpy())
+    assert OmniSerde().deserialize(copied_after) == payload
+    connector._closed = True

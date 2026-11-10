@@ -17,7 +17,7 @@ import zmq
 
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
-from ..utils.serialization import OmniSerializer
+from ..utils.serialization import OmniSerde, OmniSerializer
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
@@ -120,6 +120,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._put_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
+        self._serde = OmniSerde()
+        self._encode_buffer = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
         self._sender_endpoints: dict[int, tuple[str, int]] = {}
         self._in_flight_buffers: set[str] = set()
@@ -412,8 +414,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Reject empty data early — alloc(0) has undefined behaviour and
             # would leave a zombie entry in _local_buffers that the receiver
             # side can never consume (get() returns None for data_size==0).
-            if isinstance(data, bytes) and len(data) == 0:
-                logger.warning(f"Rejecting put for {put_key}: empty bytes payload")
+            if isinstance(data, (bytes, bytearray, memoryview)) and len(data) == 0:
+                logger.warning(f"Rejecting put for {put_key}: empty byte payload")
                 return False, 0, None
             if isinstance(data, torch.Tensor) and data.nbytes == 0:
                 logger.warning(f"Rejecting put for {put_key}: zero-size tensor")
@@ -422,8 +424,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Pre-process: serialize non-raw types before entering the copy path.
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
-            if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
-                data = OmniSerializer.serialize(data)
+            if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes, bytearray, memoryview)):
+                buffer = getattr(self._encode_buffer, "buffer", None)
+                if buffer is None:
+                    buffer = bytearray()
+                    self._encode_buffer.buffer = buffer
+                else:
+                    buffer.clear()
+                size = self._serde.serialize_into(data, buffer)
+                data = memoryview(buffer)[:size]
                 is_fast_path = False  # Receiver must deserialize
 
             if isinstance(data, ManagedBuffer):
@@ -443,7 +452,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
             # convert to Tensor and flow into this branch seamlessly.
-            if isinstance(data, (torch.Tensor, bytes)):
+            if isinstance(data, (torch.Tensor, bytes, bytearray, memoryview)):
                 # Copy Path
                 # 1. Determine size
                 if isinstance(data, torch.Tensor):
@@ -451,7 +460,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     tensor_data = data
                 else:
                     size = len(data)
-                    # Convert bytes to tensor for copy
+                    # Convert bytes / buffer view to tensor for copy
                     tensor_data = torch.frombuffer(data, dtype=torch.uint8)
 
                 # 2. Alloc from pool
