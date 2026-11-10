@@ -1197,6 +1197,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "shutdown_timeout",
         "cuda_mps",
         "additional_config",
         "distributed_executor_backend",
