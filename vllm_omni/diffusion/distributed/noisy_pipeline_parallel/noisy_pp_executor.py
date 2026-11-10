@@ -4,16 +4,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterator
-from contextlib import contextmanager
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellPlan,
     Inflight,
@@ -23,7 +22,6 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     rank_of_block,
     rank_work,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -212,10 +210,62 @@ class PendingAdmit:
     retain: frozenset[Cell] = field(default_factory=frozenset)
 
 
+@runtime_checkable
+class SupportsNoisyPPKV(Protocol):
+    """KV ops the cell loop needs — filled by experimental ``NoisyKVState``.
+
+    Mainline plan/executor only depend on this structural interface (same idea as
+    stepwise ``SupportsStepExecution``), not on ``experimental...kv_cache.noisy``.
+
+    ``end_request(..., retain=None)`` keeps the existing protect set (normal
+    plan completion); ``retain=()`` clears retained versions (fail-closed drop).
+    ``slot`` arguments are global pipeline tick indices, not inflight lists.
+    """
+
+    @property
+    def uses_comm_stream(self) -> bool: ...
+
+    def bind_rank(self, rank: int, pp_group: Any | None) -> None: ...
+
+    def begin_request(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        t0: int = 0,
+        retain: Collection[Cell] | None = None,
+    ) -> None: ...
+
+    def set_inflight(self, inflight: Sequence[Inflight]) -> None: ...
+
+    def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None: ...
+
+    def chunk_tokens(self, req: str) -> int: ...
+
+    def exchange_and_await_prior_handoffs(self, slot: int) -> list[Any]: ...
+
+    def await_task_sources(self, tasks: Sequence[tuple[str, Cell]]) -> int: ...
+
+    def prepare(self, tasks: Sequence[tuple[str, Cell]]) -> list[Any]: ...
+
+    def publish(self, tasks: Sequence[tuple[str, Cell]]) -> None: ...
+
+    def wait_sends(self) -> None: ...
+
+    def evict(self, slot: int) -> None: ...
+
+    def exchange(self, slot: int) -> list[Any]: ...
+
+    def await_ready(self, slot: int) -> int: ...
+
+    def drain(self) -> None: ...
+
+
 @dataclass
 class ARDiffusionCellContext:
     spec: CellRunSpec
-    kv: NoisyKVState
+    kv: SupportsNoisyPPKV
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
 
@@ -255,7 +305,7 @@ class ARDiffusionCellContext:
             return False
         if not can_admit(pending, slot, plan, max_batch_size=self.spec.max_batch_size):
             return False
-        inflight_tokens = {self.kv._chunk_tokens[item.req] for item in self.inflight}
+        inflight_tokens = {self.kv.chunk_tokens(item.req) for item in self.inflight}
         if inflight_tokens and chunk_tokens not in inflight_tokens:
             return False
         self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot, retain=retain)
@@ -487,13 +537,3 @@ def run_cell_pipeline(
         for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
             ctx.drop(req)
         raise
-
-
-@contextmanager
-def bind_ar_diffusion_cell_context(owner: Any, ctx: ARDiffusionCellContext) -> Iterator[ARDiffusionCellContext]:
-    prev = getattr(owner, "_ar_diffusion_cell_context", None)
-    owner._ar_diffusion_cell_context = ctx
-    try:
-        yield ctx
-    finally:
-        owner._ar_diffusion_cell_context = prev

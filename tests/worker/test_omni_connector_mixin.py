@@ -2151,3 +2151,22 @@ def test_full_payload_replace_overrides_codec_validity_accumulation(legacy_entry
         output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
         assert output["meta.codec_frame_valid"].tolist() == valid
         assert actual_request is request
+
+
+def test_first_stage_output_drain_does_not_broadcast_to_non_reply_tp_rank():
+    host = MixinHost()
+    host.init_omni_connectors(model_config=_make_model_config(stage_id=0, async_chunk=True))
+    tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+    try:
+        with (
+            patch.object(host, "_get_local_tp_group", return_value=tp_group),
+            patch.object(tp_group, "broadcast_object", side_effect=AssertionError("no receiving rank")),
+        ):
+            for index in range(32):
+                req_id = f"request-{index}"
+                host._kv_sent_req_ids.append(req_id)
+                output = host.get_omni_connector_output()
+                assert output.kv_sent_req_ids == [req_id]
+                assert host.get_omni_connector_output().kv_sent_req_ids == []
+    finally:
+        host.shutdown_omni_connectors()

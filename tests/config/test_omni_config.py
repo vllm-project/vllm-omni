@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from dataclasses import asdict, fields, replace
@@ -526,6 +527,16 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
+def test_from_pipeline_config_accepts_frontend_consumed_reasoning_parser():
+    """The API worker consumes --reasoning-parser, so stages must not claim it."""
+    omni_config = _from_pipeline_key(
+        "qwen3_omni_moe_thinker_only",
+        cli_overrides={"reasoning_parser": "qwen3"},
+    )
+
+    assert omni_config.stage_by_id(0) is not None
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
@@ -1026,19 +1037,15 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-def test_mrv2_fails_fast_on_xpu():
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
-
-
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
 @pytest.mark.parametrize("stage_override", [False, True])
-def test_mrv2_config_is_allowed_on_npu(stage_override):
+def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
     deploy = (
         DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
         if stage_override
         else DeployConfig(model_runner="v2")
     )
-    deploy = _apply_platform_overrides(deploy, platform="npu")
+    deploy = _apply_platform_overrides(deploy, platform=platform)
     if stage_override:
         assert deploy.stages[0].model_runner == "v2"
     else:
@@ -1190,6 +1197,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "shutdown_timeout",
         "cuda_mps",
         "additional_config",
         "distributed_executor_backend",
@@ -1564,6 +1572,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
         stages=[
             StageDeployConfig(
                 stage_id=0,
+                ulysses_degree=2,
                 ulysses_a2a_permute=True,
             )
         ]
@@ -2689,6 +2698,100 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+@pytest.mark.parametrize("stage_id", [0, 3])
+@pytest.mark.parametrize("encode_json", [False, True], ids=["mapping", "json"])
+def test_cli_sampling_defaults_merge_by_stage_id(stage_id: int, encode_json: bool) -> None:
+    pipeline = PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=stage_id,
+                default_sampling_params={
+                    "num_inference_steps": 50,
+                    "guidance_scale": 3.0,
+                    "extra_args": {"flow_shift": 5.0},
+                },
+            )
+        ]
+    )
+    overrides = {str(stage_id): {"guidance_scale": 0.0, "extra_args": {"use_system_prompt": "dynamic"}}}
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": json.dumps(overrides) if encode_json else overrides},
+    )
+    assert config.stage_by_id(stage_id).model_config.default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 0.0,
+        "extra_args": {"flow_shift": 5.0, "use_system_prompt": "dynamic"},
+    }
+    assert deploy.stages[0].default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 3.0,
+        "extra_args": {"flow_shift": 5.0},
+    }
+
+
+@pytest.fixture
+def sampling_defaults_pipeline() -> PipelineConfig:
+    return PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+
+
+def test_cli_sampling_defaults_reject_non_numeric_stage_key(sampling_defaults_pipeline: PipelineConfig) -> None:
+    with pytest.raises(
+        ValueError, match="Invalid default_sampling_params stage key 'text': expected an integer stage ID"
+    ):
+        VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"text": {"guidance_scale": 3.0}}'},
+        )
+
+
+def test_cli_sampling_defaults_warn_for_unknown_pipeline_stage(
+    sampling_defaults_pipeline: PipelineConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.omni_config"):
+        config = VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"2": {"guidance_scale": 3.0}}'},
+        )
+    assert "Ignoring default_sampling_params for unknown stage ID 2; pipeline stages are [0]" in caplog.text
+    assert config.stage_by_id(0).model_config.default_sampling_params is None
+
+
+def test_cli_sampling_defaults_apply_to_stage_missing_from_deploy(sampling_defaults_pipeline: PipelineConfig) -> None:
+    deploy = DeployConfig(stages=[])
+    config = VllmOmniConfig.from_pipeline_config(
+        sampling_defaults_pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": '{"0": {"guidance_scale": 3.0}}'},
+    )
+    assert config.stage_by_id(0).model_config.default_sampling_params == {"guidance_scale": 3.0}
+    assert deploy.stages == []
 
 
 def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():

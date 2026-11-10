@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import json
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -1702,7 +1703,10 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         assert isinstance(pipeline, PipelineConfig)
         deploy = _apply_platform_overrides(
@@ -1710,10 +1714,14 @@ stages:
             platform=platform,
         )
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expect_v2 = platform == "cuda"
+        expect_v2 = platform in {"cuda", "npu"}
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            expect_v2,
+            expect_v2,
+            expect_v2,
+        ]
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 
         duplex = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
@@ -3290,7 +3298,13 @@ class TestPlatformOverrides:
 
     @pytest.mark.parametrize(
         "platform,runs_v2",
-        [("cuda", [True, True]), ("npu", [True, False]), ("rocm", [True, False]), ("musa", [True, False])],
+        [
+            ("cuda", [True, True]),
+            ("npu", [True, False]),
+            ("rocm", [True, False]),
+            ("musa", [True, False]),
+            ("xpu", [True, False]),
+        ],
     )
     def test_fish_omni_dac_stage_runs_v2_on_cuda_only(self, platform, runs_v2):
         deploy = load_deploy_config(Path(get_deploy_config_path("fish_omni.yaml")))
@@ -3301,13 +3315,6 @@ class TestPlatformOverrides:
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == runs_v2
         # The pipeline lets the DAC stage take the native data plane whenever it runs on V2.
         assert stages[1].yaml_engine_args["supports_native_mrv2_data_plane"]
-
-    def test_fish_omni_is_rejected_on_xpu(self):
-        # Stage 0 already runs on V2, which XPU does not support; the DAC change adds nothing here.
-        deploy = load_deploy_config(Path(get_deploy_config_path("fish_omni.yaml")))
-
-        with pytest.raises(NotImplementedError, match="XPU"):
-            _apply_platform_overrides(deploy, platform="xpu")
 
     @pytest.mark.parametrize(
         "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
@@ -4346,3 +4353,14 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["generic-diffusion", "registered-pipeline"])
+def test_invalid_cli_sampling_json_fails_startup(registered: bool) -> None:
+    with pytest.raises(json.JSONDecodeError):
+        if registered:
+            VllmOmniConfig.from_pipeline_config(
+                OMNI_PIPELINES["moss_image"], cli_overrides={"default_sampling_params": "{"}
+            )
+        else:
+            StageConfigFactory._normalize_default_diffusion({"default_sampling_params": "{"})
