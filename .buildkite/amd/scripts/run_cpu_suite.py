@@ -8,12 +8,12 @@ import json
 import os
 import sys
 import tempfile
-import time
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -50,9 +50,11 @@ def cpu_context() -> dict[str, object]:
 
 
 class CpuSuiteArtifacts:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, suite: str | None = None) -> None:
         self.directory = directory
-        self.started = time.perf_counter()
+        self.suite = suite
+        # Tests may patch time.perf_counter; diagnostics must not consume their clock.
+        self.started = perf_counter()
         self.collected: list[str] = []
         self.selected: list[str] = []
         self.not_selected: list[str] = []
@@ -61,6 +63,7 @@ class CpuSuiteArtifacts:
         self.phases: dict[str, float] = defaultdict(float)
         self.outcomes: dict[str, dict[str, str]] = {}
         self.started_nodes: set[str] = set()
+        self.failed_subtests: set[str] = set()
         self.collection_seconds: float | None = None
         self.collection_finished = False
         self.artifact_errors: set[str] = set()
@@ -82,21 +85,23 @@ class CpuSuiteArtifacts:
     def event(self, kind: str, **fields: object) -> None:
         self.write(
             "events.jsonl",
-            {"event": kind, "elapsed_seconds": time.perf_counter() - self.started, **fields},
+            {"event": kind, "elapsed_seconds": perf_counter() - self.started, **fields},
             append=True,
         )
 
     def pytest_configure(self, config: pytest.Config) -> None:
+        weighted = bool(config.getoption("cpu_shard_profile", default=None))
         self.write(
             "invocation.json",
             {
                 "schema_version": 1,
+                "suite": self.suite,
                 "pytest_version": pytest.__version__,
                 "args": list(config.invocation_params.args),
                 "markers": config.option.markexpr,
                 "run_level": config.getoption("run_level", default=None),
-                "num_shards": config.getoption("num_shards", default=1),
-                "shard_id": config.getoption("shard_id", default=0),
+                "num_shards": config.getoption("cpu_shard_count" if weighted else "num_shards", default=1),
+                "shard_id": config.getoption("cpu_shard_index" if weighted else "shard_id", default=0),
                 "buildkite": {
                     name: os.environ.get(f"BUILDKITE_{name}")
                     for name in ("BUILD_NUMBER", "BUILD_URL", "JOB_ID", "COMMIT", "BRANCH", "LABEL", "RETRY_COUNT")
@@ -111,12 +116,12 @@ class CpuSuiteArtifacts:
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_collection(self) -> Generator[None, None, None]:
-        started = time.perf_counter()
+        started = perf_counter()
         self.event("collection_start")
         try:
             yield
         finally:
-            self.collection_seconds = time.perf_counter() - started
+            self.collection_seconds = perf_counter() - started
             self.event("collection_end", seconds=self.collection_seconds)
 
     def pytest_itemcollected(self, item: pytest.Item) -> None:
@@ -151,6 +156,13 @@ class CpuSuiteArtifacts:
         self.event("test_start", nodeid=nodeid)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        # A subtest report shares its parent's node ID and duration is already
+        # included in the parent call. Keep diagnostics without double counting.
+        if hasattr(report, "context"):
+            self.event("subtest_report", nodeid=report.nodeid, outcome=report.outcome)
+            if report.failed:
+                self.failed_subtests.add(report.nodeid)
+            return
         self.phases[report.when] += report.duration
         self.outcomes.setdefault(report.nodeid, {})[report.when] = report.outcome
         self.event(
@@ -181,7 +193,7 @@ class CpuSuiteArtifacts:
         counts = Counter()
         for nodeid in self.started_nodes | self.outcomes.keys():
             phases = self.outcomes.get(nodeid, {})
-            if "failed" in phases.values():
+            if "failed" in phases.values() or nodeid in self.failed_subtests:
                 counts["failed"] += 1
             elif "skipped" in phases.values():
                 counts["skipped"] += 1
@@ -206,7 +218,7 @@ class CpuSuiteArtifacts:
                     **{name: counts[name] for name in ("passed", "failed", "skipped", "incomplete")},
                 },
                 "seconds": {
-                    "runner_wall": time.perf_counter() - self.started,
+                    "runner_wall": perf_counter() - self.started,
                     "collection": self.collection_seconds,
                     **{phase: self.phases[phase] for phase in ("setup", "call", "teardown")},
                 },
@@ -219,7 +231,8 @@ class CpuSuiteArtifacts:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("model-executor", "other"))
+    parser.add_argument("suite", choices=("model-executor", "other", "diffusion"))
+    parser.add_argument("--timing-profile", type=Path, help="Use duration packing instead of hash sharding")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     artifact_root = Path(os.environ.get("BUILDKITE_BUILD_CHECKOUT_PATH", Path.cwd())) / "artifacts/amd-cpu-suites"
@@ -236,12 +249,30 @@ def main() -> int:
         print(f"Cannot create CPU timing artifacts: {error}", file=sys.stderr)
         return 1
     print(f"CPU timing artifacts: {directory}", flush=True)
-    recorder = CpuSuiteArtifacts(directory)
+    recorder = CpuSuiteArtifacts(directory, args.suite)
     recorder.write("cpu-before.json", cpu_context())
     # Match python -m pytest's import path when this script is invoked by path.
     sys.path.insert(0, str(Path.cwd()))
+    pytest_args = list(args.pytest_args)
+    if args.timing_profile:
+        from tests.helpers.cpu_sharding import load_profile
+
+        try:
+            if load_profile(args.timing_profile).suite != args.suite:
+                parser.error("Timing profile suite does not match the requested suite")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        # Buildkite assigns the worker count/index; the manifest only supplies costs.
+        pytest_args.extend(
+            [
+                f"--cpu-shard-profile={args.timing_profile}",
+                f"--cpu-shard-count={os.environ.get('BUILDKITE_PARALLEL_JOB_COUNT', '1')}",
+                f"--cpu-shard-index={os.environ.get('BUILDKITE_PARALLEL_JOB', '0')}",
+                f"--cpu-shard-plan={directory / 'plan.json'}",
+            ]
+        )
     status = int(
-        pytest.main([*args.pytest_args, "--durations=50", f"--junitxml={directory / 'pytest.xml'}"], plugins=[recorder])
+        pytest.main([*pytest_args, "--durations=50", f"--junitxml={directory / 'pytest.xml'}"], plugins=[recorder])
     )
     return recorder.finish(status)
 
