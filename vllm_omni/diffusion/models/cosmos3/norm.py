@@ -8,7 +8,7 @@ from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 
 
 class RMSNorm(_VllmRMSNorm):
-    """Cosmos3 RMSNorm with shared NPU fusion and native CUDA/HIP paths."""
+    """Cosmos3 Transformer RMSNorm with NPU fusion and native CUDA/HIP paths."""
 
     def forward_cuda(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
@@ -20,20 +20,20 @@ class RMSNorm(_VllmRMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, residual)
 
+
+class VAERMSNorm(RMSNorm):
+    """Preserve FP32 native normalization for the Cosmos3 LiDAR VAE."""
+
     def forward_npu(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return super().forward_npu(x, residual)
+        return self.forward_native(x, residual)
 
 
 class QKRMSNorm(RMSNorm):
     """Preserve functional Q/K normalization outside the fused NPU path."""
 
-    def forward_native(
-        self, x: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward_native(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         if residual is not None:
-            residual = residual + x
-            x = residual
-        output = F.rms_norm(x, (self.hidden_size,), self.weight, eps=self.variance_epsilon)
-        return (output, residual) if residual is not None else output
+            raise ValueError("QKRMSNorm does not support residual input.")
+        return F.rms_norm(x, (self.hidden_size,), self.weight, eps=self.variance_epsilon)
