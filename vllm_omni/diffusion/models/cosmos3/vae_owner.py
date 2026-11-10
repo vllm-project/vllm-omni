@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -91,12 +92,14 @@ class OwnerScheduler:
         order, owners = _place(tasks, self.sp.world_size, self.cfg.world_size) if distributed else (tasks, None)
         mine = [task for task in order if owners is None or owners[task.key] == self.rank]
         results = {}
+        failures: list[tuple[str, Exception]] = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos3_vae_prepare") as pool:
             prepared = _prefetched(pool, mine)
             for task in order:
                 owner = self.rank if owners is None else owners[task.key]
                 if owner == self.rank:
-                    value = _checked(task, task.run(next(prepared)))
+                    run = partial(_run_prepared, task, next(prepared))
+                    value = self._run_owned(task, run, failures) if distributed else _checked(task, run())
                 else:
                     value = torch.empty(task.shape, dtype=task.dtype, device=self.device)
                 if distributed:
@@ -105,6 +108,7 @@ class OwnerScheduler:
                 results[task.key] = value
         if distributed:
             torch.cuda.current_stream(self.device).wait_stream(self.stream)
+            self._raise_if_failed(failures)
         return results
 
     def run_to_output(self, tasks: Sequence[VaeTask], outputs: Mapping[str, torch.Tensor] | None) -> None:
@@ -120,11 +124,12 @@ class OwnerScheduler:
         # Queue every remote result before the output rank runs its own tasks.
         order = sorted(order, key=lambda task: owners[task.key] == 0)
         sp_rank, cfg_rank = self.sp.rank_in_group, self.cfg.rank_in_group
+        failures: list[tuple[str, Exception]] = []
         for task in order:
             owner = owners[task.key]
             owner_cfg, owner_sp = divmod(owner, self.sp.world_size)
             if owner == self.rank:
-                value = _checked(task, task.run(None)).contiguous()
+                value = self._run_owned(task, partial(task.run, None), failures).contiguous()
             elif sp_rank == 0 and ((cfg_rank == owner_cfg and owner_sp != 0) or (cfg_rank == 0 and owner_cfg != 0)):
                 # This rank receives the result, to relay it or to output it.
                 value = torch.empty(task.shape, dtype=task.dtype, device=self.device)
@@ -133,6 +138,36 @@ class OwnerScheduler:
             self._gather(value, owner, outputs[task.key] if self.is_output_rank else None)
             del value
         self.stream.synchronize()
+        self._raise_if_failed(failures)
+
+    def _run_owned(
+        self, task: VaeTask, run: Callable[[], torch.Tensor], failures: list[tuple[str, Exception]]
+    ) -> torch.Tensor:
+        """Run an owned task, recording a failure instead of raising it.
+
+        After a failure this rank skips its remaining tasks but still joins
+        every collective with an unused buffer, so no other rank waits forever.
+        """
+        if not failures:
+            try:
+                return _checked(task, run())
+            except Exception as error:
+                failures.append((task.key, error))
+        return torch.empty(task.shape, dtype=task.dtype, device=self.device)
+
+    def _raise_if_failed(self, failures: list[tuple[str, Exception]]) -> None:
+        """Raise the first failure of the grid on every grid rank."""
+        message = None
+        if failures:
+            key, error = failures[0]
+            message = f"VAE task {key!r} failed on grid rank {self.rank}: {error!r}"
+        for group in (self.sp, self.cfg):
+            if group.world_size > 1:
+                gathered = [None] * group.world_size
+                dist.all_gather_object(gathered, message, group=group.cpu_group)
+                message = next((item for item in gathered if item is not None), None)
+        if message is not None:
+            raise RuntimeError(message) from (failures[0][1] if failures else None)
 
     def _broadcast(self, tensor: torch.Tensor, owner: int) -> None:
         """Owner to its CFG row along SP, then every SP column along CFG."""
@@ -207,8 +242,8 @@ def _place(tasks: Sequence[VaeTask], sp_size: int, cfg_size: int) -> tuple[list[
     return order, owners
 
 
-def _prefetched(pool: ThreadPoolExecutor, tasks: Sequence[VaeTask]) -> Iterator[Any]:
-    """Yield each task's ``prepare()`` result while ``pool`` prepares the following task."""
+def _prefetched(pool: ThreadPoolExecutor, tasks: Sequence[VaeTask]) -> Iterator[Future | None]:
+    """Yield each task's ``prepare()`` future while ``pool`` prepares the following task."""
 
     def submit(task: VaeTask) -> Future | None:
         return pool.submit(task.prepare) if task.prepare is not None else None
@@ -216,7 +251,11 @@ def _prefetched(pool: ThreadPoolExecutor, tasks: Sequence[VaeTask]) -> Iterator[
     following = submit(tasks[0]) if tasks else None
     for index in range(len(tasks)):
         current, following = following, submit(tasks[index + 1]) if index + 1 < len(tasks) else None
-        yield None if current is None else current.result()
+        yield current
+
+
+def _run_prepared(task: VaeTask, prepared: Future | None) -> torch.Tensor:
+    return task.run(None if prepared is None else prepared.result())
 
 
 def _checked(task: VaeTask, value: torch.Tensor) -> torch.Tensor:

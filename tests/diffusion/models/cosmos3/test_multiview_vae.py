@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Owner placement, and the single-rank VAE path against the original serial code."""
+"""Owner placement and failures, and the single-rank VAE path against the original serial code."""
 
 from types import SimpleNamespace
 
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.models.cosmos3.multiview_vae import stream_media_to_uint8_cthw
 from vllm_omni.diffusion.models.cosmos3.transfer import media_to_uint8_cthw
-from vllm_omni.diffusion.models.cosmos3.vae_owner import VaeTask, _place
+from vllm_omni.diffusion.models.cosmos3.vae_owner import OwnerScheduler, VaeTask, _place
 from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -32,6 +32,52 @@ def test_place_longest_first_and_prefers_output_rank_on_ties() -> None:
 
     order, owners = _place([_task(str(i), 1.0) for i in range(6)], sp_size=4, cfg_size=1)
     assert owners == {"0": 0, "1": 1, "2": 2, "3": 3, "4": 0, "5": 1}
+
+
+def _grid_rank0(monkeypatch, peer_message: str | None):
+    """Grid rank 0 of an SP=2 grid whose collectives are recorded, and whose peer reports ``peer_message``."""
+    from vllm_omni.diffusion.models.cosmos3 import vae_owner
+
+    def all_gather_object(gathered, message, group):
+        gathered[:] = [message, peer_message]
+
+    monkeypatch.setattr(vae_owner.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(wait_stream=lambda stream: None))
+    sp = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=None)
+    cfg = SimpleNamespace(world_size=1, rank_in_group=0, cpu_group=None)
+    scheduler = OwnerScheduler.__new__(OwnerScheduler)
+    scheduler.__dict__.update(device=torch.device("cpu"), sp=sp, cfg=cfg, distributed=True, rank=0, stream=None)
+    broadcasts = []
+    monkeypatch.setattr(scheduler, "_broadcast", lambda tensor, owner: broadcasts.append(owner))
+    return scheduler, broadcasts
+
+
+def test_owner_failure_joins_every_collective_then_raises_everywhere(monkeypatch) -> None:
+    scheduler, broadcasts = _grid_rank0(monkeypatch, peer_message=None)
+    ran = []
+
+    def missing():
+        raise FileNotFoundError("control.mp4")
+
+    # Owners on the 2-rank grid: a -> 0, b -> 1, c -> 1, d -> 0.
+    tasks = [
+        VaeTask("a", 5.0, (1,), torch.float32, run=lambda _: torch.zeros(1), prepare=missing),
+        _task("b", 4.0),
+        _task("c", 3.0),
+        VaeTask("d", 1.0, (1,), torch.float32, run=lambda _: ran.append("d") or torch.zeros(1)),
+    ]
+    with pytest.raises(RuntimeError, match="'a' failed on grid rank 0: FileNotFoundError") as raised:
+        scheduler.run_on_all(tasks)
+    assert broadcasts == [0, 1, 1, 0]
+    assert ran == []
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
+
+
+def test_peer_failure_raises_on_every_rank(monkeypatch) -> None:
+    scheduler, broadcasts = _grid_rank0(monkeypatch, peer_message="VAE task 'b' failed on grid rank 1: OSError()")
+    with pytest.raises(RuntimeError, match="'b' failed on grid rank 1"):
+        scheduler.run_on_all([_task("a", 2.0), _task("b", 1.0)])
+    assert broadcasts == [0, 1]
 
 
 def _write_video(iio, path, seed: int, frames: int = 7) -> str:
