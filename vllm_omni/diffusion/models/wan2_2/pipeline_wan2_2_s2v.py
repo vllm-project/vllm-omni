@@ -28,7 +28,11 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    clear_scheduled_denoise_step_on_exit,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -41,6 +45,7 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
@@ -601,6 +606,16 @@ class Wan22S2VPipeline(
     # Format-specific initialization
     # ------------------------------------------------------------------
 
+    def _create_transformer(self, config: dict) -> nn.Module:
+        """Create the S2V transformer. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        # Same rule as the T2V/I2V pipeline: auto-detected startup metadata is not a
+        # user policy, so let the checkpoint's own config.json decide.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        quant_config = resolve_wan_transformer_quant_config(config, quant_config, "transformer")
+        return create_s2v_transformer_from_config(config, quant_config=quant_config)
+
     def _init_diffusers_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from a diffusers-format model with subfolders."""
         # -- Weight sources for transformer (loaded via load_weights) --
@@ -635,7 +650,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, "transformer", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     def _init_original_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from the original Wan2.2 checkpoint layout.
@@ -692,7 +707,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, ".", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
 
     # ------------------------------------------------------------------
     # Properties
@@ -1055,10 +1070,13 @@ class Wan22S2VPipeline(
         """
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
 
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Each clip restarts at step 0, so a bound attention schedule applies to each clip's sequence and is
+        # checked against it here, per clip. None without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 latent_model_input = latents.to(device)
                 timestep = t.expand(latents.shape[0]).to(device)

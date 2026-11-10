@@ -27,9 +27,10 @@ import torch
 import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.logging import LoggingConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
-from vllm.logger import init_logger
+from vllm.logger import configure_logging, init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
@@ -94,7 +95,7 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
-    from vllm.device_allocator.cumem import CuMemAllocator
+    from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
@@ -236,10 +237,10 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
-def _get_cumem_allocator_class() -> type[CuMemAllocator]:
-    from vllm.device_allocator.cumem import CuMemAllocator
+def _get_mem_allocator_instance() -> Any:
+    from vllm.device_allocator import get_mem_allocator_instance
 
-    return CuMemAllocator
+    return get_mem_allocator_instance()
 
 
 def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
@@ -331,7 +332,13 @@ class DiffusionWorker:
             if not skip_load_model:
                 self.load_model(load_format=self.od_config.diffusion_load_format)
                 self._init_weight_transfer_engine()
-                self.init_lora_manager()
+                # MoE LoRA wrappers are built eagerly here, and constructing a
+                # ``CustomOp`` (e.g. ``FusedMoEModularMethod``) dispatches its
+                # forward, which reads the compilation config from the current
+                # ``VllmConfig``. Publish it for the duration, as the other
+                # model-touching init steps do.
+                with set_current_vllm_config(self.vllm_config):
+                    self.init_lora_manager()
         except Exception:
             # init_device() owns process-global distributed state. If anything
             # after it fails, unwind that state before another inline worker is
@@ -349,12 +356,25 @@ class DiffusionWorker:
             return
         from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
+        if wt_config.backend == "omni_lora_ipc":
+            from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
+
+            with set_current_vllm_config(self.vllm_config):
+                self.init_lora_manager()
         pipeline = cast(DiffusionModelRunner, self.model_runner).pipeline
         if not getattr(pipeline, "_omni_weight_reload_prepared", False):
             raise RuntimeError("The active diffusion pipeline has no weight-reload metadata")
         self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
             wt_config, self.vllm_config, self.device, pipeline
         )
+        if wt_config.backend == "omni_lora_ipc":
+            assert isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine)
+            assert self.lora_manager is not None
+            self.weight_transfer_engine.lora_manager = self.lora_manager
+            if torch.distributed.is_initialized():
+                from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+                self.weight_transfer_engine.cpu_group = get_world_group().cpu_group
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -660,6 +680,7 @@ class DiffusionWorker:
                 lora_path=lora_path,
                 lora_scale=lora_scale,
                 max_num_batched_tokens=max_num_batched_tokens,
+                lora_application=self.od_config.lora_application,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
@@ -680,6 +701,7 @@ class DiffusionWorker:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling for this GPU worker.
 
@@ -688,6 +710,7 @@ class DiffusionWorker:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         profiler = self._get_profiler()
         if profiler is None:
@@ -699,6 +722,7 @@ class DiffusionWorker:
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 profiler.set_trace_filename(filename)
+            profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
@@ -778,9 +802,11 @@ class DiffusionWorker:
         engine = self._get_weight_transfer_engine()
         if not self._weight_update_active:
             raise RuntimeError("finish_weight_update called without a matching start_weight_update.")
-        engine.finish_weight_update()
-        engine.reset_weight_update_target()
-        self._weight_update_active = False
+        try:
+            engine.finish_weight_update()
+        finally:
+            engine.reset_weight_update_target()
+            self._weight_update_active = False
 
     def execute_model(
         self,
@@ -986,8 +1012,7 @@ class DiffusionWorker:
             and getattr(self.od_config, "kv_transfer_config", None) is not None
         ):
             raise ValueError("Cannot sleep while native KV connector memory is registered")
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
 
         usage_before = allocator.get_current_usage()
 
@@ -1038,8 +1063,7 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         if self.model_runner is not None and (tags is None or "kv_cache" in tags):
@@ -1178,8 +1202,7 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            CuMemAllocator = _get_cumem_allocator_class()
-            allocator = CuMemAllocator.get_instance()
+            allocator = _get_mem_allocator_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
                 self._owns_sleep_pool = True
@@ -1272,18 +1295,18 @@ class DiffusionWorker:
             logger.exception("Failed to collect diffusion model resources during shutdown")
         if owns_sleep_pool:
             try:
-                CuMemAllocator = _get_cumem_allocator_class()
-                allocator = CuMemAllocator.get_instance()
+                allocator = _get_mem_allocator_instance()
                 if allocator.get_current_usage():
                     gc.collect()
-                from vllm_omni.patch import release_cumem_allocations_for_shutdown
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
+                    from vllm_omni.patch import release_cumem_allocations_for_shutdown
 
-                retired_bytes = release_cumem_allocations_for_shutdown(allocator)
-                if retired_bytes:
-                    logger.info(
-                        "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
-                        retired_bytes / GiB_bytes,
-                    )
+                    retired_bytes = release_cumem_allocations_for_shutdown(allocator)
+                    if retired_bytes:
+                        logger.info(
+                            "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
+                            retired_bytes / GiB_bytes,
+                        )
                 allocator.release_pools()
                 self._owns_sleep_pool = False
                 # Re-collect after dropping the pool references so their
@@ -1817,6 +1840,12 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        # Spawned workers do not inherit the API server's logging setup.
+        # Preserve the vLLM environment's logging switch and custom config;
+        # an explicit environment level takes precedence over the stage level.
+        log_level = os.environ.get("VLLM_LOGGING_LEVEL", od_config.log_level).upper()
+        configure_logging(LoggingConfig(log_level=cast("LogLevel", log_level)))
 
         shutdown_triggered = False
 

@@ -12,7 +12,7 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 from vllm.logger import init_logger
@@ -23,6 +23,7 @@ from vllm_omni.distributed.omni_coordinator import (
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
 from vllm_omni.engine.messages import ErrorMessage, OutputQueueWriter
+from vllm_omni.engine.stage_client import StagePoolClient
 from vllm_omni.engine.stage_pool import StagePool
 
 logger = init_logger(__name__)
@@ -61,8 +62,9 @@ class MembershipController:
         self._output_queue: OutputQueueWriter | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
         self._replica_removed_callback: Callable[[int, int], None] | None = None
+        self._replica_added_callback: Callable[[int, int, StagePoolClient], Coroutine[Any, Any, None]] | None = None
 
-        self._hub = OmniCoordClientForHub(coordinator_pub_address)
+        self._hub: OmniCoordClientForHub | None = OmniCoordClientForHub(coordinator_pub_address)
         factory = load_balancer_factory
         for pool in self._stage_pools:
             pool.attach_hub(self._hub)
@@ -149,7 +151,7 @@ class MembershipController:
 
     # ---- Internal ----
 
-    def _spawn_task(self, coro: Awaitable[None], *, label: str) -> None:
+    def _spawn_task(self, coro: Coroutine[Any, Any, None], *, label: str) -> None:
         task = asyncio.create_task(coro, name=f"membership-{label}")
         self._membership_tasks.add(task)
 
@@ -168,7 +170,10 @@ class MembershipController:
         last_up: set[tuple[int, str]] = set()
         while not self._shutdown_event.is_set():
             try:
-                snap = self._hub.get_replica_list()
+                hub = self._hub
+                if hub is None:
+                    return
+                snap = hub.get_replica_list()
                 self._watch_generation += 1
                 current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
                 attached = {
@@ -263,6 +268,11 @@ class MembershipController:
             replica_id,
             input_addr,
         )
+        if self._replica_added_callback is not None:
+            self._spawn_task(
+                self._replica_added_callback(stage_id, replica_id, client),
+                label=f"replica-added-s{stage_id}-r{replica_id}",
+            )
         return input_addr
 
     def _detach_replica(self, stage_id: int, input_addr: str) -> None:
@@ -283,17 +293,19 @@ class MembershipController:
             logger.exception("[MembershipController] failed to shutdown client stage=%d addr=%s", stage_id, input_addr)
         logger.info("[MembershipController] detached replica stage=%d addr=%s", stage_id, input_addr)
 
-    def install_unregister_handlers(
+    def install_membership_handlers(
         self,
         *,
         output_queue: OutputQueueWriter,
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
         replica_removed_callback: Callable[[int, int], None] | None = None,
+        replica_added_callback: Callable[[int, int, StagePoolClient], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
-        """Install shared cleanup sinks for watcher-driven unregister events."""
+        """Install replica lifecycle callbacks and request cleanup sinks."""
         self._output_queue = output_queue
         self._cleanup_callback = cleanup_callback
         self._replica_removed_callback = replica_removed_callback
+        self._replica_added_callback = replica_added_callback
 
     def _pool_for_stage_id(self, stage_id: int) -> StagePool | None:
         if not (0 <= stage_id < len(self._stage_pools)):

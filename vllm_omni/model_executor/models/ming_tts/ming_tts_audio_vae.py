@@ -3,7 +3,6 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/modeling_audio_vae.py
 from __future__ import annotations
 
-import os
 import time
 import warnings
 from collections import OrderedDict
@@ -13,17 +12,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, KEY_STOP_REASON, MingTTSConfig
+from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
 
-logger = init_logger(__name__)
-
-MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 _STREAM_STATE_TTL_SECONDS = 15 * 60
 _MAX_STREAM_STATES = 1024
 
@@ -49,8 +44,6 @@ class MingAudioVAEModel(nn.Module):
 
         self._past_key_values: dict[str, Any] = {}
         self._stream_state: dict[str, tuple[Any, Any, Any]] = {}
-        self._patch_totals: dict[str, int] = {}
-        self._sample_totals: dict[str, int] = {}
         self._state_access_times: OrderedDict[str, float] = OrderedDict()
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -191,7 +184,6 @@ class MingAudioVAEModel(nn.Module):
                 srs.append(sr_tensor)
                 continue
 
-            patch_count = int(latent_tensor.shape[0])
             waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state = (
                 self.chunked_decode_streaming(
                     latent_tensor,
@@ -199,10 +191,6 @@ class MingAudioVAEModel(nn.Module):
                     finished=finished,
                 )
             )
-            total_patch_count = self._patch_totals.get(request_id, 0) + patch_count
-            total_waveform_numel = self._sample_totals.get(request_id, 0) + int(waveform_flat.numel())
-            self._patch_totals[request_id] = total_patch_count
-            self._sample_totals[request_id] = total_waveform_numel
             if (had_past_key_values or had_stream_state) and waveform_flat.numel() == 0 and not finished:
                 raise RuntimeError(
                     "Ming Stage-2 produced an empty waveform after cached streaming state already existed. "
@@ -211,28 +199,6 @@ class MingAudioVAEModel(nn.Module):
                 )
 
             if finished:
-                if os.environ.get("MING_TTS_STAGE1_FINAL_LOG") == "1":
-                    logger.info(
-                        "MING_STAGE1_FINAL %s",
-                        {
-                            "request_id": request_id,
-                            "chunk_id": chunk_id,
-                            "stop_reason": _first_present(
-                                info.get(KEY_STOP_REASON),
-                                kv_meta.get(KEY_STOP_REASON),
-                            ),
-                            "final_decode_step": _coerce_optional_int(
-                                _first_present(
-                                    info.get(MING_FINAL_DECODE_STEP_KEY),
-                                    kv_meta.get(MING_FINAL_DECODE_STEP_KEY),
-                                )
-                            ),
-                            "final_chunk_patch_count": patch_count,
-                            "total_patch_count": total_patch_count,
-                            "final_chunk_waveform_numel": int(waveform_flat.numel()),
-                            "total_waveform_numel": total_waveform_numel,
-                        },
-                    )
                 self._clear_request_state(request_id)
             else:
                 self._past_key_values[request_id] = past_key_values
@@ -280,8 +246,6 @@ class MingAudioVAEModel(nn.Module):
     def _clear_request_state(self, request_id: str) -> None:
         self._past_key_values.pop(request_id, None)
         self._stream_state.pop(request_id, None)
-        self._patch_totals.pop(request_id, None)
-        self._sample_totals.pop(request_id, None)
         self._state_access_times.pop(request_id, None)
 
     def _touch_request_state(self, request_id: str) -> None:

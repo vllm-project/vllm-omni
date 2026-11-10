@@ -3,12 +3,10 @@
 
 import asyncio
 import base64
-import copy
 import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -103,6 +101,7 @@ from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media.connector import MediaConnector
 from vllm.outputs import RequestOutput
 from vllm.parser.mistral import MistralToolCall
@@ -144,8 +143,10 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
-    clone_sampling_params,
     get_default_sampling_params_list,
+    merge_llm_sampling_params,
+    resolve_diffusion_sampling_params,
+    to_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
@@ -161,6 +162,7 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -420,12 +422,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         cls,
         diffusion_engine: AsyncOmni,
         model_name: str,
+        enable_force_include_usage: bool = False,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
         Args:
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
+            enable_force_include_usage: Always send a usage chunk on streams
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
@@ -440,6 +444,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_model_name = model_name
         instance._diffusion_extra_body_params = None
         instance._diffusion_extra_output_params = None
+        instance.enable_force_include_usage = enable_force_include_usage
         instance.engine_client = None
         instance.has_kv_connector = False
         # Extra body/output params are resolved lazily on first use; see
@@ -652,12 +657,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Handle diffusion mode
         if self._diffusion_mode:
-            return await self._create_diffusion_chat_completion(
+            response = await self._create_diffusion_chat_completion(
                 request,
                 normalized_extra_args,
                 diffusion_request_args,
                 raw_request,
             )
+            if request.stream and isinstance(response, ChatCompletionResponse):
+                return self._diffusion_chat_completion_stream_generator(request, response)
+            return response
 
         request_timestamp = time.time()
         if raw_request is not None:
@@ -832,7 +840,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Best-effort decode first reference image for i2i.
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
-                        img = Image.open(BytesIO(img_bytes))
+                        img = open_image(BytesIO(img_bytes))
                         engine_prompt_image = {"img2img": img}
                     except Exception:
                         engine_prompt_image = None
@@ -899,7 +907,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if reference_images:
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
-                        img = Image.open(BytesIO(img_bytes))
+                        img = open_image(BytesIO(img_bytes))
                         text_prompt["multi_modal_data"] = {"image": img}
                         text_prompt["multi_modal_uuids"] = {"image": [f"{request_id}-image-0"]}
                     except Exception:
@@ -922,7 +930,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list, request=request)
+                    sampling_params_list = to_sampling_params_list(
+                        self.engine_client,
+                        request.sampling_params_list,
+                        request_overrides=self._request_sampling_overrides(request),
+                    )
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -985,6 +997,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
                     entry_stage_id=entry_stage_id,
+                    watermarking=request.watermarking,
                 )
 
                 generators.append(generator)
@@ -1138,8 +1151,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
-            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
-            prompt_additional_information["speaker"] = [normalized]
+            set_prompt_speaker(engine_prompt, normalized)
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():
@@ -1427,113 +1439,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(
-        self,
-        sampling_params_list: list[dict],
-        request: ChatCompletionRequest | None = None,
-        *,
-        merge_llm_defaults: bool = True,
-    ) -> list[Any]:
-        """Convert request dicts to stage-typed sampling params objects.
-
-        Partial LLM dictionaries inherit deploy defaults, then explicit top-level
-        request parameters on the comprehension stage. Explicit stage fields win.
-        Video sessions set ``merge_llm_defaults=False`` so provided stage dicts
-        use constructor defaults instead, preserving their replacement semantics.
-
-        For diffusion stages, build ``OmniDiffusionSamplingParams`` so
-        downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
-        requires a dataclass) works. For LLM stages build ``SamplingParams``.
-        If callers provide params for fewer stages than the native pipeline has
-        (for example AURA has three semantic models but four engine stages),
-        append cloned deploy defaults for the omitted tail stages.
-        """
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
-        default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
-        final_sampling_params_list: list[Any] = []
-        for idx, sampling_params in enumerate(sampling_params_list):
-            stage_config = stage_configs[idx] if idx < len(stage_configs) else None
-            stage_type = get_stage_type(stage_config)
-            target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
-            if isinstance(sampling_params, dict):
-                if target_cls is SamplingParams and merge_llm_defaults:
-                    default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
-                    final_sampling_params_list.append(
-                        self._merge_llm_sampling_params(default, stage_config, sampling_params, request)
-                    )
-                else:
-                    final_sampling_params_list.append(target_cls(**sampling_params))
-            elif isinstance(sampling_params, target_cls):
-                final_sampling_params_list.append(sampling_params)
-            elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
-                # Cross-typed (e.g. user passed SamplingParams but this is a
-                # diffusion stage) — rebuild via a dict round-trip so we end
-                # up with the correct target class.
-                as_dict = {
-                    f.name: getattr(sampling_params, f.name)
-                    for f in (fields(sampling_params) if is_dataclass(sampling_params) else [])
-                } or sampling_params.__dict__
-                final_sampling_params_list.append(target_cls(**as_dict))
-            else:
-                raise ValueError(f"Invalid sampling params: {sampling_params}")
-        for idx in range(len(final_sampling_params_list), len(stage_configs)):
-            stage_config = stage_configs[idx]
-            is_comprehension = (
-                stage_config.get("is_comprehension", False)
-                if isinstance(stage_config, Mapping)
-                else getattr(stage_config, "is_comprehension", False)
-            )
-            if request is not None and is_comprehension and get_stage_type(stage_config) != "diffusion":
-                default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
-                final_sampling_params_list.append(self._merge_llm_sampling_params(default, stage_config, {}, request))
-            elif idx < len(default_params_list):
-                final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
-            else:
-                final_sampling_params_list.append(SamplingParams())
-        return final_sampling_params_list
-
-    def _merge_llm_sampling_params(
-        self,
-        default_params: SamplingParams | dict[str, Any],
-        stage_config: Any,
-        overrides: dict[str, Any],
-        request: ChatCompletionRequest | None,
-    ) -> SamplingParams:
-        """Merge raw configuration before constructing normalized runtime params."""
-        model_config = getattr(stage_config, "model_config", stage_config)
-        if isinstance(model_config, Mapping):
-            raw_defaults = model_config.get("default_sampling_params", default_params)
-        else:
-            raw_defaults = getattr(model_config, "default_sampling_params", default_params)
-        if raw_defaults is None:
-            merged = {}
-        elif isinstance(raw_defaults, Mapping):
-            merged = dict(raw_defaults)
-        elif isinstance(default_params, dict):
-            merged = dict(default_params)
-        else:
-            # Compatibility for clients without raw stage configuration. Keep
-            # their runtime policies; explicit and inferred values are ambiguous.
-            merged = {
-                name: getattr(default_params, name)
-                for name in SamplingParams.__struct_fields__
-                if not name.startswith("_") and name != "output_text_buffer_length"
-            }
-        is_comprehension = (
-            stage_config.get("is_comprehension", False)
-            if isinstance(stage_config, Mapping)
-            else getattr(stage_config, "is_comprehension", False)
-        )
-        if request is not None and is_comprehension:
-            merged.update(self._request_sampling_overrides(request))
-        extra_args = merged.get("extra_args")
-        merged.update(overrides)
-        if isinstance(extra_args, dict) and isinstance(overrides.get("extra_args"), dict):
-            merged["extra_args"] = {**extra_args, **overrides["extra_args"]}
-        # Constructors derive cache/stop/greedy state from the final values.
-        # Nested dictionaries must never alias deploy defaults or request data.
-        return SamplingParams(**copy.deepcopy(merged))
-
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
             is_comprehension = (
@@ -1559,31 +1464,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
-
-    def _apply_request_overrides(
-        self,
-        default_params: SamplingParams,
-        request: ChatCompletionRequest,
-    ) -> SamplingParams:
-        """Clone default params and override with user-provided request values.
-
-        Starts with YAML defaults and only overrides fields that the user
-        explicitly provided (non-None values) in the request.
-
-        max_tokens uses the deploy YAML default unless explicitly overridden.
-
-        Args:
-            default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
-            request: The chat completion request containing user-provided values.
-
-        Returns:
-            New SamplingParams with YAML defaults overridden by request values.
-        """
-        params = default_params.clone()
-        for field_name, value in self._request_sampling_overrides(request).items():
-            setattr(params, field_name, value)
-        return params
 
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Select explicit request values without introducing protocol defaults."""
@@ -1685,8 +1567,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
             if idx == comprehension_idx:
-                params = self._merge_llm_sampling_params(
-                    default_params, self.engine_client.stage_configs[idx], {}, request
+                params = merge_llm_sampling_params(
+                    default_params, self.engine_client.stage_configs[idx], {}, self._request_sampling_overrides(request)
                 )
                 sampling_params_list.append(params)
             else:
@@ -2903,6 +2785,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         else (output.finish_reason if output.finish_reason else "stop")
                     ),
                     stop_reason=output.stop_reason,
+                    weight_versions=(
+                        getattr(output, "weight_versions", None) if request.return_weight_versions else None
+                    ),
                 )
                 choices.append(choice_data)
                 continue
@@ -2949,7 +2834,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # the fields of FunctionDefinition are a superset of the
                 # tool call outputs and can be used for parsing
                 assert content is not None
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                tool_calls: list[FunctionDefinition] = TypeAdapter(list[FunctionDefinition]).validate_json(content)
                 tool_call_ids = []
                 for tool_call in tool_calls:
                     tool_call_ids.append(
@@ -3040,6 +2925,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ),
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                weight_versions=(getattr(output, "weight_versions", None) if request.return_weight_versions else None),
             )
             choices.append(choice_data)
 
@@ -3352,11 +3238,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         width = gen_params.width
         seed = gen_params.seed
         generator_device = gen_params.generator_device
-        num_outputs_per_prompt = gen_params.num_outputs_per_prompt
+        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
         num_inference_steps = extra_body.get("num_inference_steps")
         quality = extra_body.get("quality")
         guidance_scale = extra_body.get("guidance_scale")
-        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        true_cfg_scale = extra_body.get("true_cfg_scale", extra_body.get("cfg_scale"))
         negative_prompt = extra_body.get("negative_prompt")
         num_frames = extra_body.get("num_frames")
         guidance_scale_2 = extra_body.get("guidance_scale_2")
@@ -3618,30 +3504,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         seed = extra_body.get("seed")
         generator_device = extra_body.get("generator_device")
         negative_prompt = extra_body.get("negative_prompt")
-        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
         lora_body = extra_body.get("lora")
 
         pil_images: list[Image.Image] = []
         for img_b64 in reference_images:
             try:
                 img_bytes = base64.b64decode(img_b64)
-                pil_images.append(Image.open(BytesIO(img_bytes)))
+                pil_images.append(open_image(BytesIO(img_bytes)))
             except Exception as e:
                 logger.warning("Failed to decode reference image: %s", e)
 
-        gen_params = OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seed=seed,
-        )
+        stage_configs = getattr(engine, "stage_configs", None) or []
+        if len(stage_configs) > 1:
+            # Multi-stage requests merge explicit fields into each stage's own defaults.
+            gen_params = OmniDiffusionSamplingParams()
+        else:
+            gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine))
         self._set_if_supported(
             gen_params,
+            height=height,
+            width=width,
+            seed=seed,
+            num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
             generator_device=generator_device,
             quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
-            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            true_cfg_scale=extra_body.get("true_cfg_scale", extra_body.get("cfg_scale")),
             num_frames=extra_body.get("num_frames"),
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
@@ -3981,7 +3870,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if seed is None:
                 seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
@@ -4015,7 +3903,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             for img_b64 in reference_images:
                 try:
                     img_bytes = base64.b64decode(img_b64)
-                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                    pil_images.append(open_image(BytesIO(img_bytes)))
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
 
@@ -4026,42 +3914,61 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
             if negative_prompt is not None:
                 gen_prompt["negative_prompt"] = negative_prompt
-            gen_params = OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
-                seed=seed,
+            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
+            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
+            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
+            sampling_params_list = build_stage_sampling_params_list(
+                stage_configs,
+                default_sampling_params_list,
+                diffusion_params=OmniDiffusionSamplingParams(),
             )
+            if not sampling_params_list:
+                sampling_params_list = [resolve_diffusion_sampling_params(default_sampling_params_list)]
+            for gen_params in sampling_params_list:
+                if not isinstance(gen_params, OmniDiffusionSamplingParams):
+                    continue
+                self._set_if_supported(
+                    gen_params,
+                    height=height,
+                    width=width,
+                    num_outputs_per_prompt=extra_body.get("num_outputs_per_prompt"),
+                    seed=seed,
+                )
 
-            # Only override defaults when the user explicitly provides values
-            if num_inference_steps is not None:
-                gen_params.num_inference_steps = num_inference_steps
-            if quality is not None:
-                gen_params.quality = quality
-            if guidance_scale is not None:
-                gen_params.guidance_scale = guidance_scale
-            if true_cfg_scale is not None:
-                gen_params.true_cfg_scale = true_cfg_scale
-            apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
-            if num_frames is not None:
-                gen_params.num_frames = num_frames
-            if guidance_scale_2 is not None:
-                gen_params.guidance_scale_2 = guidance_scale_2
-            if layers is not None:
-                gen_params.layers = layers
-            if resolution is not None:
-                gen_params.resolution = resolution
+                # Only override defaults when the user explicitly provides values
+                if num_inference_steps is not None:
+                    gen_params.num_inference_steps = num_inference_steps
+                if quality is not None:
+                    gen_params.quality = quality
+                if guidance_scale is not None:
+                    gen_params.guidance_scale = guidance_scale
+                if true_cfg_scale is not None:
+                    gen_params.true_cfg_scale = true_cfg_scale
+                apply_normalized_diffusion_request_extra_args(gen_params, normalized_extra_args)
+                if num_frames is not None:
+                    gen_params.num_frames = num_frames
+                if guidance_scale_2 is not None:
+                    gen_params.guidance_scale_2 = guidance_scale_2
+                if layers is not None:
+                    gen_params.layers = layers
+                if resolution is not None:
+                    gen_params.resolution = resolution
 
-            # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
-                try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
-                except Exception as exc:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", exc)
+                # Parse per-request LoRA.
+                if lora_body and isinstance(lora_body, dict):
+                    try:
+                        lora_req, lora_scale = parse_lora_request(lora_body)
+                        if lora_req is not None:
+                            gen_params.lora_request = lora_req
+                            if lora_scale is not None:
+                                gen_params.lora_scale = lora_scale
+                    except Exception as exc:  # pragma: no cover - safeguard
+                        logger.warning("Failed to parse LoRA request: %s", exc)
+
+                if reference_videos:
+                    gen_params.extra_args["video_path"] = reference_videos[0]
+                if reference_audios:
+                    gen_params.extra_args["audio_path"] = reference_audios[0]
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []
@@ -4092,38 +3999,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             status_code=400,
                         )
 
-            if reference_videos:
-                gen_params.extra_args["video_path"] = reference_videos[0]
-            if reference_audios:
-                gen_params.extra_args["audio_path"] = reference_audios[0]
-
-            # Generate image or audio via AsyncOmni
-            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
-            stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
-            default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
-            sampling_params_list = build_stage_sampling_params_list(
-                stage_configs,
-                default_sampling_params_list,
-                diffusion_params=gen_params,
-                replace_diffusion_params=True,
-            )
-            for index, (stage_config, sampling_params) in enumerate(zip(stage_configs, sampling_params_list)):
-                if get_stage_type(stage_config) != "diffusion" or index >= len(default_sampling_params_list):
-                    continue
-                default_extra_args = getattr(default_sampling_params_list[index], "extra_args", None)
-                if default_extra_args:
-                    sampling_params.extra_args = {
-                        **default_extra_args,
-                        **(getattr(sampling_params, "extra_args", None) or {}),
-                    }
-            if not sampling_params_list:
-                sampling_params_list = [gen_params]
-
             result = None
             async for output in diffusion_engine.generate(
                 prompt=gen_prompt,
                 sampling_params_list=sampling_params_list,
                 request_id=request_id,
+                watermarking=request.watermarking,
             ):
                 result = output
             if result is None:
@@ -4312,6 +4193,90 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 f"Image generation failed: {str(e)}",
                 status_code=500,
             )
+
+    async def _diffusion_chat_completion_stream_generator(
+        self,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> AsyncGenerator[str, None]:
+        """Replay a finished diffusion chat completion as OpenAI SSE chunks.
+
+        Single-stage diffusion pipelines return their whole output (text,
+        images or audio) from one forward pass, so each choice is sent as one
+        content delta followed by a terminal ``finish_reason`` chunk.
+        """
+        chunk_object_type: Final = "chat.completion.chunk"
+        modality = "text"
+        content_choices: list[ChatCompletionResponseStreamChoice] = []
+        finish_choices: list[ChatCompletionResponseStreamChoice] = []
+        for choice in response.choices:
+            message = choice.message
+            content: Any = message.content
+            if content is None and message.audio is not None:
+                # Match the multistage stream: audio is sent as base64 content.
+                content = message.audio.data
+                modality = "audio"
+            elif isinstance(content, list):
+                modality = "image"
+            # model_construct keeps list (image) content, which DeltaMessage
+            # would otherwise reject as non-str.
+            delta = DeltaMessage.model_construct(role=message.role)
+            object.__setattr__(delta, "content", content)
+            delta.__pydantic_fields_set__.add("content")
+            content_choices.append(
+                ChatCompletionResponseStreamChoice(index=choice.index, delta=delta, logprobs=None, finish_reason=None)
+            )
+            finish_choices.append(
+                ChatCompletionResponseStreamChoice(
+                    index=choice.index,
+                    delta=DeltaMessage(),
+                    logprobs=None,
+                    finish_reason=choice.finish_reason,
+                    stop_reason=choice.stop_reason,
+                )
+            )
+
+        chunks = [
+            OmniChatCompletionStreamResponse(
+                id=response.id,
+                object=chunk_object_type,
+                created=response.created,
+                choices=content_choices,
+                model=response.model,
+                modality=modality,
+            ),
+            OmniChatCompletionStreamResponse(
+                id=response.id,
+                object=chunk_object_type,
+                created=response.created,
+                choices=finish_choices,
+                model=response.model,
+                modality=modality,
+                metrics=getattr(response, "metrics", None),
+            ),
+        ]
+        include_usage, include_continuous_usage = should_include_usage(
+            request.stream_options, self.enable_force_include_usage
+        )
+        if include_continuous_usage and response.usage is not None:
+            # The output is already complete, so every replayed chunk carries
+            # the final cumulative usage.
+            for chunk in chunks:
+                chunk.usage = response.usage
+        if include_usage and response.usage is not None:
+            chunks.append(
+                OmniChatCompletionStreamResponse(
+                    id=response.id,
+                    object=chunk_object_type,
+                    created=response.created,
+                    choices=[],
+                    model=response.model,
+                    usage=response.usage,
+                )
+            )
+        for chunk in chunks:
+            yield f"data: {chunk.model_dump_json(exclude_unset=True, warnings=False)}\n\n"
+        yield "data: [DONE]\n\n"
 
     def _extract_diffusion_prompt_and_media(
         self,

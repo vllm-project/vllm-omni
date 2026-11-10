@@ -14,7 +14,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     supports_fused_body,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 

@@ -69,7 +69,7 @@ tts_no_async_chunk_server_params = [
 DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     tts_async_chunk_server_params + tts_no_async_chunk_server_params,
@@ -101,7 +101,7 @@ def test_voice_clone_streaming_001(omni_server, online_client) -> None:
 
 # Exercise multiple reproducible draws: upstream unseeded PCM can fall below
 # the existing 1 dB HNR floor even with unchanged inputs and model weights.
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     tts_async_chunk_server_params + tts_no_async_chunk_server_params,
@@ -143,7 +143,7 @@ def test_response_format_001(omni_server, online_client, seed: int) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, online_client) -> None:
     """Regression for #5049: x-vector-only then ICL on the same ``ref_audio``.
@@ -170,7 +170,7 @@ def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, online_
     online_client.send_audio_speech_request({**base_request, "x_vector_only_mode": True})
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_inline_ref_audio_cache_ignores_openai_voice_label(omni_server, online_client) -> None:
     """An OpenAI voice label must not identify an inline Base voice clone."""

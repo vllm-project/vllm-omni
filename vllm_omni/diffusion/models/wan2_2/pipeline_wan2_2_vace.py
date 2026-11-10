@@ -24,11 +24,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import begin_scheduled_denoise, clear_scheduled_denoise_step_on_exit
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
     refresh_cache_for_denoise_schedule,
+    resolve_wan_boundary_ratio,
     resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
@@ -236,10 +238,13 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ) -> torch.Tensor:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence and returns its length; None
+        # without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
@@ -713,10 +718,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # stays None and diffuse() uses the same transformer for every step.
         boundary_timestep = None
         if self.transformer_2 is not None:
-            boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-            if boundary_ratio is None:
-                boundary_ratio = 0.875
-                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="Wan2.2 VACE")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
         refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 

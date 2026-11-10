@@ -26,7 +26,7 @@ HEIGHT = 768
 FPS = 24
 NUM_INFERENCE_STEPS = 4
 REQUEST_TIMEOUT_SECONDS = 1800
-H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 MI300_FOUR_CARD_MARKS = hardware_marks(res={"rocm": "MI325"}, num_cards=4)
 
 SERVER_ARGS = [
@@ -144,7 +144,7 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int) -> bytes:
                 init_timeout=1800,
             ),
             id="minimax_h3_dlo_dp2_t2va",
-            marks=H100_TWO_CARD_MARKS,
+            marks=TWO_CARD_MARKS,
         )
     ],
     indirect=True,

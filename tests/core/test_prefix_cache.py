@@ -316,7 +316,7 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
     s3 = run_step(mgr, view, {"b": ([3], 0, 2)}, finished=["a"])
     mgr.materialize(s3, ["b"])
     s4 = run_step(mgr, view, {"a": ([0, 1, 4], 8, 4)}, new_hits={"a": 8}, finished=["b"])
-    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1])}
+    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1], 0)}
     outs = mgr.materialize(s4, ["a"])
     assert outs.hidden_states["a"].shape == (12, HIDDEN)
     assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
@@ -335,7 +335,7 @@ def test_manager_trusts_started_event_without_a_second_lifecycle_table():
                 (PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),), ()
             )
         )
-        assert mgr._hit_spans == {"a": (4, [0])}
+        assert mgr._hit_spans == {"a": (4, [0], 0)}
     finally:
         mgr.shutdown()
 
@@ -365,7 +365,7 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
                 num_tokens_padded=1,
                 write_layout=adapter.build_write_layout(view, num_scheduled_tokens={"a": 1}),
             )
-        assert mgr._step_ctxs[second].hits == {"a": (4, [0])}
+        assert mgr._step_ctxs[second].hits == {"a": (4, [0], 0)}
         merged = mgr.materialize(second, ["a"]).hidden_states["a"]
         assert torch.equal(merged, expected_rows(view.slots_for("a", 0, 5)))
         third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
@@ -1485,14 +1485,18 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     assert mgr._controller._tasks.get(tid) is None
 
 
-def test_blocked_save_is_released_by_pool_write_alone():
+@pytest.mark.parametrize("consume", ["materialize", "discard_step"])
+def test_blocked_save_is_released_by_pool_write_alone(consume):
     """All step contexts consumed, the only slot held by a pending write:
     the committer finishing that write must unblock the waiting save."""
     mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
     _hold_writes(mgr)
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
     tid = next(iter(mgr._request_tasks.tasks["a"]))
-    mgr.materialize(s0, ["a"])
+    if consume == "materialize":
+        mgr.materialize(s0, ["a"])
+    else:
+        mgr.discard_step(s0)
     slot = mgr._step_ctxs.get(s0)  # consumed
     assert slot is None
     assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}
@@ -1626,6 +1630,27 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+    assert not any(bool(counts.any()) for counts in mgr._pending_slot_refs.values())
+
+
+def test_pending_slot_counts_drain_with_duplicate_slots():
+    """The per-slot pending-ref counter is the fast-path gate for COW
+    preservation: a ref counts each of its slots, duplicates included, and
+    the fetch's unregister takes the same amount back."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    dup = torch.cat([slots, slots[:1]])
+    with mgr._state_lock:
+        src = mgr._slot_ref(dup, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [2, 1, 1, 1] and int(counts.sum()) == 5
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(dup))
+    assert not any(bool(c.any()) for c in mgr._pending_slot_refs.values())
+    mgr.shutdown()
 
 
 def test_done_fires_only_after_completion_record_published():
@@ -1871,10 +1896,10 @@ def _bare_controller(eager=True):
 def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
-    map_slots = mgr._map_slots
+    claim_slots = mgr._claim_slots
 
-    def fail_publish(slots, tid, keys):
-        map_slots(slots, tid, keys)
+    def fail_publish(slots, keys, spans):
+        claim_slots(slots, keys, spans)
         if "k" in keys:
             raise RuntimeError("partial publish")
 
@@ -1882,7 +1907,7 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch):
         # Rollback must release both the old and newly appended deferred rows.
         sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
         mgr.materialize(sid, ["a"])
-        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
+        monkeypatch.setattr(mgr, "_claim_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
             run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}

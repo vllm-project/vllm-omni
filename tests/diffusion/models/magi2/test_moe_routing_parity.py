@@ -10,15 +10,17 @@ reproduce their outputs bit for bit.
 import pytest
 import torch
 
-import vllm_omni.diffusion.models.magi2.mh_moe as moe
+import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe as moe
+import vllm_omni.diffusion.models.magi2.layers.musa.mh_moe as musa_moe
 from tests.diffusion.models.magi2.test_bf16_moe_wiring import _gpu_device
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 _DEVICES = [
-    pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
-    pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+    pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
 ]
 
 
@@ -257,7 +259,14 @@ def test_token_major_forward_matches_head_major_reference(monkeypatch, num_token
 
     monkeypatch.setattr(moe, "invoke_fused_moe_bf16", invoke)
     expected = _reference_bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down)
-    actual = moe._bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down)
+    actual = moe._bf16_fused_moe_forward(
+        x,
+        probabilities,
+        indices,
+        packed_w13,
+        down,
+        config=(musa_moe if moe.current_omni_platform.is_musa() else moe)._BF16_MOE_CONFIG,
+    )
 
     assert actual.shape == expected.shape == x.shape
     assert actual.dtype == expected.dtype == torch.bfloat16
@@ -326,6 +335,7 @@ def test_token_major_forward_matches_head_major_reference_on_device(
         packed_w13,
         down,
         moe._allocate_bf16_route_buffers(route_count, packed_w13.shape[0], 128, device),
+        config=(musa_moe if device_type == "musa" else moe)._BF16_MOE_CONFIG,
     )
     assert actual.is_contiguous()
     assert torch.equal(actual, expected)
@@ -347,7 +357,14 @@ def test_token_major_routes_fill_identical_blocks_on_device(monkeypatch, device_
 
     monkeypatch.setattr(moe, "invoke_fused_moe_bf16", record)
     _reference_bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down)
-    moe._bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down)
+    moe._bf16_fused_moe_forward(
+        x,
+        probabilities,
+        indices,
+        packed_w13,
+        down,
+        config=(musa_moe if device_type == "musa" else moe)._BF16_MOE_CONFIG,
+    )
     assert len(launches) == 4
     (old_ids, old_experts, old_padded), (new_ids, new_experts, new_padded) = launches[0], launches[2]
     assert torch.equal(new_padded, old_padded)
@@ -387,6 +404,7 @@ def _assert_same_route(monkeypatch, layer, x_heads):
         return topk(router_logits, *args, **kwargs)
 
     monkeypatch.setattr(moe, "compute_topk_probs_and_indices", capture)
+    monkeypatch.setattr(layer, "_compute_topk_probs_and_indices", capture)
     monkeypatch.delenv("MAGI2_ROUTER_BIAS_SOURCE", raising=False)
     expected = _reference_route(layer, x_heads)
     actual = layer._route(x_heads)
