@@ -188,6 +188,88 @@ def test_close_runs_every_callback_and_reports_first_failure_as_cause(caplog):
     assert calls == []
 
 
+def test_close_finishes_cleanup_before_propagating_a_cancellation(caplog):
+    """Ctrl-C during cleanup must still release the remaining kinds, exactly once."""
+    interrupt = KeyboardInterrupt()
+    calls: list[str] = []
+
+    def interrupt_close() -> None:
+        calls.append("exec")
+        raise interrupt
+
+    def failing_close() -> None:
+        calls.append("device")
+        raise RuntimeError("device close failed")
+
+    def ok_close() -> None:
+        calls.append("host")
+
+    ledger = ResourceLedger()
+    ledger.register(object(), ResourceKind.EXECUTION, interrupt_close)
+    ledger.register(object(), ResourceKind.DEVICE, failing_close)
+    ledger.register(object(), ResourceKind.HOST_STORAGE, ok_close)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(KeyboardInterrupt) as exc_info:
+        ledger.close()
+
+    # The interrupt at kind 1 neither skipped kind 4 nor kind 8, and the original
+    # exception object is propagated instead of a LifecycleError wrapper.
+    assert calls == ["exec", "device", "host"]
+    assert exc_info.value is interrupt
+    # The ordinary failure that lost the precedence race is still reported.
+    assert any("device close failed" in record.getMessage() for record in caplog.records)
+
+    # Exactly once: a retried close neither re-runs a callback nor raises again.
+    calls.clear()
+    ledger.close()
+    assert calls == []
+
+
+def test_close_prefers_a_late_cancellation_over_an_earlier_ordinary_failure(caplog):
+    ordinary = RuntimeError("staging close failed")
+    shutdown = SystemExit(1)
+    calls: list[str] = []
+
+    def failing_close() -> None:
+        calls.append("staging")
+        raise ordinary
+
+    def shutdown_close() -> None:
+        calls.append("host")
+        raise shutdown
+
+    ledger = ResourceLedger()
+    ledger.register(object(), ResourceKind.STAGING, failing_close)
+    ledger.register(object(), ResourceKind.HOST_STORAGE, shutdown_close)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exc_info:
+        ledger.close()
+
+    assert calls == ["staging", "host"]
+    assert exc_info.value is shutdown
+    assert any("staging close failed" in record.getMessage() for record in caplog.records)
+
+
+def test_close_reports_a_lone_cancellation_without_a_lifecycle_error():
+    shutdown = SystemExit("worker shutdown")
+    calls: list[str] = []
+
+    def shutdown_close() -> None:
+        calls.append("device")
+        raise shutdown
+
+    ledger = ResourceLedger()
+    ledger.register(object(), ResourceKind.DEVICE, shutdown_close)
+    ledger.register(object(), ResourceKind.HOST_STORAGE, lambda: calls.append("host"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        ledger.close()
+
+    assert calls == ["device", "host"]
+    assert exc_info.value is shutdown
+    assert not isinstance(exc_info.value, LifecycleError)
+
+
 def test_ledger_never_calls_torch_distributed(monkeypatch):
     def _forbidden(*args, **kwargs):
         raise AssertionError("the resource ledger must not call torch.distributed")
@@ -199,3 +281,21 @@ def test_ledger_never_calls_torch_distributed(monkeypatch):
     _register(ledger, "device", ResourceKind.DEVICE)
     ledger.close()
     assert _CLOSE_LOG == ["device"]
+
+
+def test_close_keeps_torch_distributed_out_of_the_cancellation_path(monkeypatch):
+    """An interrupted cleanup must not try to release the failure through a collective."""
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the resource ledger must not call torch.distributed")
+
+    for name in ("barrier", "all_reduce", "all_gather_object", "destroy_process_group"):
+        monkeypatch.setattr(torch.distributed, name, _forbidden)
+
+    ledger = ResourceLedger()
+    ledger.register(object(), ResourceKind.EXECUTION, lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    _register(ledger, "host", ResourceKind.HOST_STORAGE)
+
+    with pytest.raises(KeyboardInterrupt):
+        ledger.close()
+    assert _CLOSE_LOG == ["host"]

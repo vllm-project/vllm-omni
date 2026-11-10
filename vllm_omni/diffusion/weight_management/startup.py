@@ -53,9 +53,13 @@ class ResourceLedger:
 
     :meth:`close` releases the remaining entries in ``ResourceKind`` order and,
     within one kind, in reverse registration order.  Closing is idempotent: the
-    second call does nothing.  A failing close callback does not stop the other
-    callbacks; after all of them have run, one :class:`LifecycleError` reports
-    the failures with the first failure as ``__cause__``.
+    second call does nothing, and every callback runs at most once even when one
+    of them fails.  A failing close callback does not stop the other callbacks;
+    after all of them have run, one :class:`LifecycleError` reports the ordinary
+    failures with the first one as ``__cause__``.  A cancellation
+    (``KeyboardInterrupt``, ``SystemExit`` or another ``BaseException`` that is
+    not an ``Exception``) is re-raised in its own type once the remaining
+    callbacks have run, and takes precedence over ordinary failures.
     """
 
     def __init__(self) -> None:
@@ -104,7 +108,12 @@ class ResourceLedger:
         return target
 
     def close(self) -> None:
-        """Close every remaining resource; safe to call more than once."""
+        """Close every remaining resource; safe to call more than once.
+
+        The ledger is marked closed and emptied before the first callback runs, so
+        every registered callback runs exactly once even when one of them raises or
+        is interrupted, and a retried ``close()`` cannot run a callback twice.
+        """
         if self._closed:
             return
         self._closed = True
@@ -113,23 +122,40 @@ class ResourceLedger:
 
         # ResourceKind ascending, then reverse registration order inside one kind.
         ordered = sorted(enumerate(entries), key=lambda item: (int(item[1].kind), -item[0]))
-        failures: list[tuple[_LedgerEntry, Exception]] = []
+        failures: list[tuple[_LedgerEntry, BaseException]] = []
         for _, entry in ordered:
             try:
                 entry.close()
-            except Exception as exc:  # noqa: BLE001 - every callback must run
+            except BaseException as exc:  # noqa: BLE001 - every callback must run
                 failures.append((entry, exc))
 
         if not failures:
             return
-        for entry, exc in failures[1:]:
+
+        # A cancellation keeps its own type and wins over ordinary cleanup failures:
+        # RFC 01 section 6.2 requires ``KeyboardInterrupt``/``SystemExit`` to bypass
+        # confirmation and stop the worker immediately, which a ``LifecycleError``
+        # wrapper would prevent.  Ordinary failures are logged instead of raised.
+        cancellation = next(((entry, exc) for entry, exc in failures if not isinstance(exc, Exception)), None)
+        first_entry, first_error = failures[0] if cancellation is None else cancellation
+        for entry, exc in failures:
+            if exc is first_error:
+                continue
             logger.error(
                 "resource close callback failed (kind=%s): %s",
                 entry.kind.name,
                 exc,
                 exc_info=exc,
             )
-        first_entry, first_error = failures[0]
+        if cancellation is not None:
+            logger.error(
+                "resource close was interrupted by %s while closing %s; "
+                "the remaining callbacks were attempted and the interruption is re-raised",
+                type(first_error).__name__,
+                first_entry.kind.name,
+                exc_info=first_error,
+            )
+            raise first_error
         raise LifecycleError(
             f"{len(failures)} resource close callback(s) failed; "
             f"first failure was {first_entry.kind.name}: {type(first_error).__name__}: {first_error}",
