@@ -206,7 +206,7 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer of ERROR/CRITICAL/traceback lines only.
+        # Bounded ring buffer of child stderr for early-exit diagnostics.
         self._server_error_lines: deque[str] = deque(maxlen=60)
         self._server_log_thread: threading.Thread | None = None
 
@@ -277,41 +277,29 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Keep only ERROR/CRITICAL/traceback lines for early-exit diagnostics.
+        # Inherit stdout (INFO still shows in CI); capture stderr only for the
+        # exited-before-ready RuntimeError message.
         self._server_error_lines = deque(maxlen=60)
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-        assert self.proc.stdout is not None
+        assert self.proc.stderr is not None
         error_lines = self._server_error_lines
-        stdout = self.proc.stdout
+        stderr = self.proc.stderr
 
-        def _drain_stdout() -> None:
-            in_traceback = False
+        def _drain_stderr() -> None:
             try:
-                for line in stdout:
-                    if "Traceback (most recent call last)" in line:
-                        in_traceback = True
-                        error_lines.append(line)
-                        continue
-                    if in_traceback:
-                        error_lines.append(line)
-                        # Exception type line ends the traceback block.
-                        if line.strip() and not line[0].isspace():
-                            in_traceback = False
-                        continue
-                    if " ERROR " in line or " CRITICAL " in line:
-                        error_lines.append(line)
+                for line in stderr:
+                    error_lines.append(line)
             except Exception:
                 pass
 
-        self._server_log_thread = threading.Thread(target=_drain_stdout, name="omni-server-log", daemon=True)
+        self._server_log_thread = threading.Thread(target=_drain_stderr, name="omni-server-stderr", daemon=True)
         self._server_log_thread.start()
 
         max_wait = self.startup_timeout
@@ -486,7 +474,7 @@ class OmniServer:
             self._server_log_thread.join(timeout=2)
         if not self._server_error_lines:
             return ""
-        return "\n=== OmniServer error log ===\n{}".format("".join(self._server_error_lines))
+        return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
     def __enter__(self):
         try:
@@ -503,9 +491,9 @@ class OmniServer:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
-            if self.proc is not None and self.proc.stdout is not None:
+            if self.proc is not None and self.proc.stderr is not None:
                 try:
-                    self.proc.stdout.close()
+                    self.proc.stderr.close()
                 except Exception:
                     pass
             if self._server_log_thread is not None:
