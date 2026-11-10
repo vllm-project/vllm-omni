@@ -309,8 +309,7 @@ class OmniServer:
             ret = self.proc.poll()
             if ret is not None:
                 raise RuntimeError(
-                    f"Server processes exited with code {ret} before becoming ready."
-                    f"{self._server_error_tail()}"
+                    f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
                 )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
@@ -318,8 +317,7 @@ class OmniServer:
                     ret = self.proc.poll()
                     if ret is not None:
                         raise RuntimeError(
-                            f"Server processes exited with code {ret} before becoming ready."
-                            f"{self._server_error_tail()}"
+                            f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
                         )
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
