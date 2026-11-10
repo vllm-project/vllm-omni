@@ -48,7 +48,7 @@ shape `[1,512,4096]`. It excludes T5 loading and encoding from DiT measurements.
 Expand it to an absolute path visible from both nodes:
 
 ```bash
-gzip -dc benchmarks/ar_diffusion/fixtures/conditioning.pt.gz > /tmp/omni-condition.pt
+gzip -dc benchmarks/wan/fixtures/conditioning.pt.gz > /tmp/omni-condition.pt
 sha256sum /tmp/omni-condition.pt
 # 198358abb9eb6e80296d18bb78f82924a4fef1fa1a44ff26af34e75cfda9c5af
 ```
@@ -63,7 +63,7 @@ NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=0 \
 python -m torch.distributed.run \
   --nnodes=2 --nproc-per-node=4 --node-rank="$OMNI_NODE_RANK" \
   --master-addr="$OMNI_MASTER_ADDR" --master-port=29879 \
-  -m benchmarks.ar_diffusion.benchmark_noisy_pp \
+  -m benchmarks.wan.benchmark_noisy_pp \
   --model "$OMNI_MODEL" --causvid-ckpt "$CAUSVID_CKPT" \
   --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 2 --steps 3 --shift 8 --chunks 128 --skip 64 --measure 32 \
@@ -79,7 +79,7 @@ For one node (`K=30`), use:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  -m benchmarks.ar_diffusion.benchmark_noisy_pp \
+  -m benchmarks.wan.benchmark_noisy_pp \
   --model "$OMNI_MODEL" --causvid-ckpt "$CAUSVID_CKPT" \
   --condition "$OMNI_CONDITION" --out "$OMNI_OUTPUT" \
   --groups 1 --steps 3 --shift 8 --chunks 128 --skip 64 --measure 32 \
@@ -207,9 +207,9 @@ were checked with another five-GPU smoke. These are single-node DiT results.
 The complete evidence and audit scripts are preserved at the fixed archive
 commit `72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe`, outside the active benchmark:
 
-- [Independent H200 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h200-validation-20261010)
-- [Original contributor's H800 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h800-q3-20261009)
-- [H800 archive audit script](https://github.com/Dong1017/vllm-omni/blob/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/audit_results.py)
+- [Independent H200 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/results/h200-validation-20261010)
+- [Original contributor's H800 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/results/h800-q3-20261009)
+- [H800 archive audit script](https://github.com/Dong1017/vllm-omni/blob/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/audit_results.py)
 
 The first baseline request establishes a reference hash, which every variant
 and repeat must match. Record that hash and optionally pass `--expected-sha`
@@ -232,7 +232,7 @@ For an installed Physis model integration, set `OMNI_MODEL` to its full local
 model snapshot or repository ID, then run from the repository root:
 
 ```bash
-python benchmarks/ar_diffusion/benchmark_e2e.py \
+python benchmarks/wan/benchmark_e2e.py \
   --model "$OMNI_MODEL" \
   --class-name PhysisWanPipeline \
   --deploy-config vllm_omni/deploy/physis_wan.yaml \

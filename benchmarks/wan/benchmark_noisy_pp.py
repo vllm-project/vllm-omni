@@ -48,8 +48,8 @@ def main():
     if args.skip < 1 or args.skip + args.measure > args.chunks:
         p.error("completion window must fit the request")
     root = Path(__file__).resolve().parents[2]
-    snapshot_files = list((root / "benchmarks/ar_diffusion").glob("*.py"))
-    snapshot_files.append(root / "benchmarks/ar_diffusion/provenance.json")
+    snapshot_files = list((root / "benchmarks/wan").glob("*.py"))
+    snapshot_files.append(root / "benchmarks/wan/provenance.json")
     snapshot_files += [
         root / name
         for name in (
@@ -173,8 +173,8 @@ def main():
                 blocks_per_rank=model.local_num_layers,
             )
         )
-        from benchmarks.ar_diffusion.hybrid_kv import HybridNoisyKVState, native_hybrid_attention
-        from benchmarks.ar_diffusion.native_optimizations import optimized
+        from benchmarks.wan.hybrid_kv import HybridNoisyKVState, native_hybrid_attention
+        from benchmarks.wan.native_optimizations import optimized
 
         kv_group = dist.new_group(ranks=list(range(world)), backend="nccl")
         reference = args.expected_sha

@@ -8,7 +8,7 @@ import pytest
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model]
 
-_PATH = Path(__file__).resolve().parents[3] / "benchmarks/ar_diffusion/benchmark_e2e.py"
+_PATH = Path(__file__).resolve().parents[3] / "benchmarks/wan/benchmark_e2e.py"
 _SPEC = importlib.util.spec_from_file_location("benchmark_e2e", _PATH)
 benchmark = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(benchmark)

@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from benchmarks.ar_diffusion.native_optimizations import CachedProjection, optimized
+from benchmarks.wan.native_optimizations import CachedProjection, optimized
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

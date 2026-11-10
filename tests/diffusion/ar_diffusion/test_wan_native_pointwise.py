@@ -16,7 +16,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("transposed", [False, True])
 def test_native_residual_preserves_intermediate_bf16_rounding(transposed):
-    from benchmarks.ar_diffusion.native_pointwise import residual
+    from benchmarks.wan.native_pointwise import residual
 
     torch.manual_seed(72)
     x = torch.randn((1, 1536, 257) if transposed else (1, 257, 1536), device="cuda", dtype=torch.bfloat16)
@@ -30,7 +30,7 @@ def test_native_residual_preserves_intermediate_bf16_rounding(transposed):
 
 
 def test_native_modulation_preserves_all_three_bf16_roundings():
-    from benchmarks.ar_diffusion.native_pointwise import modulation
+    from benchmarks.wan.native_pointwise import modulation
 
     torch.manual_seed(93)
     x = torch.randn((1, 257, 1536), device="cuda", dtype=torch.bfloat16)

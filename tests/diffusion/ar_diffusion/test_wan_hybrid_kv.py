@@ -8,10 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-from benchmarks.ar_diffusion import hybrid_transport
-from benchmarks.ar_diffusion.block_plan import BlockPlan, KVKey
-from benchmarks.ar_diffusion.hybrid_kv import HybridNoisyKVState
-from benchmarks.ar_diffusion.hybrid_transport import LayerMajorPages
+from benchmarks.wan import hybrid_transport
+from benchmarks.wan.block_plan import BlockPlan, KVKey
+from benchmarks.wan.hybrid_kv import HybridNoisyKVState
+from benchmarks.wan.hybrid_transport import LayerMajorPages
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellSchedule,
     Ordering,
@@ -55,7 +55,7 @@ def test_hybrid_adapter_satisfies_executor_protocol(monkeypatch):
     Allocation is stubbed so this runs on CPU ( Bounty-hunter's P1)."""
     from types import SimpleNamespace
 
-    import benchmarks.ar_diffusion.hybrid_kv as hybrid_kv_module
+    import benchmarks.wan.hybrid_kv as hybrid_kv_module
 
     spec = ARDiffusionNoisyKVSpec(15, 12, 128, 8, 8, 6)
     model = SimpleNamespace(local_num_layers=2, start_layer=0)
