@@ -42,6 +42,28 @@ class OmniNPUWorkerBase(NPUWorker):
                 local_rank=self.local_rank,
             )
 
+    def get_stage_post_warmup_memory_stats(self) -> None:
+        """NPU workers do not provide the optional CUDA warmup snapshot."""
+        return None
+
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
+
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready.
+
+        Mirrors ``OmniGPUWorkerBase._capture_auxiliary_graphs``: the CUDA base
+        has called this from ``compile_or_warm_up_model`` for a while, the NPU
+        base did not, so a model that relies on the hook (e.g. capturing its
+        audio graphs at startup rather than on the first request) silently
+        skipped it on Ascend.
+        """
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
+
     def profile(
         self,
         is_start: bool = True,
@@ -49,12 +71,14 @@ class OmniNPUWorkerBase(NPUWorker):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         """Override to set trace filename before starting the profiler.
 
         NPUWorker's profile() accepts profile_prefix, so we use it to generate
         a descriptive trace filename for OmniProfiler.
-        Per-session iteration controls are handled by the profiler wrapper.
+        Per-session iteration controls and constructor overrides are handled
+        by the profiler wrapper.
         """
         if self.profiler is None:
             raise RuntimeError(
@@ -70,6 +94,7 @@ class OmniNPUWorkerBase(NPUWorker):
                 stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
                 filename = profile_prefix or f"stage{stage_id}_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations

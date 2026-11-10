@@ -10,7 +10,10 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
-from dataclasses import replace
+import copy
+import json
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -26,7 +29,8 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     QueryRange,
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
     get_current_diffusion_config_or_none,
@@ -34,10 +38,17 @@ from vllm_omni.diffusion.config import (
 )
 from vllm_omni.diffusion.data import (
     AttentionConfig,
+    AttentionScheduleConfig,
     AttentionSpec,
     OmniDiffusionConfig,
     build_attention_config,
     parse_attention_config,
+    parse_attention_schedule_config,
+)
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    request_denoise_progress,
+    set_forward_context,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -133,6 +144,53 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
 
+    def test_sparge_serialized_with_overrides(self):
+        spec = AttentionSpec(
+            backend="SPARGE_ATTN",
+            sparge={
+                "topk": 0.25,
+                "q_block_tokens": 256,
+                "k_block_tokens": 64,
+                "q_tile_override": 256,
+            },
+        )
+        assert spec.backend_kwargs() == {
+            "sparge_topk": 0.25,
+            "sparge_q_block_tokens": 256,
+            "sparge_k_block_tokens": 64,
+            "sparge_q_tile_override": 256,
+        }
+
+    def test_sparge_defaults_are_applied_by_backend(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN")
+        assert spec.sparge is None
+        assert spec.backend_kwargs() is None
+        assert AttentionSpec(backend="SPARGE_ATTN", sparge={}).backend_kwargs() == {"sparge_topk": 0.5}
+
+    def test_sparge_q_block_is_serialized_without_implicit_tile(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN", sparge={"q_block_tokens": 64})
+        assert spec.backend_kwargs() == {"sparge_topk": 0.5, "sparge_q_block_tokens": 64}
+
+    def test_sparge_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SPARGE_ATTN"):
+            AttentionSpec(backend="TORCH_SDPA", sparge={"topk": 0.25})
+
+    @pytest.mark.parametrize(
+        "sparge",
+        [
+            {"topk": 0.0},
+            {"topk": None},
+            {"topk": 1.5},
+            {"q_block_tokens": 32},
+            {"q_block_tokens": 128},
+            {"k_block_tokens": 128},
+            {"q_tile_override": 32},
+        ],
+    )
+    def test_sparge_invalid_values(self, sparge):
+        with pytest.raises(ValueError):
+            AttentionSpec(backend="SPARGE_ATTN", sparge=sparge)
+
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
@@ -202,6 +260,97 @@ class TestAttentionSpec:
         assert type(cfg.precision) is str
 
 
+class TestAttentionScheduleConfig:
+    @pytest.mark.parametrize(
+        "raw",
+        [None, {}, {"profiles": {}}, {"profiles": {}, "default": []}, "{}", AttentionScheduleConfig()],
+        ids=["none", "empty", "no-profiles", "no-profiles-empty-default", "json", "typed"],
+    )
+    def test_schedule_without_profiles_is_no_schedule(self, raw):
+        # No schedule adds no compile boundary; a config that can select nothing is no schedule.
+        assert parse_attention_schedule_config(raw) is None
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is None
+
+    def test_profiles_resolve_roles_without_baseline_or_environment_merging(self, monkeypatch):
+        monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "SAGE_ATTN")
+        config = OmniDiffusionConfig(
+            diffusion_attention_config={"per_role": {"baseline.only": "FLASH_ATTN"}},
+            diffusion_attention_schedule={
+                "profiles": {
+                    "named": {
+                        "default": "TORCH_SDPA",
+                        "per_role": {"video.self": "FLASH_ATTN", "self": "TRTLLM_ATTN"},
+                    },
+                    "platform": {},
+                }
+            },
+        )
+        profile = config.diffusion_attention_schedule.profiles["named"]
+        assert profile.resolve_with_source("video.self", "self")[0].backend == "FLASH_ATTN"
+        assert profile.resolve_with_source("other.self", "self")[0].backend == "TRTLLM_ATTN"
+        assert profile.resolve_with_source("baseline.only")[0].backend == "TORCH_SDPA"
+        assert config.diffusion_attention_schedule.profiles["platform"].resolve_with_source("baseline.only") == (
+            None,
+            None,
+        )
+        assert config.diffusion_attention_config.default.backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("typed", [False, True])
+    def test_schedule_profiles_are_detached_and_round_trip(self, typed):
+        raw = {
+            "profiles": {"sparse": {"default": {"backend": "TRTLLM_ATTN", "skip_softmax": {"threshold": 0.1}}}},
+            "default": [{"start": 3, "end": None, "profile": "sparse"}],
+        }
+        source = AttentionScheduleConfig(**raw) if typed else raw
+        saved = copy.deepcopy(source)
+        config = parse_attention_schedule_config(source)
+        config.profiles["sparse"].default.skip_softmax.threshold = 0.2
+        assert source == saved
+        restored = parse_attention_schedule_config(json.loads(json.dumps(asdict(config))))
+        assert restored == config
+        assert restored is not config
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"profiles": {"bad.name": {}}},
+            {"profiles": {"3bad": {}}},
+            {"profiles": {"sparse": None}},
+            {"profiles": []},
+            {"profiles": {"sparse": "TRTLLM_ATTN"}},
+            {"default": [{"start": 0, "end": None, "profile": "unknown"}]},
+            {"default": None},
+            {"profiles": {}, "typo": []},
+        ],
+    )
+    def test_invalid_server_schedules_fail_during_config_creation(self, raw):
+        with pytest.raises((TypeError, ValueError)):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw)
+
+    def test_unused_profiles_still_validate_backend_parameters(self):
+        with pytest.raises(ValueError, match="skip_softmax"):
+            OmniDiffusionConfig(
+                diffusion_attention_schedule={
+                    "profiles": {"unused": {"default": {"backend": "TORCH_SDPA", "skip_softmax": {"threshold": 0.1}}}}
+                }
+            )
+
+    def test_schedule_profiles_reject_full_compile_granularity(self):
+        # The scheduled_attention op and its eager fallback are tested only under regional
+        # compilation, so config creation rejects profiles with 'full', as it rejects 'full' with
+        # HSDP, sequence parallelism or offload.
+        raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
+        with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")
+        # The same profiles load with regional compilation, and a schedule without profiles is no
+        # schedule, so it loads with 'full'.
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is not None
+        unscheduled = OmniDiffusionConfig(
+            diffusion_attention_schedule={"profiles": {}}, diffusion_compile_granularity="full"
+        )
+        assert unscheduled.diffusion_attention_schedule is None
+
+
 class TestAttentionConfig:
     def test_empty_config(self):
         config = AttentionConfig()
@@ -248,6 +397,13 @@ class TestAttentionConfig:
             "precision": "sage",
             "topk": 32,
         }
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sparge_config_in_per_role_mapping(self, nested):
+        spec = {"backend": "SPARGE_ATTN", "sparge": {"topk": 0.25}}
+        roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["wan.self"].backend_kwargs() == {"sparge_topk": 0.25}
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
@@ -946,11 +1102,12 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             sdpa_fallback=SimpleNamespace(
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
-            _assert_metadata_compatible=lambda metadata: None,
+            _assert_metadata_compatible=lambda metadata, **kwargs: None,
             _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,
         )
+        fake_attention.effective_attention = lambda: (fake_attention.attention, None, None)
         query = torch.randn(1, 2, 4, 8, dtype=torch.float32)
 
         output = Attention._run_local_attention(fake_attention, query, query, query, None)
@@ -976,6 +1133,17 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
         with pytest.raises(ValueError, match="Ring attention does not support attn_mask"):
             Attention._run_ring_attention(fake_attention, query, query, query, metadata)
+
+    def test_ring_attention_rejects_sparge_instead_of_running_dense(self):
+        fake_attention = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_name=lambda: "SPARGE_ATTN"),
+            attention=SimpleNamespace(skip=None),
+            ring_runner=None,
+        )
+        query = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(NotImplementedError, match="SPARGE_ATTN is not supported with ring sequence parallelism"):
+            Attention._run_ring_attention(fake_attention, query, query, query, None)
 
 
 class TestOptInFloat32Fallback:
@@ -1271,9 +1439,9 @@ class TestDense4DMaskRouting:
     """
 
     @staticmethod
-    def _backend(*, supports_4d_mask: bool):
+    def _backend(*, supports_4d_mask: bool, piecewise: bool = False):
         class _Backend:
-            supports_piecewise_spans = False
+            supports_piecewise_spans = piecewise
 
             @classmethod
             def supports_dense_4d_mask(cls, attention_spec=None):
@@ -1296,6 +1464,7 @@ class TestDense4DMaskRouting:
         monkeypatch,
         *,
         supports_4d_mask: bool = False,
+        piecewise: bool = False,
         backend_explicit: bool = False,
         paged_kv: bool = False,
         with_sdpa: bool = True,
@@ -1307,7 +1476,7 @@ class TestDense4DMaskRouting:
         attention._scheduler_paged_kv = False
         attention.role = "self"
         attention.attn_spec = None
-        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask)
+        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask, piecewise=piecewise)
         attention.backend_explicit = backend_explicit
         attention.paged_kv_cache_role = "primary" if paged_kv else None
         backend_forward = Mock(return_value=torch.ones(1))
@@ -1400,6 +1569,44 @@ class TestDense4DMaskRouting:
         backend_forward.assert_called_once()
         sdpa_forward.assert_not_called()
 
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    def test_piecewise_spans_reach_backend_despite_dense_4d_mask(self, monkeypatch, backend_explicit):
+        # HunyuanImage3 sends a dense 4D mask together with full_attn_spans; a piecewise
+        # backend honors the spans and never reads the mask, so the call must not be
+        # diverted to SDPA or rejected for an explicit FLASH_ATTN selection.
+        attention, backend_forward, sdpa_forward = self._make_attention(
+            monkeypatch, piecewise=True, backend_explicit=backend_explicit
+        )
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_piecewise_backend_without_spans_still_diverts_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, piecewise=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        backend_forward.assert_not_called()
+
+    def test_spans_on_non_piecewise_backend_still_fail_closed(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
     @pytest.mark.parametrize("is_npu", [False, True])
     def test_flash_attention_capability_matches_platform(self, monkeypatch, is_npu):
         from vllm_omni.diffusion.attention.backends import flash_attn as flash_attn_mod
@@ -1408,3 +1615,302 @@ class TestDense4DMaskRouting:
         # above cannot become dead code after a platform check regresses.
         monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
         assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu
+
+
+class TestScheduledDense4DMaskRouting:
+    """Route a dense 4D mask by the backend that runs the scheduled step.
+
+    Inside a scheduled step the layer runs the step's candidate, so the dense 4D
+    diversion, its explicit-selection error and the metadata check must read the
+    candidate's backend and spec, not the baseline's. A backend named by the
+    profile (the candidate has a spec) is an explicit selection and fails closed;
+    a role the profile leaves on the platform default (no spec) falls back to
+    SDPA. Gap steps keep the baseline rule covered by ``TestDense4DMaskRouting``.
+    """
+
+    _SPEC = AttentionSpec(backend="FLASH_ATTN")
+    _SPANS = [[(1, 3)], [(1, 3)]]
+
+    @staticmethod
+    def _backend(
+        name: str,
+        *,
+        supports_4d_mask: bool = False,
+        piecewise: bool = False,
+        mask: bool = True,
+        probed_specs: list | None = None,
+    ):
+        class _Backend:
+            supports_piecewise_spans = piecewise
+
+            @classmethod
+            def supports_dense_4d_mask(cls, attention_spec=None):
+                if probed_specs is not None:
+                    probed_specs.append(attention_spec)
+                return supports_4d_mask
+
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return mask
+
+            @staticmethod
+            def get_name() -> str:
+                return name
+
+        return _Backend
+
+    def _make_attention(
+        self,
+        monkeypatch,
+        *,
+        baseline: type,
+        candidate: type | None,
+        baseline_explicit: bool = False,
+        candidate_explicit: bool = False,
+        paged_kv: bool = False,
+        with_sdpa: bool = True,
+    ):
+        attention = Attention.__new__(Attention)
+        attention._has_custom_attention = False
+        attention._explicit_cross_contract = False
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.role = "self"
+        attention.attn_spec = None
+        attention.attn_backend = baseline
+        attention.backend_explicit = baseline_explicit
+        attention.paged_kv_cache_role = "primary" if paged_kv else None
+        forwards = SimpleNamespace(
+            baseline=Mock(return_value=torch.ones(1)),
+            candidate=Mock(return_value=torch.full((1,), 2.0)),
+            sdpa=Mock(return_value=torch.zeros(1)),
+        )
+        attention.attention = SimpleNamespace(forward=forwards.baseline)
+        attention.sdpa_fallback = SimpleNamespace(forward=forwards.sdpa) if with_sdpa else None
+        attention._schedule_configured = True
+        attention._schedule_candidates = {}
+        if candidate is not None:
+            spec = self._SPEC if candidate_explicit else None
+            attention._schedule_candidates["p"] = ScheduleCandidate(
+                backend_cls=candidate,
+                spec=spec,
+                impl=SimpleNamespace(forward=forwards.candidate),
+                backend_explicit=spec is not None,
+            )
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(paged_kv_adapter=object(), in_diffusion_kv_memory_profile=False),
+        )
+        return attention, forwards
+
+    @staticmethod
+    @contextmanager
+    def _step(step_idx: int):
+        """Publish ``step_idx`` under a schedule that selects profile "p" from step 1 on."""
+        schedule = (AttentionScheduleRange(start=1, end=None, profile="p"),)
+        with set_forward_context(), bind_attention_schedule(schedule), request_denoise_progress(step_idx, 4):
+            yield
+
+    @staticmethod
+    def _dense_4d_mask():
+        return torch.zeros(2, 1, 4, 4, dtype=torch.bool)
+
+    @staticmethod
+    def _call(attention, metadata):
+        query, key, value = torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8)
+        return attention._run_local_attention(query, key, value, metadata)
+
+    def _assert_routed(self, attention, forwards, metadata, expected: str) -> None:
+        """Assert that one call runs the ``expected`` forward, or raises naming a backend.
+
+        ``expected`` is "baseline", "candidate" or "sdpa", or "raises <BACKEND>" for the
+        explicit-selection NotImplementedError.
+        """
+        for forward in vars(forwards).values():
+            forward.reset_mock()
+        if expected.startswith("raises "):
+            backend_name = expected.removeprefix("raises ")
+            with pytest.raises(
+                NotImplementedError,
+                match=rf"Attention backend '{backend_name}' does not support a dense 4D attn_mask.*"
+                r"backend_explicit=True",
+            ):
+                self._call(attention, metadata)
+            ran = set()
+        else:
+            output = self._call(attention, metadata)
+            forward = getattr(forwards, expected)
+            assert output is forward.return_value
+            forward.assert_called_once()
+            assert forward.call_args.args[3] is metadata
+            ran = {expected}
+        assert {name for name, forward in vars(forwards).items() if forward.called} == ran
+
+    @pytest.mark.parametrize(
+        ("baseline_4d", "baseline_explicit", "candidate_4d", "candidate_explicit", "in_step", "in_gap"),
+        [
+            (True, False, False, False, "sdpa", "baseline"),
+            (True, False, False, True, "raises CANDIDATE", "baseline"),
+            (False, False, False, True, "raises CANDIDATE", "sdpa"),
+            (False, True, False, False, "sdpa", "raises BASELINE"),
+            (False, False, True, False, "candidate", "sdpa"),
+            (False, True, True, True, "candidate", "raises BASELINE"),
+        ],
+        ids=[
+            "automatic-candidate-over-capable-baseline",
+            "explicit-candidate-over-capable-baseline",
+            "explicit-candidate-over-automatic-baseline",
+            "automatic-candidate-over-explicit-baseline",
+            "capable-candidate-over-automatic-baseline",
+            "capable-candidate-over-explicit-baseline",
+        ],
+    )
+    def test_dense_4d_mask_follows_the_step_backend(
+        self, monkeypatch, baseline_4d, baseline_explicit, candidate_4d, candidate_explicit, in_step, in_gap
+    ):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=baseline_4d),
+            candidate=self._backend("CANDIDATE", supports_4d_mask=candidate_4d),
+            baseline_explicit=baseline_explicit,
+            candidate_explicit=candidate_explicit,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        # The scheduled step runs first, so a decision kept from it would show in the gap step.
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, in_step)
+        with self._step(0):
+            self._assert_routed(attention, forwards, metadata, in_gap)
+
+    @pytest.mark.parametrize(
+        (
+            "baseline_piecewise",
+            "baseline_4d",
+            "baseline_explicit",
+            "candidate_piecewise",
+            "candidate_explicit",
+            "spans",
+            "expected",
+        ),
+        [
+            (True, False, False, False, True, True, "raises CANDIDATE"),
+            (True, False, False, False, False, True, "sdpa"),
+            (False, False, True, True, False, True, "candidate"),
+            (False, True, False, True, False, False, "sdpa"),
+        ],
+        ids=[
+            "explicit-candidate-without-piecewise-spans",
+            "automatic-candidate-without-piecewise-spans",
+            "piecewise-candidate-honors-spans",
+            "piecewise-candidate-without-spans",
+        ],
+    )
+    def test_spans_precedence_follows_the_step_backend(
+        self,
+        monkeypatch,
+        baseline_piecewise,
+        baseline_4d,
+        baseline_explicit,
+        candidate_piecewise,
+        candidate_explicit,
+        spans,
+        expected,
+    ):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=baseline_4d, piecewise=baseline_piecewise),
+            candidate=self._backend("CANDIDATE", piecewise=candidate_piecewise),
+            baseline_explicit=baseline_explicit,
+            candidate_explicit=candidate_explicit,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=self._SPANS if spans else None)
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, expected)
+
+    def test_capability_probe_receives_the_candidate_spec(self, monkeypatch):
+        probed_specs: list = []
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE"),
+            candidate=self._backend("CANDIDATE", supports_4d_mask=True, probed_specs=probed_specs),
+            candidate_explicit=True,
+        )
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, AttentionMetadata(attn_mask=self._dense_4d_mask()), "candidate")
+
+        assert len(probed_specs) == 1
+        assert probed_specs[0] is self._SPEC
+
+    @pytest.mark.parametrize(
+        ("paged_kv", "with_sdpa", "detail"),
+        [(True, True, "paged_kv=True"), (False, False, "backend_explicit=False, paged_kv=False")],
+        ids=["paged-kv", "no-sdpa-fallback"],
+    )
+    def test_automatic_candidate_still_fails_closed(self, monkeypatch, paged_kv, with_sdpa, detail):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=True),
+            candidate=self._backend("CANDIDATE"),
+            paged_kv=paged_kv,
+            with_sdpa=with_sdpa,
+        )
+
+        with (
+            self._step(1),
+            pytest.raises(NotImplementedError, match=rf"'CANDIDATE' does not support a dense 4D attn_mask.*{detail}"),
+        ):
+            self._call(attention, AttentionMetadata(attn_mask=self._dense_4d_mask()))
+
+        assert not any(forward.called for forward in vars(forwards).values())
+
+    def test_unprepared_profile_raises_before_dense_4d_routing(self, monkeypatch):
+        attention, forwards = self._make_attention(monkeypatch, baseline=self._backend("BASELINE"), candidate=None)
+
+        with (
+            self._step(1),
+            pytest.raises(RuntimeError, match="attention schedule profile 'p' was not prepared on this layer"),
+        ):
+            self._call(attention, AttentionMetadata(attn_mask=self._dense_4d_mask()))
+
+        assert not any(forward.called for forward in vars(forwards).values())
+
+    @pytest.mark.parametrize("explicit", [False, True], ids=["automatic", "explicit"])
+    @pytest.mark.parametrize("scheduled", [False, True], ids=["gap-step", "scheduled-step"])
+    def test_dense_4d_routing_runs_before_the_mask_check(self, monkeypatch, scheduled, explicit):
+        # A backend without any attn_mask support is still a dense 4D case: it is
+        # diverted or fails as one, instead of failing the generic attn_mask check.
+        no_mask = self._backend("NO_MASK", mask=False)
+        capable = self._backend("CAPABLE", supports_4d_mask=True)
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=capable if scheduled else no_mask,
+            candidate=no_mask if scheduled else capable,
+            baseline_explicit=explicit and not scheduled,
+            candidate_explicit=explicit and scheduled,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with self._step(1 if scheduled else 0):
+            self._assert_routed(attention, forwards, metadata, "raises NO_MASK" if explicit else "sdpa")
+
+    def test_2d_mask_is_checked_against_the_step_backend(self, monkeypatch):
+        # MiniMax-H3 builds a 2D key mask for a mask-capable profile over a mask-free
+        # baseline such as TRTLLM_ATTN; the step must not be rejected for the baseline.
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", mask=False),
+            candidate=self._backend("CANDIDATE"),
+            candidate_explicit=True,
+        )
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False, True, False]]))
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, "candidate")
+        with self._step(0), pytest.raises(ValueError, match="'BASELINE' does not support attn_mask"):
+            self._call(attention, metadata)

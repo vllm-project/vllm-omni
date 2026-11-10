@@ -10,11 +10,12 @@ import base64
 import json
 import time
 import wave
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 try:
     import websockets
@@ -75,6 +76,18 @@ def read_pcm16_wav(path: Path) -> bytes:
         if wav_file.getcomptype() != "NONE":
             raise ValueError("input WAV must be uncompressed PCM")
         return wav_file.readframes(wav_file.getnframes())
+
+
+def _session_stats_error_message(event: Mapping[str, object]) -> str:
+    error = event.get("error")
+    if isinstance(error, Mapping):
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            return message
+    message = event.get("message")
+    if isinstance(message, str) and message:
+        return message
+    return "session.stats request failed"
 
 
 async def wait_for(
@@ -242,6 +255,49 @@ class RealtimeDuplexClient:
                     self.events.add(event)
         except ConnectionClosed:
             return
+
+    async def get_session_stats(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        event_id: str | None = None,
+    ) -> dict[str, object]:
+        """Fetch the server's per-turn stage work and audio (``session.stats``, RFC #8325)."""
+        request_id = event_id or f"evt_{uuid4().hex}"
+        from_index = len(self.events.events)
+        deadline = time.monotonic() + timeout_s
+        try:
+            await asyncio.wait_for(
+                self.send({"type": "session.stats.get", "event_id": request_id}),
+                timeout=timeout_s,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError("Timed out sending session.stats.get") from exc
+
+        def arrived() -> bool:
+            for event in self.events.events[from_index:]:
+                if event.get("type") == "session.stats" and event.get("request_event_id") == request_id:
+                    return True
+                if event.get("type") == "error" and (
+                    event.get("event_id") == request_id or event.get("related_event_id") == request_id
+                ):
+                    return True
+            self.raise_if_reader_stopped()
+            return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out sending session.stats.get")
+        await wait_for(arrived, timeout_s=remaining, label="session.stats")
+        for event in self.events.events[from_index:]:
+            if event.get("type") == "session.stats" and event.get("request_event_id") == request_id:
+                stats = event.get("stats")
+                return stats if isinstance(stats, dict) else {}
+            if event.get("type") == "error" and (
+                event.get("event_id") == request_id or event.get("related_event_id") == request_id
+            ):
+                raise ConnectionError(_session_stats_error_message(event))
+        return {}
 
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
@@ -432,6 +488,30 @@ class RealtimeDuplexClient:
                 # budget; sleeping a full unit after them accumulates drift.
                 await asyncio.sleep(max(0.0, started_at + audio_end_ms / 1000 - time.monotonic()))
         return frames_sent
+
+    async def append_silence(self, duration_ms: int) -> None:
+        """Append one zeroed PCM16 unit, e.g. drain padding after a commit.
+
+        The same ``input_audio_buffer.append`` event shape ``stream_av_units``
+        sends — ``duration_ms``/``audio_end_ms`` included, ``_media_clock_ms``
+        advanced — so the server's step loop keeps stepping on it as if the
+        clip were still streaming.
+        """
+        duration_ms = max(0, int(duration_ms))
+        if duration_ms == 0:
+            return
+        self._media_clock_ms += duration_ms
+        silence = bytes(round(PCM16_SAMPLE_RATE * duration_ms / 1000) * PCM16_BYTES_PER_SAMPLE)
+        await self.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(silence).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": self._media_clock_ms,
+            }
+        )
 
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})

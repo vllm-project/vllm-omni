@@ -9,7 +9,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
@@ -40,6 +40,7 @@ def _dist_env():
         cleanup_dist_env_and_memory()
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_packed_table_skipped_on_cpu():
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
 
@@ -47,6 +48,7 @@ def test_packed_table_skipped_on_cpu():
     assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("min_tokens", [None, "0", "59", "60", "61"])
 def test_packed_table_respects_min_tokens(monkeypatch, mocker, min_tokens):
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image

@@ -277,7 +277,7 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
     assert json.loads((score_root / "evaluation_summary.json").read_text()) == accuracy
 
 
-@pytest.mark.parametrize("failure", ["generation", "publication", "judge", "clock"])
+@pytest.mark.parametrize("failure", ["generation", "publication", "judge", "invalid_judge", "clock"])
 def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch, failure):
     samples = [
         replace(sample, evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge"))
@@ -304,6 +304,9 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
         calls += 1
         if failure == "judge" and calls == 1:
             raise ConnectionError("judge unavailable")
+        if failure == "invalid_judge" and calls <= 2:
+            # 1: the original ask, 2: the format-correction retry; both invalid.
+            return '{"success_score": "bad"}'
         return '{"success_score": 1}'
 
     monkeypatch.setattr(adapter, "write_sample_result", write)
@@ -312,7 +315,7 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
     assert accuracy["status"] == "partial" and accuracy["total"] == 2
     assert accuracy["evaluated"] == accuracy["samples"] == 1
     assert accuracy["skipped"] == int(failure in {"generation", "publication"})
-    assert accuracy["failed"] == len(accuracy["errors"]) == int(failure in {"judge", "clock"})
+    assert accuracy["failed"] == len(accuracy["errors"]) == int(failure in {"judge", "invalid_judge", "clock"})
     assert outputs[1].success
 
 
@@ -535,14 +538,29 @@ async def test_failed_sessions_are_not_judge_inputs(tmp_path, prepared, monkeypa
             raise ConnectionError("socket closed")
         if failure == "timeout":
             await asyncio.sleep(10)
-        return replace(_result(sample), error="session failed", metadata={"response_done": failure != "drain"})
+        return replace(
+            _result(sample),
+            error="session failed",
+            metadata={"response_done": failure != "drain"},
+            diagnostics={"drain_timeout_state": {"committed_observed": True}},
+        )
 
     monkeypatch.setattr(runner, "generate_sample", generate)
     monkeypatch.setattr(patch, "_omni_request_timeout_s", lambda: 0.01)
     output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
     assert not output.success and output.error
-    assert adapter.finalize_duplex_eval([sample], [output])["published"] == 0
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == 0
     assert not _result(sample).output.exists()
+    diagnostic = sample.response_root / "failed_sessions" / sample.sample.split / f"{sample.sample.id}.json"
+    if failure in {"protocol", "drain"}:
+        assert summary["failed_diagnostics"] == 1
+        assert json.loads(diagnostic.read_text())["diagnostics"] == {
+            "drain_timeout_state": {"committed_observed": True}
+        }
+    else:
+        assert summary["failed_diagnostics"] == 0
+        assert not diagnostic.exists()
 
 
 @pytest.mark.asyncio
@@ -647,6 +665,7 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
     async def handler(socket):
         nonlocal closed_before_tail
         pending = None
+        responded = False
 
         async def finish_tail():
             await asyncio.sleep(0.05)
@@ -664,7 +683,10 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
                 event = json.loads(raw)
                 if event["type"] == "session.update":
                     await socket.send(json.dumps({"type": "session.created"}))
-                elif event["type"] == "input_audio_buffer.append":
+                elif event["type"] == "input_audio_buffer.append" and not responded:
+                    # The streamed clip's reply fires once; the drain padding
+                    # appended after the commit is silence and gets no reply.
+                    responded = True
                     for response in [
                         {"type": "response.created", "response": {"id": "r1"}},
                         {"type": "response.output_text.delta", "response_id": "r1", "delta": "Earlier."},
@@ -715,6 +737,157 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
         assert "".join(chunk["text"] for chunk in response["chunks"]) == "".join(
             sentence["sentence"] for sentence in sentences
         )
+
+
+@pytest.mark.asyncio
+async def test_padding_listens_do_not_reset_the_drain_quiet_window(tmp_path, prepared, monkeypatch):
+    """The real server answers every padded silence unit with a listen.
+
+    A per-unit `response.listen` used to reset the drain's quiet window on
+    each padded step and left every drain to end at its timeout (measured
+    against the MiniCPM-o server: 19/19 drains timed out with padding
+    enabled, and one drain logged 151 listens). The drain settle test must
+    ignore the padding-acknowledging listens and settle on the reply's own
+    tail. The fake paces its listens faster than the settle window so each
+    one lands before the threshold would, mirroring the 1s padding period
+    against the 2s settle.
+    """
+    sample = _samples(tmp_path)[0]
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
+    original_wait = runner.wait_for
+
+    async def bounded_wait(predicate, **kwargs):
+        await original_wait(predicate, timeout_s=0.5, label=kwargs["label"])
+
+    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+
+    sent_listens: list[dict] = []
+
+    async def listen_every(socket, interval):
+        while True:
+            await asyncio.sleep(interval)
+            listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+            sent_listens.append(listen)
+            await socket.send(json.dumps(listen))
+
+    async def handler(socket):
+        listens = None
+        try:
+            async for raw in socket:
+                event = json.loads(raw)
+                if event["type"] == "session.update":
+                    await socket.send(json.dumps({"type": "session.created"}))
+                elif event["type"] == "input_audio_buffer.commit":
+                    await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                    for response in [
+                        {"type": "response.created", "response": {"id": "r1"}},
+                        {"type": "response.output_text.delta", "response_id": "r1", "delta": "Earlier."},
+                        {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                    ]:
+                        await socket.send(json.dumps(response))
+                    # The real server listens on every padded silence unit;
+                    # pace them faster than the settle window.
+                    listens = asyncio.create_task(listen_every(socket, 0.1))
+                elif event["type"] == "session.close":
+                    await socket.send(json.dumps({"type": "session.closed"}))
+                    return
+        finally:
+            if listens is not None:
+                listens.cancel()
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is True
+    assert output.duplex_eval_result.metadata["drain_timeout"] is None
+    # The exclusion is only exercised if padding listens actually landed after
+    # the commit; a fake whose listen task never ran would pass vacuously.
+    assert sent_listens
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == 1
+    response = json.loads(output.duplex_eval_result.output.read_text())
+    assert response["sentences"][0]["sentence"] == "Earlier."
+
+
+@pytest.mark.asyncio
+async def test_drain_settles_when_the_committed_clip_gets_only_a_listen(tmp_path, prepared, monkeypatch):
+    """A model that answers the committed clip by listening still settles.
+
+    The only post-commit event is the server's model-listen acknowledgement, so
+    the quiet window never sees activity; the residual decision must come from
+    that listen and settle the drain instead of holding it to ``drain_timeout``.
+    """
+    sample = _samples(tmp_path)[0]
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.15)
+    original_wait = runner.wait_for
+
+    async def bounded_wait(predicate, **kwargs):
+        await original_wait(predicate, timeout_s=0.8, label=kwargs["label"])
+
+    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                # No response is created for the clip: the model listens.
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await socket.send(json.dumps(listen))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is True
+    assert output.duplex_eval_result.metadata["drain_timeout"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_padding_coding_error_surfaces_through_the_sample(tmp_path, prepared, monkeypatch):
+    """An unexpected padding failure must not masquerade as a drain timeout.
+
+    ``_pad_silence_until_stopped`` only stops quietly for a dead transport; a
+    coding error in the padding path (here an ``AttributeError`` from
+    ``append_silence``) has to leave the sample visibly failed through
+    ``generate_sample`` instead of being swallowed while the drain settles on
+    the reply that the fake already finished.
+    """
+
+    async def broken_append_silence(self, duration_ms):
+        raise AttributeError("append_silence is broken")
+
+    monkeypatch.setattr(runner.RealtimeDuplexClient, "append_silence", broken_append_silence)
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                for response in [
+                    {"type": "response.created", "response": {"id": "r1"}},
+                    {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                ]:
+                    await socket.send(json.dumps(response))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        sample = _samples(tmp_path)[0]
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    assert output.success is False
+    assert "AttributeError" in output.error
 
 
 @pytest.mark.asyncio
@@ -884,7 +1057,14 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
         # the previously captured benchmark duration or throughput denominator.
         BenchmarkTime.offset = 3600.0
         return web.json_response(
-            {"choices": [{"message": {"content": json.dumps({"success_score": len(judge_calls) % 2})}}]},
+            {
+                "choices": [
+                    {
+                        "message": {"content": json.dumps({"success_score": len(judge_calls) % 2})},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
             status=judge_status,
         )
 
@@ -903,6 +1083,7 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
 
     async def handler(socket):
         responded = False
+        committed = False
         async for raw in socket:
             event = json.loads(raw)
             received_types.append(event["type"])
@@ -918,12 +1099,9 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
                     else {}
                 )
                 await socket.send(json.dumps({"type": "session.created", "session": {"capabilities": capabilities}}))
-            elif not responded and event["type"] == (
-                "input_audio_buffer.append" if turn_detection == "server_vad" else "input_audio_buffer.commit"
-            ):
+            elif not responded and event["type"] == "input_audio_buffer.append" and turn_detection == "server_vad":
                 responded = True
                 for response in [
-                    *([] if turn_detection == "server_vad" else [{"type": "input_audio_buffer.committed"}]),
                     {"type": "response.created", "response": {"id": "r1"}},
                     {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
                     {
@@ -935,6 +1113,26 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
                     {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
                 ]:
                     await socket.send(json.dumps(response))
+            elif not responded and committed and event["type"] == "input_audio_buffer.append":
+                # turn_detection == "none": the committed clip's reply drains
+                # on the padding the client appends next, so its transcript
+                # lands after the first padding unit.
+                responded = True
+                for response in [
+                    {"type": "input_audio_buffer.committed"},
+                    {"type": "response.created", "response": {"id": "r1"}},
+                    {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
+                    {
+                        "type": "response.output_audio.delta",
+                        "response_id": "r1",
+                        "sample_rate_hz": 24000,
+                        "delta": base64.b64encode(b"\0\0" * 240).decode(),
+                    },
+                    {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                ]:
+                    await socket.send(json.dumps(response))
+            elif event["type"] == "input_audio_buffer.commit" and turn_detection != "server_vad":
+                committed = True
             elif event["type"] == "session.close":
                 await socket.send(json.dumps({"type": "session.closed"}))
                 return
@@ -988,7 +1186,11 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
     response = json.loads((root / "PR_correction/0.json").read_text())
     sentence = response["sentences"][0]
     assert sentence["sentence"] == "Done."
-    assert sentence["start"] == sentence["end"] == pytest.approx(0.03 if turn_detection == "server_vad" else 0.01)
+    # server_vad: clip end (0.01) plus the streamed tail silence (0.02).
+    # none: clip end (0.01) plus the first padding unit (1.0s) the committed
+    # clip's reply drains on — the padding advances the media clock.
+    expected_start = 0.03 if turn_detection == "server_vad" else 0.01 + 1.0
+    assert sentence["start"] == sentence["end"] == pytest.approx(expected_start)
     assert response["chunks"] == [{"text": "Done.", "current_time": sentence["start"]}]
     report = json.loads((root / "duplex_metrics.json").read_text())
     assert len(report["duplex_session_metrics"]) == 2
