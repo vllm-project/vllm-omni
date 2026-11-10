@@ -636,16 +636,14 @@ class LingBotWorldCausalDMDPipeline(
         if worldkv_value is not None:
             if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
                 raise ValueError("worldkv requires eager clean commits without first-block sharing")
-            if any(
-                getattr(parallel_config, name, 1) != 1
-                for name in (
-                    "tensor_parallel_size",
-                    "ulysses_degree",
-                    "ring_degree",
-                    "pipeline_parallel_size",
+            # _validate_parallel_config already rejects pipeline, ring, CFG and VAE parallelism.
+            tensor_parallel_size = getattr(parallel_config, "tensor_parallel_size", 1)
+            ulysses_degree = getattr(parallel_config, "ulysses_degree", 1)
+            if tensor_parallel_size != 1 or ulysses_degree != 1:
+                raise ValueError(
+                    "worldkv currently requires single-rank attention, got "
+                    f"tensor_parallel_size={tensor_parallel_size}, ulysses_degree={ulysses_degree}."
                 )
-            ):
-                raise ValueError("worldkv currently requires single-rank attention")
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model

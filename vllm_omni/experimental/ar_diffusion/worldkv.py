@@ -24,6 +24,23 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+# type() instead of isinstance() below: bool is a subclass of int, and YAML
+# values such as `true` must not pass as 1.
+def _require_int(name: str, value: object, *, minimum: int) -> None:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"worldkv.{name} must be an integer >= {minimum}, got {value!r}")
+
+
+def _require_bool(name: str, value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError(f"worldkv.{name} must be a boolean, got {value!r}")
+
+
+def _require_ratio(name: str, value: object) -> None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+        raise ValueError(f"worldkv.{name} must be a number in [0, 1], got {value!r}")
+
+
 @dataclass(frozen=True)
 class WorldKVConfig:
     window_frames: int = 18
@@ -41,26 +58,22 @@ class WorldKVConfig:
     host_bank_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("reuse_attention_kv", "prefetch_kv", "prefetch_bank_allocation", "layerwise_bank_copy"):
-            if type(getattr(self, name)) is not bool:
-                raise ValueError(f"worldkv.{name} must be a boolean")
-        for name in (
-            "window_frames",
-            "sink_frames",
-            "retrieval_frames",
-            "bank_bytes",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value < 0:
-                raise ValueError(f"worldkv.{name} must be a non-negative integer")
+        # Values come from untyped YAML, so check each field's type first and
+        # the rules that relate fields afterwards.
+        _require_int("window_frames", self.window_frames, minimum=0)
+        _require_int("sink_frames", self.sink_frames, minimum=0)
+        _require_int("retrieval_frames", self.retrieval_frames, minimum=0)
+        _require_int("bank_bytes", self.bank_bytes, minimum=0)
+        _require_bool("reuse_attention_kv", self.reuse_attention_kv)
+        _require_bool("prefetch_kv", self.prefetch_kv)
+        _require_bool("prefetch_bank_allocation", self.prefetch_bank_allocation)
+        _require_bool("layerwise_bank_copy", self.layerwise_bank_copy)
+        _require_ratio("world_keep_ratio", self.world_keep_ratio)
+        if self.host_bank_limit_bytes is not None:
+            _require_int("host_bank_limit_bytes", self.host_bank_limit_bytes, minimum=1)
+
         if self.window_frames <= self.sink_frames:
             raise ValueError("worldkv.window_frames must exceed sink_frames")
-        if (
-            isinstance(self.world_keep_ratio, bool)
-            or not isinstance(self.world_keep_ratio, (int, float))
-            or not 0 <= self.world_keep_ratio <= 1
-        ):
-            raise ValueError("worldkv.world_keep_ratio must be in [0,1]")
         if self.world_score not in ("pairwise_mean", "centroid"):
             raise ValueError("worldkv.world_score must be pairwise_mean or centroid")
         if self.world_keep_ratio != 1 and not self.retrieval_frames:
@@ -69,13 +82,10 @@ class WorldKVConfig:
             raise ValueError("worldkv retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
             raise ValueError("worldkv window must leave room for current frames")
-        limit = self.host_bank_limit_bytes
-        if limit is not None:
-            if type(limit) is not int or limit <= 0:
-                raise ValueError("worldkv.host_bank_limit_bytes must be a positive integer")
+        if self.host_bank_limit_bytes is not None:
             if not self.retrieval_frames:
                 raise ValueError("worldkv.host_bank_limit_bytes requires retrieval")
-            if limit < self.bank_bytes:
+            if self.host_bank_limit_bytes < self.bank_bytes:
                 raise ValueError("worldkv.host_bank_limit_bytes must be at least bank_bytes")
 
     @classmethod
