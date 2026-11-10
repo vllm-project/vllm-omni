@@ -742,6 +742,15 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in L1 history view for plugins that consume ``conversation_view``
+    # (Qwen3-Omni): user turns before the N most recent user runs drop their
+    # audio and image parts there. ``None`` leaves every prompt unchanged.
+    context_keep_media_turns: int | None = None
+    qwen_context_policy: Literal["legacy", "budget", "budget_summary"] = "legacy"
+    qwen_context_max_tokens: int | None = None
+    qwen_summary_max_tokens: int = 512
+    qwen_summary_input_max_tokens: int = 8192
+    qwen_summary_timeout_s: float = 30.0
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
@@ -750,6 +759,21 @@ class DuplexSessionRuntimeConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
+        if self.qwen_context_policy not in ("legacy", "budget", "budget_summary"):
+            raise ValueError("Unknown duplex_session.qwen_context_policy")
+        for name in ("qwen_context_max_tokens", "qwen_summary_max_tokens", "qwen_summary_input_max_tokens"):
+            value = getattr(self, name)
+            if value is None and name == "qwen_context_max_tokens":
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
+        if (
+            isinstance(self.qwen_summary_timeout_s, bool)
+            or not isinstance(self.qwen_summary_timeout_s, (int, float))
+            or not math.isfinite(self.qwen_summary_timeout_s)
+            or self.qwen_summary_timeout_s <= 0
+        ):
+            raise ValueError("duplex_session.qwen_summary_timeout_s must be finite and positive")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (
@@ -758,6 +782,12 @@ class DuplexSessionRuntimeConfig:
             or self.max_sessions_per_replica < 1
         ):
             raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.context_keep_media_turns is not None and (
+            isinstance(self.context_keep_media_turns, bool)
+            or not isinstance(self.context_keep_media_turns, int)
+            or self.context_keep_media_turns < 0
+        ):
+            raise ValueError("duplex_session.context_keep_media_turns must be an integer >= 0 or null")
         if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
             raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
         if self.replica_groups is not None:

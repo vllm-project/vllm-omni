@@ -342,6 +342,101 @@ vllm_omni/
   the token belongs to the attachment registry, the lease generation is the
   engine-side compare-and-swap.
 
+### Authoritative history snapshots
+
+`DuplexEngineSession.history_snapshot()` synchronously captures a
+`DuplexHistorySnapshot` on the session owner's loop, without an `await`.
+Its aligned tuple columns are `messages`, public `item_ids` (possibly `None`),
+internal `source_ids`, and `source_revisions`, together with one
+`history_revision`. Unresolved history placeholders are omitted from every
+column. The record is frozen; nested protocol dictionaries and lists are
+detached, mutable copies for plugin compatibility. Text, bytes and opaque
+media payloads are shared, rather than cloned. Consumers must treat opaque
+payloads as read-only. Session mutation methods own authoritative writes.
+
+Every non-placeholder history insertion must call `_track_history_message`,
+and removal must call `_forget_history_message`, keeping the source map complete
+for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
+
+The prompt path uses `session.history` for Qwen retained-PCM identity. Unlike
+`snapshot.messages`, it copies only top-level message dictionaries; nested
+protocol/media containers and payloads remain shared with authoritative history
+and must be treated as read-only by prompt consumers.
+
+A source ID is allocated monotonically when a message becomes visible and
+is never reused within that session. Replacing a public item's contents
+preserves its source ID. Deleting it retires the source; recreating the same
+public item ID allocates a new source ID. A late item-ID binding preserves
+the source ID and advances its revision. New sources start at revision zero.
+
+Content edits, accepted changes to heard-prefix evidence, and tighter
+permanent audio cutoffs advance the affected source revision and the global
+history revision. A cutoff change can advance revisions even when the text
+stays equal. Appending or deleting a source advances the global revision.
+Equal-value replacements, rejected operations, hidden reservations, and
+internal playback/cache cleanup alone do not. Revisions are monotonic change
+tokens, not operation counts; one operation can perform multiple writes.
+
+Epoch changes fence in-flight work independently of source validity.
+Re-leasing the same live session on resume preserves IDs and revisions;
+dropping the session drops this state. Snapshots do not imply persistence
+across process restarts. Existing prompt construction remains unchanged;
+memory or stage-view consumers can adopt the snapshot in their own changes.
+
+### Derived context and per-stage views
+
+`DuplexEngineSession.context_ledger` holds derived nodes. A node records the
+`(source_id, revision)` pairs it was built from and the IDs of its parent
+nodes; parents always have smaller IDs. Nodes never write to history or
+advance a revision, and node IDs are never reused.
+
+A node is valid only while every recorded source has the recorded revision in
+the current snapshot and every parent is valid. `refresh(snapshot)` walks the
+nodes in ID order and prunes the invalid ones, so a content edit, a transcript
+update, a deleted source, an accepted heard prefix or a tighter hard cutoff
+removes the affected nodes and all of their descendants. An epoch change alone
+removes nothing. `add_node` admits a node only if its sources and parents are
+valid against the snapshot it is given, so a result computed from older
+sources is rejected when checked against a current snapshot. Admission with
+a historical snapshot does not displace a newer L1 source lookup; duplicate
+L1 nodes for the same source revision are rejected through either admission
+API. Callers refresh against a current authoritative snapshot before reading
+valid nodes.
+
+A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
+`context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
+the prompt config is built exactly as before and no L1 view is rendered. With a
+policy, `conversation` stays the authoritative history and the stage also
+receives `conversation_view`, a list aligned one-to-one with `conversation`:
+
+- User messages before the `keep_media_user_turns` most recent user runs
+  (consecutive user messages) drop their `audio_url` and `image_url` parts and
+  keep their text. The transcript is added as a text part when no text part
+  already carries it.
+- A user run is never emptied. If every message in a run would be empty, the
+  whole run is passed through unchanged.
+- Assistant, system and tool messages are never rewritten. Assistant text
+  already reflects the accepted heard prefix.
+
+This is a candidate context view, not a complete prompt: with a zero-keep
+policy, unanswered input is eligible too. Plugins must preserve current
+request media from `conversation`, and keep binding audio and validating
+sources against it. ModelChannel reuses the snapshot captured for item IDs
+when rendering the view, so both come from the same capture. Policy config
+is deployment-owned; plugin request runtime state is a separate input.
+
+Qwen3-Omni opts in its Thinker stage when
+`duplex_session.context_keep_media_turns` is set (default `null`). It then
+formats older user items from the view, including mixed text/media items.
+Dropped images are never decoded, and a text-only view replaces old audio
+even while its payload remains in the retained audio slots. A turn whose
+audio left those slots keeps its available transcript instead of being
+dropped. The current unanswered user input remains verbatim, including during
+tool continuations, after intervening system instructions, and for audio and
+image items when the knob is `0`.
+The 16-message window, the
+audio-slot limits and the no-empty-run fallback are unchanged.
+
 ## Session lifecycle
 
 ```text
@@ -978,3 +1073,49 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Qwen budget selection and summary memory
+
+Qwen's deployment-owned context policy defaults to `legacy`. Opt-in `budget`
+selection operates on complete exchanges after media binding and candidate L1
+rendering. System messages remain mandatory without separating a user from its
+answer. Rendering preserves source order. The final template, tools, media
+expansion and actual output-token reserve share one deployment context budget.
+A mandatory-input overflow is an explicit error. Pending tool continuations pin
+their source turn; published anchors expire according to selected context
+rather than the legacy fixed message count.
+
+For plugins declaring `uses_context_ledger`, ModelChannel calls
+`observe_history_context` synchronously with the captured versioned snapshot
+and session-owned ledger. Qwen uses that hook to invalidate memory and capture
+source references without passing a mutable ledger to prompt worker threads.
+A history revision change during prompt preparation prevents stale submission.
+The auxiliary runtime refreshes the same context before selecting background
+work and before accepting an asynchronous result.
+
+`budget_summary` reuses SessionMemoryRuntime's single private request slot.
+Successful prompt submission records omitted source references in model runtime
+state. Qwen selects complete text-bearing exchanges from that committed history,
+combines them with any valid previous summary, and renders a bounded stage-0
+request outside the session event loop. It captures source revisions before
+yielding. The request must pass both the runtime epoch/configuration fences and
+Qwen's source/previous-summary check before mailbox publication.
+
+Summary prompts use the checkpoint's ordinary assistant prefix and separate the
+extraction task from quoted conversation instructions. Empty, truncated,
+acknowledgment-only and explicit no-memory results cannot replace a valid
+summary. These checks reject known degenerate outputs; source validity alone
+does not establish the factual accuracy of model-generated memory.
+
+Summary nodes use flat source references instead of an ever-growing parent
+chain. Publication admits the replacement before retiring its predecessor.
+`DuplexContextLedger.discard` removes a derived node and its descendants, without
+changing authoritative history or reusing node IDs. The active summary and one
+attempted-work identity live in Qwen's session state, so unrelated history
+appends do not reset failed-work deduplication. Failed work leaves any valid
+previous summary available. Session re-leasing preserves valid memory; process
+recovery is outside this contract.
+
+The context budget bounds submitted tokens, and summary limits bound generated
+text and active work. Neither mechanism bounds resident authoritative history
+or the number of source references needed to validate a long-lived summary.

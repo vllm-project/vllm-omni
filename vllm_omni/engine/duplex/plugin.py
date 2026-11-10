@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 import pybase64 as base64
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
@@ -497,6 +499,18 @@ class DuplexModelPlugin(ABC):
         """Add model-owned context before planning an append on the session loop."""
         return config
 
+    uses_context_ledger: bool = False
+
+    def observe_history_context(
+        self,
+        *,
+        snapshot: DuplexHistorySnapshot,
+        ledger: DuplexContextLedger,
+        state: DuplexModelSessionState,
+        runtime_config: Mapping[str, object],
+    ) -> None:
+        """Observe versioned sources on the session owner loop, never a worker thread."""
+
     async def prepare_auxiliary_request(
         self,
         *,
@@ -688,6 +702,18 @@ class DuplexModelPlugin(ABC):
 
     @abstractmethod
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
+
+    def context_view_policy(
+        self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig
+    ) -> DuplexContextViewPolicy | None:
+        """Opt a stage in to a candidate context view using deployment config.
+
+        ``None`` keeps the verbatim prompt path. Consumers must bind payloads
+        and preserve current request media against authoritative ``conversation``;
+        a zero-keep policy can drop that media in ``conversation_view`` itself.
+        """
+        del stage_id, runtime_config
+        return None
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         """Refuse client ``extra_body`` keys the server owns (``private_runtime_config_keys``)."""

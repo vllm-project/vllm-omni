@@ -23,9 +23,25 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
-from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import (
+    DuplexDataPlane,
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+)
+from vllm_omni.engine.duplex.session.context_ledger import DuplexSourceRef
+from vllm_omni.model_executor.models.qwen3_omni.duplex.context_budget import (
+    CONTEXT_OMITTED,
+    CONTEXT_SOURCES,
+    CONTEXT_SUMMARY,
+    CONTEXT_TOOL_INPUT,
+    CONTEXT_TOOL_SOURCES,
+    select_history,
+    whole_turns,
+)
+from vllm_omni.model_executor.models.qwen3_omni.duplex.context_memory import QwenContextMemoryMixin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -332,7 +348,7 @@ class QwenDataPlane(DuplexDataPlane):
                 )
 
 
-class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
+class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
 
@@ -341,12 +357,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
+        self._context_config = DuplexSessionRuntimeConfig()
+        self.max_model_len = 0
         # Checkpoint speaker names, loaded once from the stage-0 model config.
         # ``None`` means "not attempted" (no validation); an empty set means the
         # checkpoint declares no speaker_id mapping (names pass through unvalidated).
         self._supported_speakers: set[str] | None = None
 
     def history_calibrator(self, runtime_config):
+        self._context_config = runtime_config
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
             return None
         if self._history_calibrator is None:
@@ -372,6 +391,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 )
                 self.data_plane.retain_history_audio = True
         return self._history_calibrator
+
+    def context_view_policy(self, *, stage_id, runtime_config):
+        self._context_config = runtime_config
+        # Only the Thinker (stage 0) formats conversation history.
+        if stage_id != 0 or runtime_config.context_keep_media_turns is None:
+            return None
+        return DuplexContextViewPolicy(keep_media_user_turns=runtime_config.context_keep_media_turns)
 
     def capabilities(self, *, max_sessions):
         return DuplexCapabilities(
@@ -434,6 +460,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen duplex does not support reference voice audio")
         self._load_supported_speakers(model_config)
+        if model_config is not None:
+            self.max_model_len = model_config.max_model_len
+        limit = self._context_config.qwen_context_max_tokens
+        if limit is not None and self.max_model_len and limit > self.max_model_len:
+            raise DuplexRuntimeConfigError("qwen_context_max_tokens exceeds deployed max_model_len")
         if model_config is None and self.processor is None:
             raise DuplexRuntimeConfigError("Qwen duplex requires the stage-0 model configuration")
         async with self._processor_lock:
@@ -467,6 +498,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         tools = config.extra_body.get("realtime_tools")
         if isinstance(tools, list):
             updated["qwen_tools"] = tools
+        for key in (CONTEXT_OMITTED, CONTEXT_TOOL_INPUT, CONTEXT_TOOL_SOURCES):
+            if key in current:
+                updated[key] = current[key]
         turns = current.get("qwen_tool_turns")
         if isinstance(turns, list):
             updated["qwen_tool_turns"] = turns
@@ -496,7 +530,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         anchors = updated.get("qwen_call_anchors")
         copied = dict(anchors) if isinstance(anchors, Mapping) else {}
         copied[call_id] = history_len
-        kept, expired = _split_call_anchors(copied, history_len=history_len)
+        if self.uses_context_ledger:
+            origins = dict(updated.get(CONTEXT_TOOL_SOURCES, {}))
+            origins[call_id] = updated.get(CONTEXT_TOOL_INPUT, ())
+            updated[CONTEXT_TOOL_SOURCES] = origins
+        kept, expired = (
+            _split_call_anchors(copied, history_len=history_len) if not self.uses_context_ledger else (copied, [])
+        )
         updated["qwen_call_anchors"] = kept
         _remember_expired(updated, expired)
         return updated
@@ -517,6 +557,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
         patch: dict[str, object] = {}
+        for key in (CONTEXT_OMITTED, CONTEXT_TOOL_INPUT):
+            if key in prompt:
+                patch[key] = prompt.pop(key)
         if "_qwen_tool_turns_remaining" in prompt:
             patch["qwen_tool_turns"] = prompt.pop("_qwen_tool_turns_remaining")
         if "_qwen_tool_turns_inflight" in prompt:
@@ -844,7 +887,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 if isinstance(key, str) and isinstance(value, int) and key != call_id
             }
             expired: list[str] = []
-            if receipt_len is not None:
+            if receipt_len is not None and not self.uses_context_ledger:
                 kept, expired = _split_call_anchors(kept, history_len=receipt_len)
             _remember_expired(updated, expired)
             if kept:
@@ -867,6 +910,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def prepare_prompt_config(self, config, *, state, payload):
         history = config.get("conversation", [])
+        # Formatting may read the L1 view; audio binding stays on ``history``.
+        view = config.get("conversation_view")
+        if not isinstance(view, list) or len(view) != len(history):
+            view = None
         bind_from = 0
         lengths = []
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
@@ -889,9 +936,25 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # before response.create. Search only the unanswered user turn so a new
         # payload can never overwrite an earlier, already answered utterance.
         current_contents = []
+        current_turn_start = len(history)
+        if view is not None:
+            # System instructions do not answer a pending user question.
+            # Protect its media even when they follow the user item.
+            for index in range(len(history) - 1, -1, -1):
+                role = history[index].get("role")
+                if role == "assistant":
+                    break
+                if role == "user":
+                    current_turn_start = index
         if has_audio:
+            # Keep payload binding on its existing trailing-user boundary;
+            # formatting protection above has a separate responsibility.
             for index, message in reversed(list(enumerate(history))):
-                if index < bind_from or message.get("role") != "user":
+                if index < bind_from:
+                    break
+                if self.uses_context_ledger and message.get("role") == "system":
+                    continue
+                if message.get("role") != "user":
                     break
                 content = message.get("content")
                 if isinstance(content, list) and any(part.get("type") == "audio_url" for part in content):
@@ -923,24 +986,40 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 turns.append((index, []))
             turns[-1][1].append(message)
 
+        if self.uses_context_ledger:
+            indexed = [dict(message, _src=index) for index, message in enumerate(history)]
+            turns = [(turn[0]["_src"], turn) for turn in whole_turns(indexed)]
         messages = []
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
-            if index + len(turn) <= len(history) - 16:
+            if not self.uses_context_ledger and index + len(turn) <= len(history) - 16:
                 continue
             if turn[0].get("role") == "assistant":
                 continue
             resolved = []
             included_audio = set()
             for offset, message in enumerate(turn):
-                src = index + offset
+                src = message["_src"] if self.uses_context_ledger else index + offset
+                source_content = message.get("content")
+                # The view formats older context. The unanswered user run is
+                # request input even when the policy keeps zero media turns.
+                if view is not None and src < current_turn_start and message.get("role") == "user":
+                    message = view[src]
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
-                        audio = next((value for keys, value in retained if any(key is content for key in keys)), None)
+                        audio = next(
+                            (value for keys, value in retained if any(key is source_content for key in keys)), None
+                        )
                         if audio is None:
-                            break
+                            # The clip left the audio slots. Keep the turn as
+                            # the view's text instead of dropping it.
+                            text = [] if view is None else self._view_text_parts(view[src])
+                            if not text:
+                                break
+                            resolved.append({"role": "user", "content": text, "_src": src})
+                            continue
                         if id(audio) not in included_audio:
                             resolved.append({"role": "user", "audio_payload": audio, "_src": src})
                             included_audio.add(id(audio))
@@ -949,16 +1028,41 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                         if other_parts:
                             resolved.append({"role": "user", "content": other_parts, "_src": src})
                         continue
+                    if view is not None and content == []:
+                        # An older media-only item the view dropped; never decode it.
+                        continue
                 copied = dict(message)
                 copied["_src"] = src
                 resolved.append(copied)
             else:
                 messages.extend(resolved)
+        if self.uses_context_ledger:
+            messages.sort(key=lambda message: message["_src"])
         if has_audio and not current_is_in_history:
             # History is context, not a replacement for the current request.
             # Re-encoding only history here makes Qwen answer an old question.
             messages.append({"role": "user", "audio_payload": payload, "_src": len(history)})
-        return {**config, "qwen_messages": messages}
+        result = {**config, "qwen_messages": messages}
+        if self.uses_context_ledger:
+            memory = state.context_memory
+            if memory.snapshot is not None:
+                result[CONTEXT_SOURCES] = tuple(
+                    DuplexSourceRef(source, revision)
+                    for source, revision in zip(
+                        memory.snapshot.source_ids, memory.snapshot.source_revisions, strict=True
+                    )
+                )
+            result[CONTEXT_SUMMARY] = memory.summary
+        return result
+
+    @staticmethod
+    def _view_text_parts(message):
+        content = message.get("content")
+        parts = [part for part in content if part.get("type") == "text"] if isinstance(content, list) else []
+        transcript = message.get("transcript")
+        if not parts and isinstance(transcript, str) and transcript:
+            parts = [{"type": "text", "text": transcript}]
+        return parts
 
     @staticmethod
     def format_history(messages):
@@ -1081,41 +1185,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             spliced.extend(turn["messages"])
         return spliced, [], waiting
 
-    async def prepare_append_plan(self, **kwargs):
-        # History mutation has already happened on the session loop. The worker
-        # owns this snapshot and never reads or mutates live session state.
-        snapshot = copy.deepcopy(kwargs)
-        return await asyncio.to_thread(self.plan_append, **snapshot)
-
-    def plan_append(
-        self, *, request_id, fence, session_config, runtime_config, seq, turn_seq, payload, final, sampling_params
-    ):
-        if not final or not isinstance(payload, dict):
-            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
-        has_audio = bool(payload.get("audio"))
-        if not has_audio and payload.get("type") != "conversation":
-            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+    def _render_context(self, history, *, runtime_config, session_config, summary=None):
         messages = []
         if runtime_config.get("instructions"):
             messages.append({"role": "system", "content": runtime_config["instructions"]})
-        history = session_config.get("qwen_messages")
-        if history is None and has_audio:
-            # Nothing prepared the conversation, so the committed payload is
-            # the whole turn. An empty prepared list is not that: it means the
-            # preparation ran and found nothing to say.
-            history = [{"role": "user", "audio_payload": payload}]
-        if not history:
-            raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
-        # A pair still in flight belongs to a response whose answer is not in
-        # history yet. Put it back on the waiting list so this prompt uses the
-        # same splice. The response id stays, so that response's ACK can drop it.
-        folded = [
-            *self._collect_tool_turns(runtime_config.get("qwen_tool_turns_inflight")),
-            *self._collect_tool_turns(session_config.get("qwen_tool_turns")),
-        ]
-        history, remaining_tool_turns, inflight_tool_turns = self._splice_tool_turns(list(history), folded)
-        if has_audio and runtime_config.get("initial_user_text"):
-            history = [*history, {"role": "user", "content": runtime_config["initial_user_text"]}]
+        if summary is not None:
+            messages.append(summary.message())
         audios = []
         images = []
         rendered = []
@@ -1143,7 +1218,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             content, audio = self._audio_content(message["audio_payload"])
             audios.append((audio, 16000))
             rendered.append({"role": "user", "content": content})
-        rendered, images = self._trim_prompt_images(rendered, images)
+        if not self.uses_context_ledger:
+            rendered, images = self._trim_prompt_images(rendered, images)
         messages.extend(self.format_history(rendered))
         tools = chat_template_tools(runtime_config.get("qwen_tools"))
         if not tools:
@@ -1157,6 +1233,142 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         mm = {"audio": audios} if audios else {}
         if images:
             mm["image"] = images
+        return prompt, mm, images, audios
+
+    def _context_token_count(self, prompt, mm):
+        if len(mm.get("image", ())) > MAX_PROMPT_IMAGES or len(mm.get("audio", ())) > 4:
+            return self.max_model_len + 1
+        count_audio = []
+        if mm.get("audio"):
+            # Match vLLM Qwen's _get_hf_mm_inputs: HF alone drops a partial
+            # final feature frame. Pad only counting inputs, never submitted PCM.
+            hop = self.processor.feature_extractor.hop_length
+            count_audio = [
+                np.pad(audio, (0, (-len(audio)) % hop)) if len(audio) % hop else audio for audio, _ in mm["audio"]
+            ]
+        processed = self.processor(
+            text=prompt,
+            audio=count_audio or None,
+            images=mm.get("image"),
+            sampling_rate=16000,
+            return_tensors="np",
+        )
+        return int(processed["input_ids"].shape[-1])
+
+    async def prepare_append_plan(self, **kwargs):
+        # History mutation has already happened on the session loop. The worker
+        # owns this snapshot and never reads or mutates live session state.
+        snapshot = copy.deepcopy(kwargs)
+        return await asyncio.to_thread(self.plan_append, **snapshot)
+
+    def plan_append(
+        self, *, request_id, fence, session_config, runtime_config, seq, turn_seq, payload, final, sampling_params
+    ):
+        if not final or not isinstance(payload, dict):
+            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        has_audio = bool(payload.get("audio"))
+        if not has_audio and payload.get("type") != "conversation":
+            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        history = session_config.get("qwen_messages")
+        if history is None and has_audio:
+            # Nothing prepared the conversation, so the committed payload is
+            # the whole turn. An empty prepared list is not that: it means the
+            # preparation ran and found nothing to say.
+            history = [{"role": "user", "audio_payload": payload}]
+        if not history:
+            raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
+        # A pair still in flight belongs to a response whose answer is not in
+        # history yet. Put it back on the waiting list so this prompt uses the
+        # same splice. The response id stays, so that response's ACK can drop it.
+        folded = [
+            *self._collect_tool_turns(runtime_config.get("qwen_tool_turns_inflight")),
+            *self._collect_tool_turns(session_config.get("qwen_tool_turns")),
+        ]
+        selection = None
+        if self.uses_context_ledger:
+            # A missing media-bearing owner must not let a pending tool result
+            # attach itself to an unrelated earlier user turn.
+            conversation = session_config.get("conversation", [])
+            available_sources = {m.get("_src") for m in history}
+            source_refs = session_config.get(CONTEXT_SOURCES, ())
+            source_positions = {ref: i for i, ref in enumerate(source_refs)}
+            origins = runtime_config.get(CONTEXT_TOOL_SOURCES, {})
+            for tool_turn in folded:
+                call_id = _tool_call_id(tool_turn)
+                if call_id in origins:
+                    refs = origins[call_id]
+                    if not refs or any(ref not in source_positions for ref in refs):
+                        raise DuplexRuntimeConfigError(
+                            "Tool continuation's source was edited or deleted", code="context_source_unavailable"
+                        )
+                    tool_turn["history_len"] = max(source_positions[ref] for ref in refs) + 1
+                anchor = tool_turn["history_len"]
+                owner = next(
+                    (
+                        i
+                        for i in range(min(anchor, len(conversation)) - 1, -1, -1)
+                        if conversation[i].get("role") == "user"
+                    ),
+                    None,
+                )
+                if owner is None:
+                    raise DuplexRuntimeConfigError(
+                        "Tool continuation has no user context", code="context_source_unavailable"
+                    )
+                start = owner
+                while start > 0 and conversation[start - 1].get("role") == "user":
+                    start -= 1
+                if not any(i in available_sources for i in range(start, owner + 1)):
+                    raise DuplexRuntimeConfigError(
+                        "Tool continuation's original input is no longer available",
+                        code="context_source_unavailable",
+                    )
+            limit = self._context_config.qwen_context_max_tokens or self.max_model_len
+            if not self.max_model_len or limit > self.max_model_len:
+                raise DuplexRuntimeConfigError("Budget policy requires a valid deployed max_model_len")
+            reserve = getattr(sampling_params, "max_tokens", None)
+            if not isinstance(reserve, int):
+                raise DuplexRuntimeConfigError("Budget policy requires a finite generation max_tokens")
+
+            def count(candidate, summary):
+                spliced, _, _ = self._splice_tool_turns(candidate, folded)
+                if has_audio and runtime_config.get("initial_user_text"):
+                    spliced.append({"role": "user", "content": runtime_config["initial_user_text"]})
+                prompt, mm, _, _ = self._render_context(
+                    spliced,
+                    runtime_config=runtime_config,
+                    session_config=session_config,
+                    summary=summary,
+                )
+                return self._context_token_count(prompt, mm)
+
+            selection = select_history(
+                list(history),
+                limit=limit,
+                generation_tokens=reserve,
+                count=count,
+                sources=session_config.get(CONTEXT_SOURCES, ()),
+                summary=session_config.get(CONTEXT_SUMMARY),
+                tool_turns=folded,
+            )
+            history = selection.messages
+            logger.info(
+                "Qwen context request=%s tokens=%d reserve=%d omitted=%d summary=%s",
+                request_id,
+                selection.prompt_tokens,
+                reserve,
+                len(selection.omitted),
+                selection.summary is not None,
+            )
+        history, remaining_tool_turns, inflight_tool_turns = self._splice_tool_turns(list(history), folded)
+        if has_audio and runtime_config.get("initial_user_text"):
+            history = [*history, {"role": "user", "content": runtime_config["initial_user_text"]}]
+        prompt, mm, images, audios = self._render_context(
+            history,
+            runtime_config=runtime_config,
+            session_config=session_config,
+            summary=selection.summary if selection is not None else None,
+        )
         logger.info(
             "Qwen duplex visual input request=%s images=%d sizes=%s audios=%d",
             request_id,
@@ -1188,6 +1400,17 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             except (OSError, ValueError):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
         prompt_payload: dict[str, object] = {"prompt": prompt, "multi_modal_data": mm}
+        if selection is not None:
+            prompt_payload[CONTEXT_OMITTED] = selection.omitted
+            source_refs = session_config.get(CONTEXT_SOURCES, ())
+            user_turn = next(
+                (turn for turn in reversed(whole_turns(selection.messages)) if turn[0].get("role") == "user"), []
+            )
+            prompt_payload[CONTEXT_TOOL_INPUT] = tuple(
+                source_refs[m["_src"]]
+                for m in user_turn
+                if m.get("role") == "user" and isinstance(m.get("_src"), int) and m["_src"] < len(source_refs)
+            )
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns
@@ -1201,7 +1424,32 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         anchors = runtime_config.get("qwen_call_anchors")
         if isinstance(conversation, list) and isinstance(anchors, Mapping):
             # Drop anchors whose user turn has already left the prompt window.
-            kept_anchors, expired_anchors = _split_call_anchors(anchors, history_len=len(conversation))
+            if selection is None:
+                kept_anchors, expired_anchors = _split_call_anchors(anchors, history_len=len(conversation))
+            else:
+                selected_sources = {m["_src"] for m in selection.messages if isinstance(m.get("_src"), int)}
+                # A published call belongs to the last user run before its anchor.
+                user_sources = [i for i, m in enumerate(conversation) if m.get("role") == "user"]
+                kept_anchors = {}
+                expired_anchors = []
+                for call_id, anchor in anchors.items():
+                    refs = runtime_config.get(CONTEXT_TOOL_SOURCES, {}).get(call_id)
+                    if refs is not None:
+                        if refs and all(
+                            ref in source_positions and source_positions[ref] in selected_sources for ref in refs
+                        ):
+                            kept_anchors[call_id] = max(source_positions[ref] for ref in refs) + 1
+                        else:
+                            expired_anchors.append(call_id)
+                        continue
+                    owner = max((i for i in user_sources if isinstance(anchor, int) and i < anchor), default=-1)
+                    run_start = owner
+                    while run_start > 0 and conversation[run_start - 1].get("role") == "user":
+                        run_start -= 1
+                    if any(index in selected_sources for index in range(run_start, owner + 1)):
+                        kept_anchors[call_id] = anchor
+                    else:
+                        expired_anchors.append(call_id)
             prompt_payload["_qwen_call_anchors"] = kept_anchors
             if expired_anchors:
                 expired_state: dict[str, object] = {

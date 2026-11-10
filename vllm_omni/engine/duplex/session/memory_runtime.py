@@ -27,6 +27,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
+from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
 logger = init_logger(__name__)
 
@@ -54,6 +55,7 @@ class SessionMemoryRuntime:
         self._epoch = ctx.session.epoch
         self._generation = 0
         self._history_revision = -1
+        self._snapshot: DuplexHistorySnapshot | None = None
         self._history: tuple[dict[str, object], ...] = ()
         self._retry_source: tuple[int, int, Hashable] | None = None
         self._failures = 0
@@ -181,6 +183,15 @@ class SessionMemoryRuntime:
         if self._history_revision != self._ctx.session.history_revision:
             self._history = self._ctx.session.history
             self._history_revision = self._ctx.session.history_revision
+            if self._ctx.plugin.uses_context_ledger:
+                self._snapshot = self._ctx.session.history_snapshot()
+        if self._snapshot is not None:
+            self._ctx.plugin.observe_history_context(
+                snapshot=self._snapshot,
+                ledger=self._ctx.session.context_ledger,
+                state=self._ctx.model_state,
+                runtime_config=self._ctx.session.runtime_config,
+            )
         return self._history
 
     @property
