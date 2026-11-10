@@ -207,9 +207,9 @@ were checked with another five-GPU smoke. These are single-node DiT results.
 The complete evidence and audit scripts are preserved at the fixed archive
 commit `72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe`, outside the active benchmark:
 
-- [Independent H200 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/results/h200-validation-20261010)
-- [Original contributor's H800 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/results/h800-q3-20261009)
-- [H800 archive audit script](https://github.com/Dong1017/vllm-omni/blob/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/wan/audit_results.py)
+- [Independent H200 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h200-validation-20261010)
+- [Original contributor's H800 report and raw evidence](https://github.com/Dong1017/vllm-omni/tree/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/results/h800-q3-20261009)
+- [H800 archive audit script](https://github.com/Dong1017/vllm-omni/blob/72d0a1a0ae92157d3aa1d5156eadad5dfb2696fe/benchmarks/ar_diffusion/audit_results.py)
 
 The first baseline request establishes a reference hash, which every variant
 and repeat must match. Record that hash and optionally pass `--expected-sha`
