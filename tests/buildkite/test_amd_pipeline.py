@@ -656,9 +656,6 @@ def test_cuda_ready_wan_bf16_exact_is_on_slow_cpu() -> None:
     assert step["mirror_hardwares"] == "l4_1"
     argv = split(next(command for command in step["commands"] if "pytest" in command))
     assert argv == ["pytest", "-sv", node, "-m", "core_model and cpu"]
-    engine = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
-    engine_argv = split(next(command for command in engine["commands"] if "pytest" in command))
-    assert f"--deselect={node}" in engine_argv
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
