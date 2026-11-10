@@ -141,7 +141,7 @@ def inspect_mixfusion_capability(pipeline: nn.Module) -> MixFusionCapability:
     root = transformer._mixfusion_plan.get("")
     if not isinstance(root, MixFusionRoot) or root.request is None:
         return MixFusionCapability(reason="MixFusion root declares no request layout")
-    config = resolve_image_request_config(root.request, pipeline, transformer)
+    config = resolve_image_request_config(root.request, pipeline)
     return MixFusionCapability(request_config=config, reason="")
 
 
@@ -170,7 +170,7 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         DEFAULT_MIN_CHUNK_TOKENS,
         mixfusion_requested,
     )
-    from vllm_omni.diffusion.mixfusion.scheduling import plan_batch
+    from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 
     request.mixfusion_info = None
     capability = getattr(engine, "mixfusion_capability", None)
@@ -190,5 +190,5 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         ),
         int(extras.get("mixfusion_max_chunks", getattr(engine.od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS))),
     )
-    if info is not None and plan_batch([(request.request_id, info)]) is not None:
+    if info is not None and fits_chunk_budget([info]):
         request.mixfusion_info = info

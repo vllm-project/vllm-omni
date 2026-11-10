@@ -101,7 +101,7 @@ def _requests():
 
 
 def _packed(model, grids, latents, ctx, mask, cond):
-    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=2))):
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
         out = model(x=latents, ctx=ctx, ctx_mask=mask, grids=grids, cond=cond)
         return out, get_forward_context().mixfusion_step.plan
 
@@ -178,3 +178,35 @@ def test_serial_forward_is_untouched_without_an_armed_step():
     expected = model(x=latents[0], ctx=ctx[:1], grids=[grids[0]], cond=cond[:1]).pred
     apply_mixfusion(model, model._mixfusion_plan)
     assert torch.equal(model(x=latents[0], ctx=ctx[:1], grids=[grids[0]], cond=cond[:1]).pred, expected)
+
+
+def test_dynamic_batch_recomputes_gcd_and_restores_each_request():
+    model = _FakeDiT()
+    reference = _FakeDiT()
+    reference.load_state_dict(model.state_dict())
+    apply_mixfusion(model, model._mixfusion_plan)
+    latents = [torch.randn(1, length, DIM) for length in (8, 16, 12)]
+    grids = [(1, length) for length in (8, 16, 12)]
+    plans = []
+    # Join, leave, and reorder. The same model/root hook retains its cache.
+    for indices, expected_chunk, expected_count in [
+        ([0, 1], 8, 3),
+        ([0, 1, 2], 4, 9),
+        ([0, 1], 8, 3),
+        ([1, 0], 8, 3),
+    ]:
+        ctx = torch.zeros(len(indices), 3, DIM)
+        mask = torch.ones(len(indices), 3, dtype=torch.bool)
+        cond = torch.tensor(indices, dtype=torch.float32).reshape(-1, 1)
+        out, plan = _packed(model, [grids[i] for i in indices], [latents[i] for i in indices], ctx, mask, cond)
+        assert (plan.chunk_size, plan.num_chunks) == (expected_chunk, expected_count)
+        for row, index in enumerate(indices):
+            expected = reference(
+                x=latents[index],
+                ctx=ctx[row : row + 1],
+                grids=[grids[index]],
+                cond=cond[row : row + 1],
+            ).pred
+            torch.testing.assert_close(out[row], expected)
+        plans.append(plan)
+    assert all(left is not right for left, right in zip(plans, plans[1:]))

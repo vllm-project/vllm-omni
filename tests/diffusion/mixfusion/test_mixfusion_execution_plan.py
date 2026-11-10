@@ -20,7 +20,6 @@ from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
 )
-from vllm_omni.diffusion.mixfusion.scheduling import plan_chunk_size
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -47,24 +46,6 @@ def _plan_kwargs(**overrides) -> dict:
     )
     kwargs.update(overrides)
     return kwargs
-
-
-# ── gcd_chunk_size / plan_chunk_size ──
-
-
-@pytest.mark.parametrize(
-    ("latents", "min_chunk_tokens", "max_chunks", "expected"),
-    [
-        ([(1, 8), (1, 12)], 1, 8, (True, "ok", 4, 5)),
-        # Two images per request multiply the chunk count.
-        ([(2, 8), (1, 12)], 1, 8, (True, "ok", 4, 7)),
-        ([(1, 4)], 8, 8, (False, "chunk_size=4 < min_chunk_tokens=8", 4, 1)),
-        ([(1, 8), (1, 12)], 1, 4, (False, "chunk_count=5 > max_chunks=4", 4, 5)),
-    ],
-)
-def test_plan_chunk_size(latents, min_chunk_tokens, max_chunks, expected):
-    shapes = [(images, seq_len, 4) for images, seq_len in latents]
-    assert plan_chunk_size(shapes, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks) == expected
 
 
 # ── build_execution_plan: happy path ──

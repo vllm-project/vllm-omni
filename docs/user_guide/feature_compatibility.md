@@ -202,8 +202,10 @@ Constraints on the packed path:
   backends use attention-only buckets (equal image lengths with text masks,
   or exact joint lengths without masks). Mixed-resolution scheduling remains
   enabled, including on NPU; there is no varlen-kernel speedup on this path.
-- **Runtime validation**: the worker executes the scheduler's approved layout.
-  Unexpected shape or runtime-capability changes fail explicitly rather than
+- **Runtime validation**: the worker builds a layout for the scheduler's
+  selected batch using actual prepared tensors. Chunk size is recomputed when
+  the layout changes, including removal of requests that fail preparation.
+  Unexpected token-count or runtime-capability changes fail explicitly rather than
   silently splitting the denoise batch.
 
 ## Limitations

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         InteractionChunkMetadata,
         InteractionSession,
     )
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -87,6 +88,8 @@ class StepRequestState:
     # request state is removed before this Worker state is built.
     prepared_layout: Any | None = None
     external_req_id: str | None = None
+    # Admission metadata retained once per request for execution validation.
+    mixfusion_info: MixFusionRequestInfo | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None

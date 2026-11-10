@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 
 from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionRequestInfo, fits_chunk_budget
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
@@ -29,7 +29,7 @@ class _Config:
 @dataclass
 class _Engine:
     od_config: _Config
-    mixfusion_capability: MixFusionCapability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, 4.0), "")
+    mixfusion_capability: MixFusionCapability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 2, 4.0), "")
 
 
 def _request(rid, h=1024, w=1024, *, engine=None, **sampling):
@@ -64,8 +64,7 @@ def test_mixed_resolutions_share_scheduler_approved_batch():
     scheduler = _scheduler(a, b)
     output = scheduler.schedule()
     assert output.scheduled_request_ids == ["a", "b"]
-    assert output.mixfusion_batch.chunk_size == 1024
-    assert output.mixfusion_batch.request_shapes == {"a": (1, 4096, 64), "b": (1, 3072, 64)}
+    assert output.use_mixfusion
 
 
 @pytest.mark.parametrize("other,extras", [(992, {}), (768, {"mixfusion_max_chunks": 4})])
@@ -75,7 +74,7 @@ def test_joint_chunk_constraint_leaves_candidate_waiting_then_runs_it(other, ext
     scheduler = _scheduler(a, b)
     output = scheduler.schedule()
     assert output.scheduled_request_ids == ["a"]
-    assert output.mixfusion_batch is not None
+    assert output.use_mixfusion
     scheduler.finish_requests("a", DiffusionRequestStatus.FINISHED_COMPLETED)
     assert scheduler.schedule().scheduled_request_ids == ["b"]
 
@@ -87,7 +86,7 @@ def test_unfulfillable_single_request_uses_dense_and_retains_geometry():
     assert a.mixfusion_info is None and b.mixfusion_info is None
     output = _scheduler(a, b).schedule()
     assert output.scheduled_request_ids == ["a"]
-    assert output.mixfusion_batch is None
+    assert not output.use_mixfusion
 
 
 def test_dense_and_packed_requests_do_not_mix_even_with_unspecified_dimensions():
@@ -103,9 +102,9 @@ def test_continuous_admission_checks_cached_and_new_requests_and_completion():
     scheduler.add_request(c)
     output = scheduler.schedule()
     assert output.scheduled_request_ids == ["c", "a", "b"]
-    assert output.mixfusion_batch.request_shapes == {"c": (1, 1024, 64), "a": (1, 4096, 64), "b": (1, 3072, 64)}
+    assert output.use_mixfusion
     scheduler.finish_requests("b", DiffusionRequestStatus.FINISHED_ABORTED)
-    assert set(scheduler.schedule().mixfusion_batch.request_shapes) == {"a", "c"}
+    assert set(scheduler.schedule().scheduled_request_ids) == {"a", "c"}
 
 
 def test_per_request_multi_image_limits_are_aggregated():
@@ -123,13 +122,13 @@ def test_cfg_branches_are_part_of_packing_compatibility():
 
 def test_geometry_uses_loaded_model_defaults_and_patch_grid():
     request = _request("a", None, None, engine=_Engine(_Config()))
-    assert request.mixfusion_info.shape == (1, 4096, 64)
-    assert _request("b", 1031, 777).mixfusion_info.shape == (1, 64 * 48, 64)
+    assert (request.mixfusion_info.num_images, request.mixfusion_info.image_tokens) == (1, 4096)
+    assert _request("b", 1031, 777).mixfusion_info.image_tokens == 64 * 48
 
 
 @pytest.mark.parametrize("default_scale,uses_cfg", [(1.0, False), (4.0, True)])
 def test_declared_cfg_default_controls_compatibility(default_scale, uses_cfg):
-    engine = _Engine(_Config(), MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, default_scale), ""))
+    engine = _Engine(_Config(), MixFusionCapability(MixFusionImageRequestConfig(8, 128, 2, default_scale), ""))
     request = _request("a")
     request.prompt = {"prompt": "a fox", "negative_prompt": " "}
     prepare_mixfusion_admission(engine, request)
@@ -141,3 +140,33 @@ def test_image_declaration_keeps_extra_prompt_inputs_dense():
     request.prompt = {"prompt": "a fox", "additional_information": {"reference": "image"}}
     prepare_mixfusion_admission(_Engine(_Config()), request)
     assert request.mixfusion_info is None
+
+
+@pytest.mark.parametrize(
+    "counts,minimum,maximum,accepted",
+    [
+        ([(1, 8), (1, 12)], 1, 8, True),
+        ([(2, 8), (1, 12)], 1, 6, False),
+        ([(1, 4)], 8, 8, False),
+        ([(1, 8), (1, 12)], 1, 4, False),
+    ],
+)
+def test_budget_predicate_uses_full_batch_and_image_counts(counts, minimum, maximum, accepted):
+    requests = [MixFusionRequestInfo(images, tokens, minimum, maximum) for images, tokens in counts]
+    assert fits_chunk_budget(requests) is accepted
+
+
+def test_new_candidate_is_checked_with_new_gcd_and_departed_requests_are_removed():
+    # Existing batch: gcd(2048, 4096)=2048, 3 chunks. Adding 3072 changes
+    # the GCD to 1024 and raises the complete batch to 9 chunks, over budget.
+    a = _request("a", 512, 1024, extra_args={"mixfusion_max_chunks": 8})
+    b = _request("b", 1024, 1024, extra_args={"mixfusion_max_chunks": 8})
+    c = _request("c", 768, 1024, extra_args={"mixfusion_max_chunks": 8})
+    scheduler = _scheduler(a, b)
+    assert scheduler.schedule().scheduled_request_ids == ["a", "b"]
+    scheduler.add_request(c)
+    assert scheduler.schedule().scheduled_request_ids == ["a", "b"]
+    scheduler.finish_requests("a", DiffusionRequestStatus.FINISHED_COMPLETED)
+    output = scheduler.schedule()
+    assert output.scheduled_request_ids == ["c", "b"]
+    assert output.use_mixfusion

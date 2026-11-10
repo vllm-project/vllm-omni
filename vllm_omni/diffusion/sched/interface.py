@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
     from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
-    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -257,7 +256,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
-    mixfusion_batch: MixFusionBatchSpec | None = None
+    # Execution mode only; the worker owns the packed tensor layout.
+    use_mixfusion: bool = False
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None

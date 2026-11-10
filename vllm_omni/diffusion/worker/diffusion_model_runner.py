@@ -46,7 +46,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec, plan_batch
+from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
@@ -1014,11 +1014,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         request_ids = [request.request_id for request in requests]
         try:
             if getattr(self.od_config, "step_execution", False):
-                packed_requests = [
-                    (request.request_id, info) for request in requests if (info := request.mixfusion_info) is not None
-                ]
-                mixfusion_batch = plan_batch(packed_requests) if packed_requests else None
-                if packed_requests and (len(packed_requests) != len(requests) or mixfusion_batch is None):
+                packed_requests = [info for request in requests if (info := request.mixfusion_info) is not None]
+                if packed_requests and (
+                    len(packed_requests) != len(requests) or not fits_chunk_budget(packed_requests)
+                ):
                     raise ValueError("Memory profile requests must form one valid MixFusion batch")
                 scheduler_output = DiffusionSchedulerOutput(
                     step_id=0,
@@ -1029,7 +1028,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     finished_req_ids=set(),
                     num_running_reqs=len(requests),
                     num_waiting_reqs=0,
-                    mixfusion_batch=mixfusion_batch,
+                    use_mixfusion=bool(packed_requests),
                 )
                 runner_output = self._execute_stepwise(
                     scheduler_output,
@@ -1157,6 +1156,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
+                    mixfusion_info=sched_new_req.req.mixfusion_info,
                 )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
@@ -1197,7 +1197,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
-        mixfusion_batch: MixFusionBatchSpec | None = None,
+        use_mixfusion: bool = False,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
@@ -1291,7 +1291,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         input_batch = InputBatch.make_batch(
             prepared_states,
             cached_batch=getattr(self, "input_batch", None),
-            mixfusion_batch=mixfusion_batch,
+            use_mixfusion=use_mixfusion,
         )
         self.input_batch = input_batch
         return prepared_states, input_batch, error_outputs
@@ -1464,7 +1464,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ):
                 current_omni_platform.reset_peak_memory_stats()
             states, input_batch, runner_output_list = self._prepare_batch_inputs(
-                states, new_request_ids, scheduler_output.mixfusion_batch
+                states, new_request_ids, scheduler_output.use_mixfusion
             )
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
@@ -1481,11 +1481,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ):
                 clear_pipeline_stage_durations(pipeline)
                 driver = getattr(pipeline, "mixfusion_driver", None)
-                if input_batch.mixfusion_batch is not None and driver is None:
+                if input_batch.use_mixfusion and driver is None:
                     raise RuntimeError("Scheduler requested MixFusion without an installed driver")
                 if driver is not None:
                     # The driver forwards dense batches to the same
-                    # ``denoise_step`` and owns the packed/ragged paths.
+                    # ``denoise_step`` and arms the approved packed path.
                     noise_pred = driver.run(input_batch, states, pipeline.denoise_step)
                 else:
                     noise_pred = pipeline.denoise_step(input_batch, states=states)

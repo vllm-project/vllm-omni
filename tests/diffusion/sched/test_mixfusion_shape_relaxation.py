@@ -109,7 +109,7 @@ def test_batch_key_shape(monkeypatch, scheduler_cls, pipeline_cls, prompt, overr
     scheduler = _initialized_scheduler(scheduler_cls, monkeypatch, pipeline_cls)
     request = _request(prompt, **overrides)
     if overrides == MIXFUSION and pipeline_cls is _MixfusionCapablePipeline and expected == (None, None, None):
-        request.mixfusion_info = MixFusionRequestInfo((1, 3072, 64), 256, 128)
+        request.mixfusion_info = MixFusionRequestInfo(1, 3072, 256, 128)
     key = scheduler._build_sampling_params_key(request)
 
     if expected is None:

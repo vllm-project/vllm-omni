@@ -137,9 +137,9 @@ def test_capability_is_resolved_after_foreign_hooks_are_installed():
     pipeline, transformer = _mount(
         supports=True,
         adapter=None,
-        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128, 64))},
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128))},
     )
-    assert inspect_mixfusion_capability(pipeline).request_config == MixFusionImageRequestConfig(8, 128, 64, 2, 1.0)
+    assert inspect_mixfusion_capability(pipeline).request_config == MixFusionImageRequestConfig(8, 128, 2, 1.0)
     transformer.register_forward_pre_hook(lambda module, args: args)
     capability = inspect_mixfusion_capability(pipeline)
     assert capability.request_config is None
@@ -155,12 +155,10 @@ def test_image_request_declaration_resolves_loaded_attributes_without_model_call
     class Geometry:
         scale: int = 4
         sample_size: int = 64
-        channels: int = 32
 
     plan = MixFusionImageRequest(
         vae_scale_factor="geometry.scale",
         default_sample_size="geometry.sample_size",
-        channels="geometry.channels",
         patch_size=1,
     )
     pipeline, transformer = _mount(supports=True, adapter=None, plan={"": MixFusionRoot(request=plan)})
@@ -178,7 +176,7 @@ def test_image_request_declaration_resolves_loaded_attributes_without_model_call
         sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=2),
     )
     prepare_mixfusion_admission(Engine(), request)
-    assert request.mixfusion_info.shape == (2, 4096, 32)
+    assert (request.mixfusion_info.num_images, request.mixfusion_info.image_tokens) == (2, 4096)
 
 
 def test_declared_runtime_mode_disables_packing_before_admission():
@@ -187,7 +185,7 @@ def test_declared_runtime_mode_disables_packing_before_admission():
     pipeline, transformer = _mount(
         supports=True,
         adapter=None,
-        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128, 64), disabled_if=("editing",))},
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128), disabled_if=("editing",))},
     )
     transformer.editing = True
     capability = inspect_mixfusion_capability(pipeline)
@@ -213,7 +211,7 @@ def test_invalid_declared_geometry_fails_at_initialization(scale):
     pipeline, _ = _mount(
         supports=True,
         adapter=None,
-        plan={"": MixFusionRoot(request=MixFusionImageRequest(scale, 128, 64))},
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(scale, 128))},
     )
     with pytest.raises(ValueError, match="positive integer"):
         inspect_mixfusion_capability(pipeline)
@@ -256,7 +254,7 @@ def test_engine_requires_rank_agreement_before_request_preparation(monkeypatch, 
     engine.od_config = _od_config(enable=True)
     engine.execution_mode = "step_batch"
     engine.executor = Mock()
-    capability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, 4.0), "")
+    capability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 2, 4.0), "")
     engine.executor.collective_rpc.return_value = [capability, capability if consistent else MixFusionCapability()]
     monkeypatch.setattr(registry, "resolve_diffusion_pipeline_cls", lambda config: Pipeline)
     if consistent:

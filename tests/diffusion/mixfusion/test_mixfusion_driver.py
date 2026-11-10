@@ -12,7 +12,7 @@ from vllm_omni.diffusion.forward_context import ForwardContext, get_forward_cont
 from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -42,13 +42,10 @@ def _states(lengths=(8, 12)):
             sampling=OmniDiffusionSamplingParams(),
             latents=torch.zeros(1, length, 4),
             timesteps=torch.tensor([500.0]),
+            mixfusion_info=MixFusionRequestInfo(1, length, 1, 128),
         )
         for i, length in enumerate(lengths)
     ]
-
-
-def _spec(states, chunk=4):
-    return MixFusionBatchSpec(chunk, {state.request_id: tuple(state.latents.shape) for state in states})
 
 
 def test_dense_execution_never_arms_packing():
@@ -60,58 +57,47 @@ def test_dense_execution_never_arms_packing():
     assert result[1] is None
 
 
-def test_approved_batch_uses_scheduler_chunk_and_restores_context_on_error():
+def test_approved_batch_arms_empty_context_and_restores_it_on_error():
     states = _states()
-    batch = InputBatch.make_batch(states, mixfusion_batch=_spec(states, chunk=2))
+    batch = InputBatch.make_batch(states, use_mixfusion=True)
     calls = []
 
     def dense_step(batch, **kwargs):
-        calls.append(get_forward_context().mixfusion_step.chunk_size)
+        calls.append(get_forward_context().mixfusion_step.plan)
         raise RuntimeError("model failure")
 
     with override_forward_context(ForwardContext()):
         with pytest.raises(RuntimeError, match="model failure"):
             _driver().run(batch, states, dense_step)
         assert get_forward_context().mixfusion_step is None
-    assert calls == [2]
+    assert calls == [None]
 
 
 def test_bad_shape_fails_before_any_forward():
     states = _states()
-    spec = _spec(states)
     states[1].latents = torch.zeros(1, 16, 4)
-    batch = InputBatch.make_batch(states, mixfusion_batch=spec)
+    batch = InputBatch.make_batch(states, use_mixfusion=True)
     with override_forward_context(ForwardContext()):
-        with pytest.raises(ValueError, match="request 1: scheduled latent shape"):
+        with pytest.raises(ValueError, match="request 1: actual latents disagree"):
             _driver().run(batch, states, lambda *a, **k: pytest.fail("must not run or fall back"))
-
-
-def test_failed_request_subset_keeps_the_scheduled_chunk_size():
-    states = _states()
-    spec = _spec(states)
-    batch = InputBatch.make_batch(states[1:], mixfusion_batch=spec)
-    with override_forward_context(ForwardContext()):
-        result = _driver().run(batch, states[1:], lambda b, **k: get_forward_context().mixfusion_step.chunk_size)
-    assert result == 4  # The survivor's own GCD would be 12.
 
 
 def test_runtime_hook_change_is_an_error():
     driver = _driver()
     states = _states()
-    batch = InputBatch.make_batch(states, mixfusion_batch=_spec(states))
+    batch = InputBatch.make_batch(states, use_mixfusion=True)
     driver.transformer.register_forward_pre_hook(lambda module, args: args)
     with pytest.raises(ValueError, match="foreign hooks"):
         driver.validate(batch)
 
 
-def test_input_batch_cache_tracks_execution_mode_and_chunk_changes():
+def test_input_batch_cache_tracks_execution_mode():
     states = _states((8, 8))
     dense = InputBatch.make_batch(states)
-    packed = InputBatch.make_batch(states, cached_batch=dense, mixfusion_batch=_spec(states))
+    packed = InputBatch.make_batch(states, cached_batch=dense, use_mixfusion=True)
     assert isinstance(packed.latents, list)
-    smaller_chunks = _spec(states, chunk=2)
-    cached = InputBatch.make_batch(states, cached_batch=packed, mixfusion_batch=smaller_chunks)
-    assert cached is packed and cached.mixfusion_batch is smaller_chunks
+    cached = InputBatch.make_batch(states, cached_batch=packed, use_mixfusion=True)
+    assert cached is packed and cached.use_mixfusion
     dense_again = InputBatch.make_batch(states, cached_batch=cached)
     assert isinstance(dense_again.latents, torch.Tensor)
 
@@ -121,7 +107,7 @@ def test_remote_contract_failure_prevents_local_forward(monkeypatch):
 
     monkeypatch.setattr(driver_module, "_any_rank_failed", lambda local: True)
     states = _states()
-    batch = InputBatch.make_batch(states, mixfusion_batch=_spec(states))
+    batch = InputBatch.make_batch(states, use_mixfusion=True)
     with pytest.raises(RuntimeError, match="another DiT rank"):
         _driver().run(batch, states, lambda *a, **k: pytest.fail("must not enter model collectives"))
 

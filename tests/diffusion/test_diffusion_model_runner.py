@@ -21,7 +21,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec, MixFusionRequestInfo
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -554,7 +554,7 @@ def test_update_states_after_list_latents_releases_finished_step_requests():
         step_index=1,
     )
     runner.state_cache = {state.request_id: state for state in (finished_state, active_state)}
-    input_batch = InputBatch.make_batch([finished_state, active_state], mixfusion_batch=MixFusionBatchSpec(1, {}))
+    input_batch = InputBatch.make_batch([finished_state, active_state], use_mixfusion=True)
     assert isinstance(input_batch.latents, list)
     runner.input_batch = input_batch
     # step_scheduler() advanced the first request past its last timestep.
@@ -1654,22 +1654,27 @@ def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
     runner.od_config.step_execution = True
     requests = [_make_request(), _make_request()]
     requests[0].request_id, requests[1].request_id = "a", "b"
-    requests[0].mixfusion_info = MixFusionRequestInfo((1, 8, 4), 1, 8)
-    requests[1].mixfusion_info = MixFusionRequestInfo((1, 12, 4), 1, 8)
+    requests[0].mixfusion_info = MixFusionRequestInfo(1, 8, 1, 8)
+    requests[1].mixfusion_info = MixFusionRequestInfo(1, 12, 1, 8)
     captured = []
 
     def execute(output, **kwargs):
-        captured.append(output.mixfusion_batch)
+        captured.append(output.use_mixfusion)
 
     runner._execute_stepwise = execute
     monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
     runner.profile_run(requests)
-    assert captured == [MixFusionBatchSpec(4, {"a": (1, 8, 4), "b": (1, 12, 4)})]
+    assert captured == [True]
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_preparation_failure_keeps_surviving_packed_request_plan():
+def test_preparation_failure_recomputes_layout_for_surviving_request():
+    import inspect
+
+    from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
+    from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
 
     class PreparePipeline:
@@ -1680,11 +1685,39 @@ def test_preparation_failure_keeps_surviving_packed_request_plan():
             state.timesteps = torch.tensor([1.0])
 
     runner.pipeline = PreparePipeline()
-    states = [StepRequestState(request_id=rid, sampling=OmniDiffusionSamplingParams()) for rid in ("bad", "good")]
+    states = [
+        StepRequestState(
+            request_id=rid,
+            sampling=OmniDiffusionSamplingParams(),
+            mixfusion_info=MixFusionRequestInfo(1, tokens, 1, 8),
+        )
+        for rid, tokens in (("bad", 8), ("good", 12))
+    ]
     runner.state_cache = {s.request_id: s for s in states}
-    spec = MixFusionBatchSpec(4, {"bad": (1, 8, 4), "good": (1, 12, 4)})
-    prepared, batch, errors = runner._prepare_batch_inputs(states, ["bad", "good"], spec)
+    prepared, batch, errors = runner._prepare_batch_inputs(states, ["bad", "good"], use_mixfusion=True)
     assert [s.request_id for s in prepared] == ["good"]
-    assert batch.mixfusion_batch is spec and batch.request_ids == ["good"]
+    assert batch.use_mixfusion and batch.request_ids == ["good"]
     assert len(batch.latents) == 1 and batch.latents[0].shape == (1, 12, 4)
     assert [e.request_id for e in errors] == ["bad"]
+
+    class Transformer(torch.nn.Module):
+        def forward(self, hidden_states, encoder_hidden_states, encoder_hidden_states_mask=None):
+            return hidden_states
+
+    transformer = Transformer()
+    adapter = ChunkedJointAdapter(MixFusionRoot())
+    signature = inspect.signature(transformer.forward)
+    # Cached layout for an earlier full batch must not survive removal of the
+    # failed request. No scheduled chunk_size is available to the adapter.
+    previous = adapter.pack_inputs(
+        transformer,
+        signature.bind([torch.zeros(1, 8, 4), torch.zeros(1, 12, 4)], torch.zeros(2, 3, 4)),
+        cache=None,
+    )
+    actual = adapter.pack_inputs(
+        transformer,
+        signature.bind(batch.latents, torch.zeros(1, 3, 4)),
+        cache=previous,
+    )
+    assert previous.plan.chunk_size == 4
+    assert actual.plan.chunk_size == 12 and actual.plan.num_chunks == 1

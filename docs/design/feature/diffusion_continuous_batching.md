@@ -221,9 +221,9 @@ cost of a pipeline contract the scheduler must not assume generically:
 After model loading, offload and cache setup, the engine collects the actual
 MixFusion capability from every worker rank. The root of `_mixfusion_plan`
 declares the request layout and its configuration sources. The framework
-resolves those sources on the loaded pipeline/transformer and sends the
+resolves those sources on the loaded pipeline and sends the
 serializable values to the engine. Its common host preparation resolves
-latent geometry and request-specific constraints before Scheduler admission,
+image counts, image token lengths and request-specific constraints before admission,
 without text encoding, device tensors or per-model preparation callbacks.
 
 Only requests with prepared `MixFusionRequestInfo` relax the resolution key.
@@ -233,21 +233,27 @@ scheduling. Requests unsupported by the model's host preparation, or unable
 to meet the chunk policy even alone, also keep dense scheduling. Existing
 per-prompt input isolation remains in effect.
 
-`StepScheduler` checks the entire running batch plus each candidate. The GCD
-of image sequence lengths must meet the strictest `mixfusion_min_chunk_tokens`
-and the total chunks, including multiple images, must fit the strictest
-`mixfusion_max_chunks`. A candidate that fails stays waiting under the normal
-FIFO policy. The scheduler publishes `MixFusionBatchSpec` with a chunk size
-and expected shapes keyed by request ID in `DiffusionSchedulerOutput`.
+`StepScheduler` passes the entire running batch plus each candidate to the
+common `fits_chunk_budget` predicate. Its GCD cost estimate must meet the
+strictest `mixfusion_min_chunk_tokens` and total chunks, including multiple
+images, must fit the strictest `mixfusion_max_chunks`. A candidate that fails
+stays waiting under the normal FIFO policy. The scheduler publishes selected
+requests and a `use_mixfusion` execution flag in `DiffusionSchedulerOutput`.
+It does not publish a chunk size, tensor shape map or packing plan.
 
 The runner builds tensor latents for dense output and list latents for an
 approved MixFusion output. Request flags no longer choose the worker layout.
-`MixFusionDriver` validates the execution contract, arms `MixFusionStep` with
-the scheduled chunk size, and calls the ordinary `pipeline.denoise_step`.
-It does not admit, split, regroup or silently fall back. Unexpected runtime
-shape or capability changes fail explicitly before model execution. Failed
-request preparation may remove a request: remaining requests retain the
-scheduled chunk size and their own identity-to-shape mapping.
+The runner retains each new request's admission metadata in `StepRequestState`.
+`MixFusionDriver` validates actual image/token counts and runtime compatibility,
+arms an empty `MixFusionStep`, and calls the ordinary `pipeline.denoise_step`.
+It does not admit, split, regroup or silently fall back. The root adapter
+computes the GCD from actual prepared latents and builds `PackedExecutionPlan`.
+Request arrivals, departures, reordering and text-length changes invalidate
+the layout cache. Failed preparation may remove a request before packing;
+the remaining requests use their own GCD immediately. Removing requests cannot
+worsen the admitted chunk budget: the GCD can only increase and chunk count
+can only decrease. Unexpected token-count or capability changes fail before
+model execution instead of bypassing the scheduler's budget.
 
 Attention backend capability does **not** restrict heterogeneous scheduling.
 The packed layout can execute through any of the existing attention routes:
@@ -272,10 +278,10 @@ implements *how*.
 
 | Layer | Location | Owns |
 | --- | --- | --- |
-| Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Whole-batch admission and host execution specification |
+| Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Compatibility and whole-batch chunk-budget admission |
 | Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Execution validation and arming/restoring `MixFusionStep` |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
-| Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Building the `PackedExecutionPlan` from the root declaration, per-request RoPE through the model's own boundary module, chunk split/reassembly |
+| Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Actual-input GCD and `PackedExecutionPlan`, per-request RoPE through the model's own boundary module, chunk split/reassembly |
 | Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
 | Startup wiring | `mixfusion/setup.py`, `mixfusion/request.py` | Config validation, mounting, request opt-in and batch-key relaxation |
 
@@ -305,11 +311,11 @@ _mixfusion_plan = {
 - `MixFusionRoot` names the per-request latent argument, the request-level
   text stream and its padding mask, and the output attribute (diffusers
   defaults). `ChunkedJointAdapter` builds the plan from them, reusing it per
-  CFG branch while the layout key (scheduled chunk size, latent shapes, text width, real text
+  CFG branch while the layout key (ordered latent shapes, text width, real text
   lengths) is unchanged.
 - `MixFusionImageRequest` describes a plain text-to-image grid. VAE scale and
-  default sample size refer to pipeline attributes; channel count refers to
-  the transformer. Dotted attribute paths or integer constants are accepted.
+  default sample size refer to pipeline attributes. Dotted attribute paths or
+  integer constants are accepted. Channel count is not a scheduling input.
   Latent patch size and the default true-CFG scale are declared explicitly
   when they differ from the defaults. Common code computes request geometry
   and CFG compatibility. This is not an inference rule for arbitrary video,

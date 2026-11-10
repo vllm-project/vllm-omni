@@ -42,7 +42,7 @@ from vllm_omni.diffusion.mixfusion.packed_attention import (
     run_mixfusion_packed_attention,
 )
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
-from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     ImageRopePrepare,
@@ -50,6 +50,8 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -178,7 +180,13 @@ def _packed_input_batch(*, do_true_cfg: bool = False):
         latents=[torch.zeros(1, 8, 16), torch.zeros(1, 8, 16)],
         image_latents=None,
         request_ids=["a", "b"],
-        mixfusion_batch=MixFusionBatchSpec(8, {"a": (1, 8, 16), "b": (1, 8, 16)}),
+        use_mixfusion=True,
+        states=[
+            StepRequestState(
+                request_id=rid, sampling=OmniDiffusionSamplingParams(), mixfusion_info=MixFusionRequestInfo(1, 8, 1, 8)
+            )
+            for rid in ("a", "b")
+        ],
         timesteps=torch.tensor([500.0, 500.0]),
         guidance=None,
         prompt_embeds=torch.zeros(2, 4, 8),
@@ -270,7 +278,7 @@ def test_rope_boundary_matches_individual_execution_per_request():
         img_shapes=[[grid] for grid in grids],
         txt_seq_lens=[5, 5, 5],
     )
-    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=8))):
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
         out = model(hidden_states=latents, **kwargs)
         plan = get_forward_context().mixfusion_step.plan
 
@@ -305,7 +313,7 @@ def test_root_reuses_the_plan_while_the_layout_is_unchanged():
                 "txt_seq_lens": [4],
             }
         )
-        with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=8))):
+        with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
             model(hidden_states=latents, **shapes)
             plans.append(get_forward_context().mixfusion_step.plan)
     assert plans[1] is plans[0]

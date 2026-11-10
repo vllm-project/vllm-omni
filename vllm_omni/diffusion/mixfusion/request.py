@@ -36,14 +36,11 @@ class MixFusionImageRequestConfig:
 
     vae_scale_factor: int
     default_sample_size: int
-    channels: int
     patch_size: int
     default_true_cfg_scale: float
 
 
-def resolve_image_request_config(
-    plan: MixFusionImageRequest, pipeline: object, transformer: object
-) -> MixFusionImageRequestConfig:
+def resolve_image_request_config(plan: MixFusionImageRequest, pipeline: object) -> MixFusionImageRequestConfig:
     def resolve(source: str | int, owner: object) -> int:
         value = attrgetter(source)(owner) if isinstance(source, str) else source
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -53,8 +50,7 @@ def resolve_image_request_config(
     return MixFusionImageRequestConfig(
         resolve(plan.vae_scale_factor, pipeline),
         resolve(plan.default_sample_size, pipeline),
-        resolve(plan.channels, transformer),
-        resolve(plan.patch_size, transformer),
+        resolve(plan.patch_size, pipeline),
         plan.default_true_cfg_scale,
     )
 
@@ -84,9 +80,7 @@ def prepare_image_request(
     num_images = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
     negative = isinstance(prompt, dict) and prompt.get("negative_prompt") is not None
     true_cfg = (sampling.true_cfg_scale or config.default_true_cfg_scale) > 1 and negative
-    return MixFusionRequestInfo(
-        (num_images, h * w, config.channels), min_chunk_tokens, max_chunks, condition_key=(true_cfg,)
-    )
+    return MixFusionRequestInfo(num_images, h * w, min_chunk_tokens, max_chunks, condition_key=(true_cfg,))
 
 
 def mixfusion_requested(sampling: Any, od_config: Any, *, supported: bool) -> bool:
@@ -122,7 +116,7 @@ def relax_step_batch_key(request: Any, values: dict, od_config: Any, *, supporte
         return values
     for name in RELAXED_STEP_KEY_FIELDS:
         values[name] = None
-    values["mixfusion_key"] = (info.shape[2], info.condition_key)
+    values["mixfusion_key"] = info.condition_key
     return values
 
 

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 class MixFusionStep:
     """Record of one packed MixFusion denoise step.
 
-    The MixFusionDriver arms the scheduled chunk size around the packed forward and
+    The MixFusionDriver arms this context around the packed forward and
     restores the previous one afterwards; the root hook fills ``plan`` and
     ``packed`` for the boundary hooks and the packed attention to read.
 
@@ -34,8 +34,6 @@ class MixFusionStep:
     the MixFusion layout or adapter types.
     """
 
-    # Scheduler-selected chunk length. Zero is invalid for an active root hook.
-    chunk_size: int = 0
     # ``PackedExecutionPlan`` of the running call (carries its AttentionLayout).
     plan: Any = None
     # ``PackedInputs`` from the adapter: rewritten call and boundary outputs.

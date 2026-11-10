@@ -48,8 +48,8 @@ from dataclasses import dataclass
 class MixFusionImageRequest:
     """Declare a text-to-image request's grid before tensors are allocated.
 
-    Attribute paths are resolved on the loaded pipeline for VAE/default size,
-    and on the plan's transformer for channels. Integer constants work too.
+    Attribute paths for VAE scale and default size are resolved on the loaded
+    pipeline. Integer constants work too.
     ``patch_size`` describes latent packing, not the attention kernel.
     Other input layouts need their own declaration before admission can relax
     their shapes; this declaration accepts plain text prompts only.
@@ -57,7 +57,6 @@ class MixFusionImageRequest:
 
     vae_scale_factor: str | int = "vae_scale_factor"
     default_sample_size: str | int = "default_sample_size"
-    channels: str | int = "in_channels"
     patch_size: int = 2
     default_true_cfg_scale: float = 1.0
 

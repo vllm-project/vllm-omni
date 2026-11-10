@@ -13,12 +13,12 @@ chunk-stacks its outputs, and the output is reassembled per request.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, MixFusionAdapter, PackedInputs, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
@@ -69,14 +69,14 @@ class ChunkedJointAdapter:
             )
         padded = int(text.shape[1])
         real_lens = [padded] * len(rows) if mask is None else [int(n) for n in mask.sum(dim=1).tolist()]
-        step = get_forward_context().mixfusion_step
-        if step is None or step.chunk_size <= 0:
-            raise ValueError("MixFusion root requires a scheduler-selected chunk size")
-        key = (step.chunk_size, tuple(tuple(sample.shape) for sample in latents), tuple(text.shape), tuple(real_lens))
+        key = (tuple(tuple(sample.shape) for sample in latents), tuple(text.shape), tuple(real_lens))
         if cache is not None and cache.adapter_state is not None and cache.adapter_state[0] == key:
             plan = cache.adapter_state[1]
         else:
-            plan = _build_plan(latents, rows, real_lens, padded, chunk_size=step.chunk_size, device=text.device)
+            # Derive the layout from this step's actual prepared batch. Adding or
+            # removing requests can change the GCD, including preparation failures.
+            chunk_size = math.gcd(*(int(sample.shape[1]) for sample in latents))
+            plan = _build_plan(latents, rows, real_lens, padded, chunk_size=chunk_size, device=text.device)
         return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan=plan, adapter_state=(key, plan))
 
     def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[torch.Tensor]:

@@ -69,7 +69,7 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
-    # Host-prepared packing metadata; only Scheduler may approve a packed batch.
+    # Host-prepared admission cost; the worker owns the packed tensor layout.
     mixfusion_info: MixFusionRequestInfo | None = None
     # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
     # transport this bag without interpreting local pages or block IDs.

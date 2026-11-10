@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.mixfusion.scheduling import plan_batch
+from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -79,16 +79,14 @@ class StepScheduler(BaseScheduler):
                 progress.resume = "timeout"
         output = super().schedule()
         packed_requests = [
-            (rid, info)
+            info
             for rid in output.scheduled_request_ids
             if (info := self._request_states[rid].req.mixfusion_info) is not None
         ]
         if packed_requests:
             if len(packed_requests) != output.num_scheduled_reqs:
                 raise RuntimeError("Scheduler mixed dense and MixFusion requests")
-            output.mixfusion_batch = plan_batch(packed_requests)
-            if output.mixfusion_batch is None:
-                raise RuntimeError("Scheduler emitted a MixFusion batch exceeding its chunk policy")
+            output.use_mixfusion = True
         for request_id in output.scheduled_request_ids:
             progress = self._request_progress[request_id]
             progress.scheduled_interaction_generation = progress.interaction_generation
@@ -128,11 +126,9 @@ class StepScheduler(BaseScheduler):
 
         if state.req.mixfusion_info is not None:
             candidates = [
-                (rid, info)
-                for rid in self._running
-                if (info := self._request_states[rid].req.mixfusion_info) is not None
-            ] + [(state.request_id, state.req.mixfusion_info)]
-            if plan_batch(candidates) is None:
+                info for rid in self._running if (info := self._request_states[rid].req.mixfusion_info) is not None
+            ] + [state.req.mixfusion_info]
+            if not fits_chunk_budget(candidates):
                 return False
 
         is_first_step = self._request_progress[state.request_id].current_step == 0
