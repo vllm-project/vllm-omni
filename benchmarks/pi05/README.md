@@ -6,6 +6,7 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 | --- | --- | --- |
 | `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi`. | A running server |
 | `bench_pi05.py` | Model-level `sample_actions` latency and output shape over a batch size × camera-view sweep, with no serving stack. Writes `pi05_sweep.csv` and `pi05_sweep.md`. | A GPU and the checkpoint |
+| `bench_batch_pi05.py` | Stage profile of `sample_actions` in rounds of B requests: time per stage (prefix embedding, prefill, denoising) and the DCGM activity of each stage looped alone. Writes one JSON per chain and a Markdown report over them. | A GPU and the checkpoint; `dcgmi` for the activity columns |
 
 ## Client E2E latency
 
@@ -78,6 +79,22 @@ Run each policy in a fresh process; correctness, capture/replay,
 stage profiling, and task-level quality require separate validation. Compare
 latency only at the same model/serving boundary, with matching inputs, denoising
 steps, warmup, GPU, and precision policy.
+
+## Stage profile
+
+`bench_batch_pi05.py` times the three calls `sample_actions` makes, in place, for rounds of B requests, then
+replays each stage alone so that the DCGM samples of a window belong to one stage. One run measures one chain
+(`bfloat16` unless `--dtype` says otherwise); the report covers every chain file in the directory.
+
+```bash
+python benchmarks/pi05/bench_batch_pi05.py --mode eager --out pi05_stages/
+python benchmarks/pi05/bench_batch_pi05.py --mode graph --out pi05_stages/
+python benchmarks/pi05/bench_batch_pi05.py --mode graph --vision-precision selective_bf16 --all4 --out pi05_stages/
+python benchmarks/pi05/bench_batch_pi05.py --report pi05_stages/ --out-md pi05_stages/report.md
+```
+
+`--all4` turns on the four opt-in runtime switches above. A batch size the optimized path has no CUDA graph for
+is reported as such rather than timed on its eager fallback.
 
 ## Reference results
 
