@@ -1485,14 +1485,18 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     assert mgr._controller._tasks.get(tid) is None
 
 
-def test_blocked_save_is_released_by_pool_write_alone():
+@pytest.mark.parametrize("consume", ["materialize", "discard_step"])
+def test_blocked_save_is_released_by_pool_write_alone(consume):
     """All step contexts consumed, the only slot held by a pending write:
     the committer finishing that write must unblock the waiting save."""
     mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
     _hold_writes(mgr)
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
     tid = next(iter(mgr._request_tasks.tasks["a"]))
-    mgr.materialize(s0, ["a"])
+    if consume == "materialize":
+        mgr.materialize(s0, ["a"])
+    else:
+        mgr.discard_step(s0)
     slot = mgr._step_ctxs.get(s0)  # consumed
     assert slot is None
     assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}

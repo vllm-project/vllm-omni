@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model]
@@ -49,6 +50,12 @@ except Exception:
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     CUDAGraphDecoderWrapper = _mod.CUDAGraphDecoderWrapper
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ieee_cudnn_fp32():
+    with ieee_cudnn_fp32():
+        yield
 
 
 class SyntheticDecoder(nn.Module):
@@ -86,14 +93,14 @@ class ShortOutputDecoder(SyntheticDecoder):
 
 
 @pytest.fixture(scope="module")
-def decoder():
+def decoder(_ieee_cudnn_fp32):
     """Create a synthetic decoder on CUDA with fixed weights."""
     torch.manual_seed(42)
     return SyntheticDecoder().to(DEVICE).eval()
 
 
 @pytest.fixture(scope="module")
-def wrapper(decoder):
+def wrapper(decoder, _ieee_cudnn_fp32):
     """Create a warmed-up CUDAGraphDecoderWrapper."""
     w = CUDAGraphDecoderWrapper(
         decoder=decoder,

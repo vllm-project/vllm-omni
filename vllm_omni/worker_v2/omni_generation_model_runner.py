@@ -17,14 +17,13 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     get_ep_all2all_manager,
 )
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import (
     BatchDescriptor,
     ExecuteModelState,
@@ -170,6 +169,9 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
         if self.finalize_output is not None:
             return self.finalize_output(self.model_runner_output)
         return self.model_runner_output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.model_runner_output.kv_connector_output
 
 
 class OmniGenerationModelRunner(OmniGPUModelRunner):
@@ -385,6 +387,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self._handle_async_chunk_updates(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self._apply_encoder_input_updates(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self._apply_block_table_staged_writes_if_available()
             if self.aux_output_connector is not None:
@@ -401,8 +404,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
-        if batch_req_state is not None:
-            num_toks = batch_req_state.num_tokens
+        num_toks, max_query_len = self._adjust_dispatch_token_count(batch_req_state, num_toks, max_query_len)
         batch_desc, dp_sync = self._dispatch_batch_descriptor(
             num_reqs=num_reqs,
             num_toks=num_toks,
@@ -414,6 +416,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             # always uses eager dispatch here.
             use_eager=True,
             max_query_len=max_query_len,
+            allow_skip_drafts=scheduler_output.skip_drafts,
         )
 
         if batch_desc.num_tokens == 0:
@@ -426,15 +429,14 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0)
         else:
-            from vllm.v1.worker.gpu.input_batch import InputBatch
-
-            input_batch = InputBatch.make_dummy(
+            input_batch = self._make_dummy_input_batch(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
-                self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
                 is_padding=not is_profile,
             )
+            if self.pcp_manager is not None:
+                input_batch = self.pcp_manager.prepare_inputs_for_capture_or_profile(input_batch)
             # Codec IDs have model-specific bounds; keep valid dummy tokens
             # even when upstream requests randomized language-model inputs.
 
@@ -471,7 +473,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             has_lora=self.lora_config is not None,
             num_active_loras=batch_desc.num_active_loras,
         )
-        with set_forward_context(
+        with self._forward_context(
             attn_metadata,
             self.vllm_config,
             num_tokens=input_batch.num_tokens_after_padding,
@@ -513,7 +515,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             finished_req_ids=scheduler_output.finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=None,
-            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            num_spec_tokens_to_schedule=self._num_spec_tokens_to_schedule(scheduler_output, dp_sync),
         )
         return None
 
@@ -604,7 +606,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 self._release_generation_slots(input_batch, keep=pending)
             return async_output
 
-        # CPU execution keeps the synchronous materialization path. Final
+        # Non-CUDA execution keeps the synchronous materialization path. Final
         # generation stages publish audio only through multimodal_outputs,
         # matching the V1 generation-runner contract.
         self._reserve_native_data_plane_outputs(list(req_ids))
