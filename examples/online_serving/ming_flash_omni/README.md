@@ -7,7 +7,7 @@ Please refer to [README.md](../../../README.md)
 ## Deployment modes
 
 | Mode | Launch command | Output |
-|------|---------------|--------|
+| ------ | --------------- | -------- |
 | Thinker + Talker (omni-speech, default) | `vllm serve ... --omni` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
 | Thinker + Imagegen (text-to-image / img2img) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml` | Image |
@@ -19,6 +19,7 @@ For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Te
 ### Launch the Server
 
 **Thinker + Talker (omni-speech, text + audio output):**
+
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
 ```
@@ -26,6 +27,7 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
 The model registry auto-loads corresponding deploy yaml.
 
 **Thinker-only (text output):**
+
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091 \
     --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml
@@ -49,12 +51,31 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
     --modalities text
 ```
 
-
 ## Image generation (text-to-image / img2img)
 
 Ming-flash-omni-2.0 also exposes an image-generation (diffusion) stage. Launch with the image deploy YAML, which adds an image-gen stage behind the thinker.
 
 The image-generation stage is a standard vLLM-Omni diffusion pipeline (`MingImagePipeline`); its request knobs are declared in `vllm_omni/model_extras/ming_flash_omni.py` and routed through `extra_body`, so they no longer need a bespoke `sampling_params_list` recipe (that form is still available for per-stage thinker sampling — see below).
+
+### A6 validation profiles
+
+The default `ming_flash_omni_image.yaml` keeps the thinker and diffusion
+stages on separate devices. For an explicit single-GPU validation, use
+`vllm_omni/deploy/ming_flash_omni_image_single_gpu.yaml`. It sets
+`cfg_parallel_size: 1`, places both stages on device 0, and enables
+`inline_diffusion`.
+
+For A6.1 CFG parallel validation, use
+`vllm_omni/deploy/ming_flash_omni_image_cfg_parallel.yaml`. It keeps the
+thinker on devices 0-3 and assigns devices 4-5 to the diffusion stage with
+`cfg_parallel_size: 2`.
+
+The profile's inline setting is a process-topology choice. It removes the
+`StageDiffusionProc` ZMQ hop for the diffusion stage. Naming the same device
+without `inline_diffusion` would still use `StageDiffusionClient`, ZMQ, and
+`OmniMsgpackEncoder` CPU serialization. The profile must be validated on a
+machine with enough free VRAM; no memory or latency result is implied by the
+YAML alone.
 
 ### Launch
 
@@ -65,7 +86,6 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni \
     --init-timeout 1800 \
     --port 8091
 ```
-
 
 ### Text-to-image
 
@@ -199,7 +219,7 @@ The reference image can also be a public URL (`"url": "https://…/photo.jpg"`) 
 | `steps` | 30 | Number of FlowMatchEuler denoise steps. |
 | `cfg` | 2.0 | Classifier-free guidance scale. |
 | `seed` | 42 | Per-request RNG seed. |
-| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…". ` format. Auto-extracted from quoted spans in the prompt when omitted. |
+| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…".` format. Auto-extracted from quoted spans in the prompt when omitted. |
 | `negative_prompt` | (empty) | Real CFG negative conditioning (text-to-image only). |
 
 For the offline `text_to_image.py` / `image_edit.py` scripts and the full knob reference, see the [image-generation section in the recipe](../../../recipes/inclusionAI/Ming-flash-omni-2.0.md#image-generation-text-to-image--img2img).
@@ -207,7 +227,7 @@ For the offline `text_to_image.py` / `image_edit.py` scripts and the full knob r
 ## Modality control
 
 | `modalities` | Server config | Output |
-|-------------|--------------|--------|
+| ------------- | -------------- | -------- |
 | `["text"]` or omitted | Thinker only | Text |
 | `["audio"]` | Thinker + Talker | Audio (speech) |
 | `["text", "audio"]` | Thinker + Talker | Text + Audio |
