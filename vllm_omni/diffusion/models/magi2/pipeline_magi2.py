@@ -462,27 +462,50 @@ class _Magi2StagedComponent(nn.Module):
         device: str | torch.device,
         *,
         pin_memory: bool,
-        stage_whole_module: bool = True,
     ) -> None:
         super().__init__()
         self.module = module
-        staged: nn.Module | list[nn.Module] = module
-        text_model = getattr(module, "text_model", None)
-        if not stage_whole_module and isinstance(getattr(text_model, "layers", None), nn.ModuleList):
-            staged = [child for name, child in text_model.named_children() if name != "layers"]
         self._stager = PinnedModuleStager(
-            staged,
+            module,
             torch.device(device),
             pin_memory=pin_memory,
         )
 
+    @property
+    def is_loaded(self) -> bool:
+        return not isinstance(self.module, nn.Identity)
+
+    def _non_block_modules(self) -> list[nn.Module]:
+        group_ids = {id(group) for group in getattr(self, "_omni_layerwise_block_groups", ())}
+        text_model = getattr(self.module, "text_model", None)
+        if text_model is None:
+            return [self.module]
+        return [child for child in text_model.children() if id(child) not in group_ids]
+
     def load_to_device(self) -> None:
+        if getattr(self, "_omni_layerwise_enabled", False):
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is None:
+                hooks = getattr(self, "_omni_layerwise_hooks", ())
+                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                stager = PinnedModuleStager(
+                    self._non_block_modules(),
+                    self._stager.device,
+                    pin_memory=pin_memory,
+                )
+                self._omni_non_block_stager = stager
+            stager.load()
+            return
         self._stager.load()
 
     def offload_to_cpu(self) -> None:
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:
                 hook.offload_layer()
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is not None:
+                stager.offload()
+            return
         self._stager.offload()
 
     def to(self, *_args: object, **_kwargs: object) -> _Magi2StagedComponent:
@@ -663,7 +686,6 @@ class Magi2Pipeline(
             text_encoder,
             self.device_str,
             pin_memory=pin_memory,
-            stage_whole_module=not self._transformer_is_layerwise_offloaded,
         )
         self.image_vae = _Magi2StagedComponent(
             image_vae,
