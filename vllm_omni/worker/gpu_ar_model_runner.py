@@ -1153,7 +1153,6 @@ class GPUARModelRunner(
         committed_token_embeddings: torch.Tensor | None = None,
         consumed_input_span: bool = False,
     ) -> dict[str, object]:
-
         has_speculative_token_delta = committed_token_ids is not None
         payload: dict[str, object] = {}
         req_hidden_states = None
@@ -1206,12 +1205,13 @@ class GPUARModelRunner(
             for key in tuple(mm_payload):
                 if key.startswith("hidden_states.layer_") and key != "hidden_states.layer_0":
                     mm_payload.pop(key, None)
-            payload["meta"] = {
+            speculative_meta: dict[str, bool | int] = {
                 "decode_span": True,
                 "committed_token_count": len(committed_token_ids or []),
             }
             if consumed_input_span:
-                payload["meta"]["consumed_input_span"] = True
+                speculative_meta["consumed_input_span"] = True
+            payload["meta"] = speculative_meta
             payload["ids"] = {"output": list(committed_token_ids or [])}
 
         # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
