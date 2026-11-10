@@ -44,7 +44,7 @@ def test_attention_delegates_to_ascend_without_losing_omni_hooks(monkeypatch):
     batch = AscendInputBatch.__new__(AscendInputBatch)
     args: tuple = (batch, CUDAGraphMode.PIECEWISE, (), None, [], None)
     result = state.prepare_attn(*args)
-    prepare.assert_called_once_with(*args, for_capture=False, ubatch_idx=0)
+    prepare.assert_called_once_with(*args, for_capture=False, ubatch_idx=0, model_specific_attn_metadata=None)
     assert result is prepare.return_value
     assert state.uses_ascend_attn_metadata
     assert NPUQwen3OmniModelState.prepare_inputs is OmniModelState.prepare_inputs

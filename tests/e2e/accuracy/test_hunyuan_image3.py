@@ -30,7 +30,7 @@ from tests.e2e.accuracy.helpers import (
     model_output_dir,
     write_accuracy_result,
 )
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner, OmniServer
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -82,15 +82,11 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-# Logical device IDs per stage. CUDA uses two devices for AR and two for DiT.
+# Comma-separated logical device IDs per stage, split between AR and DiT.
 
 
 def _default_ar_dit_devices() -> tuple[str, str]:
-    """Use two devices per CUDA stage and split visible devices on other platforms."""
-    from vllm_omni.platforms import current_omni_platform
-
-    if current_omni_platform.is_cuda():
-        return "0,1", "2,3"
+    """First floor(n/2) logical devices -> AR, rest -> DiT."""
     n = torch.accelerator.device_count()
     if n < 2:
         return "0,1", "2,3"
@@ -293,8 +289,13 @@ def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
     return params
 
 
-def _make_config(enable_kv_reuse: bool, path: Path) -> None:
+def _make_config(enable_kv_reuse: bool, path: Path, *, tensor_parallel_size: int | None = None) -> None:
     config = cast(dict[str, Any], copy.deepcopy(_DEPLOY_CONFIG))
+    if tensor_parallel_size is not None:
+        config["stages"][0]["devices"] = ",".join(str(i) for i in range(tensor_parallel_size))
+        config["stages"][0]["tensor_parallel_size"] = tensor_parallel_size
+        config["stages"][1]["devices"] = ",".join(str(i) for i in range(tensor_parallel_size, tensor_parallel_size * 2))
+        config["stages"][1]["parallel_config"]["tensor_parallel_size"] = tensor_parallel_size
     config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
     config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -333,13 +334,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(
-        MODEL_PATH,
-        deploy_config=deploy_config_path,
-        trust_remote_code=True,
-        stage_init_timeout=1200,
-        init_timeout=3000,
-    ) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path, trust_remote_code=True) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -601,22 +596,24 @@ def _run_dit_model(
             torch.accelerator.empty_cache()
 
 
-@hardware_test(res={"cuda": "H200"}, num_cards=4)
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
-    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
+@pytest.mark.parametrize(
+    "tensor_parallel_size",
+    [
+        pytest.param(4, id="tp4", marks=hardware_marks(res={"cuda": "H200"}, num_cards=8)),
+        pytest.param(2, id="tp2", marks=hardware_marks(res={"cuda": "H200"}, num_cards=4)),
+    ],
 )
-def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
+def test_image_to_image_alignment(accuracy_artifact_root: Path, tensor_parallel_size: int) -> None:
+    """Compare IT2I image and CoT against references at the selected AR/DiT TP size."""
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
     from tabulate import tabulate  # type: ignore[import-untyped]
 
-    """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
-    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + f"-offline-kv-reuse-tp{tensor_parallel_size}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _make_config(True, tmp / "on.yaml")
+        _make_config(True, tmp / "on.yaml", tensor_parallel_size=tensor_parallel_size)
         omni_image, omni_cot, time_reuse = _run_offline(str(tmp / "on.yaml"), output_dir)
 
     scorer = SemanticSimilarityScorer()
@@ -661,7 +658,7 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
             "cot_semantic_sim": thresholds["cot_semantic_sim"],
             "text_prefix_match_count": thresholds["text_prefix_match"],
         },
-        extra={"label": "offline_vs_reference"},
+        extra={"label": "offline_vs_reference", "ar_tp": tensor_parallel_size, "dit_tp": tensor_parallel_size},
     )
 
     _assert_cot_structural_markers(omni_cot, "OFFLINE")

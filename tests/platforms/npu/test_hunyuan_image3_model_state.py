@@ -38,7 +38,7 @@ def test_ascend_attention_preserves_omni_inputs_and_sampler(mocker):
     batch = AscendInputBatch.__new__(AscendInputBatch)
     args = (batch, CUDAGraphMode.NONE, (), None, mocker.sentinel.attn_groups, None)
     assert state.prepare_attn(*args) == {}
-    prepare.assert_called_once_with(*args, for_capture=False, ubatch_idx=0)
+    prepare.assert_called_once_with(*args, for_capture=False, ubatch_idx=0, model_specific_attn_metadata=None)
     assert state.uses_ascend_attn_metadata
     assert NPUHunyuanImage3ModelState.prepare_inputs is OmniModelState.prepare_inputs
     assert NPUHunyuanImage3ModelState.custom_sampler is OmniModelState.custom_sampler

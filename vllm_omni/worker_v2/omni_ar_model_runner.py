@@ -121,6 +121,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    def _dummy_run(self, num_tokens: int, *args: Any, **kwargs: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        # Upstream autotuning uses the batch token budget even when one dummy
+        # request would exceed the context-sized attention block table.
+        num_tokens = min(num_tokens, self.max_num_reqs * self.max_model_len)
+        return super()._dummy_run(num_tokens, *args, **kwargs)
+
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
             self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
