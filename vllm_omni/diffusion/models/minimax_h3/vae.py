@@ -1075,14 +1075,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         profile = getattr(self.model, "_h3_lite_decode_profile", None)
-        if (
-            profile is not None
-            and int(latent.shape[2]) == 1
-            and profile.image_context_tokens is not None
-        ):
-            context = self._denormalize_latent(
-                latent.expand(-1, -1, profile.image_context_tokens, -1, -1).contiguous()
-            )
+        if profile is not None and int(latent.shape[2]) == 1 and profile.image_context_tokens is not None:
+            context = self._denormalize_latent(latent.expand(-1, -1, profile.image_context_tokens, -1, -1).contiguous())
             with self._decode_tiling_context(context):
                 decoded = self.model.tiled_decode(context)
             phase = profile.image_context_output_phase or 0
