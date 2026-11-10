@@ -1,0 +1,4 @@
+interface:
+  display_name: "Omni Performance Headroom"
+  short_description: "Assess Omni request paths and component-level headroom"
+  default_prompt: "Use $perf-headroom to map this vLLM-Omni workload's executed stages and report near-reference components, optimization candidates, and evidence gaps."
