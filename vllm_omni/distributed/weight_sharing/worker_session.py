@@ -24,13 +24,16 @@ def resolve_worker_sharing(
     Runners may omit rank after TP initialization; workers pass their rank
     explicitly before initialization. The IPC codec checks the physical GPU.
     """
-    if CONFIG_KEY not in config.additional_config:
+    # Lightweight runner stubs may omit additional_config entirely; only the
+    # launch layer that attaches the bootstrap needs to provide it.
+    additional_config = getattr(config, "additional_config", None)
+    if not additional_config or CONFIG_KEY not in additional_config:
         return None
     if rank is None:
         from vllm.distributed import get_tensor_model_parallel_rank
 
         rank = get_tensor_model_parallel_rank()
-    bootstrap = msgspec.convert(config.additional_config[CONFIG_KEY], type=Bootstrap)
+    bootstrap = msgspec.convert(additional_config[CONFIG_KEY], type=Bootstrap)
     if role not in ("provider", "consumer") or not 0 <= rank < len(bootstrap.groups):
         raise ValueError("incorrect sharing bootstrap role or rank")
     if len(bootstrap.budgets) != len(bootstrap.groups):
