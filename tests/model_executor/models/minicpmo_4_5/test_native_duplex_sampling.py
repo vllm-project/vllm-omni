@@ -190,7 +190,7 @@ class _SentenceTokenizer:
 
     def decode(self, ids, skip_special_tokens=False):
         del skip_special_tokens
-        glyphs = {20: "正", 21: "。"}
+        glyphs = {20: "正", 21: "。", 22: "中", 23: "间", 24: "有"}
         return "".join(glyphs.get(int(token_id), "") for token_id in ids)
 
 
@@ -200,8 +200,13 @@ def _turn_end_model(
     unit_has_text: bool,
     textless_units: int = 0,
     held_turn_ends: int = 0,
+    output_ids: list[int] | None = None,
 ):
-    """One greedy row whose open turn has already emitted ``generated``."""
+    """One greedy row whose open turn has already emitted ``generated``.
+
+    ``output_ids`` is the accepted segment the hold reads. It defaults to
+    ``generated``; a different list is a stale side buffer.
+    """
     state = SimpleNamespace(
         generated_tokens=list(generated),
         current_turn_ended=False,
@@ -230,7 +235,7 @@ def _turn_end_model(
         temperature=torch.tensor([0.0]),
         top_k=torch.tensor([0]),
         top_p=torch.tensor([1.0]),
-        output_token_ids=[[20]],
+        output_token_ids=[list(generated if output_ids is None else output_ids)],
         generators={0: torch.Generator().manual_seed(0)},
     )
     return model, state, logits, md
@@ -294,6 +299,20 @@ def test_hold_cap_accepts_turn_eos_on_an_unfinished_sentence(deferred, monkeypat
     assert state.current_turn_ended is True
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("side_buffer", [[], [21]])
+def test_stale_side_buffer_does_not_release_an_unfinished_segment(deferred, side_buffer, monkeypatch):
+    model, state, logits, md = _turn_end_model(
+        side_buffer,
+        unit_has_text=True,
+        output_ids=[22, 23, 24],
+    )
+    sampled = _sample_turn_end(model, logits, md, deferred=deferred, monkeypatch=monkeypatch)
+    assert state.open_turn_tail in {"", "。"}
+    assert sampled == CHUNK_EOS
+    assert state.current_turn_ended is False
+
+
 class _SplitMarkTokenizer(_SentenceTokenizer):
     """Ids 30 and 31 are ``\\ufffd`` alone and ``。`` only when decoded together."""
 
@@ -335,11 +354,11 @@ def test_recorded_tokens_update_the_open_turn_tail():
 
     model._record_minicpmo45_duplex_generation_token(0, 20)
     assert state.open_turn_tail == "正"
-    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) == CHUNK_EOS
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS, [20]) == CHUNK_EOS
 
     model._record_minicpmo45_duplex_generation_token(0, 21)
     assert state.open_turn_tail == "正。"
-    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) is None
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS, [20, 21]) is None
 
     state.current_turn_ended = True
     model._record_minicpmo45_duplex_generation_token(0, 20)
@@ -357,10 +376,10 @@ def test_split_sentence_mark_is_decoded_with_its_token_span():
     model, state = _record_model(_SplitMarkTokenizer())
     model._record_minicpmo45_duplex_generation_token(0, 30)
     assert state.open_turn_tail == "\ufffd"
-    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) == CHUNK_EOS
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS, [30]) == CHUNK_EOS
     model._record_minicpmo45_duplex_generation_token(0, 31)
     assert state.open_turn_tail == "正。"
-    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS) is None
+    assert model._minicpmo45_unfinished_turn_chunk_eos(0, TOKEN_IDS, [30, 31]) is None
 
 
 class _NoHostReads(TorchDispatchMode):

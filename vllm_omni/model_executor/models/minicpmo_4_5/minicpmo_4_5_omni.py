@@ -1461,7 +1461,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 sampled = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
                 if sampled == turn_eos_id:
-                    replacement = self._minicpmo45_unfinished_turn_chunk_eos(row_idx, token_ids)
+                    replacement = self._minicpmo45_unfinished_turn_chunk_eos(row_idx, token_ids, recent[row_idx])
                     if replacement is not None:
                         self._minicpmo45_drop_recorded_turn_eos(row_idx, turn_eos_id)
                         self._minicpmo45_note_held_turn_end(row_idx)
@@ -1523,10 +1523,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 token = torch.where(hit, torch.full_like(token, chunk_eos_id), token)
             turn_eos_id = token_ids.get("turn_eos_token_id", -1)
             if has_chunk_eos and 0 <= turn_eos_id:
-                # Same hold as the synchronous path. The predicate reads flags
-                # maintained when tokens are recorded, so this step does not decode.
+                # Same hold as the synchronous path. Decode only an open turn's
+                # accepted segment, which is the text the handoff will speak.
                 replacements = [
-                    self._minicpmo45_unfinished_turn_chunk_eos(row_idx, token_ids) for row_idx in stage2_rows
+                    self._minicpmo45_unfinished_turn_chunk_eos(row_idx, token_ids, recent[row_idx])
+                    for row_idx in stage2_rows
                 ]
                 if any(value is not None for value in replacements):
                     replacement_ids = [turn_eos_id if value is None else value for value in replacements]
@@ -1701,12 +1702,31 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if state.open_turn_tail:
             state.turn_unit_has_text = True
 
-    def _minicpmo45_unfinished_turn_chunk_eos(self, row_idx: int, token_ids: dict[str, int]) -> int | None:
+    def _minicpmo45_segment_tail_text(self, recent: list[int], token_ids: dict[str, int]) -> str:
+        """Decode the accepted segment the handoff will speak, as one span."""
+        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        listen_id = token_ids.get("listen_token_id", -1)
+        boundaries = {token_id for token_id in (turn_eos_id, listen_id) if token_id >= 0}
+        start = 0
+        for index, token_id in enumerate(recent):
+            if token_id in boundaries:
+                start = index + 1
+        segment = recent[start:][-MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS :]
+        return self._minicpmo45_decode_duplex_tokens(segment)
+
+    def _minicpmo45_unfinished_turn_chunk_eos(
+        self,
+        row_idx: int,
+        token_ids: dict[str, int],
+        recent: list[int],
+    ) -> int | None:
         """chunk_eos when turn_eos would close an unfinished sentence, else None.
 
-        Does not mutate or decode. The open-turn tail is updated when text is
-        recorded. A second consecutive textless unit may end, as may a turn
-        that has already been held ``MAX_HELD_UNFINISHED_TURN_ENDS`` times.
+        The text is the accepted ``output_token_ids`` of this segment, not the
+        side buffer updated at record time. An empty segment is not a finished
+        sentence, but there is nothing to hold. A second consecutive textless
+        unit may end, as may a turn already held
+        ``MAX_HELD_UNFINISHED_TURN_ENDS`` times.
         """
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         if chunk_eos_id < 0:
@@ -1714,7 +1734,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None or getattr(state, "current_turn_ended", True):
             return None
-        tail = getattr(state, "open_turn_tail", "") or ""
+        tail = self._minicpmo45_segment_tail_text(recent, token_ids)
         if not tail or MiniCPMO45DuplexPolicy.turn_text_ends_sentence(tail):
             return None
         held = int(getattr(state, "held_turn_ends", 0) or 0)
