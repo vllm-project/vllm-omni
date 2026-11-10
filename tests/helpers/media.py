@@ -886,15 +886,17 @@ def _whisper_transcribe_in_current_process(
     language: str | None = None,
     temperature_fallback: bool = False,
 ) -> tuple[str, str, float]:
-    if temperature_fallback:
-        import torch
-
-        # Seed only the isolated ASR worker. This keeps fallback sampling
-        # reproducible without modifying the model server or pytest RNG state.
-        torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
     if _is_hf_whisper_model(model_size):
+        # transformers generate() has no openai-whisper temperature-fallback
+        # tuple, so temperature_fallback is intentionally ignored on this path.
         text = _hf_whisper_transcribe(output_path, model_size, language)
     else:
+        if temperature_fallback:
+            import torch
+
+            # Seed only the isolated ASR worker. This keeps fallback sampling
+            # reproducible without modifying the model server or pytest RNG state.
+            torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
         model = _get_whisper_model(model_size)
         text = model.transcribe(
             output_path,
