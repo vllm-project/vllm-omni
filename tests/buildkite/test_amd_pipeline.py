@@ -10,6 +10,7 @@ import sys
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
+from typing import cast
 
 import pytest
 import yaml
@@ -1421,6 +1422,142 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     hunyuan_step = _find_step("Reliability Test · hunyuan-image", AMD_WEEKLY_PIPELINE)
     hunyuan_command = "\n".join(hunyuan_step["commands"])
     assert "test_hunyuan_image_ep_startup.py" not in hunyuan_command
+
+    guarded_jobs = {
+        "Reliability Test · qwen3-omni": {
+            "artifact_path": "artifacts/rocm-qwen3-omni-reliability/**/*",
+            "artifact_env": "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
+            "expected_nodes": 37,
+            "expected_skipped": 10,
+            "timeout": "165m",
+            "collection_message": "Expected exactly 37 Qwen3-Omni reliability nodes",
+            "junit_message": ("Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips"),
+        },
+        "Reliability Test · wan22": {
+            "artifact_path": "artifacts/rocm-wan22-reliability/**/*",
+            "artifact_env": "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
+            "expected_nodes": 17,
+            "expected_skipped": 5,
+            "timeout": "165m",
+            "collection_message": "Expected exactly 17 Wan2.2 reliability nodes",
+            "junit_message": "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+        },
+        "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
+            "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
+            "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
+            "expected_nodes": 24,
+            "expected_skipped": 0,
+            "timeout": "75m",
+            "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
+            "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+        },
+    }
+    for label, expected in guarded_jobs.items():
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        command = "\n".join(step["commands"])
+        artifact_env = cast(str, expected["artifact_env"])
+        expected_nodes = cast(int, expected["expected_nodes"])
+        expected_skipped = cast(int, expected["expected_skipped"])
+        collection_message = cast(str, expected["collection_message"])
+        junit_message = cast(str, expected["junit_message"])
+
+        assert step["artifact_paths"] == [expected["artifact_path"]]
+        assert "--collect-only" in command
+        assert command.count("--shard-id=0 --num-shards=1") == 2
+        assert collection_message in command
+        assert f"timeout --signal=TERM --kill-after=2m {expected['timeout']}" in command
+        assert f'--junitxml="$${artifact_env}/pytest.xml"' in command
+        assert f'tee "$${artifact_env}/pytest.log"' in command
+        assert f'tail -n 100 "$${artifact_env}/pytest.log"' in command
+        assert 'exit "$${PIPESTATUS[0]}"' in command
+        assert junit_message in command
+        assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("pass", "unexpected-skip", "zero-tests", "pytest-failure", "timeout"),
+)
+@pytest.mark.parametrize(
+    (
+        "step_label",
+        "artifact_env",
+        "job_id_prefix",
+        "expected_tests",
+        "expected_skipped",
+        "expected_message",
+    ),
+    (
+        (
+            "Reliability Test · qwen3-omni",
+            "ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR",
+            "qwen3-reliability-guard",
+            37,
+            10,
+            "Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips",
+        ),
+        (
+            "Reliability Test · wan22",
+            "ROCM_WAN22_RELIABILITY_ARTIFACT_DIR",
+            "wan22-reliability-guard",
+            17,
+            5,
+            "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
+        ),
+        (
+            "Reliability Test · Invalid parameters · MI300 · 2-GPU",
+            "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
+            "invalid-parameters-reliability-guard",
+            24,
+            0,
+            "Expected exactly 24 executed invalid-parameter reliability tests",
+        ),
+    ),
+    ids=("qwen3-omni", "wan22", "invalid-parameters"),
+)
+def test_weekly_reliability_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    case: str,
+    step_label: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    expected_tests: int,
+    expected_skipped: int,
+    expected_message: str,
+) -> None:
+    pytest_status = 0
+    tests = expected_tests
+    skipped = expected_skipped
+    timeout_status = None
+    expected_status = 0
+
+    if case == "unexpected-skip":
+        skipped += 1
+        expected_status = 5
+    elif case == "zero-tests":
+        tests = 0
+        expected_status = 5
+    elif case == "pytest-failure":
+        pytest_status = 1
+        expected_status = 1
+    elif case == "timeout":
+        timeout_status = 124
+        expected_status = 124
+
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label=step_label,
+        command_fragment="pytest -s -v -ra",
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_hunyuan_offline_accuracy_has_cold_start_headroom() -> None:
