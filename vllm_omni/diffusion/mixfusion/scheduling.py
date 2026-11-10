@@ -12,12 +12,14 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
+
 
 @dataclass(frozen=True)
 class MixFusionCapability:
     """Loaded model's request-preparation configuration, or an unavailable reason."""
 
-    request_config: object | None = None
+    request_config: MixFusionImageRequestConfig | None = None
     reason: str = "MixFusion is unavailable"
 
 

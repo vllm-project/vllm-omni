@@ -19,6 +19,8 @@ from torch import nn
 from vllm_omni.diffusion.hooks.mixfusion import MixFusionRoot
 from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.mixfusion.plan import MixFusionImageRequest
+from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
 from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion, validate_mixfusion_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -132,14 +134,89 @@ class _Parallel:
 def test_capability_is_resolved_after_foreign_hooks_are_installed():
     from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
 
-    pipeline, transformer = _mount(supports=True, adapter=None)
-    pipeline.prepare_mixfusion_request = lambda *args: None
-    pipeline.mixfusion_request_config = lambda: (8, 128, 64)
-    assert inspect_mixfusion_capability(pipeline).request_config == (8, 128, 64)
+    pipeline, transformer = _mount(
+        supports=True,
+        adapter=None,
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128, 64))},
+    )
+    assert inspect_mixfusion_capability(pipeline).request_config == MixFusionImageRequestConfig(8, 128, 64, 2, 1.0)
     transformer.register_forward_pre_hook(lambda module, args: args)
     capability = inspect_mixfusion_capability(pipeline)
     assert capability.request_config is None
     assert "foreign hooks" in capability.reason
+
+
+def test_image_request_declaration_resolves_loaded_attributes_without_model_callbacks():
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability, prepare_mixfusion_admission
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    @dataclass
+    class Geometry:
+        scale: int = 4
+        sample_size: int = 64
+        channels: int = 32
+
+    plan = MixFusionImageRequest(
+        vae_scale_factor="geometry.scale",
+        default_sample_size="geometry.sample_size",
+        channels="geometry.channels",
+        patch_size=1,
+    )
+    pipeline, transformer = _mount(supports=True, adapter=None, plan={"": MixFusionRoot(request=plan)})
+    pipeline.geometry = transformer.geometry = Geometry()
+    capability = inspect_mixfusion_capability(pipeline)
+
+    @dataclass
+    class Engine:
+        od_config = _od_config(enable=True)
+        mixfusion_capability = capability
+
+    request = OmniDiffusionRequest(
+        request_id="different-layout",
+        prompt="image",
+        sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=2),
+    )
+    prepare_mixfusion_admission(Engine(), request)
+    assert request.mixfusion_info.shape == (2, 4096, 32)
+
+
+def test_declared_runtime_mode_disables_packing_before_admission():
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, transformer = _mount(
+        supports=True,
+        adapter=None,
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(8, 128, 64), disabled_if=("editing",))},
+    )
+    transformer.editing = True
+    capability = inspect_mixfusion_capability(pipeline)
+    assert capability.request_config is None
+    assert "editing" in capability.reason
+    transformer.editing = False
+    assert inspect_mixfusion_capability(pipeline).request_config is not None
+
+
+def test_missing_request_declaration_keeps_dense_admission():
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, _ = _mount(supports=True, adapter=None)
+    capability = inspect_mixfusion_capability(pipeline)
+    assert capability.request_config is None
+    assert "no request layout" in capability.reason
+
+
+@pytest.mark.parametrize("scale", [0, -1, True])
+def test_invalid_declared_geometry_fails_at_initialization(scale):
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, _ = _mount(
+        supports=True,
+        adapter=None,
+        plan={"": MixFusionRoot(request=MixFusionImageRequest(scale, 128, 64))},
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        inspect_mixfusion_capability(pipeline)
 
 
 @pytest.mark.parametrize(
@@ -174,19 +251,17 @@ def test_engine_requires_rank_agreement_before_request_preparation(monkeypatch, 
 
     class Pipeline:
         supports_mixfusion = True
-        prepare_mixfusion_request = staticmethod(lambda *args: None)
 
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = _od_config(enable=True)
     engine.execution_mode = "step_batch"
     engine.executor = Mock()
-    capability = MixFusionCapability((8, 128, 64), "")
+    capability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, 4.0), "")
     engine.executor.collective_rpc.return_value = [capability, capability if consistent else MixFusionCapability()]
     monkeypatch.setattr(registry, "resolve_diffusion_pipeline_cls", lambda config: Pipeline)
     if consistent:
         initialize_mixfusion_admission(engine)
         assert engine.mixfusion_capability == capability
-        assert engine.mixfusion_prepare_request is Pipeline.prepare_mixfusion_request
     else:
         with pytest.raises(RuntimeError, match="disagree"):
             initialize_mixfusion_admission(engine)

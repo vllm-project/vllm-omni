@@ -37,16 +37,19 @@ JOINT_TEXT_IMAGE_LAYOUT = AttentionLayout((StreamSpec("text", "request"), Stream
 class ChunkedJointAdapter:
     """Packs a joint text/image DiT call from its ``MixFusionRoot`` declaration.
 
-    Models may validate runtime inputs with ``mixfusion_validate_inputs``.
+    Input requirements are declared on the root alongside the layout.
     """
 
     def __init__(self, root: MixFusionRoot) -> None:
         self.root = root
 
     def validate_inputs(self, module: nn.Module, input_batch: Any) -> None:
-        validate = getattr(module, "mixfusion_validate_inputs", None)
-        if validate is not None:
-            validate(input_batch)
+        for name in self.root.required_inputs:
+            if getattr(input_batch, name, None) is None:
+                raise ValueError(f"Scheduled MixFusion batch is missing {name}")
+        for name in self.root.unsupported_inputs:
+            if getattr(input_batch, name, None) is not None:
+                raise ValueError(f"Scheduled MixFusion batch contains unsupported {name}")
 
     def pack_inputs(self, module: nn.Module, bound: Any, *, cache: PackedInputs | None) -> PackedInputs:
         """Build (or reuse) the plan; the call itself is left unchanged.
@@ -113,7 +116,7 @@ def resolve_mixfusion_adapter(module: nn.Module, plan: dict | None) -> MixFusion
 
     Otherwise a plan whose root is a :class:`MixFusionRoot` gets the
     framework's :class:`ChunkedJointAdapter`. ``None`` means the model is not
-    packable and ragged batches run serially.
+    packable and requests retain dense admission.
     """
     explicit = getattr(module, "mixfusion_adapter", None)
     if explicit is not None:

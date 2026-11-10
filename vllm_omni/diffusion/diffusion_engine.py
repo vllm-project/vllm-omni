@@ -85,7 +85,7 @@ from vllm_omni.metrics.utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionRequestInfo
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -279,7 +279,6 @@ class DiffusionEngine:
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
     mixfusion_capability: MixFusionCapability
-    mixfusion_prepare_request: Callable[..., MixFusionRequestInfo | None] | None = None
 
     # Class-level defaults so tests using object.__new__ (without __init__)
     # don't hit AttributeError when _busy_loop accesses them.

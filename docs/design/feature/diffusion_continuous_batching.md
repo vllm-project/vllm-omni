@@ -219,10 +219,12 @@ cost of a pipeline contract the scheduler must not assume generically:
   their key.
 
 After model loading, offload and cache setup, the engine collects the actual
-MixFusion capability from every worker rank. A model supplies a serializable
-request configuration and a host-side `prepare_mixfusion_request` helper.
-This helper resolves latent geometry and request-specific constraints before
-Scheduler admission. It does not run text encoding or create device tensors.
+MixFusion capability from every worker rank. The root of `_mixfusion_plan`
+declares the request layout and its configuration sources. The framework
+resolves those sources on the loaded pipeline/transformer and sends the
+serializable values to the engine. Its common host preparation resolves
+latent geometry and request-specific constraints before Scheduler admission,
+without text encoding, device tensors or per-model preparation callbacks.
 
 Only requests with prepared `MixFusionRequestInfo` relax the resolution key.
 Dense and packed requests have distinct keys. Static unsupported combinations
@@ -282,7 +284,12 @@ A model opts in with a declaration and two small hooks into existing code:
 ```python
 _mixfusion_plan = {
     # Per-request latent list in, one prediction per request out.
-    "": MixFusionRoot(),
+    "": MixFusionRoot(
+        request=MixFusionImageRequest(default_true_cfg_scale=4.0),
+        disabled_if=("zero_cond_t",),
+        required_inputs=("img_shapes", "txt_seq_lens"),
+        unsupported_inputs=("image_latents",),
+    ),
     # The _sp_plan split_output boundary: the framework runs it once per
     # request and chunk-stacks hidden_states / vid_freqs, stacking txt_freqs.
     "image_rope_prepare": MixFusionChunkOutputs(
@@ -293,8 +300,6 @@ _mixfusion_plan = {
     "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
 }
 
-def mixfusion_validate_inputs(self, input_batch) -> None:
-    ...  # optional runtime assertions; raise on contract mismatch
 ```
 
 - `MixFusionRoot` names the per-request latent argument, the request-level
@@ -302,6 +307,16 @@ def mixfusion_validate_inputs(self, input_batch) -> None:
   defaults). `ChunkedJointAdapter` builds the plan from them, reusing it per
   CFG branch while the layout key (scheduled chunk size, latent shapes, text width, real text
   lengths) is unchanged.
+- `MixFusionImageRequest` describes a plain text-to-image grid. VAE scale and
+  default sample size refer to pipeline attributes; channel count refers to
+  the transformer. Dotted attribute paths or integer constants are accepted.
+  Latent patch size and the default true-CFG scale are declared explicitly
+  when they differ from the defaults. Common code computes request geometry
+  and CFG compatibility. This is not an inference rule for arbitrary video,
+  editing or reference-image layouts; those need a matching layout declaration.
+- `disabled_if` names transformer flags that disable packed admission.
+  `required_inputs` and `unsupported_inputs` name `InputBatch` fields checked
+  by the framework adapter, with no model-specific validation method.
 - `MixFusionChunkOutputs` reuses the model's own projection/RoPE module: each
   request's call sees its own geometry, so positional tables match
   individual execution by construction. A model that already has an
@@ -311,10 +326,9 @@ def mixfusion_validate_inputs(self, input_batch) -> None:
   in `extra[MIXFUSION_PLAN_KEY]`; RoPE application must accept per-row tables
   (the chunk-stacked layout has one table row per chunk).
 - The pipeline declares `supports_mixfusion: ClassVar[bool] = True` and its
-  keyword builder accepts a per-request latent list. It also provides
-  `mixfusion_request_config()` from the loaded model and a static
-  `prepare_mixfusion_request(request, config, min_chunk_tokens, max_chunks)`
-  that returns host metadata or `None` for ordinary dense admission.
+  keyword builder accepts a per-request latent list. Request preparation is
+  owned by `mixfusion/request.py`; models do not add a request module or
+  implement configuration/preparation callbacks.
 
 The hooks stay inert unless the driver arms a `MixFusionStep`; without one
 the model runs its ordinary dense forward. Model-specific eligibility is

@@ -11,7 +11,15 @@ may be overridden per request through ``sampling.extra_args``.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from operator import attrgetter
+from typing import TYPE_CHECKING, Any
+
+from vllm_omni.diffusion.mixfusion.plan import MixFusionImageRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 # Defaults for requests that do not carry per-request MixFusion extras.
 DEFAULT_MIN_CHUNK_TOKENS = 256
@@ -20,6 +28,65 @@ DEFAULT_MAX_CHUNKS = 128
 #: Step-batch key fields MixFusion relaxes so mixed resolutions share a step.
 #: Dense admission retains them: equal-area images can have different RoPE.
 RELAXED_STEP_KEY_FIELDS = ("height", "width", "resolution")
+
+
+@dataclass(frozen=True)
+class MixFusionImageRequestConfig:
+    """Resolved plan values sent from workers to the host scheduler."""
+
+    vae_scale_factor: int
+    default_sample_size: int
+    channels: int
+    patch_size: int
+    default_true_cfg_scale: float
+
+
+def resolve_image_request_config(
+    plan: MixFusionImageRequest, pipeline: object, transformer: object
+) -> MixFusionImageRequestConfig:
+    def resolve(source: str | int, owner: object) -> int:
+        value = attrgetter(source)(owner) if isinstance(source, str) else source
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"MixFusion image layout requires a positive integer for {source!r}, got {value!r}")
+        return value
+
+    return MixFusionImageRequestConfig(
+        resolve(plan.vae_scale_factor, pipeline),
+        resolve(plan.default_sample_size, pipeline),
+        resolve(plan.channels, transformer),
+        resolve(plan.patch_size, transformer),
+        plan.default_true_cfg_scale,
+    )
+
+
+def image_token_grid(height: int, width: int, vae_scale_factor: int, patch_size: int) -> tuple[int, int]:
+    return int(height) // (vae_scale_factor * patch_size), int(width) // (vae_scale_factor * patch_size)
+
+
+def prepare_image_request(
+    request: OmniDiffusionRequest,
+    config: MixFusionImageRequestConfig,
+    min_chunk_tokens: int,
+    max_chunks: int,
+) -> MixFusionRequestInfo | None:
+    """Interpret the declared image grid using the common request schema."""
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+
+    sampling, prompt = request.sampling_params, request.prompt
+    if not isinstance(prompt, str):
+        if not isinstance(prompt, dict) or set(prompt) - {"prompt", "negative_prompt"}:
+            return None
+    if sampling.latents is not None:
+        return None
+    height = sampling.height or config.default_sample_size * config.vae_scale_factor
+    width = sampling.width or config.default_sample_size * config.vae_scale_factor
+    h, w = image_token_grid(height, width, config.vae_scale_factor, config.patch_size)
+    num_images = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+    negative = isinstance(prompt, dict) and prompt.get("negative_prompt") is not None
+    true_cfg = (sampling.true_cfg_scale or config.default_true_cfg_scale) > 1 and negative
+    return MixFusionRequestInfo(
+        (num_images, h * w, config.channels), min_chunk_tokens, max_chunks, condition_key=(true_cfg,)
+    )
 
 
 def mixfusion_requested(sampling: Any, od_config: Any, *, supported: bool) -> bool:

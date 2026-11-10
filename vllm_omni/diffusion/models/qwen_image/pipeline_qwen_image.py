@@ -26,17 +26,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
+from vllm_omni.diffusion.mixfusion.request import image_token_grid
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
-)
-from vllm_omni.diffusion.models.qwen_image.mixfusion_request import (
-    QwenMixFusionConfig,
-    image_token_grid,
-    prepare_mixfusion_request,
 )
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
@@ -287,13 +283,6 @@ class QwenImagePipeline(
     # step via ragged latents, so the scheduler may relax height/width out of
     # the batch key when MixFusion is enabled.
     supports_mixfusion: ClassVar[bool] = True
-
-    prepare_mixfusion_request = staticmethod(prepare_mixfusion_request)
-
-    def mixfusion_request_config(self) -> QwenMixFusionConfig | None:
-        if self.transformer.zero_cond_t:
-            return None
-        return QwenMixFusionConfig(self.vae_scale_factor, self.default_sample_size, self.transformer.in_channels)
 
     supports_weight_reload: ClassVar[bool] = True
 
@@ -606,7 +595,7 @@ class QwenImagePipeline(
         # generator=torch.Generator(device="cuda").manual_seed(42)
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
-        token_height, token_width = image_token_grid(height, width, self.vae_scale_factor)
+        token_height, token_width = image_token_grid(height, width, self.vae_scale_factor, patch_size=2)
         height, width = 2 * token_height, 2 * token_width
 
         shape = (batch_size, 1, num_channels_latents, height, width)

@@ -189,7 +189,7 @@ warning is logged if it was off), so the command above works without
 Constraints on the packed path:
 
 - **Model configuration**: the loaded model must expose a packing plan and
-  host-side request preparation. SP, CFG parallel and conflicting forward
+  a request-layout declaration. SP, CFG parallel and conflicting forward
   hooks keep requests on ordinary dense scheduling; the engine reports the
   reason at initialization.
 - **Request inputs**: currently Qwen-Image text-to-image requests are eligible.

@@ -6,7 +6,7 @@ The fake DiT here deliberately uses non-Qwen argument and output names, so the
 declarative path is shown to depend only on the plan:
 
 - the chunked adapter builds the plan from the root declaration, reuses it
-  while the layout is unchanged and validates runtime inputs through ``mixfusion_validate_inputs``;
+  while the layout is unchanged and validates the root's input requirements;
 - the chunk-outputs boundary runs the model's own module once per request and
   chunk-stacks / per-request-stacks its outputs, matching individual calls;
 - a packed forward reassembles one output per request equal to running each
@@ -65,7 +65,9 @@ class _Block(nn.Module):
 
 class _FakeDiT(nn.Module):
     _mixfusion_plan = {
-        "": MixFusionRoot(ragged_arg="x", text_arg="ctx", text_mask_arg="ctx_mask", output_attr="pred"),
+        "": MixFusionRoot(
+            ragged_arg="x", text_arg="ctx", text_mask_arg="ctx_mask", output_attr="pred", required_inputs=("grids",)
+        ),
         "embed": MixFusionChunkOutputs(
             per_request_args=("x", "grids"),
             outputs=(ChunkedOutput(seq_dim=1), ChunkedOutput(seq_dim=0), PerRequestOutput()),
@@ -85,10 +87,6 @@ class _FakeDiT(nn.Module):
         for block in self.blocks:
             x = block(x, cond, pos)
         return SimpleNamespace(pred=x)
-
-    def mixfusion_validate_inputs(self, input_batch):
-        if input_batch.grids is None:
-            raise ValueError("no grids")
 
 
 def _requests():
@@ -117,10 +115,10 @@ def test_resolve_prefers_an_explicit_adapter():
     assert resolve_mixfusion_adapter(nn.Module(), {"blocks.*.mod": MixFusionExpandRows()}) is None
 
 
-def test_validation_delegates_to_model():
+def test_validation_uses_declared_input_requirements():
     adapter = ChunkedJointAdapter(_FakeDiT._mixfusion_plan[""])
     adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=[(1, 1)]))
-    with pytest.raises(ValueError, match="no grids"):
+    with pytest.raises(ValueError, match="missing grids"):
         adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=None))
 
 

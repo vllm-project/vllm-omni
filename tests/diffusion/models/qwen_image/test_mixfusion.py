@@ -6,7 +6,7 @@ The generic driver, hooks, chunked adapter and layout primitives are covered
 under ``tests/diffusion/mixfusion`` and ``tests/diffusion/hooks``. This module
 pins what is Qwen-specific:
 
-* ``mixfusion_validate_inputs`` and that the real ``_mixfusion_plan`` exposes the
+* declared input requirements and that the real ``_mixfusion_plan`` exposes the
   block boundaries to the foreign-hook guard;
 * the pipeline's dense keyword builder feeding a packed list through an armed
   step, with and without sequential true-CFG;
@@ -91,7 +91,7 @@ def _transformer(blocks: list[nn.Module] | None = None) -> tuple[QwenImageTransf
 
 def test_validate_inputs_rejects_reference_images_and_missing_shapes():
     transformer, _ = _transformer()
-    adapter = ChunkedJointAdapter(MixFusionRoot())
+    adapter = ChunkedJointAdapter(QwenImageTransformer2DModel._mixfusion_plan[""])
     batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=None)
     adapter.validate_inputs(transformer, batch)
     batch.img_shapes = None
@@ -99,7 +99,7 @@ def test_validate_inputs_rejects_reference_images_and_missing_shapes():
         adapter.validate_inputs(transformer, batch)
     batch.img_shapes = [(16, 2, 2)]
     batch.image_latents = torch.zeros(1, 4, 8)
-    with pytest.raises(ValueError, match="editing/reference"):
+    with pytest.raises(ValueError, match="unsupported image_latents"):
         adapter.validate_inputs(transformer, batch)
 
 

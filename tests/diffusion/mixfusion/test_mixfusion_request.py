@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 import pytest
 
+from vllm_omni.diffusion.mixfusion.request import MixFusionImageRequestConfig
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
 from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
-from vllm_omni.diffusion.models.qwen_image.mixfusion_request import QwenMixFusionConfig, prepare_mixfusion_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -29,8 +29,7 @@ class _Config:
 @dataclass
 class _Engine:
     od_config: _Config
-    mixfusion_capability = MixFusionCapability(QwenMixFusionConfig(8, 128, 64), "")
-    mixfusion_prepare_request = staticmethod(prepare_mixfusion_request)
+    mixfusion_capability: MixFusionCapability = MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, 4.0), "")
 
 
 def _request(rid, h=1024, w=1024, *, engine=None, **sampling):
@@ -126,3 +125,19 @@ def test_geometry_uses_loaded_model_defaults_and_patch_grid():
     request = _request("a", None, None, engine=_Engine(_Config()))
     assert request.mixfusion_info.shape == (1, 4096, 64)
     assert _request("b", 1031, 777).mixfusion_info.shape == (1, 64 * 48, 64)
+
+
+@pytest.mark.parametrize("default_scale,uses_cfg", [(1.0, False), (4.0, True)])
+def test_declared_cfg_default_controls_compatibility(default_scale, uses_cfg):
+    engine = _Engine(_Config(), MixFusionCapability(MixFusionImageRequestConfig(8, 128, 64, 2, default_scale), ""))
+    request = _request("a")
+    request.prompt = {"prompt": "a fox", "negative_prompt": " "}
+    prepare_mixfusion_admission(engine, request)
+    assert request.mixfusion_info.condition_key == (uses_cfg,)
+
+
+def test_image_declaration_keeps_extra_prompt_inputs_dense():
+    request = _request("a")
+    request.prompt = {"prompt": "a fox", "additional_information": {"reference": "image"}}
+    prepare_mixfusion_admission(_Engine(_Config()), request)
+    assert request.mixfusion_info is None

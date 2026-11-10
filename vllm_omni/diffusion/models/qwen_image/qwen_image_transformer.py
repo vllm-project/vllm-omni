@@ -72,6 +72,7 @@ from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionChunkOutputs,
     MixFusionExpandArg,
     MixFusionExpandRows,
+    MixFusionImageRequest,
     MixFusionRoot,
     PerRequestOutput,
 )
@@ -1216,7 +1217,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # forward context per packed denoise step; these boundary hooks then run
     # the chunk-stacked layout without any MixFusion branching in forward().
     _mixfusion_plan = {
-        "": MixFusionRoot(),
+        "": MixFusionRoot(
+            request=MixFusionImageRequest(default_true_cfg_scale=4.0),
+            disabled_if=("zero_cond_t",),
+            required_inputs=("img_shapes", "txt_seq_lens"),
+            unsupported_inputs=("image_latents",),
+        ),
         # The _sp_plan split_output boundary: run per request, then chunk-stack
         # hidden_states / vid_freqs and stack the per-request txt_freqs.
         "image_rope_prepare": MixFusionChunkOutputs(
@@ -1226,13 +1232,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
         "transformer_blocks.*.img_mod": MixFusionExpandRows(),
         "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
-
-    def mixfusion_validate_inputs(self, input_batch) -> None:
-        """Validate the runtime side of the scheduler's packing contract."""
-        if self.zero_cond_t or input_batch.image_latents is not None:
-            raise ValueError("Scheduled MixFusion batch contains unsupported editing/reference inputs")
-        if input_batch.img_shapes is None or input_batch.txt_seq_lens is None:
-            raise ValueError("Scheduled MixFusion batch is missing img_shapes or txt_seq_lens")
 
     def __init__(
         self,

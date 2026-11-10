@@ -14,7 +14,12 @@ Example (Qwen-Image)::
 
     _mixfusion_plan = {
         # Per-request latent list in, one prediction per request out.
-        "": MixFusionRoot(),
+        "": MixFusionRoot(
+            request=MixFusionImageRequest(default_true_cfg_scale=4.0),
+            disabled_if=("zero_cond_t",),
+            required_inputs=("img_shapes", "txt_seq_lens"),
+            unsupported_inputs=("image_latents",),
+        ),
         # Run the model's own projection + RoPE boundary once per request and
         # chunk-stack its outputs (the _sp_plan "split_output" boundary).
         "image_rope_prepare": MixFusionChunkOutputs(
@@ -40,6 +45,24 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class MixFusionImageRequest:
+    """Declare a text-to-image request's grid before tensors are allocated.
+
+    Attribute paths are resolved on the loaded pipeline for VAE/default size,
+    and on the plan's transformer for channels. Integer constants work too.
+    ``patch_size`` describes latent packing, not the attention kernel.
+    Other input layouts need their own declaration before admission can relax
+    their shapes; this declaration accepts plain text prompts only.
+    """
+
+    vae_scale_factor: str | int = "vae_scale_factor"
+    default_sample_size: str | int = "default_sample_size"
+    channels: str | int = "in_channels"
+    patch_size: int = 2
+    default_true_cfg_scale: float = 1.0
+
+
+@dataclass(frozen=True)
 class MixFusionRoot:
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
@@ -48,12 +71,22 @@ class MixFusionRoot:
     the output attribute holding the image prediction. The defaults follow the
     diffusers DiT convention. The joint attention streams are named ``"text"``
     and ``"image"``.
+
+    ``request`` describes host-side admission; omitting it keeps dense
+    scheduling. The remaining declarations guard runtime mode and inputs
+    without adding configuration/preparation/validation methods to the model.
     """
 
     ragged_arg: str = "hidden_states"
     text_arg: str = "encoder_hidden_states"
     text_mask_arg: str | None = "encoder_hidden_states_mask"
     output_attr: str = "sample"
+    request: MixFusionImageRequest | None = None
+    # Truthy transformer attributes disable packed admission at startup.
+    disabled_if: tuple[str, ...] = ()
+    # InputBatch fields checked by the common adapter before execution.
+    required_inputs: tuple[str, ...] = ()
+    unsupported_inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

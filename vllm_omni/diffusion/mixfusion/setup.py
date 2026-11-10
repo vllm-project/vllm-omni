@@ -9,6 +9,7 @@ MixFusion logic of their own.
 from __future__ import annotations
 
 from collections.abc import Callable
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
 from torch import nn
@@ -17,6 +18,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+from vllm_omni.diffusion.mixfusion.request import prepare_image_request, resolve_image_request_config
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 
@@ -112,6 +115,11 @@ def packing_unavailable_reason(pipeline: nn.Module) -> str | None:
     transformer = driver.transformer
     if not getattr(transformer, "_mixfusion_hooks_applied", False):
         raise RuntimeError("Declared MixFusion hooks were not installed")
+    root = transformer._mixfusion_plan.get("")
+    if isinstance(root, MixFusionRoot):
+        for name in root.disabled_if:
+            if attrgetter(name)(transformer):
+                return f"packed layout is disabled by {name}"
     if getattr(pipeline, "attention_kwargs", None):
         return "attention_kwargs is set"
     parallel = getattr(pipeline, "parallel_config", None)
@@ -129,22 +137,19 @@ def inspect_mixfusion_capability(pipeline: nn.Module) -> MixFusionCapability:
     reason = packing_unavailable_reason(pipeline)
     if reason is not None:
         return MixFusionCapability(reason=reason)
-    prepare = getattr(pipeline, "prepare_mixfusion_request", None)
-    configure = getattr(pipeline, "mixfusion_request_config", None)
-    if prepare is None or configure is None:
-        return MixFusionCapability(reason="model declares no host-side MixFusion request preparation")
-    config = configure()
-    if config is None:
-        return MixFusionCapability(reason="model configuration does not support packed requests")
+    transformer = pipeline.mixfusion_driver.transformer
+    root = transformer._mixfusion_plan.get("")
+    if not isinstance(root, MixFusionRoot) or root.request is None:
+        return MixFusionCapability(reason="MixFusion root declares no request layout")
+    config = resolve_image_request_config(root.request, pipeline, transformer)
     return MixFusionCapability(request_config=config, reason="")
 
 
 def initialize_mixfusion_admission(engine: DiffusionEngine) -> None:
     """Discover initialized rank capabilities once, before accepting requests."""
-    from vllm_omni.diffusion.registry import resolve_diffusion_pipeline_cls, supports_mixfusion
+    from vllm_omni.diffusion.registry import supports_mixfusion
 
     engine.mixfusion_capability = MixFusionCapability()
-    engine.mixfusion_prepare_request = None
     if engine.execution_mode != "step_batch" or not supports_mixfusion(engine.od_config):
         return
     capabilities = engine.executor.collective_rpc(
@@ -156,11 +161,6 @@ def initialize_mixfusion_admission(engine: DiffusionEngine) -> None:
     if capabilities[0].request_config is None:
         logger.info("MixFusion uses dense admission: %s", capabilities[0].reason)
         return
-    pipeline_cls = resolve_diffusion_pipeline_cls(engine.od_config)
-    prepare = getattr(pipeline_cls, "prepare_mixfusion_request", None)
-    if not callable(prepare):
-        raise RuntimeError("Loaded MixFusion model has no host-side request preparer")
-    engine.mixfusion_prepare_request = prepare
 
 
 def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionRequest) -> None:
@@ -173,15 +173,15 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
     from vllm_omni.diffusion.mixfusion.scheduling import plan_batch
 
     request.mixfusion_info = None
-    prepare = getattr(engine, "mixfusion_prepare_request", None)
-    if prepare is None or not request.use_step_execution:
+    capability = getattr(engine, "mixfusion_capability", None)
+    if capability is None or capability.request_config is None or not request.use_step_execution:
         return
     if not mixfusion_requested(request.sampling_params, engine.od_config, supported=True):
         return
     extras = request.sampling_params.extra_args or {}
-    info = prepare(
+    info = prepare_image_request(
         request,
-        engine.mixfusion_capability.request_config,
+        capability.request_config,
         int(
             extras.get(
                 "mixfusion_min_chunk_tokens",
