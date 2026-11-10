@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -789,6 +789,15 @@ class MiniMaxH3DiTBlock(nn.Module):
             prefix=f"{prefix}.adaln_proj",
             adaln_cache=adaln_cache,
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load this block alone during per-block pre-sharded HSDP loading.
+
+        Names are block-relative. Conversion is delegated to the owning
+        ``MiniMaxH3DiTModel`` so the block and the whole-DiT loaders share one
+        implementation for every native, Diffusers and quantized layout.
+        """
+        return self._h3_dit_owner().load_block_weights(self.layer_index, weights)
 
     def forward(
         self,

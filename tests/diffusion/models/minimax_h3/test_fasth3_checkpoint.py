@@ -900,3 +900,171 @@ def test_resolve_sigma_positions_uses_release_metadata_schedule():
     assert steps == 8 == len(positions) - 1
     with pytest.raises(OmniClientError, match="must be 8"):
         pipeline._resolve_sigma_positions("t2va", _sampling(num_inference_steps=9))
+
+
+def _paired_fixtures(*, diffusers_weights: bool):
+    """Two identical fixtures: one loaded through the root, one block by block."""
+    import weakref
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTBlock
+
+    fixtures = []
+    for _ in range(2):
+        model, _, _ = _load_fixture(diffusers_weights=diffusers_weights)
+        block = model.blocks[0]
+        block.__class__ = type("_Block", (MiniMaxH3DiTBlock,), {"__init__": nn.Module.__init__})
+        block.layer_index = 0
+        object.__setattr__(block, "_h3_dit_owner", weakref.ref(model))
+        fixtures.append(model)
+    return fixtures
+
+
+def _add_scale(model, name, shape, loader=None):
+    module = model.blocks[0].get_submodule(name.rpartition(".")[0])
+    param = nn.Parameter(torch.zeros(shape), requires_grad=False)
+    param.weight_loader = loader or (lambda p, value, *shard: p.data.copy_(value.reshape_as(p)))
+    module.register_parameter(name.rpartition(".")[2], param)
+
+
+def _assert_same_state(root, per_block):
+    root_state = dict(root.blocks[0].named_parameters())
+    block_state = dict(per_block.blocks[0].named_parameters())
+    assert root_state.keys() == block_state.keys()
+    for name, value in root_state.items():
+        torch.testing.assert_close(block_state[name], value, rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize(
+    "native_weights",
+    [
+        pytest.param({"attn.qkv_proj.weight": (12, 3), "mlp.fc1.weight": (6, 3)}, id="bf16"),
+        pytest.param({"attn.qkv_proj.weight_scale": (12,)}, id="grouped-qkv-scale"),
+        pytest.param({"attn.qkv_proj.weight_scale": (1,)}, id="per-tensor-qkv-scale"),
+        pytest.param({"mlp.fc1.weight_scale": (6,)}, id="fc1-channel-scale"),
+    ],
+)
+def test_block_loader_matches_root_loader_for_native_layout(native_weights):
+    root, per_block = _paired_fixtures(diffusers_weights=False)
+    tensors = {}
+    for local, shape in native_weights.items():
+        tensors[local] = torch.arange(int(torch.Size(shape).numel()), dtype=torch.float32).reshape(shape) + 1
+        if local.endswith("weight_scale"):
+            for model in (root, per_block):
+                if local.startswith("mlp.fc1") and shape != (1,):
+
+                    def fc1_scale(p, value, shard):
+                        p.data[shard * 3 : (shard + 1) * 3].copy_(value)
+
+                    _add_scale(model, local, shape, fc1_scale)
+                else:
+                    _add_scale(model, local, shape)
+
+    root_loaded = root.load_weights([(f"blocks.0.{name}", tensor) for name, tensor in tensors.items()])
+    block_loaded = per_block.blocks[0].load_weights(list(tensors.items()))
+
+    assert block_loaded == {name.removeprefix("blocks.0.") for name in root_loaded}
+    _assert_same_state(root, per_block)
+
+
+def test_block_loader_matches_root_loader_for_diffusers_layout():
+    root, per_block = _paired_fixtures(diffusers_weights=True)
+    for model in (root, per_block):
+        qkv = model.blocks[0].attn.qkv_proj
+        _add_scale(
+            model,
+            "attn.qkv_proj.weight_scale",
+            (12,),
+            lambda p, value, shard: p.data[{"q": 0, "k": 4, "v": 8}[shard] : {"q": 4, "k": 8, "v": 12}[shard]].copy_(
+                value
+            ),
+        )
+        del qkv
+    tensors = {
+        "attn.to_q.weight": torch.arange(12.0).reshape(4, 3) + 10,
+        "attn.to_k.weight": torch.arange(12.0).reshape(4, 3) + 100,
+        "attn.to_v.weight": torch.arange(12.0).reshape(4, 3) + 200,
+        "ff.net.0.proj.weight": torch.arange(18.0).reshape(6, 3) + 300,
+        # FastVideo serializes per-channel scales as [N, 1].
+        "attn.to_q.weight_scale": torch.arange(4.0).reshape(4, 1) + 1,
+        "attn.to_k.weight_scale": torch.arange(4.0).reshape(4, 1) + 11,
+        "attn.to_v.weight_scale": torch.arange(4.0).reshape(4, 1) + 21,
+    }
+
+    root.load_weights([(f"transformer_blocks.0.{name}", tensor) for name, tensor in tensors.items()])
+    block_loaded = per_block.blocks[0].load_weights(list(tensors.items()))
+
+    assert block_loaded == {"attn.qkv_proj.weight", "attn.qkv_proj.weight_scale", "mlp.fc1.weight"}
+    _assert_same_state(root, per_block)
+
+
+def test_block_loader_rejects_incomplete_diffusers_qkv_group():
+    _, per_block = _paired_fixtures(diffusers_weights=True)
+
+    with pytest.raises(ValueError, match="incomplete Diffusers H3 QKV group blocks.0.attn.qkv_proj.weight"):
+        per_block.blocks[0].load_weights([("attn.to_q.weight", torch.zeros(4, 3))])
+
+
+def test_pipeline_remap_renames_only_diffusers_block_prefix():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    remap = MiniMaxH3Pipeline._remap_ckpt_key
+    assert remap("transformer.transformer_blocks.3.attn.to_q.weight") == "transformer.blocks.3.attn.to_q.weight"
+    assert remap("transformers_ref.transformer_blocks.0.norm1.weight") == "transformers_ref.blocks.0.norm1.weight"
+    assert remap("transformer.blocks.3.norm1.weight") == "transformer.blocks.3.norm1.weight"
+    assert remap("text_encoder.model.layers.0.weight") == "text_encoder.model.layers.0.weight"
+
+
+def _gate_pipeline(loaded_by_dit: set[str]):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = _PipelineLoadTransformer(loaded_by_dit)
+    pipeline.video_vae = None
+    pipeline.audio_vae = None
+    pipeline._vdn = None
+    pipeline._regenerate = None
+    pipeline._fasth3 = None
+    pipeline._fasth3_checkpoint = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    return pipeline
+
+
+def test_pipeline_load_weights_without_dit_stream_skips_dit_validation():
+    pipeline = _gate_pipeline(set())
+    pipeline.text_encoder = _PipelineLoadTransformer({"layer.weight"})
+
+    loaded = pipeline.load_weights([("text_encoder.layer.weight", torch.zeros(1))])
+
+    assert loaded == {"text_encoder.layer.weight"}
+
+
+def test_constructed_dit_blocks_load_through_their_owner(monkeypatch):
+    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import (
+        _FakeAttention,
+        _FakeLinear,
+        _small_od_config,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(h3, name, _FakeLinear)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+    od_config = _small_od_config()
+    # Without the AdaLN cache, construction never queries a CUDA device.
+    od_config.cache_config = {"minimax_h3_adaln_cache": False}
+    model = h3.MiniMaxH3DiTModel(od_config, diffusers_weights=False)
+    calls: list[tuple[int, list[tuple[str, torch.Tensor]]]] = []
+
+    def load_block_weights(index: int, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        calls.append((index, list(weights)))
+        return {"norm1.weight"}
+
+    monkeypatch.setattr(model, "load_block_weights", load_block_weights)
+
+    assert model.blocks[0].load_weights([("norm1.weight", torch.ones(1))]) == {"norm1.weight"}
+    assert [(index, [name for name, _ in weights]) for index, weights in calls] == [(0, ["norm1.weight"])]
+    assert not any("_h3_dit_owner" in name for name in model.state_dict())

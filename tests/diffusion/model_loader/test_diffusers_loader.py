@@ -2378,6 +2378,48 @@ def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker, 
     proxy_load.assert_called_once_with(loader, model, discovered, hsdp_config, torch.device("cpu"))
 
 
+def test_pre_sharded_hsdp_loads_and_processes_non_dit_sources(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded",
+        lora_path=None,
+        quantization_config=None,
+        num_weight_load_threads=1,
+        parallel_config=SimpleNamespace(use_hsdp=True, hsdp_replicate_size=1, hsdp_shard_size=2),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.text_encoder = nn.Linear(2, 2, bias=False)
+    dit_source = SimpleNamespace(prefix="transformer.")
+    encoder_source = SimpleNamespace(prefix="text_encoder.")
+    model.weights_sources = [dit_source, encoder_source]
+    discovered = PipelineModules(
+        dits=[model.transformer],
+        dit_names=["transformer"],
+        vaes=[],
+        encoders=[model.text_encoder],
+        encoder_names=["text_encoder"],
+        resident_modules=[],
+        resident_names=[],
+    )
+    loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = mocker.Mock()  # type: ignore[method-assign]
+    loader._process_weights_after_loading = mocker.Mock()  # type: ignore[method-assign]
+    mocker.patch.object(loader_mod.ModuleDiscovery, "discover", return_value=discovered)
+    mocker.patch("vllm_omni.diffusion.model_loader.checkpoint_load_proxy.load_with_checkpoint_proxies")
+
+    assert loader._load_model_with_hsdp(torch.device("cpu")) is model
+
+    loader.load_weights.assert_called_once_with(model, sources=[encoder_source], planned_weights=["transformer.weight"])
+    processed = loader._process_weights_after_loading.call_args.kwargs["modules_to_process"]
+    assert model.text_encoder in processed
+    assert model.transformer not in processed
+
+
 @pytest.mark.parametrize(
     "dtype,missing,optional_in_checkpoint,late_fp8",
     [
@@ -2797,3 +2839,87 @@ def test_pre_sharded_proxies_reject_duplicate_checkpoint_destinations(tmp_path, 
     with pytest.raises(ValueError, match="multiple proxy destinations"):
         proxy_module._load_checkpoint_shards(groups, HSDPInferenceConfig(enabled=True), torch.device("cpu"), 1)
     read.assert_not_called()
+
+
+def test_pre_sharded_meta_check_ignores_non_dit_online_quant_layers():
+    """An online-quantized encoder starts on meta and is loaded after the DiT groups."""
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.text_encoder = nn.Linear(2, 2, bias=False, device="meta")
+
+    DiffusersPipelineLoader._check_no_unplanned_meta_tensors(model, frozenset(), prefixes=("transformer.",))
+    with pytest.raises(ValueError, match="text_encoder.weight"):
+        DiffusersPipelineLoader._check_no_unplanned_meta_tensors(model, frozenset())
+
+    model.transformer.weight = nn.Parameter(torch.empty(2, 2, device="meta"))
+    with pytest.raises(ValueError, match="transformer.weight"):
+        DiffusersPipelineLoader._check_no_unplanned_meta_tensors(model, frozenset(), prefixes=("transformer.",))
+
+
+def _write_index_with_packed_sidecar(directory: Path) -> None:
+    """A BF16 index plus an unindexed packed file in the same directory (FastH3 QAD layout)."""
+    shard = "diffusion_pytorch_model-00001-of-00001.safetensors"
+    save_file({"transformer_blocks.0.norm1.weight": torch.ones(2)}, str(directory / shard))
+    (directory / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"transformer_blocks.0.norm1.weight": shard}})
+    )
+    save_file(
+        {
+            "transformer_blocks.0.attn.to_q::_nvfp4_weight": torch.zeros(2, 1, dtype=torch.uint8),
+            "transformer_blocks.0.attn.to_q::_nvfp4_alpha": torch.tensor(2.0),
+        },
+        str(directory / "nvfp4_weights.safetensors"),
+    )
+
+
+def test_pre_sharded_groups_plan_packed_sidecar_next_to_index(tmp_path):
+    from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    checkpoint = tmp_path / "transformer"
+    checkpoint.mkdir()
+    _write_index_with_packed_sidecar(checkpoint)
+
+    class Pipeline(nn.Module):
+        @staticmethod
+        def _remap_ckpt_key(name):
+            return name.replace("transformer.transformer_blocks.", "transformer.blocks.")
+
+    model = Pipeline()
+    model.transformer = nn.Module()
+    model.transformer.blocks = nn.ModuleList([nn.Module()])
+    model.transformer.blocks[0].norm1 = nn.Module()
+    model.transformer.blocks[0].norm1.weight = nn.Parameter(torch.empty(2))
+    model.transformer._hsdp_shard_conditions = [lambda name, module: name == "blocks.0"]
+    packed = DiffusersPipelineLoader.ComponentSource(
+        str(tmp_path),
+        "transformer",
+        None,
+        prefix="transformer.",
+        allow_patterns_overrides=["nvfp4_weights.safetensors"],
+    )
+    model.weights_sources = [
+        DiffusersPipelineLoader.ComponentSource(str(tmp_path), "transformer", None, prefix="transformer."),
+        packed,
+    ]
+    loader = _make_loader_with_weights([])
+    loader.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
+    )
+
+    groups, _ = _plan_checkpoint_groups(loader, model, discovered)
+
+    block = next(group for group in groups if group.name == "transformer.blocks.0")
+    assert {key: Path(path).name for key, path in block.checkpoint_entries.values()} == {
+        "transformer_blocks.0.norm1.weight": "diffusion_pytorch_model-00001-of-00001.safetensors",
+        "transformer_blocks.0.attn.to_q::_nvfp4_weight": "nvfp4_weights.safetensors",
+        "transformer_blocks.0.attn.to_q::_nvfp4_alpha": "nvfp4_weights.safetensors",
+    }
+    # The packed tensors stay attached to their own source, so adapters and
+    # quantization config are resolved for the sidecar, not the BF16 index.
+    by_source = {id(source): names for source, names in block.checkpoint_sources}
+    assert sorted(by_source[id(packed)]) == [
+        "transformer.blocks.0.attn.to_q::_nvfp4_alpha",
+        "transformer.blocks.0.attn.to_q::_nvfp4_weight",
+    ]

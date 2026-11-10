@@ -30,8 +30,10 @@ real block's weights, then applies FSDP sharding. Adapters use the component's
 quantization configuration and run before `convert_checkpoint_tensor`.
 Finally, it loads and processes the remaining DiT root weights and shards the root.
 
-This strategy requires the default diffusion pipeline loader, complete dedicated
-transformer checkpoint sources, and supported checkpoint key mappings.
+This strategy requires the default diffusion pipeline loader, a complete
+checkpoint source for each DiT, and supported checkpoint key mappings. Other
+weight sources, such as a text encoder registered in `weights_sources`, are
+loaded and post-processed afterwards through the ordinary loader.
 Tensor parallelism and LoRA are unsupported. Every worker needs checkpoint access.
 `num_weight_load_threads` controls the safetensors reader's threads per rank.
 
