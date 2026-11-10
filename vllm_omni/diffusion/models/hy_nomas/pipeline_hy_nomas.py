@@ -538,7 +538,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session(to_cpu=False) if bound is not None else None,
+                # Offloaded components own no resident decode budget, so fall
+                # back to the host-side decode there and keep device-resident
+                # decoding for the resident profiles.
+                self.vae.create_streaming_decode_session(to_cpu=not self._cpu_offload) if bound is not None else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:
