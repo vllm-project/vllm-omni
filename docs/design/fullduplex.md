@@ -820,12 +820,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
-MiniCPM-o native duplex treats `max_speak_chars_per_chunk` (default 28) as a
-soft target. It keeps the complete sampled token that reaches or crosses the
-target, then closes the chunk before another draw once the accepted prefix
-reaches the target. A decoded prefix ending in U+FFFD may continue to complete
-its UTF-8 bytes. Hard token and request caps retain priority; explicit
-`force_listen` bypasses only the soft character target.
+MiniCPM-o native duplex does not apply a character cap unless
+`max_speak_chars_per_chunk` is set to a positive value. The default is 0,
+so a chunk closes only at the official 20-token budget. A decoded prefix
+ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
+cap is set. That cap keeps the token that crosses the target, then closes
+the chunk before another draw. Hard token and request caps retain priority;
+explicit `force_listen` bypasses only the soft character target.
 
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change

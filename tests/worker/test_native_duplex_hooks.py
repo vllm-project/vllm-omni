@@ -2785,6 +2785,7 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
+    model.max_speak_chars_per_chunk = 28
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
     vocab_size = 151723
     candidate = 202
@@ -2803,7 +2804,8 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     sampled = model.sample(logits, sampling_metadata)
 
-    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 0
+    assert model.max_speak_chars_per_chunk == 28
     assert sampled is not None
     # Keep the complete token that reaches the soft character target.
     assert sampled.sampled_token_ids.tolist() == [[candidate]]

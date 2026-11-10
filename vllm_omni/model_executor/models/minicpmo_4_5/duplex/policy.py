@@ -96,7 +96,11 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
+    # Official streaming_generate closes a chunk at this token budget only.
+    # A 28-character cap fired earlier (16 tokens into "……数字") and the next
+    # unit then sampled <|turn_eos|>, so the number never followed. 0 disables
+    # the character cap; a positive max_speak_chars_per_chunk still opts in.
+    DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 0
     REPETITION_HISTORY_SIZE = 512
     # Talker handoff. A tail that still ends with one of these, after closing
     # quotes and brackets, has finished a sentence.
