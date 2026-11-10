@@ -320,6 +320,9 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     len(spans),
                     width,
                 )
+            # Disarm the per-step K-step state: this step falls back to the
+            # plain forward, so drafts and postprocess must follow suit.
+            self._kstep_ran_last = False
             return None
         if not uniform or len(infos) != len(spans):
             # K-step-armed decode step the frame loop cannot run. Falling back
@@ -342,20 +345,12 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     width,
                     MINICPMO_TALKER_FRAMES_MAX,
                 )
+            # Same as the prefill decline: disarm per-step K-step state.
+            self._kstep_ran_last = False
             return None
         # One replay per booked row. A width below the configured K would leave
         # rows unsampled; a width above it would write past the request's span.
         frames = width
-        # The K-step control head is two-wide (continue/stop). Keep the input
-        # batch's vocab in sync so the rejection sampler and any top-k
-        # bookkeeping do not address non-existent token ids.
-        try:
-            input_batch.vocab_size = 2
-        except AttributeError:
-            if not getattr(self, "_kstep_vocab_warned", False):
-                self._kstep_vocab_warned = True
-                logger.warning("[kstep] input_batch has no vocab_size; skipping stop-row vocab sync")
-
         if run_model is None:
 
             def run_model():
@@ -366,37 +361,60 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     return out[0]
                 return out
 
-        # make_omni_output reads its per-request info from the extra kwargs;
-        # forwarding the whole forward-input dict duplicates that key.
-        model_kwargs = {
-            "runtime_additional_information": infos,
-            "intermediate_tensors": model_inputs.get("intermediate_tensors"),
-        }
-        model_kwargs_extra = {
-            "request_token_spans": spans,
-            "model_intermediate_buffer": infos,
-        }
-        # The MRv2 stage loads the outer omni wrapper; the codec frame hooks
-        # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
-        # live on the inner talker, which the wrapper only partially forwards.
-        codec_model = getattr(self.model, "talker", self.model)
-        return multiframe.run(
-            model=codec_model,
-            run_model=run_model,
-            after_forward=lambda: None,
-            inputs_embeds=model_inputs.get("inputs_embeds"),
-            input_ids=model_inputs.get("input_ids"),
-            frames=frames,
-            model_kwargs=model_kwargs,
-            model_kwargs_extra=model_kwargs_extra,
-            narrow=None,
-        )
+        # The K-step control head is two-wide (continue/stop). Keep the input
+        # batch's vocab in sync so the rejection sampler and any top-k
+        # bookkeeping do not address non-existent token ids.
+        if not hasattr(input_batch, "vocab_size"):
+            # Fail closed: with the attribute missing, downstream sampling
+            # would index the two-wide control logits with the full codec
+            # vocab. V1 raises on an unusable step; so do we.
+            raise RuntimeError(
+                "[kstep] input_batch has no vocab_size; cannot sync the "
+                "two-wide control head safely"
+            )
+        prev_vocab_size = input_batch.vocab_size
+        input_batch.vocab_size = 2
+        # Arm the per-step K-step state: drafts and postprocess now follow
+        # the frame-loop semantics until the next decline re-disarms them.
+        self._kstep_ran_last = True
+        try:
+            # make_omni_output reads its per-request info from the extra kwargs;
+            # forwarding the whole forward-input dict duplicates that key.
+            model_kwargs = {
+                "runtime_additional_information": infos,
+                "intermediate_tensors": model_inputs.get("intermediate_tensors"),
+            }
+            model_kwargs_extra = {
+                "request_token_spans": spans,
+                "model_intermediate_buffer": infos,
+            }
+            # The MRv2 stage loads the outer omni wrapper; the codec frame hooks
+            # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
+            # live on the inner talker, which the wrapper only partially forwards.
+            codec_model = getattr(self.model, "talker", self.model)
+            return multiframe.run(
+                model=codec_model,
+                run_model=run_model,
+                after_forward=lambda: None,
+                inputs_embeds=model_inputs.get("inputs_embeds"),
+                input_ids=model_inputs.get("input_ids"),
+                frames=frames,
+                model_kwargs=model_kwargs,
+                model_kwargs_extra=model_kwargs_extra,
+                narrow=None,
+            )
+        finally:
+            # Restore before the next step: a declined or non-K-step batch on
+            # this runner must not see the two-wide control vocab.
+            input_batch.vocab_size = prev_vocab_size
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
         # K-step drafts are not predictions: they reserve the K-1 extra KV
         # rows of the next step. V1 feeds CONTINUE_TOKEN_ID (0) for every row;
         # MRv2's speculator (if any) would propose real token ids instead.
-        if not self._kstep_active():
+        if not getattr(self, "_kstep_ran_last", False):
+            # A declined step fell back to the plain forward: leave no
+            # speculative CONTINUE rows behind and defer to the base flow.
             return super()._propose_draft_tokens(input_batch, draft, num_sampled, num_rejected, mm_inputs)
         n = int(draft.num_spec_tokens or 0)
         if n > 0:

@@ -87,10 +87,12 @@ def test_span_info_count_mismatch_raises():
 def test_gate_passes_to_frame_loop(monkeypatch):
     import vllm_omni.platforms.npu.worker.talker_multiframe as multiframe
 
-    calls = {}
+    seen = {}
 
     def fake_run(**kwargs):
-        calls.update(kwargs)
+        # Late-binding closure: records the vocab the frame loop actually saw.
+        seen["vocab"] = input_batch.vocab_size
+        seen["frames"] = kwargs["frames"]
         return "frame-loop-output"
 
     monkeypatch.setattr(multiframe, "run", fake_run)
@@ -100,6 +102,87 @@ def test_gate_passes_to_frame_loop(monkeypatch):
     ns, input_batch, model_inputs = _make_runner(spans, infos)
     out = _run(ns, input_batch, model_inputs)
     assert out == "frame-loop-output"
-    assert calls["frames"] == 8
-    # The stop-row vocab sync ran against the real input batch.
-    assert input_batch.vocab_size == 2
+    assert seen["frames"] == 8
+    # The stop-row vocab sync ran during the frame loop...
+    assert seen["vocab"] == 2
+    # ...and the original vocab is restored once the loop returns.
+    assert input_batch.vocab_size == 6562
+    # The per-step arm is on after a successful frame loop.
+    assert ns._kstep_ran_last is True
+
+
+def test_vocab_size_missing_fails_closed():
+    # Without vocab_size, sampling would index the two-wide control logits
+    # with the full codec vocab; V1 semantics fail closed, so must we.
+    spans = [(i * 8, (i + 1) * 8) for i in range(2)]
+    infos = [{"req_id": str(i)} for i in range(2)]
+    ns, input_batch, model_inputs = _make_runner(spans, infos)
+    del input_batch.vocab_size
+    with pytest.raises(RuntimeError, match="no vocab_size"):
+        _run(ns, input_batch, model_inputs)
+
+
+def test_declined_step_disarms_kstep_state():
+    # A width-1 decode step falls back to the plain forward and must not
+    # leave per-step K-step state (drafts/postprocess arm) behind.
+    spans = [(0, 1), (1, 2), (2, 3)]
+    infos = [{"req_id": str(i)} for i in range(3)]
+    ns, input_batch, model_inputs = _make_runner(spans, infos)
+    ns._kstep_ran_last = True
+    assert _run(ns, input_batch, model_inputs) is None
+    assert ns._kstep_ran_last is False
+
+
+def test_prefill_decline_disarms_kstep_state():
+    spans = [(0, 14), (14, 25)]
+    infos = [{"req_id": str(i)} for i in range(2)]
+    ns, input_batch, model_inputs = _make_runner(spans, infos, has_prefill=True)
+    ns._kstep_ran_last = True
+    assert _run(ns, input_batch, model_inputs) is None
+    assert ns._kstep_ran_last is False
+
+
+def test_propose_draft_tokens_falls_back_after_decline(monkeypatch):
+    # After a declined step the runner must defer to the base proposal flow
+    # instead of writing speculative CONTINUE rows.
+    seen = {}
+    monkeypatch.setattr(
+        runner_mod.OmniARModelRunner,
+        "_propose_draft_tokens",
+        lambda self, ib, draft, ns_, nr, mm: seen.setdefault("called", (ib, draft)) and None,
+    )
+
+    class _FakeRunner(runner_mod.NPUOmniARModelRunner):
+        pass
+
+    runner = object.__new__(_FakeRunner)
+    runner._kstep_ran_last = False
+    draft = types.SimpleNamespace(num_spec_tokens=2)
+    out = runner_mod.NPUOmniARModelRunner._propose_draft_tokens(runner, "ib", draft, 1, 0, None)
+    assert seen["called"] == ("ib", draft)
+    assert out is None  # the fake base returns None; we propagate it
+
+
+def test_propose_draft_tokens_writes_continue_after_run():
+    # After a successful frame loop the K-step arm reserves K-1 KV rows by
+    # writing CONTINUE_TOKEN_ID (0) drafts, as V1 does.
+    import numpy as np
+
+    class _FakeRunner(runner_mod.NPUOmniARModelRunner):
+        pass
+
+    runner = object.__new__(_FakeRunner)
+    runner._kstep_ran_last = True
+    runner.req_states = types.SimpleNamespace(draft_tokens=np.full((3, 8), 5, dtype=np.int64))
+    ib = types.SimpleNamespace(idx_mapping=np.array([0, 1, 2]))
+    written = {}
+
+    class _Handler:
+        def set_draft_tokens(self, input_batch, arr):
+            written["arr"] = arr
+
+    runner.draft_tokens_handler = _Handler()
+    draft = types.SimpleNamespace(num_spec_tokens=2)
+    runner_mod.NPUOmniARModelRunner._propose_draft_tokens(runner, ib, draft, 1, 0, None)
+    assert (written["arr"] == 0).all()
+    assert written["arr"].shape == (3, 2)
