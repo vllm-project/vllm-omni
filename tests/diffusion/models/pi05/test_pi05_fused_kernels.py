@@ -419,13 +419,17 @@ def test_attention_matches_eager_attend(dtype, part):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-def test_batched_qkv_rope_and_attention_give_each_request_its_rows_alone(dtype):
+@pytest.mark.parametrize("batch", [3, 6, 10], ids=lambda batch: f"batch={batch}")
+def test_a_batch_gives_each_request_its_rows_alone(dtype, batch):
     """One launch over a batch reads each request's own K/V cache row, mask and
-    RoPE table: its Q, suffix K/V and attention output are the ones it has alone."""
-    batch, prefix = 3, 40
+    RoPE table, in the tiles its row count picks: a request's Q, suffix K/V,
+    attention output and the GEMMs after it are the ones it has alone."""
+    prefix = 40
     tokens, width, mlp_width = SHAPES["suffix"]
     n_keys = prefix + tokens
-    attn = _proj_dtype_module(_randomize(GemmaAttention(_gemma_config(width, mlp_width), layer_idx=0), seed=21), dtype)
+    config = _gemma_config(width, mlp_width)
+    attn = _proj_dtype_module(_randomize(GemmaAttention(config, layer_idx=0), seed=21), dtype)
+    mlp = _proj_dtype_module(_randomize(GemmaMLP(config), seed=27), dtype)
     x = _randn(batch * tokens, width, dtype=dtype, seed=22)
     cos = _randn(batch * tokens, HEAD_DIM, dtype=dtype, seed=23)
     sin = _randn(batch * tokens, HEAD_DIM, dtype=dtype, seed=24)
@@ -433,17 +437,23 @@ def test_batched_qkv_rope_and_attention_give_each_request_its_rows_alone(dtype):
     value = _randn(batch, n_keys, HEAD_DIM, dtype=dtype, seed=26)
     mask = torch.zeros(batch, tokens, n_keys, device=DEVICE)
     for b in range(batch):  # every request hides a different part of its prefix
-        mask[b, :, : 7 * b] = M.OPENPI_ATTENTION_MASK_VALUE
+        mask[b, :, : 3 * b] = M.OPENPI_ATTENTION_MASK_VALUE
+    if M._triton_gemms(dtype):  # the batch and one request run in different tiles
+        assert M._tiles("linear", dtype, batch * tokens) != M._tiles("linear", dtype, tokens)
 
     def run(x, cos, sin, key, value, mask):
         n = key.shape[0]
         key, value = key.clone(), value.clone()
         q = torch.empty(n, HEADS, tokens, HEAD_DIM, dtype=dtype, device=DEVICE)
         scores = torch.empty(n * HEADS * tokens, n_keys, dtype=dtype, device=DEVICE)
-        out = torch.empty(n * tokens, HEADS * HEAD_DIM, dtype=dtype, device=DEVICE)
+        att = torch.empty(n * tokens, HEADS * HEAD_DIM, dtype=dtype, device=DEVICE)
+        hidden = torch.empty(n * tokens, width, dtype=dtype, device=DEVICE)
+        mlp_hidden = torch.empty(n * tokens, mlp_width, dtype=dtype, device=DEVICE)
         M._fused_qkv_rope(x, attn, cos, sin, q, key[:, prefix:], value[:, prefix:])
-        M._fused_attention(q, key, value, mask, 1.0 / math.sqrt(HEAD_DIM), scores, out)
-        return q, key, value, out.view(n, tokens, -1)
+        M._fused_attention(q, key, value, mask, 1.0 / math.sqrt(HEAD_DIM), scores, att)
+        M._fused_linear_residual(att, attn.o_proj, x, hidden)
+        M._fused_linear_gelu_mul(hidden, mlp, mlp_hidden)
+        return q, key, value, hidden.view(n, tokens, -1), mlp_hidden.view(n, tokens, -1)
 
     together = run(x, cos, sin, key, value, mask)
     for b in range(batch):

@@ -1574,6 +1574,18 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
     assert model.paligemma_with_expert.fused_kernels is False
 
 
+def test_batch_tiles_start_at_their_row_counts():
+    """A launch runs in the last table that starts at or below its rows; cuBLAS GEMMs have one set of tiles."""
+    bf16, key = torch.bfloat16, ("linear", torch.bfloat16)
+    first = modeling_pi05._BATCH_TILES[0][0]
+    assert modeling_pi05._tiles("linear", bf16) is modeling_pi05._TILES[key]
+    assert modeling_pi05._tiles("linear", bf16, first - 1) is modeling_pi05._TILES[key]
+    for rows_from, table in modeling_pi05._BATCH_TILES:
+        assert modeling_pi05._tiles("linear", bf16, rows_from) is table[key]
+        assert set(table) == set(modeling_pi05._TILES)
+    assert modeling_pi05._tiles("linear", torch.float32, 10**6) is modeling_pi05._EPILOGUE_TILES
+
+
 @pytest.mark.slow
 def test_fused_kernels_serve_only_a_single_head_kv_cache_of_the_batch_size(tiny_model):
     """Calls the kernels do not cover run eagerly even once they are enabled."""

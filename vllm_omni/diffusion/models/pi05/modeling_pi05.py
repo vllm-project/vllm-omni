@@ -914,6 +914,44 @@ _TILES: dict[tuple[str, torch.dtype], _Tiles] = {
     ("linear", torch.bfloat16): _Tiles(32, 32, 256, num_stages=4),
     ("gelu_linear", torch.bfloat16): _Tiles(64, 32, 64),
 }
+# Tiles of a batch, as (rows from, tiles): the table of a launch is the last one
+# that starts at or below the rows (every request's action tokens) it covers.
+# Searched per batch size on a GH200 with 50-token chunks, here for 3-5, 6-9 and
+# 10-32 requests; smaller launches keep the tiles above. A tile only regroups the
+# same products: every candidate tried, ``block_k`` included, returned the bits
+# the tiles above return.
+_BATCH_TILES: tuple[tuple[int, dict[tuple[str, torch.dtype], _Tiles]], ...] = (
+    (
+        150,
+        {
+            ("qkv", torch.bfloat16): _Tiles(64, 16, 128),
+            ("scores", torch.bfloat16): _Tiles(128, 128, 128, num_warps=8),
+            ("values", torch.bfloat16): _Tiles(64, 64, 128, num_warps=8),
+            ("linear", torch.bfloat16): _Tiles(64, 32, 256, num_stages=4),
+            ("gelu_linear", torch.bfloat16): _Tiles(64, 64, 64),
+        },
+    ),
+    (
+        300,
+        {
+            ("qkv", torch.bfloat16): _Tiles(64, 32, 64),
+            ("scores", torch.bfloat16): _Tiles(128, 128, 64, num_warps=8),
+            ("values", torch.bfloat16): _Tiles(64, 128, 128, num_warps=8),
+            ("linear", torch.bfloat16): _Tiles(64, 64, 256),
+            ("gelu_linear", torch.bfloat16): _Tiles(128, 64, 64),
+        },
+    ),
+    (
+        500,
+        {
+            ("qkv", torch.bfloat16): _Tiles(64, 32, 64),
+            ("scores", torch.bfloat16): _Tiles(128, 128, 64, num_warps=8),
+            ("values", torch.bfloat16): _Tiles(64, 128, 64, num_warps=8),
+            ("linear", torch.bfloat16): _Tiles(64, 64, 128),
+            ("gelu_linear", torch.bfloat16): _Tiles(64, 64, 64),
+        },
+    ),
+)
 # The elementwise epilogues that follow a cuBLAS GEMM: rows × columns.
 _EPILOGUE_TILES = _Tiles(32, 64, 0)
 
@@ -922,8 +960,15 @@ def _triton_gemms(dtype: torch.dtype) -> bool:
     return dtype in _TRITON_GEMM_DTYPES
 
 
-def _tiles(kernel: str, dtype: torch.dtype) -> _Tiles:
-    return _TILES[(kernel, dtype)] if _triton_gemms(dtype) else _EPILOGUE_TILES
+def _tiles(kernel: str, dtype: torch.dtype, rows: int = 0) -> _Tiles:
+    """The tiles of a launch that covers ``rows`` rows."""
+    if not _triton_gemms(dtype):
+        return _EPILOGUE_TILES
+    table = _TILES
+    for rows_from, batch_table in _BATCH_TILES:
+        if rows >= rows_from:
+            table = batch_table
+    return table[(kernel, dtype)]
 
 
 def _fused_rms_norm(
@@ -992,7 +1037,7 @@ def _fused_qkv_rope(
     else:
         weights = tuple(proj(x[None])[0] for proj in (attn.q_proj, attn.k_proj, attn.v_proj))
         n_in = weights[0].shape[1]
-    tiles = _tiles("qkv", dtype) if fused_gemm else _EPILOGUE_TILES
+    tiles = _tiles("qkv", dtype, x.shape[0]) if fused_gemm else _EPILOGUE_TILES
     splits = head_dim // 2 // tiles.block_n
     _qkv_rope_kernel[(triton.cdiv(n_rows, tiles.block_m), (num_heads + 2) * splits, batch)](
         x,
@@ -1045,7 +1090,7 @@ def _fused_attention(
     fused_gemm = _triton_gemms(dtype)
 
     if fused_gemm:
-        tiles = _tiles("scores", dtype)
+        tiles = _tiles("scores", dtype, batch * q_len)
         _attn_scores_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_keys, tiles.block_n), batch)](
             q,
             key,
@@ -1086,7 +1131,7 @@ def _fused_attention(
         enable_fp_fusion=False,
     )
     if fused_gemm:
-        tiles = _tiles("values", dtype)
+        tiles = _tiles("values", dtype, batch * q_len)
         _attn_values_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(head_dim, tiles.block_n), batch)](
             scores,
             value,
@@ -1126,7 +1171,7 @@ def _fused_linear_residual(
     fused_gemm = _triton_gemms(dtype)
     if not fused_gemm:
         x = linear(x[None])[0]
-    tiles = _tiles("linear", dtype)
+    tiles = _tiles("linear", dtype, n_rows)
     _linear_residual_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_out, tiles.block_n))](
         x,
         linear.weight,
@@ -1169,7 +1214,7 @@ def _fused_linear_gelu_mul(x: torch.Tensor, mlp: nn.Module, out: torch.Tensor) -
     if not _triton_gemms(dtype):
         _fused_gelu_mul(mlp.gate_proj(x[None]), mlp.up_proj(x[None]), out)
         return
-    tiles = _tiles("gelu_linear", dtype)
+    tiles = _tiles("gelu_linear", dtype, n_rows)
     _linear_gelu_mul_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_out, tiles.block_n))](
         x,
         mlp.gate_proj.weight,
@@ -1851,10 +1896,13 @@ class Pi05ForActionPrediction(nn.Module):
                 continue
             # The tiles that span head_dim unmasked: the RoPE half-tiles after a
             # cuBLAS projection (the prefix's) and after a Triton one, and with
-            # Triton GEMMs the score reduction and the value columns.
-            spans = [2 * _EPILOGUE_TILES.block_n, 2 * _tiles("qkv", proj_dtype).block_n]
+            # Triton GEMMs the score reduction and the value columns, in every
+            # table a launch may pick.
+            spans = [2 * _EPILOGUE_TILES.block_n]
             if _triton_gemms(proj_dtype):
-                spans += [_tiles("scores", proj_dtype).block_k, _tiles("values", proj_dtype).block_n]
+                for table in (_TILES, *(batch_table for _, batch_table in _BATCH_TILES)):
+                    qkv, scores, values = (table[(kernel, proj_dtype)] for kernel in ("qkv", "scores", "values"))
+                    spans += [2 * qkv.block_n, scores.block_k, values.block_n]
             if any(head_dim % span for span in spans):
                 problems.append(f"the {name} head_dim {head_dim} is not a multiple of the kernel tiles {spans}")
         if problems:
