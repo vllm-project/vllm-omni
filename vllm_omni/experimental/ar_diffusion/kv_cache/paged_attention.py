@@ -72,7 +72,7 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # becomes a dynamo value guard (a recompile per distinct length). The
     # Ascend branch needs it to skip the per-layer .item() host sync when
     # slicing the gathered window to the kernel-visible length.
-    kv_len: torch.Tensor = None
+    kv_len: torch.Tensor | None = None
     # Contiguous K/V staging for this layer, when reuse_history_staging is on. ``reuse_history`` is a host
     # bool decided once per forward (``_prepare_history_staging``): it selects one of two compiled variants.
     stage_key: torch.Tensor | None = None
@@ -739,7 +739,7 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
-    if query_flat.device.type == "npu" and kv_len is not None:
+    if query_flat.device.type == "npu":
         # NPU: gather the visible blocks on device, then run the fused
         # npu_fusion_attention kernel over the packed (contiguous) window.
         # Mirrors the ROCm gather path; the reference implementation below is
@@ -752,16 +752,27 @@ def ar_diffusion_paged_attention(
         # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
         # SP8 on 910C; 477-frame precodec output bit-identical).
         block_size = key_cache.shape[1]
-        num_blocks = (int(kv_len) + block_size - 1) // block_size
+        # kv_len may arrive as a host int (AR-Diffusion path, threaded through
+        # the custom op) or None (NoisyLayerContext / lingbot direct-replay
+        # path). Normalize to a host int; the None case pays the pre-diff
+        # .item() sync once instead of silently dropping to the fp32 reference
+        # implementation, which would break direct replay's documented
+        # contract of sharing the realtime path's fused kernel.
+        if kv_len is None:
+            kv_len = int(seq_lens[0].item())
+        else:
+            kv_len = int(kv_len)
+        num_blocks = (kv_len + block_size - 1) // block_size
         block_ids = block_table[0, :num_blocks].long()
-        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(kv_len)]
-        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(kv_len)]
-        # kv_len arrives as a host int threaded through the custom op, so the
-        # per-layer .item() + .cpu().tolist() host syncs the original branch
-        # paid (3 per layer per forward = 600 per AR block at 40 layers) are
-        # gone. The query length is known statically from the flattened shape.
+        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
+        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
+        # Both lengths are host ints now, so the per-layer .item() +
+        # .cpu().tolist() host syncs the original branch paid (3 per layer
+        # per forward = 600 per AR block at 40 layers) are gone on the
+        # threaded path. The query length is known statically from the
+        # flattened shape.
         actual_seq_q = [int(query_flat.shape[0])]
-        actual_seq_kv = [int(kv_len)]
+        actual_seq_kv = [kv_len]
         out = torch_npu.npu_fusion_attention(
             query_flat.contiguous(),
             gathered_k.contiguous(),
@@ -944,7 +955,7 @@ def _paged_write_attn_impl(
     seq_lens: torch.Tensor,
     max_query_len: int,
     max_seq_len: int,
-    kv_len: torch.Tensor,
+    kv_len: torch.Tensor | None,
     softmax_scale: float,
     stage_key: torch.Tensor | None = None,
     stage_value: torch.Tensor | None = None,
@@ -1004,7 +1015,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         seq_lens: torch.Tensor,
         max_query_len: int,
         max_seq_len: int,
-        kv_len: torch.Tensor,
+        kv_len: torch.Tensor | None,
         softmax_scale: float,
         stage_key: torch.Tensor | None,
         stage_value: torch.Tensor | None,
