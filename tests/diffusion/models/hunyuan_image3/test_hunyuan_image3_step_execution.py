@@ -1009,6 +1009,8 @@ def test_startup_step_0_note_logs_only_on_rank_0(caplog, monkeypatch):
     with caplog.at_level("INFO", logger=hy3_module.logger.name):
         hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
     assert "step-0 prompt K/V" not in caplog.text
+
+
 def test_supports_request_batch_enabled():
     assert HunyuanImage3Pipeline.supports_request_batch is True
 
