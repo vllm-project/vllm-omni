@@ -1725,6 +1725,17 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "omni_mimo_audio_function",
             "Expected exactly one executed MiMo-Audio test",
         ),
+        "Covo-Audio · 1-GPU": (
+            "mi300_1",
+            180,
+            "cards_1",
+            "tests/e2e/online_serving/test_covo_audio_expansion.py",
+            ("test_audio_to_audio_001", "test_audio_to_audio"),
+            "artifacts/rocm-covo-audio-weekly/**/*",
+            "Expected exactly two Covo-Audio ROCm nodes",
+            "omni_covo_audio_function",
+            "Expected exactly two executed Covo-Audio tests",
+        ),
         "Ming-flash-omni offline · 4-GPU": (
             "mi300_4",
             180,
@@ -1798,7 +1809,22 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     mimo_command = "\n".join(_find_step("MiMo-Audio · 1-GPU", AMD_WEEKLY_PIPELINE)["commands"])
     assert "test_audio_to_text_audio_001" not in mimo_command
     assert "tests/e2e/online_serving/test_ming_flash_omni_expansion.py" not in weekly_text
-    assert "test_covo_audio_expansion.py" not in weekly_text
+    covo_deps = dependencies["omni_covo_audio_function"]
+    for dependency in (
+        "tests/e2e/online_serving/test_covo_audio_expansion.py",
+        "tests/e2e/offline_inference/test_covo_audio_expansion.py",
+        "vllm_omni/deploy/covo_audio.yaml",
+        "vllm_omni/model_executor/models/covo_audio/",
+        "vllm_omni/model_executor/stage_input_processors/covo_audio.py",
+    ):
+        assert dependency in covo_deps
+    for test_file in (
+        "tests/e2e/online_serving/test_covo_audio_expansion.py",
+        "tests/e2e/offline_inference/test_covo_audio_expansion.py",
+    ):
+        covo_source = Path(test_file).read_text(encoding="utf-8")
+        assert 'res={"cuda": "H100", "rocm": "MI325"}' in covo_source
+        assert "num_cards=1" in covo_source
     qwen_deps = dependencies["omni_qwen2_5_omni_expansion"]
     for dependency in (
         "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py",
@@ -1858,6 +1884,41 @@ def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
         expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
         artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
         job_id_prefix="qwen25-omni-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 2, 0, None, 0),
+        (0, 2, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 2, 0, None, 1),
+        (0, 2, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_covo_audio_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Covo-Audio · 1-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly two executed Covo-Audio tests",
+        artifact_env="ROCM_COVO_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="covo-audio-weekly-guard",
         pytest_status=pytest_status,
         tests=tests,
         skipped=skipped,
