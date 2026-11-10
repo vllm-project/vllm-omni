@@ -1439,6 +1439,30 @@ def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_cache, batc
     )
 
 
+class _PatchEmbedding(nn.Conv2d):
+    """SigLIP's patch convolution as one GEMM over every image's patches.
+
+    Its kernel and stride are equal, so the convolution multiplies each
+    non-overlapping patch, flattened in the weight's (channel, row, column)
+    order, by the weight. cuDNN picks a convolution's algorithm from the batch
+    size and the memory layout of the input, and the algorithms round
+    differently: from a few images on, an image of a batch got other patch
+    embeddings than alone, which the float32 vision tower carried past 1e-4 on
+    the action chunk. The GEMM depends far less on the batch: on a GH200 it gave
+    every image of 1 to 96 the patch embeddings the stock convolution gives it
+    alone, in both input layouts, and ran faster than the batched convolution.
+    """
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = pixel_values.shape
+        kernel_h, kernel_w = self.kernel_size
+        rows, cols = height // kernel_h, width // kernel_w
+        patches = pixel_values.reshape(batch, channels, rows, kernel_h, cols, kernel_w)
+        patches = patches.permute(0, 2, 4, 1, 3, 5).reshape(batch * rows * cols, channels * kernel_h * kernel_w)
+        out = torch.addmm(self.bias, patches, self.weight.reshape(self.out_channels, -1).t())
+        return out.reshape(batch, rows, cols, self.out_channels).permute(0, 3, 1, 2)
+
+
 class PaliGemmaWithActionExpertPi05(nn.Module):
     """Dual-backbone transformer: PaliGemma (Gemma 2B) + AdaRMS expert (300M).
 
@@ -1486,6 +1510,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         )
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        self._install_patch_embedding()
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         # The action expert doesn't embed tokens — it only consumes the
         # suffix action embeddings we feed in.
@@ -1497,6 +1522,28 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
         self.vision_options = Pi05VisionOptions()
+
+    def _install_patch_embedding(self) -> None:
+        """Run SigLIP's patch convolution as a GEMM over the patches (``_PatchEmbedding``)."""
+        tower = self.paligemma.model.vision_tower
+        # transformers <=5.3 wraps the vision transformer; >=5.4 can flatten it.
+        embeddings = getattr(tower, "vision_model", tower).embeddings
+        conv = embeddings.patch_embedding
+        non_overlapping = (
+            conv.stride == conv.kernel_size
+            and conv.padding in ("valid", (0, 0))
+            and conv.dilation == (1, 1)
+            and conv.groups == 1
+            and conv.bias is not None
+        )
+        if non_overlapping:
+            embeddings.patch_embedding = _PatchEmbedding(
+                conv.in_channels,
+                conv.out_channels,
+                kernel_size=conv.kernel_size,
+                stride=conv.stride,
+                padding=conv.padding,
+            )
 
     def _install_adarms_norms(self, action_expert_config) -> None:
         """Replace every action-expert RMSNorm with a conditioned AdaRMS norm."""

@@ -1574,6 +1574,33 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
     assert model.paligemma_with_expert.fused_kernels is False
 
 
+def test_patch_embedding_matches_the_convolution_on_every_image():
+    """The patch convolution as one GEMM over the patches: every image of a batch,
+    in the contiguous and in the serving frames' layout, gets the patch
+    embeddings the stock convolution gives it alone."""
+    torch.manual_seed(0)
+    conv = modeling_pi05._PatchEmbedding(3, 16, kernel_size=14, stride=14, padding="valid")
+    stock = torch.nn.Conv2d(3, 16, kernel_size=14, stride=14, padding="valid")
+    stock.load_state_dict(conv.state_dict())
+    images = torch.rand(6, 3, 224, 224) * 2 - 1
+    serving_layout = images.permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2)
+
+    with torch.no_grad():
+        for frames in (images, serving_layout):
+            batched = conv(frames)
+            assert batched.shape == (6, 16, 16, 16)
+            alone = torch.cat([stock(frames[row : row + 1]) for row in range(6)])
+            torch.testing.assert_close(batched, alone, rtol=1e-5, atol=1e-5)
+
+
+def test_model_installs_the_patch_embedding(tiny_model):
+    tower = tiny_model.paligemma_with_expert.paligemma.model.vision_tower
+    patch_embedding = getattr(tower, "vision_model", tower).embeddings.patch_embedding
+    assert isinstance(patch_embedding, modeling_pi05._PatchEmbedding)
+    # Same parameters under the same names: checkpoints load as before.
+    assert set(dict(patch_embedding.named_parameters())) == {"weight", "bias"}
+
+
 def test_batch_tiles_start_at_their_row_counts():
     """A launch runs in the last table that starts at or below its rows; cuBLAS GEMMs have one set of tiles."""
     bf16, key = torch.bfloat16, ("linear", torch.bfloat16)
