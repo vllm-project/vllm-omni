@@ -116,7 +116,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: [omni_qwen3_omni_accuracy, omni_qwen3_omni_rocm]
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm]
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
@@ -183,7 +183,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 300
-        source_file_dependencies: [omni_qwen3_omni_perf, omni_qwen3_omni_rocm]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -204,7 +204,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: [omni_qwen3_omni_perf, omni_qwen3_omni_rocm]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json

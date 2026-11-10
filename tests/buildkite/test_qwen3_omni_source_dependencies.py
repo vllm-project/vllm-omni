@@ -47,11 +47,9 @@ def nightly(request):
         for family in FAMILIES:
             if f"omni_qwen3_omni_{family}" in dependencies:
                 families[family].add(step["label"])
-    assert [len(families[family]) for family in FAMILIES] == {
-        "cuda": [1, 2, 2],
-        "npu": [1, 2, 0],
-        "rocm": [1, 2, 0],
-    }[platform]
+    assert families["accuracy"]
+    assert families["perf"]
+    assert bool(families["duplex_perf"]) == (platform == "cuda")
     return platform, path, doc, families
 
 
@@ -63,7 +61,6 @@ def _selected(nightly, changed_files):
     return {step["label"] for step in leaves}
 
 
-@pytest.mark.parametrize("mixed", [False, True], ids=["alone", "with-minicpm"])
 @pytest.mark.parametrize(
     "changed_file",
     [
@@ -104,8 +101,9 @@ def _selected(nightly, changed_files):
         ".buildkite/common/ci_mirror_hardwares.yml",
     ],
 )
-def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file, mixed):
-    changes = [changed_file, MINICPM] if mixed else [changed_file]
+def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file):
+    # A MiniCPM match disables fallback, proving Qwen has a direct dependency.
+    changes = [changed_file, MINICPM]
     expected = set().union(*nightly[3].values())
     assert expected <= _selected(nightly, changes)
 

@@ -274,7 +274,7 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
   - .buildkite/common/ci_mirror_hardwares.yml
 
 # GPU V1 workers are shared by CUDA/ROCm; NPU has its own workers/runners.
-x-qwen3-omni-gpu: &qwen3_omni_gpu
+x-omni-gpu: &omni_gpu
   - vllm_omni/worker/base.py
   - vllm_omni/worker/encoder_cudagraph.py
   - vllm_omni/worker/gpu_ar_model_runner.py
@@ -560,10 +560,9 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
 
-  # Compose the evaluation key with the job's platform key. Prefix caching
-  # and V2 are enabled by the CUDA default deploy; NPU/ROCm use V1.
-  omni_qwen3_omni_cuda:
-    - *qwen3_omni_gpu
+  # Qwen CUDA nightly deployments enable V2 and prefix caching. Keep these
+  # runtime choices separate from platform dependencies; NPU/ROCm use V1.
+  omni_qwen3_omni_cuda_runtime:
     - vllm_omni/core/prefix_cache/
     - vllm_omni/worker_v2/__init__.py
     - vllm_omni/worker_v2/delivery.py
@@ -584,6 +583,10 @@ source_file_dependencies:
     - vllm_omni/worker_v2/staged_writes.py
     - vllm_omni/worker_v2/streaming_audio.py
     - vllm_omni/worker_v2/warmup.py
+
+  # Reusable platform dependencies, composed explicitly by each model job.
+  ci_cuda:
+    - *omni_gpu
     - vllm_omni/platforms/cuda/platform.py
     - docker/Dockerfile.ci
     - docker/Dockerfile.ci.dockerignore
@@ -594,7 +597,7 @@ source_file_dependencies:
     - .buildkite/cuda/scripts/build-ci-image.sh
     - .buildkite/cuda/test-nightly.yml
 
-  omni_qwen3_omni_npu:
+  ci_npu:
     - vllm_omni/platforms/npu/__init__.py
     - vllm_omni/platforms/npu/platform.py
     - vllm_omni/platforms/npu/ascend_warmup_patch.py
@@ -612,8 +615,8 @@ source_file_dependencies:
     - .buildkite/npu/scripts/build-npu-image.sh
     - .buildkite/npu/test-npu-nightly.yml
 
-  omni_qwen3_omni_rocm:
-    - *qwen3_omni_gpu
+  ci_rocm:
+    - *omni_gpu
     - vllm_omni/platforms/rocm/platform.py
     - vllm_omni/platforms/rocm/patch/
     - docker/Dockerfile.rocm

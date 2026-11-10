@@ -451,10 +451,13 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 - **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors group model code and shared runtime dependencies. Job keys alias the relevant anchors and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
-with `omni_qwen3_omni_cuda`, `omni_qwen3_omni_npu`, or `omni_qwen3_omni_rocm`.
+with the reusable platform key `ci_cuda`, `ci_npu`, or `ci_rocm`. CUDA jobs also
+compose `omni_qwen3_omni_cuda_runtime` for their V2 and prefix-cache dependencies.
+Other models can opt into a platform key without inheriting these runtime choices.
 Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
 benchmark infrastructure, and test fixtures select both accuracy and performance
-on all three platforms. Platform workers, CI images, requirements, build scripts,
+on all three platforms, including the existing CUDA Duplex performance jobs.
+Platform workers, CI images, requirements, build scripts,
 and nightly YAML select the corresponding platform. Accuracy datasets/evaluators
 and performance runners also have their own dependencies; Duplex helpers select
 the existing CUDA Duplex jobs.
