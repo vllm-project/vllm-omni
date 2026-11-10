@@ -359,6 +359,13 @@ class DiffusionEngine:
 
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
+        from vllm_omni.request_capabilities import RuntimeServingMetadata, ServingPostProcess
+
+        self.serving_metadata = (
+            self.post_process_func.serving_metadata
+            if isinstance(self.post_process_func, ServingPostProcess)
+            else RuntimeServingMetadata()
+        )
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
         if self._prefix_cache_enabled() and self.prefix_cache_func is None:

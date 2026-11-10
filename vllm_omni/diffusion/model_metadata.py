@@ -8,6 +8,14 @@ from vllm_omni.diffusion.capability_resolvers import (
     MINIMAX_H3_CAPABILITIES,
     MINIMAX_H3_CAPABILITIES_RESOLVER,
 )
+from vllm_omni.request_capabilities import (
+    InputConstraint,
+    MaskConstraint,
+    ParameterConstraint,
+    RequestConstraints,
+    RequestSupport,
+    SourceResize,
+)
 from vllm_omni.serving_capabilities import (
     AUDIO_RESPONSE,
     IMAGE_RESPONSE,
@@ -81,6 +89,40 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 FLUX3_MAX_INPUT_IMAGES = 10
 
 
+def _image_edit_profile(max_images: int | None = None, *, native_mask: bool = False):
+    """Native image pipeline input ownership; geometry is supplied at startup.
+
+    Klein is the native image pipeline consuming mask_image/reference_image.
+    Other built-in image pipelines consume the ordinary image role only.
+    External DiffusersAdapterPipeline remains unknown below.
+    """
+    extra_support: RequestSupport = "supported" if native_mask else "unsupported"
+    return replace(
+        IMAGE_TO_IMAGE,
+        request=RequestConstraints(
+            inputs={
+                "text": InputConstraint(support="supported", min_count=1),
+                "image": InputConstraint(support="supported", min_count=1, max_count=max_images),
+                "mask_image": InputConstraint(support=extra_support, min_count=0, max_count=1 if native_mask else 0),
+                "reference_image": InputConstraint(
+                    support=extra_support, min_count=0, max_count=1 if native_mask else 0
+                ),
+            },
+            mask=MaskConstraint(
+                support="supported",
+                max_source_count=1,
+                white="edit",
+                black="preserve",
+                binarize_threshold=0.5,
+                requires_same_size=True,
+                source_resize=SourceResize(max_pixels=1024 * 1024),
+            )
+            if native_mask
+            else MaskConstraint(support="unsupported"),
+        ),
+    )
+
+
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HyNomasPipeline": DiffusionModelMetadata(
         final_output_type="video",
@@ -127,7 +169,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(FLUX2_KLEIN_MAX_INPUT_IMAGES, native_mask=True),
             sources=("vllm_omni/diffusion/models/flux2_klein/pipeline_flux2_klein.py",),
         ),
     ),
@@ -136,7 +178,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
         serving_capabilities=declare_capabilities(
             replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit_plus.py",),
         ),
     ),
@@ -148,7 +190,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(QWEN_IMAGE_21_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py",),
         ),
     ),
@@ -158,7 +200,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(HUNYUAN_IMAGE3_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py",),
         ),
     ),
@@ -171,7 +213,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(BOOGU_IMAGE_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/boogu_image/pipeline_boogu_image.py",),
         ),
     ),
@@ -180,7 +222,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
         serving_capabilities=declare_capabilities(
             replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(JOY_IMAGE_EDIT_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/joy_image/pipeline_joy_image_edit.py",),
         ),
     ),
@@ -232,9 +274,27 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=1,
         final_output_type="video",
         serving_capabilities=declare_capabilities(
-            TEXT_TO_VIDEO,
-            IMAGE_TO_VIDEO,
-            sources=("vllm_omni/diffusion/models/magi2/pipeline_magi2.py",),
+            *(
+                replace(
+                    profile,
+                    request=RequestConstraints(
+                        inputs={
+                            name: InputConstraint(support="supported", min_count=1, max_count=1)
+                            for name in profile.required_inputs
+                        },
+                        parameters={
+                            "num_frames": ParameterConstraint(support="supported", type="integer", enum=(125,)),
+                            "fps": ParameterConstraint(support="supported", type="number", enum=(12.5,)),
+                            "seconds": ParameterConstraint(support="supported", type="number", enum=(10.0,)),
+                            "resolution": ParameterConstraint(
+                                support="supported", type="string", enum=("272p", "540p")
+                            ),
+                        },
+                    ),
+                )
+                for profile in (TEXT_TO_VIDEO, IMAGE_TO_VIDEO)
+            ),
+            sources=("vllm_omni/diffusion/models/magi2/pipeline_magi2.py", "vllm_omni/model_extras/magi2.py"),
         ),
     ),
     # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
@@ -269,7 +329,16 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
         serving_capabilities=declare_capabilities(
-            IMAGE_TO_VIDEO,
+            replace(
+                IMAGE_TO_VIDEO,
+                request=RequestConstraints(
+                    inputs={
+                        "text": InputConstraint(support="supported", min_count=1),
+                        "image": InputConstraint(support="supported", min_count=1, max_count=1),
+                        "last_frame": InputConstraint(support="supported", min_count=0, max_count=1),
+                    }
+                ),
+            ),
             sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
         ),
     ),
@@ -450,7 +519,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
             TEXT_RESPONSE,
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/bagel/pipeline_bagel.py",),
         ),
     ),
@@ -460,7 +529,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/boogu_image/pipeline_boogu_image.py",),
         ),
     ),
@@ -494,7 +563,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/flux2/pipeline_flux2.py",),
         ),
     ),
@@ -509,7 +578,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/flux/pipeline_flux_kontext.py",),
         ),
     ),
@@ -536,7 +605,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/hidream_o1_image/pipeline_hidream_o1_image.py",),
         ),
     ),
@@ -589,7 +658,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
             TEXT_RESPONSE,
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             unknown_operations=("video_generation",),
             unknown_reason="checkpoint_specific_video_contract",
             sources=("vllm_omni/diffusion/models/lance/pipeline_lance.py",),
@@ -605,7 +674,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "LongCatImageEditPipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
             replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/longcat_image/pipeline_longcat_image_edit.py",),
         ),
     ),
@@ -658,7 +727,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/omnigen2/pipeline_omnigen2.py",),
         ),
     ),
@@ -715,14 +784,14 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "QwenImageEditPipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
             replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit.py",),
         ),
     ),
     "QwenImageLayeredPipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
             replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_layered.py",),
         ),
     ),
@@ -738,7 +807,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
             TEXT_RESPONSE,
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(),
             sources=("vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py",),
         ),
     ),
@@ -774,7 +843,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         serving_capabilities=declare_capabilities(
             IMAGE_RESPONSE,
             TEXT_TO_IMAGE,
-            IMAGE_TO_IMAGE,
+            _image_edit_profile(1),
             sources=("vllm_omni/diffusion/models/z_image/pipeline_z_image.py",),
         ),
     ),

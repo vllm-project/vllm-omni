@@ -37,6 +37,108 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+@pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+def test_image_edit_rejects_unsupported_native_fields_before_loading(async_omni_test_client, monkeypatch, field):
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+
+    engine = async_omni_test_client.app.state.engine_client
+    async_omni_test_client.app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(model_class_name="ZImagePipeline")
+    monkeypatch.setattr(
+        api_server_module, "_load_input_images", lambda *a, **kw: pytest.fail("must reject before decoding")
+    )
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((64, 64))), (field, make_test_image_bytes((64, 64)))],
+        data={"prompt": "edit the selection"},
+    )
+    assert response.status_code == 400
+    assert field in response.json()["detail"]
+    assert engine.captured_prompt is None
+
+
+@pytest.mark.parametrize("wire", ["upload", "data_uri"])
+def test_native_klein_mask_and_independent_reference_reach_engine(test_client, wire):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name="Flux2KleinPipeline", supports_multimodal_inputs=True, max_multimodal_image_inputs=4
+    )
+    mask = Image.new("L", (64, 64), color=255)
+    mask.putpixel((0, 0), 0)
+    buffer = io.BytesIO()
+    mask.save(buffer, format="PNG")
+    files = [("image", make_test_image_bytes((64, 64))), ("reference_image", make_test_image_bytes((32, 32)))]
+    data = {"prompt": "edit selection", "size": "64x64"}
+    if wire == "upload":
+        files.append(("mask_image", buffer.getvalue()))
+    else:
+        data["mask_image"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    response = test_client.post("/v1/images/edits", files=files, data=data)
+    assert response.status_code == 200, response.text
+    media = engine.captured_prompt["multi_modal_data"]
+    assert media["mask_image"].getpixel((0, 0)) == 0
+    assert media["mask_image"].getpixel((1, 1)) == 255
+    assert len(media["image"]) == 1
+    assert media["reference_image"].size == (32, 32)
+
+
+@pytest.mark.parametrize("source_count,mask_size", [(2, (64, 64)), (1, (32, 64))])
+def test_native_klein_rejects_ambiguous_mask_canvas(test_client, source_count, mask_size):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name="Flux2KleinPipeline", supports_multimodal_inputs=True, max_multimodal_image_inputs=4
+    )
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[
+            *[("image", make_test_image_bytes((64, 64))) for _ in range(source_count)],
+            ("mask_image", make_test_image_bytes(mask_size)),
+        ],
+        data={"prompt": "edit selection", "size": "64x64"},
+    )
+    assert response.status_code == 400
+    assert engine.captured_prompt is None
+
+
+@pytest.mark.parametrize("architecture,maximum", [("Flux2KleinPipeline", 4), ("ZImagePipeline", 1)])
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_image_edit_source_count_matches_real_handler_limit(test_client, architecture, maximum, over_limit):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name=architecture,
+        supports_multimodal_inputs=maximum > 1,
+        max_multimodal_image_inputs=maximum,
+    )
+    count = maximum + int(over_limit)
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((64, 64))) for _ in range(count)],
+        data={"prompt": "edit", "size": "64x64"},
+    )
+    assert response.status_code == (400 if over_limit else 200), response.text
+    if over_limit:
+        assert engine.captured_prompt is None
+    else:
+        media = engine.captured_prompt["multi_modal_data"]["image"]
+        assert len(media) == count if isinstance(media, list) else count == 1
+
+
+@pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+def test_multi_stage_edit_rejects_native_fields_instead_of_dropping_them(async_omni_test_client, field):
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", make_test_image_bytes((64, 64))),
+            (field, make_test_image_bytes((64, 64))),
+        ],
+        data={"prompt": "edit selection"},
+    )
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
+    assert async_omni_test_client.app.state.engine_client.captured_prompt is None
+
+
 # Unit Tests
 
 

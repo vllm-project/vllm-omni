@@ -10,7 +10,7 @@ from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, speech_inputs
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
@@ -42,6 +42,10 @@ def parse_ming_instruction_fields(server, request, *, include_voice=False, plain
 
 @register_tts_adapter
 class MingTTSAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs(
+        "reference_audio", "reference_text", "voice", "instructions", "speaker_embedding"
+    )
+
     def _coerce_ming_prompt_waveform(self, wav_samples, sample_rate):
         from torchaudio.functional import resample as resample_audio
 

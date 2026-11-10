@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_standard_sampling
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -120,6 +121,32 @@ class CosyVoice3Adapter(ARTTSAdapter):
             return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
 
         return self._validate_max_new_tokens(request)
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint, ParameterConstraint
+
+        request = super().get_request_constraints()
+        return request.model_copy(
+            update={
+                "inputs": {
+                    **request.inputs,
+                    **{
+                        role: InputConstraint(support="supported", min_count=0, max_count=1)
+                        for role in ("voice", "reference_audio", "reference_text")
+                    },
+                },
+                "required_any_of": (("voice", "reference_audio"), ("voice", "reference_text")),
+                "parameters": {
+                    **request.parameters,
+                    "max_new_tokens": ParameterConstraint(
+                        support="supported",
+                        type="integer",
+                        minimum=self.max_new_tokens_min,
+                        maximum=self.max_new_tokens_max,
+                    ),
+                },
+            }
+        )
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

@@ -71,6 +71,106 @@ An external Diffusers pipeline or an older plugin without a declaration is
 unknown. Clients should retain their existing manual configuration when
 discovery is unknown or the endpoint is absent on an older server.
 
+## Request constraints
+
+The optional, typed `request` object adds input roles and implemented parameter
+limits without changing `schema_version: 1`. Existing flat `constraints` and
+`required_inputs` remain available. Missing facts mean unknown, including a
+missing maximum; they do not mean zero or unlimited verified support.
+
+`profile.request` describes the model's implemented contract.
+`profile.routes[].request` is the **complete effective contract for that route**,
+including deployment and adapter limits. Clients use the selected route's
+object directly. They must not inherit a model contract onto a route without
+`request`, or combine facts from different routes. A route reference also has
+its own `exposure`: a video model requiring reference audio can have an enabled
+HTTP route and a disabled WebSocket profile.
+
+| Field | Meaning |
+| --- | --- |
+| `inputs.<role>.support` | Whether this path consumes the role: `supported`, `unsupported`, or `unknown`. |
+| `inputs.<role>.min_count`, `max_count` | Optional inclusive counts. `min_count: 0` means optional; an omitted maximum is unknown. |
+| `required_any_of` | Every inner list requires at least one of its roles. All lists must be satisfied. |
+| `parameters.<name>` | Optional `support`, scalar `type`, `enum`, inclusive `minimum`/`maximum`, and `step`. These describe accepted inputs, not quality recommendations. |
+| `mask` | Native mask semantics and its relationship to source images. See below. |
+| `max_output_pixels` | Optional deployment limit from `--max-generated-image-size`, not a universal model resolution limit. |
+
+For example, CosyVoice3's `required_any_of` is
+`[["voice", "reference_audio"], ["voice", "reference_text"]]`: a registered voice
+satisfies both groups; an inline reference needs both its audio and transcript.
+Qwen3-TTS Base also accepts `speaker_embedding`. These are semantic role names;
+the speech endpoint's wire fields remain `ref_audio`, `ref_text`, and
+`speaker_embedding`.
+
+### Images and native masks
+
+Image counts distinguish single-source editing from multiple reference images
+within `image_to_image`; they do not create additional operation IDs. Z-Image
+has a real single-image editing path. Klein permits up to four ordinary image
+inputs. The effective maximum also honors the deployed image handler's limit.
+
+Klein's native single-stage edit route additionally accepts `mask_image` and
+`reference_image` as separate multipart uploads or data-URI form fields.
+The latter is an independent conditioning reference, outside the ordinary
+`image` list. When a mask is supplied, there must be exactly one ordinary source
+image and its dimensions must match the mask. White edits, black preserves, and
+the worker binarizes grayscale at 0.5. The discovery shape is:
+
+```json
+{
+  "support": "supported",
+  "source_role": "image",
+  "max_source_count": 1,
+  "white": "edit",
+  "black": "preserve",
+  "binarize_threshold": 0.5,
+  "requires_same_size": true,
+  "geometry": { "state": "unknown" },
+  "source_resize": {
+    "max_pixels": 1048576,
+    "policy": "downscale_preserve_aspect_ratio"
+  }
+}
+```
+
+`geometry.multiple_of` is included only with `state: "known"`. It comes from
+the existing initialized Klein postprocessor's VAE configuration. The value
+is carried with the completed READY handshake, including remote replicas;
+inline execution uses the same initialized hook. Discovery reads the current
+local replica snapshots and returns unknown if any active replica lacks the
+fact or disagrees. It does not load a VAE or read its configuration on query.
+
+The source resize threshold is 1,048,576 pixels. It is not an output-size cap.
+A client requiring pixel-aligned selection editing should use a source/output
+canvas divisible by the reported multiple, with matching mask dimensions and
+no source downscaling. It can preserve its existing composition workflow when
+the geometry is unknown or those conditions are unmet.
+
+Multi-stage image editing currently forwards ordinary images through chat and
+cannot carry the two native fields. Supplying either now returns 400 before
+media loading. Other built-in image owners explicitly exclude unimplemented
+native mask/reference roles. For an external Diffusers backend the frontend
+leaves these facts unknown; the worker rejects a supplied field when its loaded
+pipeline signature cannot accept it, rather than silently discarding it.
+
+### Other operation families
+
+| Family | Current source-backed facts and boundaries |
+| --- | --- |
+| `chat` | Declared text/media requirements and response modalities are preserved. Unspecified optional inputs and reference counts stay unknown; an image output does not imply an image-edit input contract. |
+| `image_generation` | The image route accepts positive dimensions and output format; it has no image/mask/separate-reference mapping. Declared model limits cannot be widened by the route. |
+| `video_generation` | HTTP reference roles remain separate from the WebSocket's single-image input. Neither route maps native Wan `last_image`, so the optional offline last-frame role is excluded on these routes. MAGI-2 declares 125 frames, 12.5 fps, 10 seconds and its two native resolution modes. Joint audio output remains in `outputs`; optional audio remains in `constraints.optional_outputs`. |
+| `speech` | Each TTS adapter owns its accepted reference, voice and instruction facts beside its request builder. Loaded voice enums include validated aliases such as Kokoro's `default` only when its target exists. Qwen language enums reflect actual input validation; the generic default language list is not promoted for other adapters. |
+| `speech` music/caption profiles | MiniMax Music3/YuE2 require lyrics and style instructions, permit only the placeholder `default` voice, and exclude ordinary TTS reference controls. Audex TTA takes captions. MOSS variants separately expose reference cloning, sound-effect descriptions or voice-design instructions. |
+| `audio_generation` | The diffusion audio handler maps a text caption and optional negative prompt. It has no lyrics/instruction pair, voice or reference-media mapping. |
+
+Voxtral reference-encoder availability is unknown when it has not already been
+observed by the normal request path. Discovery does not issue the RPC used to
+obtain it. Role facts do not replace the adapter's full request validator:
+conditional transcript pairing and model-specific extra parameters remain
+validated by the existing endpoint. Adding these facts does not create a
+general-purpose form schema or promise inference quality.
+
 ## Execution observations
 
 `execution.state` is `unpaused`, `paused`, or `unknown`. This observes the
@@ -85,8 +185,8 @@ unknown execution here. `observed_at` identifies when the observation was made.
 An unpaused gate does not promise sufficient GPU memory, a healthy worker, or
 successful generation; normal request errors remain authoritative.
 
-The query reads initialized declarations, route policy, and the local execution
-condition. It does not reload configuration, resolve a checkpoint, download
+The query reads initialized declarations, route policy, local replica metadata,
+and the local execution condition. It does not reload configuration, resolve a checkpoint, download
 files, perform health RPCs, wake workers, or run generation.
 
 ## Maintaining model declarations
@@ -127,6 +227,15 @@ declaration can construct `ServingCapabilities` directly; omitted operations
 then stay unknown. Every built-in declaration includes repository-relative
 source references for review. Those references are not returned to clients.
 
+Typed request facts live in `vllm_omni/request_capabilities.py`. They remain
+serializable dataclasses so `PipelineConfig` JSON serialization is unchanged.
+Diffusion owners attach facts to their profiles; speech adapters implement
+`get_request_constraints()` using only their initialized state. Adapter methods
+must not call `load_capabilities()`, tokenizers, filesystem readers or RPCs.
+The serving projection applies the actual route's restrictions once at app
+initialization. Optional runtime geometry uses `ServingPostProcess` and
+`RuntimeServingMetadata`; a pipeline without these retains unknown geometry.
+
 Adding a supported model requires updating its declaration and the relevant
 positive and negative regression cases. Registry coverage tests ensure aliases
 reach declarations without importing concrete diffusion model implementations.
@@ -134,6 +243,8 @@ reach declarations without importing concrete diffusion model implementations.
 ```bash
 pytest tests/config/test_serving_capabilities.py \
   tests/entrypoints/openai_api/test_serving_capabilities.py \
+  tests/entrypoints/openai_api/test_request_capabilities.py \
+  tests/diffusion/test_startup_serving_metadata.py \
   -m cpu --run-level=core_model
 ```
 

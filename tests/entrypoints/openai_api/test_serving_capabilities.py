@@ -8,6 +8,7 @@ No model weights or tokenizer downloads are needed.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -32,6 +33,29 @@ from vllm_omni.serving_capabilities import OPERATIONS, ServingCapabilities
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("architecture,maximum", [("Flux2KleinPipeline", 4), ("ZImagePipeline", 1)])
+async def test_image_request_contract_preserves_model_and_route_facts(monkeypatch, tmp_path, architecture, maximum):
+    app, engine = await build_initialized_test_app(monkeypatch, tmp_path, architecture)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/omni/capabilities")
+    assert response.status_code == 200
+    profile = response.json()["models"][0]["operations"]["image_edit"]["profiles"][0]
+    assert profile["request"]["inputs"]["image"]["max_count"] == maximum
+    route = next(route for route in profile["routes"] if route["path"] == "/v1/images/edits")
+    assert route["exposure"] == "enabled"
+    assert route["request"]["inputs"]["image"]["min_count"] == 1
+    assert route["request"]["parameters"]["width"]["minimum"] == 1
+    if architecture == "Flux2KleinPipeline":
+        assert route["request"]["mask"]["geometry"]["state"] == "unknown"
+        assert route["request"]["mask"]["max_source_count"] == 1
+        assert route["request"]["mask"]["source_resize"]["max_pixels"] == 1048576
+        assert "maximum" not in route["request"]["parameters"]["width"]
+    else:
+        assert route["request"]["inputs"]["mask_image"]["support"] == "unsupported"
+    engine.generate.assert_not_called()
+
+
 def _engine(declaration=None):
     """Retain the real frontend gate, with device/engine startup omitted."""
     client = object.__new__(AsyncOmni)
@@ -39,6 +63,8 @@ def _engine(declaration=None):
     client._paused = False
     client._sleeping_tags = set()
     client.engine = object.__new__(OmniEngineBase)
+    client.engine.stage_clients = []
+    client.engine._diffusion_od_config_view = SimpleNamespace()
     client.engine.stage_configs = [
         StageConfig(stage_id=7, model_stage="encode", stage_type=StageType.LLM).to_omegaconf(),
         StageConfig(
@@ -93,6 +119,19 @@ def _app(client, *, count=1, restricted=(), missing_chat=False, duplex=False):
 
 def _routes(body):
     return {(route["transport"], route["method"], route["path"]): route["exposure"] for route in body["routes"]}
+
+
+def test_image_edit_route_requires_its_actual_diffusion_stage_guard():
+    engine = _engine()
+    engine.engine.stage_configs = [
+        StageConfig(
+            stage_id=0, model_stage="image", stage_type=StageType.LLM, final_output=True, final_output_type="image"
+        ).to_omegaconf()
+    ]
+    with TestClient(_app(engine)) as client:
+        routes = _routes(client.get("/v1/omni/capabilities").json())
+    assert routes[("http", "POST", "/v1/images/generations")] == "enabled"
+    assert routes[("http", "POST", "/v1/images/edits")] == "disabled"
 
 
 def test_real_route_and_openapi_report_aliases_and_original_stage_ids():

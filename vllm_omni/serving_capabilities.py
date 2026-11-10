@@ -7,8 +7,10 @@ PipelineConfig and DiffusionModelMetadata own instances of these declarations.
 The serving layer adds deployment routes and execution observations separately.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
+
+from vllm_omni.request_capabilities import InputConstraint, RequestConstraints
 
 OperationId = Literal["chat", "image_generation", "image_edit", "video_generation", "speech", "audio_generation"]
 Support = Literal["supported", "unsupported", "unknown"]
@@ -35,6 +37,7 @@ class CapabilityProfile:
     support: Support = "supported"
     reason_code: str = "model_declared"
     constraints: tuple[tuple[str, ConstraintValue], ...] = ()
+    request: RequestConstraints | None = None
 
 
 TEXT_RESPONSE = CapabilityProfile("text_response", "chat", ("text",), ("text",))
@@ -147,6 +150,17 @@ def declare_capabilities(
                     outputs=(),
                     support="unknown" if unknown else "unsupported",
                     reason_code=unknown_reason if unknown else unsupported_reason,
+                )
+            if profile.request is None and profile.support == "supported":
+                # Optional modalities remain unknown. Only the model owner's
+                # explicit required-input declaration supplies positive facts.
+                profile = replace(
+                    profile,
+                    request=RequestConstraints(
+                        inputs={
+                            name: InputConstraint(support="supported", min_count=1) for name in profile.required_inputs
+                        }
+                    ),
                 )
             operation_profiles.append(profile)
         states = {profile.support for profile in operation_profiles}

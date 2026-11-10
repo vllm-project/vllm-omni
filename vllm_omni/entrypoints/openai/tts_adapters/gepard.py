@@ -20,7 +20,9 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     apply_max_new_tokens,
     conditioning_cache_salt,
+    speech_inputs,
 )
+from vllm_omni.request_capabilities import ParameterConstraint
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -49,6 +51,12 @@ _UNSUPPORTED_OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
 
 @register_tts_adapter
 class GepardAdapter(ARTTSAdapter):
+    request_constraints = speech_inputs(
+        "voice", unsupported=("reference_audio", "reference_text", "instructions")
+    ).model_copy(
+        update={"parameters": {"voice": ParameterConstraint(support="supported", type="string", enum=("default",))}}
+    )
+
     name = "gepard"
     stage_keys = frozenset({"gepard"})
     model_archs = frozenset({"GepardTalkerForConditionalGeneration"})

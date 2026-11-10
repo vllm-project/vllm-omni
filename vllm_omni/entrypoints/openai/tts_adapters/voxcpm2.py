@@ -10,7 +10,12 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
@@ -21,6 +26,8 @@ logger = init_logger(__name__)
 class VoxCPM2Adapter(ARTTSAdapter):
     """VoxCPM2 shares ``latent_generator`` with VoxCPM; selected when no ``vae``
     stage is present (and/or via ``model_arch``)."""
+
+    request_constraints = speech_inputs("reference_audio", "reference_text", "voice")
 
     stage_keys = frozenset({"latent_generator"})
     model_archs = frozenset({"VoxCPM2TalkerForConditionalGeneration"})

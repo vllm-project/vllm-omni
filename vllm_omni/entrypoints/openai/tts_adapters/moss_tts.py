@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     conditioning_cache_salt,
 )
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -106,6 +107,26 @@ def _code_grid_cache_salt(audio_codes: Any) -> str:
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint
+
+        request = super().get_request_constraints()
+        inputs = dict(request.inputs)
+        variant = self._moss_variant
+        alternatives: tuple[tuple[str, ...], ...] = ()
+        if variant == "sound_effect":
+            inputs["text"] = InputConstraint(support="supported", min_count=0, max_count=1)
+            inputs["ambient_sound"] = InputConstraint(support="supported", min_count=1, max_count=1)
+        elif variant == "voice_generator":
+            inputs["instructions"] = InputConstraint(support="supported", min_count=1, max_count=1)
+        else:
+            for role in ("voice", "reference_audio", "reference_text"):
+                inputs[role] = InputConstraint(support="supported", min_count=0, max_count=1)
+            alternatives = (("voice", "reference_audio"),)
+            if variant == "ttsd":
+                inputs["reference_audio_2"] = InputConstraint(support="supported", min_count=0, max_count=1)
+        return request.model_copy(update={"inputs": inputs, "required_any_of": alternatives})
+
     accumulate_nonstreaming: bool = False
 
     def __init__(self, ctx) -> None:

@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from vllm_omni.request_capabilities import RequestConstraints
 from vllm_omni.serving_capabilities import OPERATIONS, OperationId, Support
 
 Exposure = Literal["enabled", "disabled", "unknown"]
@@ -16,6 +17,8 @@ class CapabilityRouteReference(BaseModel):
     transport: Literal["http", "websocket"] = "http"
     method: str
     path: str
+    exposure: Exposure = "unknown"
+    request: RequestConstraints | None = None
 
 
 class CapabilityRoute(CapabilityRouteReference):
@@ -38,6 +41,7 @@ class CapabilityInputProfile(BaseModel):
     routes: list[CapabilityRouteReference] = Field(default_factory=list)
     reason_code: str
     constraints: dict[str, str | int | float | bool | tuple[str, ...]] = Field(default_factory=dict)
+    request: RequestConstraints | None = None
 
 
 class CapabilityOperation(BaseModel):

@@ -122,6 +122,12 @@ def _make_batch(**overrides) -> DiffusionRequestBatch:
 @pytest.mark.core_model
 @pytest.mark.cpu
 class TestPipelineArgumentsHandling:
+    @pytest.fixture(autouse=True)
+    def _dummy_checkpoint_lookup(self, monkeypatch):
+        # These unit tests supply synthetic model IDs and mock every weight
+        # loader. Do not require a cached HF snapshot when tests run offline.
+        monkeypatch.setattr(diffusion_data, "get_model_path", lambda model, revision: model)
+
     def test_adapter_forward_returns_output(self, mocker):
         od_config = _make_od_config()
         request = _make_request()
@@ -545,6 +551,23 @@ class TestPipelineArgumentsHandling:
         assert isinstance(kwargs["generator"], torch.Generator)
         assert kwargs["generator"].device.type == "cpu"
         assert kwargs["generator"].initial_seed() == 123
+
+    @pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+    @pytest.mark.parametrize("accepted", [True, False])
+    def test_adapter_never_silently_discards_edit_conditioning(self, field, accepted):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        # The worker's already-loaded signature is the authority; no model is
+        # loaded to run this request translation regression.
+        adapter._accept_call_kwargs = {"prompt", "image"} | ({field} if accepted else set())
+        image = Image.new("RGB", (16, 16))
+        request = _make_request()
+        request.prompt = {"prompt": "edit", "multi_modal_data": {"image": image, field: image}}
+        batch = DiffusionRequestBatch(requests=[request])
+        if accepted:
+            assert adapter._build_call_kwargs(batch)[field] is image
+        else:
+            with pytest.raises(ValueError, match=field):
+                adapter._build_call_kwargs(batch)
 
     def test_adapter_extract_input_reads_negative_prompt_fallback(self):
         # 1. test with diffusers_call_kwargs.negative_prompt is a correct list[str]

@@ -35,12 +35,14 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.request_capabilities import RuntimeServingMetadata
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
+
 _MISSING_RPC_RESULT = object()
 
 
@@ -89,12 +91,14 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        serving_metadata: RuntimeServingMetadata | None = None,
     ) -> None:
         self._initialize_client(
             metadata,
             request_address,
             response_address,
             proc_manager=proc_manager,
+            serving_metadata=serving_metadata,
         )
 
     @classmethod
@@ -105,6 +109,7 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        serving_metadata: RuntimeServingMetadata | None = None,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
         return cls(
@@ -112,6 +117,7 @@ class StageDiffusionClient(StageClientBase):
             request_address,
             response_address,
             proc_manager=proc_manager,
+            serving_metadata=serving_metadata,
         )
 
     def _initialize_client(
@@ -121,9 +127,14 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
+        serving_metadata: RuntimeServingMetadata | None = None,
     ) -> None:
         self._set_stage_metadata(metadata)
         self._proc_manager = proc_manager
+        runtime_metadata = serving_metadata or getattr(proc_manager, "serving_metadata", None)
+        self.serving_metadata = (
+            runtime_metadata if isinstance(runtime_metadata, RuntimeServingMetadata) else RuntimeServingMetadata()
+        )
         self._connect_transport(request_address, response_address)
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()

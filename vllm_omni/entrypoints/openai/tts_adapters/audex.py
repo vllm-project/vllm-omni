@@ -6,8 +6,14 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
+from vllm_omni.request_capabilities import ParameterConstraint
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -27,6 +33,12 @@ _AUDEX_INTERNAL_CFG_KEYS = ("cfg_role", "cfg_pair_id", "cfg_null_prompt")
 @register_tts_adapter
 class AudexAdapter(ARTTSAdapter):
     """Plain English TTS: single built-in voice, no reference audio, optional CFG."""
+
+    request_constraints = speech_inputs(
+        "voice", unsupported=("reference_audio", "reference_text", "instructions")
+    ).model_copy(
+        update={"parameters": {"voice": ParameterConstraint(support="supported", type="string", enum=("default",))}}
+    )
 
     stage_keys = frozenset({"audex_thinker", "audex_omni"})
     name = "audex"

@@ -35,14 +35,62 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageSegmentationInstance,
     SegmentationMaskFormat,
     SegmentationRLE,
 )
+from vllm_omni.request_capabilities import MaskConstraint
+from vllm_omni.serving_capabilities import ServingCapabilities
 
 logger = init_logger(__name__)
+
+
+def _validate_native_edit_inputs(
+    raw_request: Request,
+    engine_client: Any,
+    *,
+    stage_count: int,
+    image_count: int,
+    has_mask: bool,
+    has_reference: bool,
+) -> MaskConstraint | None:
+    """Reject native fields that would be discarded, before fetching inputs."""
+    if not has_mask and not has_reference:
+        return None
+    fields = [name for name, supplied in (("mask_image", has_mask), ("reference_image", has_reference)) if supplied]
+    if stage_count > 1:
+        raise HTTPException(400, f"{', '.join(fields)} is not supported by the multi-stage image edit route")
+    from vllm_omni.diffusion.data import uses_diffusers_adapter
+
+    config = _get_diffusion_od_config(raw_request, engine_client)
+    if uses_diffusers_adapter(config):
+        # Its worker validates the already-loaded pipeline's actual signature.
+        return None
+    declaration = getattr(getattr(engine_client, "engine", None), "serving_capabilities", None)
+    if not isinstance(declaration, ServingCapabilities):
+        architecture = getattr(config, "model_class_name", None)
+        declaration = get_diffusion_model_metadata(
+            architecture if isinstance(architecture, str) else None
+        ).serving_capabilities
+    if declaration is None:
+        return None
+    profile = next((p for p in declaration.get("image_edit").profiles if p.id == "image_to_image"), None)
+    request = profile.request if profile is not None else None
+    if profile is not None and profile.support == "unsupported":
+        raise HTTPException(400, "This model does not support image editing")
+    if request is None:
+        return None
+    for field in fields:
+        constraint = request.inputs.get(field)
+        if constraint is not None and constraint.support == "unsupported":
+            raise HTTPException(400, f"{field} is not supported by this model")
+    mask = request.mask if has_mask else None
+    if mask is not None and mask.max_source_count is not None and image_count > mask.max_source_count:
+        raise HTTPException(400, f"mask_image requires at most {mask.max_source_count} source image")
+    return mask
 
 
 def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:

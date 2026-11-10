@@ -151,6 +151,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _parse_json_list_form,
     _supports_segmentation,
     _update_if_not_none,
+    _validate_native_edit_inputs,
 )
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
@@ -2189,7 +2190,7 @@ async def health(raw_request: Request) -> JSONResponse:
 _remove_route_from_router(router, "/v1/models")
 
 
-@router.get("/v1/omni/capabilities", response_model=OmniCapabilitiesResponse)
+@router.get("/v1/omni/capabilities", response_model=OmniCapabilitiesResponse, response_model_exclude_none=True)
 async def show_capabilities(raw_request: Request) -> OmniCapabilitiesResponse:
     """Describe initialized model contracts, routes, and the local execution gate."""
     service = getattr(raw_request.app.state, "omni_serving_capabilities", None)
@@ -2536,8 +2537,8 @@ async def edit_images(
     stream: bool = Form(False),
     user: str | None = Form(None),  # unused now
     # vllm-omni extensions for image editing
-    mask_image: str | UploadFile | None = None,
-    reference_image: str | UploadFile | None = None,
+    mask_image: str | UploadFile | None = Form(None),
+    reference_image: str | UploadFile | None = Form(None),
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
@@ -2599,6 +2600,14 @@ async def edit_images(
             input_images_list.extend(urls)
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
+        mask_contract = _validate_native_edit_inputs(
+            raw_request,
+            engine_client,
+            stage_count=len(stage_configs),
+            image_count=len(input_images_list),
+            has_mask=mask_image is not None,
+            has_reference=reference_image is not None,
+        )
         # Reject oversized multi-image edit requests before fetching or decoding
         # any inputs. This keeps over-limit URL requests from burning network,
         # CPU, and memory on work that will be rejected anyway.
@@ -2624,8 +2633,10 @@ async def edit_images(
         omni_prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
-            # Mask role is different (alpha channel matters); never normalize.
+            # The model owns grayscale/binary conversion; preserve mask values.
             loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            if mask_contract is not None and mask_contract.requires_same_size and loaded[0].size != pil_images[0].size:
+                raise HTTPException(400, "mask_image and its source image must have the same dimensions")
             omni_prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:

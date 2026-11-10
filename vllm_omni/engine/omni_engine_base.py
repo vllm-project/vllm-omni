@@ -456,6 +456,7 @@ class OmniEngineBase:
                 final_output_type=client.final_output_type,
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
+                serving_metadata=getattr(client, "serving_metadata", None),
             )
             for client in self.stage_clients
         ]

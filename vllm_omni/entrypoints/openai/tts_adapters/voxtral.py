@@ -9,6 +9,7 @@ from vllm.utils.async_utils import make_async
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
+from vllm_omni.request_capabilities import RequestConstraints, RequestSupport
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -19,10 +20,32 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audio_generation"})
     name = "voxtral_tts"
 
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint
+
+        request = super().get_request_constraints()
+        # The encoder observation is cached by build(). Discovery must never
+        # issue the collective_rpc used by that inference path.
+        support: RequestSupport = (
+            "unknown" if self._encoder_loaded is None else "supported" if self._encoder_loaded else "unsupported"
+        )
+        return request.model_copy(
+            update={
+                "inputs": {
+                    **request.inputs,
+                    "voice": InputConstraint(support="supported", min_count=0, max_count=1),
+                    "reference_audio": InputConstraint(
+                        support=support, min_count=0, max_count=0 if support == "unsupported" else 1
+                    ),
+                },
+                "required_any_of": (("voice", "reference_audio"),),
+            }
+        )
+
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
-        self._encoder_loaded = None
+        self._encoder_loaded: bool | None = None
 
     def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build a Voxtral prompt for either a preset voice or inline reference audio."""

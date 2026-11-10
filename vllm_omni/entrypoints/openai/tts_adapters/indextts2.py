@@ -15,7 +15,12 @@ from vllm.inputs import tokens_input
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    speech_inputs,
+)
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
     INDEXTTS25_MIN_DURATION_FACTOR,
@@ -133,6 +138,8 @@ def indextts2_conditioning_cache_salt(
 
 @register_tts_adapter
 class IndexTTS2Adapter(ARTTSAdapter):
+    request_constraints = speech_inputs("reference_audio", "voice", required_any_of=(("voice", "reference_audio"),))
+
     stage_keys = frozenset({"indextts2_talker"})
     name = "indextts2"
 
