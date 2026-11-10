@@ -49,7 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.rope import Cosmos3RotaryEmbedding
+from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -468,44 +468,6 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # Timestep Embedder
 # ---------------------------------------------------------------------------
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen3-style RoPE: (x * cos) + (rotate_half(x) * sin).
-
-    Args:
-        q: [B, S, h, D]
-        k: [B, S, H_kv, D]
-        cos: [1, S, 1, D] or broadcastable
-        sin: [1, S, 1, D] or broadcastable
-    """
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-class Cosmos3NativeRotaryEmbedding(nn.Module):
-    """Original RoPE formula, retained for the Edge implementation."""
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _apply_rotary_pos_emb(q, k, cos, sin)
-
-
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations."""
 
@@ -603,7 +565,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.rotary_embedding: nn.Module = Cosmos3NativeRotaryEmbedding()
+        self.rotary_embedding = Cosmos3RotaryEmbedding()
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_local = self.num_heads // tp_size
@@ -713,7 +675,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.rotary_embedding: nn.Module = Cosmos3NativeRotaryEmbedding()
+        self.rotary_embedding = Cosmos3RotaryEmbedding()
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_local = self.num_heads // tp_size
@@ -1298,10 +1260,6 @@ class Cosmos3VFMTransformer(nn.Module):
     _gen_layer_cls = Cosmos3GenDecoderLayer
     _cross_attention_cls = Cosmos3CrossAttention
 
-    def _create_rotary_embedding(self) -> nn.Module:
-        """Use device-dispatched RoPE for the regular Nano/Super backbone."""
-        return Cosmos3RotaryEmbedding()
-
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         return ("gen_layers" in name or "language_model.layers" in name) and name.split(".")[-1].isdigit()
@@ -1568,11 +1526,6 @@ class Cosmos3VFMTransformer(nn.Module):
             ["hidden_gen"],
             self.hidden_size,
         )
-
-        # Edge overrides the factory; shared GEN layers retain native RoPE.
-        for module in self.modules():
-            if isinstance(module, (Cosmos3CausalAttention, Cosmos3CrossAttention)):
-                module.rotary_embedding = self._create_rotary_embedding()
 
     @property
     def device(self) -> torch.device:
