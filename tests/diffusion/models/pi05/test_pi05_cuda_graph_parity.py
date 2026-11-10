@@ -34,6 +34,7 @@ import torch
 import yaml
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import make_att_2d_masks, prepare_attention_masks_4d
 from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
@@ -41,7 +42,7 @@ from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 pytestmark = [
     pytest.mark.local_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="The CUDA Graph path needs a CUDA GPU."),
 ]
 
