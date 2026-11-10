@@ -1,0 +1,212 @@
+# yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
+meta:
+  title: "MiniMax-H3-Image"
+  slug: "minimax-h3-image"
+  provider: "MiniMax"
+  description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to nine reference images, 2K-class canvases, served via vLLM-Omni"
+  date_added: 2026-11-10
+  date_updated: 2026-11-10
+  tasks:
+    - omni
+  performance_headline: "A 2720×1536 image in about 0.8 s and a 2048² edit in 1.35 s end to end on 4×H200"
+  default_hardware: h200
+  related_recipes:
+    - MiniMaxAI/MiniMax-H3
+  # H200 and RTX PRO 6000 ran end to end (see their recipes). RTX PRO 6000 is a
+  # restricted profile and must be declared to appear in the picker.
+  hardware:
+    h200: verified
+    rtx_pro_6000_2x: verified
+    rtx_pro_6000_4x: verified
+
+model:
+  model_id: "MiniMaxAI/MiniMax-H3-Image"
+  min_vllm_version: "0.33.0"
+  docker_image: "vllm/vllm-omni:minimax-h3-image"
+  install:
+    docker:
+      note: "The image bundles vLLM 0.33.0 and vLLM-Omni with MiniMax-H3-Image support."
+    pip:
+      command: |
+        uv venv --python 3.12 --seed && source .venv/bin/activate
+        uv pip install vllm==0.33.0 --torch-backend=cu130
+        git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && uv pip install -e .
+      note: "MiniMax-H3-Image support is in vLLM-Omni source; install it on top of vLLM 0.33.0."
+  architecture: dense
+  # 33.1B DiT + 33.4B Qwen3-VL text encoder (loaded from MiniMaxAI/MiniMax-H3) + 0.58B VAE.
+  parameter_count: "67B"
+  active_parameters: "67B"
+  # Diffusion pipeline: no autoregressive KV context.
+  context_length: 0
+  # H200-qualified profile A: Ulysses SP 4 and text-encoder TP 4. Keep CUDA
+  # graphs on (no --enforce-eager); VAE decode tiles are graph-replayed.
+  base_args:
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--num-gpus"
+    - "4"
+    - "--usp"
+    - "4"
+    - "--text-encoder-tp-size"
+    - "4"
+  base_env: {}
+
+omni:
+  port: 8000
+  tasks:
+    - id: t2i
+      description: "Text to image. Six steps; requests smaller than 2048² are generated on a 2048²-area canvas and resized back. 0.77 s for 1024² and 0.88 s for 2048² end to end on 4×H200."
+      curl: |
+        curl -s http://localhost:8000/v1/images/generations \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "MiniMaxAI/MiniMax-H3-Image",
+            "prompt": "Documentary photograph of a lighthouse keeper on a cliff at dawn, Kodak Portra 400",
+            "size": "2720x1536",
+            "seed": 42,
+            "response_format": "b64_json"
+          }' | jq -r '.data[0].b64_json' | base64 -d > t2i.png
+    - id: i2i
+      description: "Reference-image editing. One to nine references, presented to the model as Picture 1, Picture 2, … in upload order. 1.35 s for a 2048² edit on 4×H200."
+      curl: |
+        curl -s http://localhost:8000/v1/images/edits \
+          -F model=MiniMaxAI/MiniMax-H3-Image \
+          -F image=@cabin.png \
+          -F 'prompt=<Picture 1> is a cabin by a lake. Everything is preserved exactly; only the season changes to a snowy winter evening.' \
+          -F size=2720x1536 \
+          -F seed=42 \
+          -F response_format=b64_json | jq -r '.data[0].b64_json' | base64 -d > edit.png
+        # Repeat -F image=@... for more references, in the order the prompt names them.
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    # ceil(127 GB of BF16/FP32 weights x 1.2), summed over GPUs.
+    vram_minimum_gb: 153
+    description: "BF16 checkpoint: 66 GB DiT, 67 GB Qwen3-VL text encoder, 2.3 GB FP32 VAE. Peak per GPU on H200: 81.3 GiB (SP 4), 52.2 GiB (TP 2 × SP 2), 36.2 GiB (TP 4), 63.3 GiB (2 GPUs, TP 2)."
+    hardware_overrides:
+      # Configuration-only: SP 4 does not fit 80 GB, so H100 shards the DiT with TP 4.
+      h100:
+        extra_args:
+          - "--num-gpus"
+          - "4"
+          - "--tensor-parallel-size"
+          - "4"
+          - "--usp"
+          - "1"
+          - "--text-encoder-tp-size"
+          - "4"
+      rtx_pro_6000_2x:
+        extra_args:
+          - "--num-gpus"
+          - "2"
+          - "--tensor-parallel-size"
+          - "2"
+          - "--usp"
+          - "1"
+          - "--text-encoder-tp-size"
+          - "2"
+
+  dlo:
+    label: "BF16 + DLO"
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "One GPU with distributed layerwise offload: the DiT and the text encoder stay in pinned host memory (about 124 GiB) and stream one block at a time. 14.7 GiB peak and 8.3 s per 2048² image on one H200."
+    extra_args:
+      - "--num-gpus"
+      - "1"
+      - "--usp"
+      - "1"
+      - "--text-encoder-tp-size"
+      - "1"
+      - "--diffusion-offload-config"
+      - '{"mode":"layer","components":["dit","text_encoder"]}'
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  MiniMax-H3-Image generates and edits images with the MiniMax-H3 DiT
+  (33.1B, audio disabled), the base model's Qwen3-VL text encoder, a native
+  2D-decoder image VAE and fused per-step PDD output heads. Every request runs
+  six CFG-distilled steps and returns one image. A request with reference
+  images is an edit; there is no task flag.
+
+  | Component | Source | Precision | Parameters |
+  |---|---|---|---|
+  | DiT | `MiniMaxAI/MiniMax-H3-Image/transformer` | BF16 | 33.1B |
+  | Text encoder (Qwen3-VL) | `MiniMaxAI/MiniMax-H3/text_encoder` | BF16 | 33.4B |
+  | Image VAE | `MiniMaxAI/MiniMax-H3-Image/vae` | FP32 | 0.58B |
+
+  `model_index.json` names the base repository for the text encoder; vLLM-Omni
+  downloads only that folder. Plan for about 127 GB of disk.
+
+  ## Request contract
+
+  - `num_inference_steps`: omit or 6. `guidance_scale`: omit or 1.
+    `negative_prompt` is not supported. One image per request.
+  - `size` defaults to `1024x1024`. Requests below 2048² pixels are generated on
+    a same-aspect canvas of at least 2048² (sides on a 32-pixel grid) and
+    resized back with LANCZOS. Requesting the canvas size directly (2048x2048,
+    2720x1536, 1536x2720, 2368x1760, 2496x1664, 3136x1344) skips the resize.
+  - `extra_args.min_generation_area` overrides the canvas area per request
+    (32² to 4096²).
+  - Edits: give references at the canvas size of the requested aspect ratio and
+    request that size for the best alignment; combine several changes into one
+    edit rather than chaining edits.
+
+  ## Deployment profiles
+
+  All rows were run on H200; the RTX PRO 6000 recipe has its own measurements.
+  Other accelerators reuse these commands sized from the H200 peaks
+  (configuration-only). DLO is `--diffusion-offload-config` with
+  `mode: layer`.
+
+  | GPUs | Profile | Extra flags | Peak / GPU | 2048² t2i |
+  |---|---|---|---|---|
+  | 1 | DiT resident, text encoder offloaded | `--num-gpus 1 --diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}'` | 73.4 GiB | 3.2 s |
+  | 1 | DLO, DiT and text encoder | `--num-gpus 1 --diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"]}'` | 14.7 GiB | 8.3 s |
+  | 2 | Ulysses SP 2, resident | `--num-gpus 2 --usp 2 --text-encoder-tp-size 2` | 94.6 GiB | 1.5 s |
+  | 2 | Ulysses SP 2 + DLO (DiT AllGather) | `--num-gpus 2 --usp 2 --text-encoder-tp-size 2 --diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"],"layer_options":{"dit":{"weight_transfer":"allgather"},"text_encoder":{"weight_transfer":"rank-local"}}}'` | 12.0 GiB | 5.6 s |
+  | 2 | DiT TP 2, resident | `--num-gpus 2 --tensor-parallel-size 2 --usp 1 --text-encoder-tp-size 2` | 63.3 GiB | 1.5 s |
+  | 4 | Ulysses SP 4, resident (default) | `--num-gpus 4 --usp 4 --text-encoder-tp-size 4` | 81.3 GiB | 0.88 s |
+  | 4 | DiT TP 4, resident | `--num-gpus 4 --tensor-parallel-size 4 --usp 1 --text-encoder-tp-size 4` | 36.2 GiB | 1.0 s |
+
+  Full single-GPU residency needs an estimated 135 GiB and was not measured; it
+  is the natural choice on B200 and B300 (`--num-gpus 1`). On 80 GB H100, use DLO
+  on one or two GPUs, or TP 4 on four (SP 4 does not fit). On 96 GB RTX PRO 6000,
+  every resident layout fits (SP 2 peaks at 68.1 GiB, TP 2 at 49.7 GiB), and SP 4
+  is the fastest four-GPU layout over PCIe. Keep `resident_layers` at 0:
+  24 resident blocks ran at about 15 s per step on H200. CFG parallel and HSDP
+  are rejected; model CPU offload, quantization and cache acceleration are not
+  qualified.
+
+  ## Measured latency (4×H200, SP 4)
+
+  Median of three warm requests at concurrency 1, client end-to-end time:
+
+  | Request | Latency |
+  |---|---|
+  | t2i 1024x1024 | 0.77 s |
+  | t2i 2048x2048 | 0.88 s |
+  | t2i 4736x3552 | 3.84 s |
+  | edit 2048x2048 (one reference) | 1.35 s |
+
+  Per-profile numbers and the correctness guard are in the in-repo recipe.
+
+  ## References
+
+  - [Model card](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+  - [H200 recipe with measurements](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-H200.md)
+  - [MiniMax-H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3)
