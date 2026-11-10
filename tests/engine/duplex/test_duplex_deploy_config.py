@@ -8,7 +8,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from tests.helpers.stage_config import get_deploy_duplex_max_sessions
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_duplex_max_sessions
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -163,19 +163,21 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
 
 
 @pytest.mark.parametrize(
-    ("deploy_yaml", "expected"),
+    ("deploy_yaml", "platform", "expected"),
     [
-        ("minicpmo_4_5.yaml", 16),
-        ("minicpmo_4_5_duplex_h200.yaml", 16),
-        ("minicpmo_4_5_8x4090.yaml", 1),
-        ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
+        ("minicpmo_4_5.yaml", "cuda", 32),
+        ("minicpmo_4_5.yaml", "npu", 16),
+        ("minicpmo_4_5_duplex_h200.yaml", "cuda", 32),
+        ("minicpmo_4_5_8x4090.yaml", "cuda", 1),
+        ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "cuda", 32),
+        ("minicpmo_4_5_stage2_replicas.yaml", "npu", 4),
     ],
 )
-def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, expected: int) -> None:
+def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, platform: str, expected: int) -> None:
     # Guards the admission probe. A capacity edit, a config that declares none,
     # or an overlay inheriting one from its base must surface here rather than
     # as another nightly duplex admission timeout.
-    assert get_deploy_duplex_max_sessions(deploy_yaml) == expected
+    assert get_deploy_duplex_max_sessions(deploy_yaml, platform) == expected
 
 
 @pytest.mark.parametrize(
@@ -200,3 +202,48 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
 def test_history_calibration_requires_bounded_server_configuration(patch):
     with pytest.raises(ValueError):
         DuplexSessionRuntimeConfig(**patch)
+
+
+@pytest.mark.parametrize("platform,capacity", [("cuda", 32), ("npu", 16)])
+def test_platform_session_admission_matches_worker(monkeypatch, platform: str, capacity: int) -> None:
+    from vllm_omni.config.stage_config import _apply_platform_overrides
+    from vllm_omni.engine.omni_engine_base import OmniEngineBase, _load_engine_deploy_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    path = get_deploy_config_path("minicpmo_4_5.yaml")
+    admission = _load_engine_deploy_config(path).duplex_session
+    worker = _apply_platform_overrides(load_deploy_config(path)).duplex_session
+    assert admission == worker
+    assert admission.max_sessions == capacity
+    engine = object.__new__(OmniEngineBase)
+    engine.deploy_config = None
+    engine._deploy_config_source = None
+    engine._set_pipeline_runtime_config(None, path)
+    assert engine.duplex_session_config == admission
+
+
+@pytest.mark.parametrize("override", ["[]", "{unknown: 4}", "{max_sessions: 0}"])
+def test_invalid_platform_session_override(tmp_path, override: str) -> None:
+    from vllm_omni.config.stage_config import resolve_platform_duplex_session
+
+    path = tmp_path / "deploy.yaml"
+    path.write_text(f"platforms:\n  npu:\n    duplex_session: {override}\nstages: []\n")
+    with pytest.raises(ValueError):
+        resolve_platform_duplex_session(load_deploy_config(path), "npu")
+
+
+def test_platform_session_override_preserves_base_and_unset_fields(tmp_path) -> None:
+    from vllm_omni.config.stage_config import resolve_platform_duplex_session
+
+    path = tmp_path / "deploy.yaml"
+    path.write_text(
+        "duplex_session: {max_sessions: 32, idle_ttl_s: 600}\n"
+        "platforms: {npu: {duplex_session: {max_sessions: 16}}}\nstages: []\n"
+    )
+    base = load_deploy_config(path)
+    resolved = resolve_platform_duplex_session(base, "npu")
+    assert resolved.max_sessions == 16
+    assert resolved.idle_ttl_s == 600
+    assert base.duplex_session.max_sessions == 32
+    assert resolve_platform_duplex_session(base, "cuda") == base.duplex_session

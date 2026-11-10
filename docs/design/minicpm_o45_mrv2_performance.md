@@ -72,6 +72,67 @@ Duplex defaults to an MRv2 Thinker and Code2Wav on CUDA through
 `minicpmo_4_5.yaml`, with the multi-frame Talker on V1. Other platforms keep V1. Turn results
 do not establish duplex performance or interruption correctness.
 
+The base `minicpmo_4_5.yaml` profile targets high-concurrency serving on
+large-memory devices: GPU stages and duplex admission default to 32 requests;
+NPU stages and admission default to 16. CUDA Talker reserves 8 GiB for KV;
+NPU retains 4 GiB. Specialized memory/topology overlays retain their own caps.
+These capacities are configuration defaults, not validated full-context limits
+on every GPU/NPU SKU.
+
+Code2Wav derives Whole-Euler admission (`max_graph_batch`) from Stage 2
+`max_num_seqs` when omitted. Its workspace rows (`micro_batch_size`) default
+to that concurrency, bounded by an explicitly smaller `max_graph_batch`.
+The base profile omits both overrides. An explicit smaller `micro_batch_size`
+remains available for memory-constrained deployments: larger batches replay
+in groups over the shared workspace. For example, changing 4 to 32 rows grows
+the default five-step attention workspace from 1.25 GiB to 10 GiB; persistent
+request caches and the other stages need additional memory.
+
+### Turn-mode C64 profile
+
+`minicpmo_4_5_turn_mrv2_c64.yaml` is an opt-in single-GPU profile for
+64 concurrent turn requests. It extends the H200 MRv2 turn profile with:
+
+- stage capacity 64 and Whole-Euler admission 64;
+- an explicit 16-row `micro_batch_size`;
+- HiFT capture batches up to 64;
+- encoder runtime capture after the startup arena (threshold 8);
+- 16 GiB of Talker KV for 64 full-context requests.
+
+At this concurrency Code2Wav is the binding stage. Sixteen workspace rows
+replay a 64-row batch in four groups; both smaller and derived full-width
+workspaces were slower.
+
+Measured on one NVIDIA L20X (vLLM 0.33.0, PyTorch 2.14.0+cu126, MPS on).
+The workload is Seed-TTS English, HTTP streaming, text+audio TTS template,
+seed 0, temperature 0. C64 used 640 requests after 64 warmups; C1 used 128
+requests after 8 warmups. All requests succeeded. Mean RTF is per request;
+throughput is audio seconds generated per wall-clock second.
+
+| Deployment | C64 mean RTF | C64 P99 RTF | Audio throughput | Peak device memory |
+| --- | ---: | ---: | ---: | ---: |
+| H200 profile, capacity 64, 4-row workspace | 0.960 | 1.552 | 66.8 | 97.1 GiB |
+| This profile with 64-row workspace | 1.032 | 1.641 | 62.3 | 138.9 GiB |
+| This profile (16 rows) | 0.847 | 1.327 | 75.7 | 97.4 GiB |
+
+The first row ran at `2b610b3e9c` with 4 GiB Talker KV. Peak memory is
+`nvidia-smi` device usage sampled every 500 ms, covering all three stages.
+At C1 this profile measured a mean RTF of 0.111. Each row is one run.
+Removing the runtime encoder capture and the extended HiFT buckets
+from an otherwise similar setup changed C64 RTF by about 2% and less than 1%,
+respectively. WER and speaker similarity were not measured. The 64-row
+workspace nearly fills the 140 GiB device, so do not raise
+`micro_batch_size` for this profile without memory validation.
+
+The base profile allows 36 Whole-Euler graphs for the default six batch sizes,
+three cache offsets and steady/final query widths. Encoder graphs retain four
+rows and 12 entries; they have independent workspace and replay grouping.
+The redundant runtime encoder capture threshold is omitted because successful
+startup precapture disables request-time capture by default. NPU auxiliary
+batch buckets include 16, while the auxiliary graph pool remains bounded at
+32 entries. Validate co-located NPU memory and audio quality on the target SKU
+before relying on C16 capacity.
+
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
 matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also

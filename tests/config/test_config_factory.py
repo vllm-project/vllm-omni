@@ -1517,12 +1517,12 @@ class TestDeployConfigLoading:
     @pytest.mark.parametrize(
         ("filename", "max_sessions"),
         [
-            ("minicpmo_4_5.yaml", 16),
+            ("minicpmo_4_5.yaml", 32),
             ("minicpmo_4_5_2gpu.yaml", 4),
             ("minicpmo_4_5_3gpu.yaml", 4),
             ("minicpmo_4_5_8x4090.yaml", 1),
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 32),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 32),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
         ],
     )
@@ -1609,7 +1609,7 @@ class TestDeployConfigLoading:
                 "prompt_lookup_max": 1,
             }
             assert stages[1].yaml_engine_args["async_scheduling"] is False
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
         else:
             # CUDA arms the same block: the runner injects the constant
             # continue drafts, so the deploy stop id is the two-wide
@@ -1627,9 +1627,9 @@ class TestDeployConfigLoading:
             }
             # K-step books its span with the synchronous runner contract.
             assert stages[1].yaml_engine_args["async_scheduling"] is False
-            # Base concurrency stays 16; only the NPU overlay lowers it to 8,
+            # Base concurrency stays 32; only the NPU overlay lowers it to 16,
             # so a CUDA deployment keeps the pipeline default.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [32, 32, 32]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -2114,11 +2114,13 @@ stages:
                     "minicpmo_4_5_turn.yaml",
                     "minicpmo_4_5_turn_mrv2.yaml",
                     "minicpmo_4_5_turn_mrv2_h200.yaml",
+                    "minicpmo_4_5_turn_mrv2_c64.yaml",
                 )
                 for platform in ("npu", "rocm", "xpu", "musa")
             ),
             ("minicpmo_4_5_turn_mrv2.yaml", "cuda", True),
             ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", True),
+            ("minicpmo_4_5_turn_mrv2_c64.yaml", "cuda", True),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
@@ -3254,8 +3256,10 @@ class TestPlatformOverrides:
 
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        # Both single-device profiles reserve headroom for colocated Code2Wav.
-        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
+        # Both single-device profiles reserve headroom for colocated Code2Wav;
+        # CUDA sizes the cap for 32 full-context Talker requests.
+        expected_gib = 8 if platform == "cuda" else 4
+        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == expected_gib * 1024**3
 
     def test_minicpmo_4_5_cuda_replicas_use_automatic_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3270,7 +3274,7 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
+            # Explicit null clears the inherited single-GPU 8 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):

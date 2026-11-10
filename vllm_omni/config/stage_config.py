@@ -9,7 +9,7 @@ import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -1176,6 +1176,28 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
 _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
+def resolve_platform_duplex_session(
+    deploy: DeployConfig,
+    platform: str | None = None,
+) -> DuplexSessionRuntimeConfig:
+    """Resolve admission and worker session limits without mutating the deploy."""
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        device_name = current_omni_platform.device_name
+        platform = device_name.lower() if device_name is not None else None
+    section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if section is None or "duplex_session" not in section:
+        return deploy.duplex_session
+    overrides = section["duplex_session"]
+    if not isinstance(overrides, dict):
+        raise ValueError(f"platforms.{platform}.duplex_session must be a mapping")
+    unknown = sorted(set(overrides) - {f.name for f in fields(DuplexSessionRuntimeConfig)})
+    if unknown:
+        raise ValueError(f"platforms.{platform}.duplex_session has unknown keys: {unknown}")
+    return replace(deploy.duplex_session, **overrides)
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1187,6 +1209,7 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    deploy.duplex_session = resolve_platform_duplex_session(deploy, platform)
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):

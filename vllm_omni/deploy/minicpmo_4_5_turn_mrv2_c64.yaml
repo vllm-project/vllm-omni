@@ -1,0 +1,32 @@
+# Opt-in single-GPU C64 throughput profile for turn-mode MiniCPM-o 4.5:
+# all three stages on MRv2 with 64-request admission. At C64 Code2Wav binds;
+# a 16-row Whole-Euler workspace replays 64 rows in four groups, faster than
+# both 4 rows and the derived 64-row default at this concurrency. Encoder
+# runtime capture covers tail and prompt-initialization shapes left eager by
+# the startup arena. Measurements and limits:
+# docs/design/minicpm_o45_mrv2_performance.md
+base_config: minicpmo_4_5_turn_mrv2_h200.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      max_graph_batch: 64
+      micro_batch_size: 16
+      hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+      code2wav_encoder_capture_after_precapture: true
+      code2wav_encoder_capture_after: 8
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+  - stage_id: 1
+    max_num_seqs: 64
+  - stage_id: 2
+    max_num_seqs: 64
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # 64 full-context requests: 64 * 4096 tokens (2 GiB holds ~35k).
+        kv_cache_memory_bytes: 17179869184  # 16 GiB

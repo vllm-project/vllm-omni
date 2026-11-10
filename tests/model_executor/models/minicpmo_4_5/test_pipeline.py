@@ -191,10 +191,10 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            # The NPU overlay caps all three stages at 8 so the top tier is not
-            # gated by a single stage; every other platform keeps the base 16.
+            # The NPU overlay caps all three stages at 16 so the top tier is not
+            # gated by a single stage; every other platform keeps the base 32.
             is_npu = (current_omni_platform.device_name or "").lower() == "npu"
-            expected_seqs = 8 if is_npu else 16
+            expected_seqs = 16 if is_npu else 32
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             # The NPU overlay also retunes the per-stage memory budget for the
@@ -254,7 +254,7 @@ class TestDeployTopology:
             "code2wav_max_npu_graphs": 32,
         }
         if filename == "minicpmo_4_5.yaml":
-            expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
+            expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8, 16]
         assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:

@@ -629,7 +629,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
         # bounded pool can reuse captures across nearby batch sizes.
-        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8, 16]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected

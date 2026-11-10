@@ -615,6 +615,14 @@ independent real-model verification.
 
 ## Session-aware replica placement
 
+Platform-specific session limits can be set under
+`platforms.<platform>.duplex_session`. These fields override the top-level
+`duplex_session` values before both frontend admission and worker sizing;
+omitted fields retain their top-level values. Engine runtime-config reloads
+use the same resolver. An inherited platform limit takes precedence over an
+overlay's top-level limit: capacity-reducing overlays must also restate that
+limit in the platform block. Unknown fields and invalid values fail validation.
+
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
 session on a local replica group mapping every stage to a replica. The
 orchestrator owns a separate session reservation ledger; StagePool's request
