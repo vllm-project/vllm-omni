@@ -80,6 +80,11 @@ The AR sampler preserves comprehension token blocking, image-generation stage
 transitions, and greedy aspect-ratio selection using MRv2's device-side
 token history. Speculative decoding must be disabled for this stage.
 
+On NPU, the model state uses Ascend attention metadata and restores
+bidirectional attention within each input-image span. Image-prefix prefill
+requires eager execution, PCP/DCP sizes of one, and unquantized KV caches.
+The supplied NPU profiles use eager BF16 execution.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
