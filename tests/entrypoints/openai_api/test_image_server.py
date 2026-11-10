@@ -101,7 +101,9 @@ def test_native_klein_rejects_ambiguous_mask_canvas(test_client, source_count, m
     assert engine.captured_prompt is None
 
 
-@pytest.mark.parametrize("architecture,maximum", [("Flux2KleinPipeline", 4), ("ZImagePipeline", 1)])
+@pytest.mark.parametrize(
+    "architecture,maximum", [("Flux2KleinPipeline", 4), ("ZImagePipeline", 1), ("Flux3Pipeline", 10)]
+)
 @pytest.mark.parametrize("over_limit", [False, True])
 def test_image_edit_source_count_matches_real_handler_limit(test_client, architecture, maximum, over_limit):
     engine = test_client.app.state.engine_client

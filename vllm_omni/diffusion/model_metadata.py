@@ -28,6 +28,7 @@ from vllm_omni.serving_capabilities import (
     TEXT_TO_SPEECH,
     TEXT_TO_VIDEO,
     VIDEO_TO_VIDEO,
+    CapabilityProfile,
     ServingCapabilities,
     declare_capabilities,
 )
@@ -89,7 +90,7 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 FLUX3_MAX_INPUT_IMAGES = 10
 
 
-def _image_edit_profile(max_images: int | None = None, *, native_mask: bool = False):
+def _image_edit_profile(max_images: int | None = None, *, native_mask: bool = False) -> CapabilityProfile:
     """Native image pipeline input ownership; geometry is supplied at startup.
 
     Klein is the native image pipeline consuming mask_image/reference_image.
@@ -120,6 +121,39 @@ def _image_edit_profile(max_images: int | None = None, *, native_mask: bool = Fa
             if native_mask
             else MaskConstraint(support="unsupported"),
         ),
+    )
+
+
+def _flux3_profile(profile: CapabilityProfile) -> CapabilityProfile:
+    """The image VAE has a fixed four-level architecture; package sampling varies."""
+    request = _image_edit_profile(FLUX3_MAX_INPUT_IMAGES).request
+    assert request is not None
+    inputs = dict(request.inputs)
+    if profile.operation != "image_edit":
+        inputs["image"] = InputConstraint(
+            support="supported" if profile.operation == "chat" else "unsupported",
+            min_count=0,
+            max_count=FLUX3_MAX_INPUT_IMAGES if profile.operation == "chat" else 0,
+        )
+    # Flux3Pipeline constructs Flux3ImageVAE with AutoEncoderParams defaults:
+    # four block levels give scale 8, and forward requires twice that scale.
+    # CFG/flow-map is chosen from worker-local package config; neither
+    # guidance_scale nor negative_prompt acceptance is inferred here.
+    return replace(
+        profile,
+        request=request.model_copy(
+            update={
+                "inputs": inputs,
+                "parameters": {
+                    "width": ParameterConstraint(support="supported", type="integer", minimum=16, step=16),
+                    "height": ParameterConstraint(support="supported", type="integer", minimum=16, step=16),
+                    "num_outputs_per_prompt" if profile.operation == "chat" else "n": ParameterConstraint(
+                        support="supported", type="integer", enum=(1,)
+                    ),
+                },
+            }
+        ),
+        constraints=(("sampling_overrides", "worker_package_config"),),
     )
 
 
@@ -324,6 +358,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
         final_output_type="image",
+        serving_capabilities=declare_capabilities(
+            *(_flux3_profile(profile) for profile in (IMAGE_RESPONSE, TEXT_TO_IMAGE, IMAGE_TO_IMAGE)),
+            sources=(
+                "vllm_omni/diffusion/models/flux3/pipeline_flux3.py",
+                "vllm_omni/diffusion/models/flux3/flux3_image_vae.py",
+                "examples/online_serving/flux3/README.md",
+                "vllm_omni/entrypoints/openai/api_server.py",
+            ),
+        ),
     ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,

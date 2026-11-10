@@ -80,6 +80,31 @@ def test_video_transport_does_not_claim_offline_last_frame_or_widen_fixed_frames
     assert magi.parameters["fps"].enum == (12.5,)
 
 
+def test_flux3_profiles_distinguish_optional_chat_images_and_required_edits():
+    chat = _profile("Flux3Pipeline", "chat", "image_response")
+    chat_request = _route(chat, "/v1/chat/completions")
+    assert chat_request.inputs["image"].min_count == 0
+    assert chat_request.inputs["image"].max_count == 10
+    assert chat_request.parameters["num_outputs_per_prompt"].enum == (1,)
+    edit = _profile("Flux3Pipeline", "image_edit", "image_to_image")
+    edit_request = _route(edit, "/v1/images/edits", image_limit=2)
+    assert edit.request.inputs["image"].max_count == 10
+    assert edit_request.inputs["image"].min_count == 1
+    assert edit_request.inputs["image"].max_count == 2
+    assert edit_request.inputs["mask_image"].support == "unsupported"
+    assert edit_request.inputs["reference_image"].support == "unsupported"
+    assert edit_request.parameters["n"].enum == (1,)
+    generation = _route(_profile("Flux3Pipeline", "image_generation", "text_to_image"), "/v1/images/generations")
+    assert generation.inputs["image"].support == "unsupported"
+    for request in (chat_request, edit_request, generation):
+        assert request.parameters["width"].step == 16
+        assert request.parameters["height"].step == 16
+        # The loaded package chooses CFG or flow-map sampling. Discovery
+        # cannot infer acceptance of these overrides from a model name.
+        assert "guidance_scale" not in request.parameters
+        assert "negative_prompt" not in request.parameters
+
+
 def test_geometry_requires_agreement_of_all_current_initialized_replicas():
     def replica(multiple):
         return SimpleNamespace(

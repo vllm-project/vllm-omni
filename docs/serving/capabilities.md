@@ -164,6 +164,16 @@ pipeline signature cannot accept it, rather than silently discarding it.
 | `speech` music/caption profiles | MiniMax Music3/YuE2 require lyrics and style instructions, permit only the placeholder `default` voice, and exclude ordinary TTS reference controls. Audex TTA takes captions. MOSS variants separately expose reference cloning, sound-effect descriptions or voice-design instructions. |
 | `audio_generation` | The diffusion audio handler maps a text caption and optional negative prompt. It has no lyrics/instruction pair, voice or reference-media mapping. |
 
+FLUX.3 declares image responses through chat, text-to-image generation, and
+image editing. Chat permits zero to ten reference images; edits require at
+least one and apply the deployment's image limit. The image-generation route
+does not accept reference images. Its current fixed image VAE requires output
+dimensions divisible by 16, and each request produces one image. Native masks
+and separate reference fields are unsupported. The loaded package selects CFG
+or flow-map sampling: flow-map rejects explicit `guidance_scale` and nonempty
+`negative_prompt`. Those parameter capabilities remain unknown to the frontend,
+which does not read worker package configuration during discovery.
+
 Voxtral reference-encoder availability is unknown when it has not already been
 observed by the normal request path. Discovery does not issue the RPC used to
 obtain it. Role facts do not replace the adapter's full request validator:
