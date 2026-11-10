@@ -1562,7 +1562,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        # Stage zero has no upstream payload to fan out. In MRv2 its output
+        # is materialized only on the reply rank, so a receive-side collective
+        # here has no matching reader and eventually fills the TP SHM ring.
+        if self._stage_id > 0 and self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()

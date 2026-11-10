@@ -106,6 +106,10 @@ platforms:
       - stage_id: 1
         gpu_memory_utilization: 0.5
         enforce_eager: true
+        env:
+          # vLLM's fused XPU top-k/top-p sampler kernel hangs the talker's
+          # startup dummy sampler run; use the native sampler on this stage.
+          VLLM_XPU_USE_SAMPLER_KERNEL: "0"
       - stage_id: 2
         gpu_memory_utilization: 0.3
         # Stage 2 colocates with stage 1's device on XPU.

@@ -173,8 +173,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # token-aligned, so MRv2 can restore them together on prefix hits.
         # Duplex uses a mutable KV window; Talker owns sampled codec outputs.
         # Opt in only when the construction path explicitly identifies turn mode.
+        # The output cache refuses speculative decoding, so with a draft the
+        # Thinker reuses native KV only. The Talker reads reply rows, which a
+        # new request's hit never covers, and llm2tts takes them from the row
+        # ledger.
         self.supports_mrv2_prefix_cache_outputs = (
-            self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", None) == "turn"
+            self.model_stage == "llm"
+            and getattr(vllm_config.model_config, "session_mode", None) == "turn"
+            and getattr(vllm_config, "speculative_config", None) is None
         )
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
@@ -854,13 +860,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
 
-    def get_language_model(self) -> torch.nn.Module:
-        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+    def get_language_model(self) -> Any:
+        """The stage's decoder: drafters share the Thinker's embedding and lm_head, or the Talker's codec table."""
         if self.thinker is not None:
             return self.thinker.get_language_model()
+        if self.talker is not None and hasattr(self.talker, "get_language_model"):
+            return self.talker.get_language_model()
         return self.model
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if self.model_stage == "tts":
+            # The Talker decoder returns them with its hidden states.
+            self.talker.set_aux_hidden_state_layers(layers)
+            return
         # Only the MRv2 Thinker forward hands target layers to the drafter.
         if self.model_stage != "llm" or not self._use_v2_model_runner:
             raise NotImplementedError(
@@ -1058,7 +1070,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
         return self.model_stage == "tts" and self._use_v2_model_runner
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         if self.model_stage == "tts":
             return self.talker.mrv2_custom_sampler(sampler)
         if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
