@@ -237,7 +237,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._ensure_moe_specialty_runner_compatible()
 
     def _ensure_moe_specialty_runner_compatible(self) -> None:
-        from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+        from vllm_omni.cudagraph.moe_routing_compat import (
             ensure_moe_specialty_runner_compatible,
         )
 

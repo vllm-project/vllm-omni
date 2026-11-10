@@ -426,7 +426,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
         # V2 does not use the V1 MoE annotate/select hooks, so this is the
         # fail-fast for Mammoth FULL + use_v2_model_runner mismatches (#9911).
-        from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+        from vllm_omni.cudagraph.moe_routing_compat import (
             ensure_moe_specialty_runner_compatible,
         )
 

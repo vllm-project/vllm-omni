@@ -22,7 +22,7 @@ from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 class MammothGPUARModelRunner(GPUARModelRunner):
     """AR runner used for MammothModa2 stages that may enable MoE specialty graphs."""
 
-    # Checked by ``ensure_moe_specialty_runner_compatible`` after model load.
+    # Checked by ``vllm_omni.cudagraph.moe_routing_compat`` after model load.
     supports_moe_routing_specialty = True
 
     def _annotate_moe_routing_batch_descriptor(

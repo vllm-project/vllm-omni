@@ -78,14 +78,22 @@ def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
-    """Turn on mask-keyed FULL MoE graphs when the stage uses FULL capture (#9865)."""
-    cg_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
-    if cg_mode is not None and cg_mode.has_mode(CUDAGraphMode.FULL):
-        object.__setattr__(
-            vllm_config.compilation_config,
-            "cudagraph_specialize_moe_routing",
-            True,
-        )
+    """Turn on mask-keyed FULL MoE graphs when the stage uses FULL capture (#9865).
+
+    Auto-enables for any cudagraph mode that includes FULL. An explicit
+    ``cudagraph_specialize_moe_routing=False`` set before model load is
+    honored as an opt-out (the attribute is otherwise absent on
+    ``CompilationConfig``).
+    """
+    compilation_config = vllm_config.compilation_config
+    cg_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cg_mode is None or not cg_mode.has_mode(CUDAGraphMode.FULL):
+        return
+    if hasattr(compilation_config, "cudagraph_specialize_moe_routing") and (
+        compilation_config.cudagraph_specialize_moe_routing is False
+    ):
+        return
+    object.__setattr__(compilation_config, "cudagraph_specialize_moe_routing", True)
 
 
 def _first_int(value: Any) -> int:

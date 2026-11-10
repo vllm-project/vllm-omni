@@ -6,11 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.cudagraph.moe_routing_compat import ensure_moe_specialty_runner_compatible
 from vllm_omni.model_executor.models.mammoth_moda2.gpu_ar_model_runner import MammothGPUARModelRunner
-from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
-    ensure_moe_specialty_runner_compatible,
+from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import (
+    _enable_moe_routing_cudagraph_specialize,
 )
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_ar_worker import (
@@ -65,11 +67,26 @@ def test_resolve_gpu_ar_model_runner_cls_respects_custom_runner_cls():
     assert resolve_gpu_ar_model_runner_cls(cfg, CustomARRunner) is CustomARRunner
 
 
+def test_enable_moe_routing_specialize_auto_on_for_full_when_unset():
+    compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    _enable_moe_routing_cudagraph_specialize(SimpleNamespace(compilation_config=compilation_config))
+    assert compilation_config.cudagraph_specialize_moe_routing is True
+
+
+def test_enable_moe_routing_specialize_respects_explicit_false():
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_specialize_moe_routing=False,
+    )
+    _enable_moe_routing_cudagraph_specialize(SimpleNamespace(compilation_config=compilation_config))
+    assert compilation_config.cudagraph_specialize_moe_routing is False
+
+
 def test_ensure_moe_specialty_compatible_raises_for_non_mammoth_after_flag_set():
     """Flag is normally set during model ``__init__`` inside ``load_model``."""
     runner = object.__new__(OmniGPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
-    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+    with pytest.raises(RuntimeError, match="cudagraph_mode without FULL"):
         ensure_moe_specialty_runner_compatible(runner)
 
 
@@ -127,7 +144,6 @@ def test_v1_load_model_ensures_compat_after_model_sets_flag(monkeypatch):
 
 
 def test_v2_load_model_calls_ensure_after_publish(monkeypatch):
-    from vllm_omni.worker_v2 import omni_model_runner as v2_mod
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as V2OmniGPUModelRunner
 
     runner = object.__new__(V2OmniGPUModelRunner)
@@ -155,30 +171,22 @@ def test_v2_load_model_calls_ensure_after_publish(monkeypatch):
         order.append("ensure")
         ensure_moe_specialty_runner_compatible(r)
 
-    monkeypatch.setattr(v2_mod, "init_omni_model_state", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(V2OmniGPUModelRunner, "_configure_cudagraph_output_contract", lambda self: None)
     monkeypatch.setattr(V2OmniGPUModelRunner, "_publish_shared_backbone_if_configured", lambda self: None)
-    monkeypatch.setattr(V2OmniGPUModelRunner, "_adopt_model_logits_vocab", lambda self, model: None, raising=False)
 
-    # Patch the upstream module that V2 temporarily rebinds during load_model.
-    import vllm.v1.worker.gpu.model_runner as _mr_module
-
-    monkeypatch.setattr(_mr_module, "init_model_state", lambda *a, **k: None, raising=False)
-
-    # Resolve super().load_model to a stub via the immediate GPU parent if present.
-    for cls in V2OmniGPUModelRunner.__mro__[1:]:
-        if "load_model" in vars(cls):
-            monkeypatch.setattr(cls, "load_model", _super_load)
-            break
+    # ``super().load_model`` resolves to MRv2PrefixCacheMixin first; stub that
+    # entry so we don't need the full upstream load path.
+    parent = next(cls for cls in V2OmniGPUModelRunner.__mro__[1:] if "load_model" in vars(cls))
+    assert parent.__name__ == "MRv2PrefixCacheMixin", parent
+    monkeypatch.setattr(parent, "load_model", _super_load)
 
     with patch(
-        "vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph.ensure_moe_specialty_runner_compatible",
+        "vllm_omni.cudagraph.moe_routing_compat.ensure_moe_specialty_runner_compatible",
         _ensure,
     ):
         with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
             V2OmniGPUModelRunner.load_model(runner)
-    assert "ensure" in order
-    assert order.index("super") < order.index("ensure")
+    assert order == ["super", "ensure"]
 
 
 def test_base_moe_hooks_fail_fast_when_specialize_enabled():
