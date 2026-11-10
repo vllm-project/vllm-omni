@@ -14,6 +14,31 @@ steps:
             tests/platforms/npu/test_npu_device_copy.py
             -m 'core_model and npu and A3 and omni'
             --run-level 'core_model'
+          - >-
+            pytest -s -v
+            tests/platforms/npu/test_qwen3_omni_model_state.py
+            tests/platforms/npu/test_npu_generation_v2.py
+            tests/platforms/npu/test_code2wav_graph_wrapper.py
+            -m 'core_model and cpu'
+            --run-level 'core_model'
+
+      - label: "NPU IPC Weight Sharing - A2"
+        key: ready-npu-ipc-weight-sharing
+        mirror_hardwares: a2b3_npu_1
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - "vllm_omni/distributed/weight_sharing/"
+          - "tests/distributed/weight_sharing/"
+          - "tests/helpers/mark.py"
+          - ".buildkite/npu/test-npu-ready.yml"
+        env:
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:False"
+        commands:
+          - >-
+            pytest -s -v
+            tests/distributed/weight_sharing/test_npu_ipc.py
+            -m 'core_model and npu and A2 and cards_1'
+            --run-level 'core_model'
 
       - label: "Diffusion NPU layer tests - A2"
         key: ready-diffusion-npu-layer-tests-a2
@@ -23,6 +48,25 @@ steps:
             pytest -s -v
             tests/diffusion/layers/test_activation.py
             -m 'core_model and npu and A2'
+            --run-level 'core_model'
+
+      - label: "Diffusion Ulysses symmetric memory - A2"
+        key: ready-diffusion-ulysses-symmetric-memory
+        mirror_hardwares: a2b3_npu_4
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - "vllm_omni/diffusion/attention/parallel/"
+          - "vllm_omni/diffusion/distributed/"
+          - "tests/diffusion/distributed/test_ulysses_symmetric_memory_npu.py"
+          - "tests/helpers/mark.py"
+          - ".buildkite/npu/test-npu-ready.yml"
+        env:
+          NPU_SHMEM_SYMMETRIC_SIZE: "4294967296"
+        commands:
+          - >-
+            torchrun --standalone --nproc-per-node=4 -m pytest -s -v
+            tests/diffusion/distributed/test_ulysses_symmetric_memory_npu.py
+            -k production -m 'core_model and npu and A2'
             --run-level 'core_model'
 
       - label: "Diffusion NPU layer tests - A3"
@@ -36,16 +80,6 @@ steps:
             tests/diffusion/models/minimax_h3/test_minimax_h3_qwen3vl_swiglu.py
             tests/diffusion/models/minimax_h3/test_minimax_h3_modulation.py
             -m 'core_model and npu and A3'
-            --run-level 'core_model'
-
-      - label: "Diffusion NPU layer tests - A5"
-        key: ready-diffusion-npu-layer-tests-a5
-        mirror_hardwares: a5_npu_2
-        commands:
-          - >-
-            pytest -s -v
-            tests/diffusion/layers/test_activation.py
-            -m 'core_model and npu and A5'
             --run-level 'core_model'
 
       - label: "Diffusion NPU layer tests - 310P"

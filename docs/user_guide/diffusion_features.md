@@ -32,6 +32,12 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### MiniMax-H3 LiteVAE Decoder
+
+[LiteVAE](diffusion/light_vae.md) uses a smaller video decoder to reduce
+MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
+can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
@@ -204,8 +210,10 @@ The following tables show which models support each feature:
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
+| **PAN 2 T2V I2V**            |     ❌     |     ✅      | ✅ (Ulysses only)<sup>6</sup> |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❓        |        ❌         |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **[Hy-Nomas](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md)** (Diffusers-format weights) | ❌ | ❌ | ✅ (Ulysses only) | ❌ | ❌ | ❌ | ❌ | ✅ (module only) | ❌ | ❌ | ❌ |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
@@ -213,6 +221,15 @@ The following tables show which models support each feature:
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply
 > unvalidated on this model, not known-broken.
+> 6. PAN 2 rejects ring and all-gather sequence parallelism at startup: its padded
+> joint video/text sequence needs an attention mask those modes do not carry. Use
+> Ulysses (`--usp`), CFG-Parallel, and Tensor-Parallel, alone or combined. Under
+> Ulysses, PAN 2 always masks the padding sequence parallelism adds, whatever
+> `mask_sp_padding` is set to, so the output matches one GPU; attention backends
+> that cannot take a mask, such as `SAGE_ATTN` and `SAGE_ATTN_3`, fail when that
+> padding is needed (for example 704x1248 at `--usp 4`). Layerwise and
+> distributed layerwise offload combine with all three; HSDP does not reduce memory
+> together with distributed layerwise offload, so use one or the other.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.

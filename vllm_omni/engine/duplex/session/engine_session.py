@@ -153,6 +153,8 @@ class ConversationHistory:
     revision: int = 0
     next_source_id: int = 0
     # Keys are identities of live message dictionaries, never public item IDs.
+    # Every non-placeholder insertion must call _track_history_message;
+    # removing one must call _forget_history_message. Placeholders are untracked.
     sources: dict[int, HistorySource] = field(default_factory=dict)
     #: User items added by ``conversation.item.create`` that no response has
     #: answered yet. A turn can start from these alone, the way the Realtime

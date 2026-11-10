@@ -11,8 +11,6 @@ The registry calls vLLM's ``configure_quant_config`` with the pipeline class
 All tests are pure-CPU and do not load model weights.
 """
 
-import os
-
 import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -64,6 +62,7 @@ class _SkipPolicyQuantConfig(QuantizationConfig):
 @pytest.fixture
 def tp1_group():
     """Single-process vllm-omni parallel groups (TP/PP/SP = 1) so the model constructs on CPU."""
+    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         destroy_model_parallel,
@@ -71,8 +70,7 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29503")
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
     initialize_model_parallel(backend="gloo")
     yield
