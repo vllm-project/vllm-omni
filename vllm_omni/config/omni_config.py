@@ -84,6 +84,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model_tag",
         "omni",
         "output_modalities",
+        "reasoning_parser",
+        "reasoning_parser_plugin",
         "stage_id",
         "subparser",
         "tokenizer",
@@ -303,8 +305,10 @@ class _StageEngineValues:
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
+    kernel_config: Mapping[str, Any] | KernelConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
+    weight_transfer_config: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -833,6 +837,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
+    diffusion_attention_schedule: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
@@ -854,6 +859,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
+    lora_application: Literal["runtime", "merged"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
@@ -981,6 +987,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             TransformerConfig,
             VideoOutputTransportConfig,
             build_attention_config,
+            parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
@@ -1058,7 +1065,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
@@ -1283,15 +1293,17 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-# The three fields below are vLLM config objects passed through verbatim
+# The following fields are vLLM config objects passed through verbatim
 # instead of being unpacked structurally. speculative_config was missing from
 # this list, so a stage-1 multi-frame setup failed to load: stage_config.py
 # injects a speculative_config into stage 1 (vLLM uses spec_token_ids to
 # advance K tokens per request) and the ownership check here rejected the whole
 # stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
 # explicit engine argument(s) with no structured config owner"). It joins the
-# two pass-through fields already listed.
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
+# other pass-through fields already listed.
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
+    {"compilation_config", "kernel_config", "profiler_config", "speculative_config", "weight_transfer_config"}
+)
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1433,7 +1445,7 @@ _DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset({"default_sampling_params", "devic
 
 def _frontend_cli_fields() -> frozenset[str]:
     """Return vLLM server fields that are consumed before stage startup."""
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
 
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
@@ -1654,12 +1666,14 @@ def _stage_engine_values(
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
+        kernel_config=_copy_value(engine.get("kernel_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
-        # Same category as the two above: a vLLM config object passed through
+        # Same category as the other vLLM config objects above: pass it through
         # verbatim. Without it, a speculative_config in the deploy config
         # silently disappears (no error) and speculative decoding loses effect
         # (engine logs show speculative_config=None).
         speculative_config=_copy_value(engine.get("speculative_config")),
+        weight_transfer_config=_copy_value(engine.get("weight_transfer_config")),
     )
 
 
@@ -1722,6 +1736,7 @@ class BaseVllmOmniStageConfig:
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
+    kernel_config: KernelConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
     # Shape matters: vLLM's create_speculative_config consumes this value as a
     # dict (it calls .items() / .update() before building SpeculativeConfig).
@@ -1729,6 +1744,7 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
+    weight_transfer_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1900,9 +1916,11 @@ def _build_common_stage_config_kwargs(
             ),
             "parallel_config": parallel_config,
             "compilation_config": _copy_value(engine.compilation_config),
+            "kernel_config": _copy_value(engine.kernel_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
             "quantization_config": _copy_value(quantization_config),
+            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,

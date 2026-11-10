@@ -100,6 +100,111 @@ def moe_enable(moe_type, layer_type, layer_idx) -> bool:
     return layer_type in moe_type and start <= layer_idx < end
 
 
+_WARNED_CAPTURE_PROBES: set[str] = set()
+
+
+def _warn_missing_capture_probe_once(dev_type: str) -> None:
+    """Report a missing capture probe once per backend instead of failing silently.
+
+    A backend whose graph capture is exposed under a different name would
+    otherwise always report "not capturing", sending both call sites down the
+    eager path and baking host-side routing into the recorded graph.
+    """
+    if dev_type in _WARNED_CAPTURE_PROBES:
+        return
+    _WARNED_CAPTURE_PROBES.add(dev_type)
+    logger.warning(
+        "torch.%s exposes no is_current_stream_capturing(); MoE routing cannot "
+        "detect graph capture on this backend and will use eager dispatch.",
+        dev_type,
+    )
+
+
+def _is_graph_capturing(device: torch.device) -> bool:
+    """Return True when the current stream on `device` is capturing a device graph.
+
+    CUDA/XPU/NPU graph capture bakes host-side control flow (`.any()`/`.all()`,
+    `.item()`) into the recorded graph. During capture the dummy inputs are all
+    zeros, so a branch taken on those values would replay the wrong path for
+    real inputs. Callers switch to a graph-safe `torch.where` path here instead.
+    """
+    dev_type = device.type
+    if dev_type == "cuda":
+        if not torch.cuda.is_available():
+            return False
+        return bool(torch.cuda.is_current_stream_capturing())
+    if dev_type == "npu":
+        is_capturing = getattr(getattr(torch, "npu", None), "is_current_stream_capturing", None)
+        if not callable(is_capturing):
+            _warn_missing_capture_probe_once(dev_type)
+            return False
+        return bool(is_capturing())
+    if dev_type == "xpu":
+        is_capturing = getattr(getattr(torch, "xpu", None), "is_current_stream_capturing", None)
+        if not callable(is_capturing):
+            _warn_missing_capture_probe_once(dev_type)
+            return False
+        return bool(is_capturing())
+    return False
+
+
+def _moe_blend(
+    hidden_states: torch.Tensor,
+    und_expert: Callable[[torch.Tensor], torch.Tensor],
+    gen_expert: Callable[[torch.Tensor], torch.Tensor],
+    gen_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Graph-safe MoE routing: run both experts and select per token via `torch.where`.
+
+    Unlike the eager path, this never reads the mask on the host and emits no
+    data-dependent control flow, so the emitted kernels can be captured into a
+    device graph and replayed with any mask value.
+    """
+    if hidden_states.ndim == 3:
+        b, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+        flat_hid = hidden_states.reshape(-1, hidden_states.shape[-1])
+    elif hidden_states.ndim == 2:
+        flat_hid = hidden_states
+    else:
+        raise ValueError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
+
+    if gen_token_mask.numel() != flat_hid.shape[0]:
+        raise ValueError(
+            "gen_token_mask shape mismatch: "
+            f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
+        )
+
+    und_out = und_expert(flat_hid)
+    gen_out = gen_expert(flat_hid)
+    # bool mask [total_tokens, 1] broadcasts against [total_tokens, D_out].
+    sel = gen_token_mask.reshape(-1).unsqueeze(-1)
+    merged = torch.where(sel, gen_out, und_out)
+    if hidden_states.ndim == 3:
+        return merged.view(b, seq_len, merged.shape[-1])
+    return merged
+
+
+def make_empty_intermediate_tensors_with_gen_mask(
+    batch_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> IntermediateTensors:
+    """Empty PP intermediate tensors, including a seeded ``gen_token_mask``.
+
+    Rank > 0 always needs the key during capture/replay; the first rank
+    overwrites it with the real mask derived from ``input_ids`` when
+    ``requires_raw_input_tokens`` holds.
+    """
+    return IntermediateTensors(
+        {
+            "hidden_states": torch.zeros((batch_size, hidden_size), dtype=dtype, device=device),
+            "residual": torch.zeros((batch_size, hidden_size), dtype=dtype, device=device),
+            "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool, device=device),
+        }
+    )
+
+
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
@@ -136,6 +241,22 @@ def moe_forward(
     """
     if gen_expert is None:
         return und_expert(hidden_states)
+
+    # FULL capture must record both experts. If input_ids were dropped
+    # (gen_token_mask is None), falling through to und_expert would bake
+    # the understanding path into the graph. Fail closed instead of
+    # silently replaying the understanding expert for gen tokens.
+    if _is_graph_capturing(hidden_states.device):
+        if gen_token_mask is None or gen_token_mask.numel() == 0:
+            raise RuntimeError(
+                "MammothModa2 MoE CUDA-graph capture requires gen_token_mask; "
+                "keep input_ids on the mm graph path via requires_raw_input_tokens. "
+                "If capture still fails (for example under model_runner: v2 or a "
+                "PP path that drops the mask), set enforce_eager: true. "
+                "PIECEWISE is not a workaround: MoE still hits this path whenever "
+                "the current stream is capturing."
+            )
+        return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 
     if gen_token_mask is None or not gen_token_mask.any():
         return und_expert(hidden_states)
@@ -396,18 +517,14 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             prefix=f"{prefix}.layers",
         )
 
+        hidden_size = config.hidden_size
+
         def _make_empty_intermediate_tensors(
             batch_size: int,
             dtype: torch.dtype,
             device: torch.device,
         ) -> IntermediateTensors:
-            return IntermediateTensors(
-                {
-                    "hidden_states": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
-                    "residual": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
-                    "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool, device=device),
-                }
-            )
+            return make_empty_intermediate_tensors_with_gen_mask(batch_size, hidden_size, dtype, device)
 
         self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
         if get_pp_group().is_last_rank:
@@ -424,6 +541,19 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             return self.embed_tokens(input_ids)
 
         gen_mask = input_ids >= int(self.gen_vocab_start_index)
+        if _is_graph_capturing(input_ids.device):
+            # Graph-safe blend: compute both embeddings and select per token.
+            # Clamp both lookups so the discarded side stays in-bounds for the
+            # table being indexed: base ids clamp to base_vocab_size-1, gen ids
+            # clamp to [0, gen_embed_tokens.num_embeddings-1]. Those rows are
+            # ignored by where().
+            base_ids = input_ids.clamp(max=self.base_vocab_size - 1)
+            base_emb = self.embed_tokens(base_ids)
+            gen_ids = (input_ids - int(self.gen_vocab_start_index)).clamp(
+                min=0, max=self.gen_embed_tokens.num_embeddings - 1
+            )
+            gen_emb = self.gen_embed_tokens(gen_ids)
+            return torch.where(gen_mask.unsqueeze(-1), gen_emb, base_emb)
         if not gen_mask.any():
             return self.embed_tokens(input_ids)
         if gen_mask.all():
@@ -622,7 +752,12 @@ class Mammoth3DecoderLayer(Qwen3DecoderLayer):
 
 
 class MammothModa2Qwen3ForCausalLM(MammothModa2Qwen2ForCausalLM):
-    """MammothModa2 generation-aware language model using Qwen3 attention."""
+    """MammothModa2 generation-aware language model using Qwen3 attention.
+
+    Inherits ``forward`` / ``get_input_embeddings`` from the Qwen2 MoE host, so
+    ``gen_token_mask = input_ids >= gen_vocab_start_index`` is derived the same
+    way once ``requires_raw_input_tokens`` keeps ``input_ids`` on the mm path.
+    """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(
@@ -772,6 +907,11 @@ class MammothModa2ARForConditionalGeneration(_MammothModa2T2ITokenConstraints, Q
     """Replaces the language backbone with MoE within the Qwen2_5_VLForConditionalGeneration multi-modal framework."""
 
     have_multimodal_outputs = True
+    # Keep input_ids on the mm CUDA-graph path so gen_token_mask can be derived
+    # inside capture and replay. Otherwise vLLM passes inputs_embeds only,
+    # input_ids stays None, and the und/gen MoE routing silently routes every
+    # token to the understanding expert.
+    requires_raw_input_tokens = True
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -894,6 +1034,8 @@ class MammothModa2Qwen3ProcessingInfo(Qwen3VLProcessingInfo):
 class MammothModa2Qwen3ARForConditionalGeneration(_MammothModa2T2ITokenConstraints, Qwen3VLForConditionalGeneration):
     """MammothModa2-Dev Qwen3-VL stage for understanding and generation."""
 
+    requires_raw_input_tokens = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "llm_model.model.visual.": "visual.",
@@ -983,8 +1125,11 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 ],
             )
             self.model = self.ar
-            # Runner reads this on the top-level module to opt into the
-            # per-step metadata refresh. See AR subclasses.
+            # Runner reads both flags on the top-level module:
+            # requires_raw_input_tokens keeps input_ids on the mm graph path
+            # (gen_token_mask / MoE routing); supports_omni_decode_step_metadata
+            # refreshes decode metadata outside FULL capture. See AR wrappers.
+            self.requires_raw_input_tokens = True
             self.supports_omni_decode_step_metadata = True
         elif self.model_stage == "dit":
             self.dit = init_vllm_registered_model(

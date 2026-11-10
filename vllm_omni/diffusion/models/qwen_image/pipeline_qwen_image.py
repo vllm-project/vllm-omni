@@ -622,6 +622,7 @@ class QwenImagePipeline(
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
+            device=self.device,
             sigmas=sigmas,
             mu=mu,
         )

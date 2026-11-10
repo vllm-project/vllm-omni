@@ -26,6 +26,7 @@ th {
 | `BailingMoeV3AudioForConditionalGeneration` + `BailingTalker2` | Ming-3.0-audio-flash (ASR, speech QA and spoken answers) | `inclusionAI/Ming-3.0-audio-flash` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/inclusionAI/Ming-3.0-audio-flash.md) |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | | — |
+| `Alpamayo2SuperPolicy` + `Alpamayo2SuperPipeline` | Alpamayo 2 Super | `nvidia/Alpamayo2-Super` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/Alpamayo2-Super-H200.md) |
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | ✅︎ | — |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen-Image) |
@@ -45,7 +46,9 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
+| `HyNomasModularPipeline` | Hy-Nomas distilled (Diffusers-format weights, reference runtime adapter) | `tencent/Hy-Nomas-Diffusers` | ✅︎ (H200 tested) | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md) |
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Wan22VACEPipeline` | Wan2.2-VACE | `Pyros13/Wan2.2-VACE-Fun-A14B-Diffusers` | ✅︎ | | | ✅︎ | — |
@@ -96,6 +99,7 @@ th {
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ | — |
+| `StableAudio3Pipeline` | Stable-Audio-3 | `stabilityai/stable-audio-3-medium` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/StabilityAI/Stable-Audio-3-Medium.md) |
 | `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | ✅︎ | — |
 | `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | ✅︎ | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |

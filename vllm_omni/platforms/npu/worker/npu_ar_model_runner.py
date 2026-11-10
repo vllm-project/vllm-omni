@@ -42,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
-from vllm_ascend.worker.model_runner_v1 import graph_capture
+from vllm_ascend.worker.v1.model_runner import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -132,7 +132,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
