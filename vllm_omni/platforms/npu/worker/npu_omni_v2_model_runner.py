@@ -232,7 +232,19 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         import os
 
-        if os.environ.get("VLLM_OMNI_STATIC_SHAPE_V2", "1") == "1":
+        # The static-shape decode backend rewrites AscendAttentionBackend's
+        # impl/builder classes process-wide. It is a MiniCPM-o MRv2 optimizer
+        # (fixed-capacity FULL graph replays for the talker's K-step frame
+        # loop, engagement gated by a stage's max_model_len <= 8192). Drama 3
+        # also runs on this runner -- a GDN-hybrid model at exactly
+        # max_model_len 8192 with FULL_AND_PIECEWISE graphs -- and must keep
+        # the stock backend, so arm the install only for MiniCPM-o stages.
+        cfg = kwargs.get("vllm_config") or (args[0] if args else None)
+        architectures = getattr(getattr(cfg, "model_config", None), "architectures", None) or []
+        if (
+            any("MiniCPMO45" in str(a) for a in architectures)
+            and os.environ.get("VLLM_OMNI_STATIC_SHAPE_V2", "1") == "1"
+        ):
             try:
                 from vllm_omni.platforms.npu.attention import static_shape_decode
 
