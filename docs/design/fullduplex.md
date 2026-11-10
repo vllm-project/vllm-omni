@@ -576,9 +576,14 @@ independent real-model verification.
 
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
 session on a replica group mapping every stage to a replica. In a local
-deployment the group is local; in a distributed one its stages may live on
-different hosts, and the deployment declares the groups explicitly through
-`duplex_session.replica_groups`. The
+deployment the group is local. In a distributed one the deployment declares the
+groups explicitly through `duplex_session.replica_groups`, but a stage edge may
+cross hosts only when its connector supports remote transport. The MiniCPM-o
+4.5 stage 1 -> 2 edge uses `SharedMemoryConnector`, which is local-only, so
+every stage-1 replica must run on the same host as the stage-2 replica it feeds.
+The supported distributed layout keeps stage 0 on the head and stages 1/2
+co-located on the worker; splitting a stage-1 replica from stage 2 is not
+supported by this connector configuration. The
 orchestrator owns a separate session reservation ledger; StagePool's request
 bindings continue to describe submitted requests only. Admission reserves a
 group synchronously after taking the global admission slot. The group must
@@ -631,8 +636,10 @@ budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
 owner's groups. With `K=1`, routing and admission behavior are unchanged. A distributed
-deployment is the `K=1` case: every group belongs to the single frontend, and a
-group's stages may be spread across hosts.
+deployment is the `K=1` case: every group belongs to the single frontend. Stages
+may be spread across hosts only where the stage edge's connector supports remote
+transport; with MiniCPM-o 4.5's local-only stage 1 -> 2 `SharedMemoryConnector`,
+stage 1 and stage 2 in a group must be co-located.
 
 The multi-frontend WebSocket guard allows only `least_sessions` and plugins
 without session resume. Credentials, attachment state and replay journals

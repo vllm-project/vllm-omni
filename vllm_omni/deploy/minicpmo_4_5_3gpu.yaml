@@ -17,6 +17,8 @@ trust_remote_code: true
 enable_prefix_caching: false
 
 connectors:
+  # Local-only transport: in a distributed deployment each stage-1 replica
+  # must run on the same host as the stage-2 replica it feeds.
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
