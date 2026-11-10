@@ -130,32 +130,47 @@ def local_attention_layout(grid, tile, device):
     tiles_w = math.ceil(width / tile)
     if tiles_h <= 3 and tiles_w <= 3:
         return None
+    # Edge tiles shift their 3x3 neighborhood inward, so they read the same
+    # tiles as the tile next to them. Tiles with one neighborhood are stored
+    # together and attend as one query range.
+    tiles = []
+    for row_index in range(tiles_h):
+        for column_index in range(tiles_w):
+            center_h = min(max(row_index, 1), max(tiles_h - 2, 1))
+            center_w = min(max(column_index, 1), max(tiles_w - 2, 1))
+            tiles.append((center_h, center_w, row_index, column_index))
+    tiles.sort()
+    ranks = [0] * len(tiles)
+    ranges = {}
+    offset = 0
+    for rank, (_, _, row_index, column_index) in enumerate(tiles):
+        ranks[row_index * tiles_w + column_index] = rank
+        count = frames * min(tile, height - row_index * tile) * min(tile, width - column_index * tile)
+        ranges[row_index, column_index] = (offset, offset + count)
+        offset += count
     axes = [torch.arange(size, device=device) for size in grid]
     time, row, column = (axis.flatten() for axis in torch.meshgrid(*axes, indexing="ij"))
-    # Sort tokens tile-major: tile, then frame, then the row and column inside the tile.
-    tile_index = (row // tile) * tiles_w + column // tile
-    order = tile_index * frames + time
+    # Sort tokens by tile rank, then frame, then the row and column inside the tile.
+    tile_rank = torch.tensor(ranks, device=device)[(row // tile) * tiles_w + column // tile]
+    order = tile_rank * frames + time
     order = order * tile + row % tile
     order = order * tile + column % tile
     permutation = torch.argsort(order)
-    ranges = []
-    offset = 0
-    for row_index in range(tiles_h):
-        for column_index in range(tiles_w):
-            count = frames * min(tile, height - row_index * tile) * min(tile, width - column_index * tile)
-            ranges.append((offset, offset + count))
-            offset += count
     neighborhoods = []
-    for row_index in range(tiles_h):
-        for column_index in range(tiles_w):
-            # Edge tiles shift their 3x3 neighborhood inward.
-            center_h = min(max(row_index, 1), max(tiles_h - 2, 1))
-            center_w = min(max(column_index, 1), max(tiles_w - 2, 1))
-            neighbors = []
-            for h in range(max(0, center_h - 1), min(tiles_h, center_h + 2)):
-                for w in range(max(0, center_w - 1), min(tiles_w, center_w + 2)):
-                    neighbors.append(ranges[h * tiles_w + w])
-            neighborhoods.append((ranges[row_index * tiles_w + column_index], neighbors))
+    first = 0
+    while first < len(tiles):
+        center_h, center_w = tiles[first][:2]
+        last = first
+        while last + 1 < len(tiles) and tiles[last + 1][:2] == (center_h, center_w):
+            last += 1
+        start = ranges[tiles[first][2:]][0]
+        end = ranges[tiles[last][2:]][1]
+        neighbors = []
+        for h in range(max(0, center_h - 1), min(tiles_h, center_h + 2)):
+            for w in range(max(0, center_w - 1), min(tiles_w, center_w + 2)):
+                neighbors.append(ranges[h, w])
+        neighborhoods.append(((start, end), neighbors))
+        first = last + 1
     return permutation, torch.argsort(permutation), neighborhoods
 
 
