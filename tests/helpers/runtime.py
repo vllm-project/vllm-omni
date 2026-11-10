@@ -1202,6 +1202,22 @@ def get_model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
+def _deploy_config_arg_index(server_args: list[str]) -> int | None:
+    for index, arg in enumerate(server_args):
+        if arg == "--deploy-config" or arg.startswith("--deploy-config="):
+            return index
+    return None
+
+
+def _deploy_config_value(server_args: list[str], index: int) -> str:
+    arg = server_args[index]
+    if arg.startswith("--deploy-config="):
+        return arg.split("=", 1)[1]
+    if index + 1 >= len(server_args):
+        raise ValueError("--deploy-config requires a path")
+    return server_args[index + 1]
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -1226,9 +1242,22 @@ def iter_omni_server(
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
-        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
-
-        server_args = params.server_args or []
+        server_args = list(params.server_args or [])
+        # Some tests pass the deploy YAML only as ``--deploy-config`` in
+        # server_args. Rewrite that file too; with no deploy YAML at all,
+        # stage_config_path_for_run_level fails while the CI runner env is set.
+        deploy_arg_index = None
+        deploy_path = params.stage_config_path
+        if deploy_path is None:
+            deploy_arg_index = _deploy_config_arg_index(server_args)
+            if deploy_arg_index is not None:
+                deploy_path = _deploy_config_value(server_args, deploy_arg_index)
+        stage_config_path = stage_config_path_for_run_level(deploy_path, run_level)
+        if deploy_arg_index is not None and stage_config_path is not None:
+            if server_args[deploy_arg_index].startswith("--deploy-config="):
+                server_args[deploy_arg_index] = f"--deploy-config={stage_config_path}"
+            else:
+                server_args[deploy_arg_index + 1] = stage_config_path
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni:
@@ -1263,7 +1292,7 @@ def iter_omni_server(
                 yield server
                 print("OmniServer stopping...")
         else:
-            if stage_config_path is not None:
+            if stage_config_path is not None and deploy_arg_index is None:
                 server_args += ["--deploy-config", stage_config_path]
 
             with (

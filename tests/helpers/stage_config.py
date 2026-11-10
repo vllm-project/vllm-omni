@@ -811,8 +811,13 @@ def _apply_ci_model_runner(stage_config_path: str | None) -> str | None:
     replaces the deploy-level choice when the server loads the file.
     """
     runner = _ci_model_runner_override()
-    if runner is None or stage_config_path is None:
+    if runner is None:
         return stage_config_path
+    if stage_config_path is None:
+        raise ValueError(
+            f"{_CI_MODEL_RUNNER_ENV} is set but this test did not provide a deploy config. "
+            "Weekly CI cannot select model_runner without a deploy YAML."
+        )
 
     path = Path(stage_config_path)
     with open(path, encoding="utf-8") as f:
