@@ -70,6 +70,7 @@ def _client(engine: FakeSegmentationEngine) -> TestClient:
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     app.state.openai_serving_models = _DiffusionServingModels([BaseModelPath(name="facebook/sam3", model_path="sam3")])
     app.state.args = Namespace(default_sampling_params=None, max_generated_image_size=None)
+    app.state.supported_tasks = "x2i"
     return TestClient(app)
 
 

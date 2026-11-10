@@ -440,6 +440,7 @@ async def omni_run_server_worker(
                 excluded_urls="health,healthz,metrics",
             )
         app.state.api_server_count = api_server_count
+        app.state.supported_tasks = supported_tasks
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -987,6 +988,12 @@ async def omni_init_app_state(
             is_pure_diffusion = True
             logger.info("Detected diffusion mode (%d diffusion stage(s))", len(stage_configs))
 
+    # Get supported tasks
+    supported_tasks: set[str] = {"generate"}
+    if hasattr(engine_client, "get_supported_tasks"):
+        supported_tasks = set(await engine_client.get_supported_tasks())
+    logger.info("Supported tasks: %s", supported_tasks)
+
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
@@ -1023,14 +1030,23 @@ async def omni_init_app_state(
         state.serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
-        state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
-            enable_force_include_usage=args.enable_force_include_usage,
+        state.openai_serving_chat = (
+            OmniOpenAIServingChat.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+                enable_force_include_usage=args.enable_force_include_usage,
+            )
+            if "generate" in supported_tasks
+            else None
         )
-        state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
+
+        state.openai_serving_chat_batch = (
+            OmniOpenAIServingChatBatch.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+            )
+            if "generate" in supported_tasks
+            else None
         )
 
         # audio related
@@ -1043,26 +1059,37 @@ async def omni_init_app_state(
 
         # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_serving_video = (
+            OmniOpenAIServingVideo.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
-            engine_client=engine_client,
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_streaming_video_output = (
+            OmniStreamingVideoOutputHandler(
+                engine_client=engine_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-
-        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
-            diffusion_engine=engine_client,
-            model_name=model_name,
-            served_model_names=served_model_names,
-            stage_configs=diffusion_stage_configs,
-            speech_cache_config=speech_cache_config,
-            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
-            allowed_media_domains=getattr(args, "allowed_media_domains", None),
-            request_logger=request_logger,
+        state.openai_serving_speech = (
+            OmniOpenAIServingSpeech.for_diffusion(
+                diffusion_engine=engine_client,
+                model_name=model_name,
+                served_model_names=served_model_names,
+                stage_configs=diffusion_stage_configs,
+                speech_cache_config=speech_cache_config,
+                allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+                allowed_media_domains=getattr(args, "allowed_media_domains", None),
+                request_logger=request_logger,
+            )
+            if "speech" in supported_tasks
+            else None
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -1333,18 +1360,22 @@ async def omni_init_app_state(
         else None
     )
 
-    state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client,
-        state.openai_serving_models,
-        request_logger=request_logger,
-        model_name=model_name,
-        speech_cache_config=speech_cache_config,
-        api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
-        forced_aligner_enabled=build_forced_aligner_config(
-            getattr(args, "forced_aligner", None),
-            getattr(args, "forced_aligner_config", None),
+    state.openai_serving_speech = (
+        OmniOpenAIServingSpeech(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            model_name=model_name,
+            speech_cache_config=speech_cache_config,
+            api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
+            forced_aligner_enabled=build_forced_aligner_config(
+                getattr(args, "forced_aligner", None),
+                getattr(args, "forced_aligner_config", None),
+            )
+            is not None,
         )
-        is not None,
+        if "speech" in supported_tasks
+        else None
     )
 
     has_ming3_chat = (
@@ -1365,14 +1396,19 @@ async def omni_init_app_state(
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
-    await state.openai_serving_speech.warmup()
+    if state.openai_serving_speech is not None:
+        await state.openai_serving_speech.warmup()
 
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
-    state.openai_streaming_speech = OmniStreamingSpeechHandler(
-        speech_service=state.openai_serving_speech,
+    state.openai_streaming_speech = (
+        OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech,
+        )
+        if state.openai_serving_speech is not None
+        else None
     )
     state.openai_streaming_video = (
         create_streaming_video_handler(
@@ -1383,10 +1419,14 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    state.openai_serving_video = OmniOpenAIServingVideo(
-        engine_client,
-        model_name=served_model_names[0] if served_model_names else None,
-        stage_configs=state.stage_configs,
+    state.openai_serving_video = (
+        OmniOpenAIServingVideo(
+            engine_client,
+            model_name=served_model_names[0] if served_model_names else None,
+            stage_configs=state.stage_configs,
+        )
+        if "x2v" in supported_tasks
+        else None
     )
     # Policies whose first stage is autoregressive (for example reasoning before
     # acting) serve OpenPI too; this is None without policy_server_config.
@@ -2278,6 +2318,16 @@ async def generate_images(
     Raises:
         HTTPException: For validation errors, missing engine, or generation failures
     """
+    # Check if x2i in list of supported tasks before calling _get_engine_and_model
+    # to throw a more descriptive error
+    # _get_engine_and_model throws misleading errors for multistage models without a diffusion stage
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
+    if "x2i" not in supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
+
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
@@ -2541,6 +2591,14 @@ async def edit_images(
     """
     OpenAI-compatible image edit endpoint.
     """
+
+    # prereq: check if model supports x2i tasks
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
+    if "x2i" not in supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
 
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
@@ -2879,12 +2937,14 @@ async def segment_image(
 ) -> ImageSegmentationResponse:
     """Segment every instance of a text and/or exemplar-box concept in one image."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not _supports_segmentation(raw_request, engine_client):
+    if not _supports_segmentation(raw_request, engine_client) or "x2i" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support image segmentation.",
@@ -2963,12 +3023,14 @@ async def segment_video(
 ) -> Response:
     """Track every instance of one or more text concepts through a video."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+    print(f"Debugging: supported tasks list = {supported_tasks}")
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not supports_video_segmentation(raw_request, engine_client):
+    if not supports_video_segmentation(raw_request, engine_client) or "x2v" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support video segmentation.",
@@ -3039,12 +3101,14 @@ async def estimate_video_depth(
 ) -> Response:
     """Estimate temporally consistent depth for every frame of a video."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
     if model not in (None, "auto", model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
-    if not supports_video_depth(raw_request, engine_client):
+    if not supports_video_depth(raw_request, engine_client) or "x2v" not in supported_tasks:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support video depth estimation.",

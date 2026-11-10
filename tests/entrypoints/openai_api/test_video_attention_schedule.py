@@ -122,6 +122,7 @@ def image_client():
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
     )
+    app.state.supported_tasks = "x2i"
     return TestClient(app)
 
 
