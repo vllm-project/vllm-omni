@@ -20,7 +20,9 @@ class StepAudio2Adapter(ARTTSAdapter):
     construction with no uploaded-voice / ref-audio handling.
     """
 
-    request_constraints = speech_inputs("instructions", unsupported=("reference_audio", "reference_text", "voice"))
+    # The HTTP voice placeholder (including "default") is accepted and ignored.
+    # Leave voice selection undeclared so clients can submit ordinary speech.
+    request_constraints = speech_inputs("instructions", unsupported=("reference_audio", "reference_text"))
 
     stage_keys = frozenset({"step_audio2_thinker"})
     name = "step_audio2"

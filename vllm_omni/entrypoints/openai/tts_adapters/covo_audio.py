@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class CovoAudioAdapter(ARTTSAdapter):
-    request_constraints = speech_inputs(unsupported=("reference_audio", "reference_text", "voice", "instructions"))
+    # The HTTP voice placeholder (including "default") is accepted and ignored.
+    # Leave voice selection undeclared so clients can submit ordinary speech.
+    request_constraints = speech_inputs(unsupported=("reference_audio", "reference_text", "instructions"))
 
     stage_keys = frozenset({"fused_thinker_talker"})
     name = "covo_audio"
