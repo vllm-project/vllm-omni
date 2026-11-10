@@ -11,7 +11,11 @@ from typing import cast
 import torch
 from torch import nn
 
-from .checkpoint import H3LiteDecoderCheckpoint, convert_h3_lite_decoder_state_dict
+from .checkpoint import (
+    H3LiteDecodeProfile,
+    H3LiteDecoderCheckpoint,
+    convert_h3_lite_decoder_state_dict,
+)
 
 
 def install_h3_lite_decoder(
@@ -141,3 +145,42 @@ def install_h3_lite_decoder(
         },
         strict=True,
     )
+    apply_h3_lite_decode_profile(model, checkpoint.decode_profile)
+
+
+def apply_h3_lite_decode_profile(model: nn.Module, profile: H3LiteDecodeProfile | None) -> None:
+    """Apply a Diffusers LightVAE tile profile to the decoder of one native VAE.
+
+    Only the LightVAE instance is affected: the official path never calls this.
+    The native ``split_tiles`` contract (a single tile size/overlap per spatial
+    axis, in pixel space) is reused as-is. The anisotropic
+    ``long_axis_*`` fields are retained on the profile for a later performance
+    change but are not applied here.
+    """
+    if profile is None:
+        return
+    model._h3_lite_decode_profile = profile
+    decoder = getattr(model, "decoder", None)
+    if not isinstance(decoder, nn.Module):
+        raise ValueError("H3 Lite decode profile requires a native decoder")
+    ratio = getattr(model, "vae_ratio", None)
+    if type(ratio) is not int or ratio <= 0:
+        ratio = None
+    if profile.temporal_decode_protocol is not None and profile.image_context_tokens is not None:
+        tokens_chunk_size = getattr(model, "tokens_chunk_size", None)
+        if type(tokens_chunk_size) is int and profile.image_context_tokens != tokens_chunk_size:
+            raise ValueError(
+                "H3 Lite temporal decode protocol disagrees with the native token window: "
+                f"{profile.image_context_tokens} != {tokens_chunk_size}"
+            )
+    for name, value in (
+        ("decoder_tile_size", profile.tile_size),
+        ("decoder_tile_overlap_min", profile.tile_overlap),
+    ):
+        if value is None:
+            continue
+        if ratio is not None and value % ratio:
+            raise ValueError(f"H3 Lite {name}={value} must be a multiple of the spatial ratio {ratio}")
+        if not hasattr(model, name):
+            raise ValueError(f"native H3 VAE does not expose {name}")
+        setattr(model, name, value)
