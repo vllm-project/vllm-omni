@@ -272,3 +272,33 @@ def test_explicit_force_listen_bypasses_only_soft_character_target(monkeypatch, 
     md.output_token_ids[0] = [20] * 10
     assert sample(LISTEN) == (CHUNK_EOS if hard_cap else LISTEN)
     assert state.generated_tokens == []
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferred):
+    """Issue 9828: <|turn_eos|> after 「正」 must not end the turn."""
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=True)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    turn_eos = TOKEN_IDS["turn_eos_token_id"]
+
+    class OpenTokenizer(_CharTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "现在画面中出现的是一个绿色的正方形，正"
+
+    model._minicpmo45_tokenizer_cache = OpenTokenizer()
+    md.output_token_ids[0] = [21]
+    assert sample(turn_eos) == CHUNK_EOS
+    assert state.current_turn_ended is False
+    assert state.held_turn_ends == 1
+    assert state.generated_tokens == []
+
+    class ClosedTokenizer(_CharTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "正方形中间有一个数字十一。"
+
+    model._minicpmo45_tokenizer_cache = ClosedTokenizer()
+    md.output_token_ids[0] = [21, 22]
+    assert sample(turn_eos) == turn_eos
+    assert state.current_turn_ended is True
+    assert state.held_turn_ends == 0

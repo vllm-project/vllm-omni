@@ -1455,7 +1455,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             draws = self._minicpmo45_duplex_stage2_draws(
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata
             )
+            turn_eos_id = token_ids.get("turn_eos_token_id", -1)
             for row_idx, sampled in zip(stage2_rows, draws.tolist(), strict=True):
+                if sampled == turn_eos_id and self._minicpmo45_hold_unfinished_turn(
+                    row_idx, recent[row_idx], token_ids
+                ):
+                    self._minicpmo45_note_held_turn_end(row_idx)
+                    resolved[row_idx] = chunk_eos_id
+                    continue
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
         return [int(resolved[row_idx]) for row_idx in row_idxs]
@@ -1510,6 +1517,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 ]
                 if any(value != listen_id for value in rewritten):
                     token = torch.where(token == listen_id, index_to_device(rewritten, device), token)
+            turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+            if has_chunk_eos and turn_eos_id >= 0:
+                hold = [
+                    1 if self._minicpmo45_hold_unfinished_turn(row_idx, recent[row_idx], token_ids) else 0
+                    for row_idx in stage2_rows
+                ]
+                if any(hold):
+                    token = torch.where(
+                        (token == turn_eos_id) & index_to_device(hold, device).bool(),
+                        torch.full_like(token, chunk_eos_id),
+                        token,
+                    )
             if has_chunk_eos:
                 token = torch.where(hit, torch.full_like(token, chunk_eos_id), token)
             final[positions_t] = token
@@ -1562,10 +1581,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_sessions = pending.row_sessions
         self._minicpmo45_duplex_row_payloads = pending.row_payloads
         try:
+            turn_eos_id = pending.token_ids.get("turn_eos_token_id", -1)
+            chunk_eos_id = pending.token_ids.get("chunk_eos_token_id", -1)
             for pos, row_idx in enumerate(pending.row_idxs):
-                _final, raw, hit = values[pos]
+                final, raw, hit = values[pos]
                 if pending.stage2[pos] and hit:
                     pending.rewinds.get(pos, lambda: None)()
+                elif pending.stage2[pos] and int(raw) == turn_eos_id and int(final) == chunk_eos_id:
+                    self._minicpmo45_note_held_turn_end(row_idx)
                 elif pending.stage2[pos]:
                     self._record_minicpmo45_duplex_generation_token(row_idx, int(raw))
             for pos, row_idx in enumerate(pending.row_idxs):
@@ -1612,6 +1635,45 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         except (TypeError, ValueError):
             return None
         return max_tokens if max_tokens > 0 else None
+
+    def _minicpmo45_chunk_tail_text(self, recent: list[int], token_ids: dict[str, int]) -> str:
+        chunk = self._minicpmo45_current_chunk_tokens(recent, token_ids)
+        decode = getattr(self._minicpmo45_tokenizer(), "decode", None)
+        if not chunk or not callable(decode):
+            return ""
+        try:
+            text = decode(chunk, skip_special_tokens=True)
+        except TypeError:
+            text = decode(chunk)
+        return text if isinstance(text, str) else ""
+
+    def _minicpmo45_hold_unfinished_turn(self, row_idx: int, recent: list[int], token_ids: dict[str, int]) -> bool:
+        """Keep an open turn when ``<|turn_eos|>`` arrives before the sentence ends.
+
+        Long-context H100 duplex samples ``<|turn_eos|>`` after 「正」 (issue
+        9828) and the rest of the sentence never follows. Closing the chunk
+        instead leaves the turn open. A turn already ended, an empty chunk, a
+        finished sentence, or a turn already held
+        ``MAX_HELD_UNFINISHED_TURN_ENDS`` times is left alone.
+        """
+        if token_ids.get("turn_eos_token_id", -1) < 0 or token_ids.get("chunk_eos_token_id", -1) < 0:
+            return False
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        if state is None or getattr(state, "current_turn_ended", True):
+            return False
+        held = int(getattr(state, "held_turn_ends", 0) or 0)
+        if held >= MiniCPMO45DuplexPolicy.MAX_HELD_UNFINISHED_TURN_ENDS:
+            return False
+        text = self._minicpmo45_chunk_tail_text(recent, token_ids).rstrip()
+        if not text:
+            return False
+        return not MiniCPMO45DuplexPolicy.turn_text_ends_sentence(text)
+
+    def _minicpmo45_note_held_turn_end(self, row_idx: int) -> None:
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        if state is None:
+            return
+        state.held_turn_ends = int(getattr(state, "held_turn_ends", 0) or 0) + 1
 
     def _finalize_minicpmo45_native_duplex_sample(
         self,
@@ -1689,6 +1751,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             state.pending_terminator_token = None
             state.last_terminator_token = int(sampled)
             state.current_turn_ended = True
+            state.held_turn_ends = 0
             with suppress(Exception):
                 state.pending_speech_response_open = False
             return

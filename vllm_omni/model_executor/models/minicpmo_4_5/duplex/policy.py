@@ -107,6 +107,9 @@ class MiniCPMO45DuplexPolicy:
     SENTENCE_END_PUNCTUATION = "。！？.!?…"
     CLOSING_PUNCTUATION = "\"'”’」』）)】"
     TURN_TEXT_TAIL_CHARS = 16
+    # Long-context H100 duplex can sample <|turn_eos|> mid-sentence (issue 9828
+    # cuts scene 11 at 「正」). Hold that many times, then accept the turn end.
+    MAX_HELD_UNFINISHED_TURN_ENDS = 16
 
     @staticmethod
     def turn_text_ends_sentence(text: str) -> bool:
