@@ -120,16 +120,12 @@ async def test_single_speaker_matches_offline(adapter, ref):
     assert ("multi_modal_data" in prepared.prompt) == (ref is not None)
 
 
-@pytest.mark.parametrize("ref", [None, REF])
-@pytest.mark.parametrize("seed", [None, 0, -7])
-async def test_request_seed_reaches_reference_identity(adapter, ref, seed):
-    request = OpenAICreateSpeechRequest(input="Hello.", ref_audio=ref, seed=seed)
+@pytest.mark.parametrize("seed", [0, -7])
+async def test_request_seed_is_accepted(adapter, seed):
+    request = OpenAICreateSpeechRequest(input="Hello.", ref_audio=REF, seed=seed)
     assert adapter.validate(request) is None
-    prompt = (await adapter.build(request, [], ref is not None)).prompt
-    # Diffusion noise is seeded through SamplingParams by the shared path; the reference VAE
-    # noise needs the seed in the multimodal item identity. No reference -> nothing to seed.
-    expected = {"reference_seed": seed} if ref is not None and seed is not None else None
-    assert prompt.get("mm_processor_kwargs") == expected
+    # The shared path seeds SamplingParams; the stage-0 prompt transform derives the reference seed.
+    assert "mm_processor_kwargs" not in (await adapter.build(request, [], True)).prompt
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 4])

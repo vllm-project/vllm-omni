@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Speaker script parsing and native HF prompt layout (no checkpoint needed)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.model_executor.models.vibevoice.prompt import (
     AUDIO_BOS,
     AUDIO_EOS,
     AUDIO_TOKEN,
+    REFERENCE_SEED_KEY,
     check_reference_prompt,
     parse_vibevoice_script,
     render_script_prompt,
@@ -82,3 +85,20 @@ def test_reference_order_is_canonicalized_to_script_order():
 def test_reject_invalid_reference_speakers(refs):
     with pytest.raises(ValueError, match="Reference speakers"):
         render_script_prompt([(0, "Hello.")], refs)
+
+
+def test_request_seed_reaches_reference_identity():
+    """SamplingParams.seed alone seeds the reference VAE; a conflicting explicit seed is rejected."""
+    seeded = [SimpleNamespace(seed=7)]
+    prompt = render_vibevoice_prompt("Hello.")
+    request = {"prompt": prompt, "multi_modal_data": {"audio": object()}, "mm_processor_kwargs": {}}
+    out = check_reference_prompt(request, seeded)
+    assert out["mm_processor_kwargs"] == {REFERENCE_SEED_KEY: 7} and request["mm_processor_kwargs"] == {}
+    explicit = {**request, "mm_processor_kwargs": {REFERENCE_SEED_KEY: 7}}
+    assert check_reference_prompt(explicit, seeded) is explicit
+    with pytest.raises(ValueError, match="conflicts"):
+        check_reference_prompt({**request, "mm_processor_kwargs": {REFERENCE_SEED_KEY: 8}}, seeded)
+    # Unseeded requests and prompts without audio are left unchanged.
+    assert check_reference_prompt(request, [SimpleNamespace(seed=None)]) is request
+    no_voice = {"prompt": render_vibevoice_prompt("Hello.", reference=False)}
+    assert check_reference_prompt(no_voice, seeded) is no_voice

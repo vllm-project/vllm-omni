@@ -36,6 +36,7 @@ from .diffusion import (
 )
 from .negative_kv import VibeVoiceNegativeKV
 from .processing_vibevoice import (
+    AUDIO_SEED_FIELD,
     VibeVoiceDummyInputsBuilder,
     VibeVoiceMultiModalProcessor,
     VibeVoiceProcessingInfo,
@@ -171,12 +172,18 @@ class VibeVoiceModel(nn.Module):
             for i, embedding in zip(unseeded, batched, strict=True):
                 embeddings[i] = embedding
         device = parameter.device
-        fork_devices = [] if device.type == "cpu" else [device.index]
+        fork_devices = [] if device.type == "cpu" else [device]
         for i, seed in enumerate(seeds):
             if seed is None:
                 continue
+            # Seed only the streams the fork restores: torch.manual_seed would also
+            # reseed every other visible accelerator without restoring it.
             with torch.random.fork_rng(devices=fork_devices, device_type=device.type):
-                torch.manual_seed(seed)
+                torch.default_generator.manual_seed(seed)
+                if fork_devices:
+                    device_module = torch.get_device_module(device)
+                    with device_module.device(device):
+                        device_module.manual_seed(seed)
                 (embeddings[i],) = self._encode_references([rows[i]], [counts[i]])
         return tuple(embeddings)  # type: ignore[arg-type]
 
@@ -291,7 +298,7 @@ class VibeVoiceForConditionalGeneration(nn.Module, SupportsMultiModal):
         input_values = kwargs.get("input_values")
         if input_values is None:
             return ()
-        return self.model.reference_embeddings(input_values, kwargs["audio_num_tokens"], kwargs.get("audio_seed"))
+        return self.model.reference_embeddings(input_values, kwargs["audio_num_tokens"], kwargs.get(AUDIO_SEED_FIELD))
 
     def forward(
         self,

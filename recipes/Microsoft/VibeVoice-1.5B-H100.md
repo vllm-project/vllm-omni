@@ -141,8 +141,15 @@ and non-empty extra_params are rejected.
 A request-level `seed` gives that request private random streams for the
 reference-VAE sampling and the per-frame diffusion noise. Those depend only on
 (seed, reference audio), not on earlier requests, concurrent requests or the
-global RNG, and the global RNG is left untouched. Without `seed` the shared
-global RNG is used as before. The same seed does not guarantee a bit-identical
+global RNG, and the global RNG is left untouched. For a batch-1 request with
+at most one reference the seed gives the same reference-VAE and per-frame
+diffusion noise as Transformers after `torch.manual_seed(seed)`. Multi-speaker
+references each restart the seeded stream (Transformers draws them as one
+batch), so their noise is reproducible but not Transformers-identical.
+Without `seed` the shared global RNG is used as before. Offline,
+`SamplingParams(seed=s)` seeds both; an explicit
+`"mm_processor_kwargs": {"reference_seed": ...}` is optional and must equal `s`.
+The same seed does not guarantee a bit-identical
 waveform when batch composition differs (batched kernels round differently), and
 it does not avoid prompt-leak failures: a given seed can still draw bad noise, so
 retry such a request with another seed.

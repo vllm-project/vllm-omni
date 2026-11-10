@@ -29,15 +29,13 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.processing.processor import MultiModalProcessingResult, PlaceholderFeaturesInfo
 
-from .prompt import AUDIO_BOS, AUDIO_EOS, AUDIO_TOKEN, MAX_SPEAKERS
+from .prompt import AUDIO_BOS, AUDIO_EOS, AUDIO_TOKEN, MAX_SPEAKERS, REFERENCE_SEED_KEY
 
 SAMPLE_RATE = 24000
 SAMPLES_PER_TOKEN = 3200
 MAX_REFERENCE_SAMPLES = 60 * SAMPLE_RATE
-#: The only accepted ``mm_processor_kwargs`` key. vLLM hashes processor kwargs into
-#: each multimodal item's identity, so the encoder cache never shares a sampled
-#: reference embedding between requests with different (or no) seeds.
-REFERENCE_SEED_KEY = "reference_seed"
+#: Per-reference ``(has_seed, seed)`` int64 field consumed by ``VibeVoiceModel.reference_embeddings``.
+AUDIO_SEED_FIELD = "audio_seed"
 _INT64 = 2**63
 
 
@@ -122,7 +120,7 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
             valid_samples + SAMPLES_PER_TOKEN - 1, SAMPLES_PER_TOKEN, rounding_mode="floor"
         ).to(torch.int64)
         # Per item ``(has_seed, seed)``; every reference of a request shares the request seed.
-        outputs["audio_seed"] = torch.tensor([[seed is not None, seed or 0]] * len(audio), dtype=torch.int64)
+        outputs[AUDIO_SEED_FIELD] = torch.tensor([[seed is not None, seed or 0]] * len(audio), dtype=torch.int64)
         return outputs
 
     def _get_mm_fields_config(
@@ -133,7 +131,7 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
         return {
             "input_values": MultiModalFieldConfig.batched("audio"),
             "audio_num_tokens": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
-            "audio_seed": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+            AUDIO_SEED_FIELD: MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(

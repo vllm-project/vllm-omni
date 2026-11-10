@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for VibeVoice per-step row/state handling (no weights, no GPU)."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from transformers.models.vibevoice_acoustic_tokenizer.modeling_vibevoice_acoustic_tokenizer import (
@@ -117,8 +115,11 @@ def test_seeded_noise_is_private_to_the_request(inference):
     assert not torch.equal(_noise(inference), first)  # the stream advances per frame
     with torch.random.fork_rng(devices=[]):  # replay: a request's frames are a pure function of its seed
         generator = torch.Generator().manual_seed(5)
-        frames = [torch.randn(LATENT, generator=generator) for _ in range(2)]
-    assert torch.equal(first[0], frames[0]) and torch.equal(_noise(inference)[0], frames[1])
+        frames = [torch.randn(2, LATENT, generator=generator) for _ in range(2)]  # the reference's B=1 draw
+    assert torch.equal(first[0], frames[0][0]) and torch.equal(first[2], frames[0][1])
+    torch.manual_seed(5)  # Transformers: manual_seed(seed), then randn(2B, latent) per frame at B=1
+    assert torch.equal(first[0], torch.randn(2, LATENT)[0])
+    assert torch.equal(_noise(inference)[0], frames[1][0])
 
 
 def test_unseeded_rows_keep_the_shared_draw_beside_seeded_rows(inference):
@@ -133,31 +134,8 @@ def test_unseeded_rows_keep_the_shared_draw_beside_seeded_rows(inference):
     assert noise.shape == (6, LATENT)
     torch.testing.assert_close(noise[[0, 2]], expected[:2], atol=0, rtol=0)  # first halves of u, v
     torch.testing.assert_close(noise[[3, 5]], expected[2:], atol=0, rtol=0)
-    assert torch.equal(noise[1], noise[4])  # the seeded row repeats its draw in the unused half
-
-
-class _NoisyTower(torch.nn.Module):
-    """Stands in for the sampled VAE: latents = waveform + randn noise, drawn like the real encoder."""
-
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(1))
-
-    def encode(self, values, sample=True):
-        return SimpleNamespace(latents=(values + torch.randn_like(values)).transpose(1, 2))  # (B, tokens, 1)
-
-
-@pytest.fixture
-def encoder():
-    stub = SimpleNamespace(
-        samples_per_token=2,
-        audio_tower=_NoisyTower(),
-        latent_bias_factor=0.0,
-        latent_scaling_factor=1.0,
-        multi_modal_projector=lambda x: x,
-    )
-    stub._encode_references = lambda rows, counts: VibeVoiceModel._encode_references(stub, rows, counts)
-    return lambda *args: VibeVoiceModel.reference_embeddings(stub, *args)
+    seeded = torch.randn((2, LATENT), generator=torch.Generator().manual_seed(3))
+    assert torch.equal(noise[1], seeded[0]) and torch.equal(noise[4], seeded[1])  # (2, latent) block
 
 
 def _refs(*lengths):
@@ -169,7 +147,8 @@ def _seed(*seeds):
     return [torch.tensor([s is not None, s or 0]) for s in seeds]
 
 
-def test_seeded_reference_noise_depends_only_on_audio_and_seed(encoder):
+def test_seeded_reference_noise_depends_only_on_audio_and_seed(reference_encoder):
+    encoder = reference_encoder()
     rows, counts = _refs(8, 4, 6)
     torch.manual_seed(1)
     before = torch.get_rng_state()
@@ -183,7 +162,8 @@ def test_seeded_reference_noise_depends_only_on_audio_and_seed(encoder):
     assert torch.equal(together[0], encoder(rows[:1], counts[:1], _seed(5))[0])
 
 
-def test_unseeded_reference_keeps_batched_global_draw(encoder):
+def test_unseeded_reference_keeps_batched_global_draw(reference_encoder):
+    encoder = reference_encoder()
     rows, counts = _refs(8, 4)
     for seeds in (None, _seed(None, None)):
         torch.manual_seed(3)

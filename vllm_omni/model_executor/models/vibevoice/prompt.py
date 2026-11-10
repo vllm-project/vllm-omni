@@ -19,6 +19,11 @@ AUDIO_TOKEN_ID = 151654
 #: Official VibeVoice-1.5B speaker limit.
 MAX_SPEAKERS = 4
 
+#: The only accepted ``mm_processor_kwargs`` key. vLLM hashes processor kwargs into
+#: each multimodal item's identity, so the encoder cache never shares a sampled
+#: reference embedding between requests with different (or no) seeds.
+REFERENCE_SEED_KEY = "reference_seed"
+
 _SYSTEM_PROMPT = (
     " Transform the text provided by various speakers into speech output, "
     "utilizing the distinct voice of each respective speaker.\n"
@@ -118,15 +123,22 @@ def render_vibevoice_prompt(text: str, *, reference: bool = True) -> str:
 
 
 def check_reference_prompt(prompt: object, sampling_params_list: Sequence[object]) -> object:
-    """Reject a reference placeholder without audio (stage-0 prompt transform).
+    """Validate the reference placeholder and seed the reference (stage-0 prompt transform).
 
     vLLM skips the multimodal processor when no audio is passed, so its
     placeholder check never runs and the placeholder would be silently embedded
     as text. Audio without a matching placeholder count is rejected by the
     processor.
+
+    ``SamplingParams.seed`` only reaches the diffusion noise; the reference VAE
+    noise is drawn in the cached multimodal encoder. For a request with audio the
+    seed is therefore copied into ``mm_processor_kwargs`` (hashed into the item
+    identity) before processing; an explicit, different ``reference_seed`` is rejected.
     """
     fields = {"prompt": prompt} if isinstance(prompt, str) else prompt
-    if isinstance(fields, dict) and not fields.get("multi_modal_data"):
+    if not isinstance(fields, dict):
+        return prompt
+    if not fields.get("multi_modal_data"):
         text = fields.get("prompt")
         token_ids = fields.get("prompt_token_ids") or ()
         if (isinstance(text, str) and AUDIO_TOKEN in text) or AUDIO_TOKEN_ID in token_ids:
@@ -134,4 +146,17 @@ def check_reference_prompt(prompt: object, sampling_params_list: Sequence[object
                 "VibeVoice prompt has a reference-audio placeholder but no audio; pass "
                 "multi_modal_data={'audio': ...} or use render_vibevoice_prompt(text, reference=False)."
             )
+        return prompt
+    seed = getattr(sampling_params_list[0], "seed", None) if sampling_params_list else None
+    if seed is None:
+        return prompt
+    kwargs = fields.get("mm_processor_kwargs") or {}
+    if REFERENCE_SEED_KEY not in kwargs:
+        # A new dict: the engine passes a shallow copy and the caller's kwargs stay unchanged.
+        return {**fields, "mm_processor_kwargs": {**kwargs, REFERENCE_SEED_KEY: seed}}
+    if kwargs[REFERENCE_SEED_KEY] != seed:
+        raise ValueError(
+            f"VibeVoice mm_processor_kwargs[{REFERENCE_SEED_KEY!r}]={kwargs[REFERENCE_SEED_KEY]!r} "
+            f"conflicts with SamplingParams.seed={seed}; omit it to use the request seed."
+        )
     return prompt

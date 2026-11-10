@@ -131,6 +131,22 @@ def test_audio_stream_contract(omni_server, online_client, ref_audio, fmt):
     assert audio.size / 24000 > 0.1
 
 
+def test_request_seed_is_reproducible(omni_server, online_client, ref_audio):
+    def speak(seed=None):
+        extra = {"ref_audio": ref_audio, "max_new_tokens": 64} | ({} if seed is None else {"seed": seed})
+        response = online_client.client.audio.speech.create(
+            model=omni_server.model, input=TEXT, voice=None, response_format="pcm", extra_body=extra, timeout=300
+        )
+        audio = np.frombuffer(response.content, dtype="<i2")
+        assert audio.size > 0 and audio.size % 3200 == 0
+        return audio
+
+    first = speak(7)
+    speak()  # an unseeded request in between advances the shared RNG
+    assert np.array_equal(speak(7), first)  # serial batch-1: depends only on (seed, reference)
+    assert not np.array_equal(speak(8), first)
+
+
 def test_queue_beyond_four(omni_server, online_client, ref_audio):
     online_client.send_audio_speech_request(
         {

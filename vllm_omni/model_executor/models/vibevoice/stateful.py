@@ -171,8 +171,10 @@ class VibeVoiceStatefulInference:
 
         Unseeded rows share one global draw per active subset, as in the
         reference. Seeded rows draw only from their own generator, so the global
-        stream is not consumed on their behalf. Only the first half seeds both
-        CFG branches; seeded rows repeat theirs in the unused second half.
+        stream is not consumed on their behalf. A seeded row draws a ``(2, latent)``
+        block per frame, exactly the reference's ``(2B, latent)`` draw at B=1, so the
+        same seed gives the same noise as Transformers; only its first row seeds
+        both CFG branches, the second is unused.
         """
         latent = self._model.config.audio_config.hidden_size
         count = len(states)
@@ -184,7 +186,7 @@ class VibeVoiceStatefulInference:
             first[i], second[i] = shared[k], shared[len(free) + k]  # type: ignore[index]
         for i, state in enumerate(states):
             if state.noise_generator is not None:
-                first[i] = second[i] = torch.randn(latent, generator=state.noise_generator)
+                first[i], second[i] = torch.randn((2, latent), generator=state.noise_generator)
         return torch.cat([first, second])
 
     def release(self, request_ids: set[str] | list[str]) -> None:
