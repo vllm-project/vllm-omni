@@ -447,3 +447,42 @@ def test_chunked_eager_video_matches_one_forward(monkeypatch):
         chunked = model(x, grid)
         whole = model.forward_with_encoder_metadata(x, model.prepare_encoder_metadata(grid))
     torch.testing.assert_close(chunked, whole)
+
+
+@pytest.mark.parametrize("method", ["eagle3", "extract_hidden_states"])
+def test_thinker_rejects_unsupported_aux_method_before_loading(monkeypatch, method):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(method=method)
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="only supports DFlash"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("dflash_config", [None, {}, {"target_layer_ids": []}])
+def test_thinker_rejects_missing_dflash_layers_before_loading(monkeypatch, dflash_config):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config=dflash_config)),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="requires non-empty dflash_config.target_layer_ids"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("method", ["dflash", "ngram"])
+def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method):
+    cfg = _config()
+    cfg.speculative_config = SimpleNamespace(
+        method=method,
+        use_dflash=lambda: method == "dflash",
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
+    )
+
+    def load_model(**kwargs):
+        raise RuntimeError("reached weight loading")
+
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", load_model)
+    with pytest.raises(RuntimeError, match="reached weight loading"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)

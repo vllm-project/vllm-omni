@@ -224,8 +224,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
         self.thinker_config = thinker_config
-        # vLLM's multimodal draft-model loader reads this alias from the
-        # outer target config; Omni stores the token ID in thinker_config.
+        # vLLM's LLMBaseProposer.load_model copies image_token_index from the
+        # outer target config into the multimodal draft config. Omni stores
+        # the original token ID in thinker_config.
         self.config.image_token_index = thinker_config.image_token_id
         self.multimodal_config = multimodal_config
 
@@ -261,6 +262,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.supports_mrv2_full_graph_aux_outputs = self._returns_tuple
 
         if self.model_stage == "thinker":
+            spec_config = vllm_config.speculative_config
+            if spec_config is not None:
+                if spec_config.method in ("eagle3", "extract_hidden_states"):
+                    raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
+                if spec_config.use_dflash():
+                    draft_config = spec_config.draft_model_config
+                    dflash_config = getattr(draft_config.hf_config, "dflash_config", None) if draft_config else None
+                    if not isinstance(dflash_config, dict) or not dflash_config.get("target_layer_ids"):
+                        raise ValueError("Qwen3-Omni DFlash requires non-empty dflash_config.target_layer_ids")
             self.use_async_omni_output = True
             self.supports_async_speculative_payload = True
             # MRv2: the Talker's prompt ends with the first generated token's

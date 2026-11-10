@@ -228,6 +228,7 @@ def _make_combined(*, is_staged_run: bool, accept_hidden_layer=6) -> Qwen3OmniMo
     model.model_stage = "thinker"
     model.is_staged_run = is_staged_run
     model.talker_config = SimpleNamespace(accept_hidden_layer=accept_hidden_layer)
+    model.vllm_config = SimpleNamespace(speculative_config=None)
     model.thinker = _ThinkerStub()
     return model
 
@@ -247,11 +248,13 @@ def test_combined_forward_staged_run_captures_and_returns_tuple():
     assert isinstance(out, tuple)
 
 
-def test_combined_forward_staged_run_without_accept_layer_returns_tensor():
+def test_combined_forward_staged_run_without_accept_layer_still_captures_embeddings():
     model = _make_combined(is_staged_run=True, accept_hidden_layer=None)
     out = model.forward(**_forward_args())
-    assert "capture_layer_indices" not in model.thinker.received
-    assert isinstance(out, torch.Tensor)
+    # Layer 0 supplies Talker embeddings independently of any hidden-layer tap.
+    assert model.thinker.received["capture_layer_indices"] == [0]
+    assert model.thinker.received["return_hidden_states"] is True
+    assert isinstance(out, tuple)
 
 
 def test_make_omni_output_accepts_bare_tensor():
