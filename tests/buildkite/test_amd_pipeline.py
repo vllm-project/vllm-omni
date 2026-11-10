@@ -2489,9 +2489,9 @@ def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
         assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text
 
 
-def test_qwen_image_backend_similarity_is_one_nonblocking_nightly_job() -> None:
+def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     step = _find_step("Qwen-Image Diffusers Backend Similarity", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2891,7 +2891,7 @@ def test_minicpmo_duplex_executes_junit_guard_before_exit(
     )
 
 
-def test_qwen_image_expansion_has_separate_nonblocking_card_jobs() -> None:
+def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
     one = _find_step("Qwen-Image Expansion 1 GPU", AMD_NIGHTLY_PIPELINE)
     two = _find_step("Qwen-Image Expansion 2 GPU", AMD_NIGHTLY_PIPELINE)
     cases = (
@@ -2924,7 +2924,7 @@ def test_qwen_image_expansion_has_separate_nonblocking_card_jobs() -> None:
         ),
     )
     for step, agent_pool, marker, artifact_path, nodes, expected_message in cases:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == agent_pool
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
@@ -3100,7 +3100,7 @@ def test_qwen25_omni_merge_executes_junit_guard_before_exit(
     )
 
 
-def test_wan22_function_has_separate_nonblocking_card_jobs() -> None:
+def test_wan22_function_has_separate_blocking_card_jobs() -> None:
     one = _find_step("Wan2.2 Function 1 GPU", AMD_NIGHTLY_PIPELINE)
     two = _find_step("Wan2.2 Function 2 GPU", AMD_NIGHTLY_PIPELINE)
     cases = (
@@ -3145,7 +3145,7 @@ def test_wan22_function_has_separate_nonblocking_card_jobs() -> None:
         ),
     )
     for step, agent_pool, marker, artifact_path, nodes, expected_message in cases:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["agent_pool"] == agent_pool
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
@@ -3398,7 +3398,7 @@ def test_entrypoints_full_nightly_splits_qwen_and_bagel_without_skips() -> None:
         step = _find_step(label, AMD_NIGHTLY_PIPELINE)
         assert step["agent_pool"] == "mi300_2"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if label == "Qwen3-Omni Duplex Playback" else "NonBlocking")
         assert step["timeout_in_minutes"] == 180
         assert step["source_file_dependencies"] == dependency_key
         assert step["artifact_paths"] == [artifacts]
