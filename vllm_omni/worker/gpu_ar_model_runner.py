@@ -131,6 +131,11 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, _PackedTensorPayload):
         flat = _copy_tensor_payload_to_cpu(value.tensor, pin_memory)
+        if value.shapes and all(shape == value.shapes[0] for shape in value.shapes):
+            # Decode rows commonly have identical codec/state shapes. One
+            # batch view avoids a slice and view dispatch for every request.
+            rows = flat.view(len(value.shapes), *value.shapes[0]).unbind(0)
+            return rows if value.is_tuple else list(rows)
         items = []
         offset = 0
         for shape in value.shapes:
@@ -1335,6 +1340,13 @@ class GPUARModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+            )
+            # #9865: thin hook — MammothGPUARModelRunner retargets specialty
+            # graphs; default Omni/AR implementation is a no-op.
+            batch_desc = self._select_moe_replay_batch_descriptor(
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_unpadded,
             )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
