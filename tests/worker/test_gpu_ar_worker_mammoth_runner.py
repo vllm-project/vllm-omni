@@ -86,8 +86,10 @@ def test_ensure_moe_specialty_compatible_raises_for_non_mammoth_after_flag_set()
     """Flag is normally set during model ``__init__`` inside ``load_model``."""
     runner = object.__new__(OmniGPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
-    with pytest.raises(RuntimeError, match=r"cudagraph_mode without FULL|MammothGPUARModelRunner"):
+    with pytest.raises(RuntimeError, match="cudagraph_mode without FULL") as excinfo:
         ensure_moe_specialty_runner_compatible(runner)
+    # Deploy YAML / --compilation-config cannot set this key (extra=forbid).
+    assert "cudagraph_specialize_moe_routing=False" not in str(excinfo.value)
 
 
 def test_ensure_moe_specialty_compatible_allows_mammoth_runner():
@@ -101,8 +103,10 @@ def test_ensure_moe_specialty_compatible_rejects_v2_runner_when_flag_on():
 
     runner = object.__new__(V2OmniGPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
-    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner"):
+    with pytest.raises(RuntimeError, match="MammothGPUARModelRunner") as excinfo:
         ensure_moe_specialty_runner_compatible(runner)
+    assert "cudagraph_mode without FULL" in str(excinfo.value)
+    assert "cudagraph_specialize_moe_routing=False" not in str(excinfo.value)
 
 
 def test_ensure_moe_specialty_compatible_noop_when_flag_off():
