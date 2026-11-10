@@ -497,6 +497,35 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
             sources=("vllm_omni/diffusion/models/longcat_video/pipeline_longcat_video_avatar.py",),
         ),
     ),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+        serving_capabilities=declare_capabilities(
+            replace(
+                TEXT_TO_VIDEO,
+                request=RequestConstraints(
+                    inputs={
+                        "text": InputConstraint(support="supported", min_count=1),
+                        "image": InputConstraint(support="unsupported", max_count=0),
+                        "video": InputConstraint(support="unsupported", max_count=0),
+                    }
+                ),
+            ),
+            replace(
+                IMAGE_TO_VIDEO,
+                request=RequestConstraints(
+                    inputs={
+                        "text": InputConstraint(support="supported", min_count=1),
+                        "image": InputConstraint(support="supported", min_count=1, max_count=1),
+                        "video": InputConstraint(support="unsupported", max_count=0),
+                    }
+                ),
+            ),
+            sources=("vllm_omni/diffusion/models/pan2/pipeline_pan2.py",),
+        ),
+    ),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(

@@ -357,6 +357,34 @@ async def build_initialized_test_app(
 
 
 @pytest.mark.asyncio
+async def test_pan2_video_routes_preserve_first_frame_limits(monkeypatch, tmp_path):
+    app, engine = await build_initialized_test_app(monkeypatch, tmp_path, "PAN2ModularPipeline")
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            response = await client.get("/v1/omni/capabilities")
+        assert response.status_code == 200
+        operation = response.json()["models"][0]["operations"]["video_generation"]
+        assert operation["support"] == "supported" and operation["exposure"] == "enabled"
+        profiles = {profile["id"]: profile for profile in operation["profiles"]}
+        assert profiles["video_to_video"]["support"] == "unsupported"
+        for name in ("text_to_video", "image_to_video"):
+            profile = profiles[name]
+            assert profile["outputs"] == ["video"]
+            assert profile["required_inputs"] == (["text"] if name == "text_to_video" else ["text", "image"])
+            for path in ("/v1/videos", "/v1/videos/sync"):
+                route = next(route for route in profile["routes"] if route["path"] == path)
+                assert route["exposure"] == "enabled"
+                inputs = route["request"]["inputs"]
+                assert inputs["video"]["support"] == "unsupported"
+                assert inputs["image"]["max_count"] == (0 if name == "text_to_video" else 1)
+                if name == "image_to_video":
+                    assert inputs["image"]["min_count"] == 1
+    finally:
+        app.state.openai_serving_video.shutdown()
+    engine.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("architecture", ["QwenImagePipeline", "Cosmos3OmniDiffusersPipeline"])
 async def test_real_upstream_app_and_omni_handler_initialization(monkeypatch, tmp_path, architecture):
     """Keep the real upstream builder, Omni init, handlers, and HTTP transport."""
