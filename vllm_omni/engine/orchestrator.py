@@ -125,6 +125,23 @@ def _event_driven_orch_enabled() -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _stage_request_error_text(eco: Any, fallback: str) -> tuple[str, str | None]:
+    """Prefer RequestError.message over stop_reason for a stage failure.
+
+    A paused engine sets ``error`` and leaves ``stop_reason`` unset. Bare
+    ``FinishReason.ERROR`` outputs keep the historical fallback.
+    """
+    request_error = getattr(eco, "error", None)
+    message = getattr(request_error, "message", None)
+    code = getattr(request_error, "code", None)
+    if isinstance(message, str) and message:
+        return message, code if isinstance(code, str) else None
+    stop_reason = getattr(eco, "stop_reason", None)
+    if isinstance(stop_reason, str) and stop_reason:
+        return stop_reason, None
+    return fallback, None
+
+
 def _build_terminal_empty_output(
     request_id: str,
     *,
@@ -976,6 +993,7 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+        reported_session_errors: set[str] = set()
 
         for eco in raw_outputs.outputs:
             mm_cache_miss_hashes = getattr(eco, "mm_cache_miss_hashes", None)
@@ -995,6 +1013,12 @@ class OrchestratorBase:
                 )
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
+            if req_state is None and getattr(eco, "finish_reason", None) == FinishReason.ERROR:
+                # A failed sample of an n > 1 request fails the request, through the error branch below.
+                parent_id = pool.parallel_sample_parent_id(request_id) if request_id is not None else None
+                req_state = self.request_states.get(parent_id) if parent_id is not None else None
+                if req_state is not None and (getattr(eco, "is_segment_finished", False) or req_state.session_owned):
+                    req_state = None
             if req_state is None:
                 # Stage 0's sender lives on the frontend. Deliver its cache
                 # feedback even after cancellation; consumers may drop the error
@@ -1014,21 +1038,28 @@ class OrchestratorBase:
 
             # A non-session ERROR is fatal to the whole request. Handle it
             # before normal terminal routing so it reaches the client once.
+            # Cleanup pops the output-processor entry, so process_outputs will
+            # not see this output. Prefer RequestError.message: a paused engine
+            # sets error and leaves stop_reason unset.
             if (
                 getattr(eco, "finish_reason", None) == FinishReason.ERROR
                 and not segment_finished
                 and not req_state.session_owned
             ):
-                reason = (
-                    "Multi-modal processor cache miss. Please retry the request."
-                    if mm_cache_miss_hashes
-                    else getattr(eco, "stop_reason", None)
-                )
-                await self._handle_stage_error(
-                    stage_id,
-                    eco,
-                    error=reason if isinstance(reason, str) and reason else "Stage request failed",
-                )
+                reason, error_type = _stage_request_error_text(eco, "Stage request failed")
+                if mm_cache_miss_hashes:
+                    reason = "Multi-modal processor cache miss. Please retry the request."
+                    error_type = None
+                if error_type is None:
+                    await self._handle_stage_error(stage_id, eco, error=reason, request_id=req_state.request_id)
+                else:
+                    await self._handle_stage_error(
+                        stage_id,
+                        eco,
+                        error=reason,
+                        error_type=error_type,
+                        request_id=req_state.request_id,
+                    )
                 continue
 
             # Only streaming requests maintain the per-stage segment snapshot.
@@ -1052,12 +1083,18 @@ class OrchestratorBase:
             ):
                 raw_terminal_request_ids.add(req_state.request_id)
 
-            await self._report_duplex_session_request_error(
-                stage_id,
-                replica_id,
-                eco,
-                req_state,
-            )
+            if (
+                await self._report_duplex_session_request_error(
+                    stage_id,
+                    replica_id,
+                    eco,
+                    req_state,
+                )
+                is True
+            ):
+                reported_session_errors.add(req_state.request_id)
+                if request_id is not None:
+                    reported_session_errors.add(request_id)
             if isinstance(getattr(eco, "stage_work", None), list):
                 self._collect_duplex_stage_work(stage_id, eco, req_state)
 
@@ -1067,6 +1104,12 @@ class OrchestratorBase:
             raw_outputs,
             iteration_stats=iteration_stats,
         )
+        if reported_session_errors:
+            # Duplex already enqueued the client error. Drop a processor
+            # from_error for the same id so it is not delivered again.
+            processed = [
+                output for output in processed if getattr(output, "request_id", None) not in reported_session_errors
+            ]
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             self._stat_logger.record(
@@ -1571,12 +1614,31 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
-        """Emit a frontend-visible error and clean up request state."""
-        if self._cfg_tracker.is_companion(output.request_id):
-            parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
+    async def _handle_stage_error(
+        self,
+        stage_id: int,
+        output: Any,
+        *,
+        error: str | None = None,
+        error_type: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Emit a frontend-visible error and clean up request state.
+
+        ``request_id`` overrides ``output.request_id``, e.g. the request of a failed n > 1 sample.
+        """
+        request_id = request_id or output.request_id
+        if self._cfg_tracker.is_companion(request_id):
+            parent_id = self._cfg_tracker.get_parent_id(request_id) or request_id
         else:
-            parent_id = output.request_id
+            parent_id = request_id
+        resolved_error_type: str | None
+        if getattr(output, "mm_cache_miss_hashes", None):
+            resolved_error_type = "ServiceUnavailableError"
+        elif error_type is not None:
+            resolved_error_type = error_type
+        else:
+            resolved_error_type = getattr(output, "error_type", None)
         await self.output_async_queue.put(
             ErrorMessage(
                 request_id=parent_id,
@@ -1585,9 +1647,7 @@ class OrchestratorBase:
                 status_code=503
                 if getattr(output, "mm_cache_miss_hashes", None)
                 else getattr(output, "error_status_code", None),
-                error_type="ServiceUnavailableError"
-                if getattr(output, "mm_cache_miss_hashes", None)
-                else getattr(output, "error_type", None),
+                error_type=resolved_error_type,
                 mm_cache_miss_hashes=getattr(output, "mm_cache_miss_hashes", None),
             )
         )
@@ -1595,7 +1655,7 @@ class OrchestratorBase:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=True,
-            trace_error=getattr(output, "error_type", None) or "stage_error",
+            trace_error=resolved_error_type or "stage_error",
         )
 
     def _update_stage_replica_waiting(self, stage_id: int, replica_id: int, n_waiting: int) -> None:
@@ -2025,7 +2085,7 @@ class OrchestratorBase:
         replica_id: int | None,
         eco: Any,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         """Turn a scheduler-side error finish of a duplex session request into a request error.
 
         A duplex session request is resumable, so its terminal outputs are
@@ -2039,13 +2099,12 @@ class OrchestratorBase:
         the serving layer can fail and close the session.
         """
         if not req_state.session_owned:
-            return
+            return False
         if getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         if getattr(eco, "is_segment_finished", False):
-            return
-        stop_reason = getattr(eco, "stop_reason", None)
-        error = stop_reason if isinstance(stop_reason, str) and stop_reason else "duplex session request failed"
+            return False
+        error, error_type = _stage_request_error_text(eco, "duplex session request failed")
         logger.error(
             "[Orchestrator] Duplex session request %s failed at stage-%s replica-%s: %s",
             req_state.request_id,
@@ -2056,12 +2115,14 @@ class OrchestratorBase:
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
+                error_type=error_type,
                 fatal=False,
                 request_id=req_state.request_id,
                 stage_id=stage_id,
                 mm_cache_miss_hashes=getattr(eco, "mm_cache_miss_hashes", None),
             )
         )
+        return True
 
     async def _finish_raw_terminal_requests(
         self,
@@ -3230,6 +3291,7 @@ class OrchestratorBase:
         submit_kwargs: DiffusionSubmitKwargs | None = None,
         params_override: OmniSamplingParams | None = None,
         pinned_replica_id: int | None = None,
+        requested_replica_id: int | None = None,
     ) -> None:
         """Submit requests built from the source stage's output to the receiver stage."""
         if req_state.yield_stage_id == source_stage_id:
@@ -3245,6 +3307,8 @@ class OrchestratorBase:
             return
         to_pool = self.stage_pools[receiver_stage_id]
         update_kwargs: dict[str, Any] = {"pinned_replica_id": pinned_replica_id}
+        if requested_replica_id is not None:
+            update_kwargs["requested_replica_id"] = requested_replica_id
         if submit_kwargs is not None:
             update_kwargs["submit_kwargs"] = submit_kwargs
         initial_kwargs = dict(update_kwargs)
@@ -3666,13 +3730,13 @@ class Orchestrator(OrchestratorBase):
         if isinstance(msg, NextStageInputMessage):
             await self._handle_next_stage_input(msg)
             return True
-        msg_type = msg.type
+        msg_type = getattr(msg, "type")
         if msg_type == "add_request":
-            await self._handle_add_request(msg)
+            await self._handle_add_request(cast(StageSubmissionMessage, msg))
         elif msg_type == "streaming_update":
-            await self._handle_streaming_update(msg)
+            await self._handle_streaming_update(cast(StageSubmissionMessage, msg))
         elif msg_type == "add_companion_request":
-            await self._handle_add_companion(msg)
+            await self._handle_add_companion(cast(AddCompanionRequestMessage, msg))
         elif msg_type == "interaction":
             interaction = cast(InteractionMessage, msg)
             try:
@@ -3697,8 +3761,8 @@ class Orchestrator(OrchestratorBase):
         """Fail the request if it can't be submitted to `stage_id`; return whether it failed."""
         if not self.stage_pools[stage_id].live_replica_ids():
             # The stage lost all replicas between the HTTP-layer errored check and
-            # dispatch. Runs before request state / running counter registration,
-            # so the helper's cleanup is a no-op here.
+            # dispatch. Request-state cleanup is a no-op before registration,
+            # but binding cleanup still releases any explicit-route reservation.
             await self._fail_request_dead_stage(req_id, stage_id)
             return True
         if is_run_request and self.async_chunk:
@@ -3717,6 +3781,18 @@ class Orchestrator(OrchestratorBase):
         except ValueError as exc:
             await self._fail_request_client_error(req_id, receiver_stage_id, str(exc))
             return
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[receiver_stage_id].reserve_requested_replica(req_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    req_id,
+                    receiver_stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(req_id, receiver_stage_id, is_run_request=True):
             return
 
@@ -3756,6 +3832,7 @@ class Orchestrator(OrchestratorBase):
                 already_submitted=False,
                 t_submit_start=_time.perf_counter(),
                 submit_kwargs=msg.submit_kwargs,
+                requested_replica_id=msg.requested_replica_id,
             ),
             req_id=req_id,
             stage_id=receiver_stage_id,
@@ -3786,6 +3863,18 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
             return
 
@@ -3801,6 +3890,35 @@ class Orchestrator(OrchestratorBase):
                     "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
                     "for that stage",
                 )
+                return
+
+        # The stage pool fans out n > 1 on any LLM stage, but only the entry stage's samples have a consumer.
+        for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
+            later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
+            if later_n > 1:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    f"n > 1 is supported only on the entry stage {stage_id}; stage {later_stage_id} has n={later_n}",
+                )
+                return
+        entry_params = sampling_params_list[stage_id]
+        if (getattr(entry_params, "n", 1) or 1) > 1:
+            reason = None
+            # An LLM stage returns its n samples as one output; later stages cannot take one input per sample.
+            if final_stage_id != stage_id:
+                reason = (
+                    f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
+                    f"to stage {final_stage_id}"
+                )
+            # Streaming-input errors take the segment path, which does not resolve samples to their request.
+            elif getattr(prompt, "resumable", False):
+                reason = "n > 1 is not supported for streaming (resumable) input"
+            # Output watermarking tracks the request, not its samples.
+            elif self.stage_pools[stage_id].will_watermark(entry_params):
+                reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
+            if reason is not None:
+                await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 
         logger.debug(
@@ -3843,8 +3961,10 @@ class Orchestrator(OrchestratorBase):
             expected_replica_id = None
             if stage_id != 0:
                 _t_preprocess = _time.perf_counter()
+                preprocessing_started = False
                 try:
                     expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
+                    preprocessing_started = True
                     prompt = await self._build_entry_stage_request(
                         request_id,
                         stage_id,
@@ -3855,6 +3975,21 @@ class Orchestrator(OrchestratorBase):
                     )
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, stage_id)
+                    return
+                except OmniClientError as exc:
+                    if preprocessing_started:
+                        await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
+                    # Preserve request-scoped metadata both when preselection
+                    # revalidates a disappeared explicit replica and when the
+                    # input processor raises another OmniClientError.
+                    logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        str(exc),
+                        status_code=exc.status_code,
+                        error_type=exc.error_type,
+                    )
                     return
                 except (ValueError, VLLMClientError) as exc:
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
@@ -3876,6 +4011,7 @@ class Orchestrator(OrchestratorBase):
                     prompt,
                     prompt_text=msg.output_prompt_text,
                     expected_replica_id=expected_replica_id,
+                    requested_replica_id=msg.requested_replica_id,
                 ),
                 req_id=request_id,
                 stage_id=stage_id,
@@ -3977,6 +4113,10 @@ class Orchestrator(OrchestratorBase):
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
+                # The parent has already been admitted when this FIFO message
+                # is handled. Inherit its active binding so an explicit parent
+                # route also colocates every CFG companion without giving the
+                # companion a separate caller-selected route.
                 affinity_request_id=parent_id,
                 **route_kwargs,
             )
