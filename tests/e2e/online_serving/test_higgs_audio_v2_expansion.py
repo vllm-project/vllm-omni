@@ -137,11 +137,10 @@ class TestHiggsAudioV2OnlineHappyPath:
 
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_long_input_text(self, omni_server, online_client) -> None:
-        """A long prompt near the stage-0 context budget must synthesize fully.
+        """A multi-sentence input must synthesize fully without truncation.
 
-        Stage 0 caps generation at 1024 audio frames (~41 s at 25 fps) under
-        a 4096-token context; six repetitions exercise a multi-step decode
-        without asking the synthesized speech to exceed that frame cap.
+        Stage 0 caps generation at 1024 audio frames (~41 s at 25 fps);
+        six repetitions exercise a multi-step decode within that output cap.
         """
         long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 6
         online_client.send_audio_speech_request(
