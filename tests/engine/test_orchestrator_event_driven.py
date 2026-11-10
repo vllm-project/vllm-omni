@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import janus
 import pytest
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine import orchestrator as orchestrator_module
 from vllm_omni.engine.async_engine_utils import OutputQueueSink
@@ -170,6 +171,64 @@ async def test_idle_diffusion_poller_awaits_the_client_wakeup(
         assert set(stage0.wait_timeouts) == {orchestrator_module._ORCH_READER_RECONCILE_INTERVAL_S}
     else:
         assert stage0.wait_timeouts == []
+
+
+class _DeadInlineDiffusionStageClient(_WakeupDiffusionStageClient):
+    """Wake-up client whose executor dies: the poll raises and the waiter returns at once.
+
+    Mirrors the inline client after ``_mark_engine_dead``: ``wait_diffusion_output``
+    no longer suspends, so the poller must yield on its own for the dispatcher
+    to evict the replica.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.die = False
+
+    def get_diffusion_output_nowait(self):
+        if self.die:
+            raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
+        return super().get_diffusion_output_nowait()
+
+    async def wait_diffusion_output(self, timeout: float) -> None:
+        if self.die:
+            return
+        await super().wait_diffusion_output(timeout)
+
+
+@pytest.mark.asyncio
+async def test_dead_inline_replica_with_immediate_waiter_is_evicted(orchestrator_factory, monkeypatch) -> None:
+    """A dead wake-up replica is evicted even though its waiter never suspends.
+
+    With the queue empty the poll raises ``EngineDeadError`` on every pass and
+    the waiter returns immediately, so without an explicit yield the poller
+    would starve the dispatcher that performs the eviction.
+    """
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_WAKEUP", raising=False)
+    stage0 = _DeadInlineDiffusionStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    pool = orchestrator_fixture.orchestrator.stage_pools[0]
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-dead-inline",
+            prompt={"prompt": "draw a cat"},
+            original_prompt={"prompt": "draw a cat"},
+            sampling_params_list=[OmniDiffusionSamplingParams()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.die = True
+
+        await _wait_for(lambda: pool.live_replica_ids() == [])
+        await _wait_for(lambda: "req-dead-inline" not in orchestrator_fixture.orchestrator.request_states)
+        assert orchestrator_fixture.thread.is_alive()
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

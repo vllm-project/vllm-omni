@@ -1360,6 +1360,9 @@ class OrchestratorBase:
                             output = pool.poll_diffusion_output(replica_id)
                         except EngineDeadError as e:
                             await ready_q.put(("error", stage_id, replica_id, e))
+                            # The inline client's waiter returns at once while its
+                            # engine is dead: yield so the dispatcher can evict.
+                            await asyncio.sleep(0.001)
                             continue
                         if output is None:
                             continue
