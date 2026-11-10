@@ -249,33 +249,227 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStage(str, Enum):
+    """Atomic stages that can be composed into a diffusion stage role."""
+
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DECODE = "decode"
+
+
+class DiffusionStageOperator(str, Enum):
+    """A concrete operation requested from a diffusion pipeline."""
+
+    FORWARD = "forward"
+    ENCODE = "encode"
+    DIFFUSE = "diffuse"
+    DIFFUSE_DECODE = "diffuse_decode"
+    DECODE = "decode"
+    PREPARE_ENCODE = "prepare_encode"
+    PREPARE_DENOISE = "prepare_denoise"
+    STEP_PREPARE = "step_prepare"
+    DENOISE_STEP = "denoise_step"
+    STEP_SCHEDULER = "step_scheduler"
+    STEP_OUTPUT = "step_output"
+    POST_DECODE = "post_decode"
+    STEP_FINALIZE = "step_finalize"
+
+    @property
+    def is_request_operator(self) -> bool:
+        """Whether this operator consumes a request-level batch."""
+        return self in _REQUEST_OPERATORS
+
+    @property
+    def is_boundary_selector(self) -> bool:
+        """Whether this is a role-independent step boundary selector."""
+        return self in {DiffusionStageOperator.STEP_PREPARE, DiffusionStageOperator.STEP_FINALIZE}
+
+    @property
+    def required_stages(self) -> frozenset[DiffusionStage]:
+        """Return concrete operation permissions after resolving boundary selectors."""
+        if self.is_boundary_selector:
+            raise ValueError(f"Resolve boundary selector {self.value!r} before checking required stages.")
+        return _OPERATOR_REQUIRED_STAGES[self]
+
+    @property
+    def primitive_name(self) -> str:
+        """Return the legacy method name used by non-mixin pipelines."""
+        if self is DiffusionStageOperator.FORWARD:
+            return "forward"
+        if self is DiffusionStageOperator.ENCODE:
+            return "encode_batch"
+        if self is DiffusionStageOperator.DIFFUSE:
+            return "diffuse_batch"
+        if self is DiffusionStageOperator.DECODE:
+            return "decode_batch"
+        return self.value
+
+
+_REQUEST_OPERATORS = frozenset(
+    {
+        DiffusionStageOperator.FORWARD,
+        DiffusionStageOperator.ENCODE,
+        DiffusionStageOperator.DIFFUSE,
+        DiffusionStageOperator.DIFFUSE_DECODE,
+        DiffusionStageOperator.DECODE,
+    }
+)
+
+_OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage]] = {
+    DiffusionStageOperator.FORWARD: frozenset(DiffusionStage),
+    DiffusionStageOperator.ENCODE: frozenset({DiffusionStage.ENCODE}),
+    DiffusionStageOperator.DIFFUSE: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.DIFFUSE_DECODE: frozenset({DiffusionStage.DENOISE, DiffusionStage.DECODE}),
+    DiffusionStageOperator.DECODE: frozenset({DiffusionStage.DECODE}),
+    DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.ENCODE, DiffusionStage.DENOISE}),
+    DiffusionStageOperator.PREPARE_DENOISE: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.DENOISE_STEP: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.STEP_SCHEDULER: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.STEP_OUTPUT: frozenset({DiffusionStage.DENOISE}),
+    DiffusionStageOperator.POST_DECODE: frozenset({DiffusionStage.DECODE}),
+}
+
+
 class DiffusionStageRole(str, Enum):
     """Role of a diffusion stage within a (possibly disaggregated) pipeline.
 
     ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
-    orthogonal axis that answers *which slice of a diffusion model* the stage
-    runs. Splitting a single diffusion model across stages by role lets many
-    DiT-style models become disaggregatable through configuration alone, with no
-    per-model source changes:
+    orthogonal axis that answers *which operations a diffusion model stage may
+    run*. An operator is allowed when all of its required stages belong to the
+    role. Compound roles also allow individual operations on their components;
+    a role does not require every call to run its whole pipeline slice:
 
-    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
-                   stage. This is the default / single-stage behavior.
     - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
                    embeddings for a downstream stage.
     - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
                    and emit latents for a downstream decode stage.
-    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
-                          generation stage of E/G disaggregation).
     - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
                    stage of a 3-way E/G/D split).
+    - ``FULL``:    allow encode, denoise, decode, and their compositions. The
+                  default request operation runs the whole pipeline.
+    - ``DENOISE_DECODE``: allow denoise and decode, individually or together.
+                         The default request operation runs both.
     """
 
-    FULL = "full"
     ENCODE = "encode"
     DENOISE = "denoise"
-    DENOISE_DECODE = "denoise_decode"
     DECODE = "decode"
+    # compound roles
+    FULL = "full"
+    DENOISE_DECODE = "denoise_decode"
 
+    @property
+    def stages(self) -> frozenset[DiffusionStage]:
+        """Return the atomic stages composed by this role."""
+        return _ROLE_STAGES[self]
+
+    @property
+    def default_request_operator(self) -> DiffusionStageOperator:
+        """Return the compatibility operator for request-batch execution."""
+        return _ROLE_SPECS[self].default_request_operator
+
+    @property
+    def allowed_operators(self) -> frozenset[DiffusionStageOperator]:
+        """Return every operation authorized by this role's stage permissions."""
+        return frozenset(
+            operator
+            for operator in DiffusionStageOperator
+            if not operator.is_boundary_selector and operator.required_stages <= self.stages
+        )
+
+    @property
+    def request_operators(self) -> frozenset[DiffusionStageOperator]:
+        """Return the request-level operations authorized by this role."""
+        return frozenset(operator for operator in self.allowed_operators if operator.is_request_operator)
+
+    def required_operators(self, *, step_execution: bool) -> frozenset[DiffusionStageOperator]:
+        """Return the methods required for this deployment's default execution.
+
+        ENCODE and DECODE remain request-shaped even when the global runner is
+        configured for step execution because they are executed atomically by
+        the runner's request path. This startup contract is narrower than the
+        permission set in ``allowed_operators``; it does not prohibit explicit
+        calls to other authorized operators.
+        """
+        if not step_execution or not self.allows(DiffusionStage.DENOISE):
+            return frozenset({self.default_request_operator})
+
+        prepare_operator = (
+            DiffusionStageOperator.PREPARE_ENCODE
+            if self.allows(DiffusionStage.ENCODE)
+            else DiffusionStageOperator.PREPARE_DENOISE
+        )
+        terminal_operator = (
+            DiffusionStageOperator.POST_DECODE
+            if self.allows(DiffusionStage.DECODE)
+            else DiffusionStageOperator.STEP_OUTPUT
+        )
+        return frozenset(
+            {
+                prepare_operator,
+                DiffusionStageOperator.DENOISE_STEP,
+                DiffusionStageOperator.STEP_SCHEDULER,
+                terminal_operator,
+            }
+        )
+
+    @property
+    def step_operators(self) -> frozenset[DiffusionStageOperator]:
+        """Return the state and step operations authorized by this role."""
+        return frozenset(operator for operator in self.allowed_operators if not operator.is_request_operator)
+
+    def allows(self, stage: DiffusionStage) -> bool:
+        """Return whether this role contains an atomic stage."""
+        return stage in self.stages
+
+
+@dataclass(frozen=True)
+class _DiffusionStageRoleSpec:
+    components: tuple[DiffusionStage | DiffusionStageRole, ...]
+    default_request_operator: DiffusionStageOperator
+
+
+_ROLE_SPECS: dict[DiffusionStageRole, _DiffusionStageRoleSpec] = {
+    DiffusionStageRole.ENCODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.ENCODE,),
+        default_request_operator=DiffusionStageOperator.ENCODE,
+    ),
+    DiffusionStageRole.DENOISE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.DENOISE,),
+        default_request_operator=DiffusionStageOperator.DIFFUSE,
+    ),
+    DiffusionStageRole.DECODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStage.DECODE,),
+        default_request_operator=DiffusionStageOperator.DECODE,
+    ),
+    DiffusionStageRole.FULL: _DiffusionStageRoleSpec(
+        components=(
+            DiffusionStageRole.ENCODE,
+            DiffusionStageRole.DENOISE,
+            DiffusionStageRole.DECODE,
+        ),
+        default_request_operator=DiffusionStageOperator.FORWARD,
+    ),
+    DiffusionStageRole.DENOISE_DECODE: _DiffusionStageRoleSpec(
+        components=(DiffusionStageRole.DENOISE, DiffusionStageRole.DECODE),
+        default_request_operator=DiffusionStageOperator.DIFFUSE_DECODE,
+    ),
+}
+
+
+def _expand_role_stages(role: DiffusionStageRole) -> frozenset[DiffusionStage]:
+    stages: set[DiffusionStage] = set()
+    for component in _ROLE_SPECS[role].components:
+        if isinstance(component, DiffusionStage):
+            stages.add(component)
+        else:
+            stages.update(_expand_role_stages(component))
+    return frozenset(stages)
+
+
+_ROLE_STAGES: dict[DiffusionStageRole, frozenset[DiffusionStage]] = {
+    role: _expand_role_stages(role) for role in DiffusionStageRole
+}
 
 # Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
 # a free-form string ("text_encode"/"dit") before roles existed; keep the map so

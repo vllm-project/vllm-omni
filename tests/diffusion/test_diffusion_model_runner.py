@@ -11,6 +11,7 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.stage_config import DiffusionStageOperator, DiffusionStageRole
 from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
@@ -22,6 +23,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.models.stage_mixin import DiffusionStageMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -137,6 +139,59 @@ class _FinalOnlyStepPipeline:
 
     def post_decode(self, state):
         return DiffusionOutput(output=state.latents.clone())
+
+
+class _DenoiseOnlyStagePipeline(DiffusionStageMixin):
+    device = torch.device("cpu")
+
+    def __init__(self, role=DiffusionStageRole.DENOISE):
+        self.stage_role = role
+        self.operators = []
+        self.initialize_stage_execution(step_execution=True)
+
+    def run_stage(self, payload, *, operator=None, **kwargs):
+        self.operators.append(operator)
+        return super().run_stage(payload, operator=operator, **kwargs)
+
+    def prepare_denoise(self, state):
+        state.prompt_embeds = torch.zeros(1, 1, 1)
+        state.latents = torch.zeros(1, 1)
+        state.timesteps = torch.tensor([1.0])
+        return state
+
+    def denoise_step(self, input_batch, *, states):
+        del states
+        return torch.ones_like(input_batch.latents)
+
+    def step_scheduler(self, state, noise_pred):
+        state.latents = noise_pred
+        state.step_index += 1
+
+
+class _DecodedStagePipeline(_DenoiseOnlyStagePipeline):
+    def prepare_encode(self, state):
+        return self.prepare_denoise(state)
+
+    def post_decode(self, state):
+        return DiffusionOutput(output=state.latents + 1)
+
+
+class _AtomicStagePipeline(DiffusionStageMixin):
+    supports_request_batch = True
+    device = torch.device("cpu")
+
+    def __init__(self, role, *, step_execution=True):
+        self.stage_role = role
+        self.calls = []
+        self.initialize_stage_execution(step_execution=step_execution)
+
+    def encode_batch(self, batch):
+        self.calls.append(("encode", batch.request_ids))
+        return [DiffusionOutput(custom_output={"prompt_embeds": torch.ones(1, 1)}) for _ in batch.requests]
+
+    def decode_batch(self, batch):
+        self.calls.append(("decode", batch.request_ids))
+        return [DiffusionOutput(output="decoded") for _ in batch.requests]
 
 
 class _CompileTrackingModel:
@@ -623,6 +678,188 @@ def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypa
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    "role",
+    [
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DENOISE_DECODE,
+        DiffusionStageRole.FULL,
+    ],
+)
+def test_execute_stepwise_uses_validated_stage_operators(monkeypatch, role):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    pipeline_type = _DenoiseOnlyStagePipeline if role is DiffusionStageRole.DENOISE else _DecodedStagePipeline
+    runner.pipeline = pipeline_type(role)
+    runner.od_config.step_execution = True
+    request = OmniDiffusionRequest(
+        prompt="a prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="stage-request",
+    )
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    assert runner._supports_step_mode()
+    if role is DiffusionStageRole.DENOISE:
+        assert not hasattr(runner.pipeline, "post_decode")
+    result = runner.execute_stepwise(scheduler_output).get_request_output(request.request_id)
+
+    assert runner.pipeline.operators == [
+        DiffusionStageOperator.STEP_PREPARE,
+        DiffusionStageOperator.DENOISE_STEP,
+        DiffusionStageOperator.STEP_SCHEDULER,
+        DiffusionStageOperator.STEP_FINALIZE,
+    ]
+    assert result.finished is True
+    if role is DiffusionStageRole.DENOISE:
+        assert torch.equal(result.result.custom_output["latents"], torch.ones(1, 1))
+        assert result.result.output is None
+    else:
+        assert torch.equal(result.result.output, torch.full((1, 1), 2.0))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("role", [DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE])
+def test_execute_stepwise_uses_atomic_stage_capability(monkeypatch, role):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _AtomicStagePipeline(role)
+    runner.od_config.step_execution = True
+    request = OmniDiffusionRequest(
+        prompt="a prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="atomic-request",
+    )
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    second = OmniDiffusionRequest(
+        prompt="another", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1), request_id="atomic-second"
+    )
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=r.request_id, req=r) for r in (request, second)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    assert runner._supports_step_mode()
+    assert runner.pipeline.stage_uses_step_execution is False
+    result = runner.execute_stepwise(scheduler_output).get_request_output(request.request_id)
+
+    assert runner.pipeline.calls == [(role.value, [request.request_id, second.request_id])]
+    assert result.finished is True
+    assert result.step_index == 0
+    assert result.result.error is None
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("role", [DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE])
+def test_atomic_step_stage_shared_failure_is_terminal_for_every_batch_member(monkeypatch, role):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _AtomicStagePipeline(role)
+    operation = "encode_batch" if role is DiffusionStageRole.ENCODE else "decode_batch"
+    monkeypatch.setattr(runner.pipeline, operation, Mock(side_effect=ValueError("bad batch member")))
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=_make_scheduler_output(2).scheduled_new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+
+    output = runner._execute_atomic_step_stage(scheduled)
+
+    assert [item.request_id for item in output.runner_outputs] == ["req-0", "req-1"]
+    for item in output.runner_outputs:
+        assert item.finished is True
+        assert item.step_index == 0
+        assert item.result.error == "bad batch member"
+    getattr(runner.pipeline, operation).assert_called_once()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("role", [DiffusionStageRole.ENCODE, DiffusionStageRole.DECODE])
+@pytest.mark.parametrize("execution_fails", [False, True])
+def test_atomic_step_stage_forwards_each_requests_kv_metadata(monkeypatch, role, execution_fails):
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _AtomicStagePipeline(role)
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    metadata = [DiffusionKVMetadata(request_id=f"req-{i}", allocation_generation=i + 1, sequences=()) for i in range(2)]
+    requests = [
+        OmniDiffusionRequest(request_id=m.request_id, prompt="prompt", sampling_params=OmniDiffusionSamplingParams())
+        for m in metadata
+    ]
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[
+            NewRequestData(request_id=r.request_id, req=r, diffusion_kv_metadata=m) for r, m in zip(requests, metadata)
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+    install = Mock()
+    remove = Mock()
+    execute = Mock(
+        return_value=BatchRunnerOutput.from_list(
+            [RunnerOutput(request_id=r.request_id, result=DiffusionOutput()) for r in requests]
+        )
+    )
+    if execution_fails:
+        execute.side_effect = ValueError("shared forward failed")
+    monkeypatch.setattr(runner, "install_diffusion_kv_metadata", install)
+    monkeypatch.setattr(runner, "remove_diffusion_kv_requests", remove)
+    monkeypatch.setattr(runner, "_execute_request_list", execute)
+
+    result = runner._execute_atomic_step_stage(scheduled)
+
+    assert [call.args[0] for call in install.call_args_list] == metadata
+    assert execute.call_args.args[0] == requests
+    assert execute.call_args.kwargs["diffusion_kv_metadata"] == metadata
+    remove.assert_called_once_with([r.request_id for r in requests])
+    assert all(item.finished for item in result.runner_outputs)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_step_mode_rejects_uninitialized_or_request_only_mixin_contract():
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.step_execution = True
+    runner.pipeline = object.__new__(_DenoiseOnlyStagePipeline)
+    assert not runner._supports_step_mode()
+
+    runner.pipeline = _AtomicStagePipeline(DiffusionStageRole.ENCODE, step_execution=False)
+    assert not runner._supports_step_mode()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     """Step streaming returns empty step results until a chunk decode boundary."""
     chunks = [
@@ -972,6 +1209,23 @@ class _BatchPipeline:
         return list(self._outputs)
 
 
+class _SeparatedPipeline(DiffusionStageMixin):
+    supports_request_batch = True
+    _stage_operator_methods = {DiffusionStageOperator.DIFFUSE_DECODE: "forward"}
+
+    def __init__(self, stage_role):
+        self.stage_role = stage_role
+        self.batches = []
+
+    def forward(self, batch):
+        self.batches.append(batch.request_ids)
+        return [DiffusionOutput(custom_output={"request_id": request_id}) for request_id in batch.request_ids]
+
+    encode_batch = forward
+    diffuse_batch = forward
+    decode_batch = forward
+
+
 class _SingleRequestPipeline:
     def forward(self, batch):
         del batch
@@ -1046,6 +1300,35 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     assert result.runner_outputs[0].result.output == "a"
     assert result.runner_outputs[1].request_id == "req-1"
     assert result.runner_outputs[1].result.output == "b"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "stage_role",
+    [
+        DiffusionStageRole.ENCODE,
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DENOISE_DECODE,
+        DiffusionStageRole.DECODE,
+    ],
+)
+def test_execute_model_batch_preserves_separated_stage_request_batch(monkeypatch, stage_role):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    pipeline = _SeparatedPipeline(stage_role)
+    runner = _make_batch_runner(pipeline)
+    runner._kv_prefetch_enabled = False
+    sched = _make_scheduler_output(num_reqs=2)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+    assert pipeline.batches == [["req-0", "req-1"]]
+    assert [runner_output.request_id for runner_output in result.runner_outputs] == ["req-0", "req-1"]
+    assert [runner_output.result.custom_output["request_id"] for runner_output in result.runner_outputs] == [
+        "req-0",
+        "req-1",
+    ]
 
 
 @pytest.mark.core_model

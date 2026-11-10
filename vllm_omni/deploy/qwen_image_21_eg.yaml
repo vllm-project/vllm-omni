@@ -1,0 +1,34 @@
+# Qwen-Image 2.1 Encode/Generation deployment on two devices.
+# E: Qwen3-VL + VAE encoder. G: DiT + VAE decoder.
+# Select with --deploy-config vllm_omni/deploy/qwen_image_21_eg.yaml.
+# Template: shipped settings have not been smoke-tested; see the model recipe.
+pipeline: qwen_image_21_eg
+async_chunk: false
+
+trust_remote_code: false
+distributed_executor_backend: mp
+
+connectors:
+  qwen_image_21_encode_connector:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    output_connectors:
+      to_stage_1: qwen_image_21_encode_connector
+    default_sampling_params:
+      seed: 42
+
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    enforce_eager: true
+    tensor_parallel_size: 1
+    input_connectors:
+      from_stage_0: qwen_image_21_encode_connector
+    default_sampling_params:
+      seed: 42

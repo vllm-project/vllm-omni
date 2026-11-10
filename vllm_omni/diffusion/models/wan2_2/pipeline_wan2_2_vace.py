@@ -23,6 +23,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -205,6 +206,17 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
+        stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        if stage_role is not DiffusionStageRole.FULL:
+            raise ValueError(
+                "Wan22VACEPipeline currently supports only the FULL diffusion stage; "
+                f"role {stage_role.value!r} has no VACE stage adapter."
+            )
+        if getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False):
+            raise ValueError("Wan22VACEPipeline does not support step execution or streaming output.")
         # VACE defaults to flow_shift=3.0 for 480p (base WAN T2V uses 5.0 for 720p)
         if od_config.flow_shift is None:
             # Preserve runtime-only config provenance (including compact

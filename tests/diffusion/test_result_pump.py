@@ -374,6 +374,68 @@ class TestBatchSplitDelivery:
         assert executor._batch_split_map == {}
         assert executor._completed_outputs == {}
 
+    def test_output_ready_during_unpack_is_split_after_map_registration(self, mocker):
+        """The pump must re-check the split map after SHM unpack.
+
+        ``execute_batch`` can register the map while the result pump is
+        unpacking the worker's batch output. The old ordering claimed the map
+        first, then cached the whole batch and left every per-request waiter
+        pending.
+        """
+        executor = _make_executor()
+        req_ids = ["r0", "r1"]
+        batch_id = "batch-unpack-race"
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+        unpack_started = threading.Event()
+        release_unpack = threading.Event()
+
+        def blocked_unpack(_output):
+            unpack_started.set()
+            assert release_unpack.wait(timeout=2.0)
+
+        mocker.patch(
+            "vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm",
+            side_effect=blocked_unpack,
+        )
+        messages = queue.Queue()
+
+        def dequeue(timeout=None):
+            try:
+                return messages.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError from exc
+
+        executor._result_mq.dequeue = dequeue
+        pump = threading.Thread(target=executor._result_pump, args=(executor._result_mq,), daemon=True)
+        pump.start()
+        messages.put(ready)
+        assert unpack_started.wait(timeout=1.0)
+
+        executor.od_config.parallel_config.data_parallel_size = 1
+        executor.od_config.enable_distributed_layerwise_offload = False
+        executor._ensure_open = lambda: None
+        executor.collective_rpc = lambda *args, **kwargs: AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE,
+            rpc_id="1",
+            async_output_id=batch_id,
+        )
+        executor.execute_batch(_make_scheduler_output(req_ids))
+        release_unpack.set()
+        try:
+            for rid in req_ids:
+                fut = executor.wait_output_ready(f"{batch_id}/{rid}")
+                assert fut.result(timeout=1.0) is outputs[rid]
+        finally:
+            executor._pump_stop.set()
+            pump.join(timeout=2.0)
+        assert executor._batch_split_map == {}
+        assert executor._completed_outputs == {}
+
     def test_engine_waiter_before_output_is_resolved(self):
         """Consumers already blocked in wait_output_ready must be woken."""
         executor = _make_executor()
@@ -386,6 +448,29 @@ class TestBatchSplitDelivery:
         for rid in req_ids:
             assert futures[rid].done(), f"request {rid} never resolved"
             assert futures[rid].result(timeout=1.0) is outputs[rid]
+
+
+@pytest.mark.parametrize("wait_before_delivery", [False, True])
+def test_registered_batch_unpack_failure_reaches_every_request(mocker, wait_before_delivery):
+    executor = _make_executor()
+    batch_id = "broken-shm"
+    per_req_map = {f"{batch_id}/{rid}": rid for rid in ("r0", "r1")}
+    executor._batch_split_map[batch_id] = per_req_map
+    waiters = {key: executor.wait_output_ready(key) for key in per_req_map} if wait_before_delivery else {}
+    output = mocker.Mock()
+    mocker.patch.object(executor_module, "unpack_diffusion_output_shm", side_effect=ValueError("corrupt SHM"))
+
+    _feed_one_msg_to_pump(
+        executor,
+        AsyncDiffusionOutput(kind=AsyncOutputKind.OUTPUT_READY, async_output_id=batch_id, output=output),
+    )
+
+    for key in per_req_map:
+        result = (waiters[key] if wait_before_delivery else executor.wait_output_ready(key)).result(timeout=1)
+        assert result.error == "corrupt SHM"
+    output.get_request_output.assert_not_called()
+    assert executor._batch_split_map == {}
+    assert executor._completed_outputs == {}
 
 
 class TestShutdownCleansUpFutures:
