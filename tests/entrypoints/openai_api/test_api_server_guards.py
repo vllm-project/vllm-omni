@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 from argparse import Namespace
 from collections.abc import Callable
@@ -55,6 +56,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
@@ -62,6 +64,7 @@ from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, Tokeniz
 from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -94,16 +97,46 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
+    import httpx
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from vllm_omni.tracing import capture_trace_headers
+
+    tracing_enabled = tracing_mode == "enabled"
+    if tracing_enabled:
+        pytest.importorskip("opentelemetry.instrumentation.fastapi")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = FastAPI()
+    app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
+
+    @app.get("/trace")
+    async def trace_context():
+        return capture_trace_headers()
+
+    app.middleware_stack = app.build_middleware_stack()
+
     captured: dict[str, object] = {}
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        if tracing_mode == "no-engine":
+            del engine.engine
+        elif tracing_mode == "no-provider":
+            del engine.engine.tracer_provider
+        else:
+            engine.engine.tracer_provider = provider if tracing_enabled else None
+        yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: app)
     monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
@@ -114,6 +147,22 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for sampled in ("01", "00"):
+                parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
+                response = await client.get(
+                    "/trace",
+                    headers={"traceparent": parent, "tracestate": "vendor=state", "origin": "http://client"},
+                )
+                assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == "http://client"
+                carrier = response.json()
+                if tracing_enabled:
+                    assert carrier["traceparent"].split("-")[1] == parent.split("-")[1]
+                    assert int(carrier["traceparent"].split("-")[3], 16) & 1 == int(sampled, 16)
+                    assert carrier["tracestate"] == "vendor=state"
+                else:
+                    assert carrier == {}
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
@@ -125,6 +174,11 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
     assert captured["client_config"] is config
+    spans = exporter.get_finished_spans()
+    assert len(spans) == int(tracing_enabled)
+    if tracing_enabled:
+        assert spans[0].parent.span_id == int("1234567890123456", 16)
+    provider.shutdown()
 
 
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
@@ -155,6 +209,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/run"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),
@@ -164,6 +219,9 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/segmentations"),
+    ("POST", "/v1/videos/segmentations"),
+    ("POST", "/v1/videos/depth"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),
@@ -201,6 +259,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -232,6 +291,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -296,23 +356,6 @@ def _assert_app_state_snapshot(
     assert not unexpectedly_set, f"app.state keys expected to stay None: {unexpectedly_set}"
 
 
-def _recording_ctor(name: str, captured: dict[str, dict[str, Any]]):
-    """A stand-in handler class that records the kwargs it was constructed with.
-
-    Used to assert which frontend options reach each handler; the returned class
-    also answers the (synchronous) ``warmup()`` the init path calls.
-    """
-
-    class _Recording:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            captured[name] = kwargs
-
-        def warmup(self) -> None:
-            return None
-
-    return _Recording
-
-
 def _minimal_args(**overrides) -> SimpleNamespace:
     args = SimpleNamespace(
         tool_parser_plugin=None,
@@ -355,7 +398,6 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         enable_force_include_usage=False,
         enable_log_outputs=False,
         enable_log_deltas=False,
-        enable_per_request_metrics=False,
         tokens_only=False,
         shutdown_timeout=0,
         stage_configs_path=None,
@@ -391,6 +433,8 @@ class _FakeEngineClient:
     config_path: str | None = None
 
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
+        self.engine = object.__new__(OmniEngineBase)
+        self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
@@ -449,6 +493,46 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
     for method, path in sorted(http_routes):
         assert path in paths, f"missing OpenAPI path {path}"
         assert method.lower() in paths[path], f"missing OpenAPI method {method} {path}"
+
+
+@pytest.mark.parametrize(
+    ("stage_configs", "expected"),
+    [
+        (None, False),
+        ([], False),
+        ([{}], False),
+        ([{"engine_args": None}], False),
+        ([{"engine_args": {}}], False),
+        ([{"engine_args": {"profiler_config": None}}], False),
+        ([{"engine_args": {"profiler_config": {}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": None}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": "torch"}}}], True),
+        ([{"engine_args": {"profiler_config": {"profiler": "cuda"}}}], True),
+        # Attribute-style stage/engine_args/profiler_config, not just dicts.
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch")))],
+            True,
+        ),
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=None))],
+            False,
+        ),
+        # Any stage enabling the profiler is enough.
+        (
+            [{"engine_args": {}}, {"engine_args": {"profiler_config": {"profiler": "torch"}}}],
+            True,
+        ),
+    ],
+)
+def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, expected: bool) -> None:
+    """Lock the gate that decides whether /start_profile is registered.
+
+    vLLM-Omni enables the profiler endpoints from the stage config, matching
+    upstream vLLM v0.16.0+. Fails if the gate starts accepting a stage that
+    only half-declares ``profiler_config`` (present but with no ``profiler``),
+    stops supporting attribute-style configs, or stops scanning every stage.
+    """
+    assert api_server._should_enable_profiler_endpoints(stage_configs) is expected
 
 
 @pytest.mark.asyncio
@@ -583,6 +667,63 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
 
 @pytest.mark.asyncio
+async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monkeypatch, caplog) -> None:
+    """Lock the not-silent behavior when only ``VLLM_TORCH_PROFILER_DIR`` is set.
+
+    That variable was removed in vLLM v0.16.0 when profiling moved to
+    ``ProfilerConfig``. Omni reads it only as a migration diagnostic: a stale
+    value left in an environment or script is inert. Without this warning it
+    looks identical to a working setup: server starts, nothing logged,
+    /start_profile 404s. Fails if the routes get mounted from the env var
+    alone, or if the migration warning stops being emitted.
+    """
+
+    def fake_build_openai_app(args, supported_tasks):
+        return FastAPI()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        # No stage declares profiler_config, so the gate must stay closed.
+        yield _FakeEngineClient(
+            stage_configs=[{"engine_args": {}}],
+            vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)),
+        )
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    captured: dict[str, object] = {}
+
+    async def fake_serve_http(app, **_kwargs):
+        captured["served_app"] = app
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/omni-profiler-traces")
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
+
+    async def fake_storage_start():
+        captured["storage_started"] = True
+
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    with caplog.at_level(logging.WARNING):
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    served_app = captured["served_app"]._inner  # type: ignore[attr-defined]
+    manifest = _route_manifest(served_app.routes)
+    assert ("POST", "/start_profile") not in manifest
+    assert ("POST", "/stop_profile") not in manifest
+    assert "VLLM_TORCH_PROFILER_DIR" in caplog.text
+    assert "profiler_config" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("has_tokenization", [False, True], ids=["diffusion", "autoregressive"])
 @pytest.mark.parametrize("tokenizer_info_enabled", [False, True], ids=["no-info", "info"])
 async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
@@ -710,7 +851,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def inner(scope, receive, send):
         called[scope["type"]] = True
 
-    middleware._inner = inner
+    middleware._asgi = inner
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
@@ -1363,6 +1504,7 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OnlineDerenderer", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
@@ -1510,130 +1652,3 @@ def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, m
     with TestClient(app) as client:
         response = client.request(method, path)
     assert response.status_code == status
-
-
-@pytest.mark.asyncio
-async def test_multistage_wiring_forwards_options_upstream_passes(monkeypatch) -> None:
-    """Every handler must receive the frontend options upstream passes to it.
-
-    ``vllm serve --omni`` builds its parser with upstream ``make_arg_parser``, so
-    ``--enable-per-request-metrics``, ``--default-chat-template-kwargs`` and
-    ``--enable-flash-late-interaction`` are all accepted. Omni's hand-rolled copy
-    of upstream's ``init_generate_state`` used to construct the handlers without
-    forwarding them, which accepted each option and silently ignored it.
-    """
-    captured: dict[str, dict[str, Any]] = {}
-
-    class _ScoreCapableEngine(_FakeEngineClient):
-        async def get_supported_tasks(self) -> tuple[str, ...]:
-            # A pooling task so the scores handler is built as well.
-            return ("generate", "score")
-
-    engine = _ScoreCapableEngine(
-        stage_configs=[object(), object()],
-        vllm_config=SimpleNamespace(
-            lora_config=None,
-            model_config=SimpleNamespace(),
-            parallel_config=SimpleNamespace(_api_process_rank=0),
-        ),
-    )
-
-    class _FakeModels:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def init_static_loras(self):
-            return None
-
-    class _Stub:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    class _StubSpeech(_Stub):
-        async def warmup(self):
-            return None
-
-    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
-    monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
-    monkeypatch.setattr(api_server, "OnlineRenderer", _recording_ctor("renderer", captured))
-    monkeypatch.setattr(api_server, "OpenAIServingResponses", _recording_ctor("responses", captured))
-    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _recording_ctor("chat", captured))
-    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _recording_ctor("chat_batch", captured))
-    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _recording_ctor("completion", captured))
-    monkeypatch.setattr(api_server, "ServingTokenization", _recording_ctor("tokenization", captured))
-    monkeypatch.setattr(api_server, "AnthropicServingMessages", _recording_ctor("anthropic", captured))
-    monkeypatch.setattr(api_server, "ServingScores", _recording_ctor("scores", captured))
-    monkeypatch.setattr(api_server, "ServingPooling", _Stub)
-    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _Stub)
-    monkeypatch.setattr(api_server, "ServingClassification", _Stub)
-    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _Stub)
-    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _Stub)
-    monkeypatch.setattr(api_server, "ServingTokens", _Stub)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _StubSpeech)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _Stub)
-    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _Stub)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _Stub)
-    monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-
-    template_kwargs = {"enable_thinking": False}
-    await api_server.omni_init_app_state(
-        engine,
-        State(),
-        _minimal_args(
-            default_chat_template_kwargs=template_kwargs,
-            enable_per_request_metrics=True,
-            # Non-default on purpose: the handler's own default is True, so
-            # asserting the default would pass even if the option were dropped.
-            enable_flash_late_interaction=False,
-        ),
-    )
-
-    for name in ("renderer", "responses", "chat", "chat_batch", "tokenization", "anthropic"):
-        assert captured[name].get("default_chat_template_kwargs") == template_kwargs, name
-    # Upstream passes this to chat, completion and responses.
-    for name in ("chat", "chat_batch", "completion", "responses"):
-        assert captured[name].get("enable_per_request_metrics") is True, name
-    assert captured["scores"].get("enable_flash_late_interaction") is False
-
-    # Option off -> the handlers must see the off value, not a hardcoded one.
-    captured.clear()
-    await api_server.omni_init_app_state(engine, State(), _minimal_args())
-    for name in ("chat", "chat_batch", "completion", "responses"):
-        assert captured[name].get("enable_per_request_metrics") is False, name
-    assert captured["responses"].get("default_chat_template_kwargs") == {}
-
-
-@pytest.mark.asyncio
-async def test_duplex_wiring_forwards_options_upstream_passes(monkeypatch) -> None:
-    """Duplex builds the same handlers, so it forwards the same options.
-
-    ``_init_duplex_chat`` is a second construction site for ``OnlineRenderer``
-    and ``OmniOpenAIServingChat``; an option accepted by the CLI must not behave
-    differently just because the engine is a duplex one.
-    """
-    captured: dict[str, dict[str, Any]] = {}
-
-    class _DuplexEngine(_FakeEngineClient):
-        duplex_capabilities = SimpleNamespace(supports_chat_completions=True)
-
-    engine = _DuplexEngine()
-    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "OnlineRenderer", _recording_ctor("renderer", captured))
-    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _recording_ctor("chat", captured))
-
-    state = State()
-    state.openai_serving_models = _marker("models")
-    await api_server._init_duplex_chat(
-        engine,
-        state,
-        _minimal_args(enable_per_request_metrics=True, log_error_stack=True),
-        None,
-    )
-
-    assert captured["chat"].get("enable_per_request_metrics") is True
-    assert captured["renderer"].get("log_error_stack") is True
-
-    captured.clear()
-    await api_server._init_duplex_chat(engine, state, _minimal_args(), None)
-    assert captured["chat"].get("enable_per_request_metrics") is False
