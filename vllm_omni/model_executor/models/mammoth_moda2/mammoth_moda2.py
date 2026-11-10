@@ -86,7 +86,9 @@ def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
     deploy YAML / ``--compilation-config`` JSON, so user-facing remediation is
     V1 ``MammothGPUARModelRunner`` or a cudagraph mode without FULL.
     """
-    compilation_config = vllm_config.compilation_config
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return
     cg_mode = getattr(compilation_config, "cudagraph_mode", None)
     if cg_mode is None or not cg_mode.has_mode(CUDAGraphMode.FULL):
         return

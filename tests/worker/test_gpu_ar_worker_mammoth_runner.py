@@ -82,6 +82,11 @@ def test_enable_moe_routing_specialize_respects_explicit_false():
     assert compilation_config.cudagraph_specialize_moe_routing is False
 
 
+def test_enable_moe_routing_specialize_noop_without_compilation_config():
+    # Lightweight AR unit stubs may omit compilation_config on VllmConfig.
+    _enable_moe_routing_cudagraph_specialize(SimpleNamespace())
+
+
 def test_ensure_moe_specialty_compatible_raises_for_non_mammoth_after_flag_set():
     """Flag is normally set during model ``__init__`` inside ``load_model``."""
     runner = object.__new__(OmniGPUModelRunner)
