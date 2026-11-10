@@ -9,6 +9,7 @@ this module re-exports them for backward-compatible imports.
 
 import ctypes
 import errno
+import io
 import os
 import socket
 import subprocess
@@ -205,8 +206,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        self._server_log_path: Path | None = None
-        self._server_log_file: Any | None = None
+        self._server_log = io.StringIO()
+        self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -275,16 +276,31 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Capture child stdout/stderr so early-exit errors include a traceback.
-        self._server_log_path = Path(tempfile.gettempdir()) / f"omni_server_{self.port}.log"
-        self._server_log_file = open(self._server_log_path, "w", buffering=1)  # noqa: SIM115
+        # Pipe child output into memory so early-exit RuntimeErrors can include
+        # the traceback without writing a temp file (and without PIPE deadlock).
+        self._server_log = io.StringIO()
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
-            stdout=self._server_log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
+        assert self.proc.stdout is not None
+        log_buf = self._server_log
+        stdout = self.proc.stdout
+
+        def _drain_stdout() -> None:
+            try:
+                for line in stdout:
+                    log_buf.write(line)
+            except Exception:
+                pass
+
+        self._server_log_thread = threading.Thread(target=_drain_stdout, name="omni-server-log", daemon=True)
+        self._server_log_thread.start()
 
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
@@ -454,20 +470,14 @@ class OmniServer:
             pass
 
     def _server_log_tail(self, lines: int = 60) -> str:
-        log_path = self._server_log_path
-        if log_path is None or not log_path.exists():
+        if self._server_log_thread is not None:
+            self._server_log_thread.join(timeout=2)
+        content = self._server_log.getvalue().splitlines(keepends=True)
+        if not content:
             return ""
-        try:
-            # Flush the live Popen handle before reading the same path.
-            if self._server_log_file is not None:
-                self._server_log_file.flush()
-            with open(log_path, encoding="utf-8", errors="replace") as f:
-                content = f.readlines()
-            return f"\n=== Last {lines} lines of OmniServer log ({log_path}) ===\n" + (
-                "".join(content[-lines:]) or "<empty>"
-            )
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            return f"\n<failed to read OmniServer log {log_path}: {exc}>"
+        return "\n=== Last {} lines of OmniServer log ===\n{}".format(
+            lines, "".join(content[-lines:]) or "<empty>"
+        )
 
     def __enter__(self):
         try:
@@ -484,12 +494,14 @@ class OmniServer:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
-            if self._server_log_file is not None:
+            if self.proc is not None and self.proc.stdout is not None:
                 try:
-                    self._server_log_file.close()
+                    self.proc.stdout.close()
                 except Exception:
                     pass
-                self._server_log_file = None
+            if self._server_log_thread is not None:
+                self._server_log_thread.join(timeout=2)
+                self._server_log_thread = None
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
