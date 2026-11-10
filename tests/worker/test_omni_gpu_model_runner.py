@@ -28,7 +28,8 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids() -> None:
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids(dtype) -> None:
     """The model-side A2 adapter maps verifier IDs to Thinker embeddings."""
     from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
         Qwen3OmniMoeForConditionalGeneration,
@@ -37,10 +38,14 @@ def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids() -> No
     class _Thinker(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.arange(12, dtype=torch.float32).reshape(6, 2))
+            self.language_model = torch.nn.Module()
+            self.language_model.model = torch.nn.Module()
+            self.language_model.model.embed_tokens = torch.nn.Embedding(6, 2, dtype=dtype)
+            with torch.no_grad():
+                self.language_model.model.embed_tokens.weight.copy_(torch.arange(12).reshape(6, 2))
 
         def embed_input_ids(self, *, input_ids):
-            return self.weight[input_ids]
+            return self.language_model.model.embed_tokens(input_ids)
 
     model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
     torch.nn.Module.__init__(model)
@@ -50,7 +55,12 @@ def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids() -> No
 
     rows = model.materialize_thinker_token_embeddings([4, -1, 1])
     assert torch.equal(rows, torch.tensor([[8.0, 9.0], [2.0, 3.0]]))
-    assert model.materialize_thinker_token_embeddings([]).shape == (0, 2)
+    for token_ids in ([], [-1]):
+        empty = model.materialize_thinker_token_embeddings(token_ids)
+        assert empty.shape == (0, 2)
+        assert empty.dtype == rows.dtype == dtype
+        assert empty.device == rows.device
+        assert torch.cat([empty, rows]).dtype == dtype
 
 
 @pytest.mark.parametrize(

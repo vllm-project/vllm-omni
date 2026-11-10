@@ -608,7 +608,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         device = self._module_device(self.thinker)
         hidden_size = int(self.thinker_config.text_config.hidden_size)
         if not ids:
-            return torch.empty((0, hidden_size), device=device, dtype=torch.bfloat16)
+            embedding_weight = self.thinker.language_model.model.embed_tokens.weight
+            return embedding_weight.new_empty((0, hidden_size))
 
         input_ids = torch.tensor(ids, dtype=torch.long, device=device).view(1, -1)
         values = self.thinker.embed_input_ids(input_ids=input_ids)
