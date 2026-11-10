@@ -189,7 +189,10 @@ class TestStateEvictionContract:
         assert cfg.enable_batched_cfm is True
         assert cfg.enable_cfm_cuda_graph is False
         assert cfg.enable_cfm_prealloc_output is False
-        assert cfg.enable_batched_vae_decode is False
+        # The legacy batched VAE decoder is resolved by the talker against the
+        # actual graph condition and the delayed-copy incompatibility, so the
+        # config keeps the configured value (see the talker wiring tests).
+        assert cfg.enable_batched_vae_decode is True
         assert cfg.enable_delayed_audio_copy is True
 
     @pytest.mark.cpu

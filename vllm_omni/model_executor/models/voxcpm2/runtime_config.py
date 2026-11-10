@@ -128,14 +128,6 @@ class _VoxCPM2RuntimeConfig:
             # Incremental unified graphs batch VAE themselves; this flag only
             # controls the legacy latent-cohort collection path.
             cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
-        if cfg.enable_batched_vae_decode and (
-            cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
-        ):
-            logger.warning(
-                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
-                "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
-            )
-            cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
         if cfg.enable_unified_decode_graph:
             if cfg.enable_cfm_cuda_graph:
                 logger.info("VoxCPM2 unified decode graph supersedes independent CFM CUDA Graph; disabling it.")
