@@ -823,3 +823,34 @@ def test_rmsnorm_fused_native_parity_custom_weight():
         out_native = norm.forward_native(x)
 
         torch.testing.assert_close(out_fused, out_native, atol=atol_map[dtype], rtol=rtol_map[dtype])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rmsnorm_hip_avoids_precompiled_cuda_kernel(
+    mocker: MockerFixture, dtype: torch.dtype, with_residual: bool
+) -> None:
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    cuda_forward = mocker.patch.object(RMSNorm, "forward_cuda", side_effect=AssertionError("unsupported fused kernel"))
+    norm = RMSNorm(128, eps=1e-5, dtype=dtype)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.5, 1.5, 128, dtype=dtype))
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(2, 3, 128, generator=generator, dtype=dtype)
+    residual = torch.randn(2, 3, 128, generator=generator, dtype=dtype) if with_residual else None
+    combined = x + residual if residual is not None else x
+    expected = torch.nn.functional.rms_norm(combined.float(), (128,), norm.weight.float(), norm.variance_epsilon).to(
+        dtype
+    )
+
+    result = norm.forward_hip(x, residual)
+    cuda_forward.assert_not_called()
+    if residual is not None:
+        output, updated_residual = result
+        torch.testing.assert_close(updated_residual, combined)
+    else:
+        output = result
+    torch.testing.assert_close(output, expected)
+    assert output.dtype == dtype

@@ -111,6 +111,15 @@ class RMSNorm(CustomOp):
         except Exception:
             return self.forward_native(x)
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Select the reference before launching a potentially incompatible
+        # prebuilt kernel: an invalid HIP image can poison later operations.
+        return self.forward_native(x, residual)
+
     def forward_musa(
         self,
         x: torch.Tensor,

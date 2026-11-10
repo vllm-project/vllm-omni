@@ -31,6 +31,10 @@ class SiluAndMul(CustomOp):
         self.op(out, x)
         return out
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # Avoid requiring a compatible prebuilt vLLM activation kernel on HIP.
+        return self.forward_native(x)
+
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type != "npu":
             return self.forward_native(x)

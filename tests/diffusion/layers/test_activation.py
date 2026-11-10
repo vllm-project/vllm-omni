@@ -48,3 +48,18 @@ def test_silu_and_mul_npu_matches_packed_reference(dtype: torch.dtype) -> None:
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_silu_and_mul_hip_avoids_precompiled_cuda_kernel(monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype) -> None:
+    def unsupported_cuda(self: SiluAndMul, x: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("unsupported fused kernel")
+
+    monkeypatch.setattr(SiluAndMul, "forward_cuda", unsupported_cuda)
+    packed = torch.randn(17, 256, generator=torch.Generator().manual_seed(42), dtype=dtype)
+    gate, up = packed.chunk(2, dim=-1)
+
+    output = SiluAndMul().forward_hip(packed)
+    torch.testing.assert_close(output, F.silu(gate) * up)
+    assert output.dtype == dtype

@@ -127,6 +127,14 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=9,
+        final_output_type="image",
+        attention_mask_free=True,
+    ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
     "TaoMateH3Pipeline": DiffusionModelMetadata(
