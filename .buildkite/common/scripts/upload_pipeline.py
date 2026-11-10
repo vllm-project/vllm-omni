@@ -672,7 +672,7 @@ def _shard_timings() -> dict[str, float] | None:
     _ensure_shard_timings_env()
     raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
     timings = load_shard_timings()
-    if raw and timings is None and getattr(_shard_timings, "warned", None) != raw:
+    if raw and timings is None and not Path(raw).is_file() and getattr(_shard_timings, "warned", None) != raw:
         _shard_timings.warned = raw  # type: ignore[attr-defined]
         _log(f"automatic-shard: {raw!r} is not a file; steps stay 1 job")
     return timings

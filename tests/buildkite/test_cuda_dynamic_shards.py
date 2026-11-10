@@ -27,6 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 import pytest_file_timings  # noqa: E402
 import upload_pipeline as upload_pipeline_mod  # noqa: E402
 from merge_shard_timings import (  # noqa: E402
+    HISTORY_LOOKUP_BUDGET_SECONDS,
+    MAX_CONSECUTIVE_MISSES,
     build_step_observations,
     list_recent_build_ids,
     merge_build_observations,
@@ -34,6 +36,8 @@ from merge_shard_timings import (  # noqa: E402
     merge_step_observations,
     observations_from_download,
     percentile,
+    prepare_profile_from_history,
+    timeout_floors_from_builds,
     write_merged_profile,
 )
 from runtime_shard import PLUGIN_MODULE, _inject_plugin, plan_shard_count  # noqa: E402
@@ -338,6 +342,104 @@ def test_ready_history_excludes_main_passed_builds(monkeypatch: pytest.MonkeyPat
     assert list_recent_build_ids(branch="", limit=20, exclude_branches={"main"}, fetch=fetch) == [("ready-pr", "1")]
 
 
+def test_api_history_follows_the_next_page_after_excluded_main_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
+    monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
+    monkeypatch.setenv("BUILDKITE_API_TOKEN", "token")
+    first = "https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-omni/builds?state=passed&per_page=100"
+    second = "https://api.example/builds?page=2"
+    pages = {
+        first: (
+            json.dumps(
+                [
+                    {"id": f"main-{index}", "number": 50 - index, "state": "passed", "branch": "main"}
+                    for index in range(3)
+                ]
+            ),
+            second,
+        ),
+        second: (
+            json.dumps([{"id": "ready-pr", "number": 1, "state": "passed", "branch": "ready-pr"}]),
+            None,
+        ),
+    }
+    seen: list[str] = []
+
+    def fetch(url: str, token: str | None = None) -> tuple[str, str | None]:
+        assert token == "token"
+        seen.append(url)
+        return pages[url]
+
+    assert list_recent_build_ids(branch="", limit=20, exclude_branches={"main"}, fetch=fetch) == [("ready-pr", "1")]
+    assert seen == [first, second]
+    assert "per_page=200" not in first
+
+
+def test_history_scan_stops_after_consecutive_misses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def list_ids(**_kwargs: object) -> list[tuple[str, str]]:
+        return [(f"id-{index}", str(index)) for index in range(MAX_CONSECUTIVE_MISSES + 15)]
+
+    def download(build_id: str, dest: Path, timeout: int = 180) -> None:
+        del dest, timeout
+        calls.append(build_id)
+
+    monkeypatch.setattr("merge_shard_timings.list_recent_build_ids", list_ids)
+    monkeypatch.setattr("merge_shard_timings.download_build_timings", download)
+    assert prepare_profile_from_history(tmp_path / "out.json", include_local=False) is None
+    assert len(calls) == MAX_CONSECUTIVE_MISSES
+
+
+def test_history_scan_keeps_going_when_a_hit_breaks_the_miss_streak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+    streak = MAX_CONSECUTIVE_MISSES - 1
+    ids = [f"miss-{index}" for index in range(streak)] + ["hit-a"]
+    ids += [f"miss-{index}" for index in range(streak, streak * 2)] + ["hit-b"]
+
+    def list_ids(**_kwargs: object) -> list[tuple[str, str]]:
+        return [(build_id, str(index)) for index, build_id in enumerate(ids)]
+
+    def download(build_id: str, dest: Path, timeout: int = 180) -> None:
+        del timeout
+        calls.append(build_id)
+        if not build_id.startswith("hit-"):
+            return
+        jobs = dest / "timings" / "jobs"
+        jobs.mkdir(parents=True)
+        (jobs / "job.json").write_text(
+            json.dumps({"job_id": build_id, "label": "Simple Test", "file_seconds": {"tests/a_test.py": 1}}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("merge_shard_timings.list_recent_build_ids", list_ids)
+    monkeypatch.setattr("merge_shard_timings.download_build_timings", download)
+    path = prepare_profile_from_history(tmp_path / "out.json", include_local=False)
+    assert path is not None
+    assert json.loads(path.read_text(encoding="utf-8"))["builds"] == 2
+    assert calls == ids
+
+
+def test_history_scan_stops_at_the_lookup_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+    ticks = iter([0.0, 0.0, float(HISTORY_LOOKUP_BUDGET_SECONDS)])
+
+    def list_ids(**_kwargs: object) -> list[tuple[str, str]]:
+        return [(f"id-{index}", str(index)) for index in range(30)]
+
+    def download(build_id: str, dest: Path, timeout: int = 180) -> None:
+        del dest, timeout
+        calls.append(build_id)
+
+    monkeypatch.setattr("merge_shard_timings.list_recent_build_ids", list_ids)
+    monkeypatch.setattr("merge_shard_timings.download_build_timings", download)
+    monkeypatch.setattr("merge_shard_timings.time.monotonic", lambda: next(ticks))
+    assert prepare_profile_from_history(tmp_path / "out.json", include_local=False) is None
+    assert calls == ["id-0"]
+
+
 def test_ready_plans_simple_test_from_non_main_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -367,7 +469,8 @@ def test_ready_plans_simple_test_from_non_main_history(
         seen_excluded = frozenset(exclude_branches)
         return [("ready-pr", "42")]
 
-    def download(build_id: str, dest: Path) -> list[Path]:
+    def download(build_id: str, dest: Path, timeout: int = 180) -> None:
+        del timeout
         assert build_id == "ready-pr"
         jobs = dest / "timings" / "jobs"
         jobs.mkdir(parents=True)
@@ -388,7 +491,6 @@ def test_ready_plans_simple_test_from_non_main_history(
             parallel_job=0,
             queue="l4-k8s",
         )
-        return []
 
     monkeypatch.setattr("merge_shard_timings.list_recent_build_ids", list_ids)
     monkeypatch.setattr("merge_shard_timings.download_build_timings", download)
@@ -463,6 +565,117 @@ def test_shard_flags_expand_to_numeric_argv(tmp_path: Path) -> None:
         assert "--num-shards=2" in argv, completed.stderr
         assert "--shard-id=1" in argv, completed.stderr
         assert "pytest_file_timings" in argv
+
+
+def _build(number: int, branch: str, jobs: list[dict]) -> dict:
+    return {"id": f"build-{number}", "number": number, "branch": branch, "jobs": jobs}
+
+
+def _job(name: str, state: str, *, total: int | None = None, queue: str = "", retried: bool = False) -> dict:
+    job: dict = {"type": "script", "name": name, "state": state, "retried": retried}
+    if total is not None:
+        job["parallel_group_total"] = total
+    if queue:
+        job["agent_query_rules"] = [f"queue={queue}"]
+    return job
+
+
+def test_timeout_adds_one_job_and_stops_at_the_cap() -> None:
+    floors, queues = timeout_floors_from_builds(
+        [
+            _build(1, "ready-pr", [_job("Simple Test", "timed_out", queue="l4-k8s")]),
+            _build(2, "ready-pr", [_job("Engine&Model Executor&Work Test · H100", "timed_out", total=2)]),
+            _build(3, "ready-pr", [_job("Entrypoints Test", "timed_out", total=4)]),
+        ]
+    )
+    assert floors["Simple Test"] == 2
+    assert floors["Engine&Model Executor&Work Test · H100"] == 3
+    assert floors["Entrypoints Test"] == 4
+    assert queues["Simple Test"] == "l4-k8s"
+
+
+def test_newer_pass_or_failure_does_not_keep_an_older_timeout() -> None:
+    passed, _queues = timeout_floors_from_builds(
+        [
+            _build(2, "ready-pr", [_job("Simple Test", "passed")]),
+            _build(1, "ready-pr", [_job("Simple Test", "timed_out")]),
+        ]
+    )
+    failed, _ignored = timeout_floors_from_builds(
+        [
+            _build(2, "ready-pr", [_job("Simple Test", "failed")]),
+            _build(1, "ready-pr", [_job("Simple Test", "timed_out")]),
+        ]
+    )
+    retried, _also_ignored = timeout_floors_from_builds(
+        [_build(3, "ready-pr", [_job("Simple Test", "timed_out", retried=True), _job("Simple Test", "passed")])]
+    )
+    assert passed == {}
+    assert failed == {}
+    assert retried == {}
+
+
+def test_timeout_floor_ignores_main_and_a_still_running_build() -> None:
+    floors, _queues = timeout_floors_from_builds(
+        [
+            _build(4, "main", [_job("Simple Test", "timed_out")]),
+            _build(3, "ready-pr", [_job("Simple Test", "running")]),
+            _build(2, "ready-pr", [_job("Simple Test · Shard 1/2", "timed_out", total=2, queue="l4-k8s")]),
+        ],
+        exclude_branches={"main"},
+    )
+    assert floors == {"Simple Test": 3}
+
+
+def test_timeout_floor_splits_without_a_passed_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "timings.json"
+    profile.write_text(
+        json.dumps(
+            {"steps": {}, "timeout_floors": {"Simple Test": 2}, "timeout_floor_queues": {"Simple Test": "l4-k8s"}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(profile))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files",
+        lambda command, root: ["tests/a_test.py"] if "tests/" in command else [],
+    )
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    assert step["parallelism"] == 2
+    assert NUM_SHARDS in "\n".join(step["commands"])
+
+
+def test_timeout_floor_recorded_on_another_queue_stays_one_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "timings.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "steps": {},
+                "timeout_floors": {"Simple Test": 3},
+                "timeout_floor_queues": {"Simple Test": "mithril-h100-pool"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(profile))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files",
+        lambda command, root: ["tests/a_test.py"] if "tests/" in command else [],
+    )
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if leaf.get("label") == "Simple Test")
+    assert "parallelism" not in step
 
 
 def test_simple_test_ignores_durations_recorded_by_another_step(

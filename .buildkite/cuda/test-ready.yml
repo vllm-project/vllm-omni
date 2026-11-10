@@ -3,10 +3,13 @@
 #
 # Directory sweeps set `automatic_shard: true`. The uploader reads a per-step
 # profile from the last 20 passed non-main builds of this pipeline
-# (or VLLM_OMNI_SHARD_TIMINGS). It uses that as a greedy estimate of how many
-# jobs fit `timeout_in_minutes`. pytest-shard then hashes collected tests, so
-# the bins are not packed by those measured files. No profile means one job:
-# a pool is not reserved up front. Enrolled steps always write
+# (or VLLM_OMNI_SHARD_TIMINGS). Those builds are other pull requests, so the
+# estimate includes whatever those pull requests changed. A step whose newest
+# job timed out starts one job higher next time, up to 4. The profile is a
+# greedy estimate of how many jobs fit `timeout_in_minutes`. pytest-shard
+# then hashes collected tests, so the bins are not packed by those measured
+# files. No profile and no newer timeout means one job: a pool is not reserved
+# up front. Enrolled steps always write
 # `timings/jobs/*.json`. A one-node process (the entrypoint VRAM workaround)
 # runs when BUILDKITE_PARALLEL_JOB is unset or 0.
 
@@ -19,8 +22,8 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      # One sweep of the four former directory jobs. Split only when measured
-      # durations show this step would pass timeout_in_minutes.
+      # One sweep of the four former directory jobs. Split when measured
+      # durations exceed timeout_in_minutes, or when the newest run timed out.
       - label: "Simple Test"
         timeout_in_minutes: 15
         automatic_shard: true
@@ -291,18 +294,3 @@ steps:
           - export VLLM_IMAGE_FETCH_TIMEOUT=60
           - pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
         mirror_hardwares: h100_1
-
-  - wait: ~
-    continue_on_failure: true
-
-  - label: ":stopwatch: Merge Shard Timings"
-    key: merge-shard-timings-ready
-    soft_fail: true
-    timeout_in_minutes: 10
-    commands:
-      - buildkite-agent artifact download "timings/jobs/*.json" . || true
-      - python3 .buildkite/common/scripts/merge_shard_timings.py --builds 20 --branch main --output timings/merged.json --upload
-    agents:
-      queue: medium_cpu_queue_premerge
-    artifact_paths:
-      - timings/merged.json
