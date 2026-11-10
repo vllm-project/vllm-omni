@@ -207,7 +207,7 @@ class OmniServer:
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
         # Bounded ring buffer of child stderr for early-exit diagnostics.
-        self._server_error_lines: deque[str] = deque(maxlen=60)
+        self._server_error_lines: deque[str] = deque(maxlen=100)
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -279,7 +279,7 @@ class OmniServer:
         startup_t0 = time.perf_counter()
         # Inherit stdout (INFO still shows in CI); capture stderr only for the
         # exited-before-ready RuntimeError message.
-        self._server_error_lines = deque(maxlen=60)
+        self._server_error_lines = deque(maxlen=100)
         self.proc = subprocess.Popen(
             cmd,
             env=env,
