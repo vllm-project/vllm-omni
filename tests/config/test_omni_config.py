@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from inspect import Parameter, signature
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -58,6 +59,7 @@ from vllm_omni.config.stage_config import (
     resolve_deploy_yaml,
     update_deploy_config_async_chunk_enabled,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -126,7 +128,7 @@ def _from_pipeline_key(
 
 
 @pytest.mark.parametrize("pending", [False, True])
-def test_pending_generation_capability_reaches_both_engine_config_paths(pending):
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
@@ -147,7 +149,7 @@ def test_pending_generation_capability_reaches_both_engine_config_paths(pending)
     legacy = merge_pipeline_deploy(pipeline, deploy)[0]
     assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
     structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
-    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model="test-model")
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model=str(tmp_path))
     assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
 
 
@@ -395,6 +397,60 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
     assert omni_config.pipeline_config.hf_config_predicate is pipeline.hf_config_predicate
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "minicpmo_4_5.yaml",
+        "minicpmo_4_5_turn.yaml",
+        "minicpmo_4_5_turn_mrv2.yaml",
+        "minicpmo_4_5_turn_mrv2_h200.yaml",
+    ],
+)
+@pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])
+def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch, tmp_path):
+    from vllm_omni import platforms
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    # Select CUDA before resolving a fresh deploy; the production merge applies its overlay once.
+    monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
+    monkeypatch.setattr(platforms.current_omni_platform, "device_type", "cuda")
+    cli = None
+    if cli_prefix is not None:
+        cli = {
+            cli_prefix + "kernel_config": {
+                "ir_op_priority": {"rms_norm": ["native"], "fused_add_rms_norm": ["native"]}
+            },
+            cli_prefix + "compilation_config": {
+                "custom_ops": ["none"],
+                "pass_config": {"enable_qk_norm_rope_fusion": False},
+            },
+        }
+    config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / filename), cli_overrides=cli)
+    # EngineArgs resolves model paths during construction. Keep this config-only
+    # test local instead of attempting to download a fictitious Hub repository.
+    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
+    resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
+
+    if cli_prefix is not None:
+        assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
+        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["native"]
+        assert resolved.compilation_config.custom_ops == ["none"]
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is False
+    elif filename == "minicpmo_4_5.yaml":
+        assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
+        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
+        assert resolved.compilation_config.custom_ops == ["none", "+silu_and_mul", "+rotary_embedding"]
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is True
+        assert resolved.compilation_config.pass_config.fuse_norm_quant is False
+        assert resolved.compilation_config.pass_config.fuse_act_quant is False
+    else:
+        defaults = OmniEngineArgs(model=str(tmp_path))
+        assert asdict(resolved.kernel_config) == asdict(defaults.kernel_config)
+        assert asdict(resolved.compilation_config) == asdict(defaults.compilation_config)
+
+
 def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
     assert not hasattr(StageDeployConfig, "model_config")
     assert not hasattr(StageDeployConfig, "parallel_config")
@@ -469,6 +525,16 @@ def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
 def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_overrides):
     with pytest.raises(ValueError, match=r"no structured config owner: enable_lora"):
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
+
+
+def test_from_pipeline_config_accepts_frontend_consumed_reasoning_parser():
+    """The API worker consumes --reasoning-parser, so stages must not claim it."""
+    omni_config = _from_pipeline_key(
+        "qwen3_omni_moe_thinker_only",
+        cli_overrides={"reasoning_parser": "qwen3"},
+    )
+
+    assert omni_config.stage_by_id(0) is not None
 
 
 @pytest.mark.parametrize(
@@ -562,7 +628,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
-        # 32-entry pool covers the shape space.
+        # bounded pool can reuse captures across nearby batch sizes.
         expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
@@ -971,19 +1037,15 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-def test_mrv2_fails_fast_on_xpu():
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
-
-
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
 @pytest.mark.parametrize("stage_override", [False, True])
-def test_mrv2_config_is_allowed_on_npu(stage_override):
+def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
     deploy = (
         DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
         if stage_override
         else DeployConfig(model_runner="v2")
     )
-    deploy = _apply_platform_overrides(deploy, platform="npu")
+    deploy = _apply_platform_overrides(deploy, platform=platform)
     if stage_override:
         assert deploy.stages[0].model_runner == "v2"
     else:
@@ -1118,8 +1180,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "runtime_config",
         "parallel_config",
         "compilation_config",
+        "kernel_config",
         "profiler_config",
         "quantization_config",
+        "weight_transfer_config",
         # Stage-level speculative_config is passed straight through to the
         # engine: the Talker K-step block is read by the engine, not unpacked
         # structurally like the other stage configs.
@@ -1245,6 +1309,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -1506,6 +1571,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
         stages=[
             StageDeployConfig(
                 stage_id=0,
+                ulysses_degree=2,
                 ulysses_a2a_permute=True,
             )
         ]
@@ -2307,6 +2373,46 @@ def test_compact_offload_config_is_validated_during_projection():
         )
 
 
+def test_dlo_chunk_size_survives_cli_and_deploy_into_structured_config():
+    cli_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"dlo_chunk_size_mb": 32})
+    assert cli_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 32
+
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, dlo_chunk_size_mb=128)])
+    deploy_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert deploy_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 128
+
+
+@pytest.mark.parametrize("chunk_size_mb", [0, -1])
+def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
+    with pytest.raises(ValidationError):
+        omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
+    with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
+
+
+def test_dlo_chunk_size_accepts_reference_kv_config():
+    config = OmniDiffusionConfig(dlo_chunk_size_mb=32, kv_offload_config={"mode": "on"})
+
+    assert config.dlo_chunk_size_mb == 32
+    assert config.kv_offload_config == {"mode": "on"}
+
+
+@pytest.mark.parametrize(
+    "chunk_size_mb,kv_config,error",
+    [
+        (0, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (True, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (32, {"mode": "off"}, "kv_offload_config.mode must be on"),
+        (32, {"mode": "on", "kv_refresh_interval": -1}, "kv_refresh_interval must be an integer"),
+        (32, {"mode": "on", "kv_host_quantization": "unknown"}, "kv_host_quantization must be"),
+    ],
+)
+def test_dlo_and_reference_kv_config_reject_invalid_settings(chunk_size_mb, kv_config, error):
+    with pytest.raises(ValueError, match=error):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb, kv_offload_config=kv_config)
+
+
 @pytest.mark.parametrize("pipeline_async", [True, False])
 @pytest.mark.parametrize("stage_async", [None, False, True])
 def test_stage_async_chunk_opt_out_matches_legacy_config(pipeline_async, stage_async):
@@ -2591,3 +2697,128 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+@pytest.mark.parametrize("stage_id", [0, 3])
+@pytest.mark.parametrize("encode_json", [False, True], ids=["mapping", "json"])
+def test_cli_sampling_defaults_merge_by_stage_id(stage_id: int, encode_json: bool) -> None:
+    pipeline = PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=stage_id,
+                default_sampling_params={
+                    "num_inference_steps": 50,
+                    "guidance_scale": 3.0,
+                    "extra_args": {"flow_shift": 5.0},
+                },
+            )
+        ]
+    )
+    overrides = {str(stage_id): {"guidance_scale": 0.0, "extra_args": {"use_system_prompt": "dynamic"}}}
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": json.dumps(overrides) if encode_json else overrides},
+    )
+    assert config.stage_by_id(stage_id).model_config.default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 0.0,
+        "extra_args": {"flow_shift": 5.0, "use_system_prompt": "dynamic"},
+    }
+    assert deploy.stages[0].default_sampling_params == {
+        "num_inference_steps": 50,
+        "guidance_scale": 3.0,
+        "extra_args": {"flow_shift": 5.0},
+    }
+
+
+@pytest.fixture
+def sampling_defaults_pipeline() -> PipelineConfig:
+    return PipelineConfig(
+        model_type="test_sampling_defaults",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+        ),
+    )
+
+
+def test_cli_sampling_defaults_reject_non_numeric_stage_key(sampling_defaults_pipeline: PipelineConfig) -> None:
+    with pytest.raises(
+        ValueError, match="Invalid default_sampling_params stage key 'text': expected an integer stage ID"
+    ):
+        VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"text": {"guidance_scale": 3.0}}'},
+        )
+
+
+def test_cli_sampling_defaults_warn_for_unknown_pipeline_stage(
+    sampling_defaults_pipeline: PipelineConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.omni_config"):
+        config = VllmOmniConfig.from_pipeline_config(
+            sampling_defaults_pipeline,
+            cli_overrides={"default_sampling_params": '{"2": {"guidance_scale": 3.0}}'},
+        )
+    assert "Ignoring default_sampling_params for unknown stage ID 2; pipeline stages are [0]" in caplog.text
+    assert config.stage_by_id(0).model_config.default_sampling_params is None
+
+
+def test_cli_sampling_defaults_apply_to_stage_missing_from_deploy(sampling_defaults_pipeline: PipelineConfig) -> None:
+    deploy = DeployConfig(stages=[])
+    config = VllmOmniConfig.from_pipeline_config(
+        sampling_defaults_pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"default_sampling_params": '{"0": {"guidance_scale": 3.0}}'},
+    )
+    assert config.stage_by_id(0).model_config.default_sampling_params == {"guidance_scale": 3.0}
+    assert deploy.stages == []
+
+
+def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():
+    from vllm.config import KernelConfig
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={"kernel_config": {"ir_op_priority": {"rms_norm": ["vllm_c", "native"]}}},
+            )
+        ]
+    )
+    stage_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage_config.kernel_config, KernelConfig)
+    assert stage_config.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
+    projected = _project_omni_stage_engine_args(stage_config)
+    assert projected["kernel_config"] == stage_config.kernel_config
+    assert projected["kernel_config"] is not stage_config.kernel_config
+
+
+def test_kernel_config_mapping_rejects_unknown_upstream_fields():
+    with pytest.raises(ValidationError):
+        VllmOmniARStageConfig(
+            stage_pipeline_config=_resolve_pipeline_or_skip("qwen3_tts").stages[0],
+            kernel_config={"unknown_kernel_option": True},
+        )

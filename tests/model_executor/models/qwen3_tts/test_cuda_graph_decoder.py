@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model]
@@ -49,6 +50,12 @@ except Exception:
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     CUDAGraphDecoderWrapper = _mod.CUDAGraphDecoderWrapper
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ieee_cudnn_fp32():
+    with ieee_cudnn_fp32():
+        yield
 
 
 class SyntheticDecoder(nn.Module):
@@ -86,14 +93,14 @@ class ShortOutputDecoder(SyntheticDecoder):
 
 
 @pytest.fixture(scope="module")
-def decoder():
+def decoder(_ieee_cudnn_fp32):
     """Create a synthetic decoder on CUDA with fixed weights."""
     torch.manual_seed(42)
     return SyntheticDecoder().to(DEVICE).eval()
 
 
 @pytest.fixture(scope="module")
-def wrapper(decoder):
+def wrapper(decoder, _ieee_cudnn_fp32):
     """Create a warmed-up CUDAGraphDecoderWrapper."""
     w = CUDAGraphDecoderWrapper(
         decoder=decoder,
@@ -156,14 +163,20 @@ def test_padded_batch_size_uses_larger_capture_bucket(decoder):
     )
     w.warmup(DEVICE)
     codes = _random_codes(25, batch_size=3)
+    # The graph replays a batch-4 convolution, so its exact oracle must use
+    # the same launch shape. A batch-3 eager launch may differ by FP32 roundoff.
+    padded_codes = torch.zeros(4, NUM_QUANTIZERS, 25, dtype=torch.long, device=DEVICE)
+    padded_codes[:3] = codes
 
     with torch.no_grad():
         eager_out = decoder(codes)
+        padded_eager_out = decoder(padded_codes)[:3]
         graph_out = w.decode(codes)
 
     assert (4, 25) in w.graphs
     assert graph_out.shape == eager_out.shape
-    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+    torch.testing.assert_close(graph_out, padded_eager_out, atol=0, rtol=0)
+    torch.testing.assert_close(padded_eager_out, eager_out, atol=1e-6, rtol=1e-6)
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

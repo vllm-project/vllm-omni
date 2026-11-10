@@ -33,7 +33,7 @@ T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
 
 DEFAULT_SMOKE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"})
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 
 TEST_PROMPTS: list[dict[str, str]] = [

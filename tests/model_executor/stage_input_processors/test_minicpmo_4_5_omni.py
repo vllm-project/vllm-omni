@@ -78,6 +78,123 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
     assert info["meta"]["next_stage_prompt_len"] == 4
 
 
+def _ledger_output(prompt_ids, output_ids, forwarded):
+    """Thinker output whose latent rows follow ``forwarded``: (token, position) per row."""
+    latent = torch.stack([torch.full((4,), float(position * 100 + token)) for token, position in forwarded])
+    multimodal_output = {
+        "latent_input_ids": torch.tensor([token for token, _ in forwarded]).reshape(-1, 1),
+        "latent_positions": torch.tensor([position for _, position in forwarded]).reshape(-1, 1),
+    }
+    return _output(prompt_ids=prompt_ids, output_ids=output_ids, latent=latent, multimodal_output=multimodal_output)
+
+
+def _row(token: int, position: int) -> torch.Tensor:
+    return torch.full((4,), float(position * 100 + token))
+
+
+def test_plain_chat_handoff_reads_rows_from_ledger_when_steps_repeat() -> None:
+    """MRv2 full-payload outputs report every step's rows twice."""
+    prompt_ids, output_ids = [101, 102], [11, 12, 13]
+    steps = [[(101, 0), (102, 1)], [(11, 2)], [(12, 3)]]
+    forwarded = [row for step in steps for row in step * 2]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    # The last sampled token is never forwarded, so it has no row.
+    assert info["ids"]["tts"] == [11, 12]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3)]))
+
+
+@pytest.mark.parametrize("repeat", [1, 2], ids=["v1", "mrv2_both_channels"])
+def test_plain_chat_handoff_after_a_prefix_hit_has_no_rows_for_the_cached_prompt(repeat) -> None:
+    """Native KV reuse forwards only the uncached tail, fewer rows than the reply's position."""
+    prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13]
+    # Tokens 0-14 hit; the last prompt token and the reply are forwarded.
+    steps = [[(115, 15)], [(11, 16)], [(12, 17)]]
+    forwarded = [row for step in steps for row in step * repeat]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17)]))
+
+
+def test_plain_chat_handoff_without_reply_rows_is_an_empty_condition() -> None:
+    """A Thinker that stopped at its first token has no reply rows; the Talker finishes such a request."""
+    prompt_ids, output_ids = [101, 102], [11]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, [(101, 0), (102, 1)])], prompt=[{}])[0][
+        "model_intermediate_buffer"
+    ]
+
+    assert info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
+
+
+def test_plain_chat_handoff_after_a_preemption_keeps_reply_rows_from_before_it() -> None:
+    """A resumed request hits on its earlier reply tokens, so their rows come from before the preemption."""
+    prompt_ids, output_ids = list(range(100, 116)), [11, 12, 13, 14]
+    # Forwarded up to token 13, preempted, then resumed from a hit that ends after token 11.
+    forwarded = [(115, 15), (11, 16), (12, 17), (13, 18), (12, 17), (13, 18)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12, 13]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 16), _row(12, 17), _row(13, 18)]))
+
+
+def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:
+    """A rejected draft's row is replaced by the row forwarded at its position later."""
+    prompt_ids, output_ids = [101, 102], [11, 12, 13, 14, 15]
+    forwarded = [(101, 0), (102, 1), (11, 2), (12, 3), (99, 4), (13, 4), (14, 5)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12, 13, 14]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3), _row(13, 4), _row(14, 5)]))
+
+
+def test_plain_chat_handoff_warns_when_rows_stop_before_the_last_token(mocker) -> None:
+    from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
+
+    warning = mocker.patch.object(module.logger, "warning")
+    prompt_ids, output_ids = [101, 102], [11, 12, 13, 14]
+    # Position 3 never got a row, so the reply stops after token 11.
+    forwarded = [(101, 0), (102, 1), (11, 2), (13, 4)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11]
+    warning.assert_called_once()
+    assert "stop at token" in warning.call_args.args[0]
+    assert warning.call_args.args[1] == "req-1"
+
+
+def test_plain_chat_handoff_logs_a_ledger_of_the_wrong_length_once(mocker) -> None:
+    from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
+
+    warning_once = mocker.patch.object(module.logger, "warning_once")
+    debug = mocker.patch.object(module.logger, "debug")
+    prompt_ids, output_ids = [101, 102], [11, 12]
+    forwarded = [(101, 0), (102, 1), (11, 2)]
+    source = _ledger_output(prompt_ids, output_ids, forwarded)
+    source.outputs[0].multimodal_output["latent_positions"] = torch.tensor([0, 1]).reshape(-1, 1)
+
+    info = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    # Without a usable ledger the rows are taken by index.
+    assert info["ids"]["tts"] == [11]
+    warning_once.assert_called_once()
+    assert "row ledger" in warning_once.call_args.args[0]
+    # The counts go to the debug log, one line per mismatching output.
+    debug.assert_called_once()
+    assert debug.call_args.args[1:] == ("req-1", 3, 2, 3)
+
+
 def test_llm2tts_carries_request_ref_audio() -> None:
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(

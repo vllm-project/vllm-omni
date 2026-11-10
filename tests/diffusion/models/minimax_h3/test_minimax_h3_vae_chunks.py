@@ -16,6 +16,19 @@ from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_only_the_chunk_output_owner_can_prestart_an_encoder(monkeypatch, rank):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    monkeypatch.setattr(MiniMaxH3VideoVAE, "is_distributed_enabled", lambda self: True)
+    group = object()
+    monkeypatch.setattr(MiniMaxH3VideoVAE, "_native_parallel_state", lambda self: {"sp_process_group": group})
+    monkeypatch.setattr(dist, "get_rank", lambda actual: rank if actual is group else pytest.fail("wrong group"))
+    assert vae.owns_chunk_output is (rank == 0)
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_encode_only_video_vae_rejects_full_and_chunked_decode(chunked):
     from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE

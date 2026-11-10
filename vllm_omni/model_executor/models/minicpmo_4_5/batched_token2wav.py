@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -19,6 +20,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.utils.device_copy import index_to_device
 
+from .code2wav_stats import Code2WavSolveStats
+from .code2wav_watchdog import Code2WavWatchdog
 from .cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
@@ -362,11 +365,16 @@ class BatchedToken2Wav(nn.Module):
         cfm_tf32: bool = False,
         encoder_graph_config: Mapping[str, Any] | None = None,
         cfm_float16: bool = False,
+        watchdog: Code2WavWatchdog | None = None,
     ):
         super().__init__()
         if setup_cache_size < 0:
             raise ValueError("setup_cache_size must be >= 0")
         self._token2wav = token2wav
+        self._watchdog = watchdog or Code2WavWatchdog()
+        # Off unless VLLM_OMNI_CODE2WAV_STATS is set: counts what each CFM /
+        # HiFT solve covers, which is what decides stage-2 cost per frame.
+        self._solve_stats = Code2WavSolveStats()
         self._cfm_tf32 = bool(cfm_tf32)
         cfm_graph_cfg = dict(cfm_graph_config or {})
         # Ragged solves of rows whose caches differ in length (a stream's second chunk next to steady
@@ -634,6 +642,32 @@ class BatchedToken2Wav(nn.Module):
         self._setup_cache_size = setup_cache_size
         self._setup_cache: OrderedDict[tuple[tuple[str, str], int], BatchedToken2WavState] = OrderedDict()
 
+    def _sync_solve_timing(self, device: torch.device) -> None:
+        """Drain ``device`` before/after a timed solve.
+
+        ``time.perf_counter`` around an async launch measures the enqueue,
+        not the solve: a CUDA graph replay and most eager kernels return as
+        soon as the work is queued. With the stats enabled (a debug knob)
+        synchronize the tensor's device so ``duration`` is real device time.
+        A CPU host has nothing to drain. A backend that reports no
+        accelerator, or one whose synchronize is not implemented (older
+        torch_npu), keeps the enqueue timing rather than failing the solve.
+        """
+        if not self._solve_stats.enabled or device.type == "cpu":
+            return
+        if not torch.accelerator.is_available():
+            return
+        try:
+            torch.accelerator.synchronize(device)
+        except NotImplementedError:
+            # Only an unimplemented sync degrades to enqueue timing. A real
+            # device error -- an async kernel fault surfacing at this sync --
+            # must propagate so it is attributed to the solve that caused it.
+            logger.warning_once(
+                "accelerator sync is not implemented for %s; solve timing keeps enqueue time",
+                device.type,
+            )
+
     def _hift_inference(
         self,
         mel: torch.Tensor,
@@ -642,9 +676,20 @@ class BatchedToken2Wav(nn.Module):
         if int(mel.shape[2]) == 0:
             # No frames, no samples: HiFT itself cannot run on an empty mel.
             return empty_hift_outputs(mel)
+        self._sync_solve_timing(mel.device)
+        started = time.perf_counter()
         if self.hift_graph_wrapper is None:
-            return self.hift.inference(mel, source_cache)
-        return self.hift_graph_wrapper.replay(mel, source_cache)
+            result = self.hift.inference(mel, source_cache)
+        else:
+            result = self.hift_graph_wrapper.replay(mel, source_cache)
+        self._sync_solve_timing(mel.device)
+        self._solve_stats.record(
+            "hift",
+            batch=int(mel.shape[0]),
+            frames=int(mel.shape[2]),
+            duration=time.perf_counter() - started,
+        )
+        return result
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -1369,6 +1414,15 @@ class BatchedToken2Wav(nn.Module):
         cache in the same form, already trimmed by ``att_keep``; the eager
         path returns it stacked and untrimmed (ragged: per request, untrimmed).
         """
+        # The solve's true wall time, start to finish across every return:
+        # the duty figure must count work actually spent inside the solve,
+        # not the telescoping gap to the next record. Synchronize around the
+        # solve so an async launch cannot be mistaken for a finished one.
+        solve_timing = self._solve_stats.enabled
+        solve_started = 0.0
+        if solve_timing:
+            self._sync_solve_timing(mu.device)
+            solve_started = time.perf_counter()
         if self._cfm_only_float16:
             mu, speakers, cond = mu.half(), speakers.half(), cond.half()
         decoder = self.flow.decoder
@@ -1460,7 +1514,10 @@ class BatchedToken2Wav(nn.Module):
             keys = torch.cat((valid_queries, old_keys), dim=1)
             attn_mask = valid_queries.unsqueeze(2) & keys.unsqueeze(1)
 
-        if self._whole_euler_active() and (valid_lengths is None or self._whole_euler_ragged_active()):
+        whole_euler_attempted = self._whole_euler_active() and (
+            valid_lengths is None or self._whole_euler_ragged_active()
+        )
+        if whole_euler_attempted:
             whole_euler_result = self._whole_euler_graph_wrapper.replay(
                 x=x,
                 mu_cfg=mu_cfg,
@@ -1476,7 +1533,24 @@ class BatchedToken2Wav(nn.Module):
                 prompt_lengths=prompt_lengths,
             )
             if whole_euler_result is not None:
+                if solve_timing:
+                    self._sync_solve_timing(mu.device)
+                    self._solve_stats.record(
+                        "cfm",
+                        batch=batch_size,
+                        frames=mel_frames,
+                        ragged=valid_lengths is not None,
+                        duration=time.perf_counter() - solve_started,
+                    )
                 return whole_euler_result
+            self._watchdog.phase(
+                "cfm/eager_fallback",
+                {
+                    "batch_size": batch_size,
+                    "mel_frames": mel_frames,
+                    "cfm_mode": "eager",
+                },
+            )
         # Whole-Euler builds its capture mask directly from mel_frames.
         # Only a refused replay needs the separate step/eager padding mask.
         if pad_frames:
@@ -1575,6 +1649,15 @@ class BatchedToken2Wav(nn.Module):
                     # the valid one, in step with the mask built above.
                     next_att_cache[step][..., mel_frames : mel_frames + pad_frames, :] = 0.0
                 del step_att
+        if solve_timing:
+            self._sync_solve_timing(mu.device)
+            self._solve_stats.record(
+                "cfm",
+                batch=batch_size,
+                frames=mel_frames,
+                ragged=valid_lengths is not None,
+                duration=time.perf_counter() - solve_started,
+            )
         if pad_frames:
             x = x[:, :, :mel_frames]
         if ragged_att_cache is not None:
@@ -1708,6 +1791,13 @@ class BatchedToken2Wav(nn.Module):
         wrapper = self._whole_euler_graph_wrapper
         return wrapper is not None and wrapper.enabled and self._trt_stepper is None
 
+    def _cfm_watchdog_mode(self, *, ragged: bool = False) -> str:
+        if ragged and self._whole_euler_ragged_active():
+            return "ragged_whole_euler"
+        if self._whole_euler_active():
+            return "whole_euler"
+        return "eager"
+
     def _whole_euler_ragged_active(self) -> bool:
         """Whether Whole-Euler graphs also solve ragged (per-row length) batches."""
         return self._whole_euler_active() and self._whole_euler_graph_wrapper.ragged_body is not None
@@ -1788,6 +1878,13 @@ class BatchedToken2Wav(nn.Module):
             _SILENCE_TOKEN,
         )
         with self._autocast(prompt_tokens.device):
+            self._watchdog.phase(
+                "setup/encoder",
+                {
+                    "batch_size": batch_size,
+                    "codec_frames": int(prompt_tokens.shape[1]) + int(lookahead.shape[1]),
+                },
+            )
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 torch.cat((prompt_tokens, lookahead), dim=1),
                 last_chunk=False,
@@ -1797,6 +1894,14 @@ class BatchedToken2Wav(nn.Module):
             projected_speakers = self._project_speakers(speakers)
             # The prompt cache never reaches the trim length; ``att_keep`` only
             # tells the Whole-Euler arena the steady cache length to reserve.
+            self._watchdog.phase(
+                "setup/cfm",
+                {
+                    "batch_size": batch_size,
+                    "mel_frames": int(prompt_mels.shape[1]),
+                    "cfm_mode": self._cfm_watchdog_mode(),
+                },
+            )
             _, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -1967,6 +2072,14 @@ class BatchedToken2Wav(nn.Module):
         prompt_len = max(prompt_lengths)
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
         with self._autocast(tokens.device):
+            self._watchdog.phase(
+                "decode/encoder",
+                {
+                    "batch_size": batch_size,
+                    "codec_frames": int(tokens.shape[1]),
+                    "last_chunk": last_chunk,
+                },
+            )
             # Replay must use the same autocast context as startup capture.
             # A captured encoder graph stacks the conformer caches into its own inputs.
             graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
@@ -1982,6 +2095,14 @@ class BatchedToken2Wav(nn.Module):
                 precaptured_checked=True,
             )
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
+            self._watchdog.phase(
+                "decode/cfm",
+                {
+                    "batch_size": batch_size,
+                    "hidden_frames": int(hidden.shape[1]),
+                    "cfm_mode": self._cfm_watchdog_mode(),
+                },
+            )
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -1995,7 +2116,10 @@ class BatchedToken2Wav(nn.Module):
                 att_keep=att_keep,
                 prompt_lengths=prompt_lengths,
             )
-
+        self._watchdog.phase(
+            "decode/cache_materialization",
+            {"batch_size": batch_size, "prompt_frames": prompt_lengths},
+        )
         conformer_att = _trim_streaming_cache(conformer_att, prompt_len)
         new_flow = self._split_flow_cache(
             {
@@ -2014,6 +2138,10 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
+        self._watchdog.phase(
+            "decode/hift",
+            {"batch_size": batch_size, "mel_frames": int(mel.shape[2])},
+        )
         speech, source = self._hift_inference(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
@@ -2024,6 +2152,10 @@ class BatchedToken2Wav(nn.Module):
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
         emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
+        self._watchdog.phase(
+            "decode/output_copy",
+            {"batch_size": batch_size, "audio_samples": int(emitted.shape[-1])},
+        )
         next_states = [
             BatchedToken2WavState(
                 flow_cache=new_flow[row],
@@ -2124,6 +2256,15 @@ class BatchedToken2Wav(nn.Module):
             group_states = [states[row] for row in rows]
             group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
             with self._autocast(group_tokens.device):
+                self._watchdog.phase(
+                    "decode/encoder",
+                    {
+                        "batch_size": len(rows),
+                        "codec_frames": int(group_tokens.shape[1]),
+                        "ragged_rows": rows,
+                        "last_chunk": last_chunk,
+                    },
+                )
                 # With several groups the next replay rewrites the shared graph results, so they are copied.
                 graphed = (
                     None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
@@ -2165,6 +2306,14 @@ class BatchedToken2Wav(nn.Module):
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         with self._autocast(padded_hidden.device):
             cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
+            self._watchdog.phase(
+                "decode/cfm",
+                {
+                    "batch_size": batch_size,
+                    "hidden_frames": hidden_lengths,
+                    "cfm_mode": self._cfm_watchdog_mode(ragged=True),
+                },
+            )
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 padded_hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -2179,7 +2328,10 @@ class BatchedToken2Wav(nn.Module):
                 att_keep=(max(prompt_lengths), _CACHE_TRIM_SUFFIX),
                 prompt_lengths=prompt_lengths,
             )
-
+        self._watchdog.phase(
+            "decode/cache_materialization",
+            {"batch_size": batch_size, "prompt_frames": prompt_lengths},
+        )
         assert isinstance(estimator_att, list)
         new_flow: list[dict[str, torch.Tensor]] = []
         for row, row_estimator_att in enumerate(estimator_att):
@@ -2225,6 +2377,14 @@ class BatchedToken2Wav(nn.Module):
                 dim=0,
             )
             mel = torch.cat((old_mel, group_mel), dim=2)
+            self._watchdog.phase(
+                "decode/hift",
+                {
+                    "batch_size": len(rows),
+                    "mel_frames": int(mel.shape[2]),
+                    "ragged_rows": rows,
+                },
+            )
             speech, source = self._hift_inference(mel, old_source)
             if old_speech.shape[-1] > 0:
                 window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
@@ -2235,6 +2395,14 @@ class BatchedToken2Wav(nn.Module):
                 "speech": speech[..., -self.source_cache_len :].detach(),
             }
             emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
+            self._watchdog.phase(
+                "decode/output_copy",
+                {
+                    "batch_size": len(rows),
+                    "audio_samples": int(emitted.shape[-1]),
+                    "ragged_rows": rows,
+                },
+            )
             for group_row, row in enumerate(rows):
                 audios[row] = emitted[group_row].reshape(-1).to(dtype=torch.float32)
                 next_states[row] = BatchedToken2WavState(
