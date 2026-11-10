@@ -23,17 +23,22 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 
 import io
 import json
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from numbers import Integral
 from typing import Any
 
-import httpx
+import aiohttp
 import numpy as np
 import pybase64 as base64
 from fastapi import HTTPException, Request, UploadFile
 from PIL import Image
+from vllm.connections import HTTPConnection, global_http_connection
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
+from vllm.multimodal.media import MediaConnector
+from vllm.multimodal.media.base import MediaWithBytes
+from vllm.multimodal.media.image import ImageMediaIO
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
@@ -232,10 +237,40 @@ def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
     return fallback
 
 
+class _ImageEditHTTPConnection(HTTPConnection):
+    """Use vLLM downloads while retaining the image route's no-redirect policy."""
+
+    async def get_async_response(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
+    ) -> aiohttp.ClientResponse:
+        response = await (
+            await global_http_connection.get_async_response(
+                url, timeout=timeout, extra_headers=extra_headers, allow_redirects=False
+            )
+        )
+        if 300 <= response.status < 400:
+            response.release()
+            raise ValueError("Image URL redirects are not supported; use the final image URL")
+        return response
+
+
+class _ImageEditMediaIO(ImageMediaIO):
+    """Decode URL bytes like uploads, without EXIF rotation or alpha compositing."""
+
+    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
+        return MediaWithBytes(open_image(io.BytesIO(data)), data)
+
+
 async def _load_input_images(
-    inputs: list[str],
+    inputs: Sequence[str | UploadFile],
     *,
     normalize_rgb: bool = True,
+    allowed_media_domains: list[str] | None = None,
 ) -> list[Image.Image]:
     """
     convert to PIL.Image.Image list
@@ -258,17 +293,17 @@ async def _load_input_images(
 
         # 2. URL
         elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = open_image(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
+            connector = MediaConnector(
+                connection=_ImageEditHTTPConnection(), allowed_media_domains=allowed_media_domains
+            )
+            try:
+                loaded = await connector.load_from_url_async(inp, _ImageEditMediaIO(image_mode=None), fetch_timeout=60)
+                images.append(loaded.media if isinstance(loaded, MediaWithBytes) else loaded)
+            except Exception as e:
+                raise ValueError(f"Failed to download image from URL {inp}: {e}") from e
 
         # 3. UploadFile
-        elif hasattr(inp, "file"):
+        elif not isinstance(inp, str) and hasattr(inp, "file"):
             try:
                 img_data = await inp.read()
                 img = open_image(io.BytesIO(img_data))

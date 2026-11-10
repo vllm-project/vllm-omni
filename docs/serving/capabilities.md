@@ -120,7 +120,9 @@ has a real single-image editing path. Klein permits up to four ordinary image
 inputs. The effective maximum also honors the deployed image handler's limit.
 
 Klein's native single-stage edit route additionally accepts `mask_image` and
-`reference_image` as separate multipart uploads or data-URI form fields.
+`reference_image` as separate multipart uploads, data-URI form fields, or
+HTTP(S) URLs. All remote image roles honor the deployment's
+`--allowed-media-domains`; see [remote image access](image_edit_api.md#remote-image-access).
 The latter is an independent conditioning reference, outside the ordinary
 `image` list. When a mask is supplied, there must be exactly one ordinary source
 image and its dimensions must match the mask. White edits, black preserves, and

@@ -2628,25 +2628,36 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        allowed_media_domains = getattr(app_state_args, "allowed_media_domains", None)
+        pil_images = await _load_input_images(
+            input_images_list,
+            normalize_rgb=normalize_edit_images_rgb,
+            allowed_media_domains=allowed_media_domains,
+        )
         omni_prompt["multi_modal_data"] = {}
         omni_prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # The model owns grayscale/binary conversion; preserve mask values.
-            loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            loaded = await _load_input_images(
+                [mask_image], normalize_rgb=False, allowed_media_domains=allowed_media_domains
+            )
             if mask_contract is not None and mask_contract.requires_same_size and loaded[0].size != pil_images[0].size:
                 raise HTTPException(400, "mask_image and its source image must have the same dimensions")
             omni_prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
+            loaded = await _load_input_images(
+                [reference_image],
+                normalize_rgb=normalize_edit_images_rgb,
+                allowed_media_domains=allowed_media_domains,
+            )
             omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
         # 3.0 Init with system default values
-        app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
         # Image edits (img2img) remain gated to classical diffusion stages;
         # MammothModa2 is rejected at route level by its pipeline's endpoint

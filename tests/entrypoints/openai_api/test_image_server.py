@@ -12,8 +12,11 @@ import io
 import json
 from argparse import Namespace
 from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -36,6 +39,170 @@ from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def edit_image_http_server(monkeypatch):
+    """Serve real image bytes and record every attempted fetch locally."""
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
+    monkeypatch.delenv("VLLM_MEDIA_CACHE", raising=False)
+    requests = []
+    image = Image.new("RGBA", (64, 64), (12, 34, 56, 0))
+    image.putpixel((1, 2), (200, 100, 50, 255))
+    exif = Image.Exif()
+    exif[274] = 6
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", exif=exif)
+    payload = buffer.getvalue()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.headers["Host"], self.path))
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{server.server_port}/target")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            # A valid image body on a redirect must not turn it into a success.
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, requests, payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.fixture
+def edit_image_http_client(test_client, monkeypatch):
+    """Keep the official download client's session inside the test app's loop."""
+    from vllm.connections import HTTPConnection
+
+    async def create_session():
+        return aiohttp.ClientSession(trust_env=True)
+
+    with test_client as client:
+        session = client.portal.call(create_session)
+
+        async def get_client(self):
+            return session
+
+        monkeypatch.setattr(HTTPConnection, "get_async_client", get_client)
+        try:
+            yield client
+        finally:
+            client.portal.call(session.close)
+
+
+@pytest.mark.parametrize("field", ["url", "url[]", "mask_image", "reference_image"])
+@pytest.mark.parametrize("domains", [None, [], ["localhost"], ["media.example.com"]])
+def test_image_edit_urls_follow_deployment_domains(edit_image_http_client, edit_image_http_server, field, domains):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = domains
+    data = {"prompt": "edit", "size": "64x64", field: f"http://localhost:{port}/image.png"}
+    files = [] if field in ("url", "url[]") else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    allowed = not domains or "localhost" in domains
+    assert response.status_code == (200 if allowed else 400), response.text
+    assert len(requests) == int(allowed)
+    assert client.app.state.engine_client.generate_calls == int(allowed)
+    if not allowed:
+        assert "allowed domains" in response.json()["detail"]
+        assert client.app.state.engine_client.captured_prompt is None
+
+
+@pytest.mark.parametrize("field", ["url", "mask_image", "reference_image"])
+@pytest.mark.parametrize("authority", ["localhost@127.0.0.1", "localhost.example.invalid"])
+def test_image_edit_domains_match_hostname(edit_image_http_client, edit_image_http_server, field, authority):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = ["localhost"]
+    data = {"prompt": "edit", field: f"http://{authority}:{port}/image.png"}
+    files = [] if field == "url" else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert "allowed domains" in response.json()["detail"]
+    assert requests == []
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("field", ["url", "mask_image", "reference_image"])
+def test_image_edit_does_not_enable_local_file_urls(edit_image_http_client, edit_image_http_server, tmp_path, field):
+    client = edit_image_http_client
+    _, requests, payload = edit_image_http_server
+    source = tmp_path / "local.png"
+    source.write_bytes(payload)
+    client.app.state.args.allowed_local_media_path = str(tmp_path)
+    data = {"prompt": "edit", field: source.as_uri()}
+    files = [] if field == "url" else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert "Unsupported input" in response.json()["detail"]
+    assert requests == []
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("field", ["url", "url[]", "mask_image", "reference_image"])
+@pytest.mark.parametrize("domains", [None, ["localhost"]])
+def test_image_edit_urls_do_not_follow_redirects(
+    edit_image_http_client, edit_image_http_server, monkeypatch, field, domains
+):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = domains
+    monkeypatch.setenv("VLLM_MEDIA_URL_ALLOW_REDIRECTS", "1")
+    data = {"prompt": "edit", "size": "64x64", field: f"http://localhost:{port}/redirect"}
+    files = [] if field in ("url", "url[]") else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert requests == [(f"localhost:{port}", "/redirect")]
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("wire", ["url", "data", "upload"])
+@pytest.mark.parametrize("normalize_rgb", [False, True])
+def test_image_edit_transports_preserve_pixels(edit_image_http_client, edit_image_http_server, wire, normalize_rgb):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = ["localhost"] if wire == "url" else ["media.example.com"]
+    data = {"prompt": "edit", "size": "64x64"}
+    if normalize_rgb:
+        data["sys_type"] = "default"
+    files = []
+    for field in ("image", "mask_image", "reference_image"):
+        if wire == "upload":
+            files.append((field, payload))
+        else:
+            name = "url" if field == "image" else field
+            data[name] = (
+                f"http://localhost:{port}/image.png"
+                if wire == "url"
+                else "data:image/png;base64," + base64.b64encode(payload).decode()
+            )
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 200, response.text
+    assert len(requests) == (3 if wire == "url" else 0)
+    media = client.app.state.engine_client.captured_prompt["multi_modal_data"]
+    original = Image.open(io.BytesIO(payload))
+    for field in ("image", "mask_image", "reference_image"):
+        actual = media[field][0] if field == "image" else media[field]
+        expected = original.convert("RGB") if normalize_rgb and field != "mask_image" else original
+        assert isinstance(actual, Image.Image)
+        assert actual.mode == expected.mode
+        assert actual.size == expected.size
+        assert actual.tobytes() == expected.tobytes()
 
 
 @pytest.mark.parametrize("field", ["mask_image", "reference_image"])

@@ -104,8 +104,22 @@ Content-Type: multipart/form-data
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
 | `seed` | integer | null | Random seed for reproducibility |
-| `reference_image` | string or array | null | Reference image for inpainting |
-| `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
+| `reference_image` | file or string | null | Independent reference image, as an upload, image data URL, or HTTP(S) URL, when supported by the model |
+| `mask_image` | file or string | null | Selection mask, as an upload, image data URL, or HTTP(S) URL, when supported by the model (white areas will be inpainted) |
+
+#### Remote image access
+
+`url` / `url[]`, `mask_image`, and `reference_image` use vLLM's media
+downloader and honor `--allowed-media-domains`. When configured, the same
+domain restriction applies to all three image roles before downloading.
+An omitted or empty domain list retains unrestricted HTTP(S) domain access;
+configure allowed domains when serving untrusted clients.
+
+This endpoint does not follow redirects, including when
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS=1`; use the final image URL. Uploads and image
+data URLs remain available without a domain configuration. URL inputs retain
+the same image orientation, alpha channels, and RGB conversion as uploaded
+images. Local `file:` URLs are not accepted.
 
 ### Response Format
 
