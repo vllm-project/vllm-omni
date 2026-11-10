@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
@@ -21,12 +22,11 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
-    SupportsARDiffusionCellPipeline,
+    SupportsARDiffusionNoisyKV,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
-from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
@@ -122,7 +122,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.kv_cache: ARDiffusionKVCache | None = None
         self.noisy_kv_cache: NoisyKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
-        self._ar_diffusion_cell_capability: SupportsARDiffusionCellPipeline | None = None
+        self._ar_diffusion_noisy_kv_capability: SupportsARDiffusionNoisyKV | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
@@ -199,8 +199,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return dict(raw) if isinstance(raw, dict) else {}
 
     def _preallocate_noisy_kv(
-        self, capability: SupportsARDiffusionCellPipeline, *, available_bytes: int | None = None
+        self, capability: SupportsARDiffusionNoisyKV, *, available_bytes: int | None = None
     ) -> None:
+        """Allocate the Noisy KV pool. Does not select how requests are executed."""
         spec = capability.ar_diffusion_noisy_kv_spec()
         stage_cfg = self._stage_config()
         step_replicas = cfg_step_replicas(stage_cfg)
@@ -209,7 +210,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by step_replicas={step_replicas}")
         layer_groups = pp_world // step_replicas
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
-        self._ar_diffusion_cell_capability = capability
+        self._ar_diffusion_noisy_kv_capability = capability
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
         layer_offset = int(getattr(getattr(self.pipeline, "transformer", None), "start_layer", 0) or 0)
         blocks_per_rank = max(1, int(spec.num_layers))
@@ -244,7 +245,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
             )
-        if isinstance(self.pipeline, SupportsARDiffusionCellPipeline):
+        # Which pool to build. Request vs step execution is chosen by the caller.
+        if isinstance(self.pipeline, SupportsARDiffusionNoisyKV):
             self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
             return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
@@ -359,7 +361,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     capability.close_ar_diffusion_session(session_id)
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
-        # Noisy KV sessions share the same outer session_id; reset/close must drop them too.
+        # Noisy PP sessions share the same outer session_id; reset/close must drop them too.
         try:
             self.release_noisy_kv(session_id)
         except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
@@ -475,9 +477,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def _noisy_kv_id(req: OmniDiffusionRequest) -> tuple[str, bool, bool, bool]:
         """Return ``(kv_id, persist, reset, close)`` from request fields only.
 
-        Lifecycle belongs outside this runner. An explicit ``session_id`` is the
-        pool key and may retain history across requests; otherwise the request
-        id is ephemeral and versions are released after the forward.
+        Shared by ``execute_model`` and ``execute_model_batch``. An explicit
+        ``session_id`` is the pool key and may retain history across requests;
+        otherwise the request id is ephemeral and versions are released after
+        the forward.
         """
         session_id, extra_args, tick = ARDiffusionModelRunner._request_session(req)
         if tick is not None:
@@ -491,36 +494,78 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return kv_id, persist, reset, close_session
 
     def release_noisy_kv(self, kv_id: str) -> None:
-        """Drop retained Noisy KV versions for ``kv_id`` (outer session reset/close)."""
+        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""
         if self.noisy_kv_cache is None:
             return
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
-    def _make_chunk_context(self):
-        from vllm_omni.experimental.ar_diffusion.cell_executor import (
-            ARDiffusionCellContext,
-            CellRunSpec,
-            CellTopology,
-            resolve_pp_rank_and_group,
-        )
+    def _bound_noisy_kv(self) -> AbstractContextManager[None]:
+        """Bind the already-built Noisy KV pool for one mainline invocation."""
+        capability = self._ar_diffusion_noisy_kv_capability
+        if capability is None or self.noisy_kv_cache is None:
+            raise RuntimeError("Noisy KV capability missing after initialization")
+        return capability.bind_ar_diffusion_noisy_kv(NoisyKVState(self.noisy_kv_cache))
 
-        if self.noisy_kv_cache is None:
-            raise RuntimeError("noisy KV cache is not initialized")
-        stage_cfg = self._stage_config()
-        step_replicas = cfg_step_replicas(stage_cfg)
-        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        topology = CellTopology(step_replicas=step_replicas, layer_groups=max(1, pp_world // max(1, step_replicas)))
-        rank, pp_group = resolve_pp_rank_and_group()
-        return ARDiffusionCellContext(
-            spec=CellRunSpec(
-                topology=topology,
-                max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
-                rank=rank,
-                pp_group=pp_group,
-            ),
-            kv=NoisyKVState(self.noisy_kv_cache),
-        )
+    def _scheduled_noisy_kv_lifecycles(
+        self, scheduler_output: DiffusionSchedulerOutput
+    ) -> list[tuple[str, bool, bool, bool]]:
+        """Collect ``(kv_id, persist, reset, close)`` for each scheduled new request."""
+        entries: list[tuple[str, bool, bool, bool]] = []
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
+            req = getattr(new_req, "req", None)
+            if req is None:
+                continue
+            entries.append(self._noisy_kv_id(req))
+        return entries
+
+    @staticmethod
+    def _reject_duplicate_noisy_kv_sessions(entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
+        """Refuse a batch that schedules more than one request on the same pool key.
+
+        Batch-wide ``reset`` / release runs before Pipeline walks requests in
+        order. Two entries for session ``S`` (e.g. continue then ``reset``)
+        would wipe ``S`` before the earlier request can read its history.
+        Scheduler co-batching does not yet exclude same-session pairs; reject
+        here until that landing exists.
+        """
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for kv_id, *_ in entries:
+            if not kv_id:
+                continue
+            if kv_id in seen:
+                dupes.add(kv_id)
+            else:
+                seen.add(kv_id)
+        if dupes:
+            raise ValueError(
+                "Noisy KV batch schedules more than one request for the same "
+                f"session id(s) {sorted(dupes)!r}; co-batching the same session "
+                "is unsupported because reset/close run before per-request "
+                "execution. Wait for the prior request to finish."
+            )
+
+    def _prepare_noisy_kv_lifecycles(self, entries: Sequence[tuple[str, bool, bool, bool]]) -> None:
+        """Apply ``reset=True`` before bind — shared by single and batch entries."""
+        for kv_id, _persist, reset, _close in entries:
+            if kv_id and reset:
+                self.release_noisy_kv(kv_id)
+
+    def _finalize_noisy_kv_lifecycles(
+        self,
+        entries: Sequence[tuple[str, bool, bool, bool]],
+        *,
+        fail_closed: bool,
+    ) -> None:
+        """Release pool keys after success or on failure (same rules as ``execute_model``)."""
+        if fail_closed:
+            for kv_id in dict.fromkeys(kv_id for kv_id, *_ in entries if kv_id):
+                self.release_noisy_kv(kv_id)
+            return
+        for kv_id, persist, _reset, close_session in entries:
+            if kv_id and (close_session or not persist):
+                self.release_noisy_kv(kv_id)
 
     def execute_model(
         self,
@@ -528,28 +573,26 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
-        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+        # KV assembly only. The pipeline's request forward chooses Cell execution.
+        if self._ar_diffusion_noisy_kv_capability is not None:
             started = time.perf_counter()
-            kv_id, persist, reset, close_session = self._noisy_kv_id(req)
-            if reset:
-                self.release_noisy_kv(kv_id)
-            ctx = self._make_chunk_context()
+            entries = [self._noisy_kv_id(req)]
+            self._prepare_noisy_kv_lifecycles(entries)
             try:
-                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
+                with self._bound_noisy_kv():
                     output = super().execute_model(
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
             except Exception:
-                self.release_noisy_kv(kv_id)
+                self._finalize_noisy_kv_lifecycles(entries, fail_closed=True)
                 logger.warning(
                     "AR-Diffusion chunk forward failed for kv_id=%s; NoisyKV versions were released fail-closed",
-                    kv_id,
+                    entries[0][0],
                 )
                 raise
-            if close_session or not persist:
-                # Ephemeral requests and explicit close drop the pool key; a
-                # persistent session_id leaves retained history for the outer owner.
-                self.release_noisy_kv(kv_id)
+            # Ephemeral requests and explicit close drop the pool key; a
+            # persistent session_id leaves retained history for the outer owner.
+            self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:
@@ -579,29 +622,33 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
-        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+        """Bind Noisy KV around the mainline batch entry when the pipeline declared it.
+
+        Paged timeline KV stays single-sequence. Noisy KV uses the same
+        reset / persist / close lifecycle as ``execute_model`` for every
+        scheduled new request, but rejects duplicate session ids in one wave
+        (batch-wide reset must not race earlier same-session history reads).
+        This method does not pick a Cell executor.
+        """
+        if self._ar_diffusion_noisy_kv_capability is not None:
             # Fail-closed only for this wave's pool keys — never wipe unrelated sessions.
-            batch_kv_ids: list[str] = []
-            for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
-                req = getattr(new_req, "req", None)
-                if req is None:
-                    continue
-                kv_id, _persist, _reset, _close = self._noisy_kv_id(req)
-                if kv_id:
-                    batch_kv_ids.append(kv_id)
-            ctx = self._make_chunk_context()
+            entries = self._scheduled_noisy_kv_lifecycles(scheduler_output)
+            # Reject before any batch-wide reset so a later same-session reset
+            # cannot erase history needed by an earlier request in this wave.
+            self._reject_duplicate_noisy_kv_sessions(entries)
+            self._prepare_noisy_kv_lifecycles(entries)
             try:
-                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
-                    return super().execute_model_batch(scheduler_output, od_config)
+                with self._bound_noisy_kv():
+                    output = super().execute_model_batch(scheduler_output, od_config)
             except Exception:
-                for kv_id in dict.fromkeys(batch_kv_ids):
-                    ctx.kv.release_session(kv_id)
+                self._finalize_noisy_kv_lifecycles(entries, fail_closed=True)
                 logger.warning(
                     "AR-Diffusion chunk batch failed; released NoisyKV for batch kv_ids=%s (other sessions kept)",
-                    list(dict.fromkeys(batch_kv_ids)),
+                    list(dict.fromkeys(kv_id for kv_id, *_ in entries if kv_id)),
                 )
                 raise
+            self._finalize_noisy_kv_lifecycles(entries, fail_closed=False)
+            return output
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

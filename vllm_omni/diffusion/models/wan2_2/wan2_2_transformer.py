@@ -932,7 +932,7 @@ class WanTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        # Optional Cell / Noisy KV layer split by (rank, world) without mocking
+        # Optional Cell / Noisy PP layer split by (rank, world) without mocking
         # Omni's S·G process group. When unset, use the live pipeline-parallel group.
         if layer_pp_world is not None:
             if layer_pp_world < 1:
@@ -999,7 +999,7 @@ class WanTransformer3DModel(nn.Module):
             )
 
         if pp_world is not None:
-            # Explicit (rank, world) slice — used by Cell / Noisy KV layer groups.
+            # Explicit (rank, world) slice — used by Cell / Noisy PP layer groups.
             start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_world)
             blocks: list[nn.Module] = []
             for idx in range(num_layers):
