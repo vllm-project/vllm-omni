@@ -645,6 +645,15 @@ def test_init_rejects_cache_backend_with_cfg_parallel(cache_backend: str, error:
         MammothModa2DiTPipeline(od_config=config)
 
 
+def test_init_rejects_more_than_two_cfg_parallel_ranks() -> None:
+    config = _cache_dit_od_config()
+    config.cache_backend = "none"
+    config.parallel_config.cfg_parallel_size = 3
+
+    with pytest.raises(NotImplementedError, match="cfg_parallel_size must be 1 or 2, got 3"):
+        MammothModa2DiTPipeline(od_config=config)
+
+
 @pytest.mark.skipif(
     current_omni_platform.is_rocm(),
     reason="vLLM ROCm custom ops lack CPU fallback",

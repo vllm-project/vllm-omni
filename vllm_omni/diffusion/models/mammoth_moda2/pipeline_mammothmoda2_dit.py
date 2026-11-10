@@ -397,7 +397,12 @@ class MammothModa2DiTPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         cache_backend = str(getattr(od_config, "cache_backend", "") or "").lower()
-        cfg_parallel = (self.parallel_config.cfg_parallel_size or 1) > 1
+        cfg_parallel_size = self.parallel_config.cfg_parallel_size or 1
+        if cfg_parallel_size > 2:
+            raise NotImplementedError(
+                f"MammothModa2 has exactly two CFG branches; cfg_parallel_size must be 1 or 2, got {cfg_parallel_size}."
+            )
+        cfg_parallel = cfg_parallel_size > 1
         if cfg_parallel and cache_backend == "cache_dit":
             raise NotImplementedError(
                 "MammothModa2 does not support Cache-DiT with CFG parallelism because "
