@@ -4,17 +4,19 @@
 """π0.5 model-level functional + latency sweep over batch size × camera views.
 
 Runs the real ``lerobot/pi05_base`` weights on GPU and, for every
-(batch_size, num_views) cell, checks that a full 10-step flow-matching
-``sample_actions`` produces a correctly shaped finite action chunk, then times
-it. Model level on purpose: the OpenPI serving path is B=1 by construction
-(``pi05.yaml`` sets ``max_num_seqs: 1``), so batch behaviour can only be
-exercised here.
+(batch_size, num_views) cell, checks that a full flow-matching
+``sample_actions`` (``num_inference_steps`` steps) produces a correctly shaped
+finite action chunk, then times it. Model level on purpose: the OpenPI serving
+path is B=1 by construction (``pi05.yaml`` sets ``max_num_seqs: 1``), so batch
+behaviour can only be exercised here.
 
 The model is built by ``Pi05Pipeline`` as the server builds it, from the deploy
 config's ``model_config``: ``--dtype`` sets the serving dtype (bfloat16 is the
 mixed layout serving runs), and the optimized path (CUDA graphs over the fused
 Triton kernels) runs unless ``--enforce-eager`` is passed. The optimized path
-serves batch 1; other batch sizes run eagerly.
+serves batch 1; other batch sizes run eagerly. Every input shape, the step
+count and the expected output shape come from the built model's resolved
+``model.config``, so any valid deploy config is benchmarked at its own shapes.
 
     python bench_pi05.py --out results/            # full sweep
     python bench_pi05.py --bs 1 --views 3 --iters 5
@@ -34,13 +36,6 @@ import time
 from pathlib import Path
 
 import torch
-
-# The deployed shapes (``vllm_omni/deploy/pi05.yaml``), which make_inputs feeds.
-ACTION_DIM = 32
-ACTION_HORIZON = 50
-MAX_TOKEN_LEN = 200
-MAX_CAMERAS = 3
-NUM_STEPS = 10
 
 
 def resolve_checkpoint(path: str) -> str:
@@ -72,33 +67,44 @@ def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eag
     return pipeline.model.eval()
 
 
-def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
+def expected_shape(config, batch_size: int) -> tuple[int, int, int]:
+    """``sample_actions``' output: the chunk at the padded ``max_action_dim``
+    width, which ``Pi05Processor`` crops to ``action_dim`` afterwards."""
+    return (batch_size, config.chunk_size, config.max_action_dim)
+
+
+def make_inputs(config, batch_size: int, num_views: int, device: str, seed: int = 0):
     """Synthetic but deterministic inputs, shaped exactly as the pipeline feeds
-    them: one (B, 3, 224, 224) tensor per camera slot plus a padded token block.
-    Slots past ``num_views`` are padded as ``Pi05Processor`` pads a missing
-    camera: an all -1 image with a false mask."""
+    them for ``config``: one (B, 3, H, W) tensor per camera slot
+    (``image_resolution``, ``max_cameras`` slots), a token block padded to
+    ``tokenizer_max_length``, and noise of the action chunk's shape. Slots past
+    ``num_views`` are padded as ``Pi05Processor`` pads a missing camera: an
+    all -1 image with a false mask."""
+    height, width = config.image_resolution
+    text_len = config.tokenizer_max_length
     g = torch.Generator(device="cpu").manual_seed(seed)
-    images = [torch.rand(batch_size, 3, 224, 224, generator=g).to(device) * 2 - 1 for _ in range(num_views)]
+    images = [torch.rand(batch_size, 3, height, width, generator=g).to(device) * 2 - 1 for _ in range(num_views)]
     image_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in range(num_views)]
-    for _ in range(num_views, MAX_CAMERAS):
-        images.append(torch.full((batch_size, 3, 224, 224), -1.0, device=device))
+    for _ in range(num_views, config.max_cameras):
+        images.append(torch.full((batch_size, 3, height, width), -1.0, device=device))
         image_masks.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
-    # π0.5 pads the prompt (task text + discretized state) to 200 tokens.
-    lang_tokens = torch.randint(0, 1000, (batch_size, MAX_TOKEN_LEN), generator=g).to(device)
-    lang_masks = torch.ones(batch_size, MAX_TOKEN_LEN, dtype=torch.bool, device=device)
-    noise = torch.randn(batch_size, ACTION_HORIZON, ACTION_DIM, generator=g).to(device)
+    # π0.5 pads the prompt (task text + discretized state) to tokenizer_max_length.
+    lang_tokens = torch.randint(0, 1000, (batch_size, text_len), generator=g).to(device)
+    lang_masks = torch.ones(batch_size, text_len, dtype=torch.bool, device=device)
+    noise = torch.randn(expected_shape(config, batch_size), generator=g).to(device)
     return images, image_masks, lang_tokens, lang_masks, noise
 
 
 def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, iters: int) -> dict:
-    images, image_masks, lang_tokens, lang_masks, noise = make_inputs(batch_size, num_views, device)
+    config = model.config
+    images, image_masks, lang_tokens, lang_masks, noise = make_inputs(config, batch_size, num_views, device)
     kwargs = dict(
         images=images,
         image_masks=image_masks,
         lang_tokens=lang_tokens,
         lang_masks=lang_masks,
         noise=noise,
-        num_steps=NUM_STEPS,
+        num_steps=config.num_inference_steps,
     )
 
     if device.startswith("cuda"):
@@ -118,7 +124,7 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
                 torch.accelerator.synchronize()
             latencies.append((time.perf_counter() - start) * 1000.0)
 
-    expected = (batch_size, ACTION_HORIZON, ACTION_DIM)
+    expected = expected_shape(config, batch_size)
     ok_shape = tuple(actions.shape) == expected
     ok_finite = bool(torch.isfinite(actions).all())
 
@@ -160,7 +166,13 @@ def environment(model, device: str) -> dict:
         "vllm": version("vllm"),
         "vllm-omni": version("vllm-omni"),
         "transformers": version("transformers"),
-        "num_steps": NUM_STEPS,
+        # The shapes this run fed and checked, from the resolved model.config.
+        "num_steps": model.config.num_inference_steps,
+        "chunk_size": model.config.chunk_size,
+        "max_action_dim": model.config.max_action_dim,
+        "max_cameras": model.config.max_cameras,
+        "image_resolution": list(model.config.image_resolution),
+        "tokenizer_max_length": model.config.tokenizer_max_length,
         # What the built model runs, not what was asked for.
         "path": "eager" if getattr(model, "cuda_graphs", None) is None else "optimized (CUDA graphs + fused kernels)",
         "gemm_weight_dtype": str(
@@ -216,7 +228,13 @@ def main() -> int:
         help="Run the eager baseline instead of the optimized path (CUDA graphs + fused kernels)",
     )
     parser.add_argument("--bs", type=int, nargs="+", default=[1, 2, 4, 8])
-    parser.add_argument("--views", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument(
+        "--views",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Camera counts to sweep (default: 1 to the model config's max_cameras)",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--out", default="pi05_bench")
@@ -230,6 +248,13 @@ def main() -> int:
     print(f"checkpoint: {checkpoint_dir}")
 
     model = build_model(checkpoint_dir, args.deploy_config, args.dtype, args.enforce_eager)
+    # Checked against the built model: Pi05Pipeline resolves max_cameras from the
+    # checkpoint and the deploy config together.
+    max_cameras = model.config.max_cameras
+    if args.views is None:
+        args.views = list(range(1, max_cameras + 1))
+    elif any(not 1 <= views <= max_cameras for views in args.views):
+        parser.error(f"--views must be within 1..{max_cameras} (the model config's max_cameras), got {args.views}")
     device = str(next(model.parameters()).device)
     env = environment(model, device)
     print(json.dumps(env, indent=2))
@@ -246,7 +271,7 @@ def main() -> int:
                     "batch_size": batch_size,
                     "num_views": num_views,
                     "shape": "-",
-                    "expected_shape": f"{batch_size}x{ACTION_HORIZON}x{ACTION_DIM}",
+                    "expected_shape": "x".join(str(d) for d in expected_shape(model.config, batch_size)),
                     "shape_ok": False,
                     "finite": False,
                     "status": f"ERROR: {type(exc).__name__}: {exc}"[:200],
