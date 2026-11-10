@@ -1394,13 +1394,40 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     group = weekly["steps"][0]
     jobs = {
-        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
-        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
-        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
+        "Reliability Test · qwen3-omni": (
+            "mi300_2",
+            "slow and rocm and MI325 and cards_2",
+            "tests/dfx/reliability/test_qwen3_omni.py",
+        ),
+        "Reliability Test · wan22": (
+            "mi300_1",
+            "slow and rocm and MI325 and cards_1",
+            "tests/dfx/reliability/test_wan22.py",
+        ),
+        "Reliability Test · hunyuan-image": (
+            "mi300_4",
+            "slow and rocm and MI325 and cards_4",
+            "tests/dfx/reliability/test_hunyuan_image.py",
+        ),
+        "Reliability Test · minicpmo-4.5": (
+            "mi300_1",
+            "slow and rocm and MI325 and cards_1",
+            "tests/dfx/reliability/test_minicpmo_4_5.py",
+        ),
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU": (
+            "mi300_1",
+            "slow and rocm and MI325 and H100 and cards_1",
+            "tests/dfx/reliability/invalid_param_test/",
+        ),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
-            "cards_2",
+            "slow and rocm and MI325 and H100 and cards_2",
             "test_invalid_omni_chat.py",
+        ),
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": (
+            "mi300_1",
+            "slow and rocm and MI325 and L4 and cards_1",
+            "tests/dfx/reliability/invalid_param_test/",
         ),
     }
 
@@ -1408,13 +1435,13 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "if" not in group
     assert [step["label"] for step in group["steps"]] == list(jobs)
     for step in group["steps"]:
-        pool, cards, filename = jobs[step["label"]]
+        pool, marker, filename = jobs[step["label"]]
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
         assert step["grade"] == "NonBlocking"
         assert step["depends_on"] == "amd-build"
-        assert "slow and rocm and MI325 and " + cards in command
+        assert marker in command
         assert filename in command
         assert filename not in nightly
     assert "tests/dfx/reliability/" not in nightly
@@ -1442,6 +1469,24 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "collection_message": "Expected exactly 17 Wan2.2 reliability nodes",
             "junit_message": "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
         },
+        "Reliability Test · minicpmo-4.5": {
+            "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
+            "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
+            "expected_nodes": 3,
+            "expected_skipped": 0,
+            "timeout": "165m",
+            "collection_message": "Expected exactly 3 MiniCPM-o 4.5 reliability nodes",
+            "junit_message": "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+        },
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
+            "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
+            "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
+            "expected_nodes": 76,
+            "expected_skipped": 5,
+            "timeout": "75m",
+            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+        },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
@@ -1450,6 +1495,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "timeout": "75m",
             "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
             "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+        },
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": {
+            "artifact_path": "artifacts/rocm-invalid-parameters-audio/**/*",
+            "artifact_env": "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
+            "expected_nodes": 127,
+            "expected_skipped": 26,
+            "timeout": "105m",
+            "collection_message": "Expected exactly 127 audio invalid-parameter nodes",
+            "junit_message": "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
         },
     }
     for label, expected in guarded_jobs.items():
@@ -1505,6 +1559,22 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
         ),
         (
+            "Reliability Test · minicpmo-4.5",
+            "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
+            "minicpmo-reliability-guard",
+            3,
+            0,
+            "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+        ),
+        (
+            "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+            "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
+            "invalid-parameters-single-reliability-guard",
+            76,
+            5,
+            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+        ),
+        (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
             "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
             "invalid-parameters-reliability-guard",
@@ -1512,8 +1582,16 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             0,
             "Expected exactly 24 executed invalid-parameter reliability tests",
         ),
+        (
+            "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+            "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
+            "invalid-parameters-audio-reliability-guard",
+            127,
+            26,
+            "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+        ),
     ),
-    ids=("qwen3-omni", "wan22", "invalid-parameters"),
+    ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
 )
 def test_weekly_reliability_executes_junit_guard_before_exit(
     tmp_path: Path,
