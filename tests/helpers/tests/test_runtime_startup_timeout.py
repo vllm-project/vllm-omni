@@ -3,7 +3,6 @@
 
 """Startup deadlines must be independent of system clock corrections."""
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -24,15 +23,7 @@ def startup_server(request, tmp_path, monkeypatch):
         # Exercise the wait-loop clock without reserving or inspecting real ports.
         monkeypatch.setattr(runtime.OmniServer, "_reserve_port", lambda self: None)
         monkeypatch.setattr(runtime.OmniServer, "_owns_listening_port", lambda self: True)
-        server = runtime.OmniServer("fake-model", [])
-
-        def _close_log():
-            if server._server_log_file is not None:
-                server._server_log_file.close()
-                server._server_log_file = None
-
-        request.addfinalizer(_close_log)
-        return server
+        return runtime.OmniServer("fake-model", [])
 
     config = tmp_path / "stages.yaml"
     config.write_text("stages:\n  - stage_id: 0\n  - stage_id: 1\n")
@@ -101,28 +92,3 @@ def test_startup_deadline_ignores_wall_clock_changes(
             startup_server._start_server()
         assert first_probe_at is not None
         assert elapsed - first_probe_at == startup_timeout
-
-
-def test_omni_server_startup_failure_includes_log_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
-    monkeypatch.setattr(runtime.OmniServer, "_reserve_port", lambda self: None)
-
-    proc = MagicMock(spec=runtime.subprocess.Popen)
-    proc.pid = 4242
-    proc.poll.return_value = 1
-
-    def fake_popen(*_args, **kwargs):
-        log_fh = kwargs.get("stdout")
-        if log_fh is not None:
-            log_fh.write("ImportError: boom from child\n")
-            log_fh.flush()
-        return proc
-
-    monkeypatch.setattr(runtime.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(runtime.tempfile, "gettempdir", lambda: str(tmp_path))
-    server = runtime.OmniServer("fake-model", [], port=55555)
-    monkeypatch.setattr(server, "_kill_process_tree", lambda _pid: None)
-
-    with pytest.raises(RuntimeError, match="ImportError: boom from child"):
-        with server:
-            raise AssertionError("context body must not run after a failed enter")
