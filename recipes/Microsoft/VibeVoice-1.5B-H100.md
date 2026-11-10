@@ -134,9 +134,19 @@ not insert reference audio. Other unregistered voice names are rejected.
 Stored upload transcripts are not used as conditioning. For multi-speaker requests, use `ref_audio` instead
 of an uploaded `voice` name.
 
-Only `speed=1.0` and output `sample_rate=24000` are supported. Request-level
-seed, instructions, language, ref_text, task_type, ref_audio_2,
-speaker_embedding, word_timestamps and non-empty extra_params are rejected.
+Only `speed=1.0` and output `sample_rate=24000` are supported. Instructions,
+language, ref_text, task_type, ref_audio_2, speaker_embedding, word_timestamps
+and non-empty extra_params are rejected.
+
+A request-level `seed` gives that request private random streams for the
+reference-VAE sampling and the per-frame diffusion noise. Those depend only on
+(seed, reference audio), not on earlier requests, concurrent requests or the
+global RNG, and the global RNG is left untouched. Without `seed` the shared
+global RNG is used as before. The same seed does not guarantee a bit-identical
+waveform when batch composition differs (batched kernels round differently), and
+it does not avoid prompt-leak failures: a given seed can still draw bad noise, so
+retry such a request with another seed.
+
 Model-specific controls belong in `extra_params`; the shared request schema
 ignores unknown top-level JSON keys rather than forwarding them to the adapter.
 CFG=1.3 and ten diffusion steps are fixed.

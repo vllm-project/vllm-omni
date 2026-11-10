@@ -70,9 +70,12 @@ def processor(tmp_path, mocker, request):
     return model_cls._processor_factory.build_processor(InputProcessingContext(model_config, tokenizer))
 
 
-def _apply(processor, ids, audio, cache=None):
+def _apply(processor, ids, audio, cache=None, **kwargs):
     items = processor.info.parse_mm_data({"audio": audio})
-    return processor.apply(ProcessorInputs(prompt=ids, mm_data_items=items, cache=cache), TimingContext(enabled=False))
+    return processor.apply(
+        ProcessorInputs(prompt=ids, mm_data_items=items, cache=cache, hf_processor_mm_kwargs=kwargs),
+        TimingContext(enabled=False),
+    )
 
 
 def test_native_config_and_legacy_rejection():
@@ -133,6 +136,27 @@ def test_reference_lengths_and_cache_hit(processor, mocker):
         assert cached["mm_placeholders"]["audio"][0].length == count
         torch.testing.assert_close(data["input_values"], first["mm_kwargs"].get_data()["input_values"], atol=0, rtol=0)
     assert ids == [1, 3, 2, 1]
+
+
+def test_reference_seed_field_and_identity(processor):
+    ids = [1, 3, 2, 1]
+    audio = (np.linspace(-0.1, 0.1, 3200, dtype=np.float32), 24000)
+    results = {
+        s: _apply(processor, ids, audio, **({} if s is None else {"reference_seed": s})) for s in (None, 0, 7, -7)
+    }
+    seeds = {s: r["mm_kwargs"].get_data()["audio_seed"] for s, r in results.items()}
+    assert seeds[None].tolist() == [[0, 0]] and seeds[0].tolist() == [[1, 0]]
+    assert seeds[7].tolist() == [[1, 7]] and seeds[-7].tolist() == [[1, -7]]
+    assert seeds[7].dtype == torch.int64 and seeds[7].device.type == "cpu"
+    # The encoder cache is keyed by this identity: a sampled embedding must never be shared across seeds.
+    ids_by_seed = {s: r["mm_hashes"]["audio"][0] for s, r in results.items()}
+    assert len(set(ids_by_seed.values())) == len(ids_by_seed)
+    assert _apply(processor, ids, audio, reference_seed=7)["mm_hashes"]["audio"][0] == ids_by_seed[7]
+    for bad in (True, 1.5, "1", 2**63, -(2**63) - 1):
+        with pytest.raises(ValueError, match="64-bit"):
+            _apply(processor, ids, audio, reference_seed=bad)
+    with pytest.raises(ValueError, match="overrides"):
+        _apply(processor, ids, audio, reference_seed=1, sampling_rate=16000)
 
 
 def test_reference_resampling_and_rejection(processor):

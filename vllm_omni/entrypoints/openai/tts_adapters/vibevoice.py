@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.model_executor.models.vibevoice.processing_vibevoice import REFERENCE_SEED_KEY
 from vllm_omni.model_executor.models.vibevoice.prompt import parse_vibevoice_script, render_script_prompt
 
 logger = init_logger(__name__)
@@ -32,7 +33,6 @@ _UNSUPPORTED_FIELDS = (
     "x_vector_only_mode",
     "initial_codec_chunk_frames",
     "non_streaming_mode",
-    "seed",
 )
 
 
@@ -121,6 +121,11 @@ class VibeVoiceTTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] = {"prompt": render_script_prompt(lines, speakers[: len(audio)])}
         if audio:
             prompt["multi_modal_data"] = {"audio": audio}
+            if request.seed is not None:
+                # The shared serving path seeds the request's SamplingParams (diffusion noise); the
+                # reference VAE noise is drawn in the cached multimodal encoder, so the seed must
+                # also be part of the item's identity (processor kwargs are hashed into it).
+                prompt["mm_processor_kwargs"] = {REFERENCE_SEED_KEY: int(request.seed)}
         return PreparedRequest(prompt=prompt, model_type=self.name)
 
     def apply_sampling_overrides(

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for VibeVoice per-step row/state handling (no weights, no GPU)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers.models.vibevoice_acoustic_tokenizer.modeling_vibevoice_acoustic_tokenizer import (
@@ -47,11 +49,18 @@ def inference(mocker):
 
 
 def _step(inference, rows, sampled):
-    """rows: (request_id, num_computed, num_scheduled, prompt_len); returns (fed embeds, payload)."""
+    """rows: (request_id, num_computed, num_scheduled, prompt_len[, seed]); returns (fed embeds, payload)."""
     inference.begin_step()
     fed = [
-        inference.add_row(rid, num_computed=c, num_scheduled=n, prompt_len=p, input_embeds=torch.ones(n, HIDDEN))
-        for rid, c, n, p in rows
+        inference.add_row(
+            rid,
+            num_computed=c,
+            num_scheduled=n,
+            prompt_len=p,
+            input_embeds=torch.ones(n, HIDDEN),
+            seed=seed[0] if seed else None,
+        )
+        for rid, c, n, p, *seed in rows
     ]
     inference.record_hidden(torch.ones(len(rows), HIDDEN))
     inference.record_sampled([[token] for token in sampled])
@@ -86,6 +95,110 @@ def test_audio_subset_shares_one_noise_draw(inference):
     inference._negative_kv.forward_step.assert_called_once()
     assert inference._negative_kv.forward_step.call_args.args[0] == ["c", "b"]
     torch.testing.assert_close(inference._model.sample_audio_latent.call_args.args[2], expected, atol=0, rtol=0)
+
+
+def _noise(inference):
+    return inference._model.sample_audio_latent.call_args.args[2]
+
+
+def test_seeded_noise_is_private_to_the_request(inference):
+    """Same seed -> same stream, whatever the batch mates, history or global RNG; globals untouched."""
+    for rid, seed in ("a", 5), ("b", 5), ("c", 6), ("d", None):
+        _step(inference, [(rid, 0, 2, 2, seed)], [BOS])
+    torch.manual_seed(1)
+    before = torch.get_rng_state()
+    _step(inference, [("a", 2, 1, 2), ("c", 2, 1, 2)], [AUDIO, AUDIO])
+    first = _noise(inference)
+    _step(inference, [("b", 2, 1, 2)], [AUDIO])  # alone, reordered history, other request id
+    assert torch.equal(_noise(inference)[:1], first[:1])  # a and b share seed 5 -> same first frame
+    assert not torch.equal(first[0], first[1])  # seed 6 differs
+    assert torch.equal(torch.get_rng_state(), before)  # seeded rows never consume the global stream
+    _step(inference, [("a", 3, 1, 2), ("c", 3, 1, 2)], [AUDIO, AUDIO])
+    assert not torch.equal(_noise(inference), first)  # the stream advances per frame
+    with torch.random.fork_rng(devices=[]):  # replay: a request's frames are a pure function of its seed
+        generator = torch.Generator().manual_seed(5)
+        frames = [torch.randn(LATENT, generator=generator) for _ in range(2)]
+    assert torch.equal(first[0], frames[0]) and torch.equal(_noise(inference)[0], frames[1])
+
+
+def test_unseeded_rows_keep_the_shared_draw_beside_seeded_rows(inference):
+    for rid, seed in (("s", 3), ("u", None), ("v", None)):
+        _step(inference, [(rid, 0, 2, 2, seed)], [BOS])
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(9)
+        expected = torch.randn(2 * 2, LATENT)
+        torch.manual_seed(9)
+        _step(inference, [("u", 2, 1, 2), ("s", 2, 1, 2), ("v", 2, 1, 2)], [AUDIO] * 3)
+    noise = _noise(inference)
+    assert noise.shape == (6, LATENT)
+    torch.testing.assert_close(noise[[0, 2]], expected[:2], atol=0, rtol=0)  # first halves of u, v
+    torch.testing.assert_close(noise[[3, 5]], expected[2:], atol=0, rtol=0)
+    assert torch.equal(noise[1], noise[4])  # the seeded row repeats its draw in the unused half
+
+
+class _NoisyTower(torch.nn.Module):
+    """Stands in for the sampled VAE: latents = waveform + randn noise, drawn like the real encoder."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def encode(self, values, sample=True):
+        return SimpleNamespace(latents=(values + torch.randn_like(values)).transpose(1, 2))  # (B, tokens, 1)
+
+
+@pytest.fixture
+def encoder():
+    stub = SimpleNamespace(
+        samples_per_token=2,
+        audio_tower=_NoisyTower(),
+        latent_bias_factor=0.0,
+        latent_scaling_factor=1.0,
+        multi_modal_projector=lambda x: x,
+    )
+    stub._encode_references = lambda rows, counts: VibeVoiceModel._encode_references(stub, rows, counts)
+    return lambda *args: VibeVoiceModel.reference_embeddings(stub, *args)
+
+
+def _refs(*lengths):
+    rows = [torch.zeros(1, n) for n in lengths]
+    return rows, [torch.tensor(n // 2) for n in lengths]
+
+
+def _seed(*seeds):
+    return [torch.tensor([s is not None, s or 0]) for s in seeds]
+
+
+def test_seeded_reference_noise_depends_only_on_audio_and_seed(encoder):
+    rows, counts = _refs(8, 4, 6)
+    torch.manual_seed(1)
+    before = torch.get_rng_state()
+    together = encoder(rows, counts, _seed(5, 5, 6))
+    assert torch.equal(torch.get_rng_state(), before)  # the global stream is untouched
+    torch.manual_seed(99)
+    alone = encoder(rows[1:2], counts[1:2], _seed(5))  # different batch mates, padding and global RNG
+    assert torch.equal(together[1], alone[0])
+    other = encoder(rows[:1], counts[:1], _seed(6))
+    assert not torch.equal(together[0], other[0])
+    assert torch.equal(together[0], encoder(rows[:1], counts[:1], _seed(5))[0])
+
+
+def test_unseeded_reference_keeps_batched_global_draw(encoder):
+    rows, counts = _refs(8, 4)
+    for seeds in (None, _seed(None, None)):
+        torch.manual_seed(3)
+        reference = encoder(rows, counts, seeds)
+        torch.manual_seed(3)
+        padded = torch.stack([torch.nn.functional.pad(r, (0, 8 - r.shape[-1])) for r in rows])
+        expected = (padded + torch.randn_like(padded)).transpose(1, 2)
+        assert torch.equal(reference[0], expected[0, :4]) and torch.equal(reference[1], expected[1, :2])
+    # A seeded item neither changes nor consumes the unseeded item's global draw.
+    torch.manual_seed(3)
+    mixed = encoder(rows, counts, _seed(None, 4))
+    torch.manual_seed(3)
+    assert torch.equal(mixed[0], (rows[0][None] + torch.randn_like(rows[0][None])).transpose(1, 2)[0, :4])
+    with pytest.raises(ValueError, match="aligned"):
+        encoder(rows, counts, _seed(1))
 
 
 def test_release_and_unsupported_recompute(inference):

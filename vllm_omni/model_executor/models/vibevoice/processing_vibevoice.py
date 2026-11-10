@@ -34,6 +34,11 @@ from .prompt import AUDIO_BOS, AUDIO_EOS, AUDIO_TOKEN, MAX_SPEAKERS
 SAMPLE_RATE = 24000
 SAMPLES_PER_TOKEN = 3200
 MAX_REFERENCE_SAMPLES = 60 * SAMPLE_RATE
+#: The only accepted ``mm_processor_kwargs`` key. vLLM hashes processor kwargs into
+#: each multimodal item's identity, so the encoder cache never shares a sampled
+#: reference embedding between requests with different (or no) seeds.
+REFERENCE_SEED_KEY = "reference_seed"
+_INT64 = 2**63
 
 
 class VibeVoiceDataParser(MultiModalDataParser):
@@ -91,8 +96,12 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
     ) -> BatchFeature:
         # The supported checkpoint fixes normalization, padding and sample
         # rate. Do not silently accept overrides that alter reference tokens.
+        hf_kwargs = dict(hf_kwargs)
+        seed = hf_kwargs.pop(REFERENCE_SEED_KEY, None)
         if hf_kwargs:
             raise ValueError("VibeVoice does not support mm_processor_kwargs overrides.")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or not -_INT64 <= seed < _INT64):
+            raise ValueError(f"VibeVoice {REFERENCE_SEED_KEY} must be a 64-bit signed integer.")
         audio = hf_data["audio"]
         for item in audio:
             waveform = np.asarray(item)
@@ -112,6 +121,8 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
         outputs["audio_num_tokens"] = torch.div(
             valid_samples + SAMPLES_PER_TOKEN - 1, SAMPLES_PER_TOKEN, rounding_mode="floor"
         ).to(torch.int64)
+        # Per item ``(has_seed, seed)``; every reference of a request shares the request seed.
+        outputs["audio_seed"] = torch.tensor([[seed is not None, seed or 0]] * len(audio), dtype=torch.int64)
         return outputs
 
     def _get_mm_fields_config(
@@ -122,6 +133,7 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
         return {
             "input_values": MultiModalFieldConfig.batched("audio"),
             "audio_num_tokens": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+            "audio_seed": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(

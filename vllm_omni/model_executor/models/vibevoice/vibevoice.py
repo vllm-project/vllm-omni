@@ -132,11 +132,17 @@ class VibeVoiceModel(nn.Module):
         self,
         input_values: torch.Tensor | Sequence[torch.Tensor],
         audio_num_tokens: torch.Tensor | Sequence[torch.Tensor],
+        audio_seed: torch.Tensor | Sequence[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Encode a ragged reference batch with the official sampled VAE path.
 
         Token counts stay on CPU. Acoustic latents alone are used for reference
         conditioning; semantic feedback applies only to generated waveform.
+
+        Items with a request seed are encoded one at a time, unpadded, under a
+        forked RNG seeded with it, so the result depends only on (audio, seed):
+        not on batch mates, padding, or the global RNG stream, which is left
+        untouched. Unseeded items keep the batched global-RNG path.
         """
         counts = []
         for count in audio_num_tokens:
@@ -146,13 +152,38 @@ class VibeVoiceModel(nn.Module):
         rows = list(input_values)
         if not rows or len(rows) != len(counts):
             raise ValueError("VibeVoice reference waveform/count batches must be non-empty and aligned.")
-        lengths = [row.shape[-1] for row in rows]
         hop = self.samples_per_token
         for row, count in zip(rows, counts, strict=True):
             if row.ndim != 2 or row.shape[0] != 1 or not 0 < count * hop <= row.shape[-1]:
                 raise ValueError("VibeVoice reference waveform shape does not match its token count.")
+        seeds: list[int | None] = [None] * len(rows)
+        if audio_seed is not None:
+            if len(audio_seed) != len(rows):
+                raise ValueError("VibeVoice reference seed/waveform batches must be aligned.")
+            for index, item in enumerate(audio_seed):
+                flag, value = item.reshape(-1).tolist()
+                seeds[index] = int(value) if flag else None
         parameter = next(self.audio_tower.parameters())
-        batch = torch.stack([nn.functional.pad(row, (0, max(lengths) - row.shape[-1])) for row in rows])
+        embeddings: list[torch.Tensor | None] = [None] * len(rows)
+        unseeded = [i for i, seed in enumerate(seeds) if seed is None]
+        if unseeded:
+            batched = self._encode_references([rows[i] for i in unseeded], [counts[i] for i in unseeded])
+            for i, embedding in zip(unseeded, batched, strict=True):
+                embeddings[i] = embedding
+        device = parameter.device
+        fork_devices = [] if device.type == "cpu" else [device.index]
+        for i, seed in enumerate(seeds):
+            if seed is None:
+                continue
+            with torch.random.fork_rng(devices=fork_devices, device_type=device.type):
+                torch.manual_seed(seed)
+                (embeddings[i],) = self._encode_references([rows[i]], [counts[i]])
+        return tuple(embeddings)  # type: ignore[arg-type]
+
+    def _encode_references(self, rows: list[torch.Tensor], counts: list[int]) -> tuple[torch.Tensor, ...]:
+        parameter = next(self.audio_tower.parameters())
+        longest = max(row.shape[-1] for row in rows)
+        batch = torch.stack([nn.functional.pad(row, (0, longest - row.shape[-1])) for row in rows])
         latents = self.audio_tower.encode(batch.to(parameter), sample=True).latents
         latents = (latents + self.latent_bias_factor) * self.latent_scaling_factor
         embeddings = self.multi_modal_projector(latents)
@@ -260,7 +291,7 @@ class VibeVoiceForConditionalGeneration(nn.Module, SupportsMultiModal):
         input_values = kwargs.get("input_values")
         if input_values is None:
             return ()
-        return self.model.reference_embeddings(input_values, kwargs["audio_num_tokens"])
+        return self.model.reference_embeddings(input_values, kwargs["audio_num_tokens"], kwargs.get("audio_seed"))
 
     def forward(
         self,
@@ -295,6 +326,7 @@ class VibeVoiceForConditionalGeneration(nn.Module, SupportsMultiModal):
             num_scheduled=input_ids.shape[0],
             prompt_len=info["_omni_prompt_len"],
             input_embeds=input_embeds,
+            seed=info.get("_omni_seed"),
         )
         return input_ids, embeds, {}
 
