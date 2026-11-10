@@ -663,6 +663,8 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             persistent=False,
         )
 
+        self.local_transformer.eval()
+        self.input_local_transformer.eval()
         # CUDA Graph cache for local_forward (includes self.local_transformer inside base_local_forward).
         self.local_forward_cg_by_bs: dict[int, MiMoLocalDecodeCudaGraph] = {}
         self.local_forward_buf_by_bs: dict[int, MiMoLocalDecodeBuffer] = {}
@@ -870,7 +872,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -924,7 +928,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):

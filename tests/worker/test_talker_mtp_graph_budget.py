@@ -318,26 +318,35 @@ def test_v2_mtp_capture_restores_the_capturing_flag_while_profiling(
     import vllm.distributed.parallel_state as parallel_state
     import vllm.forward_context as forward_context
 
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
     state = object.__new__(OmniModelState)
+    state._embed_dim = 0
+    state.device = torch.device("cpu")
+    state.model = SimpleNamespace()
+    state.model.has_talker_mtp = False
+    state._mtp_state = MTPState(state)
+    state._mtp_state._raw_mtp = None
     calls = []
-    state._is_mtp_graph_runner = lambda: True
+    state._mtp_state._is_mtp_graph_runner = lambda: True
     state.model = SimpleNamespace(mtp_accepts_req_infos=False)
     state.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_num_of_warmups=1))
     state.device = "cpu"
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
-        setattr(state, name, torch.zeros(4))
-    state._mtp_sample_uniforms = None
-    state._get_mtp_capture_sizes = lambda: [2]
-    state._get_mtp_base_sampling_kwargs = lambda: {}
-    state._call_mtp_runner = lambda *args, **kwargs: calls.append(monitor.cudagraph_capturing_enabled)
+        setattr(state._mtp_state, name, torch.zeros(4))
+    state._mtp_state._mtp_sample_uniforms = None
+    state._mtp_state._get_mtp_capture_sizes = lambda: [2]
+    state._mtp_state._get_mtp_base_sampling_kwargs = lambda: {}
+    state._mtp_state._call_mtp_runner = lambda *args, **kwargs: calls.append(monitor.cudagraph_capturing_enabled)
     monkeypatch.setattr(parallel_state, "graph_capture", lambda device: _NullContext())
     monkeypatch.setattr(forward_context, "set_forward_context", lambda *args, **kwargs: _NullContext())
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", enabled_before)
 
-    state.capture_mtp_graphs(lambda num_reqs: SimpleNamespace(num_tokens=num_reqs), restore_capturing=restore_capturing)
+    state._mtp_state.capture_mtp_graphs(
+        lambda num_reqs: SimpleNamespace(num_tokens=num_reqs), restore_capturing=restore_capturing
+    )
 
     assert calls == [True, True]
     assert monitor.cudagraph_capturing_enabled is enabled_after

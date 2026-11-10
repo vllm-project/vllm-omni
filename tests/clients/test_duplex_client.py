@@ -324,6 +324,34 @@ async def test_session_expired_raises_from_event_stream(make_rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_s", [0.5, 30.0])
+async def test_websocket_upgrade_uses_handshake_timeout(monkeypatch, timeout_s):
+    import websockets
+
+    socket = FakeSocket()
+    observed_timeouts: list[float | None] = []
+
+    async def connect(url, *, additional_headers, max_size, open_timeout):
+        assert url == "ws://test-host:8099/v1/realtime"
+        assert additional_headers is None
+        assert max_size > 0
+        observed_timeouts.append(open_timeout)
+        return socket
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    client = DuplexClient(
+        "ws://test-host:8099",
+        model="test-model",
+        reconnect=None,
+        heartbeat_interval_s=None,
+        handshake_timeout_s=timeout_s,
+    )
+
+    assert await client._default_connect("ws://test-host:8099/v1/realtime") is socket
+    assert observed_timeouts == [timeout_s]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("headers", [None, {}, {"Authorization": "Bearer test-token", "X-Test": "duplex"}])
 async def test_websocket_handshake_forwards_extra_headers(headers):
     import websockets
@@ -387,6 +415,28 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
         sock.feed(SESSION_CLOSED)
         await close_task
     assert "session.close" in sock.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_get_session_stats_times_out_when_send_stalls(monkeypatch):
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    async with client:
+
+        async def hang(_raw: str) -> None:
+            await asyncio.Event().wait()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sock, "send", hang)
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(TimeoutError, match="sending session.stats"):
+                await client.get_session_stats(timeout_s=0.05)
+            assert asyncio.get_running_loop().time() - started < 1.0
+        close_task = asyncio.create_task(client.close())
+        await _drain(lambda: "session.close" in sock.sent_types())
+        sock.feed(SESSION_CLOSED)
+        await close_task
 
 
 @pytest.mark.asyncio
@@ -716,8 +766,9 @@ async def test_resume_after_transport_drop(monkeypatch, use_default_connect):
         sockets = iter([first, second])
         headers = {"Authorization": "Bearer test-token"}
 
-        async def connect(url, *, additional_headers, max_size):
+        async def connect(url, *, additional_headers, max_size, open_timeout):
             assert additional_headers == headers
+            assert open_timeout == 5.0
             calls.append(url)
             return next(sockets)
 
@@ -1410,6 +1461,20 @@ def test_summarize_session_request_metrics_averages_audio_turns():
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7},
     }
+
+
+def test_summarize_session_request_metrics_counts_turns_with_final_server_stats():
+    summary = summarize_session_request_metrics(
+        [
+            {"busy_rtf": 0.2, "stall_ratio": 0.5, "server_stats_final": True},
+            {"busy_rtf": None, "stall_ratio": None, "server_stats_final": False},
+        ],
+        session_id="sess-1",
+    )
+    # The means cover one turn; the count says so.
+    assert summary["busy_rtf"]["count"] == 1
+    assert (summary["audio_turn_count"], summary["server_stats_final_count"]) == (2, 1)
+    assert "server_stats_final_count" not in summarize_session_request_metrics([{"rtf": 0.5}], session_id="s")
 
 
 def test_summarize_session_request_metrics_includes_client_append_fields():

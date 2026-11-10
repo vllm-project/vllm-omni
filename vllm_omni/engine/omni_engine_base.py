@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config import WatermarkConfig
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
@@ -125,6 +126,7 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _watermark_config: WatermarkConfig | None = None
 
     def __init__(
         self,
@@ -136,11 +138,15 @@ class OmniEngineBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         collect_stage_metrics: bool = True,
+        watermark_config: WatermarkConfig | None = None,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
+        otlp_traces_endpoint: str | None = None,
         **kwargs: Any,
     ) -> None:
+        from vllm_omni.tracing import create_tracer_provider
+
         self.model = model
         self.tokenizer = tokenizer
         # Cached by get_diffusion_od_config().
@@ -158,6 +164,7 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._collect_stage_metrics = collect_stage_metrics
+        self._watermark_config = watermark_config
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
@@ -305,6 +312,11 @@ class OmniEngineBase:
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        # The orchestrator thread's event loop, captured once startup finishes.
+        # janus's async_q binds to the first loop that awaits it (the
+        # orchestrator loop here), so frontend submissions must route puts
+        # through this loop instead of awaiting async_q from their own loop.
+        self.orchestrator_loop: asyncio.AbstractEventLoop | None = None
         self._output_sink = OutputQueueSink(self.output_queue.sync_q)
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
@@ -318,6 +330,7 @@ class OmniEngineBase:
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
 
+        self.tracer_provider = create_tracer_provider(otlp_traces_endpoint)
         self.orchestrator_thread = threading.Thread(
             target=self._bootstrap_orchestrator,
             args=(
@@ -403,6 +416,7 @@ class OmniEngineBase:
             request_queue=self.request_queue,
             log_stats=self._log_stats,
             client_config=self._client_config,
+            watermark_config=self._watermark_config,
         )
         self._runtime.initialize()
 
@@ -479,10 +493,12 @@ class OmniEngineBase:
                 engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
+                tracer=self.tracer_provider.get_tracer("vllm_omni") if self.tracer_provider is not None else None,
                 log_stats=self._log_stats,
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
             )
+            await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()
@@ -520,6 +536,8 @@ class OmniEngineBase:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+                if self.tracer_provider is not None:
+                    self.tracer_provider.shutdown()
 
     def _validate_deployment(self) -> None:
         """Seam: check ``pipeline_config`` / ``deploy_config`` before stages start (default: nothing)."""
@@ -546,9 +564,7 @@ class OmniEngineBase:
                 self._try_shutdown("[OmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
-                startup_future.result(
-                    timeout=min(remaining, _STARTUP_POLL_INTERVAL_S),
-                )
+                self.orchestrator_loop = startup_future.result(timeout=min(remaining, _STARTUP_POLL_INTERVAL_S))
                 break
             except concurrent.futures.TimeoutError:
                 if not self.orchestrator_thread.is_alive():
@@ -994,12 +1010,12 @@ class OmniEngineBase:
         # and lets the destructor/free path handle asleep entries correctly
         # (returns a null handle so the C extension skips unmap/release).
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
-                allocator.release_pools()
-                logger.debug("[OmniEngine] Released CuMem memory pool during shutdown")
+            # Raises on platforms/builds without a sleep-mode allocator.
+            allocator = get_mem_allocator_instance()
+            allocator.release_pools()
+            logger.debug("[OmniEngine] Released sleep-mode memory pool during shutdown")
         except Exception:
             pass
 

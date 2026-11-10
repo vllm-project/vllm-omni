@@ -2,6 +2,7 @@
   "dataset": "Hothan/Omni-DuplexEval",
   "dataset_revision": null,
   "protocol_pin": "ca3c122b4d4bf67afd6b18ea5e724b4561bdde48",
+  "mix": "soundtrack",
   "sample_ids_per_split": {
     "RTD_world_knowledge": [
       "360",

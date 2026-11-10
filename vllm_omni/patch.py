@@ -24,17 +24,28 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
+from vllm_omni.cudagraph.moe_routing_batch_descriptor import (
+    patch_batch_descriptor_moe_routing_key,
+)
+from vllm_omni.cudagraph.moe_routing_dispatcher import patch_cudagraph_dispatcher_moe_routing
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+from vllm_omni.utils.mm_prefix import apply_img2img_mm_prefix_patch
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+# #9865: BatchDescriptor.moe_routing_key + CudagraphDispatcher expansion.
+# Must run before runners import BatchDescriptor into local names.
+patch_batch_descriptor_moe_routing_key()
+patch_cudagraph_dispatcher_moe_routing()
 
 # Decoder rounding is visible to audio encoders and can change mixed-media
 # answers. Preserve Omni's existing default while retaining explicit choices.
 apply_soundfile_first_audio_decode_patch()
+apply_img2img_mm_prefix_patch()
 
 # Omni's deploy config selects a runner per stage. vLLM 0.31's config property
 # otherwise defaults to v2 independently of the runner selected by our workers,
@@ -661,7 +672,10 @@ def release_cumem_allocations_for_shutdown(allocator) -> int:
 def _patch_cumem_free_callback_cuda() -> None:
     try:
         from vllm.device_allocator import cumem as cumem_module
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+        if not cumem_available:
+            return
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
@@ -708,7 +722,42 @@ def _patch_cumem_free_callback_cuda() -> None:
     _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
+def _patch_xpumem_free_callback_xpu() -> None:
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+        return
+
+    if not xpumem_available:
+        return
+
+    if getattr(XpuMemAllocator._python_free_callback, "_omni_xpumem_xpu_patched", False):
+        return
+
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            device, size, d_mem, _ = data.handle
+            result: tuple = (device, size, d_mem, [])
+            _PATCH_LOGGER.debug(
+                "[xpumem] Free callback: asleep entry %s -> empty handle",
+                ptr,
+            )
+            return result
+        # Drain pending kernels before the C extension unmaps.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    setattr(_patched_free_callback, "_omni_xpumem_xpu_patched", True)
+    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info("[xpumem] XpuMemAllocator._python_free_callback patched: asleep guard enabled for XPU.")
+
+
 _patch_cumem_free_callback_cuda()
+_patch_xpumem_free_callback_xpu()
 
 
 def _patch_batched_seeded_random_sample() -> None:

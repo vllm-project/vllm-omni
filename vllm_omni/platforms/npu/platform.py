@@ -160,6 +160,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         torch.npu.config.allow_internal_format = True
 
     @classmethod
+    def prepare_stage_engine(cls) -> None:
+        from vllm_omni.platforms.npu.mamba_compat import _install_ascend_mamba_prefill_end_compat
+
+        _install_ascend_mamba_prefill_end_compat()
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 

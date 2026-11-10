@@ -52,7 +52,7 @@ def _delta_params(n: int = 2):
 def test_thinker_forced_final_only_talker_stays_delta(serving_chat):
     serving_chat.engine_client = SimpleNamespace(stage_configs=_minicpmo45_stages())
 
-    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
 
     assert out[0].output_kind is RequestOutputKind.FINAL_ONLY
     assert out[1].output_kind is RequestOutputKind.DELTA
@@ -66,7 +66,7 @@ def test_typed_stages_force_thinker_final_only(serving_chat):
         ]
     )
 
-    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
 
     assert out[0].output_kind is RequestOutputKind.FINAL_ONLY
     assert out[1].output_kind is RequestOutputKind.DELTA
@@ -76,7 +76,7 @@ def test_typed_stages_force_thinker_final_only(serving_chat):
 def test_non_audio_request_is_untouched(serving_chat, modalities):
     serving_chat.engine_client = SimpleNamespace(stage_configs=_minicpmo45_stages())
 
-    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(), modalities)
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), modalities)
 
     assert [p.output_kind for p in out] == [RequestOutputKind.DELTA] * 2
 
@@ -85,7 +85,7 @@ def test_other_architectures_are_untouched(serving_chat):
     stages = [_stage("SomeOtherOmniForConditionalGeneration", "llm")]
     serving_chat.engine_client = SimpleNamespace(stage_configs=stages)
 
-    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(1), ["text", "audio"])
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(1), ["text", "audio"])
 
     assert out[0].output_kind is RequestOutputKind.DELTA
 
@@ -93,7 +93,20 @@ def test_other_architectures_are_untouched(serving_chat):
 def test_shorter_sampling_params_list_does_not_raise(serving_chat):
     serving_chat.engine_client = SimpleNamespace(stage_configs=_minicpmo45_stages())
 
-    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(1), ["text", "audio"])
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(1), ["text", "audio"])
 
     assert len(out) == 1
     assert out[0].output_kind is RequestOutputKind.FINAL_ONLY
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_ming3_sync_audio_waits_for_complete_thinker_text(serving_chat, async_chunk):
+    thinker = _typed_stage("BailingMoeV3AudioForConditionalGeneration", "thinker")
+    thinker.connector_config = SimpleNamespace(async_chunk=async_chunk)
+    serving_chat.engine_client = SimpleNamespace(stage_configs=[thinker, _stage("BailingTalker2", "ming3_tts")])
+
+    out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+
+    expected = RequestOutputKind.DELTA if async_chunk else RequestOutputKind.FINAL_ONLY
+    assert out[0].output_kind is expected
+    assert out[1].output_kind is RequestOutputKind.DELTA

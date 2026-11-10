@@ -6,17 +6,19 @@ Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
 
 import asyncio
+import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -43,6 +45,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
@@ -63,6 +66,7 @@ from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -305,9 +309,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
             wire_params = StageDiffusionClient._sampling_params_to_dict(sampling_params)
             self.request = OmniDiffusionRequest(
                 prompt=prompt,
-                sampling_params=StageDiffusionProc._reconstruct_sampling_params(
-                    object.__new__(StageDiffusionProc), wire_params
-                ),
+                sampling_params=OmniDiffusionSamplingParams.from_dict(wire_params),
                 request_id=request_id,
             )
 
@@ -335,6 +337,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
         stage_type="llm",
         final_output=False,
         get_kv_sender_info=lambda: None,
+        get_payload_sender_info=lambda: None,
     )
     diffusion_stage = RecordingDiffusionStage()
     orchestrator = object.__new__(Orchestrator)
@@ -541,7 +544,8 @@ def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
         ("tts", "Reference.", "generation"),
     ],
 )
-def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
+@pytest.mark.parametrize("token_count", [None, 64])
+def test_moss_reference_transcript_mode(variant, ref_text, mode, token_count, mocker):
     import torch
 
     reference = [torch.ones((3, 12), dtype=torch.int64)]
@@ -555,7 +559,13 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     )
     server._voice_created_at.return_value = 123
     request = OpenAICreateSpeechRequest(
-        input="Target.", ref_text=ref_text, language="English", voice="Speaker", seed=0, max_new_tokens=2048
+        input="Target.",
+        ref_text=ref_text,
+        language="English",
+        voice="Speaker",
+        seed=0,
+        max_new_tokens=2048,
+        token_count=token_count,
     )
     adapter = MossTTSAdapter(SpeechServingContext(server=server))
 
@@ -567,12 +577,19 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
 
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
 
+    duration = {"tokens": token_count} if variant == "local" and token_count is not None else {}
+    if mode == "continuation" and token_count is not None:
+        duration["tokens"] = 67
     if mode == "continuation":
-        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English")
+        assert prepared.tts_params["meta"] == {"ref_code_len": 3}
+        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English", **duration)
         processor.build_assistant_message.assert_called_once_with(audio_codes_list=reference)
         conversation = [processor.build_user_message.return_value, processor.build_assistant_message.return_value]
     else:
-        processor.build_user_message.assert_called_once_with(text="Target.", language="English", reference=reference)
+        assert "meta" not in prepared.tts_params
+        processor.build_user_message.assert_called_once_with(
+            text="Target.", language="English", reference=reference, **duration
+        )
         processor.build_assistant_message.assert_not_called()
         conversation = [processor.build_user_message.return_value]
     processor.assert_called_once_with(conversations=[conversation], mode=mode)
@@ -642,8 +659,11 @@ def _moss_adapter_with_stage_configs(stage_configs, mocker):
 
 
 def _moss_cuda_available(mocker, device_count=8):
-    mocker.patch("torch.cuda.is_available", return_value=True)
-    mocker.patch("torch.accelerator.device_count", return_value=device_count)
+    platform = mocker.patch("vllm_omni.platforms.current_omni_platform")
+    platform.is_npu.return_value = False
+    platform.get_device_count.return_value = device_count
+    platform.device_type = "cuda"
+    platform.get_torch_device.side_effect = lambda index: torch.device("cuda", index)
 
 
 @pytest.mark.parametrize(
@@ -701,7 +721,7 @@ def test_moss_ref_encoder_device_accepts_dict_runtime(mocker):
 def test_moss_ref_encoder_device_cpu_when_cuda_unavailable(mocker):
     import torch
 
-    mocker.patch("torch.cuda.is_available", return_value=False)
+    _moss_cuda_available(mocker, device_count=0)
     adapter = _moss_adapter_with_stage_configs(
         [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3"))],
         mocker,
@@ -731,7 +751,9 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    from_pretrained = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=processor)
+    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
+    from_pretrained = native_loader.return_value.from_pretrained
+    from_pretrained.return_value = processor
 
     assert adapter._get_moss_processor() is processor
     audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
@@ -828,10 +850,12 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
-def test_ming_flash_omni_build_constructs_prepared_request():
+@pytest.mark.parametrize("voice", [None, "DB30"])
+def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
     adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", voice="test")
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
@@ -839,8 +863,75 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] == "test"
+    assert info["voice_name"] == voice
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+    assert "speaker_conditioning" not in info
+    assert "prompt_audio_mode" not in info
     assert prepared.model_type == "ming_flash_omni_tts"
+
+
+def test_ming3_build_passes_base64_reference_audio():
+    class FakeServer:
+        uploaded_speakers = {}
+
+        async def _resolve_ref_audio_array(self, uri):
+            self.uri = uri
+            return [0.1, -0.1], 16000, "cache-key"
+
+    server = FakeServer()
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=encoded)
+
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], True))
+
+    assert server.uri == f"data:audio/wav;base64,{encoded}"
+    info = prepared.prompt["additional_information"]
+    reference = unpack_reference_audio(info)[0]
+    assert reference["sample_rate"] == 16000
+    assert reference["samples"].tolist() == pytest.approx([0.1, -0.1])
+    assert info["speaker_conditioning"] == "prompt"
+    assert info["prompt_audio_mode"] == "speaker_only"
+    assert info["instruction"] is None
+
+
+@pytest.mark.parametrize(
+    "count,samples,fetches", [(17, [0.1], 0), (2, [float("nan")], 1)], ids=["too-many-clips", "invalid-first-clip"]
+)
+def test_ming3_build_rejects_invalid_references_before_further_io(mocker, count, samples, fetches):
+    resolve = mocker.AsyncMock(return_value=(samples, 16000, "cache-key"))
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(_resolve_ref_audio_array=resolve)))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=["AA=="] * count)
+
+    with pytest.raises(ValueError, match="Reference audio"):
+        asyncio.run(adapter.build(request, [], True))
+
+    assert resolve.await_count == fetches
+
+
+def test_ming3_rejects_mixed_ip_and_reference():
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")
+    assert "either" in adapter.validate(request)
+
+
+def test_ming2_rejects_new_reference_api():
+    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="data:audio/wav;base64,AA==")
+    assert "not yet supported" in adapter.validate(request)
+
+
+def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello", voice="TEST_VOICE_A")
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert info["voice_name"] is None
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "TEST_VOICE_A"
+    assert info["speaker_conditioning"] == "mute"
+    assert prepared.model_type == "ming3_audio_tts"
 
 
 def test_step_audio2_build_constructs_open_assistant_turn():
@@ -1045,11 +1136,19 @@ def test_detects_ming3_by_architecture(architecture):
     assert detect_tts_model_type("llm", architecture) == "ming3_tts"
 
 
-def test_ming3_build_accepts_resolver_cache_key(mocker):
-    server = SimpleNamespace(_tts_tokenizer=object())
-    server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1], 24000, "cache-key"))
+@pytest.mark.parametrize("cuda", [False, True])
+def test_ming3_build_accepts_resolver_cache_key(mocker, cuda):
+    mocker.patch.object(ming3_tts_module.current_platform, "is_cuda", return_value=cuda)
+    server = SimpleNamespace(
+        _tts_tokenizer=object(),
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(model="/model")),
+    )
+    samples = np.array([0.1, 0.2], dtype=np.float32)
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(samples, 24000, "cache-key"))
     server._get_resolved_ref_audio_artifact_key = mocker.Mock(return_value="artifact-key")
-    mocker.patch.object(
+    embedding = torch.ones(1, 192)
+    extract = mocker.patch.object(ming3_tts_module, "_extract_speaker_embeddings", return_value=embedding)
+    build_prompt = mocker.patch.object(
         ming3_tts_module,
         "build_ming3_prompt",
         return_value={
@@ -1068,10 +1167,72 @@ def test_ming3_build_accepts_resolver_cache_key(mocker):
 
     prepared = asyncio.run(Ming3TTSAdapter(SpeechServingContext(server=server)).build(request, [], False))
 
-    server._resolve_ref_audio.assert_awaited_once_with(request.ref_audio)
+    server._resolve_ref_audio_array.assert_awaited_once_with(request.ref_audio)
     server._get_resolved_ref_audio_artifact_key.assert_called_once_with("cache-key")
+    # The cached array is copied, never aliased.
+    [waveform] = build_prompt.call_args.kwargs["reference_waveform"]
+    assert waveform.tolist() == [samples.tolist()] and waveform.data_ptr() != samples.ctypes.data
     assert prepared.prompt["additional_information"]["speaker_audio_keys"] == ["artifact-key"]
     assert prepared.model_type == "ming3_tts"
+    if cuda:
+        # Stage 0 embeds the reference clip on the GPU.
+        extract.assert_not_called()
+        assert build_prompt.call_args.kwargs["speaker_embedding"] is None
+        return
+    # Without CUDA, CAM++ runs in the API process; Stage 0 receives the embedding directly.
+    assert extract.call_args.args[1] == [waveform]
+    assert extract.call_args.args[0] == "/model"
+    assert extract.call_args.args[2:] == ([24000], ["artifact-key"])
+    assert build_prompt.call_args.kwargs["speaker_embedding"] is embedding
+
+
+def test_ming3_api_speaker_embeddings_reuse_artifact_keys(mocker):
+    extractor = mocker.Mock()
+    extractor.extract_from_waveform.side_effect = lambda waveform, rate: torch.full((192,), float(rate))
+    factory = mocker.patch(
+        "vllm_omni.model_executor.models.common.ming.speaker_extractor.SpeakerEmbeddingExtractor",
+        return_value=extractor,
+    )
+    mocker.patch.dict(ming3_tts_module._speaker_extractors, clear=True)
+    mocker.patch.dict(ming3_tts_module._speaker_embeddings, clear=True)
+    waveform = torch.zeros(1, 8)
+
+    first = ming3_tts_module._extract_speaker_embeddings("/model", [waveform, waveform], [16000, 24000], ["a", None])
+    second = ming3_tts_module._extract_speaker_embeddings("/model", [waveform], [16000], ["a"])
+
+    assert first.shape == (2, 192)
+    assert torch.equal(second[0], first[0])
+    assert factory.call_count == 1
+    # The keyed clip is extracted once; the unkeyed clip is never cached.
+    assert extractor.extract_from_waveform.call_count == 2
+
+
+def test_ming3_warmup_loads_tokenizer_and_speaker_extractor(mocker):
+    is_cuda = mocker.patch.object(ming3_tts_module.current_platform, "is_cuda", return_value=False)
+    server = SimpleNamespace(
+        _tts_tokenizer=None,
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(model="/model", trust_remote_code=False)),
+    )
+    tokenizer = object()
+    load = mocker.patch.object(ming3_tts_module.AutoTokenizer, "from_pretrained", return_value=tokenizer)
+    extract = mocker.patch.object(ming3_tts_module, "_extract_speaker_embeddings")
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
+
+    asyncio.run(adapter.warmup())
+
+    assert server._tts_tokenizer is tokenizer
+    assert adapter._tokenizer() is tokenizer and load.call_count == 1
+    assert extract.call_args.args[0] == "/model" and extract.call_args.args[2:] == ([16000], [None])
+
+    # A missing CAM++ asset leaves extraction to the requests.
+    extract.side_effect = RuntimeError("missing campplus.onnx")
+    asyncio.run(adapter.warmup())
+
+    # On CUDA the API process does not run CAM++.
+    is_cuda.return_value = True
+    extract.reset_mock()
+    asyncio.run(adapter.warmup())
+    extract.assert_not_called()
 
 
 def test_ming3_sampling_overrides_attach_request_rng_state(mocker):
@@ -1447,3 +1608,16 @@ def test_registered_voice_salt_preserves_resolved_conditioning(key):
     first = conditioning_cache_salt(request, {key: "a"}, registered_voice=("speaker", 123))
     second = conditioning_cache_salt(request, {key: "b"}, registered_voice=("speaker", 123))
     assert first != second
+
+
+def test_ming3_tts_defaults_to_ip_voice_without_reference():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello")
+    assert adapter.validate(request) is None
+    assert request.voice == "灵小柔"
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "灵小柔"
+    assert info["prompt_audio_mode"] == "none"
+    assert info["speaker_conditioning"] == "mute"
+    assert "reference_audio" not in info

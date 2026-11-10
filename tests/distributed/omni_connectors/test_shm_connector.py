@@ -80,18 +80,39 @@ class TestKeyBasedReadWrite:
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)
         assert result is None
 
-    def test_get_empty_shm_race_returns_none(self, connector, monkeypatch):
-        def raise_empty_file(*args, **kwargs):
-            raise ValueError("cannot mmap an empty file")
+    def test_get_does_not_open_shm_before_writer_sizes_it(self, connector, tmp_path, monkeypatch, mocker):
+        import threading
 
-        monkeypatch.setattr(
-            "vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_pkg.SharedMemory",
-            raise_empty_file,
-        )
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-        result = connector.get("s0", "s1", "not_ready_yet", metadata=None)
+        # Isolate the publication lock from the host's coordination directory.
+        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        entered, release = threading.Event(), threading.Event()
+        original = os.ftruncate
+        opens = mocker.spy(module.shm_pkg, "SharedMemory")
 
-        assert result is None
+        def pause_size(fd, size):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(fd, size)
+
+        key = "sizing_" + uuid.uuid4().hex[:16]
+        result = []
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "ftruncate", pause_size)
+            writer = threading.Thread(target=lambda: result.append(connector.put("0", "1", key, {"ready": True})))
+            writer.start()
+            try:
+                assert entered.wait(timeout=5)
+                before_read = opens.call_count
+                assert connector.get("0", "1", key) is None
+                assert opens.call_count == before_read
+            finally:
+                release.set()
+                writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert result[0][0]
+        assert connector.get("0", "1", key, metadata=result[0][2])[0] == {"ready": True}
 
     def test_rank_aware_keys_independent(self, connector):
         """Each TP rank writes/reads its own key — simulates homogeneous TP."""
@@ -289,7 +310,7 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     def fail_deserialize(_data):
         raise ValueError("invalid payload")
 
-    monkeypatch.setattr(connector, "deserialize_obj", fail_deserialize)
+    monkeypatch.setattr(connector._serde, "deserialize", fail_deserialize)
     assert connector.get("0", "1", key) is None
     assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
     connector.reap_consumed()
@@ -325,7 +346,7 @@ def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path)
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
     directory = tmp_path / "deployment"
-    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(directory))
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory))
     original_scandir = os.scandir
     scanned = []
 
@@ -353,7 +374,7 @@ def test_missing_wakeup_directory_keeps_payload_transport_working(monkeypatch, t
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
     directory = tmp_path / "missing"
-    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(directory))
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(directory))
     sender, receiver = _stage_connector(88), _stage_connector(89)
     key = f"wake_{uuid.uuid4().hex}"
     try:
@@ -492,7 +513,7 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path))
     receiver = _stage_connector(82)
     peer_path = tmp_path / "stage_82_peer"
     os.mkfifo(peer_path, 0o600)
@@ -520,7 +541,7 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 def test_wakeup_ignores_stale_fifo_and_non_fifo_paths(monkeypatch, tmp_path):
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.SharedMemoryConnector, "_wakeup_directory", lambda self: str(tmp_path))
     sender, receiver = _stage_connector(83), _stage_connector(84)
     plain = tmp_path / "84_plain"
     plain.write_text("unchanged")
