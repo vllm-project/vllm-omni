@@ -98,6 +98,62 @@ def test_parse_size_edge_cases():
         parse_size("1024 1024")
 
 
+def test_parse_size_ratio_valid():
+    """Test aspect-ratio size parsing (allow_ratio=True).
+
+    Ratios resolve to ~1 megapixel dimensions aligned to multiples of 32,
+    matching the Qwen-Image family default canvas.
+    """
+    assert parse_size("1:1", allow_ratio=True) == (1024, 1024)
+    assert parse_size("16:9", allow_ratio=True) == (1376, 768)
+    assert parse_size("9:16", allow_ratio=True) == (768, 1376)
+    assert parse_size("4:3", allow_ratio=True) == (1184, 896)
+    assert parse_size("3:4", allow_ratio=True) == (896, 1184)
+    assert parse_size("21:9", allow_ratio=True) == (1568, 672)
+    assert parse_size("3:2", allow_ratio=True) == (1248, 832)
+    # Unreduced ratios behave the same as their reduced form
+    assert parse_size("32:18", allow_ratio=True) == parse_size("16:9", allow_ratio=True)
+    # Arbitrary positive integer pairs are accepted
+    width, height = parse_size("5:4", allow_ratio=True)
+    assert width > 0 and height > 0
+    assert width % 32 == 0 and height % 32 == 0
+    # WxH format is still accepted with allow_ratio=True
+    assert parse_size("1024x1024", allow_ratio=True) == (1024, 1024)
+
+
+def test_parse_size_ratio_invalid():
+    """Test invalid aspect-ratio size strings"""
+    with pytest.raises(ValueError, match="Aspect-ratio format"):
+        parse_size("1:2:3", allow_ratio=True)
+
+    with pytest.raises(ValueError, match="must be integers"):
+        parse_size("1.5:1", allow_ratio=True)
+
+    with pytest.raises(ValueError, match="positive integers"):
+        parse_size("0:1", allow_ratio=True)
+
+    with pytest.raises(ValueError, match="positive integers"):
+        parse_size("1:0", allow_ratio=True)
+
+    with pytest.raises(ValueError, match="must be integers"):
+        parse_size("16:", allow_ratio=True)
+
+    with pytest.raises(ValueError, match="must be integers"):
+        parse_size(":9", allow_ratio=True)
+
+
+def test_parse_size_ratio_too_extreme():
+    """Ratios that cannot resolve to 32-aligned positive dimensions are rejected"""
+    with pytest.raises(ValueError, match="too extreme"):
+        parse_size("4097:1", allow_ratio=True)
+
+
+def test_parse_size_ratio_requires_opt_in():
+    """Without allow_ratio, ratio strings fall back to the strict WxH parser"""
+    with pytest.raises(ValueError, match="Invalid size format"):
+        parse_size("16:9")
+
+
 def test_encode_image_base64():
     """Test image encoding to base64"""
     # Create a simple test image
@@ -1430,6 +1486,73 @@ def test_different_image_sizes(test_client):
             },
         )
         assert response.status_code == 200, f"Failed for size {size}"
+
+
+def test_ratio_size_single_stage(test_client, mock_async_diffusion):
+    """Aspect-ratio size strings resolve to concrete dimensions (single stage)"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a wide landscape",
+            "size": "16:9",
+        },
+    )
+    assert response.status_code == 200
+    captured = mock_async_diffusion.captured_sampling_params_list[0]
+    assert captured.width == 1376
+    assert captured.height == 768
+
+
+def test_ratio_size_multistage(async_omni_test_client):
+    """Aspect-ratio size strings resolve via the chat handler (multi stage).
+
+    Uses 3:2 (1248x832) because this fixture caps max_generated_image_size at
+    1024*1024 and 32-alignment rounding can push wider ratios just above it.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a wide landscape",
+            "size": "3:2",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].width == 1248
+    assert captured[1].height == 832
+
+
+def test_invalid_ratio_size_parse_error(test_client):
+    """Malformed ratio passes Pydantic but fails parse_size() -> 400"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "size": "16:9:4",  # Has ":" so Pydantic accepts, but parse_size() rejects
+        },
+    )
+    assert response.status_code == 400
+    detail = str(response.json()["detail"])
+    assert "size" in detail.lower() or "invalid" in detail.lower()
+
+
+def test_ratio_size_image_edit(async_omni_test_client):
+    """/v1/images/edits accepts aspect-ratio size strings too"""
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={
+            "prompt": "hello world.",
+            "size": "2:3",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    assert captured_sampling_params.width == 832
+    assert captured_sampling_params.height == 1248
 
 
 def test_parameter_validation():
