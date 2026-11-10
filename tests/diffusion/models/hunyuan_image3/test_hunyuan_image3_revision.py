@@ -21,6 +21,9 @@ def checkpoint(request, mocker):
     config.revision = revision
     config.weight_sharing = None
     config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    # Pipeline startup resolves the default attention schedule (subscripts its
+    # entries); an unset optional config must be None, not an auto-created Mock.
+    config.diffusion_attention_schedule = None
     hf_config = PretrainedConfig(vae_downsample_factor=[8, 8], patch_size=2, vae={})
     get_config = mocker.patch.object(pipeline, "get_config", return_value=hf_config)
     generation = mocker.patch.object(pipeline.GenerationConfig, "from_pretrained")

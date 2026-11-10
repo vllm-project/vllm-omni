@@ -15,6 +15,7 @@ from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
 from vllm_omni.config.weight_sharing import WeightSharingConfig
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.distributed.weight_sharing.runtime import (
     CONFIG_KEY,
@@ -190,10 +191,10 @@ class StageSharingHost:
                     raise ValueError("sharing requires a separate StageDiffusionProc and multiprocessing workers")
                 if any(
                     (
-                        config.enable_cpu_offload,
-                        config.enable_layerwise_offload,
-                        config.enable_distributed_layerwise_offload,
-                        config.diffusion_offload_config,
+                        # Resolve the compact/legacy offload policy the same way
+                        # the diffusion worker does; the legacy enable_*_offload
+                        # fields are compatibility aliases only.
+                        offload_enabled(config),
                         config.lora_path,
                         config.custom_pipeline_args,
                         parallel.use_hsdp,

@@ -176,7 +176,9 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
-        weight_sharing=structured_config.weight_sharing,
+        # Optional: callers may build partial structured views (and older
+        # configs predate the field), exactly like strategy provenance above.
+        weight_sharing=getattr(structured_config, "weight_sharing", None),
     )
 
 

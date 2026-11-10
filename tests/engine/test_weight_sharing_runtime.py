@@ -85,6 +85,10 @@ def test_unsupported_topology_is_rejected_before_launch(host, bad, mocker):
         cfg.diffusion_config.distributed_executor_backend = "uni"
     elif bad == "offload":
         cfg.diffusion_config.enable_cpu_offload = True
+        # The offload policy resolves and caches on first read, which fixture
+        # construction already performed; drop the cache so this deliberately
+        # late mutation is observed back by the guard.
+        vars(cfg.diffusion_config).pop("_resolved_diffusion_offload", None)
     elif bad == "devices":
         mocker.patch.object(host.runtime, "_resolve_replica_physical_devices", return_value="1,0")
     else:
