@@ -19,6 +19,7 @@ th {
 
 | Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU | Recipe |
 | -------------- | -------- | ------------------- | ------------ | --------- | ----- | ----------- | -------- |
+| `Lfm3OmniForConditionalGeneration` | LFM3-Omni-2B | `LiquidAI/LFM3-Omni-2B` | | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LiquidAI/LFM3-Omni-2B.md) |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-Omni.md) |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `MingFlashOmniForConditionalGeneration` + `MingImagePipeline` | Ming-flash-omni-2.0 (omni-speech + imagegen<sup>1</sup>) | `Jonathan1909/Ming-flash-omni-2.0` | ✅︎ | | | ✅︎ | — |
@@ -45,6 +46,7 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Flux3Pipeline` | Flux3 — T2I, I2I | — | ✅︎ | | | | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
 | `HyNomasModularPipeline` | Hy-Nomas distilled (Diffusers-format weights, reference runtime adapter) | `tencent/Hy-Nomas-Diffusers` | ✅︎ (H200 tested) | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md) |
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Noisy KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
+"""Noisy PP versioned KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     PRIOR_HANDOFF_SLOT,
     Cell,
     CellPlan,
@@ -631,6 +631,10 @@ class NoisyKVState:
         if retain:
             self.protect(req, retain)
 
+    def chunk_tokens(self, req: str) -> int:
+        """Public read for mainline ``SupportsNoisyPPKV`` (admit token-uniformity)."""
+        return self._chunk_tokens[req]
+
     def set_inflight(self, inflight: tuple[Inflight, ...]) -> None:
         self._inflight = inflight
 
@@ -638,6 +642,11 @@ class NoisyKVState:
         return version in self._retain.get(req, ())
 
     def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None:
+        """Finish one admitted request.
+
+        ``retain is None`` keeps the existing protect set (normal plan
+        completion). ``retain=()`` clears retained versions for ``req``.
+        """
         self.cache.transport.wait_sends()
         if retain is not None:
             self._retain[req] = set(retain)
