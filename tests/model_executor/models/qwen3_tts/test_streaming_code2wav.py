@@ -3,6 +3,7 @@
 
 import threading
 from collections import defaultdict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -68,7 +69,7 @@ def backend(monkeypatch):
     )
 
 
-def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None):
+def _decode(backend, values, request_ids, caches, *, terminal=None, eager=None):
     lengths = [len(row) for row in values]
     codes = torch.zeros(len(values), 1, max(lengths), dtype=torch.long)
     for index, row in enumerate(values):
@@ -79,10 +80,37 @@ def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None)
         request_ids=request_ids,
         caches=caches,
         terminal=terminal or [False] * len(values),
-        legacy_decoder=legacy,
+        eager_decoder=eager,
         chunk_size=300,
         left_context_size=25,
     )
+
+
+def test_priming_pre_capture_uses_descending_shapes_and_shared_pool(monkeypatch, mocker):
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import streaming_decoder
+
+    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
+    monkeypatch.setattr(_Codec, "RING", 128)
+    monkeypatch.setattr(_Codec, "max_frames", 57)
+    monkeypatch.setattr(_Codec, "nq", 1, raising=False)
+    monkeypatch.setattr(_Codec, "scratch_slot", 0, raising=False)
+    mocker.patch.object(streaming_decoder.current_omni_platform, "synchronize")
+    mocker.patch.object(torch.cuda, "CUDAGraph")
+    mocker.patch.object(torch.cuda, "graph", side_effect=lambda *_args, **_kwargs: nullcontext())
+
+    backend = module.StreamingCode2Wav(
+        None, num_slots=4, max_batch_size=4, batch_sizes=[1, 4, 2], frame_sizes=[1, 25], capture=True
+    )
+
+    priming_frames = [72, 55]
+    assert list(backend.prefix_graphs) == priming_frames
+    # Each shape runs once for warmup and once inside capture.
+    assert [(codes.shape[1], codes.shape[0]) for codes, _, _ in backend.decoder.calls] == [
+        (frames, batch) for frames in [*priming_frames, 25, 1] for batch in [4, 2, 1] for _ in range(2)
+    ]
+    graphs = [*backend.prefix_graphs.values(), *backend.graphs.values()]
+    assert all(graph.pool is backend.graph_pool for graph in graphs)
+    assert all(graph.sizes == [1, 2, 4] for graph in graphs)
 
 
 def test_long_chunk_splits_at_decoder_limit(backend):
@@ -92,10 +120,10 @@ def test_long_chunk_splits_at_decoder_limit(backend):
     assert [call[2] for call in backend.decoder.calls] == [[0], [3], [6]]
 
 
-def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend, mocker):
-    legacy = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
-    legacy.batched_chunked_decode.return_value = [torch.ones(1, 7)]
-    actual = _decode(backend, [[1]], ["dummy"], [{"_is_dummy_run": True}], legacy=legacy)[0]
+def test_dummy_run_uses_eager_decoder_without_allocating_request_state(backend, mocker):
+    eager = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
+    eager.batched_chunked_decode.return_value = [torch.ones(1, 7)]
+    actual = _decode(backend, [[1]], ["dummy"], [{"_is_dummy_run": True}], eager=eager)[0]
     torch.testing.assert_close(actual, torch.ones(1, 7))
     assert not backend.request_states and len(backend.free_slots) == 2
     assert not backend.decoder.calls
@@ -178,7 +206,7 @@ def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
             request_ids=["icl"],
             caches=[{"prefix_frames": 2}],
             terminal=[True],
-            legacy_decoder=None,
+            eager_decoder=None,
             chunk_size=300,
             left_context_size=25,
         )[0]

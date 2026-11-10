@@ -911,7 +911,7 @@ class StreamingDecodeGraphs:
         dev = sd.device
         pool = torch.cuda.graph_pool_handle() if pool is None else pool
         self.pool = pool
-        for bsz in sorted(set(batch_sizes)):
+        for bsz in sorted(set(batch_sizes), reverse=True):
             codes = torch.zeros(bsz, frames, sd.nq, dtype=torch.int32, device=dev)
             slots = torch.full((bsz,), sd.scratch_slot, dtype=torch.int32, device=dev)
             pos = torch.zeros(bsz, dtype=torch.int32, device=dev)
