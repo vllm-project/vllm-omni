@@ -378,6 +378,13 @@ def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
     assert diffusion_kv["kv_prefetch_min_free_mem_ratio"] == 0.2
 
 
+def _is_generated_image_output(output: object) -> bool:
+    if getattr(output, "images", None):
+        return True
+    multimodal_output = getattr(output, "multimodal_output", None)
+    return isinstance(multimodal_output, dict) and bool(multimodal_output.get("images"))
+
+
 def _extract_generated_image(outputs: list[object]) -> Image.Image:
     if not outputs:
         raise AssertionError("No outputs were returned from Omni.generate()")
@@ -492,8 +499,11 @@ def test_shared_backbone_ar_kv_dit_and_consumer_first_shutdown(sharing_tp4_confi
         assert sharing is not None and sharing.state == "READY"
         assert len(sharing.identities) == 4
         outputs = _generate_outputs(omni, "en_think_recaption", 512, num_requests=2)
-        assert len(outputs) == 2
-        for output in outputs:
+        # Each request yields its stage-0 text output and its stage-1 image
+        # output; only the images belong to this test.
+        image_outputs = [output for output in outputs if _is_generated_image_output(output)]
+        assert len(image_outputs) == 2
+        for output in image_outputs:
             image = _extract_generated_image([output])
             assert image.size == (512, 512)
             assert any(low != high for low, high in image.convert("RGB").getextrema())
