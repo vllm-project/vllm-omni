@@ -212,6 +212,42 @@ async def test_a_call_that_settles_during_a_tool_gets_no_failure_report(outcome)
 
 
 @pytest.mark.asyncio
+async def test_run_waits_for_a_settled_tool_to_finish_its_cleanup():
+    sock = FakeSocket()
+    sock.feed(session_with("client_response_create"))
+    cleanup_started = asyncio.Event()
+    release = asyncio.Event()
+    cleanup_done = asyncio.Event()
+
+    async def cleans_up_slowly(arguments):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release.wait()
+            cleanup_done.set()
+            raise
+        return "late"
+
+    client, _ = make_client(sock)
+    async with client:
+        task = asyncio.create_task(DuplexToolRunner(client, {"get_weather": cleans_up_slowly}).run())
+        sock.feed(call_event())
+        await settle()
+        sock.feed(settled_event())
+        await asyncio.wait_for(cleanup_started.wait(), 2)
+        sock.feed(SESSION_CLOSED)
+        await settle()
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, 2)
+        assert cleanup_done.is_set()
+    assert sent(sock, "conversation.item.create") == []
+    assert sent(sock, "function_call.cancel") == []
+    assert sent(sock, "response.create") == []
+
+
+@pytest.mark.asyncio
 async def test_settled_calls_are_forgotten_once_their_tool_stops():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -224,8 +260,10 @@ async def test_settled_calls_are_forgotten_once_their_tool_stops():
 
         runner.handle_event(wrap_event(settled_event()))
         assert runner._settled == {"call_a"}
+        assert runner._tasks == {"call_a": task}
         await settle()
         assert runner._settled == set()
+        assert runner._tasks == {}
 
         runner.handle_event(wrap_event(settled_event("call_with_no_tool")))
         assert runner._settled == set()

@@ -41,21 +41,30 @@ class DuplexToolRunner:
     def __init__(self, client: DuplexClientBase, handlers: Mapping[str, ToolHandler]) -> None:
         self._client = client
         self._handlers = dict(handlers)
+        #: Every running tool, including a settled one still finishing its
+        #: cancellation cleanup, so ``run()`` waits for that cleanup too.
         self._tasks: dict[str, asyncio.Task[None]] = {}
         #: Running calls the server ended. Anything sent for one would be refused.
         self._settled: set[str] = set()
 
     async def run(self) -> None:
-        """Handle calls until the session ends; running tools are then cancelled."""
+        """Handle calls until the session ends; running tools are then cancelled.
+
+        Returns only after every tool has finished, including the cancellation
+        cleanup of one whose call already settled.
+        """
         try:
             async for event in self._client.events():
                 self.handle_event(event)
         finally:
-            tasks = list(self._tasks.values())
+            tasks = dict(self._tasks)
             self._tasks.clear()
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for call_id, task in tasks.items():
+                # A settled tool was already cancelled; a second cancel would
+                # interrupt its cleanup.
+                if call_id not in self._settled:
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     def handle_event(self, event: DuplexEvent) -> None:
         """Start a tool for a new call, or stop one whose call has ended."""
@@ -68,8 +77,10 @@ class DuplexToolRunner:
             call_id = details.get("call_id") if isinstance(details, dict) else None
             if not isinstance(call_id, str):
                 return
-            task = self._tasks.pop(call_id, None)
-            if task is not None:
+            task = self._tasks.get(call_id)
+            if task is not None and call_id not in self._settled:
+                # The task stays in ``_tasks`` until it is done; ``_forget``
+                # then removes it.
                 self._settled.add(call_id)
                 task.cancel()
 
