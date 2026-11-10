@@ -43,8 +43,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
-
     from tests.helpers.runtime import OmniRunner
 
 logger = init_logger(__name__)
@@ -163,7 +161,7 @@ def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke", seed: int
 
     ``seed`` pins the policy's sampling noise for this request (see ``docs/serving/openpi_api.md``).
     """
-    identity_eef_9d: NDArray[np.float32] = np.zeros((1, 1, 9), dtype=np.float32)
+    identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
     identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
     observation: dict[str, Any] = {
         "session_id": session_id,
