@@ -296,7 +296,11 @@ def build_voxcpm2_prompt(
 
 
 def _platform_copies_to_host_async() -> bool:
-    """Whether device-to-host copies here use pinned memory and a side stream."""
+    """Whether device-to-host copies here use pinned memory and a side stream.
+
+    The stop-mask and delayed-audio copies allocate pinned host memory whenever
+    this returns True, so it must stay limited to platforms that support it.
+    """
     platform = omni_platform.current_omni_platform
     return platform.device_type == "cuda" or getattr(platform, "is_npu", lambda: False)()
 
@@ -3310,6 +3314,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # Compiled/graph VAE output storage can be reused on the next token.
         if self._vae_output_storage_may_be_reused():
             src = src.clone()
+        # Pinned: only CUDA/NPU reach here (_platform_copies_to_host_async).
         host = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
         device_module = torch.get_device_module(src.device)
         if self._audio_copy_stream is None:
@@ -3451,6 +3456,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 stop_logits.record_stream(self._stop_mask_stream)
             if model_state is not None:
                 stacked.record_stream(self._stop_mask_stream)
+            # Pinned: only CUDA/NPU reach here (_platform_copies_to_host_async).
             stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
             # Canary: a host read that races ahead of the DMA observes True —
             # a deterministic wrong value for keep-going requests, caught by
