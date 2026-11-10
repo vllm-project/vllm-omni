@@ -232,11 +232,16 @@ platforms:
           stop_token_ids: [1]
 
   npu:
-    # All three stages run MRv2. Same-card A/B against the v1 default
-    # (910B3, seed-tts en, warm tiers 32@1/64@4/128@8): mean audio RTF
-    # 0.3181/0.5762/0.8795 vs v1 0.3296/0.5728/0.8785 -- no throughput
-    # regression at any tier. The known cost is first-audio tail latency
-    # at the top tier: c8 p99 audio TTFP 2419.6 ms vs v1 2242.9 ms (+7.9%).
+    # All three stages run MRv2. Same-card A/B (910B3 card 7, 2026-11-10,
+    # HEAD 59a85c105, seed-tts en, warm tiers 32@1/64@4/128@8): mean audio
+    # RTF 0.3181/0.5762/0.8795 (MRv2) vs 0.3199/0.5675/0.8764 (v1) --
+    # -0.6%/+1.5%/+0.4%, within run-to-run noise (a second MRv2 run on the
+    # same card differed by -0.4%/-4.4%/-1.6%). The c8 p99 audio-TTFP tail
+    # (2419.6 ms vs v1 2267.0 ms, +6.8%) likewise overlaps the noise band
+    # (second MRv2 run: 2274.8 ms). Runner-class selection on NPU is made
+    # by vllm-ascend (env VLLM_USE_V2_MODEL_RUNNER overrides, MRv2 by
+    # default); this key is validated but not consulted there -- pin v1
+    # via the env var.
     model_runner: v2
     stages:
       - stage_id: 0
