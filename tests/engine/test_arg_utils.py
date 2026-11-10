@@ -756,6 +756,13 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("diffusion_attention_backend", "SDPA"),
     ("fastvideo_vsa_topk", 96),
     ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    (
+        "diffusion_attention_schedule",
+        {
+            "profiles": {"sparse": {"default": {"backend": "SDPA"}}},
+            "default": [{"start": 2, "end": None, "profile": "sparse"}],
+        },
+    ),
     ("diffusion_compile_granularity", "whole"),
     ("diffusion_compile_dynamic", False),
     ("enable_cuda_graph_decode", False),

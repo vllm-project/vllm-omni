@@ -1,7 +1,11 @@
-# Noisy KV
+# Noisy PP
 
-> **Status:** experimental (`vllm_omni.experimental.ar_diffusion`). Not a public
-> HTTP schema.
+> **Status:** `noisy_pp_plan` / `noisy_pp_executor` live under
+> `vllm_omni.diffusion.distributed.noisy_pipeline_parallel` (request path).
+> Mainline types KV only as `SupportsNoisyPPKV` (like stepwise
+> `SupportsStepExecution`); concrete NoisyKV pools stay experimental
+> (`vllm_omni.experimental.ar_diffusion.kv_cache.noisy`). AR-Diffusion
+> engine/runner wiring remains experimental. Not a public HTTP schema.
 >
 > **Tracking:** [#102](https://github.com/JiusiServe/vllm-omni-project-manage/issues/102)
 > (v0.31), quality [#103](https://github.com/JiusiServe/vllm-omni-project-manage/issues/103)
@@ -14,8 +18,8 @@
     - [What is a cell?](#what-is-a-cell)
 - [Scope](#scope)
 - [Architecture](#architecture)
-- [Cell schedule](#cell-schedule)
-- [Cell executor](#cell-executor)
+- [Noisy PP plan](#noisy-pp-plan)
+- [Noisy PP executor](#noisy-pp-executor)
 - [NoisyKV](#noisykv)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
@@ -25,7 +29,10 @@
 
 ## Overview
 
-Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
+Noisy PP is the Cell path on Omni's existing **layer PP**. Scheduler and
+worker exchange a single request; the cell pipeline runs to completion inside
+that request (`forward` → `admit_cell_request` → `run_cell_pipeline` →
+`emit_cell_output`).
 
 ### Symbols
 
@@ -111,27 +118,29 @@ Layer split uses `(g, G)` via `get_pp_indices(B, pp_rank % G, G)`, not
 Optional Session
         │
         ▼
-ARDiffusionModelRunner
-  ├─ Legacy → paged KV (DreamZero / LingBot)
-  └─ Cell   → NoisyKV + CellPlan
+ARDiffusionModelRunner (experimental)
+  ├─ Legacy → SupportsStepExecution + paged KV
+  └─ Cell   → SupportsNoisyPPKV + CellPlan
         │
-   cell_schedule │ cell_executor (tick loop, PP P2P)
-        └────► kv_cache/noisy.py
+   noisy_pp_plan │ noisy_pp_executor (tick loop, PP P2P)
+        │           (mainline; no import of NoisyKV types)
+        └──── inject experimental NoisyKVState (implements SupportsNoisyPPKV)
 ```
 
 ### How it works
 
 1. The pipeline builds a `CellSchedule` from request `extra_args` and calls
    `build_cell_plan()` (pure function, no torch).
-2. `ARDiffusionModelRunner` binds an `ARDiffusionCellContext` over a shared
-   `NoisyKVCache` for the request.
+2. `ARDiffusionModelRunner` binds an `ARDiffusionCellContext` over a
+   `SupportsNoisyPPKV` backend (today: experimental `NoisyKVState` on a shared
+   `NoisyKVCache`) for the request.
 3. `run_cell_pipeline()` admits inflight plans, runs one cell per tick on each
    rank, and overlaps KV / activation P2P with compute.
 4. Rank 0 gathers finished chunk latents (or streams them) for VAE decode.
 
-## Cell schedule
+## Noisy PP plan
 
-Implemented in `experimental/ar_diffusion/cell_schedule.py`.
+Implemented in `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/noisy_pp_plan.py`.
 
 - **In:** `CellSchedule(N, D, S, G, B, K, ordering, H)`.
 - **Out:** `CellPlan` — per-tick cells `(c,s,b)`, plus `sources` / `transfers` /
@@ -159,9 +168,9 @@ Invariants:
 - Finite `H` + `last_use` bounds residency
 - Consumer of `b` never waits on producer's `b' ≠ b` (activation edges are separate)
 
-## Cell executor
+## Noisy PP executor
 
-Implemented in `experimental/ar_diffusion/cell_executor.py`.
+Implemented in `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/noisy_pp_executor.py`.
 
 Per tick on each rank:
 
@@ -173,13 +182,23 @@ Per tick on each rank:
 Received versions are readable only on a later tick. Same-tick producer /
 consumer of the same version is forbidden.
 
-`run_cell_pipeline()` owns admit / drop / fail-closed cleanup so a mid-request
-exception does not leak `VersionPool` slots. Rank topology is described by
-`CellTopology` / `CellRunSpec` inside `ARDiffusionCellContext`.
+On the request path, Runner `execute_model` / `execute_model_batch` share the
+same Noisy KV lifecycle (`reset` before bind; `close_session` / ephemeral
+release after success; fail-closed release on error), bind the KV pool, and
+delegate to Pipeline `forward`, which admits via `admit_cell_request`, runs
+`run_cell_pipeline` to completion, then `emit_cell_output`. A batch may not
+schedule two requests on the same session id (batch-wide reset would otherwise
+run before per-request execution). Admit / drop / fail-closed cleanup prevent
+mid-request leaks of `VersionPool` slots.
+`extra_args.stream_decode` remains available on this path; abort/fail-closed
+calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
 
 ## NoisyKV
 
-Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
+Implemented in `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
+(`NoisyKVCache` / `NoisyKVState`). Stays experimental; not graduated with
+the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the cell
+context.
 
 | | |
 | --- | --- |
@@ -193,7 +212,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 
 ### Same-Step with a first-chunk clean sink
 
-`Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
+`Ordering.SAME_STEP` uses a first-chunk clean sink when a request has multiple chunks.
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. When the clean successor is on the same rank, the executor carries
@@ -215,7 +234,7 @@ requires separate validation.
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
-| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and multi-chunk shape) |
+| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and CellPlan shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
@@ -234,7 +253,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
 | No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
 | Session + legacy loop | Supported (unchanged) |
-| Session + Cell path | Designed; not required for #102 |
+| Session + Cell path | Supported (single active session; see [#9758](https://github.com/vllm-project/vllm-omni/pull/9758)) |
 
 **CausVidWan S=1 default:** if request `extra_args` omits `kv_history_chunks`,
 `H` defaults to model `max_history_chunks` (not `0`) — that adds the history
@@ -247,23 +266,28 @@ runs the clean step regardless of `H`. Same-Step (`S=D`, including `S=1`
 when `D=1`) runs clean only for chunk 0. `kv_history_chunks: 0` removes recent
 history but retains the Same-Step sink.
 
-Capability: `SupportsARDiffusionCellPipeline` —
-`ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.
+KV assembly is `SupportsARDiffusionNoisyKV`: `ar_diffusion_noisy_kv_spec()`
+and `bind_ar_diffusion_noisy_kv()`. The runner allocates, binds, and releases
+that pool around the existing request entry. It does not open a Cell mode, and
+it does not choose the executor from `noisy_kv_cache is not None`. The pipeline
+builds the plan and calls `run_cell_pipeline` from its request `forward`.
 
 ## Testing
 
-CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`,
-`test_noisy_kv*.py`, and model/config resolve tests under the same tree.
+CPU: `tests/diffusion/distributed/noisy_pipeline_parallel/test_{noisy_pp_plan,noisy_pp_executor}.py`;
+NoisyKV: `tests/diffusion/ar_diffusion/test_noisy_kv*.py`, `test_noisy_session.py`;
+plus CausVid / Physis model resolve tests.
 
 GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 (`benchmarks/` / recipe smoke).
 
 ## Open issues
 
-- Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
-- Noisy KV not wired to session.
+- Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
+- Multi-session NoisyKV pool admission / bounded eviction (single-session is the
+  current contract).
 - Micro-batch packing (`R`): varlen vs pad.
-- Cell schedule with `K>1` multiplies ticks; activation inbox is keyed by
+- Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
 
 ## Related
@@ -272,4 +296,5 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - [AR-Diffusion pipeline capability](../ar_diffusion_pipeline_capability.md)
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
-- Code: `experimental/ar_diffusion/{cell_schedule,cell_executor,kv_cache/noisy}.py`
+- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{noisy_pp_plan,noisy_pp_executor}.py`;
+  NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
