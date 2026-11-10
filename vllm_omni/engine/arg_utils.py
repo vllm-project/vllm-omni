@@ -230,6 +230,37 @@ def _map_offload_config(args: "OmniEngineArgs") -> None:
     kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
 
     lmcache_config = kv_store.get("lmcache_config")
+    mooncake_config = kv_store.get("mooncake_config")
+
+    if mooncake_config is not None:
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        from vllm_omni.distributed.kv_transfer.mooncake.config import (
+            CONNECTOR_MODULE,
+            CONNECTOR_NAME,
+            EXTRA_CONFIG_KEY,
+            MooncakeConfig,
+        )
+
+        if "lmcache_config" in kv_store:
+            raise ValueError("Select either mooncake_config or lmcache_config, not both")
+        config = MooncakeConfig.from_dict(mooncake_config)
+        if args.enable_prefix_caching:
+            raise ValueError("Mooncake KV/HS caching requires enable_prefix_caching=false")
+        if args.kv_transfer_config is not None:
+            raise ValueError("mooncake_config cannot be combined with an explicit kv_transfer_config")
+        if kv_store.get("kv_role", "kv_both") != "kv_both":
+            raise ValueError("Mooncake KV/HS caching requires kv_role=kv_both")
+        args.enable_prefix_caching = False
+        args.kv_transfer_config = KVTransferConfig(
+            kv_connector=CONNECTOR_NAME,
+            kv_connector_module_path=CONNECTOR_MODULE,
+            kv_connector_extra_config={EXTRA_CONFIG_KEY: config.to_dict()},
+            kv_role="kv_both",
+            kv_load_failure_policy="recompute",
+        )
+        logger.info("[Omni] kv_transfer_config: kv_connector=%s", CONNECTOR_NAME)
+        return
 
     if lmcache_config:
         # LMCacheConnectorV1 only (OffloadingConnector removed due to
