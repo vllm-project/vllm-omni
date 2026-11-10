@@ -320,3 +320,37 @@ def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferre
     assert state.current_turn_ended is True
     assert state.held_turn_ends == 0
     assert state.open_turn_tail == ""
+
+
+def test_deferred_sentence_ender_is_committed_before_the_next_turn_eos(monkeypatch):
+    """The next stage-0 step commits the pending text token before it holds.
+
+    ``。`` and ``<|turn_eos|>`` are consecutive deferred samples, with no
+    explicit commit between them. The turn end is accepted.
+    """
+    model, state, md, _sample = _character_cap_case(monkeypatch, deferred=True, all_greedy=True)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    model._minicpmo45_tokenizer_cache = _SentenceTokenizer()
+    turn_eos = TOKEN_IDS["turn_eos_token_id"]
+
+    def draw(token):
+        logits = torch.full((1, VOCAB), -100.0)
+        logits[0, token] = 100.0
+        output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+        return output.sampled_token_ids.item()
+
+    md.output_token_ids[0] = []
+    assert draw(21) == 21
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert state.open_turn_tail.endswith("正")
+
+    md.output_token_ids[0] = [21]
+    assert draw(22) == 22
+    assert state.open_turn_tail.endswith("正")  # 22 is still pending
+
+    md.output_token_ids[0] = [21, 22]
+    assert draw(turn_eos) == turn_eos
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert state.open_turn_tail == ""
+    assert state.current_turn_ended is True

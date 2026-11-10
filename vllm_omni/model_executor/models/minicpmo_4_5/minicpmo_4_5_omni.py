@@ -1639,6 +1639,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return cached
         token_ids = getattr(self, "_minicpmo45_native_duplex_token_ids_cache", None) or {}
         cached = {int(value) for value in token_ids.values() if isinstance(value, int) and int(value) >= 0}
+        # An empty cache is not final: the first record can run before the
+        # tokenizer ids are loaded, and a stored empty set would never refill.
+        if not cached:
+            return cached
         self._minicpmo45_duplex_control_ids_cache = cached
         return cached
 
