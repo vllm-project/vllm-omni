@@ -1790,6 +1790,7 @@ class HunyuanImage3Pipeline(
                 "num_special_tokens": kwargs.get("num_special_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
+                "hunyuan_paged_prefix_cut": kwargs.get("hunyuan_paged_prefix_cut"),
             }
         )
         return model_inputs
@@ -1817,6 +1818,10 @@ class HunyuanImage3Pipeline(
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
         if "paged_request_ids" in model_kwargs:
             updated_model_kwargs["paged_request_ids"] = model_kwargs["paged_request_ids"]
+        if "paged_row_keys" in model_kwargs:
+            updated_model_kwargs["paged_row_keys"] = model_kwargs["paged_row_keys"]
+        if "hunyuan_paged_prefix_cut" in model_kwargs:
+            updated_model_kwargs["hunyuan_paged_prefix_cut"] = model_kwargs["hunyuan_paged_prefix_cut"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1970,6 +1975,8 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        # Hunyuan-local per-row / scalar prefix cut for packed paged prefills.
+        hunyuan_paged_prefix_cut: int | tuple[int, ...] | None = None,
         # for CFG distilled models
         guidance: torch.Tensor | None = None,
         guidance_scatter_index: torch.Tensor | None = None,
@@ -2070,16 +2077,14 @@ class HunyuanImage3Pipeline(
         bsz, seq_len, n_embd = inputs_embeds.shape
 
         paged_kv_cached_prefix_len = 0
-        paged_kv_cached_prefix_lens: tuple[int, ...] | None = None
+        prefix_cut: int | tuple[int, ...] | None = hunyuan_paged_prefix_cut
         if first_step and self._uses_scheduler_paged_kv():
             if not is_forward_context_available():
                 raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
             context = get_forward_context()
             paged_kv_cached_prefix_len = int(context.paged_kv_cached_prefix_len)
-            paged_kv_cached_prefix_lens = context.paged_kv_cached_prefix_lens
-        prefix_cut: int | tuple[int, ...] | None = paged_kv_cached_prefix_lens or (
-            paged_kv_cached_prefix_len if paged_kv_cached_prefix_len else None
-        )
+            if prefix_cut is None:
+                prefix_cut = paged_kv_cached_prefix_len if paged_kv_cached_prefix_len else None
         if prefix_cut:
             if ar_kv_reuse_len:
                 raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
@@ -2417,6 +2422,14 @@ class HunyuanImage3Pipeline(
         row_branches = [branch for branch in range(cfg_factor) for _ in states]
         return row_state_indexes, row_branches
 
+    @staticmethod
+    def _cfg_major_paged_row_keys(
+        request_ids: list[str],
+        cfg_factor: int,
+    ) -> list[tuple[str, int]]:
+        """Match ``_step_row_order``: cond of every request, then uncond."""
+        return [(request_id, sequence_id) for sequence_id in range(cfg_factor) for request_id in request_ids]
+
     def _validate_step_group_states(self, states: list["StepRequestState"]) -> tuple[bool, int]:
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty group.")
@@ -2562,9 +2575,11 @@ class HunyuanImage3Pipeline(
         # step 1.
         step_indexes = {state.step_index for state in states}
         context_step_index = next(iter(step_indexes)) if len(step_indexes) == 1 else None
+        request_ids = [state.request_id for state in states]
         set_forward_context_denoise_step_idx(
             context_step_index,
-            request_ids=[state.request_id for state in states],
+            request_ids=request_ids,
+            paged_row_keys=self._cfg_major_paged_row_keys(request_ids, cfg_factor),
             paged_step_idx=0 if first_step else 1,
         )
         try:
@@ -2880,18 +2895,22 @@ class HunyuanImage3Pipeline(
 
         request_prefixes = [self._request_cached_prefix_len(request) for request in requests]
         row_prefixes = self._cfg_major_row_values(request_prefixes, len(requests), prepared_layout)
+        unique_prefixes = set(row_prefixes)
+        if len(unique_prefixes) == 1:
+            hunyuan_paged_prefix_cut: int | tuple[int, ...] | None = row_prefixes[0]
+            shared_prefix = row_prefixes[0]
+        else:
+            hunyuan_paged_prefix_cut = tuple(row_prefixes)
+            shared_prefix = 0
         if is_forward_context_available():
-            context = get_forward_context()
-            unique_prefixes = set(row_prefixes)
-            if len(unique_prefixes) == 1:
-                context.paged_kv_cached_prefix_len = row_prefixes[0]
-                context.paged_kv_cached_prefix_lens = None
-            else:
-                context.paged_kv_cached_prefix_len = 0
-                context.paged_kv_cached_prefix_lens = tuple(row_prefixes)
+            # Shared scalar only; mixed per-row cuts stay on Hunyuan kwargs.
+            get_forward_context().paged_kv_cached_prefix_len = shared_prefix
 
         computed_tokens = [tuple(getattr(request, "kv_computed_tokens", ()) or ()) for request in requests]
         kv_computed_tokens = computed_tokens[0] if len(set(computed_tokens)) == 1 else ()
+        request_ids = [request.request_id for request in requests]
+        cfg_factor = 1 if prepared_layout is None else prepared_layout.num_branches // max(len(requests), 1)
+        paged_row_keys = self._cfg_major_paged_row_keys(request_ids, cfg_factor)
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
@@ -2906,11 +2925,13 @@ class HunyuanImage3Pipeline(
             bot_task=tokenizer_bot_task,
             prepared_layout=prepared_layout,
             kv_computed_tokens=kv_computed_tokens,
-            paged_request_ids=[request.request_id for request in requests],
+            paged_request_ids=request_ids,
             **ar_kv_kwargs,
         )
         model_inputs.update(ar_kv_kwargs)
-        model_inputs["paged_request_ids"] = [request.request_id for request in requests]
+        model_inputs["paged_request_ids"] = request_ids
+        model_inputs["paged_row_keys"] = paged_row_keys
+        model_inputs["hunyuan_paged_prefix_cut"] = hunyuan_paged_prefix_cut
 
         self._ensure_grouped_attention_backend_supported(len(requests))
         image = self._generate(**model_inputs, **kwargs)

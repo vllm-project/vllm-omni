@@ -1299,7 +1299,8 @@ def test_forward_request_group_publishes_per_row_mixed_prefix(monkeypatch):
     def fake_generate(**kwargs):
         context = get_forward_context()
         captured["prefix_len"] = context.paged_kv_cached_prefix_len
-        captured["prefix_lens"] = context.paged_kv_cached_prefix_lens
+        captured["prefix_cut"] = kwargs.get("hunyuan_paged_prefix_cut")
+        captured["row_keys"] = kwargs.get("paged_row_keys")
         return torch.tensor([[0], [1]])
 
     monkeypatch.setattr(pipeline, "prepare_model_inputs", fake_prepare_model_inputs)
@@ -1322,7 +1323,8 @@ def test_forward_request_group_publishes_per_row_mixed_prefix(monkeypatch):
 
     assert [output.output["payload"]["image"].tolist() for output in outputs] == [[0], [1]]
     assert captured["prefix_len"] == 0
-    assert captured["prefix_lens"] == (0, 4)
+    assert captured["prefix_cut"] == (0, 4)
+    assert captured["row_keys"] == [("cold", 0), ("hit", 0)]
     assert captured["kv_computed_tokens"] == ()
 
 

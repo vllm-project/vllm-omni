@@ -42,15 +42,15 @@ class ForwardContext:
     paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
     # Block-aligned prefix already resident in Scheduler-owned pages for the
     # active request-level prefill. Zero keeps the cold/full-prefill path.
+    # Mixed public-request hits leave this at 0; models that need per-row cuts
+    # must carry those lengths themselves (not via ForwardContext).
     paged_kv_cached_prefix_len: int = 0
-    # Per-row prefix cuts when a packed request group has mixed hit lengths.
-    # None means every row uses ``paged_kv_cached_prefix_len``.
-    paged_kv_cached_prefix_lens: tuple[int, ...] | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+
     # Startup-only memory profiling runs before Scheduler-owned pages exist.
     # Attention layers use this explicit scope to distinguish that probe from
     # a malformed paged request whose Worker adapter was not activated.
@@ -352,6 +352,7 @@ def set_forward_context_denoise_step_idx(
     step_idx: int | None,
     request_ids: tuple[str, ...] | list[str] | None = None,
     paged_step_idx: int | None = None,
+    paged_row_keys: tuple[tuple[str, int | None], ...] | list[tuple[str, int | None]] | None = None,
 ) -> None:
     """Set the current diffusion denoise step on the active ForwardContext.
 
@@ -361,6 +362,10 @@ def set_forward_context_denoise_step_idx(
     denoise, so a caller that batches states with different real indices
     passes the phase through ``paged_step_idx`` instead of flattening
     ``step_idx``.
+
+    ``request_ids`` filters Scheduler rows while preserving their installed
+    order. Models that need a different activation order pass explicit
+    ``paged_row_keys`` as ``(request_id, sequence_id)`` pairs.
     """
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
@@ -371,6 +376,7 @@ def set_forward_context_denoise_step_idx(
                 ensure_active(
                     paged_step_idx if paged_step_idx is not None else step_idx,
                     request_ids=request_ids,
+                    row_keys=paged_row_keys,
                 )
 
 

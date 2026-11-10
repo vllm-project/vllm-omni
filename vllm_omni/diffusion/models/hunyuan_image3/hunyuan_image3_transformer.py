@@ -3145,10 +3145,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         if is_forward_context_available():
             context = get_forward_context()
-            if context.paged_kv_cached_prefix_len or context.paged_kv_cached_prefix_lens:
+            prefix_cut = model_kwargs.get("hunyuan_paged_prefix_cut")
+            if context.paged_kv_cached_prefix_len or prefix_cut:
                 # Local hits are sliced after conditional-image embeddings are
                 # prepared in forward_call; the AR path must not truncate them.
                 return input_ids, 0
+
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         computed_tokens = get_paged_kv_computed_tokens()
         if computed_tokens and computed_tokens[0] > 0:
@@ -3403,6 +3405,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     set_forward_context_denoise_step_idx(
                         i,
                         request_ids=model_kwargs.get("paged_request_ids"),
+                        paged_row_keys=model_kwargs.get("paged_row_keys"),
                         paged_step_idx=0 if i == 0 else 1,
                     )
                 else:

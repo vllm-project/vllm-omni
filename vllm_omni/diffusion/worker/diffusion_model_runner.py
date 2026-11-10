@@ -949,8 +949,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             f"got {mixed_cfg_rows}"
                         )
                     cached_prefix_lens = {next(iter(prefixes)) for prefixes in prefixes_by_request.values()}
-                    # Mixed prefixes across public requests are split by Hunyuan
-                    # grouping; the outer context only carries a uniform value.
+                    # Shared scalar only when every public request agrees. Mixed
+                    # hits leave 0; models that need per-row cuts must carry them
+                    # outside ForwardContext.
                     paged_kv_cached_prefix_len = next(iter(cached_prefix_lens)) if len(cached_prefix_lens) == 1 else 0
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata

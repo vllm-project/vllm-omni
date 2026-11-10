@@ -1143,7 +1143,7 @@ def _cfg_row(request_id: str, sequence_id: int, seq_len: int, kv_start_pos: int)
     )
 
 
-def test_rows_for_requests_orders_grouped_cfg_rows_like_hunyuan_step() -> None:
+def test_filter_rows_for_requests_preserves_scheduler_order() -> None:
     # Scheduler metadata is request-major: both CFG sequences of req-0, then req-1.
     rows = (
         _cfg_row("req-0", 0, 17, 9),
@@ -1152,22 +1152,41 @@ def test_rows_for_requests_orders_grouped_cfg_rows_like_hunyuan_step() -> None:
         _cfg_row("req-1", 1, 13, 5),
     )
 
-    grouped = DiffusionPagedAttentionRuntime._rows_for_requests(rows, ["req-0", "req-1"])
-    assert [(row.request_id, row.sequence_id, row.seq_len) for row in grouped] == [
+    filtered = DiffusionPagedAttentionRuntime._filter_rows_for_requests(rows, ["req-0", "req-1"])
+    assert [(row.request_id, row.sequence_id, row.seq_len) for row in filtered] == [
         ("req-0", 0, 17),
-        ("req-1", 0, 13),
         ("req-0", 1, 17),
+        ("req-1", 0, 13),
         ("req-1", 1, 13),
     ]
 
-    single = DiffusionPagedAttentionRuntime._rows_for_requests(rows, ["req-1"])
+    single = DiffusionPagedAttentionRuntime._filter_rows_for_requests(rows, ["req-1"])
     assert [(row.request_id, row.sequence_id, row.seq_len) for row in single] == [
         ("req-1", 0, 13),
         ("req-1", 1, 13),
     ]
 
 
-def test_ensure_active_uses_cfg_major_row_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rows_for_keys_applies_caller_order() -> None:
+    rows = (
+        _cfg_row("req-0", 0, 17, 9),
+        _cfg_row("req-0", 1, 17, 9),
+        _cfg_row("req-1", 0, 13, 5),
+        _cfg_row("req-1", 1, 13, 5),
+    )
+    ordered = DiffusionPagedAttentionRuntime._rows_for_keys(
+        rows,
+        [("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)],
+    )
+    assert [(row.request_id, row.sequence_id, row.seq_len) for row in ordered] == [
+        ("req-0", 0, 17),
+        ("req-1", 0, 13),
+        ("req-0", 1, 17),
+        ("req-1", 1, 13),
+    ]
+
+
+def test_ensure_active_uses_explicit_row_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     captured: list[tuple[tuple[str, int | None], ...]] = []
 
@@ -1193,7 +1212,11 @@ def test_ensure_active_uses_cfg_major_row_order(monkeypatch: pytest.MonkeyPatch)
         ),
     )
     runtime = DiffusionPagedAttentionRuntime(adapter, metadata)
-    runtime.ensure_active(1, request_ids=["req-0", "req-1"])
+    runtime.ensure_active(
+        1,
+        request_ids=["req-0", "req-1"],
+        row_keys=[("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)],
+    )
 
     assert captured == [
         (("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)),
