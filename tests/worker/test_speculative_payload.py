@@ -68,15 +68,19 @@ def test_speculative_token_selection_tracks_committed_rows(use_dflash, sampled, 
     assert runner._get_speculative_committed_token_ids("r1", 0, scheduler_output, [sampled]) == expected
 
 
-def test_first_speculative_delta_seeds_prefill_sampled_token() -> None:
+@pytest.mark.parametrize("first_committed", [10, 11])
+@pytest.mark.parametrize("prior_rows", [0, 3, 4])
+def test_first_speculative_delta_seeds_prefill_sampled_token(first_committed, prior_rows) -> None:
     runner = object.__new__(GPUARModelRunner)
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner._pending_full_payload_send = {"r1": ({}, {}, {"hidden_states.layer_0": 3}, object())}
+    runner._pending_full_payload_send = {"r1": ({}, {}, {"hidden_states.layer_0": prior_rows}, object())}
     runner.requests = {"r1": SimpleNamespace(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11])}
     scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={"r1": [4, 5, 6]})
 
-    assert runner._get_speculative_committed_token_ids("r1", 0, scheduler_output, [[11, 12]]) == [10, 11, 12]
+    committed = [first_committed, 12]
+    expected = [10, *committed] if prior_rows <= 3 else committed
+    assert runner._get_speculative_committed_token_ids("r1", 0, scheduler_output, [committed]) == expected
 
 
 def test_async_speculative_delta_seeds_only_the_first_prefill_sample() -> None:

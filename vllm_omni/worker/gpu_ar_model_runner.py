@@ -1076,12 +1076,7 @@ class GPUARModelRunner(
         # verifier span arrives. Seed it only on that first generated-token
         # step; later spans already have prior output tokens.
         seed_first_sample = len(output_ids) - len(committed) == 1 if is_async_chunk else prior_rows <= prompt_len
-        if (
-            seed_first_sample
-            and output_ids
-            and committed
-            and (is_async_chunk or int(output_ids[0]) != int(committed[0]))
-        ):
+        if seed_first_sample and output_ids and committed:
             committed.insert(0, int(output_ids[0]))
         return committed
 
