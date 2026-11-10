@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-import pickle
+import io
 
 import pytest
+import torch
 
 from vllm_omni.diffusion.weight_management.errors import (
     MAX_ERROR_MESSAGE_CHARS,
@@ -54,6 +55,21 @@ EXPECTED_PHASES = {
     LifecycleError: "lifecycle",
     RuntimeFault: "service",
 }
+
+
+def _round_trip(value):
+    """Round-trip ``value`` through torch's pickle-based serializer.
+
+    RFC 01 ships :class:`ErrorSummary` inside ``all_gather_object`` messages, so it
+    must survive serialization.  The repository forbids direct ``pickle`` imports
+    outside an allowlist, and this test does not justify an exception: ``torch``
+    uses the same pickle protocol for this object graph.  The real confirmation
+    transport is exercised against a live Gloo world by the 01-4 tests.
+    """
+    buffer = io.BytesIO()
+    torch.save(value, buffer)
+    buffer.seek(0)
+    return torch.load(buffer, weights_only=False)
 
 
 def test_message_format_includes_all_context():
@@ -114,7 +130,7 @@ def test_point_scoped_errors_take_an_instance_phase():
     assert timeout.phase == "point0_topology"
 
 
-def test_error_summary_is_picklable_and_truncated():
+def test_error_summary_survives_serialization_and_is_truncated():
     error = WriteError("x" * (MAX_ERROR_MESSAGE_CHARS * 2))
     error.stage_id = 1
     error.rank = 2
@@ -128,8 +144,9 @@ def test_error_summary_is_picklable_and_truncated():
     assert len(summary.message) == MAX_ERROR_MESSAGE_CHARS
     assert summary.message.startswith("[weight-stack][stage 1][rank 2/4][write] xxx")
 
-    restored = pickle.loads(pickle.dumps(summary))
+    restored = _round_trip(summary)
     assert restored == summary
+    assert type(restored) is ErrorSummary
 
 
 def test_error_summary_uses_unknown_rank_sentinel():
