@@ -263,6 +263,25 @@ def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     return _supports_native_online_mxfp4_moe()
 
 
+def _is_native_modelopt_nvfp4_moe(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the model uses ModelOpt NVFP4 MoE on a native backend."""
+    if _uses_explicit_lora_capable_moe_backend(od_config):
+        return False
+
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig, ModelOptNvFp4Config
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import cutlass_fp4_supported
+
+    quant_config = getattr(od_config, "quantization_config", None)
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # Expert prefixes are unknown before the model is built; any NVFP4 layer counts.
+        algos = {str(recipe.get("quant_algo", "")).upper() for recipe in quant_config.quantized_layers.values()}
+        if "NVFP4" not in algos:
+            return False
+    elif not isinstance(quant_config, ModelOptNvFp4Config) or quant_config.quant_method != "NVFP4":
+        return False
+    return cutlass_fp4_supported()
+
+
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,
@@ -295,14 +314,18 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     lora_backend = getattr(od_config, "lora_backend", "peft")
     lora_backend = getattr(lora_backend, "value", lora_backend)
     moe_lora_enabled = od_config.is_moe and lora_backend == "peft"
-    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_accelerator_online_mxfp4_moe(od_config):
-        # vLLM rejects native MXFP4 MoE kernels while LoRA is enabled.
+    if (
+        moe_lora_enabled
+        and not getattr(od_config, "lora_path", None)
+        and (_is_accelerator_online_mxfp4_moe(od_config) or _is_native_modelopt_nvfp4_moe(od_config))
+    ):
+        # vLLM rejects native MXFP4/NVFP4 MoE kernels while LoRA is enabled.
         # Keep the baseline on those kernels. Startup adapters keep LoRA enabled;
         # CUDA can fall back to W4A16 MARLIN, while XPU has no LoRA MXFP4 backend.
         logger.info(
-            "Disabling MoE LoRA for online MXFP4 on a native-capable CUDA/XPU device "
-            "without a startup adapter; "
-            "this enables the native MXFP4 MoE backend."
+            "Disabling MoE LoRA for online MXFP4 or ModelOpt NVFP4 on a native-capable "
+            "device without a startup adapter; "
+            "this enables the native MoE backend."
         )
         moe_lora_enabled = False
     if moe_lora_enabled:
