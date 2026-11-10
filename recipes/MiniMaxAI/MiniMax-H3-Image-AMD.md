@@ -230,6 +230,21 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 1032,5376,14336,False,torch.bfloat16,torch.bfloat16,False,False
 CSV
 
+# Run in the control environment, before setting an external CSV override.
+python - <<'PY'
+import os
+import shutil
+from pathlib import Path
+
+from aiter.jit.core import AITER_CONFIGS
+
+resolved = Path(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
+destination = Path(os.environ["TUNING_DIR"])
+shutil.copyfile(resolved, destination / "baseline.csv")
+shutil.copyfile(resolved, destination / "tuned.csv")
+print(f"Seeded tuning from the resolved control table: {resolved}")
+PY
+
 python csrc/gemm_a16w16/gemm_a16w16_tune.py \
   --input_file "$TUNING_DIR/shapes.csv" \
   --tuned_file "$TUNING_DIR/tuned.csv" \
@@ -247,6 +262,18 @@ input/output dtypes, backend, and solution index. Numeric hipBLASLt solution
 indices are specific to the compatible library build; retune after changing
 the runtime. Do not copy indices from another machine's trace. This recipe
 ships tuning inputs, without prescribing native solution indices.
+
+Seed from AITER's resolved control table, which can merge the canonical CSV
+with per-model tables. Replacing it with a three-row file would discard
+unrelated tuning. In the recorded runtime the default resolved table had
+5,021 rows; adding these three previously absent keys produced 5,024 rows.
+The default tuner skips existing keys and appends newly tuned rows while
+preserving the seeded records. Require uniqueness across all ten key
+columns: `gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle`.
+To retune an existing key, replace only its row in the working copy through
+a verified key-aware update, or remove that exact key before tuning. Keep
+`baseline.csv` intact and verify that unrelated keys/configurations survive;
+do not append a duplicate key or reset the complete serving profile.
 
 Add the following options to the server's `docker run`, before the image
 argument. The first and third environment settings are already present in
