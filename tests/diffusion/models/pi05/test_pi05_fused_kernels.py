@@ -374,6 +374,19 @@ def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype, tokens):
 
 
 # ── Reordered reductions: attention and the output head ────────────────
+def _attention_reference(q, key, value, mask, scaling) -> torch.Tensor:
+    """``softmax(Q Kᵀ · scale + mask) · V`` with every step in float64, as
+    ``(q_len, heads · head_dim)``. It does not call ``_attend``, whose softmax
+    runs in float32 whatever the input dtype. The mask stays additive, as eager
+    adds it: a fully masked (padded) query row then gets uniform weights, as in
+    eager, where ``-inf`` would give NaN."""
+    q64 = q[0].double()  # (heads, q_len, head_dim)
+    key64, value64 = key.double(), value.double()  # (n_keys, head_dim): the one KV head
+    scores = q64 @ key64.t() * scaling + mask[0, 0, :, : key.shape[0]].double()
+    out = torch.softmax(scores, dim=-1) @ value64  # (heads, q_len, head_dim)
+    return out.transpose(0, 1).reshape(q.shape[2], -1)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("part", SHAPES, ids=str)
 def test_attention_matches_eager_attend(dtype, part):
@@ -400,12 +413,9 @@ def test_attention_matches_eager_attend(dtype, part):
     value = _randn(n_keys, HEAD_DIM, dtype=dtype, seed=16)
     scaling = 1.0 / math.sqrt(HEAD_DIM)
 
-    def attend(q, key, value, mask):
-        out = M._attend(q, key[None, None], value[None, None], mask, num_kv_groups=HEADS, scaling=scaling)
-        return out.transpose(1, 2).reshape(tokens, HEADS * HEAD_DIM)
-
-    expected = attend(q, key, value, mask)
-    reference = attend(q.double(), key.double(), value.double(), mask.double())
+    expected = M._attend(q, key[None, None], value[None, None], mask, num_kv_groups=HEADS, scaling=scaling)
+    expected = expected.transpose(1, 2).reshape(tokens, HEADS * HEAD_DIM)
+    reference = _attention_reference(q, key, value, mask, scaling)
     actual = torch.empty_like(expected)
     scores = torch.empty(HEADS * tokens, n_keys, dtype=dtype, device=DEVICE)
     M._fused_attention(q[0], key, value, mask[0, 0], scaling, scores, actual)
