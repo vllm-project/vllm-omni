@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import logging
 from inspect import Signature, signature
 from types import SimpleNamespace
@@ -711,3 +712,26 @@ class TestAudioGenerateAPI:
         response = client.post("/v1/audio/generate", json=payload)
         # Pydantic v2 ignores extra fields by default
         assert response.status_code == 200
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_audio_generation_inherits_engine_defaults(explicit: bool) -> None:
+    engine = _make_engine_client()
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    server = _make_server(engine)
+    for override in (explicit, False):
+        request = OpenAICreateAudioGenerateRequest(input="rain", **({"guidance_scale": 0.0} if override else {}))
+        asyncio.run(server.create_audio_generate(request))
+        params = engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.num_inference_steps == 50
+        assert params.seed == 42
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}
