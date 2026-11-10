@@ -738,9 +738,6 @@ class MiniMaxH3DiTModel(nn.Module):
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
-        use_aiter_gemm = (getattr(od_config, "additional_config", None) or {}).get("minimax_h3_use_aiter_gemm", False)
-        if type(use_aiter_gemm) is not bool:
-            raise ValueError("minimax_h3_use_aiter_gemm must be a boolean")
         cache_config = getattr(od_config, "cache_config", {})
         enabled = (
             cache_config.get("minimax_h3_adaln_cache", True)
@@ -859,10 +856,6 @@ class MiniMaxH3DiTModel(nn.Module):
             ]
         )
         self.controlnet = None
-        if use_aiter_gemm:
-            from .aiter_gemm import enable_minimax_h3_aiter_gemm
-
-            enable_minimax_h3_aiter_gemm(self.blocks)
         if getattr(od_config, "controlnet_model_path", None):
             self.controlnet = MiniMaxH3ControlNet(arch)
         self.sp_prepare = MiniMaxH3SPPrepare()

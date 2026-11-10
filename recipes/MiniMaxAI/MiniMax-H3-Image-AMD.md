@@ -193,31 +193,17 @@ runs from POST submission through full response-body receipt, including
 queueing, generation, encoding, and base64 transfer. Throughput includes
 client validation and persistence. Warmups are excluded from both metrics.
 
-## Optional tuned BF16 DiT GEMMs
+## Tune the existing BF16 GEMM dispatch
 
-`--additional-config '{"text_encoder_cudnn_sdp":false,"minimax_h3_use_aiter_gemm":true}'`
-opts the shared H3 DiT into AITER's existing `gemm_a16w16` tuned dispatcher.
-The flag defaults to `false` and must be a JSON boolean. This integration
-requires an AITER build providing `get_GEMM_A16W16_tuned_config` and
-`gemm_a16w16`; these APIs are present in the recorded AITER 0.1.26 runtime.
-An older build missing these APIs cannot use this opt-in. Image serving
-also requires a checkout containing the H3-Image pipeline; the shared DiT
-adapter does not supply that pipeline.
-
-If the image-support checkout gates the native ROCm RMSNorm/Silu compatibility
-fallbacks behind `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS`, set
-`VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` in both control and tuned server runs
-when using the recorded runtime. Keep this compatibility setting identical
-across the comparison; it is separate from the GEMM opt-in.
-
-Only the main DiT's unquantized QKV, MLP gate/up, and MLP down projections
-are eligible. Tuned calls require inference mode, eager execution, TP1,
-contiguous two-dimensional GPU BF16 inputs and native BF16 weights, and
-no bias. Other dtypes, quantized/custom linear methods, tensor-parallel
-projections, shuffled weights, batch-invariant execution, and shapes without
-an AITER tuned entry retain the original linear method. Original weight
-loading, layer forwards, LoRA composition, and offload hooks remain in use.
-This does not change the six PDD steps, canvas policy, or precision.
+The recorded vLLM 0.33/AITER 0.1.26 runtime already routes the large native
+BF16 H3 projections through `UnquantizedLinearMethod` →
+`rocm_unquantized_gemm_impl` → `aiter.tuned_gemm.tgemm.mm` → `gemm_a16w16`
+on `gfx950` when AITER linear support is enabled. These shapes bypass the
+preceding Triton/skinny dispatch cases. AITER's standard tuned CSV is
+therefore sufficient; no Omni model feature flag or replacement linear
+method is required. Verify this route again when changing vLLM versions.
+Image serving separately requires a checkout containing the H3-Image
+pipeline.
 
 Tune the shapes observed for your workload using the same AITER source,
 ROCm/hipBLASLt build, and GPU model that will serve it. For the four-GPU,
@@ -259,32 +245,46 @@ Record the serving image digest alongside these files. The tuner writes
 AITER's standard columns, including GPU architecture, CU count, dimensions,
 input/output dtypes, backend, and solution index. Numeric hipBLASLt solution
 indices are specific to the compatible library build; retune after changing
-the runtime. Do not copy indices from another machine's trace. No solution
-indices or model-specific tuning table are shipped by this integration.
+the runtime. Do not copy indices from another machine's trace. This recipe
+ships tuning inputs, without prescribing native solution indices.
 
 Add the following options to the server's `docker run`, before the image
-argument, and use the `additional-config` flag above:
+argument. The first and third environment settings are already present in
+the base command; keep one copy of each:
 
 ```bash
 -v "$TUNING_DIR:/h3-gemm-tuning:ro" \
+-e VLLM_ROCM_USE_AITER=1 \
+-e VLLM_ROCM_USE_AITER_LINEAR=1 \
+-e VLLM_ROCM_USE_SKINNY_GEMM=0 \
 -e AITER_CONFIG_GEMM_BF16=/h3-gemm-tuning/tuned.csv \
 ```
 
-Set the CSV before worker startup and restart the workers after changing
-it: AITER and this adapter cache lookups for the worker lifetime. AITER
-validates and selects entries through its own GPU/CU/dtype/shape policy;
-unmatched entries fall back to the original path. Malformed CSVs and
-incompatible native libraries must be corrected rather than treated as
-performance results.
+`VLLM_ROCM_USE_AITER_LINEAR` defaults to enabled in the recorded runtime;
+setting it explicitly makes the serving configuration reproducible. Set the
+CSV before worker startup and restart workers after changing it: AITER
+caches configuration lookups for the worker lifetime. AITER owns GPU/CU,
+dtype, shape matching, and backend selection, including its default path
+for untuned shapes. Invalid CSVs and incompatible native libraries must be
+corrected before interpreting performance measurements. This configuration
+uses the existing linear path and preserves its weight loading, TP, LoRA,
+and residency behavior.
+
+If the image-support checkout gates the native ROCm RMSNorm/Silu compatibility
+fallbacks behind `VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS`, set
+`VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1` in both control and tuned server runs
+when using the recorded runtime. Keep this compatibility setting identical
+across the comparison; it is separate from GEMM tuning.
 
 Warm the complete image pipeline before collecting profiler-disabled
 latencies. Initial native-library/JIT setup took 14–98 seconds in the
-exploratory runtime and is excluded from steady-state timings. Keep the
-same prompts, paired seeds, warmups, canvas, six-step schedule, precision,
-concurrency, and source revision for comparisons with the flag disabled.
-Check output validity and image quality separately; a tuned BF16 GEMM
-can have different floating-point accumulation order. This opt-in alone
-does not establish an end-to-end speedup or image-quality equivalence.
+exploratory runtime and is excluded from steady-state timings. Compare the
+external CSV with a control using the same AITER settings and its default
+table. Keep prompts, paired seeds, warmups, canvas, six-step PDD schedule,
+BF16 precision, concurrency, and source revision identical. Check output
+validity and image quality separately; a tuned BF16 GEMM can have a
+different floating-point accumulation order. A tuning table alone does
+not establish an end-to-end speedup or image-quality equivalence.
 
 ## Historical MI350X validation
 

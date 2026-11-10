@@ -124,21 +124,12 @@ integration that skips weight transfers must coordinate with `OffloadPlan`
 before prefetch and provide a safe miss path; moving weight storage currently
 causes conservative cache invalidation.
 
-## MiniMax-H3 tuned BF16 linear methods
+## Existing library GEMM tuning
 
-MiniMax-H3's optional `additional_config.minimax_h3_use_aiter_gemm` flag
-installs a linear-method adapter only on native unquantized main-DiT QKV
-and MLP gate/up/down layers on ROCm. The default is disabled. This model
-integration owns the eligible projections and strict BF16/TP1/eager guards;
-AITER owns tuned CSV parsing, hardware and shape matching, and backend
-selection. The model does not embed native solution indices or interpret
-another tuning artifact format.
-
-The adapter preserves the original method instance for weight creation,
-post-load processing, and unsupported or untuned calls. Layer forward
-methods, tensor-parallel handling, surrounding LoRA wrappers, and weight
-residency hooks remain in control. Validate these fallback and lifecycle
-contracts in CPU tests, then qualify tuned entries with the exact serving
-library build and workload before making numerical or performance claims.
-See the [AMD H3-Image tuning recipe](../../../../recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md#optional-tuned-bf16-dit-gemms)
-for external CSV preparation and warmup requirements.
+Model integrations should use the framework's existing linear dispatch when
+it already supports a hardware library's tuned configuration. In the
+recorded `gfx950` H3 runtime, vLLM's unquantized ROCm path reaches AITER's
+standard BF16 tuned CSV. AITER owns table parsing, hardware/shape matching,
+and backend selection; a second model-specific adapter is unnecessary.
+See the [AMD H3-Image tuning recipe](../../../../recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md#tune-the-existing-bf16-gemm-dispatch)
+for build-compatible external tuning and validation requirements.
