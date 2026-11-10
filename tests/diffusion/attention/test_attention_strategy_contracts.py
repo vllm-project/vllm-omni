@@ -271,7 +271,6 @@ def test_model_copy_and_state_dict_preserve_strategy(local_attention, compiled):
         {"pipeline_parallel_size": 2},
         {"data_parallel_size": 2},
         {"use_hsdp": True},
-        {"cfg_parallel_size": 2},
     ],
 )
 def test_strategy_rejects_unsupported_parallel_combinations(parallel):
@@ -325,6 +324,51 @@ def test_strategy_admits_pure_ulysses(enforce_eager):
     config.enforce_eager = False
     config.diffusion_compile_granularity = "full"
     with pytest.raises(ValueError, match="regional compilation or eager"):
+        validate_strategy_parallel(config)
+
+
+@pytest.mark.parametrize("ulysses_degree", [1, 2, 4])
+def test_strategy_admits_ulysses_within_cfg_branches(ulysses_degree):
+    from vllm_omni.diffusion.attention.contracts import AttentionExecutionEnvironment, validate_strategy_parallel
+
+    world = 2 * ulysses_degree
+    config = configuration(presets={"base": "FLASH_ATTN"}, layout={"default": "base"})
+    config.num_gpus = world
+    config.parallel_config = SimpleNamespace(
+        ulysses_degree=ulysses_degree,
+        cfg_parallel_size=2,
+        world_size=world,
+        sequence_parallel_size=ulysses_degree,
+    )
+    config.diffusion_compile_granularity = "regional"
+    validate_strategy_parallel(config)
+    environment = AttentionExecutionEnvironment.for_model(config, StrategyModelSupport(ulysses=True))
+    # Ulysses degree is per CFG branch; single-branch execution stays local.
+    assert environment.ulysses_degree == ulysses_degree
+    assert environment.single_device_strategy == (ulysses_degree == 1)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"num_gpus": 3},
+        {"world_size": 2},
+        {"sequence_parallel_size": 4},
+        {"tensor_parallel_size": 2},
+    ],
+)
+def test_strategy_rejects_cfg_branches_combined_with_other_parallelism(mismatch):
+    from vllm_omni.diffusion.attention.contracts import validate_strategy_parallel
+
+    config = configuration(presets={"base": "FLASH_ATTN"}, layout={"default": "base"})
+    config.num_gpus = 4
+    config.parallel_config = SimpleNamespace(
+        ulysses_degree=2, cfg_parallel_size=2, world_size=4, sequence_parallel_size=2
+    )
+    config.diffusion_compile_granularity = "regional"
+    for name, value in mismatch.items():
+        setattr(config if name == "num_gpus" else config.parallel_config, name, value)
+    with pytest.raises(ValueError, match="single-device"):
         validate_strategy_parallel(config)
 
 

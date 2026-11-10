@@ -66,12 +66,20 @@ class AttentionExecutionEnvironment:
 
 
 def validate_strategy_parallel(config):
-    """Admit single-device or pure strict Ulysses execution for the PoC."""
+    """Admit single-device or strict Ulysses execution, optionally per CFG branch.
+
+    CFG-parallel ranks each run one complete guidance branch with the same
+    denoising schedule and exchange only the final noise predictions. Layout
+    selection uses the logical step, block selection is rank-local, and Ulysses
+    collectives use the per-branch Ulysses group, so attention strategies need
+    no coordination across CFG ranks.
+    """
     parallel = getattr(config, "parallel_config", None)
     degree = getattr(parallel, "ulysses_degree", 1) or 1
+    world = degree * (getattr(parallel, "cfg_parallel_size", 1) or 1)
     if (
-        getattr(config, "num_gpus", degree) != degree
-        or (getattr(parallel, "world_size", degree) or degree) != degree
+        getattr(config, "num_gpus", world) != world
+        or (getattr(parallel, "world_size", world) or world) != world
         or (getattr(parallel, "sequence_parallel_size", degree) or degree) != degree
         or any(
             (getattr(parallel, name, 1) or 1) != 1
@@ -81,13 +89,14 @@ def validate_strategy_parallel(config):
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
                 "data_parallel_size",
-                "cfg_parallel_size",
             )
         )
         or getattr(parallel, "use_hsdp", False)
         or getattr(config, "enable_distributed_layerwise_offload", False)
     ):
-        raise ValueError("Attention strategies require single-device or pure Ulysses execution")
+        raise ValueError(
+            "Attention strategies require single-device or strict Ulysses execution, optionally per CFG branch"
+        )
     if degree > 1:
         if getattr(parallel, "ulysses_mode", "strict") != "strict":
             raise ValueError("Attention strategies currently require strict Ulysses mode")
