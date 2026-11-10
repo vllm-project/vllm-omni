@@ -361,65 +361,47 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     return out[0]
                 return out
 
-        # The K-step control head is two-wide (continue/stop). Keep the input
-        # batch's vocab in sync so the rejection sampler and any top-k
-        # bookkeeping do not address non-existent token ids.
-        prev_vocab_size = None
-        had_vocab = True
-        try:
-            prev_vocab_size = input_batch.vocab_size
-        except AttributeError:
-            # V2 InputBatch carries no vocab_size field (the sampling vocab
-            # lives on model_config): there is nothing on the batch to sync
-            # and no reader to mislead. The two-wide control logits are
-            # consumed by the talker's device-side sampler stages, and the
-            # duplex K-step path installs no rejection speculator
-            # (mrv2_custom_sampler returns no speculator for K > 0). Raising
-            # here kills every real MRv2 deployment at the first decode step
-            # (observed on the 910B3 bench), so keep the original
-            # warn-once-and-skip semantics.
-            had_vocab = False
-            if not getattr(self, "_kstep_vocab_warned", False):
-                self._kstep_vocab_warned = True
-                logger.warning(
-                    "[kstep] input_batch has no vocab_size; skipping stop-row vocab sync"
-                )
-        else:
-            input_batch.vocab_size = 2
-        # Arm the per-step K-step state: drafts and postprocess now follow
-        # the frame-loop semantics until the next decline re-disarms them.
+        # No vocab sync is needed on this runner. The MRv2 step's input_batch
+        # carries no vocab_size field (the sampling vocab lives on
+        # model_config) and nothing on this path reads it: the two-wide
+        # control logits are consumed by the talker's device-side sampler
+        # stages, the duplex K-step dispatch installs no rejection speculator
+        # (mrv2_custom_sampler returns no speculator for K > 0), and the
+        # frame loop's stop-row guard raises the batch's own vocab_size to
+        # STOP_ROW_WIDTH itself when it is missing (talker_multiframe.py).
+        # Setting the field here would only create an attribute no one reads,
+        # and raising on its absence killed every real MRv2 deployment at the
+        # first decode step (observed on the 910B3 bench).
+        # make_omni_output reads its per-request info from the extra kwargs;
+        # forwarding the whole forward-input dict duplicates that key.
+        model_kwargs = {
+            "runtime_additional_information": infos,
+            "intermediate_tensors": model_inputs.get("intermediate_tensors"),
+        }
+        model_kwargs_extra = {
+            "request_token_spans": spans,
+            "model_intermediate_buffer": infos,
+        }
+        # The MRv2 stage loads the outer omni wrapper; the codec frame hooks
+        # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
+        # live on the inner talker, which the wrapper only partially forwards.
+        codec_model = getattr(self.model, "talker", self.model)
+        out = multiframe.run(
+            model=codec_model,
+            run_model=run_model,
+            after_forward=lambda: None,
+            inputs_embeds=model_inputs.get("inputs_embeds"),
+            input_ids=model_inputs.get("input_ids"),
+            frames=frames,
+            model_kwargs=model_kwargs,
+            model_kwargs_extra=model_kwargs_extra,
+            narrow=None,
+        )
+        # Arm the per-step K-step state only after a successful frame loop:
+        # drafts and postprocess now follow the frame-loop semantics until
+        # the next decline re-disarms them.
         self._kstep_ran_last = True
-        try:
-            # make_omni_output reads its per-request info from the extra kwargs;
-            # forwarding the whole forward-input dict duplicates that key.
-            model_kwargs = {
-                "runtime_additional_information": infos,
-                "intermediate_tensors": model_inputs.get("intermediate_tensors"),
-            }
-            model_kwargs_extra = {
-                "request_token_spans": spans,
-                "model_intermediate_buffer": infos,
-            }
-            # The MRv2 stage loads the outer omni wrapper; the codec frame hooks
-            # (preprocess/make_omni_output/take_batch_stop_logits/merge_frame_outputs)
-            # live on the inner talker, which the wrapper only partially forwards.
-            codec_model = getattr(self.model, "talker", self.model)
-            return multiframe.run(
-                model=codec_model,
-                run_model=run_model,
-                after_forward=lambda: None,
-                inputs_embeds=model_inputs.get("inputs_embeds"),
-                input_ids=model_inputs.get("input_ids"),
-                frames=frames,
-                model_kwargs=model_kwargs,
-                model_kwargs_extra=model_kwargs_extra,
-                narrow=None,
-            )
-        finally:
-            # Restore before the next step: a declined or non-K-step batch on
-            # this runner must not see the two-wide control vocab.
-            if had_vocab:
-                input_batch.vocab_size = prev_vocab_size
+        return out
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
         # K-step drafts are not predictions: they reserve the K-1 extra KV

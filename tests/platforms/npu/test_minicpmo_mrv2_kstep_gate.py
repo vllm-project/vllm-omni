@@ -31,7 +31,9 @@ def _make_runner(spans, infos, has_prefill=False):
         _request_token_spans=lambda input_batch: spans,
     )
     ns.model = types.SimpleNamespace()  # no .talker: codec_model falls back
-    input_batch = types.SimpleNamespace(has_prefill=has_prefill, vocab_size=6562)
+    # A real MRv2 step's batch carries no vocab_size field (the sampling
+    # vocab lives on model_config); the fake mirrors that.
+    input_batch = types.SimpleNamespace(has_prefill=has_prefill)
     model_inputs = {"model_intermediate_buffer": infos}
     return ns, input_batch, model_inputs
 
@@ -90,8 +92,6 @@ def test_gate_passes_to_frame_loop(monkeypatch):
     seen = {}
 
     def fake_run(**kwargs):
-        # Late-binding closure: records the vocab the frame loop actually saw.
-        seen["vocab"] = input_batch.vocab_size
         seen["frames"] = kwargs["frames"]
         return "frame-loop-output"
 
@@ -103,30 +103,8 @@ def test_gate_passes_to_frame_loop(monkeypatch):
     out = _run(ns, input_batch, model_inputs)
     assert out == "frame-loop-output"
     assert seen["frames"] == 8
-    # The stop-row vocab sync ran during the frame loop...
-    assert seen["vocab"] == 2
-    # ...and the original vocab is restored once the loop returns.
-    assert input_batch.vocab_size == 6562
-    # The per-step arm is on after a successful frame loop.
+    # The per-step arm is on only after a successful frame loop.
     assert ns._kstep_ran_last is True
-
-
-def test_vocab_size_missing_skips_sync_and_runs(monkeypatch):
-    # V2 InputBatch carries no vocab_size field; the sync must skip (warn
-    # once) and the frame loop must still run - raising here killed real
-    # MRv2 deployments at the first decode step (910B3 bench, 04:12 crash).
-    import vllm_omni.platforms.npu.worker.talker_multiframe as multiframe
-
-    monkeypatch.setattr(multiframe, "run", lambda **kwargs: "frame-loop-output")
-    spans = [(i * 8, (i + 1) * 8) for i in range(2)]
-    infos = [{"req_id": str(i)} for i in range(2)]
-    ns, input_batch, model_inputs = _make_runner(spans, infos)
-    del input_batch.vocab_size
-    out = _run(ns, input_batch, model_inputs)
-    assert out == "frame-loop-output"
-    # The frame loop still ran and the per-step arm is set.
-    assert ns._kstep_ran_last is True
-    assert ns._kstep_vocab_warned is True
 
 
 def test_declined_step_disarms_kstep_state():
