@@ -32,9 +32,10 @@ def test_graph_tile_decode_is_bitwise_eager():
     again = vae.decode_latent(latent, use_cuda_graph=True)
     assert torch.equal(eager, graphed)
     assert torch.equal(graphed, again)
-    # One tile shape, replayed over parallel stream replicas.
+    # One tile shape, replayed over parallel stream replicas (one on ROCm).
     assert len(vae._decode_graphs.entries) == 1
-    assert len(next(iter(vae._decode_graphs.entries.values()))) > 1
+    replicas = len(next(iter(vae._decode_graphs.entries.values())))
+    assert replicas == 1 if torch.version.hip else replicas > 1
 
 
 def test_concurrent_graph_replicas_match_eager_at_release_width():
@@ -44,6 +45,8 @@ def test_concurrent_graph_replicas_match_eager_at_release_width():
     decoder width, replicas captured on one shared side stream race when map()
     replays them concurrently and return corrupted tiles.
     """
+    if torch.version.hip:
+        pytest.skip("ROCm replays one graph replica")
     config = {
         "_class_name": "MiniMaxH3ImageVAE",
         "latent_channels": 24,

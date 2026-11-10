@@ -553,7 +553,8 @@ class _TileGraphs:
     """
 
     max_shapes = 4
-    replicas = 6
+    # Concurrent replica replay can hang on ROCm (gfx950); one replica does not.
+    replicas = 1 if torch.version.hip else 6
 
     def __init__(self, fn, *, autocast_dtype: torch.dtype) -> None:
         self.fn = fn
