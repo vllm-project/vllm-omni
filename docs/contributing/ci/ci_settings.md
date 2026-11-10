@@ -255,53 +255,154 @@ Canonical layout (prefer these paths for new changes):
     2. Match `agents`, `env`, `timeout_in_minutes`, and `command`/`commands` with sibling steps.
     3. Keep `pipeline-intel.yml` listed in `L2_YAML_FILES` in `ci_conditions.py`.
 
-## Opt-in AMD model-executor CPU partition qualification
+## AMD CPU duration partitions and qualification
 
-The timing-based partitioner is experimental. Production READY/MERGE retain their
-three hash shards, current selectors, exclusion, blocking grades, and timeouts.
-No measured timing profile or production activation is included with this feature.
-TIME-01 artifacts are the prerequisite for evaluating a new split; shard-level
-averages alone do not identify which test modules should move.
+READY/MERGE configure five duration-weighted Model Executor shards using
+`.buildkite/amd/cpu-timings/model-executor-v1.json`. Selectors, exclusions, blocking
+grades and timeouts are unchanged. The checked-in profile contains all 9,145
+selected nodes from the successful six-way target READY trial in
+[build #15651](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15651), merge
+commit `79b424021514b082757f60fbacf2fe010cdadd7c`. The trial used the same
+four-thread limit as production, selected every live node exactly once, and had
+no test, collection, or artifact failures. Repacking those measured phase totals
+into five module-preserving shards estimates 152.91 seconds per shard **before**
+collection and job overhead. This is a planning estimate until the five-way
+candidate completes target CI; it is not a measured p95.
+The Model Executor jobs also set OMP/MKL/OpenBLAS/NumExpr to four threads, matching
+their CPU quota. In the source CI image on an AMD EPYC 9965 host, with a four-CPU
+quota and 16 GiB memory, the four reference cases below all passed at 1/2/4 threads.
+Three measured fresh-process runs after one warmup averaged 31.32s, 22.73s and
+19.38s respectively (ranges 30.31–32.67s, 22.30–23.15s and 19.30–19.44s).
+This is a thread-count comparison, not a measured full-build speedup.
+Software: PyTorch `2.13.0+rocm10.0.0`, vLLM `0.33.0+rocm100`, Python 3.12.15,
+pytest 9.1.1; image digest
+`sha256:921f117d536431ea91bd2fbf08a74821af5738fb909aa48d557dd0bc5a564e14`.
+
+### Diffusion CPU: five-shard rebalance and bounded threads
+
+The five regular Diffusion shards use `diffusion-v1.json`, with 11,609 node
+timings from all five successful instrumented artifacts in
+[build #15658](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15658), merge
+commit `fb25dd4336fb2098e5a4de1d3fc90cf1b72ad4f4`. The first bounded-thread
+trial selected every live node exactly once, with no failures, incomplete tests,
+collection errors or artifact errors. Its legacy profile had 204 unknown and
+116 stale nodes; the regular job walls ranged from 4m42s to 7m42s. Repacking
+the measured setup + call + teardown totals estimates 255.19 seconds per shard
+before collection/overhead, with zero unknown or stale nodes. Exact refreshed-
+profile CI remains the qualification gate. Keep five shards; trial six only if
+future measured p95 rises above 20 minutes and queue capacity allows it.
+
+Regular and Slow CPU jobs bound OMP/MKL/OpenBLAS/NumExpr to two threads per
+process, allowing two gloo ranks to fit the observed four-CPU quota. Four unchanged
+reference cases (Wan fused/exact decode, long LingBot metadata rollout, and real
+causal-VAE continuation) passed at 1/2/4 threads. In the same image and host
+configuration documented above, three measured runs after a warmup averaged
+46.30s, 46.34s and 47.14s respectively (ranges 44.58–48.50s, 45.64–46.99s and
+46.03–48.20s). These results do not establish a meaningful advantage of two over
+one thread; two is a quota-bounded trial setting, including for spawned ranks.
+
+No network shape, rollout length, tolerance or assertion is reduced. Slow CPU
+retains exactly its six reference cases, blocking grade, 40-minute timeout and
+exit-134 retry rule. Regular shards retain their marker expression, both ignored
+files, six deselections, 60-minute timeout and retry rule. Whole modules retain
+fixture locality. Both jobs now emit phase, selection, CPU pressure and cgroup
+memory current/peak/limit/events artifacts under `artifacts/amd-cpu-suites/`.
+JUnit lives in each fresh run directory as `pytest.xml`.
+
+The π0 remapping fixture constructs the real full model hierarchy on `meta`,
+then allocates only the original vision/embedding target parameters on CPU,
+preserving tied aliases. The three remapping tests retain their original tensor
+shapes, payloads and assertions. They do not execute the unused backbone; the
+separate checkpoint/inference parity coverage is unchanged. Their shared mutable
+targets remain order-independent because each test loads a distinct constant.
+This avoids initializing unrelated full-network weights without shrinking the
+property under test. Reproduce the fixture check with the same dependencies as
+the reference benchmark:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
+  python -m pytest -q tests/diffusion/models/pi0/test_pi0_units.py \
+  -k 'remap' --durations=10
+```
+
+In paired fresh containers on the reference host/image above, with four CPUs,
+two threads and a 32 GiB memory limit, one warmup plus three measured runs per
+variant passed all three original tests. Mean process wall time fell from
+61.62s (61.11–62.18s) to 31.62s (31.52–31.83s). Peak pytest process RSS was
+26.33 GiB before and 15.24 GiB after. This measures the fixture change only;
+it does not establish the full shard p95 or a target-agent memory limit.
+
+Reproduce the initial profile from the original artifact filenames:
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py --suite diffusion \
+  --junit downloaded/pytest-*-of-5.xml \
+  --source-build-url https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15582 \
+  --source-commit 438155621484248827a30256e679cb4c84f544fb \
+  --output diffusion-v2.json
+```
+
+The importer rejects missing/duplicate shards, failures, unresolved modules and
+overlapping node IDs. Zero-duration collection skips are not executable node IDs.
+Only use legacy JUnit produced with pytest's total-duration setting. For new
+profiles, use the instrumented artifact builder below and provide the five
+regular job directories separately from Slow CPU.
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/diffusion-thread-trial -- \
+  -q 'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-fused]' \
+  'tests/diffusion/ar_diffusion/test_kv_orchestration.py::test_rollout_keeps_metadata_bounded[2-False-lingbot-two-minutes]' \
+  'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]' \
+  'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+```
+
+The refreshed profile must pass exact-head target CI with the bounded thread
+setting. Compare the exact executed node union and skip outcomes, and retain the
+original numerical checks. Measure concurrent five-shard plus Slow CPU memory
+peaks, CPU throttling, queue latency, summed agent-minutes and paired READY/MERGE
+wall time. The planning target remains p95 below 18 minutes for every regular
+shard and Slow CPU. Revert the pipeline thread export and timing-profile option
+to roll back; do not move Slow CPU cases or weaken their assertions to meet the
+target.
 
 ### Prepare a shared profile
 
-Download the artifact directories from successful TIME-01 **Model Executor** jobs.
+Download the artifact directories from successful instrumented CPU jobs.
 Supply exactly one successful attempt of every shard from each source build:
 
 ```bash
 python .buildkite/amd/scripts/cpu_shard_plan.py \
   downloaded/build-1/shard-0 downloaded/build-1/shard-1 downloaded/build-1/shard-2 \
-  --output model-executor-timings.json
+  --suite model-executor --output model-executor-timings-v2.json
 ```
 
 The tool consumes `invocation.json`, `selection.json`, `summary.json`, and
 `events.jsonl`. Failed/incomplete runs, missing or duplicate shards, overlapping
 selected nodes, and incomplete phase reports are rejected. It sums setup, call,
 and teardown per node, then takes the median across supplied builds. The output
-records `schema_version: 1`, `node_seconds`, and source build URLs/commits.
+records `schema_version: 1`, the suite, `node_seconds`, and source build URLs/commits.
+The same builder accepts `--suite other` and `--suite diffusion` with their
+existing marker and directory contracts. Do not combine different suites in one profile.
 Use a new output path; existing profiles are never overwritten.
 
 ### Run a candidate shard
 
 Run from the repository root in the AMD CI image with the normal test dependencies.
-Use the **same profile bytes and source revision** on all three workers, set the
-index to 0, 1, or 2, and choose a distinct output path for each invocation:
+Use the **same profile bytes and source revision** on all five workers. The runner
+reads the count/index from Buildkite and creates a fresh artifact directory:
 
 ```bash
-SHARD_INDEX=0
-PLAN_DIR=$(mktemp -d)
-pytest -sv tests/model_executor \
+BUILDKITE_PARALLEL_JOB_COUNT=5 BUILDKITE_PARALLEL_JOB=0 \
+python .buildkite/amd/scripts/run_cpu_suite.py \
+  --timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json \
+  model-executor -sv tests/model_executor \
   -m 'core_model and cpu and not omni' \
-  --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end \
-  --cpu-shard-profile=model-executor-timings.json \
-  --cpu-shard-count=3 --cpu-shard-index="$SHARD_INDEX" \
-  --cpu-shard-plan="$PLAN_DIR/plan.json" \
-  --durations=50 --junitxml="$PLAN_DIR/pytest.xml"
+  --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
 ```
 
 These options replace `--num-shards` / `--shard-id` for the qualification run.
 Combining the two partitioners or enabling xdist workers fails before execution.
-The opt-in scope is `core_model` + `cpu`, excluding `omni`, under
+The Model Executor scope is `core_model` + `cpu`, excluding `omni`, under
 `tests/model_executor/`. Marker, keyword, and explicit deselection filters run
 before partitioning. Without `--cpu-shard-profile`, collection behavior is unchanged.
 
@@ -319,17 +420,82 @@ inside each shard; an empty selected shard retains pytest's exit code 5.
 stale timing counts, source builds, the profile SHA-256, an eligible-node SHA-256,
 and algorithm version `module-lpt-v1`. The file is written before execution and
 is **not** an execution result. Invalid profiles or plan-write errors fail closed.
-All workers must report identical profile/eligible-node hashes and assignments;
-compare the executed JUnit node union and skip outcomes with the baseline too.
+All workers must report identical profile/eligible-node hashes and assignments.
+Compare one complete successful baseline build against one complete candidate
+build using the downloaded artifact directories:
+
+```bash
+python .buildkite/amd/scripts/verify_cpu_shards.py --suite model-executor \
+  --baseline downloaded/baseline/shard-* --candidate downloaded/candidate/shard-*
+```
+
+This rejects missing/duplicate attempts, failed or incomplete execution, changed
+node unions, changed skips, and execution that disagrees with the shared plan.
+Run baseline and candidate on the same source revision, image and resource limits.
 
 Shared fixture cost can be counted repeatedly in historical hash shards; collection,
 imports, and CPU contention are not modeled by the weights. Estimated loads and
-synthetic tests are not hardware speedup evidence. Before production activation,
-measure paired READY/MERGE runs, whole-build latency, CPU pressure, and aggregate
-job minutes. Proposed qualification goals are a median slowest/fastest ratio at
-most 1.20 and no more than 10% growth in aggregate job minutes. Keep the existing
-three-worker/thread policy and coverage contract while evaluating the candidate.
-Rollback is omission of the opt-in flags; TIME-01 instrumentation is independent.
+synthetic tests are not hardware speedup evidence. Before merging the five-worker
+trial, verify available `amd_mi300_1` capacity and queue latency at that concurrency.
+The source jobs expose 192 logical CPUs but have a four-CPU cgroup quota.
+An agent inventory alone cannot establish spare cluster capacity. Measure paired
+READY/MERGE runs, whole-build latency, queue latency, CPU pressure, peak memory,
+and summed agent-minutes. The planning target is each shard p95 below 18 minutes;
+also check a median slowest/fastest ratio at most 1.20 and no more than 10% growth
+in aggregate job minutes. Require unchanged coverage and numerical assertions.
+Rollback restores `parallelism: 3`, removes `--timing-profile`, and restores the
+original `--num-shards` / `--shard-id` arguments; timing instrumentation remains.
+
+Benchmark CPU thread counts without changing reference inputs or tolerances:
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/cpu-thread-trial -- \
+  -q tests/model_executor/models/ming3_tts/test_ming3_batched_campplus.py::test_batched_campplus_matches_per_clip_pipeline \
+  tests/model_executor/models/kokoro/test_kokoro.py::test_speed_shortens_durations \
+  tests/model_executor/models/cosyvoice3/test_speaker_embedding_capture_failure.py::test_first_replay_failure_leaves_no_bucket \
+  tests/model_executor/models/kokoro/test_kokoro.py::test_network_is_deterministic_per_generator
+```
+
+Use the CI image and its quota; the script interleaves 1/2/4 threads, with one
+warmup and three measured fresh processes per count. Logs, JUnit results and
+software versions are retained. A failure or skip invalidates the benchmark.
+
+### Other CPU: two-shard trial
+
+READY/MERGE split Other into two duration-weighted shards using
+`.buildkite/amd/cpu-timings/other-v1.json`, generated from all 8,954 selected
+nodes in the successful two-way target READY trial in
+[build #15655](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15655), merge
+commit `ae8a431e3e53b102b77b2e7ebdd2ad3dea31fe5f`. The first trial selected
+every live node exactly once with no test, collection, or artifact failures;
+both workers launched with seven-second queue delays and finished in 12m04s and
+14m50s. Repacking those measured setup + call + teardown totals estimates
+12m17s per shard before collection and job overhead. This remains a planning
+estimate until the refreshed profile completes target CI. A third shard should
+be considered only after measuring the two-shard p95 and queue/agent cost.
+
+The existing `core_model and cpu` expression and all five `--ignore` arguments
+are retained. Whole modules stay together, including expensive subprocess and
+import fixtures. Fixture scopes, mutation isolation and pass criteria do not
+change. New tests are assigned from live collection even without timing history.
+
+The historical artifact contains three zero-duration `unittest.subTest` call
+reports before one parent call. The importer accepts this passed zero-duration
+prefix only while requiring exactly one test start per selected node; repeated
+nonzero phase reports still fail. New artifacts record `subtest_report` separately,
+preserve subtest failures, and avoid double-counting parent call duration.
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py downloaded/other-job \
+  --suite other --output other-v2.json
+python .buildkite/amd/scripts/verify_cpu_shards.py --suite other \
+  --baseline downloaded/other-baseline --candidate downloaded/other-candidate-*
+```
+
+Before rollout, require the unchanged executed node union and skip outcomes,
+per-shard p95 below 18 minutes, and measured summed agent-minutes, build wall
+time and queue latency. Other retains its existing thread environment. Rollback
+removes `parallelism: 2` and `--timing-profile`, and restores the unsharded label.
 
 ## Cross-cutting conventions
 
@@ -447,8 +613,8 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 ### Policy
 
-- **Always uploaded** (no key): L2 **Simple Test**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
 
 ### YAML examples
 
