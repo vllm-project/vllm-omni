@@ -656,7 +656,6 @@ def _ensure_shard_timings_env() -> None:
             output,
             branch=branch,
             exclude_branches=exclude_branches,
-            include_local=False,
         )
     except Exception as exc:  # noqa: BLE001 - planning must not fail the upload
         _log(f"automatic-shard: timing download skipped ({exc})")

@@ -14,10 +14,6 @@ one job.
 Durations are keyed by step label, with a `` · Shard N/M`` suffix removed, so
 one step does not inherit another step's time for the same path.
 
-The newest Buildkite job with state ``timed_out`` raises that step by one
-job on the next upload, up to ``MAX_AUTOMATIC_SHARDS``. A newer passed job
-clears the raise. A failed job that did not time out does not add a job.
-
 Every enrolled step always records per-file timings through
 ``pytest_file_timings`` and uploads ``timings/jobs/*.json``, even when it
 stays one job.
@@ -111,33 +107,6 @@ def load_step_queues() -> dict[str, str]:
     return {base_label(str(label)): str(queue) for label, queue in queues.items() if queue}
 
 
-def load_timeout_floors() -> dict[str, int]:
-    """Minimum job count after the newest ``timed_out`` attempt of a step."""
-    payload = _profile_payload()
-    raw = payload.get("timeout_floors") if isinstance(payload, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    floors: dict[str, int] = {}
-    for label, count in raw.items():
-        if isinstance(count, bool):
-            continue
-        try:
-            value = int(count)
-        except (TypeError, ValueError):
-            continue
-        if value > 1:
-            floors[base_label(str(label))] = min(MAX_AUTOMATIC_SHARDS, value)
-    return floors
-
-
-def load_timeout_floor_queues() -> dict[str, str]:
-    payload = _profile_payload()
-    raw = payload.get("timeout_floor_queues") if isinstance(payload, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    return {base_label(str(label)): str(queue) for label, queue in raw.items() if queue}
-
-
 def plan_shard_count(
     weights: list[float],
     budget_seconds: float,
@@ -228,14 +197,6 @@ def apply_automatic_shard(
     weights = _measured_weights(files, step_timings)
     count = 1 if weights is None else plan_shard_count(weights, budget_seconds)
     measured = 0 if weights is None else len(weights)
-    floor = load_timeout_floors().get(base_label(label), 0)
-    floor_queue = load_timeout_floor_queues().get(base_label(label), "")
-    if floor and floor_queue and step_queue and floor_queue != step_queue:
-        log(f"automatic-shard: {label!r} ignores a timeout recorded on {floor_queue}")
-        floor = 0
-    if floor > count:
-        log(f"automatic-shard: {label!r} raises {count} -> {floor} jobs (previous run timed out)")
-        count = min(floor, MAX_AUTOMATIC_SHARDS)
     if count <= 1:
         if weights is None:
             reason = "no timings for this step" if timings else "no timing profile"
