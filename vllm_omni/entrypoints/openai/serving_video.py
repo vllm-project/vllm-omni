@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping

@@ -285,8 +285,8 @@ def test_preencoded_worker_frame_counts_avoid_reopening_mp4(mocker: MockerFixtur
         output = asyncio.run(
             handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "known-count")
         )
-        assert output[0] == b"already-encoded"
-        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        assert output.video_bytes == b"already-encoded"
+        assert output.video_metadata == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
     finally:
         handler.shutdown()
 
@@ -307,8 +307,8 @@ def test_invalid_worker_frame_counts_fall_back_without_losing_video(mocker: Mock
         output = asyncio.run(
             handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "fallback-count")
         )
-        assert output[0] == b"already-encoded"
-        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        assert output.video_bytes == b"already-encoded"
+        assert output.video_metadata == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
         count_frames.assert_called_once_with(b"already-encoded")
     finally:
         handler.shutdown()

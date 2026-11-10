@@ -216,9 +216,9 @@ def _validate_topology(checkpoint: dict[str, int] | None = None, **parallel: Any
         {"cfg_parallel_size": 2},
         {"ulysses_degree": 2},
         {"tensor_parallel_size": 2, "ulysses_degree": 4},
-        {"ulysses_mode": "ag"},
+        {"ulysses_mode": "advanced_uaa"},
     ],
-    ids=["single_gpu", "cfg2", "cp2", "tp2_cp4", "ag_mode_without_cp"],
+    ids=["single_gpu", "cfg2", "cp2", "tp2_cp4", "uaa_mode_without_cp"],
 )
 def test_parallel_config_accepts_supported_topologies(parallel: dict[str, Any]) -> None:
     _validate_topology(**parallel)
@@ -232,7 +232,7 @@ def test_parallel_config_accepts_supported_topologies(parallel: dict[str, Any]) 
         ({"allgather_degree": 2}, None, "allgather_degree=1"),
         ({"pipeline_parallel_size": 2}, None, "pipeline_parallel_size=1"),
         ({"vae_patch_parallel_size": 2}, None, "vae_patch_parallel_size=1"),
-        ({"ulysses_degree": 2, "ulysses_mode": "ag"}, None, "ulysses_mode='strict'"),
+        ({"ulysses_degree": 2, "ulysses_mode": "advanced_uaa"}, None, "ulysses_mode='strict'"),
         ({"ulysses_degree": 3}, None, r"query heads \(32\) must be divisible by TP × CP \(1 × 3\)"),
         (
             {"tensor_parallel_size": 2, "ulysses_degree": 8},
@@ -242,7 +242,7 @@ def test_parallel_config_accepts_supported_topologies(parallel: dict[str, Any]) 
         ({}, {**_CHECKPOINT_HEADS, "num_attention_heads": 30}, "integral GQA ratio"),
         ({"tensor_parallel_size": 2}, {**_CHECKPOINT_HEADS, "intermediate_size": 12289}, "intermediate_size"),
     ],
-    ids=["cfg3", "ring", "allgather", "pipeline", "vae_patch", "ag_mode_cp2", "cp3", "tp2_cp8", "gqa", "mlp_tp2"],
+    ids=["cfg3", "ring", "allgather", "pipeline", "vae_patch", "uaa_mode_cp2", "cp3", "tp2_cp8", "gqa", "mlp_tp2"],
 )
 def test_parallel_config_rejects_unsupported_topologies(
     parallel: dict[str, Any], checkpoint: dict[str, int] | None, match: str
