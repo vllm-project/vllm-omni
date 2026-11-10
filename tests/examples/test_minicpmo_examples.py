@@ -8,7 +8,7 @@ consumes it in a real run:
 - the offline ``end2end.py`` ``main()``, with ``Omni`` replaced by a stand-in
   whose ``generate`` resolves the list through ``OmniBase``;
 - the curl script, with ``curl`` replaced by a stub that records the request
-  body, which then goes through the chat server's ``_to_sampling_params_list``;
+  body, which then goes through the chat server's ``to_sampling_params_list``;
 - the SDK client's response handling, with a fake OpenAI client;
 - the deploy name in ``barge_in_serve.sh``, resolved from the directory
   ``barge_in_client.py`` tells users to run it from.
@@ -36,7 +36,7 @@ from vllm import SamplingParams
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.entrypoints.omni_base import OmniBase
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.example]
@@ -159,12 +159,11 @@ def test_curl_payload_resolves_against_deploy_defaults(tmp_path, args):
         {"stage_type": "llm", "is_comprehension": stage.owns_tokenizer, "default_sampling_params": dict(d)}
         for stage, d in zip(MINICPMO_4_5_PIPELINE.stages, defaults, strict=True)
     ]
-    serving = object.__new__(OmniOpenAIServingChat)
-    serving.engine_client = SimpleNamespace(
+    engine_client = SimpleNamespace(
         stage_configs=stage_configs,
         default_sampling_params_list=[SamplingParams(**d) for d in defaults],
     )
-    resolved = serving._to_sampling_params_list(body["sampling_params_list"])
+    resolved = to_sampling_params_list(engine_client, body["sampling_params_list"])
     assert len(resolved) == 3
     _assert_keeps_deploy_defaults(resolved[1], defaults[1])
 
