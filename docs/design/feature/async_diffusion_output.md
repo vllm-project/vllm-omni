@@ -188,9 +188,15 @@ outcome, without resending the video.
 This supports single-request execution on the multiprocessing executor and on
 the Ray executor (including multi-node). Ray carries ``CHUNK_READY`` over a
 driver-owned ``ray.util.queue.Queue`` with CPU tensors instead of the multiproc
-MessageQueue/SHM path; the engine handler and ``wait_output_ready`` contract are
-the same. Batched requests retain final-output behavior. Request streaming does
-not pause or resume the computation plan in response to output pressure.
+MessageQueue/SHM path. After the reply rank finishes putting chunks it enqueues
+a barrier sentinel; ``collective_rpc`` waits until the driver pump has delivered
+every prior chunk before returning the execute result, so the Engine does not
+retire stream state while chunks are still queued. Cooperative cancellation on
+Ray uses a per-worker local flag table updated through a dedicated actor
+concurrency group (not POSIX ``SharedMemory`` names). The engine handler and
+``wait_output_ready`` contract are the same. Batched requests retain final-output
+behavior. Request streaming does not pause or resume the computation plan in
+response to output pressure.
 
 ## Configuration
 
@@ -219,8 +225,9 @@ client streaming) needs no extra flag: it is enabled when `step_execution=False`
 
 - `vllm_omni/diffusion/data.py`: `AsyncDiffusionOutput`, `AsyncOutputKind`, `DiffusionOutput.async_output_id`
 - `vllm_omni/diffusion/worker/diffusion_worker.py`: `WorkerProc._return_result()`, `_async_output_loop()`, `_generate_async_output_id()`
-- `vllm_omni/diffusion/executor/multiproc_executor.py`: `ResultPumpThread`, `collective_rpc()` two-path dispatch, `wait_output_ready()`, `_batch_split_map`
-- `vllm_omni/diffusion/executor/ray_executor.py`: Ray `CHUNK_READY` queue/pump, `wait_output_ready()` / `drop_output()` for request streaming
+- `vllm_omni/diffusion/executor/multiproc_executor.py`: `ResultPumpThread`, `collective_rpc()` two-path dispatch, `_batch_split_map`
+- `vllm_omni/diffusion/executor/async_output_cache.py`: shared `wait_output_ready()` / `drop_output()` Future lifecycle for multiproc and Ray
+- `vllm_omni/diffusion/executor/ray_executor.py`: Ray `CHUNK_READY` queue/pump and queue-consumption barrier
 - `vllm_omni/diffusion/diffusion_engine.py`: `step()` / `step_streaming()` / `add_req_and_wait_for_response()` async output waiting
 - `vllm_omni/diffusion/sched/request_scheduler.py`: `update_from_output()` — `async_output_id` → `FINISHED_COMPLETED`
 - `vllm_omni/diffusion/ipc.py`: `pack_diffusion_output_shm()` side-stream D2H path

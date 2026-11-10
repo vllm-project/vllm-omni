@@ -37,7 +37,11 @@ def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch)
     executor.workers = []
     executor._init_workers(object())
     assert fake_ray.remote.call_args.kwargs["max_concurrency"] == 1
-    assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {"health": 1, "monitor": 1}
+    assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {
+        "health": 1,
+        "monitor": 1,
+        "cancel": 1,
+    }
     worker_env = fake_ray.remote.call_args.kwargs["runtime_env"]["env_vars"]
     assert worker_env["NCCL_SOCKET_IFNAME"] == "eth-test"
     assert worker_env["CUSTOM_PLUGIN_SETTING"] == "enabled"
@@ -721,3 +725,117 @@ def test_ray_executor_chunk_pump_caches_for_wait_output_ready():
     media = executor.wait_output_ready("ray-chunk").result(timeout=1)
     assert media.async_output_id == "ray-chunk"
     torch.testing.assert_close(media.output, torch.zeros(3))
+
+
+def test_collective_rpc_waits_for_chunk_barrier_before_returning(monkeypatch):
+    """RPC return must wait until the pump consumes the barrier (and prior chunks)."""
+    import queue
+    from collections import OrderedDict
+
+    from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind
+    from vllm_omni.diffusion.executor.ray_executor import _ChunkBarrier
+
+    # stdlib Queue raises queue.Empty; align with the pump's empty sentinel.
+    monkeypatch.setattr(ray_module, "RayQueueEmpty", queue.Empty)
+
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._chunk_ready_handler = None
+    executor._futures_lock = threading.RLock()
+    executor._output_futures = {}
+    executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
+    executor._chunk_barriers = {}
+    executor._chunk_barrier_lock = threading.Lock()
+    executor._chunk_queue = queue.Queue()
+    executor._chunk_pump_stop = threading.Event()
+    executor.workers = [
+        SimpleNamespace(worker=SimpleNamespace(execute_rpc=SimpleNamespace(remote=lambda **_kw: "fut")))
+    ]
+    delivered: list[tuple[str, int]] = []
+    executor.register_chunk_ready_handler(lambda request_id, chunk_index, *_: delivered.append((request_id, chunk_index)))
+
+    barrier_id = "barrier-rpc"
+    payload = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2), async_output_id="b0")
+    executor._chunk_queue.put(
+        AsyncDiffusionOutput(
+            kind=AsyncOutputKind.CHUNK_READY,
+            async_output_id="b0",
+            output=payload,
+            request_id="req",
+            chunk_index=0,
+        )
+    )
+    executor._chunk_queue.put(_ChunkBarrier(barrier_id=barrier_id))
+
+    fake_ray = Mock()
+    fake_ray.get.side_effect = lambda _futs, timeout=None: [
+        {"rank": 0, "replied": True, "result": "ok", "chunk_barrier_id": barrier_id}
+    ]
+    # Capture exceptions from ray.get's callers (GetTimeoutError etc. not used here).
+    fake_ray.exceptions = SimpleNamespace(
+        GetTimeoutError=TimeoutError,
+        RayActorError=RuntimeError,
+        RayTaskError=RuntimeError,
+    )
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+
+    rpc_done = threading.Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _run_rpc():
+        try:
+            results.append(executor.collective_rpc("execute_model", unique_reply_rank=0))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            rpc_done.set()
+
+    # Pump not running yet: collective_rpc must block on the barrier.
+    waiter = threading.Thread(target=_run_rpc, daemon=True)
+    waiter.start()
+    assert not rpc_done.wait(0.2)
+    assert delivered == []
+
+    pump = threading.Thread(target=executor._chunk_pump, daemon=True)
+    pump.start()
+    try:
+        assert rpc_done.wait(2.0)
+        assert errors == []
+        assert results == ["ok"]
+        assert delivered == [("req", 0)]
+    finally:
+        executor._chunk_pump_stop.set()
+        pump.join(timeout=2.0)
+        waiter.join(timeout=2.0)
+
+
+def test_ray_cancellation_flags_update_without_shm():
+    from vllm_omni.diffusion.cancellation import (
+        RayRequestCancellationRegistry,
+        check_request_cancellation,
+        request_cancellation_scope,
+        bind_ray_cancel_table,
+        reset_ray_cancel_table,
+    )
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    registry = RayRequestCancellationRegistry(
+        lambda ids, cancelled=False, finish=False: actor.update_cancellation_flags(
+            ids, cancelled=cancelled, finish=finish
+        )
+    )
+    signal = registry.create("req-a")
+    token = bind_ray_cancel_table(actor._cancel_flags)
+    try:
+        with request_cancellation_scope([signal]):
+            check_request_cancellation()
+            registry.cancel(["req-a"])
+            with pytest.raises(DiffusionRequestAbortedError):
+                check_request_cancellation()
+    finally:
+        reset_ray_cancel_table(token)
+        registry.finish("req-a")

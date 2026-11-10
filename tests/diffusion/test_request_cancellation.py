@@ -132,8 +132,11 @@ def _admission_engine(registry):
     from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 
     engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig()
+    engine.step_execution = False
+    engine._request_chunk_states = {}
     engine.scheduler = RequestScheduler()
-    engine.scheduler.initialize(OmniDiffusionConfig())
+    engine.scheduler.initialize(engine.od_config)
     engine._request_cancellations = registry
     engine._cv = threading.Condition(threading.RLock())
     engine._closed = False

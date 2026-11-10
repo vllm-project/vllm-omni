@@ -64,23 +64,31 @@ def test_async_host_copy_cpu_path():
     assert torch.equal(host, latent)
 
 
-def test_local_on_chunk_emits_each_chunk_and_join_returns_none():
+@pytest.mark.parametrize(
+    "session_ids,expected_seen",
+    [
+        ([0, 1], [0, 1]),
+        ([5, 6], [0, 1]),  # session-absolute ids remap to request-relative
+    ],
+)
+def test_local_on_chunk_emits_each_chunk_and_join_returns_none(session_ids, expected_seen):
     vae = _FakeVae()
     decoder = _FakeDecoder()
-    seen: list[int] = []
+    seen: list[tuple[int, tuple[int, ...]]] = []
 
     def on_chunk(idx: int, pixels: torch.Tensor) -> None:
-        seen.append(idx)
+        seen.append((idx, tuple(pixels.shape)))
         assert pixels.shape[1] == 3
 
     job = _start_local(vae=vae, decoder=decoder, session_id="req-chunk", on_chunk=on_chunk)
-    assert job.on_finished is not None
-    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
-    job.on_finished(1, torch.randn(1, 4, 2, 4, 4))
-    assert job.join() is None
-    assert seen == [0, 1]
-    assert decoder.chunks == 2
     assert job.streams_to_client is True
+    assert job.on_finished is not None
+    for session_id in session_ids:
+        job.on_finished(session_id, torch.randn(1, 4, 2, 4, 4))
+    assert job.join() is None
+    assert [idx for idx, _ in seen] == expected_seen
+    assert all(shape == (1, 3, 2, 4, 4) for _, shape in seen)
+    assert decoder.chunks == 2
     assert job.emitted_chunks == 2
 
 
@@ -243,41 +251,143 @@ def test_chunk_decode_on_chunk_when_request_streaming_bound(monkeypatch):
     assert emitted[0].total_chunks == 3
 
 
-def test_local_on_chunk_does_not_accumulate():
-    vae = _FakeVae()
-    decoder = _FakeDecoder()
-    seen: list[tuple[int, tuple[int, ...]]] = []
+def test_remote_cancel_drains_posted_irecvs(monkeypatch):
+    """Mid-request cancel must finish every posted irecv (FIFO mock)."""
+    from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import start_async_chunk_decode
 
-    def on_chunk(idx: int, pixels: torch.Tensor) -> None:
-        seen.append((idx, tuple(pixels.shape)))
+    pending: list[object] = []
+    completed: list[object] = []
 
-    job = _start_local(vae=vae, decoder=decoder, session_id="req-stream", on_chunk=on_chunk)
-    assert job.streams_to_client is True
-    assert job.on_finished is not None
-    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
-    job.on_finished(1, torch.randn(1, 4, 2, 4, 4))
-    video = job.join()
-    assert video is None
-    assert decoder.chunks == 2
-    assert seen == [(0, (1, 3, 2, 4, 4)), (1, (1, 3, 2, 4, 4))]
-    assert job.emitted_chunks == 2
+    class _Work:
+        def __init__(self, payload):
+            self.payload = payload
+            self._done = threading.Event()
+
+        def wait(self):
+            assert self._done.wait(timeout=5.0)
+
+        def complete(self):
+            self._done.set()
+
+    def fake_irecv(buf, src, group):
+        del src, group
+        work = _Work(buf)
+        pending.append(work)
+        return work
+
+    def fake_isend(host, dst, group):
+        del dst, group
+        if not pending:
+            raise AssertionError("isend with no matching irecv")
+        work = pending.pop(0)
+        work.payload.copy_(host)
+        work.complete()
+        completed.append(work)
+        return work
+
+    monkeypatch.setattr(asd_mod.dist, "irecv", fake_irecv)
+    monkeypatch.setattr(asd_mod.dist, "isend", fake_isend)
+
+    shape = (1, 4, 2, 4, 4)
+    n_chunks = 3
+    pp_group = SimpleNamespace(ranks=[0, 1])
+    owner = start_async_chunk_decode(
+        vae=_FakeVae(),
+        decoder=_FakeDecoder(),
+        session_id="drain",
+        n_chunks=n_chunks,
+        latent_shape=shape,
+        dtype=torch.float32,
+        pp_rank=0,
+        source_rank=1,
+        pp_group=pp_group,
+        stream_group=object(),
+        on_chunk=lambda *_: None,
+    )
+    source = start_async_chunk_decode(
+        vae=None,
+        decoder=None,
+        session_id="drain",
+        n_chunks=n_chunks,
+        latent_shape=shape,
+        dtype=torch.float32,
+        pp_rank=1,
+        source_rank=1,
+        pp_group=pp_group,
+        stream_group=object(),
+    )
+    assert len(pending) == n_chunks
+    assert source.on_finished is not None
+    source.on_finished(0, torch.ones(shape))
+    # Owner cancel waits on remaining irecvs; run it concurrently so the
+    # source cancel can fill the gap without deadlocking this thread.
+    owner_done = threading.Event()
+
+    def _cancel_owner():
+        owner.cancel()
+        owner_done.set()
+
+    threading.Thread(target=_cancel_owner, daemon=True).start()
+    source.cancel()
+    assert owner_done.wait(timeout=5.0)
+    assert not pending
+    assert len(completed) == n_chunks
 
 
-def test_local_on_chunk_remaps_session_absolute_ids_to_request_relative():
-    """Session continuation uses chunk_base>0; client protocol still starts at 0."""
-    vae = _FakeVae()
-    decoder = _FakeDecoder()
-    seen: list[int] = []
+def test_remote_cancel_refuses_fill_while_sender_stuck_on_copy(monkeypatch):
+    """Stuck D2H event must not filler-then-late-isend (would pollute the group)."""
+    import time
 
-    def on_chunk(idx: int, pixels: torch.Tensor) -> None:
-        del pixels
-        seen.append(idx)
+    from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import start_async_chunk_decode
 
-    job = _start_local(vae=vae, decoder=decoder, session_id="world-e2e", on_chunk=on_chunk)
-    assert job.on_finished is not None
-    # WanCell reports session-absolute ids (chunk_base=5 continuation).
-    job.on_finished(5, torch.randn(1, 4, 2, 4, 4))
-    job.on_finished(6, torch.randn(1, 4, 2, 4, 4))
-    assert job.join() is None
-    assert seen == [0, 1]
-    assert job.emitted_chunks == 2
+    monkeypatch.setattr(asd_mod, "_SENDER_CANCEL_JOIN_TIMEOUT_S", 0.05)
+    sends: list[torch.Tensor] = []
+
+    class _Work:
+        def wait(self):
+            return None
+
+    def fake_isend(host, dst, group):
+        del dst, group
+        sends.append(host.detach().clone())
+        return _Work()
+
+    monkeypatch.setattr(asd_mod.dist, "isend", fake_isend)
+
+    hold = threading.Event()
+
+    class _DelayedEvent:
+        def synchronize(self):
+            assert hold.wait(timeout=5.0)
+
+    monkeypatch.setattr(
+        asd_mod,
+        "_async_host_copy",
+        lambda latent, *, shape, dtype: (torch.zeros(shape, dtype=dtype), _DelayedEvent()),
+    )
+
+    shape = (1, 4, 2, 4, 4)
+    source = start_async_chunk_decode(
+        vae=None,
+        decoder=None,
+        session_id="stuck-sender",
+        n_chunks=1,
+        latent_shape=shape,
+        dtype=torch.float32,
+        pp_rank=1,
+        source_rank=1,
+        pp_group=SimpleNamespace(ranks=[0, 1]),
+        stream_group=object(),
+    )
+    assert source.on_finished is not None
+    source.on_finished(0, torch.ones(shape))
+    time.sleep(0.05)  # let sender dequeue and block on synchronize
+    with pytest.raises(RuntimeError, match="latent sender did not stop"):
+        source.cancel()
+    assert sends == []
+    hold.set()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and not sends:
+        time.sleep(0.01)
+    # Cancelled sender must skip the late real isend; no fillers either.
+    assert sends == []

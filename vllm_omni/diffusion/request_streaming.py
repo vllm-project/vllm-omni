@@ -107,9 +107,7 @@ class RequestStreamState:
     max_output_bytes: int = 64 * 1024 * 1024
     cancelled: bool = False
     output_ack: bool = False
-    failed: bool = False
     terminal_emitted: bool = False
-    error: str | None = None
     retained_by_chunk: dict[int, int] = field(default_factory=dict)
 
     def release_chunk(self, chunk_index: int) -> None:
@@ -119,8 +117,7 @@ class RequestStreamState:
 
     def fail(self, message: str) -> tuple[str, str]:
         """Choose one error terminal; Engine propagates cancellation to execution."""
-        self.failed = self.cancelled = self.terminal_emitted = True
-        self.error = message
+        self.cancelled = self.terminal_emitted = True
         return "fail", message
 
     def accept_chunk(

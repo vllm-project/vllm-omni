@@ -33,7 +33,13 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.cancellation import (
+    RayRequestCancellationRegistry,
+    bind_ray_cancel_table,
+    reset_ray_cancel_table,
+)
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
 from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -42,7 +48,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.request_streaming import request_chunk_transport
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
-from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
+from vllm_omni.diffusion.utils.future_utils import try_set_exception
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -60,10 +66,22 @@ _HEALTH_CHECK_TIMEOUT_S = 10
 # Must stay below StageDiffusionClient's wait for the Ray subprocess to exit.
 _WORKER_SHUTDOWN_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
-_CHUNK_DRAIN_TIMEOUT_S = 10.0
+_CHUNK_BARRIER_TIMEOUT_S = 30.0
 _CHUNK_PUMP_JOIN_TIMEOUT_S = 2.0
-_DROPPED_OUTPUT_IDS_MAX = 4096
 _REQUEST_CHUNK_EXECUTE_METHODS = frozenset({"execute_model", "execute_model_batch"})
+
+
+@dataclass(frozen=True)
+class _ChunkBarrier:
+    """Sentinel after all CHUNK_READY puts for one reply-rank forward.
+
+    The driver waits for the pump to process this before returning the execute
+    RPC result to the Engine, so stream state is not retired while chunks are
+    still sitting in the Ray queue.
+    """
+
+    barrier_id: str
+
 
 try:
     import ray
@@ -75,17 +93,6 @@ except ImportError:
     RayQueue = None  # type: ignore[assignment,misc]
     RayQueueEmpty = None  # type: ignore[assignment,misc]
     PlacementGroupSchedulingStrategy = None  # type: ignore[assignment,misc]
-
-
-class _DropPlaceholder(concurrent.futures.Future):
-    """Abort registered that nobody will wait for this chunk payload."""
-
-
-def _dropped_output_error(async_output_id: str) -> RuntimeError:
-    return RuntimeError(
-        f"async output {async_output_id} was dropped: the request was aborted "
-        "before its output was claimed; retry with a new request."
-    )
 
 
 def _worker_env(od_config: OmniDiffusionConfig) -> dict[str, str]:
@@ -281,8 +288,10 @@ class RayDiffusionWorkerWrapper:
         self.rank = provisional_rank
         self.worker = None
         self._chunk_queue = None
-        self._chunk_pending = 0
-        self._chunk_pending_cv = threading.Condition()
+        # Local cancel flags updated via the ``cancel`` concurrency group so a
+        # mid-forward abort does not wait behind ``execute_rpc``.
+        self._cancel_flags: dict[str, threading.Event] = {}
+        self._cancel_flags_lock = threading.Lock()
 
     def get_node_ip(self) -> str:
         return get_ip()
@@ -313,6 +322,24 @@ class RayDiffusionWorkerWrapper:
     def set_chunk_queue(self, chunk_queue: Any) -> None:
         """Attach the driver-owned Ray queue used for mid-forward CHUNK_READY."""
         self._chunk_queue = chunk_queue
+
+    def update_cancellation_flags(
+        self,
+        request_ids: list[str],
+        *,
+        cancelled: bool = False,
+        finish: bool = False,
+    ) -> None:
+        """Apply Engine cancel/create/finish without queuing behind execute_rpc."""
+        with self._cancel_flags_lock:
+            for request_id in request_ids:
+                if finish:
+                    self._cancel_flags.pop(request_id, None)
+                elif cancelled:
+                    # Create-if-missing: fire-and-forget cancel can race ahead of create.
+                    self._cancel_flags.setdefault(request_id, threading.Event()).set()
+                else:
+                    self._cancel_flags.setdefault(request_id, threading.Event())
 
     def _is_primary_in_replica(self) -> bool:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
@@ -358,26 +385,11 @@ class RayDiffusionWorkerWrapper:
                 request_id=request_id,
                 chunk_index=output.chunk_index,
             )
-            with self._chunk_pending_cv:
-                self._chunk_pending += 1
-            try:
-                self._chunk_queue.put(message)
-            except Exception:
-                with self._chunk_pending_cv:
-                    self._chunk_pending = max(0, self._chunk_pending - 1)
-                    self._chunk_pending_cv.notify_all()
-                raise
-            with self._chunk_pending_cv:
-                self._chunk_pending = max(0, self._chunk_pending - 1)
-                self._chunk_pending_cv.notify_all()
+            # request_chunk_transport's lock already waits for in-flight emit
+            # callbacks before exit; put is synchronous, so no put-pending counter.
+            self._chunk_queue.put(message)
 
         return emit_chunk
-
-    def _wait_chunk_puts(self, timeout: float = _CHUNK_DRAIN_TIMEOUT_S) -> bool:
-        with self._chunk_pending_cv:
-            if self._chunk_pending == 0:
-                return True
-            return bool(self._chunk_pending_cv.wait_for(lambda: self._chunk_pending == 0, timeout=timeout))
 
     def execute_rpc(
         self,
@@ -397,31 +409,41 @@ class RayDiffusionWorkerWrapper:
             should_reply = self._is_primary_in_replica()
 
         result = None
-        if should_execute:
-            use_chunk_transport = (
-                method in _REQUEST_CHUNK_EXECUTE_METHODS and self._request_streaming_enabled() and should_reply
-            )
-            if use_chunk_transport:
-                with request_chunk_transport(self._make_emit_chunk):
-                    result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
-                if not self._wait_chunk_puts():
-                    raise RuntimeError(
-                        f"Ray rank {self.rank}: request CHUNK_READY drain timed out with "
-                        f"{self._chunk_pending} put(s) still pending (method={method})"
-                    )
-            else:
-                # Still bind a closed transport so accidental emits are no-ops
-                # when this rank is not the reply owner.
-                if method in _REQUEST_CHUNK_EXECUTE_METHODS and self._request_streaming_enabled():
-                    with request_chunk_transport(None):
+        chunk_barrier_id: str | None = None
+        cancel_token = bind_ray_cancel_table(self._cancel_flags)
+        try:
+            if should_execute:
+                use_chunk_transport = (
+                    method in _REQUEST_CHUNK_EXECUTE_METHODS and self._request_streaming_enabled() and should_reply
+                )
+                if use_chunk_transport:
+                    with request_chunk_transport(self._make_emit_chunk):
                         result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+                    # Queue-order barrier: pump delivers every prior CHUNK_READY
+                    # before signalling this id on the driver.
+                    assert self._chunk_queue is not None
+                    chunk_barrier_id = uuid.uuid4().hex
+                    self._chunk_queue.put(_ChunkBarrier(barrier_id=chunk_barrier_id))
                 else:
-                    result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+                    # Still bind a closed transport so accidental emits are no-ops
+                    # when this rank is not the reply owner.
+                    if method in _REQUEST_CHUNK_EXECUTE_METHODS and self._request_streaming_enabled():
+                        with request_chunk_transport(None):
+                            result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+                    else:
+                        result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+        finally:
+            reset_ray_cancel_table(cancel_token)
         if should_reply:
             result = _move_to_cpu(result)
         else:
             result = None
-        return {"rank": self.rank, "replied": should_reply, "result": result}
+        return {
+            "rank": self.rank,
+            "replied": should_reply,
+            "result": result,
+            "chunk_barrier_id": chunk_barrier_id,
+        }
 
     def check_alive(self) -> bool:
         return self.worker is not None
@@ -437,7 +459,7 @@ class RayDiffusionWorkerWrapper:
             worker.shutdown()
 
 
-class RayDiffusionExecutor(DiffusionExecutor):
+class RayDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     """Execute one diffusion worker per Ray GPU actor."""
 
     def _init_executor(self) -> None:
@@ -459,6 +481,8 @@ class RayDiffusionExecutor(DiffusionExecutor):
         self._chunk_queue: RayQueue | None = None
         self._chunk_pump_stop = threading.Event()
         self._chunk_pump_thread: threading.Thread | None = None
+        self._chunk_barriers: dict[str, threading.Event] = {}
+        self._chunk_barrier_lock = threading.Lock()
         self.workers: list[_RayWorkerMetadata] = []
 
         if not ray.is_initialized():
@@ -557,7 +581,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
             num_gpus=1,
             runtime_env={"env_vars": _worker_env(self.od_config)},
             max_concurrency=1,
-            concurrency_groups={"health": 1, "monitor": 1},
+            concurrency_groups={"health": 1, "monitor": 1, "cancel": 1},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
                 placement_group_capture_child_tasks=True,
@@ -648,6 +672,23 @@ class RayDiffusionExecutor(DiffusionExecutor):
     def register_failure_callback(self, callback: Callable[[], None]) -> None:
         self._failure_callbacks.append(callback)
 
+    def create_cancellation_registry(self) -> RayRequestCancellationRegistry:
+        """Cross-node cancel path: update local worker flags without waiting on execute."""
+
+        def broadcast(request_ids: list[str], *, cancelled: bool = False, finish: bool = False) -> None:
+            if not self.workers:
+                return
+            # Fire-and-forget on the cancel concurrency group so abort does not
+            # queue behind an in-flight execute_rpc (SharedMemory property).
+            for item in self.workers:
+                item.worker.update_cancellation_flags.options(concurrency_group="cancel").remote(
+                    request_ids,
+                    cancelled=cancelled,
+                    finish=finish,
+                )
+
+        return RayRequestCancellationRegistry(broadcast)
+
     def register_chunk_ready_handler(
         self,
         handler: Callable[[str, int, DiffusionOutput | None, str | None], None] | None,
@@ -658,16 +699,19 @@ class RayDiffusionExecutor(DiffusionExecutor):
     def _chunk_pump(self) -> None:
         """Deliver worker CHUNK_READY messages while execute RPCs are still in flight."""
         assert self._chunk_queue is not None
-        assert RayQueueEmpty is not None
+        empty_exc = RayQueueEmpty if RayQueueEmpty is not None else Exception
         while not self._chunk_pump_stop.is_set():
             try:
                 msg = self._chunk_queue.get(block=True, timeout=0.1)
-            except RayQueueEmpty:
+            except empty_exc:
                 continue
             except Exception:
                 if self._chunk_pump_stop.is_set() or self._closed:
                     return
                 logger.exception("Ray CHUNK_READY queue read failed")
+                continue
+            if isinstance(msg, _ChunkBarrier):
+                self._signal_chunk_barrier(msg.barrier_id)
                 continue
             if not isinstance(msg, AsyncDiffusionOutput):
                 logger.error("Unexpected Ray chunk message type: %s", type(msg))
@@ -676,6 +720,33 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 logger.error("Unexpected Ray chunk kind: %s", msg.kind)
                 continue
             self._deliver_chunk_ready(msg)
+
+    def _register_chunk_barrier(self, barrier_id: str) -> threading.Event:
+        event = threading.Event()
+        with self._chunk_barrier_lock:
+            existing = self._chunk_barriers.get(barrier_id)
+            if existing is not None:
+                return existing
+            self._chunk_barriers[barrier_id] = event
+        return event
+
+    def _signal_chunk_barrier(self, barrier_id: str) -> None:
+        with self._chunk_barrier_lock:
+            event = self._chunk_barriers.get(barrier_id)
+            if event is None:
+                event = threading.Event()
+                self._chunk_barriers[barrier_id] = event
+            event.set()
+
+    def _wait_chunk_barrier(self, barrier_id: str, timeout: float = _CHUNK_BARRIER_TIMEOUT_S) -> None:
+        event = self._register_chunk_barrier(barrier_id)
+        if not event.wait(timeout=timeout):
+            raise TimeoutError(
+                f"Timed out after {timeout:.1f}s waiting for Ray CHUNK_READY barrier {barrier_id}; "
+                "Engine must not retire stream state while chunks remain queued."
+            )
+        with self._chunk_barrier_lock:
+            self._chunk_barriers.pop(barrier_id, None)
 
     def _deliver_chunk_ready(self, msg: AsyncDiffusionOutput) -> None:
         """Cache one chunk payload and notify the engine without completing the RPC."""
@@ -703,90 +774,6 @@ class RayDiffusionExecutor(DiffusionExecutor):
             )
         except Exception:
             logger.exception("CHUNK_READY handler failed for %s", async_output_id)
-
-    def _finish_output(
-        self,
-        async_output_id: str,
-        result: DiffusionOutput | None,
-        exc: BaseException | None,
-    ) -> None:
-        """Hand one delivered chunk to its waiter. Caller holds ``_futures_lock``."""
-        pending = self._output_futures.pop(async_output_id, None)
-        if pending is None:
-            if async_output_id in self._dropped_output_ids:
-                return
-            cached: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
-            if exc is not None:
-                cached.set_exception(exc)
-            else:
-                assert result is not None
-                cached.set_result(result)
-            self._completed_outputs[async_output_id] = cached
-            return
-        if isinstance(pending, _DropPlaceholder):
-            try_set_exception(pending, _dropped_output_error(async_output_id))
-            self._remember_dropped(async_output_id)
-            return
-        if not pending.done():
-            if exc is not None:
-                delivered = try_set_exception(pending, exc)
-            else:
-                delivered = try_set_result(pending, result)
-            if not delivered:
-                self._remember_dropped(async_output_id)
-        else:
-            self._remember_dropped(async_output_id)
-
-    def _remember_dropped(self, async_output_id: str) -> None:
-        dropped = self._dropped_output_ids
-        dropped[async_output_id] = None
-        dropped.move_to_end(async_output_id)
-        while len(dropped) > _DROPPED_OUTPUT_IDS_MAX:
-            dropped.popitem(last=False)
-
-    def wait_output_ready(self, async_output_id: str) -> concurrent.futures.Future[DiffusionOutput]:
-        """Resolve a CHUNK_READY payload cached by the Ray chunk pump."""
-        with self._futures_lock:
-            if self._closed:
-                closed: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
-                closed.set_exception(RuntimeError("Executor shut down"))
-                return closed
-            cached = self._completed_outputs.pop(async_output_id, None)
-            if cached is not None:
-                return cached
-            existing = self._output_futures.get(async_output_id)
-            if existing is not None:
-                if isinstance(existing, _DropPlaceholder) or not existing.done():
-                    return existing
-                self._output_futures.pop(async_output_id, None)
-                self._remember_dropped(async_output_id)
-            if async_output_id in self._dropped_output_ids:
-                self._dropped_output_ids.move_to_end(async_output_id)
-                dropped: concurrent.futures.Future = concurrent.futures.Future()
-                dropped.set_exception(_dropped_output_error(async_output_id))
-                return dropped
-            fut: concurrent.futures.Future = concurrent.futures.Future()
-            self._output_futures[async_output_id] = fut
-        return fut
-
-    def drop_output(self, async_output_id: str) -> None:
-        """Discard a chunk payload that will never be waited on."""
-        with self._futures_lock:
-            cached = self._completed_outputs.pop(async_output_id, None)
-            if cached is not None:
-                self._remember_dropped(async_output_id)
-                return
-            existing = self._output_futures.get(async_output_id)
-            if existing is None:
-                placeholder: _DropPlaceholder = _DropPlaceholder()
-                self._output_futures[async_output_id] = placeholder
-                return
-            if isinstance(existing, _DropPlaceholder):
-                return
-            if not existing.done():
-                try_set_exception(existing, _dropped_output_error(async_output_id))
-            self._output_futures.pop(async_output_id, None)
-            self._remember_dropped(async_output_id)
 
     def collective_rpc(
         self,
@@ -829,6 +816,17 @@ class RayDiffusionExecutor(DiffusionExecutor):
             # can safely accept another RPC from this executor.
             self._fail(exc)
             raise EngineDeadError() from exc
+
+        # CHUNK_READY rides a side queue; wait until the pump has delivered
+        # every chunk that was put before each reply-rank barrier sentinel.
+        for envelope in envelopes:
+            barrier_id = envelope.get("chunk_barrier_id")
+            if barrier_id:
+                try:
+                    self._wait_chunk_barrier(barrier_id)
+                except TimeoutError as exc:
+                    self._fail(exc)
+                    raise
 
         replies = sorted(
             (envelope for envelope in envelopes if envelope["replied"]),

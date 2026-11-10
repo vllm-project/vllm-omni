@@ -358,11 +358,14 @@ Final request-mode outputs stay on the synchronous RPC path (no multiproc
 `COMPUTE_DONE` / `OUTPUT_READY` pumps). When `streaming_output=True` keeps
 Request execution, mid-forward `CHUNK_READY` uses a driver-owned
 `ray.util.queue.Queue`: the reply rank binds the request chunk emitter, puts
-CPU-copied chunks onto the queue, drains pending puts before the RPC returns,
-and the executor's chunk pump caches payloads for `wait_output_ready` then
-notifies the engine. Driver inference settings and explicit stage
-`runtime.env` are forwarded, excluding worker identity and device assignment.
-See [Stage configuration](../../../configuration/stage_configs.md) for cluster
+CPU-copied chunks onto the queue, then a barrier sentinel; `collective_rpc`
+waits until the pump has delivered every prior chunk before returning the
+execute result to the Engine. Cooperative cancellation uses a `cancel`
+concurrency group that updates per-worker local flags (not POSIX shared
+memory), so multi-node abort does not depend on SHM names. Driver inference
+settings and explicit stage `runtime.env` are forwarded, excluding worker
+identity and device assignment. See
+[Stage configuration](../../../configuration/stage_configs.md) for cluster
 setup and environment details.
 
 ## Worker and runner boundary

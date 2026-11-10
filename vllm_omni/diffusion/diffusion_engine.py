@@ -470,9 +470,14 @@ class DiffusionEngine:
         self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self._request_cancellations = (
-            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
-        )
+        self._request_cancellations = None
+        if supports_request_cancellation(self.od_config):
+            create_registry = getattr(self.executor, "create_cancellation_registry", None)
+            if callable(create_registry):
+                # Ray (and any multi-host executor) must not use POSIX SHM names.
+                self._request_cancellations = create_registry()
+            else:
+                self._request_cancellations = RequestCancellationRegistry()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False

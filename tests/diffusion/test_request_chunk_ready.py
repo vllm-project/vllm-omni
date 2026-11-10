@@ -8,8 +8,6 @@ import asyncio
 import concurrent.futures
 import queue
 import threading
-import time
-from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,11 +16,12 @@ import torch
 
 from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
-from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request_streaming import RequestStreamState
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+from tests.diffusion.test_result_pump import _make_executor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,47 +41,6 @@ class _StepOnlyPipeline:
     def step_scheduler(self): ...
 
     def post_decode(self): ...
-
-
-def _make_executor() -> MultiprocDiffusionExecutor:
-    executor = object.__new__(MultiprocDiffusionExecutor)
-    executor.od_config = SimpleNamespace(step_execution=False)
-    executor._rpc_id_counter = 0
-    executor._rpc_id_lock = threading.Lock()
-    executor._rpc_futures = {}
-    executor._output_futures = {}
-    executor._completed_outputs = {}
-    executor._dropped_output_ids = OrderedDict()
-    executor._batch_split_map = {}
-    executor._futures_lock = threading.RLock()
-    executor._chunk_ready_handler = None
-    executor._pump_running = False
-    executor._pump_stop = threading.Event()
-    executor._sync_result_buffer = queue.Queue()
-    executor._result_mq = MagicMock()
-    executor._result_mqs = []
-    executor._broadcast_mq = MagicMock()
-    executor._closed = False
-    executor._is_failed = False
-    return executor
-
-
-def _feed_one_msg_to_pump(executor: MultiprocDiffusionExecutor, msg: AsyncDiffusionOutput) -> None:
-    call_count = [0]
-
-    def mock_dequeue(timeout=None):
-        del timeout
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return msg
-        executor._pump_stop.set()
-        time.sleep(0.05)
-        raise TimeoutError
-
-    executor._result_mq.dequeue = mock_dequeue
-    thread = threading.Thread(target=executor._result_pump, daemon=True)
-    thread.start()
-    thread.join(timeout=2.0)
 
 
 def _engine_for_chunks() -> tuple[DiffusionEngine, asyncio.Queue]:
@@ -106,74 +64,6 @@ def _engine_for_chunks() -> tuple[DiffusionEngine, asyncio.Queue]:
         max_output_bytes=1024,
     )
     return engine, output_queue
-
-
-def test_chunk_ready_kind_and_fields() -> None:
-    assert AsyncOutputKind.CHUNK_READY.value == "chunk_ready"
-    message = AsyncDiffusionOutput(
-        kind=AsyncOutputKind.CHUNK_READY,
-        request_id="req",
-        chunk_index=2,
-        async_output_id="aid",
-    )
-    assert message.request_id == "req"
-    assert message.chunk_index == 2
-    assert message.rpc_id is None
-
-
-def test_result_pump_routes_chunk_ready_without_completing_rpc(mocker) -> None:
-    mocker.patch("vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm")
-    executor = _make_executor()
-    rpc_future: concurrent.futures.Future = concurrent.futures.Future()
-    executor._rpc_futures["7"] = rpc_future
-    seen: list[tuple] = []
-    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
-    payload = torch.zeros(2)
-    output = DiffusionOutput(finished=False, chunk_index=0, total_chunks=3, output=payload, async_output_id="chunk-0")
-    msg = AsyncDiffusionOutput(
-        kind=AsyncOutputKind.CHUNK_READY,
-        rpc_id="7",
-        request_id="req",
-        chunk_index=0,
-        async_output_id="chunk-0",
-        output=output,
-    )
-
-    _feed_one_msg_to_pump(executor, msg)
-
-    assert not rpc_future.done()
-    assert "7" in executor._rpc_futures
-    assert len(seen) == 1
-    request_id, chunk_index, delivered, error = seen[0]
-    assert request_id == "req"
-    assert chunk_index == 0
-    assert delivered is output
-    assert error is None
-    ready = executor.wait_output_ready("chunk-0")
-    assert ready.done()
-    assert ready.result().output is payload
-
-
-def test_result_pump_closed_chunk_ready_reclaims_shm(mocker) -> None:
-    unpack = mocker.patch("vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm")
-    executor = _make_executor()
-    executor._closed = True
-    seen: list[tuple] = []
-    executor.register_chunk_ready_handler(lambda *args: seen.append(args))
-    output = DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(1))
-    msg = AsyncDiffusionOutput(
-        kind=AsyncOutputKind.CHUNK_READY,
-        request_id="req",
-        chunk_index=0,
-        async_output_id="chunk-0",
-        output=output,
-    )
-
-    _feed_one_msg_to_pump(executor, msg)
-
-    unpack.assert_called_once_with(output)
-    assert seen == []
-    assert executor._completed_outputs == {}
 
 
 def test_engine_puts_intermediate_chunk_without_scheduler_update() -> None:
@@ -283,8 +173,6 @@ def test_engine_chunk_error_suppresses_later_success() -> None:
     state = engine._request_chunk_states["req"]
     state.next_chunk_index = 1
     state.terminal_emitted = True
-    state.failed = True
-    state.error = "request streaming protocol error"
     scheduler_state = SimpleNamespace(status=DiffusionRequestStatus.FINISHED_COMPLETED, error=None)
     engine.scheduler.get_request_state.return_value = scheduler_state
     engine.scheduler.pop_request_state.return_value = scheduler_state
@@ -332,55 +220,6 @@ def test_resolve_execution_mode_auto_enables_existing_step_contract() -> None:
     assert od_config.step_execution is True
 
 
-def test_worker_emit_chunk_does_not_send_compute_done(mocker) -> None:
-    proc = object.__new__(WorkerProc)
-    proc.gpu_id = 0
-    proc.result_mq = MagicMock()
-    proc._result_mq_lock = threading.Lock()
-    proc._async_output_queue = queue.Queue()
-    proc._async_output_done = threading.Condition()
-    proc._async_output_pending = 0
-    proc._chunk_output_pending = 0
-    proc.od_config = SimpleNamespace(
-        step_execution=False,
-        video_output_transport=SimpleNamespace(enable_registered_shm=False),
-    )
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
-        return_value=None,
-    )
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
-    mock_torch = mocker.MagicMock()
-    mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
-
-    emit = proc._make_emit_chunk("req")
-    chunk = DiffusionOutput(finished=False, chunk_index=1, total_chunks=4, output=torch.zeros(2))
-    emit(chunk)
-    with pytest.raises(ValueError, match="finished=False"):
-        emit(DiffusionOutput(finished=True, chunk_index=2))
-
-    proc.result_mq.enqueue.assert_not_called()
-    assert proc._async_output_pending == 1
-    assert proc._chunk_output_pending == 1
-
-    thread = threading.Thread(target=proc._async_output_loop, daemon=True)
-    thread.start()
-    assert proc.drain_async_outputs(timeout=2.0) is True
-    proc._async_output_queue.put(None)
-    thread.join(timeout=2.0)
-
-    messages = [call.args[0] for call in proc.result_mq.enqueue.call_args_list]
-    assert len(messages) == 1
-    message = messages[0]
-    assert message.kind is AsyncOutputKind.CHUNK_READY
-    assert message.request_id == "req"
-    assert message.chunk_index == 1
-    assert message.rpc_id is None
-    assert message.kind != AsyncOutputKind.COMPUTE_DONE
-    assert proc._chunk_output_pending == 0
-
-
 def test_runner_binds_request_identity_and_suppresses_batches() -> None:
     from vllm_omni.diffusion.request_streaming import (
         bind_emit_factory,
@@ -405,77 +244,6 @@ def test_runner_binds_request_identity_and_suppresses_batches() -> None:
         factory.assert_not_called()
     finally:
         reset_emit_factory(token)
-
-
-def test_chunk_reaches_result_mq_while_request_chunk_transport_open(mocker) -> None:
-    """Production emit path: packer enqueues CHUNK_READY before transport closes.
-
-    Unlike a fake ``result_mq.put`` factory, this drives ``_make_emit_chunk`` and
-    the background packing thread so a packer-only-flushes-on-drain regression fails.
-    """
-    from vllm_omni.diffusion.request_streaming import get_emit_chunk, request_chunk_emitter
-
-    proc = object.__new__(WorkerProc)
-    proc.gpu_id = 0
-    proc.result_mq = MagicMock()
-    proc._result_mq_lock = threading.Lock()
-    proc._async_output_queue = queue.Queue()
-    proc._async_output_done = threading.Condition()
-    proc._async_output_pending = 0
-    proc._chunk_output_pending = 0
-    proc.od_config = SimpleNamespace(
-        step_execution=False,
-        video_output_transport=SimpleNamespace(enable_registered_shm=False),
-    )
-    mocker.patch(
-        "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.record_device_event",
-        return_value=None,
-    )
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
-    mock_torch = mocker.MagicMock()
-    mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
-    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
-
-    release = threading.Event()
-    enqueued = threading.Event()
-    transport_open = threading.Event()
-
-    original_enqueue = proc._enqueue_result
-
-    def track_enqueue(msg):
-        original_enqueue(msg)
-        enqueued.set()
-
-    proc._enqueue_result = track_enqueue  # type: ignore[method-assign]
-    packer = threading.Thread(target=proc._async_output_loop, daemon=True)
-    packer.start()
-
-    def forward():
-        with proc._request_chunk_transport("execute_model", True):
-            transport_open.set()
-            with request_chunk_emitter([SimpleNamespace(request_id="req")], enabled=True):
-                emit = get_emit_chunk()
-                assert emit is not None
-                emit(DiffusionOutput(finished=False, chunk_index=0, output=torch.zeros(2)))
-                assert enqueued.wait(timeout=2), "CHUNK_READY must hit result_mq while transport is open"
-                assert release.wait(timeout=5)
-
-    thread = threading.Thread(target=forward, daemon=True)
-    thread.start()
-    try:
-        assert transport_open.wait(timeout=2)
-        assert enqueued.wait(timeout=2)
-        assert thread.is_alive()
-        messages = [call.args[0] for call in proc.result_mq.enqueue.call_args_list]
-        assert len(messages) == 1
-        assert messages[0].kind is AsyncOutputKind.CHUNK_READY
-        assert messages[0].request_id == "req"
-    finally:
-        release.set()
-        thread.join(timeout=2)
-        proc._async_output_queue.put(None)
-        packer.join(timeout=2)
-    assert not thread.is_alive() and not packer.is_alive()
 
 
 def test_chunk_delivered_while_pipeline_forward_is_blocked() -> None:
