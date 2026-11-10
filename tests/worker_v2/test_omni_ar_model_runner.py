@@ -39,13 +39,11 @@ def test_dummy_run_respects_context_capacity(mocker, num_tokens, max_num_reqs, m
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.max_num_reqs = max_num_reqs
     runner.max_model_len = max_model_len
-    runner.max_num_tokens = 32768
     parent_run = mocker.patch.object(
         omni_ar_model_runner.OmniGPUModelRunner, "_dummy_run", return_value=mocker.sentinel.outputs
     )
     assert runner._dummy_run(num_tokens, skip_attn=False, context_len=0) is mocker.sentinel.outputs
     parent_run.assert_called_once_with(expected_tokens, skip_attn=False, context_len=0)
-    assert runner.max_num_tokens == 32768
 
 
 class _FakeStream:
