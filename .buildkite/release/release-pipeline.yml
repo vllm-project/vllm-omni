@@ -28,7 +28,7 @@ steps:
       - 'export PATH="$HOME/.local/bin:$PATH"'
       - "uv venv --python=3.12 && source .venv/bin/activate"
       - "uv pip install --upgrade build"
-      - "python3 -m build"
+      - "python3 -m build --wheel"
       - "bash .buildkite/release/scripts/upload-nightly-wheels.sh"
     env:
       # setup.py appends +xpu to the version and uses requirements/xpu.txt.
