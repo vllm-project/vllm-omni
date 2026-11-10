@@ -67,3 +67,47 @@ def test_companion_completion_without_registered_parent_asserts():
 
     with pytest.raises(AssertionError, match="completed before parent req1 was registered"):
         tracker.on_companion_completed("req1__cfg_text")
+
+
+def test_defer_records_one_deadline_across_redeferrals():
+    now = [10.0]
+    tracker = CfgCompanionTracker(clock=lambda: now[0])
+    tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
+
+    tracker.defer_parent("req1", {"out": 1}, stage_id=0)
+    now[0] = 15.0
+    tracker.defer_parent("req1", {"out": 2}, stage_id=1)
+
+    assert tracker.poll_expired(10.0, now=19.9) == []
+    expired = tracker.poll_expired(10.0, now=20.0)
+
+    assert len(expired) == 1
+    parent_id, pending = expired[0]
+    assert parent_id == "req1"
+    assert pending["engine_outputs"] == {"out": 2}
+    assert pending["stage_id"] == 1
+    assert tracker.poll_expired(10.0, now=21.0) == []
+
+
+def test_terminal_claim_is_idempotent_until_cleanup():
+    tracker = CfgCompanionTracker()
+    tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
+
+    assert tracker.claim_terminal("req1") is True
+    assert tracker.claim_terminal("req1") is False
+    assert tracker.is_terminal("req1")
+    assert tracker.is_request_terminal("req1__cfg_text")
+    assert tracker.register_companion("req1", "late", "req1__late") is False
+    assert not tracker.is_companion("req1__late")
+
+    tracker.cleanup_parent("req1")
+    assert tracker.is_request_terminal("req1__cfg_text")
+    tracker.finalize_terminal("req1")
+    assert not tracker.is_terminal("req1")
+    assert not tracker.is_request_terminal("req1__cfg_text")
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0, float("inf"), float("nan")])
+def test_poll_expired_requires_positive_finite_timeout(timeout_s):
+    with pytest.raises(ValueError, match="timeout_s must be finite and > 0"):
+        CfgCompanionTracker().poll_expired(timeout_s)
