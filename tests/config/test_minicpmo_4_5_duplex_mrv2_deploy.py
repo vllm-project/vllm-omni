@@ -47,4 +47,7 @@ def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
+    # PR #10062 enables full-MRv2 three-stage serving on NPU; the other
+    # non-CUDA platforms still resolve to the v1 data plane.
+    expected = [True, True, True] if platform == "npu" else [False, False, False]
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == expected

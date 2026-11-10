@@ -2650,6 +2650,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             old_codes = state.get("codes")
             if not isinstance(old_codes, torch.Tensor):
                 old_codes = hidden.new_empty((0,), dtype=torch.long)
+            elif old_codes.device != delta.device:
+                # The prefill handoff seeds ``codes`` on the host, while the
+                # fused CUDA graph emits ``delta`` on the device. Align them
+                # before concatenating (build 19180 Stage-1 fatal error).
+                old_codes = old_codes.to(delta.device)
             # Full-width mirror; only the host-side ``_request_codec_history``
             # (flushed one step later) is exact, and it is the one readers use.
             state["codes"] = torch.cat((old_codes.reshape(-1), delta.reshape(-1)))

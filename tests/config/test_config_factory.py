@@ -3297,13 +3297,32 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        assert deploy.model_runner == (cuda_default_runner if platform == "cuda" else "v1")
+        # PR #10062 turns on full-MRv2 three-stage serving on NPU by default
+        # for the three MiniCPM-o deploy profiles it touches; every other
+        # platform/profile keeps the v1 data plane.
+        npu_full_mrv2 = platform == "npu" and filename in (
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_duplex_h200.yaml",
+        )
+        if platform == "cuda":
+            expected_runner = cuda_default_runner
+        elif npu_full_mrv2:
+            expected_runner = "v2"
+        else:
+            expected_runner = "v1"
+        assert deploy.model_runner == expected_runner
 
         # The selection must reach the live worker-dispatch consumer, not just
         # the transport-level DeployConfig field.
         pipeline = resolve_pipeline_config(pipeline_key)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expected = [platform == "cuda" and stage.stage_id not in cuda_v1_stages for stage in stages]
+        if platform == "cuda":
+            expected = [stage.stage_id not in cuda_v1_stages for stage in stages]
+        elif npu_full_mrv2:
+            expected = [True for _ in stages]
+        else:
+            expected = [False for _ in stages]
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == expected
         expect_v2 = all(expected)
 
