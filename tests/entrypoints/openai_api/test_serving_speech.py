@@ -493,6 +493,9 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
             create_messages=mocker.AsyncMock(return_value=unexpected_dispatch_error)
         ),
         "serving_tokens": SimpleNamespace(serve_tokens=mocker.AsyncMock(return_value=unexpected_dispatch_error)),
+        "openai_serving_audio_generate": SimpleNamespace(
+            create_audio_generate=mocker.AsyncMock(return_value=unexpected_dispatch_error)
+        ),
     }
     captured_app = None
     serve_started = asyncio.Event()
@@ -574,6 +577,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
                 },
             )
             sibling_payloads = {
+                "/v1/audio/generate": {"model": "cosyvoice3", "input": "hello"},
                 "/v1/responses": {"model": model_name, "input": "hello"},
                 "/v1/messages": {
                     "model": model_name,
@@ -632,6 +636,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     sibling_handlers["openai_serving_responses"].create_responses.assert_not_awaited()
     sibling_handlers["anthropic_serving_messages"].create_messages.assert_not_awaited()
     sibling_handlers["serving_tokens"].serve_tokens.assert_not_awaited()
+    sibling_handlers["openai_serving_audio_generate"].create_audio_generate.assert_not_awaited()
     speech_handler.create_speech.assert_awaited_once()
     speech_handler.create_speech_batch.assert_awaited_once()
     speech_handler.shutdown.assert_called_once()

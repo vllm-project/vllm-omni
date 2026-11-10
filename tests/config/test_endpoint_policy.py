@@ -48,6 +48,7 @@ def test_speech_pipelines_reject_generation_before_dispatch(pipeline):
         "/v1/messages",
         "/invocations",
         "/inference/v1/generate",
+        "/v1/audio/generate",
     )
 
     async def generate():

@@ -30,6 +30,7 @@ class OmniServingCapability(Enum):
     MESSAGES = RouteTarget("/v1/messages", frozenset({"POST"}))
     INVOCATIONS = RouteTarget("/invocations", frozenset({"POST"}))
     GENERATE_TOKENS = RouteTarget("/inference/v1/generate", frozenset({"POST"}))
+    AUDIO_GENERATE = RouteTarget("/v1/audio/generate", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
     RUN = RouteTarget("/v1/run", frozenset({"POST"}))
 
@@ -67,6 +68,7 @@ def speech_only_endpoint_restrictions(model_name: str) -> tuple[EndpointRestrict
             (OmniServingCapability.MESSAGES, "Messages"),
             (OmniServingCapability.INVOCATIONS, "Invocations"),
             (OmniServingCapability.GENERATE_TOKENS, "Generate Tokens"),
+            (OmniServingCapability.AUDIO_GENERATE, "Audio Generate"),
         )
     )
 
