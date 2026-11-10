@@ -321,6 +321,59 @@ def test_bias_resolves_rows_through_owning_request_in_mixed_step():
     assert int(torch.isfinite(logits[1]).sum()) == 1
 
 
+def test_dispatch_keeps_the_ramp_completion_frame():
+    """The final delay-pattern frame must be delivered before LM audio-EOS."""
+    t = _talker()
+    audio_token_id = 3
+    t.config = SimpleNamespace(
+        audio_token_id=audio_token_id,
+        audio_delay_token_id=4,
+        num_codebooks=2,
+        audio_stream_bos_id=30,
+        audio_stream_eos_id=31,
+    )
+    t.audio_codebook_logits = lambda hidden, mask: torch.zeros(
+        int(mask.sum()), 2, 32, dtype=hidden.dtype, device=hidden.device
+    )
+    t._sample_audio_codes_upstream = (
+        lambda cb2d, temperature, top_k, top_p: torch.tensor([31, 5], dtype=torch.long, device=cb2d.device)
+        .expand(cb2d.shape[0] // 2, -1)
+        .reshape(-1)
+    )
+    t._audio_state = {
+        "req-1": {
+            "num_delay": 1,
+            "num_remaining_delays": 1,
+            "audio_out_ids": torch.zeros(2, 2, dtype=torch.long),
+        }
+    }
+    t._slot_output_len = {"req-1": 0}
+
+    t._dispatch_audio_codes(
+        SimpleNamespace(sampled_token_ids=torch.tensor([[audio_token_id]])),
+        torch.zeros(1, 4),
+        None,
+        row_req_ids=["req-1"],
+    )
+
+    assert t._last_audio_codes.tolist() == [[31, 5]]
+    assert t._audio_state["req-1"]["audio_out_ids"].shape == (2, 3)
+    assert t._audio_state["req-1"]["should_terminate"]
+
+
+def test_v1_postprocess_clears_empty_audio_frame():
+    """An empty V1 step must overwrite, rather than replay, the prior frame."""
+    t = _talker()
+    t._last_audio_codes = torch.full((1, 2), -1, dtype=torch.long)
+    t._postprocess_cursor = 0
+
+    update = t.postprocess(torch.zeros(1, 4), req_id="req-1")
+
+    audio = update["codes"]["audio"]
+    assert audio.shape == (0, 2)
+    assert audio.dtype == torch.int32
+
+
 def test_dispatch_keys_state_by_row_owner_in_mixed_step():
     """Delay-pattern state must land under the row owner, not ``req_ids[row]``."""
     t = _talker()

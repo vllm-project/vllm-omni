@@ -1378,7 +1378,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         num_codebooks = int(self.config.num_codebooks)
         bos = int(self.config.audio_stream_bos_id)
         eos_stream = int(self.config.audio_stream_eos_id)
-        audio_eos_vocab = int(getattr(self.config, "audio_eos_token_id", -1))
 
         # ``audio_row_indices`` and ``self._audio_state`` were initialised
         # earlier (right after ``is_audio`` was computed) so the RAS check
@@ -1439,18 +1438,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     num_remaining_delays = num_codebooks - last_eos_idx - 1
 
             if num_remaining_delays is not None and num_remaining_delays <= 0:
-                # Audio ramp-down finished. Set a per-slot termination flag
-                # so the NEXT step's bias forces audio_eos_token_id (upstream's
-                # ``next_tokens[...] = audio_eos_token_id`` override at the
-                # ramp-completion point — see modeling_higgs_audio.py:1564).
-                _ = audio_eos_vocab
+                # Audio ramp-down finished. Keep this completion frame: the
+                # upstream generator appends ``next_audio_tokens`` before it
+                # emits the LM ``audio_eos_token_id`` on the following step.
+                # The flag still lets the next step's bias produce that stop
+                # token without mutating the sampler output in place.
                 num_delay = 0
                 num_remaining_delays = None
                 state["num_delay"] = num_delay
                 state["num_remaining_delays"] = num_remaining_delays
                 state["should_terminate"] = True
-                new_codes_flat.append(torch.full_like(this_codes, -1))
-                continue
 
             state["num_delay"] = num_delay
             state["num_remaining_delays"] = num_remaining_delays
@@ -1862,7 +1859,12 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Drop placeholder rows (-1): only emit codes for actual audio positions.
         audio_rows = slice_codes[:, 0] >= 0
         if not bool(audio_rows.any()):
-            return {}
+            # V1 stores postprocess results in a merge-style intermediate
+            # buffer. An empty update would leave the previous frame there,
+            # and the next forward could publish that stale frame again at
+            # the audio-EOS boundary. Publish an explicit empty tensor so the
+            # buffer is cleared while preserving its codebook dimension.
+            return {"codes": {"audio": slice_codes[:0].to(torch.int32)}}
         new_codes = slice_codes[audio_rows].to(torch.int32)
 
         # Return only this step's frames: the engine accumulates per-step
