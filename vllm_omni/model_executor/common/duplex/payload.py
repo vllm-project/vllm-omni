@@ -31,11 +31,13 @@ def decode_pcm_f32le_payload(
     sample_rate_hz: int,
     exact_samples: int | None = None,
     model: str = "duplex",
+    check_finite: bool = True,
 ) -> bytes:
     """Raw PCM of one append that must be ``pcm_f32le`` at ``sample_rate_hz``.
 
     ``exact_samples`` pins the unit length (a lockstep model takes exactly one
     frame per append); ``None`` accepts any whole number of samples.
+    ``check_finite=False`` leaves the finiteness check to the caller.
     """
     if not isinstance(payload, Mapping):
         raise ValueError(f"{model} duplex append payload must be a mapping")
@@ -43,7 +45,7 @@ def decode_pcm_f32le_payload(
         raise ValueError(f"{model} duplex append format must be pcm_f32le")
     if payload.get("sample_rate_hz") != sample_rate_hz:
         raise ValueError(f"{model} duplex append sample_rate_hz must be {sample_rate_hz}")
-    raw = decode_pcm_f32le_base64(payload_audio(payload), model=model)
+    raw = decode_pcm_f32le_base64(payload_audio(payload), model=model, check_finite=check_finite)
     if exact_samples is not None and pcm_f32le_sample_count(raw) != exact_samples:
         raise ValueError(f"{model} duplex append must contain exactly {exact_samples} samples")
     return raw

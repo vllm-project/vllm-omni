@@ -50,6 +50,7 @@ import pytest
 import torch
 import yaml
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.auk.auk_transformer import (
     AuKTransformer,
     Rotary,
@@ -104,15 +105,20 @@ SKIP_REASON = _skip_reason()
 pytestmark = [
     pytest.mark.local_model,
     pytest.mark.diffusion,
-    pytest.mark.gpu,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(SKIP_REASON is not None, reason=str(SKIP_REASON)),
 ]
 
 
+def _require_ckpt_dir() -> str:
+    if CKPT_DIR is None:
+        raise RuntimeError("AUK_CKPT_DIR is not set")
+    return CKPT_DIR
+
+
 def _arch() -> dict:
     """Read the backbone geometry out of the checkpoint's config."""
-    config = yaml.safe_load(Path(CKPT_DIR, "config.yaml").read_text())["model"]
+    config = yaml.safe_load(Path(_require_ckpt_dir(), "config.yaml").read_text())["model"]
     return {
         "dim": config["arch"]["dim"],
         "heads": config["arch"]["heads"],
@@ -155,7 +161,7 @@ def models() -> tuple[torch.nn.Module, AuKTransformer]:
 
     arch = _arch()
     device = torch.device(DEVICE)
-    state = dit_state_dict(load_file(str(Path(CKPT_DIR, "auk_base.safetensors")), device="cpu"))
+    state = dit_state_dict(load_file(str(Path(_require_ckpt_dir(), "auk_base.safetensors")), device="cpu"))
 
     reference = Flux2Edit(dropout=0.0, attn_backend="torch", attn_mask_enabled=True, **arch)
     reference.load_state_dict(state, strict=True)

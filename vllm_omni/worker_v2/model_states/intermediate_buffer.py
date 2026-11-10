@@ -117,7 +117,8 @@ class OmniIntermediateBuffer:
 
     def gather(self, input_batch: InputBatch) -> list[dict[str, Any]]:
         """Return buffer dicts in current batch order (via ``idx_mapping_np``)."""
-        return [self.buffers[idx] for idx in input_batch.idx_mapping_np]
+        buffers = self.buffers
+        return [buffers[idx] for idx in np.asarray(input_batch.idx_mapping_np).tolist()]
 
     @staticmethod
     def _split_gpu_keys(gpu_resident_keys: set[Any] | None) -> tuple[set[Any], dict[Any, set[Any]]]:
@@ -131,10 +132,11 @@ class OmniIntermediateBuffer:
         return top_level, nested
 
     @staticmethod
-    def _store_value(dest: dict[Any, Any], key: Any, value: Any, gpu_keys: set[Any]) -> None:
+    def _store_value(dest: dict[Any, Any], key: Any, value: Any, gpu_keys: set[Any], owned: bool = False) -> None:
         if isinstance(value, torch.Tensor):
             if key in gpu_keys:
-                dest[key] = value.detach().clone()
+                # An owned value is never written by its producer again: keep it, no snapshot.
+                dest[key] = value.detach() if owned and value.is_cuda else value.detach().clone()
             else:
                 dest[key] = value.detach().cpu().contiguous()
         elif isinstance(value, list):
@@ -156,11 +158,15 @@ class OmniIntermediateBuffer:
         req_index: int,
         updates: dict[Any, Any],
         gpu_resident_keys: set[Any] | None = None,
+        *,
+        owned: bool = False,
     ) -> None:
         """Merge *updates* into the buffer at *req_index*.
 
         Tensors are detached; those whose key is **not** in
-        *gpu_resident_keys* are moved to CPU.
+        *gpu_resident_keys* are moved to CPU. With ``owned`` the caller
+        guarantees the resident tensors are not written after this call, so
+        they are stored without a snapshot copy.
         """
         if not updates:
             return
@@ -173,7 +179,7 @@ class OmniIntermediateBuffer:
                 if not isinstance(existing_sub, dict):
                     existing_sub = {}
                     existing[type_key] = existing_sub
-                self._store_value(existing_sub, qualifier, v, nested_gpu_keys.get(type_key, set()))
+                self._store_value(existing_sub, qualifier, v, nested_gpu_keys.get(type_key, set()), owned=owned)
             elif isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 if not isinstance(existing_sub, dict):
@@ -220,9 +226,9 @@ class OmniIntermediateBuffer:
                 for qualifier, value in v.items():
                     if qualifier in merged_qualifiers:
                         continue
-                    self._store_value(existing_sub, qualifier, value, nested_gpu_keys.get(k, set()))
+                    self._store_value(existing_sub, qualifier, value, nested_gpu_keys.get(k, set()), owned=owned)
             else:
-                self._store_value(existing, k, v, top_gpu_keys)
+                self._store_value(existing, k, v, top_gpu_keys, owned=owned)
 
     def update_gpu_tensor_rows(
         self,

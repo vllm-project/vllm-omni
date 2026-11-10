@@ -1564,7 +1564,7 @@ class TestRegistry:
             assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
             deploy_config = load_deploy_config(yaml_path)
             stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
-            assert stage_0.engine_extras["attention_backend"] == "FLASHINFER"
+            assert stage_0.attention_backend == "FLASHINFER"
             assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
 
 
@@ -1774,3 +1774,30 @@ class TestVoiceCloneReferenceCache:
         assert cache_hit is True
         assert inflight_wait is False
         assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+
+
+def test_released_sample_graphs_are_captured_again():
+    """The worker captures the sampler graphs once while profiling to measure
+    them, releases them, and warmup captures them for real."""
+    import vllm_omni.model_executor.models.higgs_audio_v3.full_sample_graph as full_sample_graph
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+
+    model = SimpleNamespace(
+        _sample_graph_enabled=True,
+        _sample_graphs_ready=True,
+        _dense_sample_graphs={"key": object()},
+        _dense_sample_metadata_sources={"key": object()},
+    )
+    # Ready graphs are kept: capture returns before touching the model.
+    full_sample_graph.capture_sample_graphs(model, max_num_reqs=1)
+
+    HiggsAudioV3TalkerForConditionalGeneration.release_auxiliary_graphs(model)
+
+    assert model._dense_sample_graphs == {}
+    assert model._dense_sample_metadata_sources == {}
+    assert model._sample_graphs_ready is False
+    # Released graphs are captured again: capture now reads the model.
+    with pytest.raises(AttributeError, match="model"):
+        full_sample_graph.capture_sample_graphs(model, max_num_reqs=1)

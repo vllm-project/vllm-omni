@@ -1,0 +1,22 @@
+# Opt-in: MammothModa2 AR stage with cudagraph_mode FULL.
+#
+# Use for intentional t2i AR decode graphs. Under FULL, MoE layers 14–27 run
+# both und and gen experts then torch.where per token so capture cannot bake
+# a host-side mask branch (~+25% AR decode vs single-expert eager on H200
+# t2i). That dual-expert cost also applies to understanding-only batches that
+# share the same FULL graphs.
+#
+# For und-only / chat AR, prefer mammoth_moda2_ar.yaml (eager) — do not use
+# this preset. Sampling stays at the base mammoth_moda2.yaml defaults; for
+# #9851 / #9764 routing repros, override temperature/top_k at the client.
+
+base_config: mammoth_moda2.yaml
+
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    compilation_config:
+      # mode 0: CUDA graphs without torch.compile (FULL does not need the
+      # PIECEWISE compile path).
+      mode: 0
+      cudagraph_mode: FULL

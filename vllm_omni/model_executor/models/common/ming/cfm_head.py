@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/fm/flowloss.py
 
 import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
-from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, build_timesteps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS, Solver, build_timesteps
 
 
 class FlowLoss(nn.Module):
@@ -21,7 +21,18 @@ class FlowLoss(nn.Module):
         self.cfm.add_module("model", DiT(in_channels=z_channels, llm_cond_dim=llm_cond_dim, **kwargs))
 
     @torch.no_grad()
-    def sample(self, z, latent_history, cfg=2.0, patch_size=1, sigma=0.25, temperature=0):
+    def sample(
+        self,
+        z,
+        latent_history,
+        cfg=2.0,
+        patch_size=1,
+        sigma=0.25,
+        temperature=0,
+        generator=None,
+        initial_noise=None,
+        solver_noise=None,
+    ):
         # z: [Batch, Time=1, Dimension]
         # latent_history: [Batch, History_Time, Dimension]
         if z.ndim != 3:
@@ -35,7 +46,31 @@ class FlowLoss(nn.Module):
                 f"Batch mismatch across conditioning and latent_history: {z.shape[0]}, {latent_history.shape[0]}"
             )
         dtype = z.dtype
-        noise = torch.randn(z.shape[0], self.z_channels, patch_size, device=z.device, dtype=torch.float32)
+        if initial_noise is None:
+            noise = torch.randn(
+                z.shape[0],
+                self.z_channels,
+                patch_size,
+                device=z.device,
+                dtype=torch.float32,
+                generator=generator,
+            ).transpose(1, 2)
+        else:
+            noise = initial_noise
+            expected = (z.shape[0], patch_size, self.z_channels)
+            if tuple(noise.shape) != expected:
+                raise ValueError(f"Initial noise shape mismatch: got {tuple(noise.shape)}, expected {expected}")
+        t = build_timesteps(
+            DEFAULT_CFM_STEPS,
+            device=noise.device,
+            dtype=noise.dtype,
+            use_epss=True,
+            sway_sampling_coef=-1.0,
+        )
+        if solver_noise is not None:
+            expected = (len(t) - 1, z.shape[0], patch_size, self.z_channels)
+            if tuple(solver_noise.shape) != expected:
+                raise ValueError(f"Solver noise shape mismatch: got {tuple(solver_noise.shape)}, expected {expected}")
 
         def fn(t, x):
             x = x.to(dtype)
@@ -52,11 +87,15 @@ class FlowLoss(nn.Module):
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return (pred + (pred - null_pred) * cfg).float()
 
-        t = build_timesteps(
-            10,
-            device=noise.device,
-            dtype=noise.dtype,
-            use_epss=True,
-            sway_sampling_coef=-1.0,
+        return (
+            Solver(
+                fn,
+                noise,
+                sigma=sigma,
+                temperature=temperature,
+                generator=generator,
+                noise=solver_noise,
+            )
+            .integrate(t)[-1]
+            .to(dtype)
         )
-        return Solver(fn, noise.transpose(1, 2), sigma=sigma, temperature=temperature).integrate(t)[-1].to(dtype)

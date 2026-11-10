@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
@@ -50,6 +50,49 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
+
+
+def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
+    """Build the per-row duplex handoff metadata shared by the V1 and MRv2 Thinker outputs."""
+    duplex_rows = []
+    for req_info in request_infos:
+        duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
+        duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
+
+    outputs: dict[str, Any] = {}
+    prompt_rows = []
+    for duplex_info in duplex_rows:
+        prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
+        # This is a complete per-handoff snapshot, not a generated
+        # tensor delta. Keep it as row-local metadata so output
+        # accumulation replaces the previous value instead of
+        # attempting to concatenate variable-length prompts.
+        prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
+    if any(row is not None for row in prompt_rows):
+        outputs["duplex_prompt_token_ids"] = prompt_rows
+
+    special_rows = [
+        info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows
+    ]
+    special_values: dict[str, int] = {}
+    for special in special_rows:
+        for key, value in special.items():
+            if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                special_values.setdefault(key, value)
+    if special_values:
+        # These are tokenizer constants. A row whose append built no unit has
+        # none on MRv2, and a None entry would stay in that request's
+        # accumulated metadata over the values later appends publish.
+        # Host tensors: every consumer reads them on the host, and a pageable
+        # host->device copy per row and key would wait for the whole forward.
+        outputs["meta"] = {
+            key: [
+                torch.tensor([value if isinstance(value, int) and value >= 0 else constant], dtype=torch.long)
+                for value in (special.get(key) for special in special_rows)
+            ]
+            for key, constant in sorted(special_values.items())
+        }
+    return outputs
 
 
 @dataclass(slots=True)
@@ -81,7 +124,7 @@ def _generator_rewind(generator: torch.Generator) -> Callable[[], None]:
     info=MiniCPMO45OmniLLMProcessingInfo,
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
+class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, SupportsEagle3):
     """MiniCPM-o 4.5 Omni model for conditional generation.
 
     Three-stage pipeline:
@@ -92,6 +135,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     """
 
     requires_raw_input_tokens = True
+    # Set when a drafter (EAGLE-3, DFlash, DSpark) reads Thinker layers.
+    _returns_aux_hidden_states = False
+    _num_aux_hidden_states = 0
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -123,18 +169,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.model_stage = vllm_config.model_config.model_stage
         self.model_sampler_wants_sampling_params = self.model_stage == "tts"
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        if (
+        # Turn-mode Thinker outputs (latent, token ids and positions) are all
+        # token-aligned, so MRv2 can restore them together on prefix hits.
+        # Duplex uses a mutable KV window; Talker owns sampled codec outputs.
+        # Opt in only when the construction path explicitly identifies turn mode.
+        # The output cache refuses speculative decoding, so with a draft the
+        # Thinker reuses native KV only. The Talker reads reply rows, which a
+        # new request's hit never covers, and llm2tts takes them from the row
+        # ledger.
+        self.supports_mrv2_prefix_cache_outputs = (
             self.model_stage == "llm"
-            and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "session_mode", "turn") != "turn"
-        ):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
-        if (
-            self.model_stage == "llm"
-            and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "async_chunk", False)
-        ):
-            raise ValueError("MiniCPM-o MRv2 Thinker requires async_chunk: false for its full llm2tts payload")
+            and getattr(vllm_config.model_config, "session_mode", None) == "turn"
+            and getattr(vllm_config, "speculative_config", None) is None
+        )
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
         self.requires_raw_input_tokens = self.model_stage == "llm"
@@ -204,7 +251,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 self.preprocess_decode_batch = batch_decode
             # Model Runner V2 hooks: device-side codec output, EOS control and
             # codec penalty (see MiniCPMO45OmniTTSForConditionalGeneration).
-            for hook_name in ("preprocess_decode_batch_mrv2", "make_omni_output_mrv2", "mrv2_custom_sampler"):
+            for hook_name in (
+                "preprocess_decode_batch_mrv2",
+                "make_omni_output_mrv2",
+                "mrv2_custom_sampler",
+                "finalize_multimodal_outputs_from_cpu_snapshot",
+            ):
                 hook = getattr(self.talker, hook_name, None)
                 if callable(hook):
                     setattr(self, hook_name, hook)
@@ -212,6 +264,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
+            # CUDA K-step fused graph hooks live on the Talker; the runner sees
+            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            for hook_name in (
+                "prepare_cuda_kstep",
+                "cuda_kstep_frame",
+                "commit_cuda_kstep",
+                "warmup_kstep_sampling_kernels",
+            ):
+                hook = getattr(self.talker, hook_name, None)
+                if callable(hook):
+                    setattr(self, hook_name, hook)
         else:
             raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts'")
 
@@ -230,13 +293,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
-        # Turn-mode Thinker inputs use the native multimodal encoder/cache on
-        # MRv2. Marking it as a custom-preprocess model disables that encoder
-        # path in the runner. Duplex still uses the V1 preprocess hook.
-        self.has_preprocess = self.model_stage == "tts" or not self._use_v2_model_runner
+        is_duplex = getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+        self.has_preprocess = (
+            self.model_stage == "tts" or not self._use_v2_model_runner or (self.model_stage == "llm" and is_duplex)
+        )
+        # The duplex Thinker also serves media chat requests, whose image,
+        # audio and video features come from the native MRv2 encoder.
+        self.preprocess_keeps_mm_inputs = self.model_stage == "llm" and is_duplex and self._use_v2_model_runner
         # Neither AR stage has a postprocess, so step outputs can use the
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}
+        # Code2Wav consumes codec codes and metadata, not Talker hidden states.
+        # Keep the Thinker hidden-state handoff, but avoid snapshotting and
+        # transporting an unused hidden tensor on every Talker decode step.
+        self.omni_pooler_payload_include_hidden = self.model_stage != "tts"
+
+        if self.model_stage == "llm" and is_duplex and self._use_v2_model_runner:
+            # Only the duplex Thinker exposes the MRv2 batch-preprocess hook.
+            self.preprocess_batch_mrv2 = self._preprocess_batch_mrv2
 
         if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
             # Build the Stage-0 duplex runtime (remote-code processor and
@@ -255,6 +329,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
+
+    @property
+    def tts_model(self) -> nn.Module | None:
+        """The Talker's transformer, without registering a duplicate submodule."""
+        talker = getattr(self, "talker", None)
+        return getattr(talker, "tts_model", None) if talker is not None else None
 
     def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
@@ -283,11 +363,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_sessions = {
             row.row_idx: row.session_id for row in rows if row.session_id is not None
         }
-        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
-        if not isinstance(request_sessions, dict):
-            request_sessions = {}
-            self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
+        self._minicpmo45_duplex_request_session_map().update(
+            {row.request_id: row.session_id for row in rows if row.session_id is not None}
+        )
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
@@ -427,13 +505,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
+        if getattr(self, "_use_v2_model_runner", False) and self.model_stage == "llm":
+            req_id = kwargs.get("req_id")
+            if req_id is not None:
+                if not hasattr(self, "_mrv2_sampling_infos"):
+                    self._mrv2_sampling_infos = {}
+                self._mrv2_sampling_infos[str(req_id)] = kwargs
+
         duplex = kwargs.get("duplex")
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
-        prompt_len_meta = kwargs.get("duplex_prompt_len")
-        token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        prompt_len_meta = kwargs.get("_omni_prompt_len")
+        if prompt_len_meta is None:
+            prompt_len_meta = kwargs.get("duplex_prompt_len")
+        token_offset_meta = kwargs.get("_omni_num_computed_tokens")
+        if token_offset_meta is None:
+            token_offset_meta = kwargs.get("duplex_token_offset", 0)
         if (
             isinstance(prompt_len_meta, int)
             and isinstance(token_offset_meta, int)
@@ -457,6 +546,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # A deferred sample of this session updates the latches its append reads.
         self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
         state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+        req_id = kwargs.get("req_id")
+        if req_id is not None:
+            # Own the session from its first append: MRv2 samples no partial
+            # prefill row, so a request cancelled mid-prefill never reaches
+            # prepare_duplex_sampling and on_requests_finished must still free it.
+            self._minicpmo45_duplex_request_session_map()[str(req_id)] = session_id
         prefill_kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
         seq = prefill_kwargs["seq"]
         result = helper.take_staged_prefill(state, prefill_kwargs["epoch"], seq)
@@ -488,7 +583,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         )
         full_req_embeds = result["inputs_embeds"].to(device=input_ids.device, dtype=target_dtype)
         full_input_token_ids = list(result.get("input_token_ids") or [])
-        prompt_len = kwargs.get("duplex_prompt_len")
+        prompt_len = kwargs.get("_omni_prompt_len")
+        if prompt_len is None:
+            prompt_len = kwargs.get("duplex_prompt_len")
         try:
             prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
         except (TypeError, ValueError):
@@ -523,7 +620,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
         span_len = int(input_ids.shape[0])
-        token_offset = kwargs.get("duplex_token_offset", 0)
+        token_offset = kwargs.get("_omni_num_computed_tokens")
+        if token_offset is None:
+            token_offset = kwargs.get("duplex_token_offset", 0)
         try:
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
@@ -552,13 +651,79 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
         return req_input_ids, req_embeds, {"duplex": update_result}
 
+    preprocess_batch_requires_stable_decode = True
+
+    @property
+    def preprocess_batch_fills_rows(self) -> bool:
+        return self.model_stage == "tts" and self.talker.emb_code[0].weight.device.type == "cuda"
+
+    def _preprocess_talker_decode_rows(
+        self,
+        req_ids: list[str],
+        buffers: dict[str, dict[str, Any]],
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        token_offsets: list[int] | None,
+        num_scheduled_tokens: list[int] | None,
+        num_computed_tokens: list[int] | None,
+        prompt_lens: list[int] | None,
+    ) -> list[str] | None:
+        # Inspect the live request order and layout on every call. Never cache
+        # by batch size: admission, preemption and duplex conditions can change
+        # while the batch size stays fixed.
+        count = len(req_ids)
+        if (
+            not count
+            or input_ids is None
+            or inputs_embeds is None
+            or self.talker._k_step_frames != 0
+            or token_offsets != list(range(count))
+            or num_scheduled_tokens != [1] * count
+            or num_computed_tokens is None
+            or prompt_lens is None
+            or len(num_computed_tokens) != count
+            or len(prompt_lens) != count
+            or any(done < length for done, length in zip(num_computed_tokens, prompt_lens))
+        ):
+            return None
+        infos: list[dict[str, Any]] = []
+        for rid in req_ids:
+            info = buffers.get(rid)
+            if not isinstance(info, dict) or not isinstance(info.get("audio_state"), dict):
+                return None
+            infos.append(info)
+        for rid, info, done, length in zip(req_ids, infos, num_computed_tokens, prompt_lens):
+            info["request_id"] = rid
+            info["duplex_token_offset"] = done
+            info["duplex_prompt_len"] = length
+            info["_omni_prompt_len"] = length
+            info["_omni_num_computed_tokens"] = done
+            info["_omni_is_prefill"] = False
+        decode_ids = input_ids[:count]
+        ids, embeds, updates = self.talker.preprocess_decode_batch(input_ids=decode_ids, req_infos=infos)
+        inputs_embeds[:count].copy_(embeds)
+        if ids is not decode_ids:
+            decode_ids.copy_(ids)
+        # This hook emits only empty CPU codec deltas; pending device ids are
+        # owned by Talker. Update the existing buffer in place, preserving its
+        # alias in the runner's request state and all condition metadata.
+        for info, update in zip(infos, updates):
+            info.setdefault("codes", {}).update(update["codes"])
+        return req_ids
+
     def preprocess_batch(
         self,
         *,
         req_ids: list[str],
         model_intermediate_buffer: dict[str, dict[str, Any]],
         device: torch.device,
-    ) -> None:
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_offsets: list[int] | None = None,
+        num_scheduled_tokens: list[int] | None = None,
+        num_computed_tokens: list[int] | None = None,
+        prompt_lens: list[int] | None = None,
+    ) -> list[str] | None:
         """Runner hook before ``preprocess``: batch this step's duplex appends across sessions.
 
         With two or more appends, camera frames share vision-tower calls (``prefetch_vision``) and
@@ -566,6 +731,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         takes the staged results and builds or reports anything skipped here.
         """
         del device
+        if self.model_stage == "tts":
+            # Full device-graph replay skips Talker.forward's Python cleanup.
+            # Release finished requests before preprocessing can reuse slots.
+            self.talker._flush_deferred_cleanup()
+            if inputs_embeds is not None:
+                return self._preprocess_talker_decode_rows(
+                    req_ids,
+                    model_intermediate_buffer,
+                    input_ids,
+                    inputs_embeds,
+                    token_offsets,
+                    num_scheduled_tokens,
+                    num_computed_tokens,
+                    prompt_lens,
+                )
+            return None
         if self.model_stage != "llm":
             return
         infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
@@ -608,6 +789,29 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
+
+    def _preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
+        """MRv2 ``preprocess_batch_mrv2`` hook (prefill rows only): ``preprocess_batch``'s cross-session batching.
+
+        Without it MRv2 builds every duplex append in ``preprocess`` one session
+        at a time: one batch-1 streaming-encoder pass per unit and no shared
+        vision-tower call for camera frames.
+        """
+        buffers = {
+            str(info["req_id"]): info
+            for info in req_infos
+            if isinstance(info, dict) and info.get("req_id") is not None and isinstance(info.get("duplex"), dict)
+        }
+        if buffers:
+            self.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=device)
+
+    def _minicpmo45_duplex_request_session_map(self) -> dict[str, str]:
+        """Request id -> Stage-0 session id, read by ``on_requests_finished`` to free the session."""
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._minicpmo45_duplex_request_sessions = request_sessions
+        return request_sessions
 
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""
@@ -655,6 +859,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = MiniCPMO45Stage0DuplexRuntime(self, model_path=model_path, device=device)
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
+
+    def get_language_model(self) -> torch.nn.Module:
+        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+        if self.thinker is not None:
+            return self.thinker.get_language_model()
+        return self.model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Only the MRv2 Thinker forward hands target layers to the drafter.
+        if self.model_stage != "llm" or not self._use_v2_model_runner:
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 drafters that read target hidden layers (EAGLE-3, DFlash, DSpark) "
+                "need the Thinker stage on model_runner: v2"
+            )
+        super().set_aux_hidden_state_layers(layers)
+        language_model = self.get_language_model()
+        decoder = getattr(language_model, "model", language_model)
+        stored = getattr(decoder, "aux_hidden_state_layers", None)
+        if stored is None:
+            raise RuntimeError(
+                f"MiniCPM-o Thinker decoder {type(decoder).__name__} keeps no aux_hidden_state_layers "
+                "for the drafter's target layers"
+            )
+        self._returns_aux_hidden_states = True
+        # The decoder returns one tensor per layer it stored (vLLM dedupes them).
+        self._num_aux_hidden_states = len(stored)
 
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
@@ -738,7 +968,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 **kwargs,
             )
 
-            if isinstance(thinker_output, tuple):
+            aux_hidden_states = None
+            if self._returns_aux_hidden_states:
+                text_hidden_states, aux_hidden_states = thinker_output
+                if not isinstance(aux_hidden_states, (list, tuple)) or len(aux_hidden_states) != (
+                    self._num_aux_hidden_states
+                ):
+                    raise RuntimeError(
+                        f"MiniCPM-o Thinker returned {type(aux_hidden_states).__name__} for the drafter's "
+                        f"{self._num_aux_hidden_states} target layers"
+                    )
+            elif isinstance(thinker_output, tuple):
                 _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
@@ -752,6 +992,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 # FULL graphs return tensors. The row ledger is reconstructed
                 # from this step's live input batch after replay, never from
                 # Python values or token buffers captured during warmup.
+                if aux_hidden_states is not None:
+                    return text_hidden_states, aux_hidden_states
                 return text_hidden_states
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
@@ -763,51 +1005,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                duplex_rows = []
-                for req_info in runtime_info:
-                    duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
-                    duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
-
-                prompt_rows = []
-                for duplex_info in duplex_rows:
-                    prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                    # This is a complete per-handoff snapshot, not a generated
-                    # tensor delta. Keep it as row-local metadata so output
-                    # accumulation replaces the previous value instead of
-                    # attempting to concatenate variable-length prompts.
-                    prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
-                if any(row is not None for row in prompt_rows):
-                    multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
-
-                special_keys = {
-                    key
-                    for duplex_info in duplex_rows
-                    for key, value in (
-                        duplex_info.get("special_token_ids", {}).items()
-                        if isinstance(duplex_info.get("special_token_ids"), dict)
-                        else ()
-                    )
-                    if isinstance(key, str) and isinstance(value, int) and value >= 0
-                }
-                if special_keys:
-                    # Host tensors: every consumer reads them on the host, and a pageable
-                    # host->device copy per row and key would wait for the whole forward.
-                    multimodal_outputs["meta"] = {
-                        key: [
-                            torch.tensor([int(value)], dtype=torch.long)
-                            if isinstance(value, int) and value >= 0
-                            else None
-                            for duplex_info in duplex_rows
-                            for value in [
-                                (
-                                    duplex_info.get("special_token_ids", {}).get(key)
-                                    if isinstance(duplex_info.get("special_token_ids"), dict)
-                                    else None
-                                )
-                            ]
-                        ]
-                        for key in sorted(special_keys)
-                    }
+                multimodal_outputs.update(_duplex_row_outputs(runtime_info))
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -835,22 +1033,116 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 req_states=req_states,
                 model_intermediate_buffer=model_intermediate_buffer,
             )
-        if any(isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
         num_tokens = model_outputs.shape[0]
+        multimodal_outputs: dict[str, Any] = {
+            "latent": model_outputs,
+            "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
+            "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
+        }
+        if model_intermediate_buffer and any(
+            isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer
+        ):
+            # The prompt snapshot and special ids change only with an append,
+            # and the output accumulator keeps the last value of a missing key.
+            # Publish them on steps that complete an append's prefill instead
+            # of copying every row's whole prompt on every decode step.
+            num_reqs = int(input_batch.num_reqs)
+            completes_prefill = input_batch.is_prefilling_np[:num_reqs] & (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+                >= input_batch.prefill_len_np[:num_reqs]
+            )
+            if completes_prefill.any():
+                multimodal_outputs.update(_duplex_row_outputs(model_intermediate_buffer))
+
         return OmniOutput(
             text_hidden_states=model_outputs,
-            multimodal_outputs={
-                "latent": model_outputs,
-                "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
-                "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
-            },
+            multimodal_outputs=multimodal_outputs,
         )
+
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
+        return self.model_stage == "tts" and self._use_v2_model_runner
+
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+        if self.model_stage == "tts":
+            return self.talker.mrv2_custom_sampler(sampler)
+        if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
+                MiniCPMO45DuplexSampler,
+            )
+
+            return MiniCPMO45DuplexSampler(sampler, self), None
+        # Keep the runner's defaults, including the rejection sampler that
+        # verifies draft tokens.
+        return None
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
+
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        """Forward the Talker's sampling-eligibility contract to the runner.
+
+        The runner only supplies ``request_sample_eligible`` when the model it
+        sees declares the flag, and it always sees this wrapper -- never the
+        inner Talker (the same resolution rule as talker_multiframe.applies
+        below). Without the forward, the Talker's K-step branch falls back to
+        treating every request as eligible, so an incomplete prefill chunk
+        advances codec history and RNG state and the generated audio starts
+        depending on prefill chunking.
+        """
+        talker = getattr(self, "talker", None)
+        return talker is not None and bool(getattr(talker, "requires_request_sample_eligibility", False))
+
+    # Runner-side forwards for multi-frame decode. The baseline declares these
+    # four methods on this outer wrapper class; the runner only ever sees the
+    # wrapper (talker_multiframe.applies / is_multi_token_decode /
+    # ensure_stop_token_vocab all resolve through getattr(model, ...)), so
+    # without them:
+    #   * missing supports_multi_frame_decode -> the check silently reads False,
+    #     the multi-frame loop never runs and no reason is logged;
+    #   * missing take/set_batch_stop_logits -> per-frame stop rows unavailable;
+    #   * missing batch_stop_logits -> the runner's gate probe reads None and
+    #     always falls back to text_hidden_states;
+    #   * missing merge_frame_outputs -> multi-frame results cannot be merged.
+    # The speculative config alone is not enough: the runner-side loop and its
+    # vocab-width correction (ensure_stop_token_vocab) stay dormant, the
+    # rejection sampler consumes width-0 rows, AIV goes out of bounds (507035)
+    # and the stage-1 engine dies with empty audio.
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        # "This wrapper implements the multi-frame path", not "the loop is
+        # running": the Talker (tts) stage has it, the Thinker does not. Whether
+        # a step actually runs it is decided per deployment by stage 1's
+        # speculative_config (the runner checks its num_spec_tokens for that).
+        return self.model_stage == "tts"
+
+    @property
+    def batch_stop_logits(self):
+        # The runner probes this attribute on the registered architecture
+        # (getattr in npu_model_runner); without the forward it reads None and
+        # the gate always falls back to text_hidden_states.
+        if self.model_stage != "tts":
+            return None
+        return self.talker.batch_stop_logits
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        if self.model_stage != "tts":
+            return frame_outputs
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
@@ -874,6 +1166,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             finished = set(finished_req_ids)
             completed_segments = {segment for segment in forced_segments if segment[0] in finished}
             forced_segments.difference_update(completed_segments)
+        mrv2_sampler = getattr(self, "_mrv2_duplex_sampler", None)
+        if mrv2_sampler is not None and hasattr(mrv2_sampler, "forget_requests"):
+            mrv2_sampler.forget_requests(finished_req_ids)
         if hasattr(self.model, "on_requests_finished"):
             self.model.on_requests_finished(finished_req_ids)
 
@@ -987,64 +1282,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self._minicpmo45_duplex_forbidden_index_cache = cache
         return cache[1]
 
-    def _minicpmo45_duplex_cut_tables(self, token_ids: dict[str, int], vocab: int, device):
-        """Per-token decoded length and "never cut" mask for ``_maybe_cut_minicpmo45_native_duplex_text_chunk``.
-
-        Byte-level decoding is additive after a prefix ending on a character boundary:
-        ``len(decode(chunk + [t])) == len(decode(chunk)) + length[t]``. None (no device cut) without batch
-        decode, or with the whitespace clean-up that rewrites across token boundaries.
-        """
-        key = (vocab, str(device))
-        cache = getattr(self, "_minicpmo45_duplex_cut_tables_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[1]
-        tables = None
-        tokenizer = self._minicpmo45_tokenizer()
-        batch_decode = getattr(tokenizer, "batch_decode", None)
-        if callable(batch_decode) and not getattr(tokenizer, "clean_up_tokenization_spaces", False):
-            try:
-                num_tokens = min(vocab, len(tokenizer))
-                texts = batch_decode([[token_id] for token_id in range(num_tokens)], skip_special_tokens=True)
-            except Exception:
-                texts = None
-            if texts is not None and len(texts) == num_tokens:
-                lengths = torch.zeros(vocab, dtype=torch.int32)
-                lengths[:num_tokens] = torch.tensor([len(text) for text in texts], dtype=torch.int32)
-                never_cut = torch.ones(vocab, dtype=torch.bool)
-                never_cut[:num_tokens] = False
-                special = [t for t in self._minicpmo45_native_special_token_ids(token_ids) if 0 <= t < vocab]
-                if special:
-                    never_cut[torch.tensor(special, dtype=torch.long)] = True
-                tables = (lengths.to(device), never_cut.to(device))
-        self._minicpmo45_duplex_cut_tables_cache = (key, tables)
-        return tables
-
-    def _minicpmo45_duplex_cut_bases(
-        self,
-        row_idxs: list[int],
-        recent_tokens_by_row: dict[int, list[int]],
-        token_ids: dict[str, int],
-        max_chars: int,
-    ) -> list[int] | None:
-        """Each row's decoded current-chunk length (-1: never cut), or None when a row needs the host decode.
-
-        A chunk ending in U+FFFD may end inside a character the next token's bytes complete: not additive.
-        """
-        decode = getattr(self._minicpmo45_tokenizer(), "decode", None)
-        if max_chars <= 0 or not callable(decode):
-            return [-1] * len(row_idxs)
-        bases = []
-        for row_idx in row_idxs:
-            chunk = self._minicpmo45_current_chunk_tokens(recent_tokens_by_row[row_idx], token_ids)
-            try:
-                text = decode(chunk, skip_special_tokens=True)
-            except Exception:
-                return None
-            if not isinstance(text, str) or text.endswith("\ufffd"):
-                return None
-            bases.append(len(text))
-        return bases
-
     @staticmethod
     def _minicpmo45_duplex_recent_tokens(
         sampling_metadata: SamplingMetadata, row_idxs: list[int]
@@ -1054,14 +1291,50 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         rows = {row_idx: output_token_ids[row_idx] if row_idx < len(output_token_ids) else () for row_idx in row_idxs}
         return {row: [int(t) for t in tokens if isinstance(t, int) and t >= 0] for row, tokens in rows.items()}
 
-    def _minicpmo45_duplex_capped_rows(self, row_idxs: list[int], recent: dict[int, list[int]]) -> set[int]:
-        """Rows at their per-chunk speak-length cap: chunk_eos without sampling anything."""
+    def _minicpmo45_duplex_capped_rows(
+        self, row_idxs: list[int], recent: dict[int, list[int]], token_ids: dict[str, int]
+    ) -> set[int]:
+        """End an exhausted chunk before sampling, without discarding a sampled token.
+
+        The character budget is a soft chunk target: a whole token may cross
+        it. Only a complete accepted prefix ends the next step; a trailing
+        replacement character may still need another token's UTF-8 bytes.
+        Token/request caps remain hard; explicit force-listen bypasses only
+        the soft character target. Exhausted budgets precede any special draw.
+        """
         limit = self._minicpmo45_policy_limit(
             "max_new_speak_tokens_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
         )
         request_max = {row_idx: self._minicpmo45_duplex_row_request_max_tokens(row_idx) for row_idx in row_idxs}
         row_limit = {row: limit if request is None else min(limit, request) for row, request in request_max.items()}
-        return {row for row, row_cap in row_limit.items() if len(recent[row]) >= max(1, row_cap - 1)}
+        capped = {row for row, row_cap in row_limit.items() if len(recent[row]) >= max(1, row_cap - 1)}
+        max_chars = self._minicpmo45_policy_limit(
+            "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
+        )
+        decode = getattr(self._minicpmo45_tokenizer(), "decode", None)
+        if max_chars <= 0 or not callable(decode):
+            return capped
+        for row in row_idxs:
+            payload = self._minicpmo45_duplex_payload_for_row(row)
+            if row in capped or isinstance(payload, dict) and payload.get("force_listen") is True:
+                continue
+            chunk = self._minicpmo45_current_chunk_tokens(recent[row], token_ids)
+            try:
+                try:
+                    text = decode(chunk, skip_special_tokens=True)
+                except TypeError:
+                    text = decode(chunk)
+            except Exception:
+                logger.debug(
+                    "MiniCPM-o soft character-cap decode failed for row %s; retaining hard token/request caps.",
+                    row,
+                    exc_info=True,
+                )
+                continue
+            # Invalid UTF-8 may also leave U+FFFD; hard token/request caps bound this fallback.
+            if isinstance(text, str) and not text.endswith("\ufffd") and len(text) >= max_chars:
+                capped.add(row)
+        return capped
 
     def _minicpmo45_duplex_boundary_hits(
         self, logits: torch.Tensor, rows: list[int], chunk_eos_id: int, sampling_metadata: SamplingMetadata
@@ -1070,7 +1343,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         The drawn token only matters when it is chunk_eos, so a Bernoulli at
         ``P(sample == chunk_eos)`` drawn with the row's generator is the same
-        decision, without a full-vocabulary softmax and multinomial per row.
+        decision, using a batched softmax without a multinomial per row.
         """
         rows_logits = logits[index_to_device(rows, logits.device)]
         if getattr(sampling_metadata, "all_greedy", False):
@@ -1166,7 +1439,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
         resolved: dict[int, int] = {}
         if 0 <= chunk_eos_id < logits.shape[-1]:
-            resolved = dict.fromkeys(self._minicpmo45_duplex_capped_rows(row_idxs, recent), chunk_eos_id)
+            resolved = dict.fromkeys(self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids), chunk_eos_id)
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
                 hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
@@ -1178,7 +1451,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
             for row_idx, sampled in zip(stage2_rows, draws.tolist(), strict=True):
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
-                sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(sampled, recent[row_idx], token_ids)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
         return [int(resolved[row_idx]) for row_idx in row_idxs]
 
@@ -1204,25 +1476,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         all_greedy = bool(getattr(sampling_metadata, "all_greedy", False))
         generators = getattr(sampling_metadata, "generators", {}) or {}
         recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
-        capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent) if has_chunk_eos else set()
+        capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids) if has_chunk_eos else set()
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in capped]
         drawn_rows = [row_idx for row_idx in stage2_rows if not (all_greedy or float(row_params[row_idx][0]) <= 0)]
         if any(generators.get(row_idx) is None for row_idx in drawn_rows):
             return None
-        cut = None
-        if has_chunk_eos and stage2_rows:
-            max_chars = self._minicpmo45_policy_limit(
-                "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
-            )
-            bases = self._minicpmo45_duplex_cut_bases(stage2_rows, recent, token_ids, max_chars)
-            if bases is None:
-                return None
-            if any(base >= 0 for base in bases):
-                tables = self._minicpmo45_duplex_cut_tables(token_ids, vocab, device)
-                if tables is None:
-                    return None
-                cut = (tables, bases, max_chars)
-
         final = torch.full((len(row_idxs),), max(chunk_eos_id, 0), dtype=torch.long, device=device)
         position = {row_idx: pos for pos, row_idx in enumerate(row_idxs)}
         rewinds: dict[int, Callable[[], None]] = {}
@@ -1238,11 +1496,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into
             )
             token = raw
-            if cut is not None:
-                (lengths, never_cut), bases, max_chars = cut
-                base_t = index_to_device(bases, device)
-                cut_t = (base_t >= 0) & ~never_cut[raw] & (base_t + lengths[raw].long() >= max_chars)
-                token = torch.where(cut_t, torch.full_like(raw, chunk_eos_id), raw)
             listen_id = token_ids.get("listen_token_id", -1)
             if 0 <= listen_id:
                 # The host rewrite of a sampled listen (to tts_bos inside an open turn), decided per row.
@@ -1313,42 +1566,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 self._record_minicpmo45_duplex_terminator(row_idx, int(values[pos][0]), pending.token_ids)
         finally:
             self._minicpmo45_duplex_row_sessions, self._minicpmo45_duplex_row_payloads = saved
-
-    def _maybe_cut_minicpmo45_native_duplex_text_chunk(
-        self,
-        sampled: int,
-        recent_tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> int:
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        if chunk_eos_id < 0:
-            return int(sampled)
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        if sampled in special_ids:
-            return int(sampled)
-        max_chars = int(
-            getattr(
-                self,
-                "max_speak_chars_per_chunk",
-                MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK,
-            )
-            or MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
-        )
-        if max_chars <= 0:
-            return int(sampled)
-        tokenizer = self._minicpmo45_tokenizer()
-        decode = getattr(tokenizer, "decode", None)
-        if not callable(decode):
-            return int(sampled)
-        candidate_tokens = self._minicpmo45_current_chunk_tokens(recent_tokens, token_ids)
-        candidate_tokens.append(int(sampled))
-        try:
-            text = decode(candidate_tokens, skip_special_tokens=True)
-        except TypeError:
-            text = decode(candidate_tokens)
-        except Exception:
-            return int(sampled)
-        return int(chunk_eos_id) if isinstance(text, str) and len(text) >= max_chars else int(sampled)
 
     @staticmethod
     def _minicpmo45_current_chunk_tokens(
@@ -1685,8 +1902,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @staticmethod
     def _duplex_boundary_chunk_eos_probs(logits: torch.Tensor, chunk_eos_id: int) -> torch.Tensor:
-        """Per-row ``softmax(logits)[:, chunk_eos_id]`` as ``exp(l_eos - logsumexp(l))``."""
-        return torch.exp(logits[:, chunk_eos_id] - torch.logsumexp(logits, dim=-1))
+        """Match StreamDecoder's softmax probability for the chunk boundary."""
+        # Do not materialize logsumexp in the model dtype before subtracting:
+        # BF16 rounding of that intermediate changes the boundary probability
+        # even when every logit is shifted by the same constant.
+        return torch.softmax(logits, dim=-1)[:, chunk_eos_id]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""

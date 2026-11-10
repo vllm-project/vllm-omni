@@ -2,6 +2,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
   constructor() {
     super();
     this.queue = [];
+    this.pendingMessages = [];
     this.offset = 0;
     this.playedFrames = 0;
     this.underrunFrames = 0;
@@ -18,6 +19,13 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
   }
 
   handleMessage(message) {
+    // Keep each response's samples and drain marker together. The next
+    // response can finish generating before this one finishes playing.
+    if (message.type !== 'clear' && this.activeResponseId
+        && message.responseId && message.responseId !== this.activeResponseId) {
+      this.pendingMessages.push(message);
+      return;
+    }
     if (message.type === 'audio' && message.pcm) {
       const wasEmpty = this.queue.length === 0;
       if (!this.started && !this.activeResponseId) {
@@ -47,6 +55,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
         });
       }
       this.queue = [];
+      this.pendingMessages = [];
       this.offset = 0;
       this.playedFrames = 0;
       this.underrunFrames = 0;
@@ -92,6 +101,9 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.bufferWaitFrames = this.initialBufferFrames;
     this.rebuffering = false;
     this.fadeInFrames = 0;
+    const pending = this.pendingMessages;
+    this.pendingMessages = [];
+    for (const message of pending) this.handleMessage(message);
   }
 
   reportUnderrun() {

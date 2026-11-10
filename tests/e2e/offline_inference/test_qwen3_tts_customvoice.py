@@ -30,6 +30,8 @@ def get_cuda_graph_config():
     return modify_stage_config(
         get_deploy_config_path("qwen3_tts.yaml"),
         updates={
+            # Exercise the legacy runner explicitly; the bundled default is V2.
+            "model_runner": "v1",
             "async_chunk": False,
             "stages": {
                 0: {

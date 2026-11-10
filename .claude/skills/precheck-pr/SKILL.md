@@ -1,11 +1,61 @@
 ---
 name: precheck-pr
-description: Self-check your branch before creating a PR — catch dead code, prevent new model-specific Python examples, verify accuracy/perf claims, validate PR title format, and confirm merge readiness. Use when the user says "precheck", "self review", "pre-submit check", or "check my PR before I open it." Never posts to GitHub.
+description: Self-check your branch before creating a PR — catch dead code, prevent new model-specific Python examples, verify accuracy/perf claims, validate PR title format, and confirm merge readiness. Use before implementing a contribution and when the user says "precheck", "self review", "pre-submit check", or "check my PR before I open it." Never posts to GitHub.
 ---
 
 # PR Pre-Check
 
 Self-review your branch before creating a PR against `vllm-project/vllm-omni`. Two modes: **quick** catches showstoppers, **full** does a thorough maintainer-grade review. Never posts to GitHub; the report is for the contributor's terminal only.
+
+## Contributor intent gate
+
+Before self-checking, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current change; apply only relevant checks.
+
+Run this gate before implementing a contribution and again before submission
+if its intent or scope has changed. It applies to contributor self-review,
+not independent review of somebody else's PR or automated review selection.
+
+The human contributor must explicitly answer these four questions:
+
+1. What outcome do you want to achieve?
+2. What is the highest-leverage variable for that outcome?
+3. How will this work move that variable?
+4. Whose customer or user needs does this address, and what are those needs?
+
+Reuse explicit human answers already supplied for this task or in its issue;
+do not ask the contributor to repeat them. An agent must not invent answers,
+infer approval from a diff, or fill gaps with its own rationale. Ask the human
+for any missing or materially ambiguous answers and wait before implementing
+or submitting the contribution. Read-only investigation may continue to make
+the questions concrete.
+
+Before submission, verify that the PR description answers all four required
+questions in the [PR template](../../../.github/PULL_REQUEST_TEMPLATE.md),
+or provides public-safe references to the human's explicit answers. Blank
+sections, unchanged placeholders, and agent-written guesses do not satisfy
+the gate. Missing or ambiguous answers block submission and readiness for
+review; ask the human and wait. This is a contributor workflow requirement,
+not a claim that GitHub or CI mechanically enforces the template.
+
+Once the answers are clear, ask whether achieving the outcome actually needs
+a PR. Prefer an existing capability, configuration change, documentation or
+support answer, or no change when that meets the need. Documentation changes
+may themselves need a PR. If no PR is needed, stop the submission workflow and
+explain the smaller next step. If a PR is needed, connect its narrow scope and
+validation plan to the human's stated outcome and variable.
+
+For a bug fix, establish an actual failure: record expected versus observed
+behavior, the affected revision and environment, and supporting evidence such
+as a minimal reproducer, failing regression test, or observed failure trace.
+Do not treat a plausible diagnosis or an unexecuted reproducer as verified
+failure evidence. If the failure is not established, report the evidence gap
+and continue investigation rather than claiming a confirmed fix.
+
+Keep the answers and their source in the self-review report. Do not copy
+private task conversations into a public issue or PR; share an intent summary
+only within the audience and information-sharing scope the human authorized.
 
 ## Mode Selection
 
@@ -62,6 +112,15 @@ If multiple rows apply (e.g., a diffusion model is also a new model), union the 
 ### Step 4: Run Checklist
 
 Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type from [references/checklists.md](references/checklists.md). Each item produces ✓, ✗, or ⚠.
+
+**Also resolve affected design contracts** using the canonical review
+[design-contract resolver](../review-pr/references/process/design-contracts.md).
+Use the candidate head's existing module and feature pages; update an affected
+active contract in the same PR. Check user guides and examples when public
+configuration, defaults, or supported behavior changes. Treat draft invariants
+as review questions, not automatic blockers. In the PR description, summarize
+before/after behavior, the affected documentation (or why it is unchanged),
+and the supporting regression evidence. Report checks not run explicitly.
 
 **Also run the Code-Quality sweep on every PR**, regardless of type or mode: the five diff-scoped checks in [references/code-quality.md](references/code-quality.md) — kwargs fragility, broad-except swallow, `Any`/wrong type hints, hot-path `.clone()`/`deepcopy`, and event-loop blocking — plus the advisory conventions (log level, structured logging, synchronization, cleanup, dependencies, naming) in [checklists.md](references/checklists.md). These count only lines the PR *adds* — the pre-existing backlog across the repo is out of scope.
 

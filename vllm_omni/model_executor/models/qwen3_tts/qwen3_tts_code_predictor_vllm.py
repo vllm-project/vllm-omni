@@ -55,8 +55,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             talker_hidden_size=int(talker_config.hidden_size),
             prefix=prefix,
         )
-        # TTS owns its frame-local cache and overrides _predict_step_logits.
-        # Do not also activate the shared wrapper's Omni incremental loop.
+        # CUDA's frame-local cache keeps the shared loop disabled.
+        # Eager platforms may enable shared KV reuse in _setup_compile.
         self._kv_cache_enabled = False
         # Store talker_config for backward compat (accessed by some callers)
         self.talker_config = talker_config
@@ -70,6 +70,13 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
 
     def _setup_compile(self) -> None:
         if self._compiled_model_fwd is not None:
+            return
+        if not current_omni_platform.is_cuda():
+            super()._setup_compile()
+            if self._kv_requested and not self._kv_cache_enabled:
+                logger.warning_once(
+                    "Qwen3-TTS: code_predictor_kv_cache=True is unsupported on this execution path; using re-prefill"
+                )
             return
         weight = next(self.model.parameters())
         supported = (
@@ -108,7 +115,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             self._fused = FusedCodePredictor(self, max_batch)
             # Compile every kernel variant outside any graph capture.
             hidden = int(self.talker_config.hidden_size)
-            for batch in range(1, min(2, max_batch) + 1):
+            for batch in self._fused.warmup_batches():
                 zeros = torch.zeros(batch, 1, hidden, device=weight.device, dtype=weight.dtype)
                 uniforms = torch.full(
                     (batch, self._num_groups - 1, int(self.config.vocab_size)), 0.5, device=weight.device

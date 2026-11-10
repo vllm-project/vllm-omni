@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Multimodal output data structures for vLLM-Omni.
 
 This module defines structured types for multimodal outputs.
@@ -25,11 +26,11 @@ from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
 logger = init_logger(__name__)
 
-# Keys whose values are metadata scalars (e.g. audio sample rate) but may
-# arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
-# so we relocate them to .metadata before consolidation to avoid a bogus
-# torch.cat attempt and its warn-and-keep-last fallback.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+# Keys whose values are metadata scalars (e.g. audio sample rate or the
+# latest completion flag) may arrive as 0-d torch.Tensors. from_dict routes
+# all tensors into .tensors, so relocate these keys to .metadata before
+# consolidation to preserve the latest value without attempting torch.cat.
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate", "meta.finished"})
 
 
 def _cat_tensors(
@@ -155,7 +156,7 @@ class MultimodalPayload(Mapping):
         """Merge *incoming* onto this payload and return the result.
 
         Content tensors accumulate into lists for deferred concatenation;
-        known sample-rate keys are snapshots replaced immediately, including
+        known scalar metadata keys are snapshots replaced immediately, including
         in DELTA streams that do not consolidate each emission. Missing keys
         retain their previous value. Other values keep the existing merge
         behavior. When this payload

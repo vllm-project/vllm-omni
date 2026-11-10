@@ -234,7 +234,9 @@ def resolve_omni_config(
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
+    default_config = StageConfigFactory.create_typed_default_diffusion(
+        model, normalized_overrides, deploy_config_path=deploy_config_path
+    )
 
     return OmniConfigResolution(
         config_path=deploy_config_path,

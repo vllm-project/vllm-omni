@@ -1,6 +1,13 @@
 # Qwen3-Omni-MoE production deploy, verified on 2x H100 (stage 0 on cuda:0,
 # stages 1+2 on cuda:1).
 #
+# Runner selection:
+#   Model Runner V2 is the default on CUDA and NPU. Set `model_runner: v1`
+#   in an overlay to opt out. XPU, ROCm and MUSA keep V1. The Thinker prefix
+#   cache is on for CUDA on both runners (stage 0). NPU, the other platforms
+#   and qwen3_omni_moe_mrv2.yaml keep it off.
+#   Duplex keeps V1 in qwen3_omni_duplex.yaml.
+#
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this
 # model:
@@ -12,6 +19,7 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -29,7 +37,7 @@ stages:
     gpu_memory_utilization: 0.9
     moe_backend: triton
     trust_remote_code: true
-    enable_prefix_caching: false
+    enable_prefix_caching: true
     devices: "0"
     default_sampling_params:
       temperature: 0.0
@@ -92,7 +100,10 @@ platforms:
   # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
   # profile before vLLM performs its normal quantization auto-detection.
   musa:
+    model_runner: v1
     stages:
+      - stage_id: 0
+        enable_prefix_caching: false
       - stage_id: 1
         hf_overrides:
           quantization_config: null
@@ -103,6 +114,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.6
         tensor_parallel_size: 2
         max_num_batched_tokens: 8192
@@ -126,13 +138,18 @@ platforms:
   # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
   # graph-capture failures.
   rocm:
+    model_runner: v1
     stages:
+      - stage_id: 0
+        enable_prefix_caching: false
       - stage_id: 2
         enforce_eager: true
 
   xpu:
+    model_runner: v1
     stages:
       - stage_id: 0
+        enable_prefix_caching: false
         tensor_parallel_size: 4
         enforce_eager: true
         max_cudagraph_capture_size: 0

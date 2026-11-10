@@ -11,18 +11,28 @@ from torch import nn
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
 
+from vllm_omni.platforms import current_omni_platform
+
 from .audio_tokenizer_v2 import MossAudioTokenizerMultiheadAttention
+
+_CUDA_RN_OPS = current_omni_platform.is_cuda()
 
 
 @triton.jit
-def _rotate(value, partner, dim, position, scale: tl.constexpr):
+def _rotate(value, partner, dim, position, scale: tl.constexpr, cuda_rn_ops: tl.constexpr = _CUDA_RN_OPS):
     angle = libdevice.exp((dim // 2).to(tl.float32) * scale) * position.to(tl.float32)
     cosine = libdevice.cos(angle)
     sine = libdevice.sin(angle)
+    value_fp32 = value.to(tl.float32)
     signed_partner = tl.where(dim % 2 == 0, -partner.to(tl.float32), partner.to(tl.float32))
-    return libdevice.add_rn(libdevice.mul_rn(value.to(tl.float32), cosine), libdevice.mul_rn(signed_partner, sine)).to(
-        value.dtype
-    )
+    if cuda_rn_ops:
+        rotated = libdevice.add_rn(
+            libdevice.mul_rn(value_fp32, cosine),
+            libdevice.mul_rn(signed_partner, sine),
+        )
+    else:
+        rotated = value_fp32 * cosine + signed_partner * sine
+    return rotated.to(value.dtype)
 
 
 @triton.jit
@@ -102,8 +112,9 @@ class EmptyHistoryAttention(nn.Module):
         self.dim = original.embed_dim
         self.heads = original.num_heads
         self.max_period = original.rope.max_period
+        self._cached_attn_bias = None
 
-    def forward(self, query, key, value, execution_context=None):
+    def forward(self, query, key, value, execution_context=None, attn_bias=None):
         if query.shape[1] == 1:
             # The sole causal key has probability one. Its state is discarded.
             attended = F.linear(query, self.in_proj.weight[2 * self.dim :])
@@ -139,33 +150,22 @@ class StatelessFirstGraphs:
         self._decode = decode
         if not batch_sizes:
             return
-        self.compiled = torch.compile(
-            decode,
-            dynamic=False,
-            fullgraph=True,
-            options={"triton.cudagraphs": False, "epilogue_fusion": False, "emulate_precision_casts": True},
-        )
         device = next(codec.parameters()).device
         stream = torch.cuda.Stream(device=device)
         # Buckets replay serially and copy their outputs before the next replay.
         # Share a first-frame-only pool, separate from Talker/MTP allocations.
         pool = torch.cuda.graph_pool_handle()
         stream.wait_stream(torch.cuda.current_stream(device))
-        # Each configured bucket needs a compiled specialization. Scope the
-        # cache bound to capture instead of changing the process-wide default.
-        with (
-            torch._dynamo.config.patch(recompile_limit=max(torch._dynamo.config.recompile_limit, len(batch_sizes))),
-            torch.cuda.stream(stream),
-        ):
+        with torch.cuda.stream(stream):
             for batch in reversed(self.batch_sizes):
                 codes = torch.zeros(num_quantizers, batch, 1, dtype=torch.long, device=device)
                 lengths = torch.ones(batch, dtype=torch.long, device=device)
                 for _ in range(max(1, warmups)):
-                    self.compiled(codes, lengths)
+                    decode(codes, lengths)
                 stream.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream, pool=pool):
-                    pcm = self.compiled(codes, lengths)
+                    pcm = decode(codes, lengths)
                 self.entries[batch] = graph, codes, pcm
         torch.cuda.current_stream(device).wait_stream(stream)
         stream.synchronize()
