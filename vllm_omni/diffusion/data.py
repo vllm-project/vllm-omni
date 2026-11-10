@@ -295,7 +295,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+
+    Uses platform symmetric memory on CUDA and NPU. NPU currently requires
+    eager inference and pure Ulysses over WORLD in one HCCS domain, with
+    TorchNPU's NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    """
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
@@ -764,10 +769,12 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
-    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
+    if _looks_like_flux3(model, cfg):
+        return "Flux3Pipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1388,6 +1395,9 @@ class OmniDiffusionConfig:
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
+        # Parsed before the 'full' check, which needs the normalized value: a schedule without
+        # profiles parses to None.
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1404,6 +1414,10 @@ class OmniDiffusionConfig:
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
                     }[offload_strategy]
                 )
+            if self.diffusion_attention_schedule is not None:
+                # The scheduled_attention op and its eager fallback are tested only under
+                # regional compilation.
+                incompatible_features.append("diffusion_attention_schedule profiles")
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1468,7 +1482,6 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
         validate_kv_cache_dtype_vs_attention_specs(
             self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
         )
@@ -1659,6 +1672,7 @@ class OmniDiffusionConfig:
 
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
+            _looks_like_flux3,
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
@@ -1678,6 +1692,10 @@ class OmniDiffusionConfig:
                 self.model,
                 revision=self.revision,
             )
+            # Mixed Flux3 packages also ship a Diffusers index. Native loading
+            # must resolve variant quantization from the package config below.
+            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+                config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1758,6 +1776,16 @@ class OmniDiffusionConfig:
                         )
                         self.update_multimodal_support()
                         return
+                    # Some native checkpoints (for example the Flux3
+                    # format) intentionally contain only component weights
+                    # and configs. When stage resolution or the caller has
+                    # already selected a registered pipeline, that explicit
+                    # class is sufficient to continue loading without a
+                    # top-level Hugging Face config.
+                    elif self.model_class_name is not None:
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
@@ -1768,12 +1796,26 @@ class OmniDiffusionConfig:
 
                 assert self.model is not None
                 is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
 
                 if is_hidream_o1:
                     self.model_class_name = "HiDreamO1ImagePipeline"
                     self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif is_flux3:
+                    from vllm_omni.diffusion.utils.flux3_package import _resolve_flux3_package_selection
+
+                    self.model_class_name = "Flux3Pipeline"
+                    # Resolve variant metadata before the loader snapshots quantization.
+                    selection = _resolve_flux3_package_selection(self.model, self.additional_config)
+                    if selection.quantization is not None:
+                        raise ValueError(
+                            f"Flux3 quantized variant {selection.quantization!r} is not supported by the "
+                            "BF16 base pipeline"
+                        )
+                    self.set_tf_model_config(TransformerConfig.from_dict(selection.package_config))
                     self.update_multimodal_support()
                 elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
@@ -2483,7 +2525,7 @@ def parse_attention_schedule_config(
     """Normalize service config without initializing backends or reading env vars.
 
     A config without profiles can never select a candidate (its default must then be empty), so it
-    is returned as None: no schedule, and no attention layer prepares candidates.
+    is returned as None: no schedule, and no compile boundary on the attention layers.
     """
     if value is None:
         return None

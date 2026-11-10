@@ -14,7 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
@@ -2500,3 +2500,74 @@ def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_n
     else:
         with pytest.raises(ValueError, match="unknown profile"):
             scheduler.add_request(request)
+
+
+# (stage_role, model_stage) of the Wan2.2 topology stages, plus deploy configs that set only the
+# legacy model_stage. All of them use the WanPipeline class.
+_WAN_STAGES_WITHOUT_DENOISING = [
+    pytest.param("encode", "text_encode", id="eg-egd-encode"),
+    pytest.param("decode", "decode", id="egd-decode"),
+    pytest.param(None, "text_encode", id="legacy-text-encode"),
+    pytest.param(None, "vae_decode", id="legacy-vae-decode"),
+]
+_WAN_DENOISING_STAGES = [
+    pytest.param("denoise", "denoise", id="egd-denoise"),
+    pytest.param("denoise_decode", "dit", id="eg-denoise-decode"),
+    pytest.param("full", "diffusion", id="single-stage"),
+    pytest.param(None, None, id="unset"),
+]
+
+
+def _wan_stage_scheduler(stage_role, model_stage, service) -> RequestScheduler:
+    scheduler = RequestScheduler()
+    scheduler.initialize(
+        OmniDiffusionConfig(
+            model_class_name="WanPipeline",
+            stage_role=stage_role,
+            model_stage=model_stage,
+            diffusion_attention_schedule=service,
+        )
+    )
+    return scheduler
+
+
+@pytest.mark.parametrize(("stage_role", "model_stage"), _WAN_STAGES_WITHOUT_DENOISING)
+def test_wan_stage_without_denoising_drops_the_request_schedule_copied_to_it(stage_role, model_stage) -> None:
+    """Video and chat endpoints copy the request's diffusion params to every Wan2.2 EG/EGD stage.
+
+    The request names a profile that only the denoising stage configures. The schedule is written into
+    extra_args after construction, which the inline stage client delivers unabsorbed.
+    """
+    scheduler = _wan_stage_scheduler(stage_role, model_stage, service=None)
+    sampling_params = OmniDiffusionSamplingParams(num_inference_steps=1)
+    sampling_params.extra_args["attention_schedule"] = [{"start": 0, "end": None, "profile": "sparse"}]
+    request = OmniDiffusionRequest(prompt="prompt", sampling_params=sampling_params, request_id="req")
+
+    scheduler.add_request(request)
+
+    assert request.sampling_params.attention_schedule is None
+    assert "attention_schedule" not in request.sampling_params.extra_args
+
+
+@pytest.mark.parametrize(("stage_role", "model_stage"), _WAN_DENOISING_STAGES)
+def test_denoising_wan_stage_keeps_and_validates_the_request_schedule(stage_role, model_stage) -> None:
+    scheduler = _wan_stage_scheduler(stage_role, model_stage, service=_attention_schedule_service())
+    known = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1, attention_schedule=[{"start": 0, "end": None, "profile": "sparse"}]
+        ),
+        request_id="known",
+    )
+    unknown = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1, attention_schedule=[{"start": 0, "end": None, "profile": "missing"}]
+        ),
+        request_id="unknown",
+    )
+
+    scheduler.add_request(known)
+    assert known.sampling_params.attention_schedule == (AttentionScheduleRange(start=0, end=None, profile="sparse"),)
+    with pytest.raises(InvalidAttentionScheduleError, match="unknown profile"):
+        scheduler.add_request(unknown)
