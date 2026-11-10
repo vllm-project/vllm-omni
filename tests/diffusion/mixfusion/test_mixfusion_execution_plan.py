@@ -18,10 +18,9 @@ from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     build_execution_plan,
     expand_per_chunk,
-    gcd_chunk_size,
-    plan_chunk_size,
     reassemble_chunk_rows,
 )
+from vllm_omni.diffusion.mixfusion.scheduling import plan_chunk_size
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -53,11 +52,6 @@ def _plan_kwargs(**overrides) -> dict:
 # ── gcd_chunk_size / plan_chunk_size ──
 
 
-def test_gcd_chunk_size_is_the_largest_common_divisor():
-    assert gcd_chunk_size([torch.zeros(1, 8, 4), torch.zeros(2, 12, 4)]) == 4
-    assert gcd_chunk_size([torch.zeros(1, 8, 4)]) == 8
-
-
 @pytest.mark.parametrize(
     ("latents", "min_chunk_tokens", "max_chunks", "expected"),
     [
@@ -69,8 +63,8 @@ def test_gcd_chunk_size_is_the_largest_common_divisor():
     ],
 )
 def test_plan_chunk_size(latents, min_chunk_tokens, max_chunks, expected):
-    tensors = [torch.zeros(images, seq_len, 4) for images, seq_len in latents]
-    assert plan_chunk_size(tensors, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks) == expected
+    shapes = [(images, seq_len, 4) for images, seq_len in latents]
+    assert plan_chunk_size(shapes, min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks) == expected
 
 
 # ── build_execution_plan: happy path ──

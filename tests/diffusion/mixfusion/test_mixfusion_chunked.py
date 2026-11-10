@@ -6,7 +6,7 @@ The fake DiT here deliberately uses non-Qwen argument and output names, so the
 declarative path is shown to depend only on the plan:
 
 - the chunked adapter builds the plan from the root declaration, reuses it
-  while the layout is unchanged and asks ``mixfusion_can_pack`` for limits;
+  while the layout is unchanged and validates runtime inputs through ``mixfusion_validate_inputs``;
 - the chunk-outputs boundary runs the model's own module once per request and
   chunk-stacks / per-request-stacks its outputs, matching individual calls;
 - a packed forward reassembles one output per request equal to running each
@@ -77,7 +77,7 @@ class _FakeDiT(nn.Module):
         super().__init__()
         self.embed = _Embed()
         self.blocks = nn.ModuleList([_Block(), _Block()])
-        self.text_tables = []
+        self.text_tables: list[torch.Tensor] = []
 
     def forward(self, x, ctx, ctx_mask=None, grids=None, cond=None):
         x, pos, text_table = self.embed(x, grids, ctx.shape[1])
@@ -86,8 +86,9 @@ class _FakeDiT(nn.Module):
             x = block(x, cond, pos)
         return SimpleNamespace(pred=x)
 
-    def mixfusion_can_pack(self, input_batch):
-        return (False, "no grids") if input_batch.grids is None else (True, "")
+    def mixfusion_validate_inputs(self, input_batch):
+        if input_batch.grids is None:
+            raise ValueError("no grids")
 
 
 def _requests():
@@ -102,7 +103,7 @@ def _requests():
 
 
 def _packed(model, grids, latents, ctx, mask, cond):
-    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=2))):
         out = model(x=latents, ctx=ctx, ctx_mask=mask, grids=grids, cond=cond)
         return out, get_forward_context().mixfusion_step.plan
 
@@ -116,12 +117,11 @@ def test_resolve_prefers_an_explicit_adapter():
     assert resolve_mixfusion_adapter(nn.Module(), {"blocks.*.mod": MixFusionExpandRows()}) is None
 
 
-def test_can_pack_delegates_to_the_model_limits():
+def test_validation_delegates_to_model():
     adapter = ChunkedJointAdapter(_FakeDiT._mixfusion_plan[""])
-    assert adapter.can_pack(_FakeDiT(), SimpleNamespace(grids=[(1, 1)])) == (True, "")
-    assert adapter.can_pack(_FakeDiT(), SimpleNamespace(grids=None)) == (False, "no grids")
-    # A model without limits packs whatever the driver admitted.
-    assert adapter.can_pack(nn.Module(), SimpleNamespace()) == (True, "")
+    adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=[(1, 1)]))
+    with pytest.raises(ValueError, match="no grids"):
+        adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=None))
 
 
 def test_packed_forward_matches_each_request_alone():

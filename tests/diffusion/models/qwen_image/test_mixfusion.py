@@ -6,12 +6,10 @@ The generic driver, hooks, chunked adapter and layout primitives are covered
 under ``tests/diffusion/mixfusion`` and ``tests/diffusion/hooks``. This module
 pins what is Qwen-specific:
 
-* ``mixfusion_can_pack`` and that the real ``_mixfusion_plan`` exposes the
+* ``mixfusion_validate_inputs`` and that the real ``_mixfusion_plan`` exposes the
   block boundaries to the foreign-hook guard;
 * the pipeline's dense keyword builder feeding a packed list through an armed
   step, with and without sequential true-CFG;
-* the serial-ragged fallback keeping each request's spatial RoPE when
-  equal-area images differ in aspect ratio;
 * the real ``ImageRopePrepare`` boundary under the plan: per-request RoPE
   identical to individual execution, chunk-stacked;
 * the packed cross-attention: the model checks for an armed MixFusion step,
@@ -27,7 +25,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.forward_context import (
     ForwardContext,
@@ -45,6 +42,7 @@ from vllm_omni.diffusion.mixfusion.packed_attention import (
     run_mixfusion_packed_attention,
 )
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     ImageRopePrepare,
@@ -52,8 +50,6 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
 )
-from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -93,24 +89,18 @@ def _transformer(blocks: list[nn.Module] | None = None) -> tuple[QwenImageTransf
 # ---------------------------------------------------------------------------
 
 
-def test_can_pack_rejects_zero_cond_t_reference_images_and_missing_shapes():
+def test_validate_inputs_rejects_reference_images_and_missing_shapes():
     transformer, _ = _transformer()
     adapter = ChunkedJointAdapter(MixFusionRoot())
-
-    def batch(**overrides):
-        return SimpleNamespace(**{"img_shapes": [(16, 2, 2)], "txt_seq_lens": [4], "image_latents": None, **overrides})
-
-    assert adapter.can_pack(transformer, batch()) == (True, "")
-    assert adapter.can_pack(transformer, batch(img_shapes=None)) == (
-        False,
-        "img_shapes and txt_seq_lens are required",
-    )
-    assert adapter.can_pack(transformer, batch(image_latents=torch.zeros(1, 4, 8))) == (
-        False,
-        "image_latents (reference images) are not supported",
-    )
-    object.__setattr__(transformer, "zero_cond_t", True)
-    assert adapter.can_pack(transformer, batch()) == (False, "zero_cond_t/editing path is not supported")
+    batch = SimpleNamespace(img_shapes=[(16, 2, 2)], txt_seq_lens=[4], image_latents=None)
+    adapter.validate_inputs(transformer, batch)
+    batch.img_shapes = None
+    with pytest.raises(ValueError, match="missing img_shapes"):
+        adapter.validate_inputs(transformer, batch)
+    batch.img_shapes = [(16, 2, 2)]
+    batch.image_latents = torch.zeros(1, 4, 8)
+    with pytest.raises(ValueError, match="editing/reference"):
+        adapter.validate_inputs(transformer, batch)
 
 
 def _offloaded_block() -> nn.Module:
@@ -187,8 +177,8 @@ def _packed_input_batch(*, do_true_cfg: bool = False):
     return SimpleNamespace(
         latents=[torch.zeros(1, 8, 16), torch.zeros(1, 8, 16)],
         image_latents=None,
-        # Lowering the minimum keeps this tiny fixture packable.
-        request_extras=[{"mixfusion_min_chunk_tokens": 1}],
+        request_ids=["a", "b"],
+        mixfusion_batch=MixFusionBatchSpec(8, {"a": (1, 8, 16), "b": (1, 8, 16)}),
         timesteps=torch.tensor([500.0, 500.0]),
         guidance=None,
         prompt_embeds=torch.zeros(2, 4, 8),
@@ -210,6 +200,7 @@ def test_driver_runs_the_pipeline_denoise_step_packed(do_true_cfg):
     transformer = _StubTransformer()
     pipeline = _StubPipeline(transformer)
     driver = MixFusionDriver(pipeline, transformer, ChunkedJointAdapter(MixFusionRoot()))
+    pipeline.mixfusion_driver = driver
     batch = _packed_input_batch(do_true_cfg=do_true_cfg)
 
     with override_forward_context(ForwardContext()):
@@ -233,54 +224,6 @@ def test_driver_runs_the_pipeline_denoise_step_packed(do_true_cfg):
     expected = 2.0 + batch.true_cfg_scale * (1.0 - 2.0) if do_true_cfg else 1.0
     for out, latent in zip(result, batch.latents):
         assert torch.equal(out, torch.full_like(latent, expected))
-
-
-# ---------------------------------------------------------------------------
-# Serial-ragged fallback keeps each request's spatial RoPE.
-# ---------------------------------------------------------------------------
-
-
-def test_serial_fallback_keeps_each_requests_rope_for_equal_area_aspect_ratios():
-    """A rejected batch's dense groups must not share one image geometry.
-
-    2x4 and 4x2 token grids have the same sequence length, but the real
-    ``ImageRopePrepare`` / ``QwenEmbedRope`` builds one table from
-    ``img_shapes[0]`` per dense call, so grouping them would hand the second
-    request the first request's spatial RoPE.
-    """
-    prepare = ImageRopePrepare(nn.Identity(), QwenEmbedRope(theta=10000, axes_dim=[4, 6, 6], scale_rope=True))
-    grids = [(1, 2, 4), (1, 4, 2), (1, 3, 4)]
-    states = [
-        StepRequestState(
-            request_id=f"req-{idx}",
-            sampling=SimpleNamespace(true_cfg_scale=None, cfg_normalize=False),
-            latents=torch.zeros(1, frame * height * width, 4),
-            timesteps=torch.tensor([500.0]),
-            img_shapes=[[(frame, height, width)]],
-            txt_seq_lens=[3],
-            extra={"use_ragged_latents": True},
-        )
-        for idx, (frame, height, width) in enumerate(grids)
-    ]
-
-    def dense_step(batch, **kwargs):
-        # Same call the transformer makes: one RoPE table per dense batch.
-        _, vid_freqs, _ = prepare(batch.latents, batch.img_shapes, batch.txt_seq_lens)
-        return [vid_freqs for _ in range(batch.num_reqs)]
-
-    # A chunk policy no batch can meet forces the serial fallback.
-    batch = InputBatch.make_batch(states)
-    for extra in batch.request_extras:
-        extra["mixfusion_min_chunk_tokens"] = 1024
-    driver = MixFusionDriver(
-        _StubPipeline(_StubTransformer()), _StubTransformer(), ChunkedJointAdapter(MixFusionRoot())
-    )
-    with override_forward_context(ForwardContext()):
-        outputs = driver.run(batch, states, dense_step)
-
-    for output, state in zip(outputs, states):
-        expected, _ = prepare.pos_embed(state.img_shapes[0], state.txt_seq_lens, device=torch.device("cpu"))
-        assert torch.equal(output, expected), state.request_id
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +270,7 @@ def test_rope_boundary_matches_individual_execution_per_request():
         img_shapes=[[grid] for grid in grids],
         txt_seq_lens=[5, 5, 5],
     )
-    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=8))):
         out = model(hidden_states=latents, **kwargs)
         plan = get_forward_context().mixfusion_step.plan
 
@@ -362,7 +305,7 @@ def test_root_reuses_the_plan_while_the_layout_is_unchanged():
                 "txt_seq_lens": [4],
             }
         )
-        with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep())):
+        with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(chunk_size=8))):
             model(hidden_states=latents, **shapes)
             plans.append(get_forward_context().mixfusion_step.plan)
     assert plans[1] is plans[0]
@@ -545,7 +488,8 @@ def test_packed_attention_packs_mixed_requests_into_one_packed_call():
 def test_mask_capable_dense_backend_matches_the_varlen_result():
     # Three requests share one image shape but differ in text length: a
     # mask-capable dense backend fuses them into one masked forward.
-    shapes = {"txt_lens": [3, 5, 2], "chunks_per_request": [2, 2, 2], "txt_padded": 5}
+    txt_lens = [3, 5, 2]
+    shapes = {"txt_lens": txt_lens, "chunks_per_request": [2, 2, 2], "txt_padded": 5}
     varlen_module = _mixfusion_module(_PackedAttentionStub(varlen=True), _CapturingRope())
     _, _, varlen_img, varlen_txt = _forward(varlen_module, **shapes)
     attn, rope = _PackedAttentionStub(varlen=False), _CapturingRope()
@@ -557,7 +501,7 @@ def test_mask_capable_dense_backend_matches_the_varlen_result():
     assert attn.dense_calls[0]["shape"] == (3, 5 + image_tokens, HEADS, HEAD_DIM)
     # True on each request's real text and its whole image stream.
     mask = attn.dense_calls[0]["mask"]
-    for row, text_len in enumerate(shapes["txt_lens"]):
+    for row, text_len in enumerate(txt_lens):
         expected = torch.zeros(5 + image_tokens, dtype=torch.bool)
         expected[:text_len] = True
         expected[5:] = True

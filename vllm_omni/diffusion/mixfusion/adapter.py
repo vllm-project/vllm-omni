@@ -77,17 +77,12 @@ class PackedInputs:
 class MixFusionAdapter(Protocol):
     """Model-side contract for the MixFusion packed path.
 
-    The driver asks ``can_pack`` once per step at admission; once admitted,
-    the root hook delegates packing and output restoration unconditionally.
+    Scheduler admission precedes packing. Worker validation checks only that
+    the actual inputs satisfy the model contract; it never chooses a fallback.
     """
 
-    def can_pack(self, module: nn.Module, input_batch: Any) -> tuple[bool, str]:
-        """Whether this ragged batch is packable; ``(False, reason)`` stays serial.
-
-        Only layout/model-specific limits belong here; the driver already checks the
-        model-agnostic ones (adapter/hooks present, attention kwargs, SP, CFG
-        parallel, foreign hooks, chunk policy).
-        """
+    def validate_inputs(self, module: nn.Module, input_batch: Any) -> None:
+        """Raise when runtime inputs disagree with the scheduled packed contract."""
         ...
 
     def pack_inputs(self, module: nn.Module, bound: Any, *, cache: PackedInputs | None) -> PackedInputs:

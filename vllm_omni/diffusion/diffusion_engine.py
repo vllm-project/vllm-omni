@@ -85,6 +85,7 @@ from vllm_omni.metrics.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability, MixFusionRequestInfo
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -277,6 +278,8 @@ class DiffusionEngine:
     #: engine class itself, and ``od_config.diffusion_model_runner_cls``
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
+    mixfusion_capability: MixFusionCapability
+    mixfusion_prepare_request: Callable[..., MixFusionRequestInfo | None] | None = None
 
     # Class-level defaults so tests using object.__new__ (without __init__)
     # don't hit AttributeError when _busy_loop accesses them.
@@ -313,6 +316,9 @@ class DiffusionEngine:
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
+            from vllm_omni.diffusion.mixfusion.setup import initialize_mixfusion_admission
+
+            initialize_mixfusion_admission(self)
             profile_requests = self._prepare_diffusion_kv_profile_requests()
             kv_control_plane = initialize_diffusion_kv_control_plane(
                 self.executor,
@@ -1387,6 +1393,9 @@ class DiffusionEngine:
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
+        from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
+
+        prepare_mixfusion_admission(self, request)
         self._validate_diffusion_kv_profile_limits(request)
         # Gate cache-input preparation itself: disabled caching must not inspect
         # tensors / RNG state or copy token IDs just to discard their hashes.

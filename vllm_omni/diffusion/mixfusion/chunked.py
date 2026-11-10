@@ -18,11 +18,11 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, MixFusionAdapter, PackedInputs, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
     build_execution_plan,
-    gcd_chunk_size,
     reassemble_chunk_rows,
 )
 from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
@@ -37,16 +37,16 @@ JOINT_TEXT_IMAGE_LAYOUT = AttentionLayout((StreamSpec("text", "request"), Stream
 class ChunkedJointAdapter:
     """Packs a joint text/image DiT call from its ``MixFusionRoot`` declaration.
 
-    Model-specific admission limits come from an optional
-    ``module.mixfusion_can_pack(input_batch) -> (bool, reason)``.
+    Models may validate runtime inputs with ``mixfusion_validate_inputs``.
     """
 
     def __init__(self, root: MixFusionRoot) -> None:
         self.root = root
 
-    def can_pack(self, module: nn.Module, input_batch: Any) -> tuple[bool, str]:
-        check = getattr(module, "mixfusion_can_pack", None)
-        return (True, "") if check is None else check(input_batch)
+    def validate_inputs(self, module: nn.Module, input_batch: Any) -> None:
+        validate = getattr(module, "mixfusion_validate_inputs", None)
+        if validate is not None:
+            validate(input_batch)
 
     def pack_inputs(self, module: nn.Module, bound: Any, *, cache: PackedInputs | None) -> PackedInputs:
         """Build (or reuse) the plan; the call itself is left unchanged.
@@ -66,11 +66,14 @@ class ChunkedJointAdapter:
             )
         padded = int(text.shape[1])
         real_lens = [padded] * len(rows) if mask is None else [int(n) for n in mask.sum(dim=1).tolist()]
-        key = (tuple(tuple(sample.shape) for sample in latents), tuple(text.shape), tuple(real_lens))
+        step = get_forward_context().mixfusion_step
+        if step is None or step.chunk_size <= 0:
+            raise ValueError("MixFusion root requires a scheduler-selected chunk size")
+        key = (step.chunk_size, tuple(tuple(sample.shape) for sample in latents), tuple(text.shape), tuple(real_lens))
         if cache is not None and cache.adapter_state is not None and cache.adapter_state[0] == key:
             plan = cache.adapter_state[1]
         else:
-            plan = _build_plan(latents, rows, real_lens, padded, device=text.device)
+            plan = _build_plan(latents, rows, real_lens, padded, chunk_size=step.chunk_size, device=text.device)
         return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan=plan, adapter_state=(key, plan))
 
     def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[torch.Tensor]:
@@ -84,9 +87,9 @@ def _build_plan(
     text_lens: list[int],
     text_padded: int,
     *,
+    chunk_size: int,
     device: torch.device,
 ) -> PackedExecutionPlan:
-    chunk_size = gcd_chunk_size(rows)
     ranges: list[tuple[int, int]] = []
     chunk_to_request: list[int] = []
     for row_idx, row in enumerate(rows):

@@ -96,6 +96,8 @@ if TYPE_CHECKING:
 
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
+
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
@@ -489,6 +491,15 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+
+    def get_mixfusion_capabilities(self) -> list[MixFusionCapability]:
+        from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+        assert self.model_runner is not None and self.model_runner.pipeline is not None
+        pipeline = self.model_runner.pipeline
+        return _run_and_gather_rank_values(
+            "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
+        )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""

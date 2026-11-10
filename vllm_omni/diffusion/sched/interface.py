@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
     from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -53,6 +54,9 @@ class StepBatchSamplingParamsKey:
     Fields not included here are treated as request-local and do not
     participate in the current homogeneous batching policy.
     """
+
+    # Packed and ordinary dense requests never share an execution contract.
+    mixfusion_key: tuple | None = None
 
     # Spatial / temporal shape.
     height: int | None = None
@@ -253,6 +257,7 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    mixfusion_batch: MixFusionBatchSpec | None = None
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None

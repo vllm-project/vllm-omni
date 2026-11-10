@@ -69,7 +69,7 @@ def _active_step():
 class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    The driver only arms a step after ``adapter.can_pack`` admitted the batch,
+    The driver only arms a step for a scheduler-approved batch,
     so ``pre_forward`` packs unconditionally. ``adapter`` is the model's
     explicit ``mixfusion_adapter`` or the framework's chunked one.
     """

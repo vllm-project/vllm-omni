@@ -12,7 +12,6 @@ max_seqlen). Layout only: no model-specific semantics, no ``nn.Module`` state.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -21,39 +20,6 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
-
-
-def gcd_chunk_size(latents: Sequence[torch.Tensor]) -> int:
-    """Largest chunk length that divides every request's image sequence.
-
-    Each ``[num_images, S, C]`` latent must split into equal chunks along
-    ``S``; the GCD keeps every request on the same chunk length.
-    """
-    chunk_size = int(latents[0].shape[1])
-    for sample in latents[1:]:
-        chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
-    return chunk_size
-
-
-def plan_chunk_size(
-    latents: Sequence[torch.Tensor],
-    *,
-    min_chunk_tokens: int,
-    max_chunks: int,
-) -> tuple[bool, str, int, int]:
-    """Decide whether these per-request latents may be packed.
-
-    The GCD chunk length must reach ``min_chunk_tokens`` and the total chunk
-    count must stay within ``max_chunks``. Returns
-    ``(accepted, reason, chunk_size, chunk_count)``.
-    """
-    chunk_size = gcd_chunk_size(latents)
-    chunk_count = sum(int(sample.shape[1]) // chunk_size * int(sample.shape[0]) for sample in latents)
-    if chunk_size < min_chunk_tokens:
-        return False, f"chunk_size={chunk_size} < min_chunk_tokens={min_chunk_tokens}", chunk_size, chunk_count
-    if chunk_count > max_chunks:
-        return False, f"chunk_count={chunk_count} > max_chunks={max_chunks}", chunk_size, chunk_count
-    return True, "ok", chunk_size, chunk_count
 
 
 @dataclass

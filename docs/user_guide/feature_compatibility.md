@@ -171,7 +171,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 ```
 
 | Flag | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `--enable-mixfusion` / `--no-enable-mixfusion` | off | Let the scheduler pack mixed-resolution requests into one step batch |
 | `--mixfusion-min-chunk-tokens` | 256 | Minimum packed-chunk token count below which a candidate is not packed |
 | `--mixfusion-max-chunks` | 128 | Maximum number of chunks in one packed forward |
@@ -188,15 +188,23 @@ warning is logged if it was off), so the command above works without
 
 Constraints on the packed path:
 
-- **Edit (image-conditioned) requests**: silently fall back to serial ragged
-  execution; the zero_cond_t variant of the editing path raises an error.
-- **Sequence parallelism (SP>1)**: rejected with an error.
-- **Forward hooks (incl. HSDP `fully_shard`) and `do_true_cfg`**: the affected
-  requests silently fall back to serial ragged execution; other requests in
-  the batch are unaffected.
-- **NPU**: the packed varlen kernel is unavailable, so the attention layer
-  serves packed batches through its automatic length-bucketed dense fallback
-  (documents stay isolated; no varlen-kernel speedup, no per-request loop).
+- **Model configuration**: the loaded model must expose a packing plan and
+  host-side request preparation. SP, CFG parallel and conflicting forward
+  hooks keep requests on ordinary dense scheduling; the engine reports the
+  reason at initialization.
+- **Request inputs**: currently Qwen-Image text-to-image requests are eligible.
+  Other inputs keep the ordinary pipeline's support and compatibility limits.
+- **Chunk policy**: the scheduler checks the full candidate batch. Requests
+  that cannot join it remain waiting; a request that cannot meet the limits
+  alone uses dense execution. Dense batches retain resolution constraints.
+- **CFG**: sequential true-CFG is supported; CFG parallel is not packed.
+- **Attention backend**: native multi-document varlen is optional. Dense
+  backends use attention-only buckets (equal image lengths with text masks,
+  or exact joint lengths without masks). Mixed-resolution scheduling remains
+  enabled, including on NPU; there is no varlen-kernel speedup on this path.
+- **Runtime validation**: the worker executes the scheduler's approved layout.
+  Unexpected shape or runtime-capability changes fail explicitly rather than
+  silently splitting the denoise batch.
 
 ## Limitations
 

@@ -9,17 +9,22 @@ MixFusion logic of their own.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
+from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 _DEFAULT_DIT_ATTRS = ("transformer", "transformer_2", "dit", "unet")
 
@@ -79,11 +84,8 @@ def mount_mixfusion(model: nn.Module, od_config: Any, *, supported: bool) -> Non
     with the hooks installed still runs its serial forward unchanged when
     MixFusion is not requested.
 
-    The driver is the entry point for ragged batches even without a plan: its
-    serial fallback has to run because the dense path cannot accept list
-    latents. A request may opt in on any ``supports_mixfusion`` pipeline (the
-    server flag only sets the default), so the driver is mounted for every
-    capable pipeline.
+    The engine discovers the effective capability after all model wrappers
+    are installed. Pipelines without a plan keep ordinary dense scheduling.
     """
     if not (getattr(od_config, "enable_mixfusion", False) or supported):
         return
@@ -91,10 +93,6 @@ def mount_mixfusion(model: nn.Module, od_config: Any, *, supported: bool) -> Non
     if not transformers:
         return
 
-    # One step packs one DiT: mount the first DiT whose plan resolves to an
-    # adapter (the framework's chunked one for a declarative plan). Without
-    # one, the driver still serves ragged batches serially. Admission rejects
-    # SP per step, so the hooks stay inert there.
     for attr, transformer in transformers:
         plan = getattr(transformer, "_mixfusion_plan", None)
         adapter = resolve_mixfusion_adapter(transformer, plan)
@@ -103,5 +101,94 @@ def mount_mixfusion(model: nn.Module, od_config: Any, *, supported: bool) -> Non
             apply_mixfusion(transformer, plan, adapter)
             model.mixfusion_driver = MixFusionDriver(model, transformer, adapter)
             return
-    logger.warning("No transformer declares a packable _mixfusion_plan; MixFusion requests run serially.")
-    model.mixfusion_driver = MixFusionDriver(model, transformers[0][1], None)
+    logger.info("No packable _mixfusion_plan; keeping dense request admission.")
+
+
+def packing_unavailable_reason(pipeline: nn.Module) -> str | None:
+    """Inspect the loaded runtime without depending on varlen support."""
+    driver = getattr(pipeline, "mixfusion_driver", None)
+    if driver is None:
+        return "no packable MixFusion plan"
+    transformer = driver.transformer
+    if not getattr(transformer, "_mixfusion_hooks_applied", False):
+        raise RuntimeError("Declared MixFusion hooks were not installed")
+    if getattr(pipeline, "attention_kwargs", None):
+        return "attention_kwargs is set"
+    parallel = getattr(pipeline, "parallel_config", None)
+    if parallel is not None and parallel.sequence_parallel_size > 1:
+        return "sequence parallelism is enabled"
+    if parallel is not None and parallel.cfg_parallel_size > 1:
+        return "CFG parallel is enabled"
+    foreign = plan_foreign_hooks(transformer, transformer._mixfusion_plan)
+    if foreign:
+        return f"foreign hooks on the packed path ({', '.join(foreign)})"
+    return None
+
+
+def inspect_mixfusion_capability(pipeline: nn.Module) -> MixFusionCapability:
+    reason = packing_unavailable_reason(pipeline)
+    if reason is not None:
+        return MixFusionCapability(reason=reason)
+    prepare = getattr(pipeline, "prepare_mixfusion_request", None)
+    configure = getattr(pipeline, "mixfusion_request_config", None)
+    if prepare is None or configure is None:
+        return MixFusionCapability(reason="model declares no host-side MixFusion request preparation")
+    config = configure()
+    if config is None:
+        return MixFusionCapability(reason="model configuration does not support packed requests")
+    return MixFusionCapability(request_config=config, reason="")
+
+
+def initialize_mixfusion_admission(engine: DiffusionEngine) -> None:
+    """Discover initialized rank capabilities once, before accepting requests."""
+    from vllm_omni.diffusion.registry import resolve_diffusion_pipeline_cls, supports_mixfusion
+
+    engine.mixfusion_capability = MixFusionCapability()
+    engine.mixfusion_prepare_request = None
+    if engine.execution_mode != "step_batch" or not supports_mixfusion(engine.od_config):
+        return
+    capabilities = engine.executor.collective_rpc(
+        "get_mixfusion_capabilities", unique_reply_rank=0, exec_all_ranks=True
+    )
+    if not capabilities or any(item != capabilities[0] for item in capabilities[1:]):
+        raise RuntimeError("MixFusion capabilities disagree across Worker ranks")
+    engine.mixfusion_capability = capabilities[0]
+    if capabilities[0].request_config is None:
+        logger.info("MixFusion uses dense admission: %s", capabilities[0].reason)
+        return
+    pipeline_cls = resolve_diffusion_pipeline_cls(engine.od_config)
+    prepare = getattr(pipeline_cls, "prepare_mixfusion_request", None)
+    if not callable(prepare):
+        raise RuntimeError("Loaded MixFusion model has no host-side request preparer")
+    engine.mixfusion_prepare_request = prepare
+
+
+def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionRequest) -> None:
+    """Attach trusted host metadata; unsupported requests retain dense keys."""
+    from vllm_omni.diffusion.mixfusion.request import (
+        DEFAULT_MAX_CHUNKS,
+        DEFAULT_MIN_CHUNK_TOKENS,
+        mixfusion_requested,
+    )
+    from vllm_omni.diffusion.mixfusion.scheduling import plan_batch
+
+    request.mixfusion_info = None
+    prepare = getattr(engine, "mixfusion_prepare_request", None)
+    if prepare is None or not request.use_step_execution:
+        return
+    if not mixfusion_requested(request.sampling_params, engine.od_config, supported=True):
+        return
+    extras = request.sampling_params.extra_args or {}
+    info = prepare(
+        request,
+        engine.mixfusion_capability.request_config,
+        int(
+            extras.get(
+                "mixfusion_min_chunk_tokens",
+                getattr(engine.od_config, "mixfusion_min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
+            )
+        ),
+        int(extras.get("mixfusion_max_chunks", getattr(engine.od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS))),
+    )
+    if info is not None and plan_batch([(request.request_id, info)]) is not None:
+        request.mixfusion_info = info

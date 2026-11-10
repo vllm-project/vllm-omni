@@ -96,8 +96,8 @@ class _DummyAdapter:
     def __init__(self) -> None:
         self.pack_calls: list[dict] = []
 
-    def can_pack(self, module, input_batch) -> tuple[bool, str]:
-        return True, ""
+    def validate_inputs(self, module, input_batch) -> None:
+        pass
 
     def pack_inputs(self, module, bound, *, cache: PackedInputs | None) -> PackedInputs:
         rows = [h.float() for h in bound.arguments["hidden_states"]]

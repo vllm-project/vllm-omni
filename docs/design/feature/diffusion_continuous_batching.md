@@ -11,7 +11,7 @@ and output delivery. For user-facing configuration and CLI examples, see
 `max_num_seqs` as that mode's scheduler capacity:
 
 | Configuration | Engine mode | Scheduler | Execution |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
 | `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
 | `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
@@ -139,7 +139,7 @@ Step execution exposes denoising progress to the scheduler. A supporting
 pipeline implements four stateful operations:
 
 | Operation | Responsibility |
-|---|---|
+| --- | --- |
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
 | `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
@@ -212,57 +212,55 @@ cost of a pipeline contract the scheduler must not assume generically:
   (same coupling as `streaming_output`).
 - The scheduler resolves the capability in `initialize()` and only then
   applies the shape relaxation through `mixfusion.request.relax_step_batch_key`.
-  Every MixFusion decision lives under `vllm_omni/diffusion/mixfusion/`;
-  the shared engine, loader and schedulers only make one call each. On an unsupported pipeline, a request-level
+  MixFusion policy and packing live under `vllm_omni/diffusion/mixfusion/`.
+  On an unsupported pipeline, a request-level
   `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
   stays in the key and per-prompt `additional_information` requests keep
   their key.
 
-With the capability present, the model runner hands every denoise step to
-`pipeline.mixfusion_driver`, a model-agnostic `MixFusionDriver` that
-`mixfusion.setup.mount_mixfusion` mounts at model load. The driver
-dispatches on the batch: dense (tensor) latents go straight to
-`pipeline.denoise_step`; list latents return `None` when the pipeline is
-interrupted and otherwise take one packed forward only when
-`MixFusionDriver.admit` accepts them. Rejected batches fall back to
-`serial_ragged`, which rebuilds one dense batch per compatible group and calls
-the same `denoise_step` with flattened latents, so per-image conditioning
-stays aligned. A group shares the latent shape, CFG/guidance settings,
-`img_shapes` and the step-key fields MixFusion relaxed (height, width,
-resolution): equal-area images with different aspect ratios share a sequence
-length but not their positional embedding.
+After model loading, offload and cache setup, the engine collects the actual
+MixFusion capability from every worker rank. A model supplies a serializable
+request configuration and a host-side `prepare_mixfusion_request` helper.
+This helper resolves latent geometry and request-specific constraints before
+Scheduler admission. It does not run text encoding or create device tensors.
 
-Admission rejects, in order:
+Only requests with prepared `MixFusionRequestInfo` relax the resolution key.
+Dense and packed requests have distinct keys. Static unsupported combinations
+(no packing plan, SP, CFG parallel or conflicting hooks) retain dense
+scheduling. Requests unsupported by the model's host preparation, or unable
+to meet the chunk policy even alone, also keep dense scheduling. Existing
+per-prompt input isolation remains in effect.
 
-- a transformer without a packable `_mixfusion_plan` (a `MixFusionRoot` or an explicit `mixfusion_adapter`);
-- a transformer whose `_mixfusion_plan` hooks were not applied
-  (`_mixfusion_hooks_applied`);
-- a non-empty `pipeline.attention_kwargs` (the packed forward has no
-  `attention_kwargs` channel, so the serial path threads them into every
-  block instead);
-- `sequence_parallel_size > 1` (packing already splits and stacks the image
-  stream; SP would shard rows a second time);
-- `cfg_parallel_size > 1` (CFG parallel all-gathers tensor predictions);
-- foreign forward hooks on any module the plan touches, reported by
-  `plan_foreign_hooks` as `<plan name>:torch-native` (layerwise offload,
-  FSDP2 or cache hooks would see a layout they were not written for);
-- a chunk policy the layout cannot meet: the greatest common divisor of the
-  per-request sequence lengths is the chunk size, which must be at least
-  `mixfusion_min_chunk_tokens`, and the total chunk count must not exceed
-  `mixfusion_max_chunks`. Per-request extras are aggregated conservatively
-  (max of the minimums, min of the maximums; defaults 256 and 128), so no
-  request's limits are violated by fusing the batch.
+`StepScheduler` checks the entire running batch plus each candidate. The GCD
+of image sequence lengths must meet the strictest `mixfusion_min_chunk_tokens`
+and the total chunks, including multiple images, must fit the strictest
+`mixfusion_max_chunks`. A candidate that fails stays waiting under the normal
+FIFO policy. The scheduler publishes `MixFusionBatchSpec` with a chunk size
+and expected shapes keyed by request ID in `DiffusionSchedulerOutput`.
 
-Backends without packed varlen support (e.g. NPU)
-are served by the attention layer's automatic fallback: documents are grouped
-by length into mask-free dense forwards, so the packed dispatch stays active
-and documents remain isolated without a per-request loop.
+The runner builds tensor latents for dense output and list latents for an
+approved MixFusion output. Request flags no longer choose the worker layout.
+`MixFusionDriver` validates the execution contract, arms `MixFusionStep` with
+the scheduled chunk size, and calls the ordinary `pipeline.denoise_step`.
+It does not admit, split, regroup or silently fall back. Unexpected runtime
+shape or capability changes fail explicitly before model execution. Failed
+request preparation may remove a request: remaining requests retain the
+scheduled chunk size and their own identity-to-shape mapping.
 
-Known limitation: the packed path does not thread `attention_kwargs`
-into the packed forward. To keep them from being dropped silently, the
-driver falls back to the serial ragged path when they are set; features
-that rely on them (e.g. LoRA scales, TeaCache) therefore lose MixFusion
-batching until the packed call grows an `attention_kwargs` channel.
+Attention backend capability does **not** restrict heterogeneous scheduling.
+The packed layout can execute through any of the existing attention routes:
+
+- Native multi-document varlen uses `cu_seqlens` to isolate requests.
+- A mask-capable dense backend groups equal image lengths and pads/masks
+  request-level text within each group.
+- Other dense paths group exact joint text-plus-image lengths without masks.
+  Effective KV quantization policy is included in the varlen capability check.
+
+These buckets exist only inside attention. The remaining transformer
+computations retain the chunk-stacked layout; this is not a per-group denoise
+fallback. Sequential true-CFG remains supported. Unsupported packed input
+channels such as `attention_kwargs` must be accounted for before admission;
+unexpected changes after scheduling are execution-contract errors.
 
 #### Driver / plan layering
 
@@ -271,8 +269,9 @@ the packed layout starts, is produced and is expanded, and the framework
 implements *how*.
 
 | Layer | Location | Owns |
-|---|---|---|
-| Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Step dispatch, admission, chunk-policy aggregation, arming/restoring `MixFusionStep`, serial-ragged fallback grouped by geometry |
+| --- | --- | --- |
+| Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Whole-batch admission and host execution specification |
+| Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Execution validation and arming/restoring `MixFusionStep` |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
 | Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Building the `PackedExecutionPlan` from the root declaration, per-request RoPE through the model's own boundary module, chunk split/reassembly |
 | Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
@@ -294,14 +293,14 @@ _mixfusion_plan = {
     "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
 }
 
-def mixfusion_can_pack(self, input_batch) -> tuple[bool, str]:
-    ...  # optional model-specific limits
+def mixfusion_validate_inputs(self, input_batch) -> None:
+    ...  # optional runtime assertions; raise on contract mismatch
 ```
 
 - `MixFusionRoot` names the per-request latent argument, the request-level
   text stream and its padding mask, and the output attribute (diffusers
   defaults). `ChunkedJointAdapter` builds the plan from them, reusing it per
-  CFG branch while the layout key (latent shapes, text width, real text
+  CFG branch while the layout key (scheduled chunk size, latent shapes, text width, real text
   lengths) is unchanged.
 - `MixFusionChunkOutputs` reuses the model's own projection/RoPE module: each
   request's call sees its own geometry, so positional tables match
@@ -312,14 +311,16 @@ def mixfusion_can_pack(self, input_batch) -> tuple[bool, str]:
   in `extra[MIXFUSION_PLAN_KEY]`; RoPE application must accept per-row tables
   (the chunk-stacked layout has one table row per chunk).
 - The pipeline declares `supports_mixfusion: ClassVar[bool] = True` and its
-  keyword builder accepts a per-request latent list.
+  keyword builder accepts a per-request latent list. It also provides
+  `mixfusion_request_config()` from the loaded model and a static
+  `prepare_mixfusion_request(request, config, min_chunk_tokens, max_chunks)`
+  that returns host metadata or `None` for ordinary dense admission.
 
-Admission and the hooks stay inert unless the driver arms a `MixFusionStep`;
-without one the model runs its serial forward unchanged. Paths the packed
-layout cannot express are refused by the driver's admission guards (above);
-model-specific refusals live in `mixfusion_can_pack`. For Qwen-Image it
-refuses `zero_cond_t` (editing), image latents (reference images) and
-batches without `img_shapes` / `txt_seq_lens`. The fused joint QK-norm-RoPE
+The hooks stay inert unless the driver arms a `MixFusionStep`; without one
+the model runs its ordinary dense forward. Model-specific eligibility is
+resolved before admission. Runtime validation rejects unexpected editing or
+reference inputs and missing `img_shapes` / `txt_seq_lens` on a scheduled
+Qwen-Image packed batch. The fused joint QK-norm-RoPE
 table is skipped for per-row RoPE tables, because text (per-request) and
 image rows (per-chunk) cannot share one table.
 
@@ -374,7 +375,7 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
   conservative step path.
 - MixFusion shape relaxation requires the pipeline `supports_mixfusion`
   capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, CFG
-  parallel and active forward hooks fall back to serial ragged execution.
+  parallel and conflicting forward hooks retain ordinary dense admission.
 
 ## Related Implementation
 

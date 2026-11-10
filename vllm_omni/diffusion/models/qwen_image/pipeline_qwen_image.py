@@ -33,6 +33,11 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
+from vllm_omni.diffusion.models.qwen_image.mixfusion_request import (
+    QwenMixFusionConfig,
+    image_token_grid,
+    prepare_mixfusion_request,
+)
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -282,6 +287,13 @@ class QwenImagePipeline(
     # step via ragged latents, so the scheduler may relax height/width out of
     # the batch key when MixFusion is enabled.
     supports_mixfusion: ClassVar[bool] = True
+
+    prepare_mixfusion_request = staticmethod(prepare_mixfusion_request)
+
+    def mixfusion_request_config(self) -> QwenMixFusionConfig | None:
+        if self.transformer.zero_cond_t:
+            return None
+        return QwenMixFusionConfig(self.vae_scale_factor, self.default_sample_size, self.transformer.in_channels)
 
     supports_weight_reload: ClassVar[bool] = True
 
@@ -594,8 +606,8 @@ class QwenImagePipeline(
         # generator=torch.Generator(device="cuda").manual_seed(42)
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
-        height = 2 * (int(height) // (self.vae_scale_factor * 2))
-        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        token_height, token_width = image_token_grid(height, width, self.vae_scale_factor)
+        height, width = 2 * token_height, 2 * token_width
 
         shape = (batch_size, 1, num_channels_latents, height, width)
 

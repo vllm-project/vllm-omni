@@ -1227,19 +1227,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
         "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
 
-    def mixfusion_can_pack(self, input_batch) -> tuple[bool, str]:
-        """Qwen-specific MixFusion limits (the framework checks the rest)."""
-        if self.zero_cond_t:
-            # The editing path passes per-token modulate indices that the
-            # packed layout does not build yet.
-            return False, "zero_cond_t/editing path is not supported"
-        if input_batch.image_latents is not None:
-            # Reference-image tokens need their own RoPE and per-token
-            # conditioning in the packed layout, which is not built yet.
-            return False, "image_latents (reference images) are not supported"
+    def mixfusion_validate_inputs(self, input_batch) -> None:
+        """Validate the runtime side of the scheduler's packing contract."""
+        if self.zero_cond_t or input_batch.image_latents is not None:
+            raise ValueError("Scheduled MixFusion batch contains unsupported editing/reference inputs")
         if input_batch.img_shapes is None or input_batch.txt_seq_lens is None:
-            return False, "img_shapes and txt_seq_lens are required"
-        return True, ""
+            raise ValueError("Scheduled MixFusion batch is missing img_shapes or txt_seq_lens")
 
     def __init__(
         self,

@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 import vllm_omni.diffusion.registry as registry_module
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey, StepBatchSamplingParamsKey
@@ -106,7 +107,10 @@ PER_PROMPT = {"prompt": "a cat", "additional_information": {"image": "x"}}
 )
 def test_batch_key_shape(monkeypatch, scheduler_cls, pipeline_cls, prompt, overrides, expected):
     scheduler = _initialized_scheduler(scheduler_cls, monkeypatch, pipeline_cls)
-    key = scheduler._build_sampling_params_key(_request(prompt, **overrides))
+    request = _request(prompt, **overrides)
+    if overrides == MIXFUSION and pipeline_cls is _MixfusionCapablePipeline and expected == (None, None, None):
+        request.mixfusion_info = MixFusionRequestInfo((1, 3072, 64), 256, 128)
+    key = scheduler._build_sampling_params_key(request)
 
     if expected is None:
         assert key is None

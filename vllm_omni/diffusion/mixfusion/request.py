@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request MixFusion opt-in plumbing (framework, model-agnostic).
 
-The scheduler and the runner both ask whether a request opts into MixFusion;
-this module is the single answer. The scheduler relaxes resolution out of
-the step-batch key for such requests, and the runner stamps the ragged
-latents switch and chunk-policy thresholds onto a newly admitted step
-request, so neither a pipeline nor a scheduler class carries MixFusion logic.
+The engine resolves request opt-in before admission. Only requests carrying
+model-resolved packing metadata receive a relaxed step-batch key. The runner
+follows the scheduler output rather than interpreting the request opt-in.
 The opt-in is gated on the pipeline's ``supports_mixfusion`` capability and
 may be overridden per request through ``sampling.extra_args``.
 """
@@ -20,8 +18,7 @@ DEFAULT_MIN_CHUNK_TOKENS = 256
 DEFAULT_MAX_CHUNKS = 128
 
 #: Step-batch key fields MixFusion relaxes so mixed resolutions share a step.
-#: A dense fallback must restore them: requests that differ here may share a
-#: latent sequence length (equal area, different aspect ratio) but not RoPE.
+#: Dense admission retains them: equal-area images can have different RoPE.
 RELAXED_STEP_KEY_FIELDS = ("height", "width", "resolution")
 
 
@@ -46,15 +43,19 @@ def has_per_prompt_inputs(prompt: Any) -> bool:
 def relax_step_batch_key(request: Any, values: dict, od_config: Any, *, supported: bool) -> dict | None:
     """Drop resolution from a step-batch key when ``request`` opts in.
 
-    Step batches resolve shapes per request (packed or serial ragged). Returns
+    Only prepared, packable requests may relax the shape key. Returns
     ``None`` when the request cannot share a key at all (per-prompt inputs).
     """
-    if not mixfusion_requested(request.sampling_params, od_config, supported=supported):
+    info = getattr(request, "mixfusion_info", None)
+    if info is None:
+        if mixfusion_requested(request.sampling_params, od_config, supported=supported) and has_per_prompt_inputs(
+            request.prompt
+        ):
+            return None
         return values
-    if has_per_prompt_inputs(request.prompt):
-        return None
     for name in RELAXED_STEP_KEY_FIELDS:
         values[name] = None
+    values["mixfusion_key"] = (info.shape[2], info.condition_key)
     return values
 
 
@@ -69,20 +70,3 @@ def request_batch_key_allowed(request: Any, od_config: Any, *, supported: bool) 
         mixfusion_requested(request.sampling_params, od_config, supported=supported)
         and has_per_prompt_inputs(request.prompt)
     )
-
-
-def mixfusion_request_extras(sampling: Any, od_config: Any, *, supported: bool) -> dict[str, object]:
-    """Build the ``state.extra`` entries that opt a request into MixFusion.
-
-    Returns an empty dict unless the request opts in on a capable pipeline.
-    """
-    if not mixfusion_requested(sampling, od_config, supported=supported):
-        return {}
-    extra_args = sampling.extra_args or {}
-    return {
-        "use_ragged_latents": True,
-        "mixfusion_min_chunk_tokens": extra_args.get(
-            "mixfusion_min_chunk_tokens", od_config.mixfusion_min_chunk_tokens
-        ),
-        "mixfusion_max_chunks": extra_args.get("mixfusion_max_chunks", od_config.mixfusion_max_chunks),
-    }

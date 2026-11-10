@@ -52,6 +52,7 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "condition_key",
     "lora_int_id",
     "use_step_execution",
+    "mixfusion_key",
 }
 
 

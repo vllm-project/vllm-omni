@@ -4,13 +4,13 @@
 
 The server-level ``enable_mixfusion`` flag only sets the request-level
 default; a request may opt in whenever the pipeline declares
-``supports_mixfusion``. That makes the scheduler relax the shape key and turns
-``InputBatch.latents`` into a list, so the driver has to be mounted for every
-capable pipeline, even with the server flag off.
+``supports_mixfusion``. Plans are mounted even with the server flag off;
+actual capability discovery happens after all runtime wrappers are installed.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -78,13 +78,9 @@ def test_declarative_plan_mounts_the_framework_adapter():
     assert transformer._mixfusion_hooks_applied is True
 
 
-def test_transformer_without_a_packable_plan_gets_a_serial_driver():
+def test_transformer_without_a_packable_plan_does_not_mount_driver():
     pipeline, transformer = _mount(supports=True, adapter=None, plan={})
-
-    # Ragged batches still need the serial fallback instead of reaching the
-    # dense path with a list.
-    assert pipeline.mixfusion_driver.adapter is None
-    assert pipeline.mixfusion_driver.transformer is transformer
+    assert not hasattr(pipeline, "mixfusion_driver")
     assert getattr(transformer, "_mixfusion_hooks_applied", False) is False
 
 
@@ -125,3 +121,72 @@ def test_validate_mixfusion_config(config, supported, outcome):
         assert validate_mixfusion_config(od_config, supported=capability) is outcome
     # The pipeline class is only resolved when MixFusion is enabled.
     assert len(lookups) == (1 if config.get("enable_mixfusion") else 0)
+
+
+@dataclass
+class _Parallel:
+    sequence_parallel_size: int = 1
+    cfg_parallel_size: int = 1
+
+
+def test_capability_is_resolved_after_foreign_hooks_are_installed():
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, transformer = _mount(supports=True, adapter=None)
+    pipeline.prepare_mixfusion_request = lambda *args: None
+    pipeline.mixfusion_request_config = lambda: (8, 128, 64)
+    assert inspect_mixfusion_capability(pipeline).request_config == (8, 128, 64)
+    transformer.register_forward_pre_hook(lambda module, args: args)
+    capability = inspect_mixfusion_capability(pipeline)
+    assert capability.request_config is None
+    assert "foreign hooks" in capability.reason
+
+
+@pytest.mark.parametrize(
+    "parallel,reason", [(_Parallel(2, 1), "sequence parallelism"), (_Parallel(1, 2), "CFG parallel")]
+)
+def test_parallel_capability_keeps_dense_admission(parallel, reason):
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, _ = _mount(supports=True, adapter=None)
+    pipeline.parallel_config = parallel
+    capability = inspect_mixfusion_capability(pipeline)
+    assert capability.request_config is None and reason in capability.reason
+
+
+def test_missing_declared_hooks_is_an_initialization_error():
+    from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+    pipeline, transformer = _mount(supports=True, adapter=None)
+    transformer._mixfusion_hooks_applied = False
+    with pytest.raises(RuntimeError, match="not installed"):
+        inspect_mixfusion_capability(pipeline)
+
+
+@pytest.mark.parametrize("consistent", [True, False])
+def test_engine_requires_rank_agreement_before_request_preparation(monkeypatch, consistent):
+    from unittest.mock import Mock
+
+    import vllm_omni.diffusion.registry as registry
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
+    from vllm_omni.diffusion.mixfusion.setup import initialize_mixfusion_admission
+
+    class Pipeline:
+        supports_mixfusion = True
+        prepare_mixfusion_request = staticmethod(lambda *args: None)
+
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = _od_config(enable=True)
+    engine.execution_mode = "step_batch"
+    engine.executor = Mock()
+    capability = MixFusionCapability((8, 128, 64), "")
+    engine.executor.collective_rpc.return_value = [capability, capability if consistent else MixFusionCapability()]
+    monkeypatch.setattr(registry, "resolve_diffusion_pipeline_cls", lambda config: Pipeline)
+    if consistent:
+        initialize_mixfusion_admission(engine)
+        assert engine.mixfusion_capability == capability
+        assert engine.mixfusion_prepare_request is Pipeline.prepare_mixfusion_request
+    else:
+        with pytest.raises(RuntimeError, match="disagree"):
+            initialize_mixfusion_admission(engine)

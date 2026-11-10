@@ -21,6 +21,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionBatchSpec, MixFusionRequestInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -154,6 +155,7 @@ def _make_request():
         prompt="a prompt",
         sampling_params=sampling_params,
         kv_sender_info=None,
+        mixfusion_info=None,
     )
 
 
@@ -497,7 +499,7 @@ def test_update_states_carries_prepared_layout() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_update_states_stamps_mixfusion_request_extras() -> None:
+def test_update_states_does_not_choose_packing_from_request_flag() -> None:
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     runner.pipeline.supports_mixfusion = True
     runner.od_config.enable_mixfusion = True
@@ -515,9 +517,7 @@ def test_update_states_stamps_mixfusion_request_extras() -> None:
 
     states, _ = DiffusionModelRunner._update_states(runner, scheduler_output)
 
-    assert states[0].extra["use_ragged_latents"] is True
-    assert states[0].extra["mixfusion_min_chunk_tokens"] == 64
-    assert states[0].extra["mixfusion_max_chunks"] == 16
+    assert "use_ragged_latents" not in states[0].extra
 
     # A pipeline without the capability never gets the ragged opt-in, even
     # when the server-level default is on.
@@ -554,7 +554,7 @@ def test_update_states_after_list_latents_releases_finished_step_requests():
         step_index=1,
     )
     runner.state_cache = {state.request_id: state for state in (finished_state, active_state)}
-    input_batch = InputBatch.make_batch([finished_state, active_state])
+    input_batch = InputBatch.make_batch([finished_state, active_state], mixfusion_batch=MixFusionBatchSpec(1, {}))
     assert isinstance(input_batch.latents, list)
     runner.input_batch = input_batch
     # step_scheduler() advanced the first request past its last timestep.
@@ -1645,3 +1645,46 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id, requests[1].request_id = "a", "b"
+    requests[0].mixfusion_info = MixFusionRequestInfo((1, 8, 4), 1, 8)
+    requests[1].mixfusion_info = MixFusionRequestInfo((1, 12, 4), 1, 8)
+    captured = []
+
+    def execute(output, **kwargs):
+        captured.append(output.mixfusion_batch)
+
+    runner._execute_stepwise = execute
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
+    runner.profile_run(requests)
+    assert captured == [MixFusionBatchSpec(4, {"a": (1, 8, 4), "b": (1, 12, 4)})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_preparation_failure_keeps_surviving_packed_request_plan():
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+
+    class PreparePipeline:
+        def prepare_encode(self, state):
+            if state.request_id == "bad":
+                raise ValueError("bad input")
+            state.latents = torch.zeros(1, 12, 4)
+            state.timesteps = torch.tensor([1.0])
+
+    runner.pipeline = PreparePipeline()
+    states = [StepRequestState(request_id=rid, sampling=OmniDiffusionSamplingParams()) for rid in ("bad", "good")]
+    runner.state_cache = {s.request_id: s for s in states}
+    spec = MixFusionBatchSpec(4, {"bad": (1, 8, 4), "good": (1, 12, 4)})
+    prepared, batch, errors = runner._prepare_batch_inputs(states, ["bad", "good"], spec)
+    assert [s.request_id for s in prepared] == ["good"]
+    assert batch.mixfusion_batch is spec and batch.request_ids == ["good"]
+    assert len(batch.latents) == 1 and batch.latents[0].shape == (1, 12, 4)
+    assert [e.request_id for e in errors] == ["bad"]
