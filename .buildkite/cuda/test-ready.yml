@@ -24,7 +24,7 @@ steps:
       # One sweep of the four former directory jobs. Split when measured
       # durations exceed timeout_in_minutes.
       - label: "Simple Test"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 25
         automatic_shard: true
         commands:
           - "pytest -sv tests/ -m 'core_model and cpu'"
@@ -123,7 +123,7 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: "Engine&Model Executor&Work Test · L4"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 15
         automatic_shard: true
         commands:
           - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
