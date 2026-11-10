@@ -68,7 +68,15 @@ The CUDA/NPU long profiles use two candidate-only 600-chunk sessions. They
 record actual camera acknowledgements and post-warmup memory samples, retain
 the 256 MiB per-device growth bound within and across sessions, reuse the
 existing streamed-block/paced-playback/stop lifecycle checks, and require
-server/device cleanup. These instrumented measurements are not performance
+server/device cleanup. Orderly WebSocket close and abrupt transport loss each
+require a complete, ordered fresh rollout with a distinct request ID on the
+same server. `lifecycle.json` records passed, failed and unstarted cases;
+failed long sessions retain their raw chunks, events, terminal state and memory
+observations before propagating the failure. These traces are diagnostic evidence,
+not successful measurements. Post-recovery device usage must remain within the
+profile's 256 MiB growth budget relative to the warmed live server. Device
+cleanup is also checked after a failed run without replacing its original error.
+These instrumented measurements are not performance
 samples. They do not repeat reference, tensor or semantic-quality campaigns.
 
 ## Commands and local verification

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
-from vllm_omni.benchmarks.realtime_video.client import resolve_image_reference, run_session
+from vllm_omni.benchmarks.realtime_video.client import SessionResult, resolve_image_reference, run_session
 
 ROOT = Path(__file__).resolve().parents[3]
 ENGINE_ENVIRONMENT = {"VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0", "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0"}
@@ -463,6 +463,22 @@ def stability_session(server, settings: dict[str, Any], image: Path, destination
             "transition_chunks": 2,
         },
     }
+
+    def retain(result: SessionResult, error: BaseException | None = None) -> None:
+        write_json(
+            destination,
+            {
+                "events": result.events,
+                "memory": memory,
+                "timing_scope": "instrumented; excluded from performance",
+                "request_id": result.request_id,
+                "chunks": [row.to_dict() for row in result.records],
+                "done_event": result.done_event,
+                "transport_complete": error is None,
+                "error": str(error) if error is not None else None,
+            },
+        )
+
     result = asyncio.run(
         run_session(
             f"ws://{server.host}:{server.port}/v1/realtime/video",
@@ -475,24 +491,16 @@ def stability_session(server, settings: dict[str, Any], image: Path, destination
             print_chunks=False,
             on_chunk=observe,
             interactions_after_chunk={2: camera_update},
+            on_failure=retain,
         )
     )
+    retain(result)
     if (
         len(result.records) != settings["num_chunks"]
         or [r.index for r in result.records] != list(range(settings["num_chunks"]))
         or any(r.num_frames != (9 if i == 0 else 12) or r.byte_length <= 0 for i, r in enumerate(result.records))
     ):
         raise RegressionError("Incomplete long-session chunk/frame population")
-    write_json(
-        destination,
-        {
-            "events": result.events,
-            "memory": memory,
-            "timing_scope": "instrumented; excluded from performance",
-            "request_id": result.request_id,
-            "chunks": [row.to_dict() for row in result.records],
-        },
-    )
     applied = [
         event
         for event in result.events
@@ -512,10 +520,57 @@ def stability_session(server, settings: dict[str, Any], image: Path, destination
     return {"memory": memory, "events": len(result.events), "request_id": result.request_id}
 
 
-def run_stability(settings):
+def run_lifecycle_checks(server, image: Path, output: Path, *, dies: int, memory_budget: int) -> None:
+    """Retain per-case verdicts, including the failing case, on one live server."""
     import pytest
 
     from tests.e2e.online_serving import test_lingbot_world_v2_stepwise as lifecycle
+
+    cases = [
+        ("completion", lambda: lifecycle.test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(server)),
+        ("paced_playback", lambda: lifecycle.test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(server)),
+        (
+            "stop_and_recover",
+            lambda: lifecycle.test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(server),
+        ),
+        (
+            "close_and_recover",
+            lambda: lifecycle.test_lingbot_world_v2_stepwise_disconnect_releases_session(server, False),
+        ),
+        (
+            "transport_loss_and_recover",
+            lambda: lifecycle.test_lingbot_world_v2_stepwise_disconnect_releases_session(server, True),
+        ),
+    ]
+    from vllm_omni.platforms import current_omni_platform as platform
+
+    def memory_used() -> list[int]:
+        samples = []
+        for device in range(dies):
+            with platform.device(device):
+                free, total = platform.get_device_memory()
+            samples.append(total - free)
+        return samples
+
+    baseline = memory_used()
+    report: dict[str, dict[str, object]] = {name: {"status": "not_run"} for name, _ in cases}
+    write_json(output, report)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lifecycle, "_IMAGE_PATH_OVERRIDE", str(image))
+        for name, check in cases:
+            report[name] = {"status": "failed"}
+            try:
+                check()
+                used = memory_used()
+                report[name] = {"status": "failed", "baseline_bytes": baseline, "used_bytes": used}
+                if any(after - before > memory_budget for before, after in zip(baseline, used)):
+                    raise RegressionError(f"Memory retained after lifecycle case {name} exceeds the profile budget")
+                report[name]["status"] = "passed"
+            finally:
+                write_json(output, report)
+
+
+def run_stability(settings):
     from tests.helpers.runtime import OmniServer
 
     if settings["num_chunks"] != 600 or settings.get("measured_sessions") != 2 or len(settings["cases"]) != 1:
@@ -549,15 +604,24 @@ def run_stability(settings):
                 samples = [m["used_bytes"][device] for r in report["sessions"] for m in r["memory"]]
                 if max(samples) - min(samples) > settings["memory_growth_budget_bytes"]:
                     raise RegressionError("Memory growth across stability sessions exceeds the profile budget")
-            with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(lifecycle, "_IMAGE_PATH_OVERRIDE", str(image))
-                lifecycle.test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(server)
-                lifecycle.test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(server)
-                lifecycle.test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(server)
-        assert_device_cleanup(settings["dies"], output / "cleanup.json")
+            run_lifecycle_checks(
+                server,
+                image,
+                output / "lifecycle.json",
+                dies=settings["dies"],
+                memory_budget=settings["memory_growth_budget_bytes"],
+            )
         report["passed"] = True
     except Exception as error:
-        report["errors"].append(str(error))
+        report["errors"].append(f"{type(error).__name__}: {error}")
     finally:
+        # OmniServer has unwound even when a rollout or lifecycle assertion fails.
+        # Retain cleanup evidence as well as the original failure.
+        if "hardware" in report:
+            try:
+                assert_device_cleanup(settings["dies"], output / "cleanup.json")
+            except Exception as error:
+                report["passed"] = False
+                report["errors"].append(f"cleanup: {type(error).__name__}: {error}")
         write_json(output / "stability.json", report)
     return report

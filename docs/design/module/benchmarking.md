@@ -71,7 +71,12 @@ per-dimension/binary limits and complete input-frame coverage. No frozen cohort,
 held-out or external calibration-delivery workflow is part of these cases.
 
 Long stability uses two candidate-only 600-chunk sessions with observed memory,
-camera, lifecycle and cleanup assertions. Its instrumentation is excluded from
+camera, lifecycle and cleanup assertions. Stop, orderly close and abrupt
+transport loss require complete, ordered follow-up requests on the same server.
+Per-case verdicts and post-recovery device-memory observations remain separate
+from the final server/device-cleanup check. Failed sessions retain partial
+chunk/event/memory traces; cleanup is checked after server teardown even on a
+failed run, preserving the primary failure. Its instrumentation is excluded from
 speed measurements. CPU helper tests and CI rendering validate implementation
 contracts; only matching-source real hardware execution can establish native
 accuracy, speed or stability outcomes.
