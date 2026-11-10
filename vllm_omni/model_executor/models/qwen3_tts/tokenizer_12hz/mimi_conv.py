@@ -4,7 +4,9 @@
 # Adapted from transformers.models.mimi.modeling_mimi.MimiConv1d.forward.
 # Copyright 2024 Kyutai, and the HuggingFace Inc. team. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
-
+# Based on Transformers 5.14.1 MimiConv1d.forward; parity also validated
+# against Transformers 5.19.0. Recheck this override on Transformers upgrades.
+# Remove it once upstream provides equivalent integer-only padding arithmetic.
 """Model-local, integer-only padding sizes for the Mimi reference encoder."""
 
 from types import MethodType

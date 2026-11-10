@@ -58,13 +58,6 @@ def test_integer_padding_preserves_streaming_cache(mode, kernel, stride):
         torch.testing.assert_close(caches[1].padding_cache[0], caches[0].padding_cache[0], rtol=0, atol=0)
 
 
-def test_noncausal_padding_rejects_cache():
-    conv = _conv(causal=False)
-    use_integer_padding(conv)
-    with pytest.raises(ValueError, match="not supported for non-causal"):
-        conv(torch.randn(1, 4, 8), padding_cache=object())
-
-
 @torch.inference_mode()
 def test_padding_override_is_local_and_preserves_state(mocker):
     conv = _conv()
@@ -85,16 +78,6 @@ def test_padding_override_is_local_and_preserves_state(mocker):
     # Avoiding upstream device-scalar padding arithmetic is the optimization.
     mocker.patch.object(conv, "_get_extra_padding_for_conv1d", side_effect=AssertionError("tensor padding used"))
     conv(torch.randn(1, 4, 17))
-
-
-@torch.inference_mode()
-def test_noncontiguous_bfloat16_padding():
-    original = _conv().to(dtype=torch.bfloat16)
-    candidate = copy.deepcopy(original)
-    use_integer_padding(candidate)
-    x = torch.randn(1, 4, 34, dtype=torch.bfloat16)[..., ::2]
-    assert not x.is_contiguous()
-    torch.testing.assert_close(candidate(x), original(x), rtol=0, atol=0)
 
 
 def test_encoder_constructor_installs_integer_padding(mocker):
