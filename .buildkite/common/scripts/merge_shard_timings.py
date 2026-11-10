@@ -414,8 +414,10 @@ def download_build_timings(build_id: str, dest: Path, *, timeout: int = 180) -> 
     """Download ``timings/jobs/*.json``. Callers read that directory themselves."""
     dest.mkdir(parents=True, exist_ok=True)
     try:
+        # TEMPORARY: delete after the CI check. Artifact search keeps only the
+        # latest attempt, so timings from a timed-out job vanish once it is retried.
         completed = _run_agent(
-            ["artifact", "download", JOB_GLOB, str(dest), "--build", build_id],
+            ["artifact", "download", JOB_GLOB, str(dest), "--build", build_id, "--include-retried-jobs"],
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
