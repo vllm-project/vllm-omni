@@ -191,10 +191,16 @@ steps:
       DOCKER_BUILDKIT: "1"
       DOCKERHUB_USERNAME: "vllm"
 
+  # Own block: an XPU release does not wait on the CUDA image builds.
+  - block: "Publish release XPU image to DockerHub"
+    key: block-publish-release-images-xpu
+    depends_on:
+      - build-release-image-xpu
+      - input-release-version
+
   - label: "Publish release XPU image to DockerHub"
     depends_on:
-      - block-publish-release-images
-      - build-release-image-xpu
+      - block-publish-release-images-xpu
     key: publish-release-images-dockerhub-xpu
     agents:
       queue: small_cpu_queue_release

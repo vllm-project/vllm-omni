@@ -12,6 +12,31 @@ vLLM-Omni currently recommends using the Docker image setup steps below.
 
 # --8<-- [start:pre-built-wheels]
 
+#### Installation of vLLM
+
+vLLM-Omni is built on vLLM. The XPU builds of vLLM and PyTorch are not on PyPI,
+and `requirements/xpu.txt` does not install them. Install vLLM for XPU first,
+following the
+[vLLM XPU installation guide](https://docs.vllm.ai/en/v0.33.0/getting_started/installation/gpu/index.html)
+for the version that `docker/Dockerfile.xpu` targets (`VLLM_VERSION`, currently
+v0.33.0), including the oneAPI runtime packages it lists for XPU graph support.
+
+#### Installation of vLLM-Omni
+
+XPU wheels of vLLM-Omni are published to their own index, separate from the
+default (CUDA) wheels. Replace `<version>` with the release, for example `0.33.0`:
+
+```bash
+uv pip install vllm-omni --extra-index-url https://wheels.vllm.ai/omni/v<version>/xpu \
+  --excludes <(printf 'torch\ntriton-xpu\n')
+```
+
+`--excludes` keeps the PyTorch and Intel runtime packages from the vLLM XPU
+install; without it, `uv` re-resolves `torch` and can downgrade them.
+
+To install the build of the latest main branch, use
+`https://wheels.vllm.ai/omni/nightly/xpu` instead.
+
 # --8<-- [end:pre-built-wheels]
 
 # --8<-- [start:build-wheel-from-source]
@@ -83,5 +108,14 @@ docker run -it -d --shm-size 10g \
 # --8<-- [end:build-docker]
 
 # --8<-- [start:pre-built-images]
+
+Pre-built XPU images are published to Docker Hub as
+[`vllm/vllm-omni-xpu`](https://hub.docker.com/r/vllm/vllm-omni-xpu) (x86_64):
+
+- `latest` and `v<version>`: releases
+- `nightly` and `nightly-<commit>`: builds of the latest main branch
+
+Run them with the same `docker run` options as the locally built image above,
+replacing `vllm-omni-xpu` with `vllm/vllm-omni-xpu:<tag>`.
 
 # --8<-- [end:pre-built-images]
