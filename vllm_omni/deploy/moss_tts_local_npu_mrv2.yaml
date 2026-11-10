@@ -1,17 +1,8 @@
-# MOSS-TTS-Local-Transformer-v1.5 on Ascend NPU: Stage0 (talker) on MRV2.
+# MOSS-TTS-Local-Transformer-v1.5 on Ascend NPU: both stages on MRV2.
 # Opt-in: select with --deploy-config (vllm-omni#9446).
-# Stage1 (codec) stays on V1 until MRV2 is supported in NPUGenerationWorker,
-# and runs eagerly: its NPUGraph capture fails on A2 and A3 (#9812).
-# Use this profile on NPU only; the Stage1 eager setting is not applied per platform.
+# Inherits the NPU codec graph configuration from moss_tts_local.yaml.
 base_config: moss_tts_local.yaml
-
-stages:
-  - stage_id: 1
-    enforce_eager: true
 
 platforms:
   npu:
     model_runner: v2
-    stages:
-      - stage_id: 1
-        model_runner: v1

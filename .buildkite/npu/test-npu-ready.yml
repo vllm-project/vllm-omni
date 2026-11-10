@@ -155,9 +155,8 @@ steps:
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
         commands:
-          # Keep the core_model smoke selection, but load real weights: the
-          # Stage0 stop head needs them to end a request, so dummy weights
-          # would never stop generating.
+          # The A3 dummy-weight probe returned a header-only WAV (44 bytes).
+          # Keep real weights for payload checks; Whisper runs in Nightly.
           - >-
             pytest -s -v
             tests/platforms/npu/test_moss_tts_local_model_state.py

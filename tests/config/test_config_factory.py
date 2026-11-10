@@ -3363,7 +3363,7 @@ class TestPlatformOverrides:
         assert all(not stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         assert all(not stage.yaml_runtime.get("cuda_mps", False) for stage in stages)
 
-    def test_moss_local_npu_mrv2_profile_runs_talker_on_v2_and_codec_on_v1_eager(self, monkeypatch):
+    def test_moss_local_npu_mrv2_profile_runs_both_stages_on_v2_with_codec_graphs(self, monkeypatch):
         from vllm_omni.platforms import current_omni_platform
 
         monkeypatch.setattr(current_omni_platform, "device_name", "npu")
@@ -3372,10 +3372,12 @@ class TestPlatformOverrides:
         config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=path)
         talker, codec = config.stage_configs
         assert talker.model_config.use_v2_model_runner
-        assert not codec.model_config.use_v2_model_runner
-        assert codec.model_config.enforce_eager
+        assert codec.model_config.use_v2_model_runner
+        assert not codec.model_config.enforce_eager
+        assert codec.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64]
         stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, False]
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+        assert stages[1].yaml_engine_args["enforce_eager"] is False
 
     def test_moss_local_custom_deploy_overrides_default(self, monkeypatch, tmp_path):
         from vllm_omni.platforms import current_omni_platform

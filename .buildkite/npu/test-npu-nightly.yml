@@ -176,7 +176,7 @@ steps:
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_moss_tts_local_npu_mrv2.py -m 'advanced_model and npu and A3' --run-level 'advanced_model'
+          - pytest -s -v tests/e2e/online_serving/test_moss_tts_local_npu_mrv2.py -m 'full_model and npu and A3' --run-level 'full_model'
 
       - label: ":full_moon: TTS · Perf Test"
         source_file_dependencies: tts_qwen3_tts_perf

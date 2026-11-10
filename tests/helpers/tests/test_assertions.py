@@ -347,8 +347,8 @@ def test_failed_pcm_capture_preserves_bytes_rate_and_original_hnr_failure(monkey
         directory.write_text("not a directory")
     original_error = AssertionError("PCM speech HNR is below the configured floor")
 
-    def fail_hnr(audio_bytes, min_hnr_db, sr):
-        assert (audio_bytes, min_hnr_db, sr) == (b"\x00\x00" * 100, -1.0, 24_000)
+    def fail_hnr(audio_bytes, min_hnr_db, sr, channels):
+        assert (audio_bytes, min_hnr_db, sr, channels) == (b"\x00\x00" * 100, -1.0, 24_000, 1)
         raise original_error
 
     monkeypatch.setattr(assertions, "_assert_pcm_int16_speech_hnr", fail_hnr)
@@ -465,7 +465,7 @@ def test_pcm_rejects_invalid_channel_count(channels, monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
     with pytest.raises(AssertionError, match="transcript_pcm_channels"):
         assert_audio_speech_response(
-            SimpleNamespace(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+            OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
             {"input": "hello", "response_format": "pcm", "transcript_pcm_channels": channels},
             "advanced_model",
         )
@@ -481,7 +481,7 @@ def test_stereo_pcm_hnr_rejects_partial_frame():
 def test_stereo_pcm_frame_failure_retains_original_audio(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(tmp_path))
     pcm_bytes = _interleave_stereo(_pcm_sine(sample_rate=48_000)) + bytes(2)
-    response = SimpleNamespace(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm")
+    response = OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm")
 
     with pytest.raises(AssertionError, match="aligned to int16 frames"):
         assert_audio_speech_response(

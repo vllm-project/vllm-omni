@@ -811,9 +811,9 @@ pipeline no longer changes configuration based on a GPU-memory or MPS probe.
 
 Other platforms use V1 in the same file; NPU keeps its codec graph override.
 On Ascend NPU, `moss_tts_local_npu_mrv2.yaml` is an opt-in profile that runs the
-Talker (Stage0) on MRV2 with Ascend attention metadata and keeps the codec
-(Stage1) on V1 until MRV2 is supported in `NPUGenerationWorker`. The codec runs
-eagerly because its graph capture fails on A2 and A3 (#9812), and the Stage0
+Talker (Stage0) and codec (Stage1) on MRV2. The Talker builds Ascend attention
+metadata, and the codec inherits the NPU streaming graph settings from
+`moss_tts_local.yaml`. The Stage0
 first-frame direct decode is off on NPU because it needs CUDA-only kernels, so
 Stage1 delivers every chunk:
 

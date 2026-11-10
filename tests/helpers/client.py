@@ -43,6 +43,8 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
     from tests.helpers.runtime import OmniRunner
 
 logger = init_logger(__name__)
@@ -161,7 +163,7 @@ def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke", seed: int
 
     ``seed`` pins the policy's sampling noise for this request (see ``docs/serving/openpi_api.md``).
     """
-    identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
+    identity_eef_9d: NDArray[np.float32] = np.zeros((1, 1, 9), dtype=np.float32)
     identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
     observation: dict[str, Any] = {
         "session_id": session_id,
@@ -1510,13 +1512,18 @@ class OnlineOmniClient:
 
         return result
 
-    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_audio_speech_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Call the /v1/audio/speech endpoint using the same configuration-dict
         style as send_omni_request, but via the OpenAI Python client's
         audio.speech APIs.
 
-        Expected keys in request_config:
+        A list sends distinct requests concurrently and validates each response
+        against its own configuration. Results retain input order.
+
+        Expected keys in each request configuration:
           - model: model name/path (required)
           - input: text to synthesize (required)
           - response_format: audio format such as "wav" or "pcm" (optional)
@@ -1532,6 +1539,15 @@ class OnlineOmniClient:
         For negative / contract checks (expected 4xx), use
         :meth:`send_audio_speech_http_request` with ``err_code`` / ``err_message``.
         """
+        if isinstance(request_config, list):
+            if not request_config:
+                raise ValueError("request_config list must not be empty")
+            if request_num != 1:
+                raise ValueError("request_num is not supported when request_config is a list")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
+                config_futures = [executor.submit(self.send_audio_speech_request, config) for config in request_config]
+                return [config_future.result()[0] for config_future in config_futures]
+
         timeout = float(request_config.get("timeout", 120.0))
 
         model = request_config["model"]

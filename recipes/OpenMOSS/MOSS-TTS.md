@@ -171,14 +171,12 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ### NPU
 
-#### 1x Ascend A3 or A2 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
+#### 1x Ascend A3 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
 
-`moss_tts_local_npu_mrv2.yaml` is an opt-in profile. Stage0 (Talker) runs on
-Model Runner V2 with ACL graphs, and its model state builds Ascend attention
-metadata. Stage1 (codec) stays on V1 and runs eagerly, because its NPUGraph
-capture fails and blocks startup on A2 and A3
-([#9812](https://github.com/vllm-project/vllm-omni/issues/9812)). Stage0 does
-not send the first audio frame itself on NPU; Stage1 delivers every chunk.
+`moss_tts_local_npu_mrv2.yaml` is an opt-in profile with both stages on
+Model Runner V2. Stage0 (Talker) uses ACL graphs and builds Ascend attention
+metadata; Stage1 (codec) uses streaming NPUGraphs. Stage0 does not send the
+first audio frame itself on NPU; Stage1 delivers every chunk.
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
@@ -191,18 +189,16 @@ The startup log contains `NPU Model Runner V2 loaded
 MossTTSLocalTalkerForGeneration with Ascend attention metadata`. The speech
 request is the same as for GPU; Local 1.5 returns 48 kHz stereo audio.
 
-Validated on one Atlas A3 (910C) and one Atlas A2 (910B3) card with vLLM
-v0.32.0. On seed-tts English at concurrency 1, the measured profile has
-comparable WER and speaker similarity to V1, with audio RTF about 20% lower
-on A3 and 24% lower on A2. The baseline uses V1 Stage0 PIECEWISE because V1
-FULL graphs produced incorrect, nonterminating audio in this environment
-([#9952](https://github.com/vllm-project/vllm-omni/issues/9952)). V2 uses
-FULL_AND_PIECEWISE. At concurrency 4 and 16, the measurements show no
-consistent end-to-end advantage.
+The two-stage MRV2 profile is validated on Atlas A3 (910C) with vLLM v0.33.0,
+CANN 9.2.1 and torch_npu 2.10.0.post7. Codec warmup captures all 21 configured
+graphs, and speech requests use NPUGraph replay. Validation requests set
+`seed: 42`; non-streaming WAV and streaming PCM return 48 kHz stereo audio
+and pass transcription checks.
 
-Without this profile, NPU keeps Stage0 on V1. Do not use V1 Stage0 FULL graphs
-(`FULL_DECODE_ONLY` or `FULL_AND_PIECEWISE`) on NPU: they produce wrong audio
-that does not stop. V1 with `cudagraph_mode: PIECEWISE` is correct.
+The default NPU profile continues to use V1 for Stage0. Historical vLLM
+v0.32.0 validation and benchmark results, including the V1 graph-mode
+comparison, are recorded in the
+[PR evidence](https://github.com/vllm-project/vllm-omni/pull/9953#issuecomment-6676396983).
 
 ## Local 1.5 unified deployment and slot attention
 
