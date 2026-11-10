@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model Runner V2 binding of the omni prefix cache."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -123,7 +124,11 @@ def test_init_refuses_unmirrored_layouts(monkeypatch, block_sizes, dcp_size, mat
         ({"b"}, "latent", True, False),
     ],
 )
-def test_save_keeps_step_only_for_rewrites(rewrite_ids, output_type, written_in_sample, kept):
+def test_save_keeps_step_only_for_rewrites(monkeypatch, rewrite_ids, output_type, written_in_sample, kept):
+    from vllm.distributed import parallel_state
+
+    tp_group = MagicMock(return_value=SimpleNamespace(is_first_rank=True))
+    monkeypatch.setattr(parallel_state, "get_tp_group", tp_group)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.omni_prefix_cache = cache = _FakePrefixCache(rewrite_ids)
     runner._prefix_cache_group_view = view = MagicMock()
@@ -142,6 +147,7 @@ def test_save_keeps_step_only_for_rewrites(rewrite_ids, output_type, written_in_
         assert rewrite.rows == ((1, "b"),) and cache.consumed == []
     else:
         assert rewrite is None and cache.consumed == [("discard", 9)]
+        tp_group.assert_not_called()
 
 
 def test_save_is_a_noop_without_cache():
@@ -219,3 +225,119 @@ def test_rewrite_consumes_step_once_even_when_materialize_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="already consumed"):
         rewrite.discard()
     assert cache.consumed == [("materialize", 3)]
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "mp",
+        "mp_class",
+        "external_launcher",
+        "external_launcher_async",
+        "external_launcher_qualname",
+        "ray",
+        "mp_kv",
+        "mp_ec",
+    ],
+)
+def test_tp_output_consumption_recycles_staging_slots(monkeypatch, caplog, tp_rank, backend):
+    """Exercise vLLM 0.33's reply gate and local-output consumers on CPU."""
+    from vllm.distributed import parallel_state
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+    from vllm.v1.executor.uniproc_executor import ExecutorWithExternalLauncher
+
+    from tests.core.test_prefix_cache_mrv2 import input_batch, sched_output
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+    from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: SimpleNamespace(is_first_rank=tp_rank == 0))
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    executor_backend = backend
+    worker_cls = WorkerProc
+    if backend == "ray":
+        pytest.importorskip("ray")
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        worker_cls = RayWorkerProc
+    elif backend == "mp_class":
+        executor_backend = MultiprocExecutor
+    elif backend == "external_launcher_qualname":
+        executor_backend = "vllm.v1.executor.uniproc_executor.ExecutorWithExternalLauncher"
+    elif backend.startswith("mp_"):
+        executor_backend = "mp"
+    elif backend == "external_launcher_async":
+        # A class-valued backend must follow the same contract as its alias.
+        executor_backend = ExecutorWithExternalLauncher
+    cfg = PrefixCacheConfig(num_blocks=8, block_size=4, staging_depth=2, staging_claim_timeout_s=0)
+    cache = OmniPrefixCacheManager(cfg, eager=True)
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.omni_prefix_cache = cache
+    runner.is_pooling_model = False
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    runner._prefix_cache_group_view = MRv2FullAttentionGroupView(runner._prefix_cache_adapter, 4)
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="latent"),
+        parallel_config=SimpleNamespace(distributed_executor_backend=executor_backend),
+        kv_transfer_config=SimpleNamespace(is_kv_consumer=False) if backend == "mp_kv" else None,
+        ec_transfer_config=SimpleNamespace() if backend == "mp_ec" else None,
+    )
+    outputs = []
+    errors = []
+
+    def sample_tokens(req_id, computed):
+        runner._prefix_cache_step_begin(
+            sched_output(new=[(req_id, computed, [0, 1])], scheduled={req_id: 8 - computed})
+        )
+        batch = input_batch([(req_id, computed, 8 - computed)])
+        batch.num_tokens = batch.num_tokens_after_padding = 8 - computed
+        batch.query_start_loc_np = np.array([0, batch.num_tokens])
+        hidden = torch.arange(computed, 8, dtype=torch.float32).reshape(-1, 1)
+        rewrite = runner._prefix_cache_save_mrv2(batch, hidden, {})
+        finalize = runner._prefix_cache_output_finalizer(rewrite, None, mergeable=True)
+        return _async_output(req_ids=[req_id], text_hidden=hidden, input_batch=batch, finalize_output=finalize)
+
+    def handle_output(output):
+        if isinstance(output, Exception):
+            errors.append(output)
+        else:
+            outputs.append(output.get_output())
+
+    worker = worker_cls.__new__(worker_cls)
+    worker.rank = tp_rank
+    worker.worker = SimpleNamespace(sample_tokens=sample_tokens)
+    worker.handle_output = handle_output
+    all_ranks_consume = backend not in ("mp", "mp_class", "ray")
+    if backend.startswith("external_launcher"):
+        executor = ExecutorWithExternalLauncher.__new__(ExecutorWithExternalLauncher)
+        executor.driver_worker = worker.worker
+    try:
+        # Seed full rows, then repeatedly reuse the first block. Drive the real
+        # executor reply gate, rather than consuming every returned rewrite.
+        for index in range(8):
+            req_id = f"request-{index}"
+            args = (req_id, 0 if index == 0 else 4)
+            if backend.startswith("external_launcher"):
+                non_block = backend.endswith("_async")
+                result = executor.collective_rpc("sample_tokens", args=args, single_value=True, non_block=non_block)
+                outputs.append(result.result() if non_block else result)
+            else:
+                # Connector aggregation requests replies from every rank.
+                output_rank = None if all_ranks_consume else 0
+                worker._execute_worker_rpc(("sample_tokens", args, {}, output_rank))
+            runner._prefix_cache_step_begin(sched_output(finished=[req_id]))
+            # A bounded final count alone would miss contexts held between hits.
+            assert not cache._step_ctxs
+            assert not any(cache._controller._staging_pool._busy)
+        assert not errors
+        # Non-replying workers log RPC exceptions instead of returning them.
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+        assert not cache._step_ctxs
+        assert cache._controller.in_flight_tasks() == 0
+        assert not any(cache._controller._staging_pool._busy)
+        assert len(outputs) == (8 if tp_rank == 0 or all_ranks_consume else 0)
+        for output in outputs:
+            assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.arange(8).reshape(-1, 1))
+    finally:
+        cache.shutdown()
