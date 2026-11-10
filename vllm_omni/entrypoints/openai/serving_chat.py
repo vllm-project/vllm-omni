@@ -541,17 +541,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         preview + target + 1, the count the reference implementation truncates
         at) declare an ``ar_max_tokens_builder``. Calling it here matches the
         reference's truncation budget, so generation stops at the grid's token
-        count instead of running to the deploy-YAML ceiling. Without a builder
-        — or without an explicit target size — the stage keeps its configured
-        ceiling.
+        count instead of running to the deploy-YAML ceiling. A size-less
+        request is capped at the processor's default 1024x1024 grid budget,
+        the same grid the processor and the propagated positions build.
+        Models without a builder keep their configured ceiling.
         """
         if ar_idx is None or ar_idx >= len(sampling_params_list):
-            return
-        if height is None or width is None:
             return
         builder = get_ar_max_tokens_builder(self._resolve_multistage_model_class_name(engine))
         if builder is None:
             return
+        # Mirror the processor's resolution: a size-less request generates a
+        # 1024x1024 grid, so cap it at that grid's budget too instead of the
+        # deploy-YAML ceiling.
+        height = 1024 if height is None else height
+        width = 1024 if width is None else width
         sp = sampling_params_list[ar_idx]
         if hasattr(sp, "max_tokens"):
             sp.max_tokens = builder(height, width, is_i2i=is_i2i)
