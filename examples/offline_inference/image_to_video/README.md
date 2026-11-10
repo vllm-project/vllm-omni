@@ -1,7 +1,7 @@
 # Image-To-Video
 
 This shared example generates videos from images with VACE, Wan2.2, LTX-2,
-HunyuanVideo-1.5, SANA-Video, Cosmos3, MAGI-2, Kandinsky 6, and other compatible pipelines.
+HunyuanVideo-1.5, SANA-Video, Cosmos3, MAGI-2, Kandinsky 6, PAN 2, and other compatible pipelines.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -235,6 +235,22 @@ python image_to_video.py \
 See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, T2V, defaults, and advanced options.
 
+### PAN 2
+
+```bash
+python image_to_video.py \
+  --model IFM/PAN2 \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms swaying gently in the breeze, petals drifting across the frame" \
+  --output pan2_i2v_output.mp4
+```
+
+PAN 2 needs a structured prompt; the plain prompt above only shows the command.
+See the [PAN 2 recipe](../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`.
+
 ### SANA-Video-2B
 
 The checkpoint metadata selects the upstream T2V pipeline, so pass
@@ -344,8 +360,6 @@ Key arguments:
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
 - `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
-
-
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 

@@ -5,11 +5,12 @@ This example demonstrates how to deploy text-to-video models for online video ge
 ## Supported Models
 
 | Model | Model ID |
-|-------|----------|
+| ------- | ---------- |
 | Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| PAN 2 | `IFM/PAN2` |
 | Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
 | SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
@@ -36,6 +37,7 @@ bash run_server.sh
 ```
 
 The script allows overriding:
+
 - `MODEL` (default: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`)
 - `PORT` (default: `8091`)
 - `BOUNDARY_RATIO` (default: `0.875`)
@@ -51,6 +53,7 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
+
 - `POST /v1/videos`: create a video generation job (async)
 - `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
@@ -188,7 +191,7 @@ curl -X POST http://localhost:8091/v1/videos \
 | `fps`                 | int    | None    | Frames per second for output video               |
 | `num_inference_steps` | int    | None    | Number of denoising steps                        |
 | `guidance_scale`      | float  | None    | CFG guidance scale (low-noise stage)             |
-| `guidance_scale_2`    | float  | None    | CFG guidance scale (high-noise stage, Wan2.2)     |
+| `guidance_scale_2`    | float  | None    | CFG guidance scale (high-noise stage, Wan2.2)    |
 | `boundary_ratio`      | float  | None    | Boundary split ratio for low/high DiT (Wan2.2)   |
 | `flow_shift`          | float  | None    | Scheduler flow shift (Wan2.2)                    |
 | `seed`                | int    | None    | Random seed (reproducible)                       |
@@ -259,6 +262,30 @@ vllm serve Lightricks/LTX-2 --omni --port 8098
 
 See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, requests, defaults, and advanced options.
+
+## PAN 2
+
+```bash
+# One GPU with ~100 GiB free; see the recipe for multi-GPU and smaller GPUs.
+vllm serve IFM/PAN2 --omni --port 8091
+```
+
+```bash
+create_response=$(curl -s http://localhost:8091/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=A paper boat drifts down a rain-soaked street gutter, reflections of neon signs rippling around it." \
+  -F "seed=42")
+video_id=$(echo "$create_response" | jq -r '.id')
+```
+
+Poll and download the result as shown in [Poll Until
+Complete](#poll-until-complete). PAN 2 needs a structured prompt; the plain
+prompt above only shows the command. See the [PAN 2
+recipe](../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`. `--no-guardrails`
+turns them off at your own risk.
 
 ## Helios
 

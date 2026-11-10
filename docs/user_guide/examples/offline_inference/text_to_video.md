@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_video>.
 
-
 A unified script for text-to-video generation. Supports multiple models with model-aware defaults.
 
 For backend selection and SageAttention usage, see the [Diffusion Attention Backends](../../diffusion/attention_backends.md) guide.
@@ -10,9 +9,10 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 ## Supported Models
 
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `robbyant/lingbot-video-dense-1.3b` / `robbyant/lingbot-video-moe-30b-a3b` | 192x320 | 9 | 2 | 3.0 | ~68 GiB (MoE smoke) |
+| `IFM/PAN2` | 704x1248 | 313 | 50 | 2.5 | ~100 GiB (1 GPU); 32 GB GPUs with offload |
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
@@ -68,6 +68,21 @@ python text_to_video.py \
 
 See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, I2V, defaults, and advanced options.
+
+### PAN 2
+
+```bash
+python text_to_video.py \
+  --model IFM/PAN2 \
+  --prompt "A red fox trots through fresh snow in a quiet pine forest at dawn, steam rising from its breath." \
+  --output pan2_output.mp4
+```
+
+PAN 2 needs a structured prompt; the plain prompt above only shows the command.
+See the [PAN 2 recipe](../../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -187,7 +202,7 @@ accepts `motion_score`, `clean_caption`, and `use_resolution_binning` through
 ### HunyuanVideo-1.5 Optimal Configs
 
 | Variant | flow_shift | guidance_scale | steps |
-|---------|-----------|----------------|-------|
+| --------- | ----------- | ---------------- | ------- |
 | 480p T2V | 5.0 | 6.0 | 50 |
 | 720p T2V | 9.0 | 6.0 | 50 |
 | 480p I2V | 5.0 | 6.0 | 50 |
