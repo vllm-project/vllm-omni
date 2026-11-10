@@ -37,6 +37,28 @@ On CUDA and NPU the same file selects model runner v2 for all three stages. The 
 The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
 XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
 
+The standard launch above is turn-based. To expose the Realtime duplex route
+using Qwen3's opt-in chat-fallback bridge, select its dedicated overlay:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_chat_fallback.yaml
+```
+
+Then run the model-neutral barge-in client:
+
+```bash
+python examples/online_serving/barge_in_client.py --preset none \
+    --url ws://localhost:8091/v1/duplex \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --question-wav input_16k_mono.wav \
+    --interrupt-wav follow_up_16k_mono.wav \
+    --output-dir ./duplex_out
+```
+
+The default fallback overlay disables asynchronous chunk streaming. The separate
+`qwen3_omni_chat_fallback_streaming.yaml` enables incremental output; both
+profiles start the fallback request after the input turn is committed.
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
 BF16 or FP16. This avoids incorrect low-precision convolutions that can make

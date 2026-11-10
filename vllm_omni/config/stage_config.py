@@ -473,8 +473,9 @@ class PipelineConfig:
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
-    # Dotted path of the model's ``DuplexModelPlugin``. Online serving uses
-    # DuplexOmni only when the deploy configuration selects session_mode: duplex.
+    # Dotted path of the model's optional ``DuplexModelPlugin``. The effective
+    # deploy profile must also declare ``session_mode: duplex`` before
+    # ``vllm-omni serve`` selects ``DuplexOmni``.
     duplex_plugin: str | None = None
     # Preserve legacy turn deployments when adding an optional duplex plugin.
     default_session_mode: str | None = None

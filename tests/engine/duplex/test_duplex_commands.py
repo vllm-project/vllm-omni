@@ -135,6 +135,25 @@ def test_append_audio_decodes_and_converts_pcm16_to_16k_float32():
     assert command.audio_end_ms is None
 
 
+def test_append_audio_preserves_pcm_f32le_capture_rate():
+    source = np.sin(np.linspace(0, 2 * np.pi, 24, endpoint=False)).astype("<f4")
+    encoded = base64.b64encode(source.tobytes()).decode("ascii")
+
+    command = command_from_realtime(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": encoded,
+            "format": "pcm_f32le",
+            "sample_rate_hz": 24_000,
+        }
+    )
+
+    assert isinstance(command, AppendAudio)
+    assert command.format == "pcm_f32le"
+    assert command.sample_rate_hz == 24_000
+    assert command.audio == source.tobytes()
+
+
 def test_append_audio_defaults_come_from_the_session_payload():
     defaults = RealtimeInputDefaults().with_session_payload({"input_audio_format": "pcm16", "sample_rate_hz": 8000})
     assert defaults.input_audio_format == "pcm16"
@@ -277,6 +296,46 @@ def test_malformed_payloads_raise_command_error_with_code(payload: dict[str, obj
 
     assert excinfo.value.code == code
     assert excinfo.value.event_id == "evt-bad"
+
+
+def test_turn_based_interrupt_response_is_deferred_to_engine_capabilities():
+    command = translate_realtime_command(
+        {
+            "type": "session.update",
+            "session": {"turn_detection": {"type": "server_vad", "interrupt_response": False}},
+        }
+    )
+
+    assert isinstance(command, UpdateSession)
+    assert command.patch["turn_detection"]["interrupt_response"] is False
+
+
+@pytest.mark.parametrize("overlap_policy", ["listen_only", "barge_in_on_speech"])
+def test_session_update_defers_omitted_vad_interrupt_default(overlap_policy: str):
+    patch = {"turn_detection": {"type": "server_vad"}, "overlap_policy": overlap_policy}
+
+    command = translate_realtime_command({"type": "session.update", "session": patch})
+
+    assert isinstance(command, UpdateSession)
+    assert command.patch == patch
+
+
+@pytest.mark.parametrize(
+    ("turn_detection", "overlap_policy"),
+    [
+        ({"type": "server_vad", "interrupt_response": True}, "listen_only"),
+        ({"type": "server_vad", "interrupt_response": False}, "barge_in_on_speech"),
+        ({"type": "server_vad", "interrupt_response": None}, "listen_only"),
+        (None, "barge_in_on_speech"),
+    ],
+)
+def test_session_update_rejects_explicit_vad_overlap_conflicts(turn_detection, overlap_policy):
+    with pytest.raises(DuplexCommandError) as excinfo:
+        translate_realtime_command(
+            {"type": "session.update", "session": {"turn_detection": turn_detection, "overlap_policy": overlap_policy}}
+        )
+
+    assert excinfo.value.code == "unsupported_turn_detection"
 
 
 # ---- payload() rendering ----
