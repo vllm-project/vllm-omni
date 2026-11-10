@@ -58,6 +58,9 @@ SCHEMA = "vllm_omni.shard_timings.merged.v1"
 SUCCESS_STATES = frozenset({"passed", "finished"})
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?', re.IGNORECASE)
+# TEMPORARY: delete after the CI check. Build 19202 failed, so the passed-only
+# listing skips it, but jobs that finished still uploaded timings/jobs.
+_TEMPORARY_READY_BUILD = ("01a1c572-3981-4193-a5d7-cc49ad086d49", "19202")
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -288,6 +291,26 @@ def _fetch_page(url: str, *, token: str | None = None) -> tuple[str, str | None]
         return body, _next_link(response.headers.get("Link", ""))
 
 
+def _with_temporary_ready_build(
+    found: list[tuple[str, str]],
+    *,
+    branch: str,
+    fetch: Callable[..., tuple[str, str | None]],
+    current_build_id: str,
+) -> list[tuple[str, str]]:
+    """Prepend failed build 19202 on a real Ready listing. Delete with the constant."""
+    if branch or fetch is not _fetch_page:
+        return found
+    build_id, number = _TEMPORARY_READY_BUILD
+    if build_id == current_build_id or any(item[0] == build_id or item[1] == number for item in found):
+        return found
+    print(
+        f"merge-shard-timings: temporary include of failed build #{number} for artifact-history verification",
+        file=sys.stderr,
+    )
+    return [(build_id, number), *found]
+
+
 def list_recent_build_ids(
     *,
     branch: str,
@@ -333,9 +356,9 @@ def list_recent_build_ids(
         except (OSError, UnicodeError, ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
             print(f"merge-shard-timings: API list failed ({exc})", file=sys.stderr)
             if found:
-                return found
+                return _with_temporary_ready_build(found, branch=branch, fetch=fetch, current_build_id=current_build_id)
         else:
-            return found
+            return _with_temporary_ready_build(found, branch=branch, fetch=fetch, current_build_id=current_build_id)
 
     base = _pipeline_url()
     if not base:
@@ -374,7 +397,7 @@ def list_recent_build_ids(
         found.append((build_id, str(number)))
         if len(found) >= limit:
             break
-    return found
+    return _with_temporary_ready_build(found, branch=branch, fetch=fetch, current_build_id=current_build_id)
 
 
 def _run_agent(args: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
