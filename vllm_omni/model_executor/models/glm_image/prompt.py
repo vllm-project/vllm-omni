@@ -4,6 +4,11 @@
 import math
 from typing import NamedTuple
 
+# GLM-Image's default generation target size in pixels: the processor's
+# _build_generation_grids falls back to it, and the serving cap resolves
+# size-less requests against the same grid.
+DEFAULT_TARGET_SIZE = 1024
+
 
 class GridTokenLayout(NamedTuple):
     """Token-grid geometry for one GLM-Image target size at factor=32.

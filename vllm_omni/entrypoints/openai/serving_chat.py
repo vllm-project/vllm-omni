@@ -49,6 +49,7 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
+from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
     build_text_to_image_prompt,
@@ -554,8 +555,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Mirror the processor's resolution: a size-less request generates a
         # 1024x1024 grid, so cap it at that grid's budget too instead of the
         # deploy-YAML ceiling.
-        height = 1024 if height is None else height
-        width = 1024 if width is None else width
+        height = DEFAULT_TARGET_SIZE if height is None else height
+        width = DEFAULT_TARGET_SIZE if width is None else width
         sp = sampling_params_list[ar_idx]
         if hasattr(sp, "max_tokens"):
             sp.max_tokens = builder(height, width, is_i2i=is_i2i)
@@ -987,15 +988,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         request.modalities,
                     )
 
+                # The AR stage index does not depend on the request size;
+                # only the extra_args write below does. Size-less multistage
+                # requests still cap their AR budget — the cap resolves the
+                # processor's default grid itself. Single-stage engines have
+                # no AR stage to cap.
                 comprehension_idx = (
-                    self._get_comprehension_stage_index()
-                    if _image_gen_height is not None and _image_gen_width is not None
-                    else None
+                    None if is_single_stage_diffusion(self.engine_client) else self._get_comprehension_stage_index()
                 )
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
-                    if idx == comprehension_idx:
+                    has_image_size = _image_gen_height is not None and _image_gen_width is not None
+                    if idx == comprehension_idx and has_image_size:
                         extra_args = dict(getattr(sp, "extra_args", {}) or {})
                         extra_args["target_h"] = int(_image_gen_height)
                         extra_args["target_w"] = int(_image_gen_width)

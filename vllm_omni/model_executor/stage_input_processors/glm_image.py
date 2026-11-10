@@ -11,7 +11,7 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.glm_image.prompt import grid_token_layout
+from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE, grid_token_layout
 
 logger = init_logger(__name__)
 
@@ -252,11 +252,11 @@ def ar2diffusion(
     # then fall back to top-level fields for backward compatibility.
     height = _coerce_dim(
         mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("height"), 1024),
+        _coerce_dim(original_prompt.get("height"), DEFAULT_TARGET_SIZE),
     )
     width = _coerce_dim(
         mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("width"), 1024),
+        _coerce_dim(original_prompt.get("width"), DEFAULT_TARGET_SIZE),
     )
     text_prompt = original_prompt.get("prompt", "")
 

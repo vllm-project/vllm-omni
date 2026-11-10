@@ -96,7 +96,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from vllm_omni.model_executor.models.glm_image.prompt import grid_token_layout
+from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE, grid_token_layout
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -436,10 +436,14 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         )
         if target_h is None or target_w is None:
             target_h = (
-                hf_processor_mm_kwargs.get("height") if isinstance(hf_processor_mm_kwargs.get("height"), int) else 1024
+                hf_processor_mm_kwargs.get("height")
+                if isinstance(hf_processor_mm_kwargs.get("height"), int)
+                else DEFAULT_TARGET_SIZE
             )
             target_w = (
-                hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
+                hf_processor_mm_kwargs.get("width")
+                if isinstance(hf_processor_mm_kwargs.get("width"), int)
+                else DEFAULT_TARGET_SIZE
             )
 
         # Same preview-grid construction as HF's processor; both go through
