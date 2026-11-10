@@ -278,29 +278,33 @@ class OmniServer:
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
         # Inherit stdout (INFO still shows in CI); capture stderr only for the
-        # exited-before-ready RuntimeError message.
+        # exited-before-ready RuntimeError message. errors=replace keeps the
+        # reader alive on undecodable bytes so a full pipe cannot hang serve.
         self._server_error_lines = deque(maxlen=100)
+        self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
-        assert self.proc.stderr is not None
-        error_lines = self._server_error_lines
-        stderr = self.proc.stderr
+        stderr = getattr(self.proc, "stderr", None)
+        # Test doubles may omit a pipe; skip capture rather than asserting.
+        if stderr is not None:
+            error_lines = self._server_error_lines
 
-        def _drain_stderr() -> None:
-            try:
-                for line in stderr:
-                    error_lines.append(line)
-            except Exception:
-                pass
+            def _drain_stderr() -> None:
+                try:
+                    for line in stderr:
+                        error_lines.append(line)
+                except Exception:
+                    pass
 
-        self._server_log_thread = threading.Thread(target=_drain_stderr, name="omni-server-stderr", daemon=True)
-        self._server_log_thread.start()
+            self._server_log_thread = threading.Thread(target=_drain_stderr, name="omni-server-stderr", daemon=True)
+            self._server_log_thread.start()
 
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
@@ -474,6 +478,25 @@ class OmniServer:
             return ""
         return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
 
+    def _stop_stderr_reader(self) -> None:
+        """Join the drain thread; close stderr only if the reader has stopped.
+
+        Closing the pipe from this thread while the reader is blocked in
+        ``readline`` can hang (e.g. a descendant still holds the write end).
+        Prefer abandoning a stuck daemon reader over blocking ``__exit__``.
+        """
+        thread = self._server_log_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        if thread is None or not thread.is_alive():
+            stderr = getattr(self.proc, "stderr", None) if self.proc is not None else None
+            if stderr is not None:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
+        self._server_log_thread = None
+
     def __enter__(self):
         try:
             self._start_server()
@@ -489,14 +512,7 @@ class OmniServer:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
-            if self.proc is not None and self.proc.stderr is not None:
-                try:
-                    self.proc.stderr.close()
-                except Exception:
-                    pass
-            if self._server_log_thread is not None:
-                self._server_log_thread.join(timeout=2)
-                self._server_log_thread = None
+            self._stop_stderr_reader()
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
