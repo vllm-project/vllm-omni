@@ -119,7 +119,7 @@ def test_npu_host_lengths_custom_op_preserves_mutation_and_valid_lengths(monkeyp
     seen = []
 
     def attention(q, kc, vc, **kwargs):
-        seen.append(kwargs["npu_lengths"])
+        seen.append((kwargs["npu_lengths"], kwargs["fp8_fa_mode"], kwargs["rotate_qk"]))
         # Return independent storage, as required by the custom-op contract.
         return q + kc.flatten(0, 1)[slots] + vc.flatten(0, 1)[slots]
 
@@ -147,8 +147,10 @@ def test_npu_host_lengths_custom_op_preserves_mutation_and_valid_lengths(monkeyp
         torch.empty(0),
         False,
         0,
+        "C8V16_TILING512",
+        True,
     )
-    assert seen == [(3, 5)]
+    assert seen == [((3, 5), "C8V16_TILING512", True)]
     torch.testing.assert_close(key_pool[slots], keys)
     torch.testing.assert_close(value_pool[slots], values)
     torch.testing.assert_close(output, query + keys + values)

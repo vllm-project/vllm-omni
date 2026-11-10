@@ -714,6 +714,8 @@ def ar_diffusion_paged_attention(
     current_tokens: int = 0,
     stage_first_block: int = 0,
     npu_lengths: tuple[int, int] | None = None,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
     """Run non-causal paged attention over a vLLM block table.
 
@@ -741,6 +743,8 @@ def ar_diffusion_paged_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             host_lengths=npu_lengths,
+            fp8_fa_mode=fp8_fa_mode,
+            rotate_qk=rotate_qk,
             stage_key=stage_key,
             stage_value=stage_value,
             reuse_history=reuse_history,
@@ -920,6 +924,8 @@ def _paged_write_attn_impl(
     reuse_history: bool = False,
     stage_first_block: int = 0,
     npu_lengths: tuple[int, int] | None = None,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
     from vllm_omni.experimental.ar_diffusion.kv_cache.slot_write import write_kv_slots
 
@@ -947,6 +953,8 @@ def _paged_write_attn_impl(
         current_tokens=int(k_curr.shape[0]),
         stage_first_block=stage_first_block,
         npu_lengths=npu_lengths,
+        fp8_fa_mode=fp8_fa_mode,
+        rotate_qk=rotate_qk,
     )
 
 
@@ -1061,6 +1069,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_npu_paged_write_attn"):
         stage_value: torch.Tensor,
         reuse_history: bool,
         stage_first_block: int,
+        fp8_fa_mode: str = "",
+        rotate_qk: bool = False,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -1084,6 +1094,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_npu_paged_write_attn"):
             reuse_history=reuse_history,
             stage_first_block=stage_first_block,
             npu_lengths=(query_len, kv_len),
+            fp8_fa_mode=fp8_fa_mode,
+            rotate_qk=rotate_qk,
         )
 
     @_npu_paged_write_attn_op.register_fake
@@ -1110,14 +1122,27 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_npu_paged_write_attn"):
         stage_value,
         reuse_history,
         stage_first_block,
+        fp8_fa_mode="",
+        rotate_qk=False,
     ):
         return torch.empty_like(query)
 
 
 def paged_write_attn(
-    inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act, softmax_scale: float
+    inputs: ARDiffusionPagedLayerInputs,
+    query,
+    k_curr,
+    v_curr,
+    k_act,
+    v_act,
+    softmax_scale: float,
+    *,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
     """Model-facing entry: routes through the custom op (traceable in fullgraph)."""
+    if fp8_fa_mode and inputs.npu_lengths is None:
+        raise ValueError("Paged FP8 FIA requires lingbot_npu_host_lengths")
     if inputs.npu_lengths is not None and query.device.type == "npu":
         return torch.ops.vllm_omni.ar_diffusion_npu_paged_write_attn(
             query,
@@ -1141,6 +1166,8 @@ def paged_write_attn(
             inputs.stage_value,
             inputs.reuse_history,
             inputs.stage_first_block,
+            fp8_fa_mode,
+            rotate_qk,
         )
     return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
         query,

@@ -1,8 +1,6 @@
 # Accuracy-changing performance candidates, eager TP1/Ulysses4.
 # MXFP8 Linear and native Q/K RMSNorm change output; quality unvalidated.
 # Set VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 for staged history reuse.
-# Optional attention: VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE=C8V16_TILING512.
-# Optional head-major KV staging for EagleFIA: VLLM_OMNI_LINGBOT_FP8_FIA_BNSD_GATHER=1.
 # No sparse BSA selection or VAE normalization restoration/fusion.
 pipeline: lingbot_world
 async_chunk: false
@@ -13,6 +11,14 @@ stages:
     devices: "0,1,2,3"
     max_num_seqs: 1
     enforce_eager: true
+    diffusion_attention_config:
+      per_role:
+        self:
+          backend: FLASH_ATTN
+          npu_quant:
+            precision: fp8
+            fp8_fa_mode: C8V16_TILING512
+            qk_rotation: none
     model_class_name: LingBotWorldCausalDMDPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     step_execution: true

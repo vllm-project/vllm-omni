@@ -2186,6 +2186,23 @@ class BlockSparseSpec:
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
+@dataclass(frozen=True)
+class NPUAttentionQuantSpec:
+    """MindIE-SD block FP8 options for the NPU FLASH_ATTN implementation."""
+
+    precision: str = "fp8"
+    fp8_fa_mode: str = "HIGH_PRECISION"
+    qk_rotation: str = "hadamard"
+
+    def __post_init__(self) -> None:
+        if self.precision != "fp8":
+            raise ValueError("npu_quant currently supports only fp8 precision")
+        if self.fp8_fa_mode not in ("HIGH_PRECISION", "C8V16_TILING512"):
+            raise ValueError("npu_quant.fp8_fa_mode must be HIGH_PRECISION or C8V16_TILING512")
+        if self.qk_rotation not in ("hadamard", "none"):
+            raise ValueError("npu_quant.qk_rotation must be hadamard or none")
+
+
 @dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
@@ -2193,6 +2210,7 @@ class AttentionSpec:
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    npu_quant: NPUAttentionQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
@@ -2205,6 +2223,9 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.npu_quant = self._coerce(self.npu_quant, NPUAttentionQuantSpec, "npu_quant")
+        if self.npu_quant is not None and self.backend.upper() != "FLASH_ATTN":
+            raise ValueError("npu_quant requires the FLASH_ATTN backend")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
@@ -2283,6 +2304,8 @@ class AttentionSpec:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
             if quant_kw:
                 kw["quant"] = quant_kw
+        if self.npu_quant is not None:
+            kw["npu_quant"] = self.npu_quant
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
         if self.sparge is not None:
@@ -2376,6 +2399,7 @@ class AttentionConfig:
             "backend",
             "skip_softmax",
             "quant",
+            "npu_quant",
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",

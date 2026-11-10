@@ -3,11 +3,37 @@
 """Dense FP8 EagleFIA using MindIE-SD's coupled C8V16/V512 mode."""
 
 import math
+from collections.abc import Callable
 
 import torch
 
 
-def eagle_fp8_fia(query, key, value, *, scale, kv_head_major=False):
+def quant_attention_npu(
+    runtime: Callable[..., torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    precision: str,
+    layout: str,
+    scale: float,
+    fp8_fa_mode: str | None = None,
+    rotate_qk: bool = True,
+) -> torch.Tensor:
+    kwargs = dict(precision=precision, layout=layout, scale=scale)
+    if fp8_fa_mode is not None:
+        kwargs["fp8_fa_mode"] = fp8_fa_mode
+    if rotate_qk:
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
+
+        rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
+        kwargs.update(q_rot=rotation, k_rot=rotation)
+    return runtime(query, key, value, **kwargs)
+
+
+def eagle_fp8_fia(
+    query, key, value, *, scale, kv_head_major=False, fp8_fa_mode="C8V16_TILING512", rotate_qk=False
+):
     if query.ndim != 3 or key.ndim != 3 or key.shape != value.shape:
         raise ValueError("EagleFIA requires TND Q and matching rank-three K/V")
     kv_heads = key.shape[0 if kv_head_major else 1]
@@ -30,14 +56,16 @@ def eagle_fp8_fia(query, key, value, *, scale, kv_head_major=False):
         k, v = key.unsqueeze(0), value.unsqueeze(0)
     else:
         k, v = (x.transpose(0, 1).unsqueeze(0).contiguous() for x in (key, value))
-    out = quant_attention(
+    out = quant_attention_npu(
+        quant_attention,
         q,
         k,
         v,
         precision="fp8",
         layout="BNSD",
         scale=scale,
-        fp8_fa_mode=FP8FAMode.C8V16_TILING512,
+        fp8_fa_mode=FP8FAMode(fp8_fa_mode),
+        rotate_qk=rotate_qk,
     )
     if out.shape != q.shape or out.dtype != query.dtype:
         raise RuntimeError("MindIE FP8 EagleFIA output contract mismatch")

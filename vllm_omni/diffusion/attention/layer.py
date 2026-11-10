@@ -222,6 +222,8 @@ class Attention(nn.Module):
                 )
             self.attn_spec = spec
             if spec is not None:
+                if scheduler_paged_kv and paged_kv_cache_role is not None and spec.npu_quant is not None:
+                    raise ValueError("FLASH_ATTN npu_quant does not support scheduler-owned paged KV")
                 backend_kwargs = spec.backend_kwargs()
                 self.backend_pref = spec.backend
                 self.backend_explicit = True

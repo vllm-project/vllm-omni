@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ascend paged self-attention for AR diffusion."""
 
-import os
-
 import torch
 
 
@@ -23,6 +21,8 @@ def npu_paged_attention(
     softmax_scale: float,
     causal: bool = False,
     host_lengths: tuple[int, int] | None = None,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
     stage_key: torch.Tensor | None = None,
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
@@ -53,14 +53,8 @@ def npu_paged_attention(
     block_size = key_cache.shape[1]
     num_blocks = (int(max_seq_len) + block_size - 1) // block_size
     block_ids = block_table[0, :num_blocks].long()
-    # Host lengths are an explicit opt-in from the LingBot deployment.
-    # Keep the process-wide FP8 setting out of other paged attention callers.
-    fp8_fia_mode = os.environ.get("VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE") if host_lengths is not None else None
-    if fp8_fia_mode:
-        if fp8_fia_mode != "C8V16_TILING512":
-            raise ValueError("FP8 FIA mode must be C8V16_TILING512")
-        if causal:
-            raise ValueError("Dense FP8 EagleFIA currently requires noncausal block attention")
+    if fp8_fa_mode and (causal or host_lengths is None):
+        raise ValueError("Paged FP8 FIA requires noncausal attention and explicit host lengths")
     staging = (
         contiguous_kv_gather_enabled()
         and stage_key is not None
@@ -76,8 +70,7 @@ def npu_paged_attention(
         if not 0 <= stage_first_block < num_blocks:
             raise ValueError("NPU stage_first_block must address a visible block")
         if (
-            fp8_fia_mode == "C8V16_TILING512"
-            and os.environ.get("VLLM_OMNI_LINGBOT_FP8_FIA_BNSD_GATHER") == "1"
+            fp8_fa_mode == "C8V16_TILING512"
             and host_lengths is not None
             and key_cache.dtype == value_cache.dtype == torch.bfloat16
             and key_cache.shape == value_cache.shape
@@ -94,7 +87,15 @@ def npu_paged_attention(
             k, v = gather_kv_bnsd(
                 key_cache, value_cache, block_ids, kv_len, stage_key, stage_value, first_block=first_block
             )
-            return eagle_fp8_fia(query_flat, k, v, scale=softmax_scale, kv_head_major=True).reshape(query.shape)
+            return eagle_fp8_fia(
+                query_flat,
+                k,
+                v,
+                scale=softmax_scale,
+                kv_head_major=True,
+                fp8_fa_mode=fp8_fa_mode,
+                rotate_qk=rotate_qk,
+            ).reshape(query.shape)
         staged_k, staged_v = stage_key[:capacity], stage_value[:capacity]
         _stage_window(
             staged_k,
@@ -115,12 +116,17 @@ def npu_paged_attention(
         kv_len = int(seq_lens[0].item())
         actual_seq_q = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int32).cpu().tolist()
         actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
-    if fp8_fia_mode:
+    if fp8_fa_mode:
         from vllm_omni.platforms.npu.attention.eagle_fp8_fia import eagle_fp8_fia
 
-        return eagle_fp8_fia(query_flat, gathered_k[:kv_len], gathered_v[:kv_len], scale=softmax_scale).reshape(
-            query.shape
-        )
+        return eagle_fp8_fia(
+            query_flat,
+            gathered_k[:kv_len],
+            gathered_v[:kv_len],
+            scale=softmax_scale,
+            fp8_fa_mode=fp8_fa_mode,
+            rotate_qk=rotate_qk,
+        ).reshape(query.shape)
     out = torch_npu.npu_fusion_attention(
         query_flat.contiguous(),
         gathered_k[:kv_len].contiguous(),

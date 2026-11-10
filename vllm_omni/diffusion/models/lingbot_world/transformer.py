@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -242,6 +243,10 @@ class LingBotSelfAttention(nn.Module):
             prefix=prefix,
             skip_sequence_parallel=True,
         )
+        quant = getattr(getattr(self.attn, "attn_spec", None), "npu_quant", None)
+        self.configured_fp8_fa_mode = quant.fp8_fa_mode if quant is not None else ""
+        self.fp8_fa_mode = self.configured_fp8_fa_mode
+        self.rotate_qk = quant is not None and quant.qk_rotation == "hadamard"
 
     def _update_cache(
         self,
@@ -375,6 +380,8 @@ class LingBotSelfAttention(nn.Module):
                 None,
                 None,
                 self.head_dim**-0.5,
+                fp8_fa_mode=self.fp8_fa_mode,
+                rotate_qk=self.rotate_qk,
             ).unsqueeze(0)
         else:
             # The direct path sees history + current K/V even when the caller
@@ -425,6 +432,8 @@ class LingBotSelfAttention(nn.Module):
                     npu_lengths=(query.shape[1], visible_key.shape[1])
                     if self.npu_host_lengths and query.device.type == "npu"
                     else None,
+                    fp8_fa_mode=self.fp8_fa_mode,
+                    rotate_qk=self.rotate_qk,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -1111,7 +1120,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             raise ValueError("LingBot NPU optimization options must be booleans")
         self.cache_block_conditions = cache_block_conditions
         self.npu_host_lengths = host_lengths
+        legacy_mode = os.environ.get("VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE", "") if host_lengths else ""
+        if legacy_mode not in ("", "C8V16_TILING512"):
+            raise ValueError("Legacy FP8 FIA mode must be C8V16_TILING512")
         for block in self.blocks:
+            block.self_attn.fp8_fa_mode = block.self_attn.configured_fp8_fa_mode or legacy_mode
             block.self_attn.npu_host_lengths = host_lengths
             block.npu_fused_adaln = fused_adaln
             block.npu_fused_residual = fused_residual

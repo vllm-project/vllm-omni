@@ -5,7 +5,7 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -27,7 +27,7 @@ def test_dense_rectangular_tails_and_mode(monkeypatch, q_len, k_len, kv_head_maj
     provider = ModuleType("mindiesd.layers.flash_attn.quant_flash_attn")
     mode = ModuleType("mindiesd.quantization.mode")
     sentinel = object()
-    mode.FP8FAMode = SimpleNamespace(C8V16_TILING512=sentinel)
+    mode.FP8FAMode = lambda name: sentinel if name == "C8V16_TILING512" else None
     calls = []
 
     def quant(q, k, v, **kw):

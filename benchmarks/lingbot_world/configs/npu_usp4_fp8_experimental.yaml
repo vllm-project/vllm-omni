@@ -2,7 +2,6 @@
 # MXFP8 Linear and native Q/K RMSNorm change output; quality unvalidated.
 # Set VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 for staged history reuse.
 # Optional attention: VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE=C8V16_TILING512.
-# Optional head-major KV staging for EagleFIA: VLLM_OMNI_LINGBOT_FP8_FIA_BNSD_GATHER=1.
 # No sparse BSA selection or VAE normalization restoration/fusion.
 pipeline: lingbot_world
 async_chunk: false

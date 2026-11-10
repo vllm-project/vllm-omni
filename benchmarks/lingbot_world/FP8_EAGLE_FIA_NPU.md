@@ -36,3 +36,6 @@ separately. Preserve short and long KV cases, three timing trials, independent
 profiling, and output accuracy. Do not combine two changes in one attribution.
 
 EagleFIA requires `model_config.lingbot_npu_host_lengths: true`. Generic NPU paged attention retains its default backend when the environment variable is set.
+
+
+The stacked deploy preset configures `stages[].diffusion_attention_config.per_role.self.npu_quant` on `FLASH_ATTN`. Set `fp8_fa_mode: C8V16_TILING512` and `qk_rotation: none` to match the previous LingBot runs. The legacy FIA environment variable remains accepted by LingBot at initialization. Tiling512 uses head-major gather when compatible staging is available.
