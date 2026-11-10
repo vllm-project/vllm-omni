@@ -509,6 +509,8 @@ def test_kstep_control_rows_pad_uneven_counts_and_skip_chunked_prefill():
     assert _adopted(rows, num_sampled) == [[], [7, 8, 9]]
     assert num_sampled.tolist() == [0, 3]
     assert num_rejected.tolist() == [0, 0]
+
+
 def test_mrv2_output_marks_each_draft_row() -> None:
     talker = _talker()
     prompt_lens = {0: 4, 1: 4, 3: 4096 - 100}

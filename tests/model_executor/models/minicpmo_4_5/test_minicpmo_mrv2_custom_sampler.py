@@ -47,17 +47,16 @@ def test_duplex_kstep_returns_no_speculator(fake_sampler):
     # Duplex + K>0 is how the K-step count reaches the Talker; it must not
     # raise and must not install a draft speculator.
     talker = _talker("duplex", 8)
-    assert tts_mod.MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(
-        talker, fake_sampler
-    ) == (fake_sampler, None)
+    assert tts_mod.MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(talker, fake_sampler) == (
+        fake_sampler,
+        None,
+    )
 
 
 def test_no_spec_config_returns_no_speculator(fake_sampler):
     talker = _talker("duplex", 8)
     talker.vllm_config.speculative_config = None
-    assert MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(
-        talker, fake_sampler
-    ) == (fake_sampler, None)
+    assert MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(talker, fake_sampler) == (fake_sampler, None)
 
 
 def test_turn_session_installs_rejection_sampler(fake_sampler, monkeypatch):

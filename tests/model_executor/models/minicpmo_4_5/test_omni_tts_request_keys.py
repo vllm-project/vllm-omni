@@ -8,9 +8,13 @@ something else silently degrades to the batch row index, which is reused
 whenever a slot is recycled, so the release path can never match the entry.
 """
 
+import pytest
+
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _request_key,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_request_key_prefers_engine_req_id():
@@ -50,9 +54,7 @@ def _decode_preprocess_is_identity(k_frames):
         MiniCPMO45OmniTTSForConditionalGeneration,
     )
 
-    prop = MiniCPMO45OmniTTSForConditionalGeneration.__dict__[
-        "mrv2_decode_preprocess_is_identity"
-    ]
+    prop = MiniCPMO45OmniTTSForConditionalGeneration.__dict__["mrv2_decode_preprocess_is_identity"]
     fake = types.SimpleNamespace(_k_step_frames=k_frames)
     return bool(prop.__get__(fake, MiniCPMO45OmniTTSForConditionalGeneration))
 

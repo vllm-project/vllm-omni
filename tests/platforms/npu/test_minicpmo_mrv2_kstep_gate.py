@@ -16,7 +16,10 @@ import pytest
 
 pytest.importorskip("vllm_ascend")
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms.npu.worker import npu_omni_v2_model_runner as runner_mod
+
+pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 KSTEP_SPEC = {"method": "ngram", "num_speculative_tokens": 7}  # K = 8
 
@@ -130,7 +133,7 @@ def test_prefill_decline_disarms_kstep_state():
 def test_propose_draft_tokens_falls_back_after_decline(monkeypatch):
     # After a declined step the runner must defer to the base proposal flow
     # instead of writing speculative CONTINUE rows.
-    seen = {}
+    seen: dict[str, object] = {}
     monkeypatch.setattr(
         runner_mod.OmniARModelRunner,
         "_propose_draft_tokens",

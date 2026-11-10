@@ -13,9 +13,12 @@ import pytest
 
 pytest.importorskip("vllm_ascend")
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+pytestmark = [pytest.mark.core_model, pytest.mark.omni, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 
 def _state(frames):

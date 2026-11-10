@@ -366,9 +366,11 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # model_config) and nothing on this path reads it: the two-wide
         # control logits are consumed by the talker's device-side sampler
         # stages, the duplex K-step dispatch installs no rejection speculator
-        # (minicpmo_4_5_omni_tts.py:2041 returns no speculator for K > 0), and the
-        # frame loop's stop-row guard raises the batch's own vocab_size to
-        # STOP_ROW_WIDTH itself when it is missing (talker_multiframe.py).
+        # (minicpmo_4_5_omni_tts.py:2041 returns no speculator for K > 0), and
+        # the only consumer that needs a wider row, ``ensure_stop_token_vocab``
+        # (talker_multiframe.py:710), is called only from the v1 NPU runner
+        # (npu_model_runner.py:566) and the GPU runner (gpu_model_runner.py:2444)
+        # -- never from this runner or from multiframe.run.
         # Setting the field here would only create an attribute no one reads,
         # and raising on its absence killed every real MRv2 deployment at the
         # first decode step (observed on the 910B3 bench).
