@@ -49,7 +49,6 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
-from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
     build_text_to_image_prompt,
@@ -543,20 +542,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         at) declare an ``ar_max_tokens_builder``. Calling it here matches the
         reference's truncation budget, so generation stops at the grid's token
         count instead of running to the deploy-YAML ceiling. A size-less
-        request is capped at the processor's default 1024x1024 grid budget,
-        the same grid the processor and the propagated positions build.
-        Models without a builder keep their configured ceiling.
+        request is capped at the model's default grid budget — the builder
+        resolves the absent size itself. Models without a builder keep their
+        configured ceiling.
         """
         if ar_idx is None or ar_idx >= len(sampling_params_list):
             return
         builder = get_ar_max_tokens_builder(self._resolve_multistage_model_class_name(engine))
         if builder is None:
             return
-        # Mirror the processor's resolution: a size-less request generates a
-        # 1024x1024 grid, so cap it at that grid's budget too instead of the
-        # deploy-YAML ceiling.
-        height = DEFAULT_TARGET_SIZE if height is None else height
-        width = DEFAULT_TARGET_SIZE if width is None else width
         sp = sampling_params_list[ar_idx]
         if hasattr(sp, "max_tokens"):
             sp.max_tokens = builder(height, width, is_i2i=is_i2i)

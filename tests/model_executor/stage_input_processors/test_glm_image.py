@@ -180,6 +180,13 @@ class TestComputeMaxTokens:
         result = compute_max_tokens(512, 512, factor=16, is_i2i=False)
         assert result == 1089
 
+    def test_sizeless_resolves_to_default_grid(self):
+        # The builder owns the size-less default: None resolves to the
+        # processor's DEFAULT_TARGET_SIZE (1024x1024 -> 256 + 1024 + 1).
+        # Fails with a TypeError before the builder resolved absent sizes.
+        assert compute_max_tokens(None, None, is_i2i=False) == 1281
+        assert compute_max_tokens(None, None, is_i2i=True) == 1025
+
     def test_i2i_smaller_than_t2i(self):
         t2i = compute_max_tokens(1024, 1024, is_i2i=False)
         i2i = compute_max_tokens(1024, 1024, is_i2i=True)

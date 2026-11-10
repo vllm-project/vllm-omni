@@ -57,7 +57,7 @@ def _first_source_image(mm_data: Any) -> Any:
     return images
 
 
-def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
+def compute_max_tokens(height: int | None, width: int | None, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
 
@@ -72,14 +72,18 @@ def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool =
     the deploy-YAML ceiling.
 
     Args:
-        height: Target image height in pixels
-        width: Target image width in pixels
+        height: Target image height in pixels; ``None`` resolves to the
+            processor's ``DEFAULT_TARGET_SIZE`` grid (the builder owns that
+            default so the serving layer stays model-agnostic).
+        width: Target image width in pixels; ``None`` as above.
         factor: Downsampling factor (32 for GLM-Image AR output)
         is_i2i: Whether the request is image-to-image mode
 
     Returns:
         Total number of tokens to generate for the specified mode
     """
+    height = DEFAULT_TARGET_SIZE if height is None else height
+    width = DEFAULT_TARGET_SIZE if width is None else width
     layout = grid_token_layout(height, width, factor)
     if is_i2i:
         return layout.large_tokens + 1

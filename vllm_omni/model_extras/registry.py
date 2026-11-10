@@ -516,8 +516,9 @@ def get_ar_max_tokens_builder(model_class_name: str | None) -> Callable[..., int
     ``ar_max_tokens_builder``. GLM-Image's is preview + target + 1 tokens
     (image-to-image: target + 1), the exact count the reference
     implementation truncates at; serving calls it with the request's target
-    height/width so generation stops at the grid's budget instead of the
-    deploy-YAML ceiling. Models without one keep their configured default.
+    height/width and the builder resolves an absent size to its model's
+    default target grid itself. Models without one keep their configured
+    default.
     """
     spec = _get_spec(model_class_name)
     return spec.get("ar_max_tokens_builder") if spec is not None else None
