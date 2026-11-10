@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 import queue
 import socket
@@ -229,9 +230,65 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._init_pool()
         self._init_listener(config)
 
+    def _requires_tcp_completion(self) -> bool:
+        """Return whether the effective native path may use TCP."""
+        return self.protocol.lower() == "tcp" or (
+            self.protocol.lower() == "rdma" and "MC_FORCE_TCP" in os.environ
+        )
+
+    def _validate_rdma_transport(self) -> None:
+        """Reject RDMA configurations that would silently fall back to TCP."""
+        if "MC_FORCE_TCP" in os.environ:
+            raise ValueError(
+                "Mooncake protocol 'rdma' cannot be used with MC_FORCE_TCP; "
+                "unset MC_FORCE_TCP or configure protocol='tcp' with "
+                "native_tcp_proto_version=2"
+            )
+        # MC_FORCE_HCA makes the native engine fail closed if no HCA is
+        # available, so no topology probe is needed in that mode.
+        if "MC_FORCE_HCA" in os.environ:
+            return
+        get_topology = getattr(self.engine, "get_local_topology", None)
+        if get_topology is None:
+            raise RuntimeError(
+                "Mooncake RDMA requires get_local_topology() or MC_FORCE_HCA=1 "
+                "to prevent an implicit TCP fallback"
+            )
+        try:
+            topology = json.loads(get_topology(self.device_name or None))
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to verify an HCA for Mooncake protocol 'rdma'; "
+                "set MC_FORCE_HCA=1 to make native initialization fail closed"
+            ) from exc
+
+        hcas: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, str):
+                hcas.add(value)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        if isinstance(topology, dict):
+            for value in topology.values():
+                collect(value)
+        requested = {
+            item.strip() for item in str(self.device_name).split(",") if item.strip()
+        }
+        if not hcas or (requested and not requested.issubset(hcas)):
+            selected = ", ".join(sorted(requested)) or "any HCA"
+            raise RuntimeError(
+                f"Mooncake protocol 'rdma' requires an available HCA ({selected}); "
+                "refusing an implicit TCP fallback"
+            )
+
     def _init_engine(self) -> None:
         """Initialize the Mooncake engine and discover the local RPC port."""
         self.engine = TransferEngine()
+        if self.protocol.lower() == "rdma":
+            self._validate_rdma_transport()
         # Note: For P2P handshake mode, local_hostname should be just the IP address.
         # Mooncake will auto-assign an RPC port, retrievable via get_rpc_port().
         ret = self.engine.initialize(self.host, "P2PHANDSHAKE", self.protocol, self.device_name)
@@ -801,7 +858,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         if metadata.get("protocol_version") != _PROTOCOL_VERSION:
             raise RuntimeError("Mooncake deadline receive requires protocol v2 on both peers")
-        if self.protocol.lower() == "tcp" and (
+        if self._requires_tcp_completion() and (
             metadata.get("native_tcp_proto_version") != 2 or self.native_tcp_proto_version != 2
         ):
             raise RuntimeError("Mooncake TCP acknowledged completion is not available on both peers")
@@ -1406,7 +1463,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if meta.protocol_version != _PROTOCOL_VERSION:
                 response = TRANS_ERROR
                 return
-            if self.protocol.lower() == "tcp" and (
+            if self._requires_tcp_completion() and (
                 meta.native_tcp_proto_version != 2 or self.native_tcp_proto_version != 2
             ):
                 response = TRANS_NOT_SUBMITTED

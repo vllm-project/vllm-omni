@@ -75,6 +75,21 @@ stages:
 | `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
 | `device_name` | `""` | RDMA device name (e.g., `"mlx5_0"`). Empty for auto-detect. Can also be set via `RDMA_DEVICE_NAME` env var. |
 
+#### RDMA Transport Guard
+
+With `protocol: "rdma"`, connector startup verifies the local Mooncake
+topology before initializing the data engine. Startup fails when no HCA is
+available, when a configured `device_name` is not discovered, or when
+`MC_FORCE_TCP` is set. This prevents Mooncake from silently falling back to
+TCP, whose completion semantics may not protect a remote destination buffer.
+
+Set `MC_FORCE_HCA=1` before starting the process if the native SDK should be
+the authority for RDMA-only initialization. In this mode the connector skips
+the Python topology probe and relies on Mooncake to fail initialization when
+an HCA cannot be used. Do not use `MC_FORCE_TCP` with `protocol: "rdma"`; use
+`protocol: "tcp"` instead and configure `native_tcp_proto_version: 2` only
+after verifying acknowledged TCP support on both endpoints.
+
 #### ZMQ Port Offset Scheme
 
 To avoid port conflicts when multiple edges, purposes, DP replicas, or TP ranks share the same node, the actual ZMQ port is computed as:

@@ -18,6 +18,8 @@ pytestmark = [pytest.mark.cpu, pytest.mark.core_model]
 
 
 class Engine:
+    topology = '{"cuda:0": [["mlx5_0"], []]}'
+
     def __init__(self):
         self.gate = threading.Event()
         self.gate.set()
@@ -31,6 +33,9 @@ class Engine:
 
     def get_rpc_port(self):
         return 1
+
+    def get_local_topology(self, device_name=None):
+        return self.topology
 
     def unregister_memory(self, *args):
         self.unregistered.set()
@@ -225,6 +230,46 @@ def test_tcp_sender_rejects_unsupported_peer_before_native_submission(connectors
     finally:
         sock.close(linger=0)
         ctx.term()
+
+
+def test_rdma_tcp_fallback_rejects_before_native_submission(connectors, monkeypatch):
+    sender = connectors("sender", protocol="rdma", native_tcp_proto_version=2)
+    monkeypatch.setenv("MC_FORCE_TCP", "1")
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 2000)
+    try:
+        sock.connect(f"tcp://127.0.0.1:{sender.zmq_port}")
+        request = module.MooncakeAgentMetadata(
+            "127.0.0.1", 1, "key@0_1", [123], [8], protocol_version=2, native_tcp_proto_version=1
+        )
+        sock.send(msgspec.msgpack.encode(request))
+        assert sock.recv() == module.TRANS_NOT_SUBMITTED
+        assert not sender.engine.calls
+    finally:
+        sock.close(linger=0)
+        ctx.term()
+
+
+def test_rdma_rejects_missing_hca(connectors, monkeypatch):
+    monkeypatch.setattr(Engine, "topology", "{}")
+    with pytest.raises(RuntimeError, match="available HCA"):
+        connectors()
+
+
+def test_rdma_rejects_unavailable_configured_hca(connectors, monkeypatch):
+    with pytest.raises(RuntimeError, match="mlx5_1"):
+        connectors(device_name="mlx5_1")
+
+
+def test_rdma_force_hca_skips_python_topology_probe(connectors, monkeypatch):
+    monkeypatch.setenv("MC_FORCE_HCA", "1")
+
+    def fail_probe(self, device_name=None):
+        raise AssertionError("topology probe should be skipped")
+
+    monkeypatch.setattr(Engine, "get_local_topology", fail_probe)
+    connectors()
 
 
 def test_legacy_metadata_fails_before_write(connectors):
