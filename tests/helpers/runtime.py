@@ -206,8 +206,8 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
-        # Bounded ring buffer: only the last lines are kept for failure errors.
-        self._server_log_lines: deque[str] = deque(maxlen=60)
+        # Bounded ring buffer of ERROR/CRITICAL/traceback lines only.
+        self._server_error_lines: deque[str] = deque(maxlen=60)
         self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
@@ -277,9 +277,8 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
-        # Drain child output into a bounded ring buffer so early-exit errors can
-        # include a traceback without unbounded memory or a temp file.
-        self._server_log_lines = deque(maxlen=60)
+        # Keep only ERROR/CRITICAL/traceback lines for early-exit diagnostics.
+        self._server_error_lines = deque(maxlen=60)
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -290,13 +289,25 @@ class OmniServer:
             bufsize=1,
         )
         assert self.proc.stdout is not None
-        log_lines = self._server_log_lines
+        error_lines = self._server_error_lines
         stdout = self.proc.stdout
 
         def _drain_stdout() -> None:
+            in_traceback = False
             try:
                 for line in stdout:
-                    log_lines.append(line)
+                    if "Traceback (most recent call last)" in line:
+                        in_traceback = True
+                        error_lines.append(line)
+                        continue
+                    if in_traceback:
+                        error_lines.append(line)
+                        # Exception type line ends the traceback block.
+                        if line.strip() and not line[0].isspace():
+                            in_traceback = False
+                        continue
+                    if " ERROR " in line or " CRITICAL " in line:
+                        error_lines.append(line)
             except Exception:
                 pass
 
@@ -311,7 +322,7 @@ class OmniServer:
             if ret is not None:
                 raise RuntimeError(
                     f"Server processes exited with code {ret} before becoming ready."
-                    f"{self._server_log_tail()}"
+                    f"{self._server_error_tail()}"
                 )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
@@ -320,7 +331,7 @@ class OmniServer:
                     if ret is not None:
                         raise RuntimeError(
                             f"Server processes exited with code {ret} before becoming ready."
-                            f"{self._server_log_tail()}"
+                            f"{self._server_error_tail()}"
                         )
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
@@ -330,7 +341,7 @@ class OmniServer:
                         )
                     return
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_log_tail()}")
+        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -470,14 +481,12 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
-    def _server_log_tail(self) -> str:
+    def _server_error_tail(self) -> str:
         if self._server_log_thread is not None:
             self._server_log_thread.join(timeout=2)
-        if not self._server_log_lines:
+        if not self._server_error_lines:
             return ""
-        return "\n=== Last {} lines of OmniServer log ===\n{}".format(
-            len(self._server_log_lines), "".join(self._server_log_lines)
-        )
+        return "\n=== OmniServer error log ===\n{}".format("".join(self._server_error_lines))
 
     def __enter__(self):
         try:
