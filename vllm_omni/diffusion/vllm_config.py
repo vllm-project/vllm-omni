@@ -325,7 +325,8 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         logger.info(
             "Disabling MoE LoRA for online MXFP4 or ModelOpt NVFP4 on a native-capable "
             "device without a startup adapter; "
-            "this enables the native MoE backend."
+            "this enables the native MoE backend. "
+            "Set `moe_backend: marlin` on CUDA to keep request-time MoE LoRA."
         )
         moe_lora_enabled = False
     if moe_lora_enabled:

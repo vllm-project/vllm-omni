@@ -24,8 +24,9 @@ from vllm_omni.lora.layers import (
 MOE_LORA_UNAVAILABLE_ERROR = (
     "MoE LoRA is unavailable because its token capacity was not configured. "
     "Online MXFP4 and ModelOpt NVFP4 disable MoE LoRA when no startup `lora_path` "
-    "is set so they can use the native expert kernel. Set `lora_path` at startup "
-    "to enable MoE adapters; request-time MoE adapters cannot use the native path."
+    "is set so they can use the native expert kernel. Set `lora_path` at startup, "
+    "or `moe_backend: marlin` on CUDA, to enable MoE adapters; "
+    "request-time MoE adapters cannot use the native path."
 )
 
 
