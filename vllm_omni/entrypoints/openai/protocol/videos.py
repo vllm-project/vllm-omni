@@ -18,6 +18,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
+from vllm_omni.entrypoints.openai.protocol.images import SegmentationRLE
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
 
 # Bound int request fields to avoid overflow issues.
@@ -375,6 +376,12 @@ class VideoGenerationRequest(BaseModel):
     # request-owned temporary files here.
     _timeline_guide_input: Any = PrivateAttr(default=None)
 
+    # Cleanup paths are populated by the multipart parser, never by clients.
+    _control_reference_paths: list[str] = PrivateAttr(default_factory=list)
+    # MiniMax H3 control uploads by role (``control_path``/``source_path``/``mask_path``),
+    # forwarded in ``multi_modal_data`` so client-supplied ``extra_params`` cannot name paths.
+    _minimax_h3_control_media: dict[str, str] = PrivateAttr(default_factory=dict)
+
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(
         default=None,
@@ -559,3 +566,59 @@ class VideoListResponse(BaseModel):
     has_more: bool = Field(..., description="Whether there are more items available.")
     data: list[VideoResponse] = Field(..., description="Array of video job records.")
     object: Literal["list"] = Field(default="list", description="Object type identifier for list responses.")
+
+
+class VideoSegmentationInstance(BaseModel):
+    id: int = Field(..., description="Object id, stable across the frames of one video")
+    score: float = Field(..., description="Detection confidence in [0, 1] of the object when it was first found")
+    box: list[float] = Field(..., description="[x0, y0, x1, y1] in input-video pixels")
+    mask: SegmentationRLE
+
+
+class VideoSegmentationFrame(BaseModel):
+    frame_index: int
+    instances: list[VideoSegmentationInstance]
+
+
+class VideoSegmentationObject(BaseModel):
+    id: int
+    prompt: str = Field(..., description="The text prompt whose concept this object matched")
+    mask_video: str | None = Field(
+        None, description="Base64 H.264 MP4 of the object's mask over the whole video (white inside), if requested"
+    )
+
+
+class VideoSegmentationResponse(BaseModel):
+    """Every tracked instance of the prompted concepts, frame by frame."""
+
+    created: int = Field(..., description="Unix timestamp of when segmentation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Input video width in pixels")
+    height: int = Field(..., description="Input video height in pixels")
+    num_frames: int
+    fps: float | None = Field(None, description="Input frame rate, when the container reports one")
+    objects: list[VideoSegmentationObject]
+    frames: list[VideoSegmentationFrame]
+
+
+class VideoDepthResponse(BaseModel):
+    """Per-frame depth of a video, as a video and optionally as raw values."""
+
+    created: int = Field(..., description="Unix timestamp of when depth estimation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Depth map width in pixels (the input after the max_res bound)")
+    height: int = Field(..., description="Depth map height in pixels (the input after the max_res bound)")
+    num_frames: int
+    fps: float | None = Field(None, description="Input frame rate, when the container reports one")
+    metric: bool = Field(
+        ..., description="True: depth in meters. False: relative inverse depth (larger is nearer), unitless"
+    )
+    depth_min: float = Field(..., description="Smallest depth value over the whole video")
+    depth_max: float = Field(..., description="Largest depth value over the whole video")
+    video: str = Field(
+        ...,
+        description="Base64 H.264 MP4 of the depth, normalized by depth_min and depth_max over the whole video",
+    )
+    depth: str | None = Field(
+        None, description="Base64 NPZ with a float16 'depth' array [num_frames, height, width], if requested"
+    )

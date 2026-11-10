@@ -25,6 +25,7 @@ import asyncio
 import dataclasses
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -33,7 +34,7 @@ from contextlib import suppress
 from http import HTTPStatus
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
@@ -75,6 +76,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _validate_image_pixel_limit,
     decode_audio_url,
     decode_input_reference,
+    validate_control_media_file,
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multiview_upload_indexes
@@ -558,12 +560,13 @@ async def _persist_uploaded_control_reference(
     *,
     max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
     numeric_lidar: bool = False,
+    field_name: str = "control_reference",
 ) -> str:
     """Stream one model control upload to request-scoped local storage."""
-    suffix = _control_upload_suffix(upload, numeric_lidar=numeric_lidar)
+    suffix = _control_upload_suffix(upload, numeric_lidar=numeric_lidar, field_name=field_name)
     return await _persist_uploaded_reference(
         upload,
-        field_name="control_reference",
+        field_name=field_name,
         suffix=suffix,
         max_bytes=max_bytes,
     )
@@ -597,6 +600,33 @@ async def _persist_latent_edit_source(
     )
 
 
+async def validate_latent_continuation_source(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+) -> str | None:
+    """Return ``extra_params["continue_from"]`` once it names a completed job of this server."""
+    source = (request.extra_params or {}).get("continue_from")
+    if source is None:
+        return None
+    if not handler.supports_latent_continuation:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from is not supported by this model.",
+        )
+    if not isinstance(source, str) or not source:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from must be a video id returned by POST /v1/videos.",
+        )
+    job = await VIDEO_STORE.get(source)
+    if job is None or job.status != VideoGenerationStatus.COMPLETED:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"continue_from video {source!r} is unknown or has not completed.",
+        )
+    return source
+
+
 def _validate_latent_edit_inputs(
     handler: OmniOpenAIServingVideo,
     *,
@@ -604,8 +634,13 @@ def _validate_latent_edit_inputs(
     source_audio: UploadFile | None,
     video_noise_mask: Any | None,
     audio_noise_mask: Any | None,
+    regenerate: bool = False,
 ) -> bool:
-    """Validate cross-field latent-edit requirements before persisting files."""
+    """Validate cross-field latent-edit requirements before persisting files.
+
+    A MiniMax H3 ``regenerate`` request carries its draft as ``source_video``
+    without masks; the encoder supplies the all-keep mask itself.
+    """
     has_any_input = any(value is not None for value in (source_video, source_audio, video_noise_mask, audio_noise_mask))
     if not has_any_input:
         return False
@@ -614,7 +649,7 @@ def _validate_latent_edit_inputs(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing is not supported by this model.",
         )
-    if video_noise_mask is None and audio_noise_mask is None:
+    if video_noise_mask is None and audio_noise_mask is None and not (regenerate and source_video is not None):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing requires at least one of video_noise_mask or audio_noise_mask.",
@@ -627,7 +662,9 @@ def _validate_latent_edit_inputs(
     return True
 
 
-def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -> str:
+def _control_upload_suffix(
+    upload: UploadFile, *, numeric_lidar: bool = False, field_name: str = "control_reference"
+) -> str:
     """Use the same media classification before and during persistence."""
     suffix = Path(upload.filename or "").suffix.lower()
     if numeric_lidar:
@@ -643,7 +680,7 @@ def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -
     if kind == "audio" or (suffix and suffix not in supported_suffixes):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="control_reference must be an image or video file.",
+            detail=f"{field_name} must be an image or video file.",
         )
     if not suffix:
         suffix = ".png" if kind == "image" else ".mp4"
@@ -651,14 +688,17 @@ def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -
 
 
 async def _admit_multiview_uploads(
+    handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
     input_references: list[UploadFile],
     resources: VideoRequestResources,
 ) -> None:
-    """Persist multiview ``input_references`` and rewrite manifest indexes to their paths.
+    """Admit a multiview request: persist ``input_references`` and rewrite manifest indexes to their paths.
 
-    The model-specific manifest rules live in ``admit_multiview_uploads``; this
-    wrapper only supplies HTTP upload persistence and error mapping.
+    Runs for every multiview request, with or without uploads, so manifest errors
+    fail here instead of in the asynchronous job. The model-specific rules live in
+    ``admit_multiview_uploads``; this wrapper supplies upload persistence, the
+    request-level frame rate, the server's local-media allowlist and error mapping.
     """
 
     async def persist(index: int, numeric_lidar: bool) -> str:
@@ -675,8 +715,10 @@ async def _admit_multiview_uploads(
         request.extra_params = await admit_multiview_uploads(
             request.extra_params,
             negative_prompt=request.negative_prompt,
+            sampling_frame_rates={"fps": request.fps},
             num_uploads=len(input_references),
             persist=persist,
+            allowed_local_media_path=handler.allowed_local_media_path,
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, detail=str(exc)) from exc
@@ -732,17 +774,76 @@ def _validate_control_upload(
     return normalized_type
 
 
+def _validate_h3_control_uploads(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+    control_reference: UploadFile | None,
+    control_type: str | None,
+    source_reference: UploadFile | None,
+    mask_reference: UploadFile | None,
+    *,
+    has_references: bool,
+) -> str | None:
+    """Validate H3's uploaded conditioning without opening server-local paths."""
+    modes = {"canny", "depth", "hed", "mlsd", "pose", "inpaint"}
+    extras = request.extra_params or {}
+    active = {mode for mode in modes if mode in extras}
+    supplied = any(item is not None for item in (control_reference, source_reference, mask_reference, control_type))
+    if not supplied and not active:
+        return None
+
+    def reject(message: str) -> NoReturn:
+        raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=message)
+
+    if not handler.controlnet_configured:
+        reject("MiniMax H3 control requires starting the server with --controlnet-model-path.")
+    selected = control_type.strip().lower() if control_type else None
+    if selected is None or selected not in modes:
+        reject("MiniMax H3 conditioning requires control_type: canny, depth, hed, mlsd, pose, or inpaint.")
+    if active - {selected}:
+        reject("Provide parameters for only the selected control_type.")
+    if source_reference is not None and mask_reference is None:
+        reject("source_reference requires mask_reference.")
+    if selected != "inpaint" and control_reference is None:
+        reject("control_type requires a control_reference upload.")
+    if selected == "inpaint" and mask_reference is None:
+        reject("control_type=inpaint requires mask_reference.")
+    if has_references:
+        reject(
+            "MiniMax H3 control cannot be combined with input/image/video/audio references, "
+            "keyframes, or latent-mask editing."
+        )
+    config = extras.get(selected, {})
+    if not isinstance(config, Mapping):
+        reject(f"extra_params.{selected} must be an object.")
+    if any(key in config for key in ("control", "control_path", "source", "source_path", "mask", "mask_path")):
+        reject("Use control_reference/source_reference/mask_reference uploads, not server-local paths or tensors.")
+    unknown = set(config) - {"control_context_scale"}
+    if unknown:
+        reject(f"Unknown extra_params.{selected} fields: {', '.join(sorted(unknown))}.")
+    strength = config.get("control_context_scale", 1.0)
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        reject("control_context_scale must be a finite, non-negative number.")
+    try:
+        strength = float(strength)
+    except OverflowError:
+        reject("control_context_scale must be a finite, non-negative number.")
+    if not math.isfinite(strength) or strength < 0:
+        reject("control_context_scale must be a finite, non-negative number.")
+    for role, upload in (("control_reference", control_reference), ("source_reference", source_reference)):
+        if upload is not None and _uploaded_media_kind(upload) != "video":
+            reject(f"{role} must be a video file.")
+    return selected
+
+
 def _attach_control_upload(
     request: VideoGenerationRequest,
     control_type: str,
-    control_path: str | None = None,
 ) -> None:
-    """Declare an uploaded control and attach its persisted path when available."""
+    """Declare the uploaded control type before selecting the reference decode policy."""
     extra_params = dict(request.extra_params or {})
     existing = extra_params.get(control_type)
     control_params = dict(existing) if isinstance(existing, Mapping) else {}
-    if control_path is not None:
-        control_params["control_path"] = control_path
     extra_params[control_type] = control_params
     request.extra_params = extra_params
 
@@ -1021,6 +1122,8 @@ async def _parse_video_form(
     input_reference: UploadFile | None = File(default=None),
     input_references: list[UploadFile] | None = File(default=None),
     control_reference: UploadFile | None = File(default=None),
+    source_reference: UploadFile | None = File(default=None),
+    mask_reference: UploadFile | None = File(default=None),
     control_type: str | None = Form(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
@@ -1184,14 +1287,16 @@ async def _parse_video_form(
         source_audio=source_audio,
         video_noise_mask=parsed_video_noise_mask,
         audio_noise_mask=parsed_audio_noise_mask,
+        regenerate=(request.extra_params or {}).get("regenerate") is True,
     )
 
     try:
         supports_multiview = handler.supports_multiview_reference_inputs
-        has_indexes = has_multiview_upload_indexes(request.extra_params or {})
+        extra = request.extra_params or {}
+        has_indexes = has_multiview_upload_indexes(extra)
         if has_indexes and not supports_multiview:
             raise HTTPException(400, detail="This model does not support multiview uploaded references.")
-        if supports_multiview and (input_references or has_indexes):
+        if supports_multiview and (input_references or has_indexes or extra.get("multiview") is not None):
             if has_latent_edit or any(
                 value is not None
                 for value in (
@@ -1201,13 +1306,39 @@ async def _parse_video_form(
                     parsed_audio_reference,
                     control_reference,
                     control_type,
+                    source_reference,
+                    mask_reference,
                 )
             ):
-                raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
-            await _admit_multiview_uploads(request, input_references, resources)
+                raise HTTPException(400, detail="Multiview requests cannot be combined with generic reference fields.")
+            await _admit_multiview_uploads(handler, request, input_references, resources)
             return request, handler, effective_model_name, None, None, None, resources, None
 
-        normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
+        h3_control = handler.is_minimax_h3
+        if h3_control:
+            normalized_control_type = _validate_h3_control_uploads(
+                handler,
+                request,
+                control_reference,
+                control_type,
+                source_reference,
+                mask_reference,
+                has_references=bool(input_references)
+                or any(
+                    item is not None
+                    for item in (
+                        input_reference,
+                        parsed_image_reference,
+                        parsed_video_reference,
+                        parsed_audio_reference,
+                    )
+                )
+                or has_latent_edit,
+            )
+        else:
+            if source_reference is not None or mask_reference is not None:
+                raise HTTPException(400, detail="source_reference/mask_reference are not supported by this model.")
+            normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
         if normalized_control_type is not None:
             # Make the selected transfer mode visible while choosing the model's
             # reference-video decode policy. The upload itself stays unpersisted
@@ -1322,12 +1453,29 @@ async def _parse_video_form(
         if audio_paths:
             reference_audio = ReferenceAudio(path=audio_paths if len(audio_paths) > 1 else audio_paths[0])
 
-        if control_reference is not None and normalized_control_type is not None:
-            control_path = await _persist_uploaded_control_reference(
-                control_reference, max_bytes=CONTROL_REFERENCE_MAX_BYTES
-            )
-            resources.add(control_path)
-            _attach_control_upload(request, normalized_control_type, control_path)
+        if normalized_control_type is not None:
+            try:
+                for role, upload in (
+                    ("control", control_reference),
+                    ("source", source_reference),
+                    ("mask", mask_reference),
+                ):
+                    if upload is None:
+                        continue
+                    path = await _persist_uploaded_control_reference(
+                        upload,
+                        max_bytes=CONTROL_REFERENCE_MAX_BYTES,
+                        field_name=f"{role}_reference",
+                    )
+                    resources.add(path)
+                    if h3_control:
+                        await asyncio.to_thread(validate_control_media_file, path, allow_image=role == "mask")
+                        request._minimax_h3_control_media[f"{role}_path"] = path
+                    else:
+                        assert request.extra_params is not None
+                        request.extra_params[normalized_control_type][f"{role}_path"] = path
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(400, detail=str(exc)) from exc
 
         latent_edit_input: LatentEditInput | None = None
         if has_latent_edit:

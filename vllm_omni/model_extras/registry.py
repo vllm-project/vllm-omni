@@ -41,6 +41,7 @@ from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as buil
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
 from vllm_omni.model_extras.kandinsky6 import (
     KANDINSKY6_EXTRA_BODY_PARAMS,
     KANDINSKY6_EXTRA_OUTPUT_PARAMS,
@@ -255,6 +256,16 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "video_generation_defaults_builder": get_magi2_video_generation_defaults,
         "reference_image_size_resolver": magi2_preserves_reference_image_size,
     },
+    "HyNomasPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
+    },
+    "HyNomasModularPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
+    },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -351,6 +362,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "QwenImage21Pipeline": {
         "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
+    },
+    "Flux3Pipeline": {
+        "extra_body_params": frozenset({"flow_shift"}),
+        "image_to_image_prompt_builder": default_image_to_image_prompt,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]

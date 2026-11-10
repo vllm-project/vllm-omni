@@ -1287,13 +1287,16 @@ def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> Non
 @pytest.mark.parametrize(
     ("dtype", "allow_tf32", "tolerance"),
     [
-        pytest.param(
-            torch.bfloat16,
-            True,
-            3e-2,
-            id="bf16",
-            marks=pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/8841"),
-        ),
+        # bf16: channels-last conv algorithms round differently than the
+        # NCDHW reference, and the gap is bounded by the bf16 grid rather
+        # than by the fastpath. One representable step at magnitude [4, 8)
+        # is already 3.125e-2, which is what the old 3e-2 threshold tripped
+        # on (issue #8841). Measured max_abs_diff: 0.0196 / PSNR 56.8 dB on
+        # L20X (Ada, 5 seeds), 0.03125 / PSNR 52.3 dB (one step at [4, 8))
+        # on the L4 CI, passing on GB200. 4e-2 covers one bf16 step at
+        # [4, 8) with headroom; the PSNR floor catches drift beyond
+        # isolated rounding steps.
+        pytest.param(torch.bfloat16, True, 4e-2, id="bf16"),
         # With TF32 disabled the only difference is cuDNN's channels-last algorithm
         # choice and the norm kernel's reduction order.
         pytest.param(torch.float32, False, 2e-4, id="fp32"),
@@ -1343,4 +1346,4 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
     error = difference.max().item()
     mse = (difference**2).mean().item()
     psnr = float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
-    assert error <= tolerance, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"
+    assert error <= tolerance and psnr >= 45.0, f"max_abs_diff={error:.3e} psnr={psnr:.2f} dB tolerance={tolerance}"

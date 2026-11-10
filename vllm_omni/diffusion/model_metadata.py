@@ -25,6 +25,25 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Whether the pipeline keeps finished clips' latents under
+    # ``extra_args["latent_cache_key"]`` and accepts ``extra_args["continue_from"]``
+    # to continue one; the video API tags requests with their job id.
+    supports_latent_continuation: bool = False
+    # Whether ``/v1/images/segmentations`` may serve this model: it takes one
+    # image plus text/box prompts and returns a ``segmentation`` payload.
+    supports_segmentation: bool = False
+    # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
+    # video path plus text prompts and returns a ``video_segmentation`` payload.
+    supports_video_segmentation: bool = False
+    # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
+    # and returns a ``video_depth`` payload of per-frame depth maps.
+    supports_video_depth: bool = False
+
+
+# ``extra_args`` keys that only name a request (the video API's job-id tag for
+# ``supports_latent_continuation``) and never change its forward schedule, so
+# requests differing only in them may share a DLO data-parallel wave.
+REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -37,10 +56,20 @@ HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
+    "Sam3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        supports_segmentation=True,
+        supports_video_segmentation=True,
+    ),
+    "VideoDepthAnythingPipeline": DiffusionModelMetadata(supports_video_depth=True),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
@@ -74,8 +103,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -90,8 +121,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
         attention_mask_free=True,
     ),
@@ -118,6 +151,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
+    ),
+    "Flux3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
+        final_output_type="image",
     ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,

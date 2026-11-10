@@ -1,4 +1,9 @@
 # MammothModa2 AR→DiT (text-to-image).
+#
+# Stage-0 defaults to enforce_eager: true. Keep that for und-only / mixed
+# understanding traffic: any CUDA-graph capture of MoE (FULL or PIECEWISE)
+# takes the dual-expert graph-safe path (#9764). Opt into FULL only for
+# intentional t2i AR decode graphs via mammoth_moda2_ar_graph_full.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2

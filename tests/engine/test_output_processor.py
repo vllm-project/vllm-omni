@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestError, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
@@ -890,6 +890,41 @@ def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss
     assert request.external_req_id not in processor.external_req_ids
 
 
+def test_admission_error_returns_external_pause_message():
+    """A queue=None generation request must surface RequestError, not a chunk."""
+    kwargs = dict(_NO_DETOK_STATE_KWARGS)
+    kwargs["request_id"] = "internal"
+    kwargs["external_req_id"] = "ext"
+    state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE, stream_input=True)
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, engine_core_output_type="audio")
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    pause = "Generation is paused. Please retry after it resumes."
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id="internal",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                error=RequestError(code="engine_paused", message=pause, retryable=True),
+                multimodal_output={"audio": torch.tensor([1.0, 2.0])},
+            )
+        ]
+    )
+
+    assert processed.reqs_to_abort == ["internal"]
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert output.request_id == "ext"
+    assert output.error == pause
+    assert output.error_type == "engine_paused"
+    assert output.finished is True
+    assert output.outputs == []
+    assert state.mm_accumulated.is_empty
+    assert "internal" not in processor.request_states
+
+
 def test_no_detokenizer_generation_cache_miss_keeps_multimodal_completion():
     """A generation-stage error must retain its completion type and payload."""
     processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, output_modality=OutputModality.AUDIO)
@@ -950,6 +985,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
+        error=None,
     )
 
     result = processor.process_outputs([engine_output])
@@ -997,6 +1033,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,
+        error=None,
     )
 
 

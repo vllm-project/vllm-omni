@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, TypeGuard
 
 import pytest
@@ -319,10 +320,15 @@ def benchmark_params(request):
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
-    return {
-        "test_name": test_name,
-        "params": all_params[param_index],
-    }
+    params = dict(all_params[param_index])
+    with ExitStack() as stack:
+        if params.get("duplex_eval_accuracy_config"):
+            # The judge reads these files during evaluation. Keep the temporary
+            # directory under the configured root, within its allowed media path.
+            root = Path(params.get("duplex_eval_response_root", "omni-duplex-eval-output")).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            params["duplex_eval_response_root"] = stack.enter_context(TemporaryDirectory(prefix="tmp-", dir=root))
+        yield {"test_name": test_name, "params": params}
 
 
 def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:

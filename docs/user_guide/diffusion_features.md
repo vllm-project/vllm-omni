@@ -32,6 +32,12 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### MiniMax-H3 LiteVAE Decoder
+
+[LiteVAE](diffusion/light_vae.md) uses a smaller video decoder to reduce
+MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
+can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
@@ -207,6 +213,7 @@ The following tables show which models support each feature:
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **[Hy-Nomas](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md)** (Diffusers-format weights) | ❌ | ❌ | ✅ (Ulysses only) | ❌ | ❌ | ❌ | ❌ | ✅ (module only) | ❌ | ❌ | ❌ |
 
 > Notes:
 > Cosmos3-Nano-Transfer-Auto runs CFGP and strict Ulysses CP on GB200; HSDP and TP are configuration-only;

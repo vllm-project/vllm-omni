@@ -2719,18 +2719,17 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
-@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5, 1.0, 3.0, 5.0])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_transfer_control_delta_is_independent_of_text_guidance(
+def test_transfer_control_increment_is_independent_of_text_guidance(
     make_cosmos3_pipeline, guidance_scale, cfg_normalize
 ) -> None:
     pipeline = make_cosmos3_pipeline()
     cond_no_control = torch.tensor([2.0, 4.0])
     cond_full = torch.tensor([6.0, 10.0])
     uncond_full = torch.tensor([1.0, 3.0])
-    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
-    if guidance_scale != 0.0:
-        expected += 1.5 * (cond_full - cond_no_control)
+    expected = uncond_full + guidance_scale * (cond_full - uncond_full)
+    expected += (1.5 - 1.0) * (cond_full - cond_no_control)
     if cfg_normalize:
         expected = pipeline.cfg_normalize_function(cond_full, expected)
 
@@ -2740,6 +2739,47 @@ def test_transfer_control_delta_is_independent_of_text_guidance(
         cfg_normalize=cfg_normalize,
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5])
+@pytest.mark.parametrize("text_cfg_below_one", [False, True])
+@pytest.mark.parametrize("delayed_control", [False, True])
+def test_diffuse_transfer_supports_zero_and_small_text_guidance(
+    make_cosmos3_pipeline, sequential_cfg_parallel, guidance_scale, text_cfg_below_one, delayed_control
+) -> None:
+    """Preserve control-only dispatch and allow combined CFG at zero or tiny scales."""
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7] if delayed_control else [7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance_scale,
+        control_guidance=1.5,
+        control_guidance_interval=(0.0, 8.0) if delayed_control else None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    # The stub predicts 102 with text+control, 2 with text only, and 101
+    # with unconditional text+control; its scheduler adds each prediction.
+    expected_calls = [(2, True), (2, False)]
+    expected = 152.0
+    if text_cfg_below_one:
+        expected_calls.append((1, True))
+        expected = 151.0 + guidance_scale
+    if delayed_control:
+        initial_calls = [(2, True), (1, True)] if text_cfg_below_one else [(2, True)]
+        expected_calls = initial_calls + expected_calls
+        expected += 101.0 + guidance_scale if text_cfg_below_one else 102.0
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+    torch.testing.assert_close(result, torch.full_like(latents, expected))
 
 
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2772,7 +2812,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 154.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2957,7 +2997,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 408.0))
 
 
 @pytest.mark.parametrize(
@@ -4119,6 +4159,67 @@ def test_multiview_output_reports_generated_rate_as_video_fps(
     assert OmniOpenAIServingVideo._resolve_fps(result) == expected_fps
 
 
+@pytest.mark.parametrize(
+    ("multiview_args", "vision_views", "expected"),
+    [
+        ({}, (0, 1), [0, 1, 8, 9]),
+        ({"condition_video_as_image": True}, (0, 1), [0, 8]),
+        ({"condition_frame_indexes_vision": "2,0,2"}, (0, 1), [0, 2, 8, 10]),
+        ({}, (1,), list(range(8, 16))),
+    ],
+    ids=["default_video_prefix", "video_as_image", "explicit_local_indexes", "view_completion"],
+)
+def test_multiview_condition_indexes_expand_per_view_local_frames(
+    make_cosmos3_pipeline, multiview_args: dict[str, Any], vision_views: tuple[int, ...], expected: list[int]
+) -> None:
+    """Per-view-local latent indexes select the same frames in every camera's camera-major block."""
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+    prepare_latents = pipeline._prepare_multiview_latents
+    captured: dict[str, Any] = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return prepare_latents(**kwargs)
+
+    pipeline._prepare_multiview_latents = capture
+    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
+    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 16, 1, 1)
+    views = [
+        {**view, "control_path": f"control{index}.mp4"}
+        | ({"vision_path": f"vision{index}.mp4"} if index in vision_views else {})
+        for index, view in enumerate(_t2v_multiview_views())
+    ]
+    sp = make_sampling_params(
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": views, **multiview_args}, "wsm": {}, "aspect_ratio": "16,9"},
+    )
+
+    pipeline.forward(make_request_batch({"prompt": "Driving."}, sp))
+
+    assert captured["num_views"] == 2
+    assert captured["condition_indexes"] == expected
+
+
+@pytest.mark.parametrize("above_ceiling", [False, True], ids=["negative", "above_ceiling"])
+def test_multiview_forward_rejects_out_of_range_max_sequence_length(make_cosmos3_pipeline, above_ceiling: bool) -> None:
+    """A negative length would otherwise slice tokens off the end of every caption."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
+
+    length = COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH + 1 if above_ceiling else -5
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+    sp = make_sampling_params(
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": _t2v_multiview_views()}, "max_sequence_length": length},
+    )
+
+    with pytest.raises(ValueError, match=rf"max_sequence_length must be positive.*requested={length},"):
+        pipeline.forward(make_request_batch({"prompt": "Driving."}, sp))
+
+
 def _generate_multiview_mp4(
     make_cosmos3_pipeline,
     monkeypatch: pytest.MonkeyPatch,
@@ -4626,6 +4727,78 @@ def test_admit_multiview_uploads_persists_checks_lidar_and_resolves(tmp_path) ->
     assert resolved["lidar"] == {"control_path": paths[1], "return_output": True}
 
 
+@pytest.mark.parametrize(("fps", "accepted"), [(None, True), (12, True), (24, False)])
+def test_admit_multiview_request_checks_request_frame_rate(fps: float | None, accepted: bool) -> None:
+    """Admission covers manifests without uploads and the video API's top-level fps."""
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        raise AssertionError("nothing to persist")
+
+    extra = {"multiview": {"views": _t2v_multiview_views()}, "resolved_frame_rate": 12}
+    admit = admit_multiview_uploads(
+        extra, negative_prompt=None, num_uploads=0, persist=persist, sampling_frame_rates={"fps": fps}
+    )
+
+    if accepted:
+        assert asyncio.run(admit)["multiview"]["views"] == _t2v_multiview_views()
+    else:
+        with pytest.raises(ValueError, match=r"disagree: extra_args\.resolved_frame_rate=12, sampling_params\.fps=24"):
+            asyncio.run(admit)
+
+
+@pytest.mark.parametrize(
+    ("view_path", "lidar_path", "allowed", "match"),
+    [
+        ("media/front.mp4", "media/lidar.safetensors", True, None),
+        ("media/front.mp4", None, False, r"require the server's --allowed-local-media-path"),
+        ("outside.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/../outside.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media-sibling/front.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/escape.mp4", None, True, "outside --allowed-local-media-path"),
+        ("media/front.mp4", "outside.safetensors", True, "outside --allowed-local-media-path"),
+    ],
+    ids=["inside", "no_allowlist", "outside", "dot_dot", "prefix_sibling", "symlink", "lidar_outside"],
+)
+def test_admit_multiview_contains_client_named_paths(
+    tmp_path, view_path: str, lidar_path: str | None, allowed: bool, match: str | None
+) -> None:
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "escape.mp4").symlink_to(tmp_path / "outside.mp4")
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        raise AssertionError("nothing to persist")
+
+    view = {
+        "camera_key": "camera_front_wide_120fov",
+        "prompt": "A car drives.",
+        "control_path": str(tmp_path / view_path),
+    }
+    extra: dict[str, Any] = {"multiview": {"views": [view]}, "wsm": {}}
+    if lidar_path is not None:
+        extra["lidar"] = {"control_path": str(tmp_path / lidar_path)}
+    admit = admit_multiview_uploads(
+        extra,
+        negative_prompt=None,
+        num_uploads=0,
+        persist=persist,
+        allowed_local_media_path=str(media) if allowed else "",
+    )
+
+    if match is None:
+        assert asyncio.run(admit)["multiview"]["views"] == [view]
+    else:
+        with pytest.raises(ValueError, match=match):
+            asyncio.run(admit)
+
+
 def test_admit_multiview_uploads_rejects_before_and_after_persisting(tmp_path) -> None:
     import asyncio
 
@@ -4837,3 +5010,46 @@ def test_pipeline_init_rejects_model_cpu_offload_under_pp_before_loading(monkeyp
     od_config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="model-level CPU offload"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+@pytest.mark.parametrize("use_session", [False, True])
+@pytest.mark.parametrize("guidance_scale", [1.0, 3.0])
+@pytest.mark.parametrize("fail_after_first_step", [False, True])
+def test_diffuse_releases_conditioning_after_completion_or_failure(
+    make_cosmos3_pipeline, sequential_cfg_parallel, use_session, guidance_scale, fail_after_first_step
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._use_session_state = use_session
+    pipeline._memory_manager = SessionStateManager()
+
+    def progress(timesteps):
+        yield timesteps[0]
+        assert pipeline.transformer.cached_kv is not None
+        assert pipeline.transformer.cached_freqs_gen is not None
+        if fail_after_first_step:
+            raise RuntimeError("failure after conditioning was cached")
+        yield timesteps[1]
+
+    pipeline.progress_bar = progress
+    kwargs = dict(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([7, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance_scale,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+        session_id="cache-lifetime",
+    )
+    if fail_after_first_step:
+        with pytest.raises(RuntimeError, match="failure after conditioning"):
+            pipeline.diffuse(**kwargs)
+    else:
+        pipeline.diffuse(**kwargs)
+        # Each branch constructs conditioning only once, reusing it on step two.
+        cold_calls = sum(call["cache_before"] is None for call in pipeline.transformer.calls)
+        assert cold_calls == (2 if guidance_scale > 1 else 1)
+    assert pipeline.transformer.cached_kv is None
+    assert pipeline.transformer.cached_freqs_gen is None
+    assert "cache-lifetime" not in pipeline._memory_manager

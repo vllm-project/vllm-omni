@@ -41,7 +41,6 @@ from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
-    expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, patch_grid, unpack_state
@@ -411,8 +410,8 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
         if lengths_by_text is not None:
             kwargs["caption_lengths"] = lengths_by_text[kwargs["text_ids"].data_ptr()]
         # The shared transfer loop passes these to every branch. Captions are
-        # already compacted, hints carry no per-control weight, and the LiDAR
-        # condition prefix is applied by _apply_transfer_condition.
+        # already compacted, the single hint's normalized weight is always 1.0,
+        # and the LiDAR condition prefix is applied by _apply_transfer_condition.
         for key in ("text_mask", "control_weights", "lidar_condition_latents"):
             kwargs.pop(key, None)
         return super().predict_noise(**kwargs)
@@ -665,7 +664,6 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
         vision_kind = _media_kind(self._view_value(views[known_views[0]], "vision")) if has_vision else None
 
         latent_frames_per_view = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        latent_t = num_views * latent_frames_per_view
         raw_indexes = multiview.get("condition_frame_indexes_vision")
         if raw_indexes is None:
             if not has_vision:
@@ -685,7 +683,9 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
         else:
             if any(index < 0 or index >= latent_frames_per_view for index in local_indexes):
                 raise ValueError("Camera condition frame index is outside the generated latent clip.")
-            condition_indexes = expand_multiview_condition_frame_indexes(local_indexes, num_views, latent_t)
+            condition_indexes = [
+                view * latent_frames_per_view + frame for view in range(num_views) for frame in local_indexes
+            ]
 
         # Only views with conditioned latent frames need their vision encoded.
         vision_views = sorted({index // latent_frames_per_view for index in condition_indexes}) if has_vision else []
@@ -728,10 +728,10 @@ class Cosmos3MultiviewPipeline(MultiviewVaeMixin, Cosmos3OmniDiffusersPipeline):
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
             or COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
         )
-        if max_sequence_length > COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
+        if not 1 <= max_sequence_length <= COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH:
             raise ValueError(
-                "Cosmos3 multiview max_sequence_length cannot exceed the variant ceiling the sparse "
-                f"attention is sized for: requested={max_sequence_length}, "
+                "Cosmos3 multiview max_sequence_length must be positive and within the variant ceiling the "
+                f"sparse attention is sized for: requested={max_sequence_length}, "
                 f"ceiling={COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH}."
             )
         patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latents.shape[3], latents.shape[4])

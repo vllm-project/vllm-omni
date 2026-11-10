@@ -4,8 +4,8 @@
 Online serving L2 smoke tests for ``nvidia/Cosmos3-Nano`` and
 ``nvidia/Cosmos3-Nano-Transfer-Auto``.
 
-These keep Cosmos3 in the regular ``core_model`` diffusion lane while the
-broader image/video similarity checks stay in ``tests/e2e/accuracy``.
+These Cosmos3 smokes run on the weekly ``slow`` lane. Image/video
+similarity checks stay in ``tests/e2e/accuracy`` and are not scheduled.
 """
 
 import json
@@ -67,7 +67,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
@@ -96,7 +96,7 @@ def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniCli
     assert payload["data"][0]["b64_json"]
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_video_generation_modes_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
@@ -139,7 +139,7 @@ def test_video_generation_modes_001(omni_server: OmniServer, online_client: Onli
         online_client.send_video_diffusion_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
