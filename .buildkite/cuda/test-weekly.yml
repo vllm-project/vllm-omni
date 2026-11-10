@@ -66,23 +66,24 @@ steps:
     if: build.env("NON_CRITICAL") == "1"
     steps:
 
-      # VLLM_USE_V2_MODEL_RUNNER selects vLLM Model Runner V2 for servers these jobs launch.
+      # VLLM_OMNI_CI_MODEL_RUNNER writes deploy model_runner before the server
+      # starts. Upstream VLLM_USE_V2_MODEL_RUNNER does not select Omni stages.
       # Online Qwen2.5 expansion is 2-card; offline expansion + AutoRound are 4-card.
       - label: "Omni · L4 · 2-GPU"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/e2e/online_serving/test_qwen2_5_omni_expansion.py -m "slow and L4 and omni and cards_2" --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Omni · L4 · 4-GPU"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py -m "slow and L4 and omni and cards_4" --run-level "core_model"
           - >-
             pytest -s -v tests/e2e/
@@ -95,7 +96,7 @@ steps:
       - label: "Omni · H100 · Single-GPU"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
           - >-
             pytest -sv
@@ -106,7 +107,7 @@ steps:
       - label: "Omni · H100 · 4-GPU"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
           - >-
             pytest -sv
@@ -117,11 +118,11 @@ steps:
       - label: "TTS · Moss · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -140,11 +141,11 @@ steps:
       - label: "TTS · VoxCPM2 · Voxtral · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -163,11 +164,11 @@ steps:
       - label: "TTS · Higgs · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -183,11 +184,11 @@ steps:
       - label: "TTS · OmniVoice · Step-Audio · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -204,11 +205,11 @@ steps:
       - label: "TTS · Ming · GLM · IndexTTS · Breeze · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -228,11 +229,11 @@ steps:
       - label: "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
             for f in \
@@ -250,11 +251,11 @@ steps:
       - label: "TTS · H100"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_USE_DEEP_GEMM: "0"
-          VLLM_MOE_USE_DEEP_GEMM: "0"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
           - >-
             pytest -sv
             tests/e2e/ -m "slow and H100 and tts"
@@ -268,9 +269,9 @@ steps:
       - label: "TTS · Gepard-1.0 · L4"
         timeout_in_minutes: 90
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" > /tmp/gepard-overrides.txt
           - uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" "nemo_toolkit[tts]==2.7.3" --overrides /tmp/gepard-overrides.txt
           - >-
@@ -286,7 +287,7 @@ steps:
       - label: "TTS · Kokoro-82M · L4"
         timeout_in_minutes: 30
         env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
         commands:
           - >-
             uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')"
@@ -301,8 +302,6 @@ steps:
 
       - label: "Diffusion · L4 · Single-GPU"
         timeout_in_minutes: 60
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -312,8 +311,6 @@ steps:
 
       - label: "Diffusion · L4 · 2-GPU"
         timeout_in_minutes: 60
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -323,8 +320,6 @@ steps:
 
       - label: "Diffusion · L4 · 4-GPU"
         timeout_in_minutes: 60
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -337,8 +332,6 @@ steps:
 
       - label: "Diffusion · Qwen-Image · H100 · Single-GPU"
         timeout_in_minutes: 120
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -354,8 +347,6 @@ steps:
 
       - label: "Diffusion · JoyAI-Image-Edit · Accuracy · H100 · Single-GPU"
         timeout_in_minutes: 180
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -366,8 +357,6 @@ steps:
 
       - label: "Diffusion · Wan2.1 VACE · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -378,8 +367,6 @@ steps:
 
       - label: "Diffusion · LongCat · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -391,8 +378,6 @@ steps:
 
       - label: "Diffusion · Bagel · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -406,8 +391,6 @@ steps:
 
       - label: "Diffusion · Boogu · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -421,8 +404,6 @@ steps:
 
       - label: "Diffusion · Flux · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -434,8 +415,6 @@ steps:
 
       - label: "Diffusion · LTX · H100 · Single-GPU"
         timeout_in_minutes: 120
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -451,8 +430,6 @@ steps:
 
       - label: "Diffusion · Krea2 · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -464,8 +441,6 @@ steps:
 
       - label: "Diffusion · Kandinsky6 · H100 · Single-GPU"
         timeout_in_minutes: 40
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -477,10 +452,8 @@ steps:
 
       - label: "Diffusion · Cosmos3 · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          VLLM_IMAGE_FETCH_TIMEOUT: "60"
         commands:
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
           - >-
             pytest -sv
             tests/e2e/online_serving/test_cosmos3.py
@@ -490,10 +463,8 @@ steps:
 
       - label: "Diffusion · SANA-Video · H100 · Single-GPU"
         timeout_in_minutes: 180
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          SANA_VIDEO_GOLDEN_BASE_URL: "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/sana-video/v2"
         commands:
+          - export SANA_VIDEO_GOLDEN_BASE_URL=https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/sana-video/v2
           - >-
             pytest -sv
             tests/e2e/online_serving/test_sana_video_expansion.py
@@ -506,12 +477,10 @@ steps:
         timeout_in_minutes: 90
         artifact_paths:
           - sensenova-accuracy/**/*
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
-          SENSENOVA_U1_ARTIFACT_DIR: sensenova-accuracy
-          SENSENOVA_U1_CI_IMAGE: "936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
         commands:
           - |
+            export SENSENOVA_U1_ARTIFACT_DIR=sensenova-accuracy
+            export SENSENOVA_U1_CI_IMAGE="936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$$BUILDKITE_COMMIT"
             mkdir -p "$$SENSENOVA_U1_ARTIFACT_DIR"
             set +e
             pytest -sv \
@@ -540,8 +509,6 @@ steps:
 
       - label: "Diffusion · MammothModa2 · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -553,8 +520,6 @@ steps:
 
       - label: "Diffusion · Helios · H100 · Single-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -567,8 +532,6 @@ steps:
       # slow+cards_2 diffusion file and exceeded 90 minutes.
       - label: "Diffusion · Qwen-Image · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -580,8 +543,6 @@ steps:
 
       - label: "Diffusion · Wan2.1 VACE · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -592,8 +553,6 @@ steps:
 
       - label: "Diffusion · LongCat · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -605,8 +564,6 @@ steps:
 
       - label: "Diffusion · Bagel · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -618,8 +575,6 @@ steps:
 
       - label: "Diffusion · Boogu · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -631,8 +586,6 @@ steps:
 
       - label: "Diffusion · Flux · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -644,8 +597,6 @@ steps:
 
       - label: "Diffusion · GLM-Image · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -657,8 +608,6 @@ steps:
 
       - label: "Diffusion · LTX · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -669,8 +618,6 @@ steps:
 
       - label: "Diffusion · Krea2 · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -681,8 +628,6 @@ steps:
 
       - label: "Diffusion · DreamZero · H100 · 2-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -693,8 +638,6 @@ steps:
 
       - label: "Diffusion · H100 · 3-GPU"
         timeout_in_minutes: 120
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -704,8 +647,6 @@ steps:
 
       - label: "Diffusion · H100 · 4-GPU"
         timeout_in_minutes: 90
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -718,8 +659,6 @@ steps:
       # 2-GPU sweep is only 90 minutes.
       - label: "Diffusion · HiDream-O1-Image Accuracy · H100 · 2-GPU"
         timeout_in_minutes: 180
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m "slow and diffusion and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
@@ -727,8 +666,6 @@ steps:
       # Dedicated: Boogu CFG-parallel size 3 needs 3 GPUs; weekly has no H100 3-GPU sweep.
       - label: "Diffusion · Boogu Edit CFG · H100 · 3-GPU"
         timeout_in_minutes: 120
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - >-
             pytest -sv
@@ -742,8 +679,6 @@ steps:
       # shared H100 4-GPU sweep is only 90 minutes.
       - label: "Diffusion · MAGI-2 Preview Serving Smoke · H100 · 4-GPU"
         timeout_in_minutes: 180
-        env:
-          VLLM_USE_V2_MODEL_RUNNER: "1"
         commands:
           - pytest -s -v tests/e2e/online_serving/test_magi2.py -m "slow and diffusion and cuda and H100 and cards_4" --run-level "full_model"
         mirror_hardwares: h100_4
