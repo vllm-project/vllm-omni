@@ -306,16 +306,20 @@ async def test_audio_end_ms_counts_the_decoded_audio_of_every_input_format(
 
 
 @pytest.mark.usefixtures("input_clock_model")
-async def test_a_converter_that_returns_no_base64_text_fails_the_append_instead_of_counting_nothing(
+async def test_a_converter_that_returns_neither_bytes_nor_base64_text_fails_the_append(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``audio_end_ms`` must not stall silently while ``unit_end_ms`` keeps advancing: such an append fails."""
     h = await open_harness(extra_body=INPUT_CLOCK)
     try:
         monkeypatch.setattr(
-            runner_module, "convert_input_audio_with_rate", lambda audio, fmt, **kwargs: (b"raw", "pcm_f32le", 16000)
+            runner_module,
+            "convert_input_audio_with_rate",
+            lambda audio, fmt, **kwargs: ([0.0] * 3200, "pcm_f32le", 16000),
         )
-        events = await h.run(append_audio(samples=3200, event_id="evt-raw"))
+        events = await h.run(
+            commands.AppendAudio(audio=b"\x10\x00" * 3200, format="pcm16", sample_rate_hz=16000, event_id="evt-raw")
+        )
 
         assert types(events) == ["error", "input_audio_buffer.processed"]
         assert events[0].code == "internal_error"
