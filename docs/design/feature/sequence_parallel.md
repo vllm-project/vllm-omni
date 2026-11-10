@@ -45,6 +45,26 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### NPU symmetric-memory Ulysses
+
+On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
+symmetric memory directly into the final attention layout. It requires
+TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
+search path. This backend does not build a repository C++/AscendC extension;
+Triton uses its normal JIT toolchain.
+
+The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
+`ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
+WORLD ranks in the same order within one HCCS domain. Every rank must issue
+matching exchanges on one stream. A publication barrier precedes peer reads
+and a reuse barrier follows them. Outputs own their storage; one growable staging workspace is reused
+across layers. Worker shutdown must clear it collectively before destroying
+the process group.
+
+The NPU attention factory rejects Ulysses × AllGather-KV when this option is
+enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
+The same topology remains available through the standard communication path.
+
 ---
 
 ## UAA Mode (Experimental)
@@ -77,7 +97,9 @@ Use it when plain Ulysses-SP would otherwise fail because:
 
 - `auto_pad=True` pads sequence tokens in `_sp_plan` and requires attention backends that support `attention_mask`.
 - `advanced_uaa` does not depend on mask-based token padding inside Ulysses attention. It is therefore a better fit for non-divisible head counts and uneven Ulysses shard sizes.
-- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume `attention_mask`.
+- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume arbitrary
+  `attention_mask` values. A model with contiguous suffix padding may instead publish `valid_kv_length`; Ring trims
+  each circulated K/V block against that global valid prefix.
 - `advanced_uaa` is still experimental and hybrid mode remains limited by Ring's equal-shape requirement.
 
 ---
@@ -279,6 +301,10 @@ NOTE: be careful to test adequately when refactoring classes that take this styl
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 | `split_output` | bool | `False`: shard **input** params; `True`: shard **output** tensors |
 | `auto_pad` | bool | Auto-pad if sequence not divisible by world_size (default: `False`) |
+| `clone_shard` | bool | Give multi-rank shards their own contiguous storage (default: `False`); single-rank inputs are unchanged |
+
+With `clone_shard=True`, memory savings require callers to drop their references to the full tensor.
+Other references to the same storage also keep the full allocation alive.
 
 **SequenceParallelOutput Parameters:**
 
@@ -416,7 +442,7 @@ _sp_plan = {
 | Constraint | Description |
 |------------|-------------|
 | **Attention Backend Compatibility** | The attention backends must support `attention_mask`. Currently only `TORCH_SDPA` and `FLASH_ATTN` (default for diffusion models) are supported. |
-| **Ring Attention Limitation** | Ring attention does not support `attention_mask`. Therefore, when using `auto_pad=True`, the combination of Ulysses + Ring attention is not feasible. |
+| **Ring Attention Limitation** | Ring attention does not support arbitrary `attention_mask` values, so `auto_pad=True` remains incompatible. Contiguous suffix padding is supported when the model publishes the global `valid_kv_length` prefix. |
 
 1. Enable `auto_pad=True` for all sequence-dimension inputs in `_sp_plan`:
 ```python

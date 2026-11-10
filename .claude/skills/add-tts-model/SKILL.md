@@ -44,7 +44,7 @@ Pick exactly one per-step semantics for `forward()` and document it in the docst
 If you choose **delta**, verify the full emit→consolidate→consume chain:
 
 1. `forward()` returns `{"model_outputs": <new_chunk_only>, ...}`
-2. `_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py` concatenates the audio key into one tensor at finish. If it skips the key (`continue`), offline consumers receive only the final chunk. See `output_processor.py` for the concrete list of handled modality keys.
+2. `_consolidate_multimodal_tensors()` in `vllm_omni/outputs/output_processor.py` concatenates the audio key into one tensor at finish. If it skips the key (`continue`), offline consumers receive only the final chunk. See `output_processor.py` for the concrete list of handled modality keys.
 3. Streaming consumers (SSE, Gradio) receive per-step deltas; offline consumers (`engine.generate()`) receive a single concatenated tensor.
 
 Cumulative-vs-delta mismatch is the most common silent bug — offline RTF benchmarks pass, but users hear replays or truncation.
@@ -499,6 +499,13 @@ Common pre-commit failures, recovery commands for missing sign-off, and the
 full `pre-commit run` invocation for a TTS model:
 [references/precommit-dco.md](references/precommit-dco.md).
 
+## Documentation and recipe
+
+Follow the [`add-recipe` skill](../add-recipe/SKILL.md) to add or update the
+in-repository model-family recipe, the `recipes/README.md` index, the supported
+models table, TTS example documentation, and the speech API contract using
+validated evidence.
+
 ## Integration Checklist
 
 Use this checklist when integrating a new TTS model:
@@ -543,6 +550,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] Buildkite entries match level: `test-ready.yml` / `test-merge.yml` or nightly TTS job / `test-nightly.yml`
 - [ ] Gradio demo working
 - [ ] Documentation added (offline + online docs, nav, supported models)
+- [ ] In-repository recipe and `recipes/README.md` row added via the `add-recipe` skill
 
 ### Phase 4: Async Chunk
 - [ ] Pipeline declares the async handoff processor

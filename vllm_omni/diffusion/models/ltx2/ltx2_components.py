@@ -15,12 +15,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
-from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
-from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import AutoModelForImageTextToText, AutoTokenizer, Gemma3ForConditionalGeneration
@@ -31,17 +29,18 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import Dis
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .ltx2_diffusion_decoder import (
-    LTX25_NATIVE_ARTIFACT_REVISION,
-    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
-    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
-)
-from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
+from .ltx2_audio_transformer import LTX2AudioTransformerModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -49,6 +48,13 @@ from .ltx2_transformer import (
     apply_split_rotary_emb,
     to_ltx_padding_mask,
 )
+from .vae.decoder import (
+    LTX25_NATIVE_ARTIFACT_REVISION,
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+    LTX2VideoVaeNeighborhoodNattenProcessor,
+)
+from .vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
@@ -148,6 +154,28 @@ LTX25_FULL_COMPONENT_PROFILE = LTXComponentProfile(
     preserve_connector_attention_mask=True,
 )
 
+# Text-to-audio keeps the checkpoint's audio branch and shared text
+# conditioning components, but deliberately omits the video VAE.  The
+# Transformer itself is an audio-only projection of the full checkpoint and
+# is constructed by ``initialize_audio_pipeline_components``.
+LTX2_T2A_COMPONENT_PROFILE = replace(
+    LTX2_COMPONENT_PROFILE,
+    name="ltx2_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
+LTX23_T2A_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
+LTX25_T2A_COMPONENT_PROFILE = replace(
+    LTX25_FULL_COMPONENT_PROFILE,
+    name="ltx2_5_text_to_audio",
+    vae_modules=("audio_vae",),
+)
+
 
 LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     name="ltx2_distilled",
@@ -228,6 +256,9 @@ LTX25_TWO_STAGE_COMPONENT_PROFILE = replace(
 )
 
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
+    ("text_to_audio", "2"): LTX2_T2A_COMPONENT_PROFILE,
+    ("text_to_audio", "2.3"): LTX23_T2A_COMPONENT_PROFILE,
+    ("text_to_audio", "2.5"): LTX25_T2A_COMPONENT_PROFILE,
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
     ("one_stage", "2.5"): LTX25_FULL_COMPONENT_PROFILE,
@@ -247,7 +278,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
 
 def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
     """Derive checkpoint requirements from the execution contract."""
-    if pipeline_kind in {"one_stage", "two_stage"}:
+    if pipeline_kind in {"one_stage", "two_stage", "text_to_audio"}:
         return "regular"
     if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
         return "distilled"
@@ -279,7 +310,7 @@ def resolve_ltx_artifact(
     # independently pinned artifact revision.
     revision = model_revision if model == repo_id else artifact_revision
     try:
-        return hf_hub_download(
+        return hf_api().hf_hub_download(
             repo_id=repo_id,
             filename=filename,
             revision=revision,
@@ -298,7 +329,7 @@ def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
-            "Install kernels==0.14.1, use a supported GPU, leave "
+            "Install kernels==0.16.1, use a supported GPU, leave "
             "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
@@ -351,7 +382,7 @@ def _load_ltx_metadata_json(model: str, filename: str, revision: str | None = No
             return {}
     else:
         try:
-            path = hf_hub_download(repo_id=model, filename=filename, revision=revision)
+            path = hf_api().hf_hub_download(repo_id=model, filename=filename, revision=revision)
         except Exception:
             return {}
     try:
@@ -529,7 +560,7 @@ def _detect_vocoder_output_sample_rate(model: str, revision: str | None = None) 
     vocoder_config_path = os.path.join(model, "vocoder", "config.json")
     if not os.path.exists(vocoder_config_path):
         try:
-            vocoder_config_path = hf_hub_download(model, "vocoder/config.json", revision=revision)
+            vocoder_config_path = hf_api().hf_hub_download(model, "vocoder/config.json", revision=revision)
         except Exception:
             return None
     try:
@@ -550,9 +581,33 @@ def get_ltx2_post_process_func(od_config: Any):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         video, audio = output
+        if isinstance(video, torch.Tensor) and video.dtype == torch.uint8:
+            if video.ndim != 5 or video.shape[-1] != 3 or not video.is_contiguous():
+                raise ValueError(
+                    "LTX uint8 video output must be contiguous BTHWC RGB, "
+                    f"got shape={tuple(video.shape)} stride={video.stride()}"
+                )
+            video = video.detach().cpu().numpy()
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
         result: dict[str, Any] = {"video": video, "audio": audio}
+        if output_sample_rate is not None:
+            result["audio_sample_rate"] = output_sample_rate
+        return result
+
+    return post_process_func
+
+
+def get_ltx2_audio_post_process_func(od_config: Any):
+    """Build the audio-only LTX engine-output adapter."""
+    output_sample_rate = _detect_vocoder_output_sample_rate(
+        od_config.model,
+        revision=getattr(od_config, "revision", None),
+    )
+
+    def post_process_func(output: torch.Tensor):
+        audio = output.detach().cpu() if isinstance(output, torch.Tensor) else output
+        result: dict[str, Any] = {"audio": audio}
         if output_sample_rate is not None:
             result["audio_sample_rate"] = output_sample_rate
         return result
@@ -579,6 +634,31 @@ def _load_component(
         revision=revision,
         torch_dtype=dtype,
     )
+
+
+def _load_ltx_vocoder(
+    profile: LTXComponentProfile,
+    model: str,
+    *,
+    local_files_only: bool,
+    dtype: torch.dtype,
+    revision: str | None,
+    prefetch_list: tuple[str, ...] = _LTX_COMPONENT_SUBFOLDERS,
+) -> Any:
+    """Load the profile's BWE vocoder, with the legacy-vocoder fallback."""
+    component_kwargs = {
+        "local_files_only": local_files_only,
+        "dtype": dtype,
+        "revision": revision,
+        "prefetch_list": prefetch_list,
+    }
+    try:
+        return _load_component(profile.vocoder_cls, model, "vocoder", **component_kwargs)
+    except (TypeError, OSError, ValueError):
+        fallback_cls = profile.vocoder_fallback_cls
+        if fallback_cls is None or fallback_cls is profile.vocoder_cls:
+            raise
+        return _load_component(fallback_cls, model, "vocoder", **component_kwargs)
 
 
 def _load_ltx25_native_diffusion_decoder(
@@ -613,17 +693,23 @@ def _load_ltx25_native_diffusion_decoder(
 
 def _place_aux_components(pipeline: Any) -> None:
     parallel_config = getattr(pipeline.od_config, "parallel_config", None)
-    use_managed_placement = bool(
-        getattr(pipeline.od_config, "enable_cpu_offload", False)
-        or getattr(pipeline.od_config, "enable_layerwise_offload", False)
-        or getattr(parallel_config, "use_hsdp", False)
-    )
+    use_managed_placement = resolve_offload_strategy(pipeline.od_config) in (
+        OffloadStrategy.MODEL_LEVEL,
+        OffloadStrategy.LAYER_WISE,
+    ) or bool(getattr(parallel_config, "use_hsdp", False))
     if use_managed_placement:
         return
 
     modules = ModuleDiscovery.discover(pipeline)
     for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
         module.to(pipeline.device)
+
+
+def _declare_text_encoder_offload_plan(pipeline: Any) -> None:
+    """Make the text encoder streamable; offloading the DiT alone leaves it resident."""
+    language_model = getattr(getattr(pipeline.text_encoder, "model", None), "language_model", None)
+    if language_model is not None and hasattr(language_model, "layers"):
+        pipeline._offload_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("model.language_model.layers",)})
 
 
 def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
@@ -655,7 +741,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         revision=revision,
     )
     if profile.text_encoder_cls is None:
-        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.13.0,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
             profile.text_encoder_cls,
@@ -673,6 +759,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
+    _declare_text_encoder_offload_plan(pipeline)
     _install_connector_attention(
         pipeline.connectors,
         preserve_learned_register_mask=profile.preserve_connector_attention_mask,
@@ -714,26 +801,13 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
-    try:
-        pipeline.vocoder = _load_component(
-            profile.vocoder_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
-    except (TypeError, OSError, ValueError):
-        if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
-            raise
-        pipeline.vocoder = _load_component(
-            profile.vocoder_fallback_cls,
-            model,
-            "vocoder",
-            local_files_only=local_files_only,
-            dtype=dtype,
-            revision=revision,
-        )
+    pipeline.vocoder = _load_ltx_vocoder(
+        profile,
+        model,
+        local_files_only=local_files_only,
+        dtype=dtype,
+        revision=revision,
+    )
 
     if "latent_upsampler" in profile.resident_modules:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
@@ -832,7 +906,7 @@ def load_transformer_config(
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"LTX transformer config not found: {config_path}")
     else:
-        config_path = hf_hub_download(
+        config_path = hf_api().hf_hub_download(
             repo_id=model_path,
             filename=f"{subfolder}/config.json",
             revision=revision,
@@ -856,3 +930,19 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
 
     return LTX2VideoTransformer3DModel(**kwargs)
+
+
+def create_audio_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> LTX2AudioTransformerModel:
+    """Project a full LTX config onto its audio-only Transformer arguments."""
+    if not config and quant_config is None:
+        return LTX2AudioTransformerModel()
+
+    signature = inspect.signature(LTX2AudioTransformerModel.__init__)
+    allowed_keys = set(signature.parameters)
+    kwargs = {key: value for key, value in config.items() if key in allowed_keys}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+    return LTX2AudioTransformerModel(**kwargs)

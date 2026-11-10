@@ -13,7 +13,6 @@ It can send model inference requests to either a locally running vLLM-Omni servi
 > [!TIP]
 > If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
 
-
 ## Installation
 
 Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
@@ -21,9 +20,10 @@ Copy this folder to the `custom_nodes` subfolder of your ComfyUI installation. Y
 If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
 
 > [!TIP]
-> You can use utility websites such as https://download-directory.github.io/ to download a subdirectory of a repo. Also checkout community discussions (e.g., https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository) for more info.
+> You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
 
 On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
 ```bash
 cd ComfyUI
 
@@ -35,6 +35,7 @@ python main.py --cpu
 ```
 
 On the device and virtual environment you run vLLM-Omni, start a model service with
+
 ```bash
 vllm serve The_Model_ID_to_Serve --omni --port 8000
 ```
@@ -48,13 +49,35 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio;
+  see the [standalone and H3 chaining guide](docs/seedvr2-restoration.md).
+- **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
+- **MiniMax H3 Add Guide** for anchoring images, clips, and audio at chosen frames of a MiniMax-H3 video (timeline guides)
+- **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for lyrics-and-description-to-music generation
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
 > [!NOTE]
 > The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
+
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Restore Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated or restored image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References, Latent Mask Editing | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+The `model` field of every node that talks to a server doubles as a dropdown of what the server actually serves: the list is fetched through the ComfyUI backend (so `localhost` resolves to the host running ComfyUI, not to the machine the browser is on), refetched when the `url` field changes or the **↻ refresh models** button is clicked, and falls back to plain free text whenever the list cannot be fetched -- a server that is down must never make the node unfillable. A value saved in a workflow is always kept, even when it is not in the fetched list.
+
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,
 
@@ -117,11 +140,236 @@ You can configure per-stage sampling parameters for multi-stage models.
 </p>
 
 > [!TIP]
-> Connect a **frame** image for first-frame / image-to-video (e.g., Wan I2V, MiniMax-H3 FL2VA).
+> Connect **frame** for backward-compatible first-frame / image-to-video behavior. For MiniMax-H3 FL2VA,
+> connect **first_frame**, **last_frame**, or both to condition the start frame, end frame, or both.
 >
 > For reference-conditioned generation (MiniMax-H3 Ref2VA), connect a **Video References** node instead.
 >
-> Do not use `frame` and `references` together. Task routing is automatic from which inputs you connect.
+> Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
+> `references`. Task routing is automatic from which inputs you connect.
+
+For MiniMax-H3 Ref2VA, **Video References** accepts up to 9 images (`image_1`–`image_9`),
+3 videos (`video_1`–`video_3`), and 3 audio clips (`audio_1`–`audio_3`), with at most
+12 connected inputs in total. Any mixture containing at least one image or video
+is supported; empty and audio-only references are rejected. For example, you can
+combine 6 images, 3 videos, and 3 audio clips in one request.
+
+Within each media type, references follow slot-number order, skipping unconnected
+slots. For example, connecting `image_2` and `image_9` sends `image_2` as the first
+image and `image_9` as the second. Each image slot uses the first image in its batch.
+Existing connections to `image_1`, `image_2`, `audio_1`, `audio_2`, `video_1`, and
+`video_2` remain valid in saved workflows.
+
+#### MiniMax-H3 Reference to Video
+
+Load [MiniMax-H3 Reference to Video](example_workflows/vLLM-Omni%20MiniMax-H3%20Reference%20to%20Video.json)
+from **Templates → ComfyUI-vLLM-Omni**, or drag the JSON onto the canvas.
+It adapts the [official ComfyUI R2V workflow](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json)
+to remote vLLM-Omni execution. Model loading, sampling, and VAE decoding run on
+the server; ComfyUI loads references and saves the returned video.
+
+Use an extension version containing the audio-preserving output fix from
+[#7456](https://github.com/vllm-project/vllm-omni/pull/7456). Older versions can
+drop the server's audio while decoding the response.
+
+1. Start a Ref2VA-capable service using the [MiniMax-H3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md).
+   Set **Generate Video** to its `/v1` URL and served model name.
+2. Select your own image in **Load Image**. The template's filenames are placeholders
+   relative to ComfyUI's input directory; no sample assets or model weights are bundled.
+3. Connect **Load Video** and **Load Audio** when needed. Duplicate the loaders to
+   fill more reference slots, or disconnect the image when using video-only input.
+   Keep the references connected to **Generate Video** and leave `frame` disconnected.
+4. Match prompt tags such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>` to the
+   connected references, counting each media type separately and skipping empty slots.
+   To drive the clip with a soundtrack instead, connect exactly one audio and set
+   **MiniMax-H3 Video Params → audio_mode** to `lock_source`; that audio is not
+   counted as an `<Audio N>` reference.
+5. Run the workflow. **Save Video** writes an MP4 under `output/video/` and preserves
+   the generated audio when the audio-output prerequisite is installed.
+
+The default is **1344×768, 24 FPS, 124 frames** (about 5.17 seconds), 50 sampling
+points, video flow shift 12, audio flow shift 3, and seed 42. The duration widget
+is set to 5.167 seconds, which converts to 124 frames at 24 FPS. Other H3 canvas presets
+are 1024×768, 768×768, 768×1024, and 768×1344. Keep frame counts at `17k+5` within
+the 4–15 second output range; examples are 107, 124, 209, and 345 frames.
+Reference video/audio clips must each be 2–15 seconds, with at most 15 seconds of
+reference video and at most 15 seconds of standalone reference audio per request.
+
+For **Ref2VA Turbo**, use the same template. Configure a Ref2VA-only server with
+`--lora-backend peft --lora-path "$TURBO_LORA" --task-type ref2va`, following the
+recipe's hardware setup. For `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`,
+set **LoRA** `local_path` to that file's path on the server and connect it to
+**Generate Video**. Use `num_inference_steps=5`, `flow_shift=12`,
+`audio_flow_shift=3`, and LoRA `scale=1`. The API counts sigma points, so five
+points produce four denoiser evaluations. Use the Diffusers artifact, not its
+`_comfyui_` export. To return to base mode, disconnect LoRA and restore 50 steps.
+The 8-step v1.0 Ref2VA adapter instead requires nine sampling points and video
+flow shift 6. FastH3 is a separate startup-fused T2VA deployment.
+
+Validate the template's wiring and defaults locally with:
+
+```bash
+python -m pytest tests/e2e/features/comfyui/test_h3_reference_workflow.py -q
+```
+
+For a real-model check, run the workflow against H3 and inspect the saved file:
+
+```bash
+ffprobe -v error -show_entries stream=codec_type,width,height,r_frame_rate,sample_rate,channels \
+  -show_entries format=duration -of json "$OUTPUT_MP4"
+```
+
+Check for 24 FPS video, stereo audio, the requested canvas, and aligned duration;
+also play the result to assess reference conditioning and audio/video synchronization.
+Record the server commit, model/adapter, input assets, prompt, settings, and output
+alongside the result. Local schema or mocked-server checks do not establish H3
+generation quality or replace this real-model validation.
+
+### MiniMax H3 Text to Video
+
+Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)
+for remote video generation with audio. It includes connected base presets and
+optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
+[workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
+settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
+the downloaded Turbo artifact on your server before enabling Turbo.
+
+#### H3 all-in-one (H3-06)
+
+The **vLLM-Omni MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and mixed-reference Ref2VA in one graph. The server URL, served model name, duration, sampling, and flow shifts are set once and shared by all modes; enable the group for the mode you want to run. It does not include a prompt LLM. See [workflow setup](docs/h3-06-all-in-one.md).
+
+#### H3 music video from a supplied track (H3-03)
+
+The **vLLM-Omni MiniMax-H3 Music Video** template cuts a supplied music track into 124-frame slices, generates one Ref2VA shot per slice with a shared character/style image, and joins the shots with the original track as the soundtrack. Each shot sets **MiniMax-H3 Video Params → audio_mode** to `lock_source`, so its slice drives generation instead of acting as a short reference. Requires ComfyUI v0.36.0+ for Concatenate Video. See [workflow setup](docs/h3-03-music-video.md).
+
+#### H3 video upscale (WF-07)
+
+The **vLLM-Omni MiniMax H3 Video Upscale** template generates video remotely, upscales it with SeedVR2, and saves the original and upscaled videos with the generated audio and FPS. See [workflow setup](docs/wf07-h3-upscale.md).
+
+#### FastH3 text-to-video
+
+FastH3 is fused into MiniMax-H3 when the vLLM-Omni server starts; it is not a request-switchable LoRA. Download one adapter variant and start a non-offloaded FL2VA server. For the Dense / Data-Free profile:
+
+```bash
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+
+vllm serve /path/to/MiniMax-H3 \
+  --omni \
+  --task-type fl2va \
+  --lora-path "${FASTH3_DIR}/dense-datafree/adapter_model.safetensors" \
+  --port 8000
+```
+
+For the VSA / Data-Free profile, download `vsa-datafree/adapter_model.safetensors`, use that file as `--lora-path`, and add:
+
+```bash
+--diffusion-attention-backend FASTVIDEO_VSA \
+--fastvideo-vsa-topk 64
+```
+
+The VSA profile also requires a compatible `fastvideo-kernel` installation. See the [MiniMax-H3 FastH3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter) for the full serving contract, supported parallel layouts, and kernel requirements.
+
+Open the **vLLM-Omni FastH3 Text to Video** template, then:
+
+- Set the server URL and served model name on **FastH3 Deployment**.
+- Connect its output to **Generate Video → fast_h3**. When connected, the deployment node's URL and model take precedence over the corresponding Generate Video widgets.
+- Keep `frame`, `references`, **LoRA**, and **MiniMax-H3 Video Params** disconnected. FastH3 Preview v1 supports T2VA only, is already fused, and owns both flow shifts.
+- A connected **Diffusion Sampling Params** node may set seed and other ordinary sampling options. The integration always enforces four denoising steps and 24 FPS for FastH3.
+
+The node records which server the workflow targets; it does not start one, nor switch adapters or attention backends on a running server.
+
+#### Latent-mask editing (MiniMax-H3)
+
+The [WF-05 template](example_workflows/vLLM-Omni%20MiniMax-H3%20Latent%20Mask%20Editing.json) contains inpainting, object removal, continuation, and extension examples in one graph. See the [workflow guide](docs/wf05-h3-latent-editing.md) for inputs, mask settings, dependencies, and preview limitations.
+
+Connect a **Latent Mask Editing** node to **Generate Video → latent_edit** to edit a source clip instead of generating from scratch. It uploads the source media and serializes the video/audio noise masks the MiniMax H3 API accepts:
+
+- `source_video` / `source_audio` — the media to edit.
+- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. The client area-downsamples it by 16 to keep the upload small, and the server resizes it to the video latent grid.
+- `audio_mask` — a scalar in `[0, 1]`; `0` keeps the source audio, `1` regenerates it, fractional values blend.
+
+The node requires at least one mask; the server then enforces the cross-field rules (a source requires a matching mask, and a non-trivial mask requires its source). This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
+
+#### Timeline guides (MiniMax-H3)
+
+Timeline guides pin a still image or a clip, optionally with audio, to a chosen
+frame of the generated video. Chain **MiniMax H3 Add Guide** nodes
+(`VLLMOmniMiniMaxH3Guide`) and connect the last one to
+**Generate Video → timeline_guides**:
+
+```text
+Load Image ─────image──► Add Guide (frame_index=36) ─┐
+Load Image ─────image──► Add Guide (frame_index=72) ◄┘ ─┐
+Load Video ─────video──► Add Guide (frame_index=-22) ◄──┘ ──timeline_guides──► Generate Video ──► Save Video
+Load Audio ─────audio──┘
+```
+
+The [MiniMax-H3 Timeline Guides](example_workflows/vLLM-Omni%20MiniMax-H3%20Timeline%20Guides.json)
+template (**Templates → ComfyUI-vLLM-Omni**) wires this chain, guiding the closing
+clip with its own soundtrack through **Get Video Components → audio**. Its loader
+filenames are placeholders; select your own files.
+
+| Socket | Type | Notes |
+| --- | --- | --- |
+| `frame_index` (widget) | `INT` | Output frame where the guide starts, on the 24 FPS timeline. Negative values count from the end: `-1` is the last frame, `-22` starts a clip that ends on it. |
+| `image` | `IMAGE` | One frame. A batch of several images is rejected; turn it into a clip with **Create Video** at 24 FPS and connect `video` instead. |
+| `video` | `VIDEO` | A clip, decoded by the server at 24 FPS whatever its own frame rate. Its soundtrack is **not** used; connect **Get Video Components → audio** to `audio` to guide with it. |
+| `audio` | `AUDIO` | One mono or stereo clip, starting at the same frame. Audio-only guides are allowed. |
+| `timeline_guides` (input/output) | `H3_TIMELINE_GUIDES` | The chain. Each node appends one guide to a copy, so branching a chain never changes the other branch. |
+
+Every node adds exactly one guide that carries media: `image`, `video`, `audio`,
+`image` + `audio`, or `video` + `audio`. `image` and `video` cannot be combined.
+Guides keep chain order; they are not sorted, deduplicated, or checked for
+overlap, so a repeated image is sent as its own guide.
+
+The request carries the guides as a `timeline_guides` JSON manifest plus one
+repeated `guide_files` upload per medium (PNG; MP4, with MKV/WebM sources
+converted; FLAC), numbered in chain order with the visual input before the audio,
+as described in the [Videos API](../../docs/serving/videos_api.md#minimax-h3-timeline-guides).
+Limits are 8 guides, 16 uploads, and 30 MiB per image, 50 MiB per clip, 15 MiB
+per audio after encoding; larger inputs fail before anything is uploaded.
+
+The server, not the node, fits guides to the video. The output length is
+aligned up to `17k+5` frames, a negative index resolves to `frames + index`,
+and a clip is shortened to `17k+5` frames (or 1) and must fit between its start
+and the end of the video. Errors such as an index that does not fit are shown
+in ComfyUI as returned by the server.
+
+A guided request:
+
+- sets **fps** to 24 (other values are rejected rather than changed) and sends
+  `quality=lossless`; requests without guides are sent exactly as before;
+- keeps the usual routing: guides alone are T2VA, with `first_frame` /
+  `last_frame` FL2VA, with **Video References** Ref2VA. References keep their
+  `<Picture N>` / `<Video N>` / `<Audio N>` numbering;
+- needs base H3 weights: **FastH3 Deployment**, a request **LoRA** with a
+  non-zero scale (including Turbo), and **Latent Mask Editing** are rejected
+  before upload. Other server-side restrictions (cache acceleration, distilled
+  schedules, continuation, `audio_mode=lock_source`) are reported by the server.
+
+Use a vLLM-Omni server that includes timeline guides
+([#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Older servers
+may silently ignore the unknown form fields, and `/v1/models` does not report
+guide support, so the node cannot detect this for you.
+
+The served model name must match the H3 model spec (for example, start the
+server with `--served-model-name MiniMaxAI/MiniMax-H3`); otherwise the node
+refuses to send guides, for example to a server named only by its model path.
+
+Validate the node and the request contract locally with:
+
+```bash
+python -m pytest -q tests/e2e/features/comfyui/test_timeline_guides.py
+python -m pytest -q tests/e2e/features/comfyui/test_comfyui_integration.py -k timeline_guides
+```
+
+The second command runs the real `/v1/videos` multipart parser against a mocked
+model. Neither replaces a real-model run: generate against H3, save with
+**Save Video**, then check the file with
+`ffprobe -v error -count_frames -show_streams -show_format -of json "$OUTPUT"`
+and `ffmpeg -v error -i "$OUTPUT" -f null -`, and watch and listen to it.
 
 ### TTS (e.g., Qwen TTS series)
 
@@ -137,6 +385,48 @@ You can configure per-stage sampling parameters for multi-stage models.
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
 
+### Text to Music (e.g., MiniMax Music 3/YuE2)
+
+Open **ComfyUI sidebar->Template->vLLM-Omni** and select:
+
+- **vLLM-Omni Text to Music(MiniMax Music3)** — the existing MiniMax Music 3 template.
+- **vLLM-Omni Text to Music(YuE2)** — uses YuE2 Params with `cot=off` by default.
+
+Set Generate Music's URL and model to the running service. Caption and lyrics
+map to `instructions` and `input`. For YuE2, connect YuE2 Params to the optional
+`model_specific_params` input. Leave ABC empty for `off`; `melody/full` require
+ABC score text, pasted or connected as STRING, not a file path.
+
+See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md) for deployment details.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg">
+    <img alt="vLLM-Omni Text to Music(MiniMax Music3)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg" width=55%>
+  </picture>
+</p>
+
+### Music Cover (e.g. YuE2)
+
+Open **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Cover(YuE2)**.
+
+The template uses native Load Audio, Audio Encoder Loader and SheetSage2 Audio
+to ABC nodes locally, followed by remote YuE2 generation. Download
+[sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors)
+into `models/audio_encoders/`, select it and upload your source audio.
+
+Keep SheetSage2 mode and YuE2 Params cot matched; both default to `melody`.
+Provide lyrics separately. The remote service receives ABC text rather than the
+source recording, and returns audio without generated ABC or truncation metadata.
+Save Audio previews and saves the result.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg">
+    <img alt="vLLM-Omni Music Cover(YuE2)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg" width=55%>
+  </picture>
+</p>
+
 ### Chaining multiple model services
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Chaining Services**)
@@ -151,6 +441,8 @@ You can configure per-stage sampling parameters for multi-stage models.
 ## Develop
 
 Follow the [development convention and rules of vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/).
+
+Node tints and the title-bar mark are applied in `web/main.js`, keyed off each node's declared output types rather than a list of node names. A new node that returns an existing type is themed with no front-end change; a new output type needs one entry in `FAMILY_BY_OUTPUT` there.
 
 ## Limitation and Non-Goals
 
@@ -178,11 +470,11 @@ Whenever you find an issue or problem, please
 
 Features
 
-- https://github.com/dougbtv/comfyui-vllm-omni/ The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
-- https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras ComfyUI's built-in node implementations.
+- <https://github.com/dougbtv/comfyui-vllm-omni/> The official reference implementation for ComfyUI integration with vLLM-Omni's DALL-E compatible image generation API.
+- <https://github.com/Comfy-Org/ComfyUI/tree/master/comfy_extras> ComfyUI's built-in node implementations.
 
 UI/UX design references
 
-- https://github.com/sgl-project/sglang/pull/15271 SGLang Diffusion's official ComfyUI integration for image and video generation.
-- https://github.com/SXQBW/ComfyUI-Qwen-Omni A third party ComfyUI integration for Qwen Omni series.
-- https://github.com/flybirdxx/ComfyUI-Qwen-TTS https://github.com/DarioFT/ComfyUI-Qwen3-TTS Third  party ComfyUI integrations for Qwen TTS series.
+- <https://github.com/sgl-project/sglang/pull/15271> SGLang Diffusion's official ComfyUI integration for image and video generation.
+- <https://github.com/SXQBW/ComfyUI-Qwen-Omni> A third party ComfyUI integration for Qwen Omni series.
+- <https://github.com/flybirdxx/ComfyUI-Qwen-TTS> <https://github.com/DarioFT/ComfyUI-Qwen3-TTS> Third  party ComfyUI integrations for Qwen TTS series.

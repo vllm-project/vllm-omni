@@ -116,7 +116,13 @@ per request. Cache refresh, homogeneous LoRA activation, and
 
 `RequestBatchSamplingParamsKey` contains fields that affect the tensor contract,
 including shape, guidance, output count, and LoRA identity. Only compatible
-requests can share a fused forward call.
+requests can share a fused forward call. The key also holds the request's
+`attention_schedule` resolved against the service default, because the runner
+binds one schedule per batch, plus whether the request sent it. An omitted
+schedule does not share a key with the same ranges sent explicitly, because an
+explicit schedule is checked against the step count while an inherited default
+is not. `[]` never shares a batch with an omitted schedule, and different
+ranges never share.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
@@ -150,8 +156,17 @@ that do not belong in the shared contract should be stored in `state.extra`.
 Queueing and lifecycle metadata remain in the scheduler's request state.
 
 Current native pipelines that explicitly enable step execution include
-Qwen-Image, HunyuanImage3, and Helios. Step execution alone does not imply
-continuous-batching support: Qwen-Image accepts batched step states.
+Qwen-Image, BAGEL, HunyuanImage3, and Helios. Step execution alone does not
+imply continuous-batching support: Qwen-Image accepts batched step states.
+BAGEL accepts batched step states for image generation with its default,
+think-mode, and single-stage deploy configs. Only the diffusion stage uses the
+step protocol in two-stage deployments; explicit single-stage text output
+retains complete-request execution. BAGEL requires at least two inference steps
+because it schedules `num_inference_steps - 1` denoising updates, and its step
+path does not currently support sequence parallelism or a diffusion cache
+backend. When a finished stepwise request is followed by an explicit text
+fallback wave, the runner retires its step state and paged diffusion-KV rows
+before the full forward dispatch.
 HunyuanImage3 accepts batched step states only when its resolved self-attention
 backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
 Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
@@ -178,8 +193,8 @@ denoise forward, then applies scheduler updates per request:
 
 `StepBatchSamplingParamsKey` protects the batched tensor contract. Requests can
 have different total step counts and current step indices, but shape-sensitive,
-CFG-sensitive, and LoRA fields must be compatible. FIFO head-of-line blocking
-also applies here.
+CFG-sensitive, LoRA, and `attention_schedule` fields must be compatible. FIFO
+head-of-line blocking also applies here.
 
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.

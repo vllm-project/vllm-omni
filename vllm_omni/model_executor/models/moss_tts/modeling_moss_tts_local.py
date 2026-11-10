@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -23,7 +26,7 @@ previous KV-cache loop -- causal attention, only the last position is read.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -138,6 +141,24 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         return codes
 
 
+def _normalize_generators(
+    generators: Sequence[torch.Generator | None] | None,
+    batch_size: int,
+) -> list[torch.Generator | None] | None:
+    """Validate per-row generators against the batch they will sample for.
+
+    Mirrors ``Qwen3CodePredictor._normalize_generators``: a length mismatch is
+    an error instead of a silent per-row fallback to the global RNG, which would
+    quietly break reproducibility of seeded requests.
+    """
+    if generators is None:
+        return None
+    row_generators = list(generators)
+    if len(row_generators) != batch_size:
+        raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+    return row_generators
+
+
 def _sample_token(
     logits: torch.Tensor,
     temperature: float,
@@ -145,6 +166,7 @@ def _sample_token(
     top_p: float,
     do_sample: bool,
     generator: torch.Generator | None = None,
+    generators: Sequence[torch.Generator | None] | None = None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling for the upstream inference branch.
 
@@ -153,6 +175,12 @@ def _sample_token(
     vocabulary. This preserves the categorical distribution when the top-k
     boundary has no ties, but it is not seed/bit equivalent to multinomial over
     a full-vocabulary tensor because random-number mapping depends on width.
+
+    When ``generators`` is provided (per-row), each row is sampled with its
+    own generator via separate ``multinomial`` calls. This keeps the rest of
+    the forward batched while making seeded requests reproducible per-row.
+    ``generators`` must hold exactly one entry per batch row; a mismatch raises
+    ``ValueError`` rather than silently falling back to the global RNG.
     """
     if not do_sample or temperature <= 0:
         return logits.argmax(dim=-1)
@@ -181,8 +209,20 @@ def _sample_token(
             logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_indices, logits)
 
     probs = F.softmax(logits, dim=-1)
-    flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+    B = int(probs.shape[0])
+    row_generators = _normalize_generators(generators, B)
+    if row_generators is not None and any(gen is not None for gen in row_generators):
+        rows = []
+        for row in range(B):
+            row_probs = probs[row : row + 1]
+            flat = row_probs.reshape(-1, row_probs.shape[-1])
+            sampled = torch.multinomial(flat, num_samples=1, generator=row_generators[row])
+            rows.append(sampled)
+        sampled = torch.cat(rows, dim=0).reshape(probs.shape[:-1])
+    else:
+        flat = probs.reshape(-1, probs.shape[-1])
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+
     if compact_indices is not None:
         return compact_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
     return sampled

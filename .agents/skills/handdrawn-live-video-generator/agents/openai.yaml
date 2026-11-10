@@ -1,0 +1,4 @@
+interface:
+  display_name: "Handdrawn Live-Action Fusion"
+  short_description: "Direct drawn morphs and real-world interactions"
+  default_prompt: "Use $handdrawn-live-video-generator to prepare the requested H3 prompts or video with the available tools."

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for multi-modal streaming finish_reason behavior (commit 44c799bc).
 
 Verifies that the /v1/chat/completions streaming endpoint emits exactly one
@@ -411,7 +412,7 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
 @pytest.mark.asyncio
 async def test_audio_choice_error_response_is_not_iterated_as_choices():
     """Any ErrorResponse from the audio path is skipped, not iterated."""
-    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+    from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
     serving_chat = build_serving_chat()
     request = make_request(modalities=["text", "audio"])

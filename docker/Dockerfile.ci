@@ -1,27 +1,11 @@
-# Target vllm version: v0.28.0 (tag v0.28.0 @ 2cf0a6915ce5).
-# Keep VLLM_BASE_TAG aligned with the target vLLM release on every rebase.
-#
-# Release-boundary form: there is no precompiled-wheel pin here, because the
-# base image already ships exactly the target vLLM. Everything the runtime
-# needs — torch, flashinfer, nvJitLink, numpy — comes from that image as one
-# self-consistent set.
-#
-# This block reappears only when the rebase targets a vLLM commit that is NOT a
-# released tag. During the 0.27 rebase, targeting v0.27.0rc1 on top of the
-# v0.26.0 base image required reinstalling vLLM from wheels.vllm.ai and then
-# hand-repairing the fallout: pinning torch ahead of flashinfer (installing it
-# after bound flashinfer's TVM FFI runtime to the old torch and aborted engine
-# core init), registering libnvJitLink.so.13 with ldconfig, and re-pinning numpy
-# under numba's ceiling. All of it was compensation for a base image and a vLLM
-# that disagreed. At a real release boundary they agree, so none of it is
-# needed. The 0.28 rebase repeated the cycle: the v0.28.0rc / final-tag wheels
-# rode on the v0.27.0 base image with the full reinstall block until the
-# official v0.28.0 image shipped, at which point this file dropped back to the
-# form you are reading. If you pin an untagged commit again, restore the
-# reinstall block — agent/tasks/20_update_wheel_url.sh fails the run rather
-# than letting the Dockerfile silently ship the wrong vLLM.
+# Install the final v0.33.0 package from its frozen commit index.
+# Use the matching published v0.33.0 image and verify the selected runtime
+# from its exact frozen wheel below.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5
+ARG VLLM_VERSION=0.33.0
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.28.0
+# Update the digest together with VLLM_VERSION; the digest selects the image bytes.
+ARG VLLM_BASE_TAG=v${VLLM_VERSION}@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
@@ -29,6 +13,13 @@ ARG VLLM_BASE_TAG=v0.28.0
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+ARG VLLM_BASE_IMAGE
+ARG VLLM_BASE_TAG
+# The base overrides Torch's NCCL dependency for its optional EFA build.
+# Resolve the official wheel's declared dependencies for the Omni runtime.
+ENV UV_OVERRIDE=""
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT
+ARG VLLM_VERSION
 # Keep APP_DIR outside /workspace so k8s Buildkite workspace mounts cannot
 # shadow the editable install target (#5364). Docker WORKDIR creates /opt if
 # needed.
@@ -53,12 +44,83 @@ RUN apt-get update && \
 # for CI
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+COPY tools/build_gradio_pillow13.py tools/build_gradio_pillow13.py
+COPY tools/prepare_ci_telemetry.py tools/prepare_ci_telemetry.py
+COPY tools/gradio_pillow13/ tools/gradio_pillow13/
+# Scope the override to Omni; dependency source builds need their own versions.
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Editable install: deps + project metadata are cached in this layer, while
 # the package itself is linked to APP_DIR (populated later by COPY --link).
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
-RUN uv pip install --system -e ".[dev]"
+RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+# This exact base contains an unused exporter requiring a newer SDK than
+# LMCache supports. Validate its known metadata before removing that orphan.
+RUN python3 tools/prepare_ci_telemetry.py "${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}" && \
+    uv pip uninstall --system opentelemetry-exporter-otlp-common
+RUN uv pip install --system -r requirements/cuda-bootstrap.txt \
+    "nvidia-nccl-cu13==2.30.7" \
+    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
+    "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+    -e ".[dev]"
+# The final base's LMCache wheel was compiled against Torch 2.13. Its CUDA
+# extension references a c10 symbol removed in Torch 2.14. Follow LMCache's
+# source workflow so the unchanged release is compiled against this runtime.
+RUN uv pip install --system -r requirements/cuda-bootstrap.txt \
+    ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
+    "setuptools_scm>=8" "grpcio==1.78.0" "grpcio-tools==1.78.0" wheel
+# CUDA builder images can lack the math-library headers supplied by the
+# installed NVIDIA packages. Keep all published LMCache CUDA architectures.
+# Disable the installer cache so an older Torch-specific source wheel cannot
+# satisfy this rebuild merely because its Python package version is unchanged.
+RUN PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))') && \
+    test -f "${PYTHON_SITE}/nvidia/cu13/include/cusparse.h" && \
+    test -f "${PYTHON_SITE}/nvidia/cusparselt/include/cusparseLt.h" && \
+    CUDA_VISIBLE_DEVICES="" CUDA_HOME=/usr/local/cuda BUILD_WITH_CUDA=1 MAX_JOBS=3 NVCC_THREADS=1 \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;11.0;12.0" \
+    CPATH="${PYTHON_SITE}/nvidia/cu13/include:${PYTHON_SITE}/nvidia/cusparselt/include${CPATH:+:${CPATH}}" \
+    uv pip install --system --no-cache --no-binary lmcache \
+    --no-build-isolation-package lmcache --reinstall-package lmcache \
+    -r requirements/cuda-bootstrap.txt "lmcache==0.5.6"
+RUN uv pip check --system && rm -rf /tmp/gradio-pillow13
+# cuDNN 9.24 causes the original Qwen-Image 2.1 pixel gate to fail under
+# Torch 2.14. Keep Torch's declared Python dependencies and load the verified
+# NVIDIA 9.25.1 wheel in a private target outside Python's import path.
+RUN uv pip install --target /opt/vllm-omni-cudnn --no-deps --only-binary=:all: \
+    --require-hashes -r requirements/cudnn-runtime.txt
+ENV LD_PRELOAD="/opt/vllm-omni-cudnn/nvidia/cudnn/lib/libcudnn.so.9 ${LD_PRELOAD:-}"
+ENV LD_LIBRARY_PATH="/opt/vllm-omni-cudnn/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-/usr/local/nvidia/lib:/usr/local/nvidia/lib64}"
+
+# Fail the image build if dependency resolution replaced the selected vLLM.
+# The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
+# of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.
+RUN python3 -c "from vllm._version import __commit_id__, __version__; commit = (__commit_id__ or '').removeprefix('g'); assert len(commit) >= 8 and '${VLLM_PRECOMPILED_WHEEL_COMMIT}'.startswith(commit), __commit_id__; assert __version__ == '${VLLM_VERSION}', __version__"
+
+# Exercise ordinary tools and Torch CPU operations with the preload enabled.
+# Record driver/device visibility so a CPU-builder result has an explicit scope.
+RUN uv pip check --system && python3 - <<'PY'
+import glob
+import json
+import os
+from pathlib import Path
+
+import torch
+
+maps = Path("/proc/self/maps").read_text()
+assert any(os.path.realpath(path) in maps for path in os.environ["LD_PRELOAD"].split() if "libcudnn.so.9" in path)
+assert torch.arange(4, device="cpu").sum().item() == 6
+cuda_available = torch.cuda.is_available()
+assert not torch.cuda.is_initialized()
+print(json.dumps({
+    "cpu_preload_smoke": "passed",
+    "cudnn": torch.backends.cudnn.version(),
+    "cuda_available": cuda_available,
+    "cuda_initialized": torch.cuda.is_initialized(),
+    "gpu_device_nodes": sorted(glob.glob("/dev/nvidia*")),
+    "driver_module_visible": Path("/sys/module/nvidia").exists(),
+    "driver_proc_visible": Path("/proc/driver/nvidia/version").exists(),
+}))
+PY
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -376,9 +376,9 @@ def _ensure_local_dir(model: str | os.PathLike[str], allow_patterns: list[str] |
     model_path = Path(model)
     if model_path.exists():
         return model_path
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return Path(snapshot_download(str(model), allow_patterns=allow_patterns))
+    return Path(hf_api().snapshot_download(str(model), allow_patterns=allow_patterns))
 
 
 def _ensure_avatar_model_index(model_dir: Path, use_int8: bool) -> None:

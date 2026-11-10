@@ -6,12 +6,8 @@
 ``_process_pending_chunk_timeouts`` covers async-chunk. Both share
 ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S``.
 
-Verifies that the mixin correctly *delegates* timed-out requests to the
-base scheduler's ``finish_requests`` API with ``RequestStatus.FINISHED_ERROR``.
-The end-to-end effect (queue removal + status set + per-request cleanup +
-client-facing FINISHED_ERROR emission) is the responsibility of upstream
-vLLM's ``finish_requests`` implementation and is covered by upstream tests;
-this file only asserts the wiring from the mixin to that API.
+Verifies scheduler cleanup and explicit client-facing ERROR outputs. Upstream
+``finish_requests`` frees requests but does not emit their terminal output.
 """
 
 from __future__ import annotations
@@ -23,6 +19,9 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from vllm import SamplingParams
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.request import Request
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
@@ -44,6 +43,7 @@ class _FakeScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.input_coordinator = coordinator
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))
@@ -52,7 +52,7 @@ class _FakeScheduler(OmniSchedulerMixin):
 def test_process_pending_input_timeouts_delegates_to_finish_requests():
     """Timed-out request present in self.requests is forwarded to finish_requests."""
     req_id = "stuck-req"
-    requests = {req_id: SimpleNamespace(request_id=req_id)}
+    requests = {req_id: SimpleNamespace(request_id=req_id, client_index=0)}
     coord = _FakeCoordinator(timed_out_ids={req_id})
     scheduler = _FakeScheduler(requests, coord)
 
@@ -128,6 +128,7 @@ class _FakeChunkScheduler(OmniSchedulerMixin):
         self.requests = requests
         self.chunk_transfer_adapter = adapter
         self.finish_calls = []
+        self._outputs_awaiting_stage_payload = {}
 
     def finish_requests(self, req_ids, status):
         self.finish_calls.append((set(req_ids), status))
@@ -142,7 +143,7 @@ def test_process_pending_chunk_timeouts_delegates_to_finish_requests():
     """
     req_id = "stalled-stream"
     adapter = _FakeChunkAdapter(timed_out_ids={req_id})
-    scheduler = _FakeChunkScheduler({req_id: SimpleNamespace(request_id=req_id)}, adapter)
+    scheduler = _FakeChunkScheduler({req_id: SimpleNamespace(request_id=req_id, client_index=0)}, adapter)
 
     scheduler._process_pending_chunk_timeouts()
 
@@ -152,6 +153,41 @@ def test_process_pending_chunk_timeouts_delegates_to_finish_requests():
     finished_ids, status = scheduler.finish_calls[0]
     assert finished_ids == {req_id}
     assert getattr(status, "name", str(status)).endswith("FINISHED_ERROR")
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("synthesize_abort_outputs", [False, True])
+def test_timeout_emits_error_once_even_without_model_outputs(chunked, synthesize_abort_outputs):
+    from vllm.v1.engine import FinishReason
+
+    request = Request(
+        request_id="stuck",
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        client_index=3,
+    )
+    if chunked:
+        scheduler = _FakeChunkScheduler({"stuck": request}, _FakeChunkAdapter({"stuck"}))
+        scheduler._process_pending_chunk_timeouts()
+    else:
+        scheduler = _FakeScheduler({"stuck": request}, _FakeCoordinator({"stuck"}))
+        scheduler._process_pending_input_timeouts()
+    # Model upstream's finish_requests cleanup. Generation must still emit
+    # ERROR, and AR's synthetic ABORT must not replace or duplicate it.
+    scheduler.requests.clear()
+    scheduler.finished_req_ids_dict = {3: {"stuck"}}
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=synthesize_abort_outputs)
+
+    [error] = outputs[3].outputs
+    assert error.request_id == "stuck"
+    assert error.finish_reason == FinishReason.ERROR
+    assert "connector input" in error.stop_reason
+    assert outputs[3].finished_requests == {"stuck"}
+    outputs = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=synthesize_abort_outputs)
+    assert outputs == {}
 
 
 def test_process_pending_chunk_timeouts_skips_already_freed_request():

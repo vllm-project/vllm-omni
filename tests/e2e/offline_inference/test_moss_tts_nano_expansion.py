@@ -121,7 +121,7 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
     """English TTS produces non-empty 48 kHz stereo audio."""
     req = _build_request("Hello, this is a short voice cloning demo for testing.", ref_audio_path)
@@ -133,7 +133,7 @@ def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese TTS produces non-empty audio."""
     req = _build_request("你好，这是语音合成测试。", ref_audio_path)
@@ -145,7 +145,7 @@ def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Same seed produces identical waveforms."""
     req = _build_request("Reproducible output test.", ref_audio_path, seed=123)
@@ -157,7 +157,7 @@ def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) ->
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "L4", "npu": "A2"})
 def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Batch of two requests returns audio for each."""
     requests = [

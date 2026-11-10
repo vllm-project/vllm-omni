@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving tests: Qwen3-Omni.
 See examples/online_serving/qwen3_omni/README.md
@@ -18,8 +21,9 @@ from tests.examples.helpers import (
     strip_audio_saved_to_lines,
     strip_trailing_audio_saved_line,
 )
+from tests.examples.qwen3_omni_audio_artifacts import transcribe_qwen3_omni_audio
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
+from tests.helpers.media import cosine_similarity_text
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -41,9 +45,9 @@ test_params = [
 common_args = ["python", os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py")]
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_send_multimodal_request_001(omni_server) -> None:
+def test_send_multimodal_request_001(omni_server, request: pytest.FixtureRequest) -> None:
     command = common_args + [
         "--query-type",
         "use_image",
@@ -56,7 +60,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
     text_content = strip_trailing_audio_saved_line(text_content_tmp)
     wav_path = extract_last_audio_saved_path(result)
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_qwen3_omni_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
 
@@ -69,9 +73,9 @@ def test_send_multimodal_request_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_send_multimodal_request_002(omni_server) -> None:
+def test_send_multimodal_request_002(omni_server, request: pytest.FixtureRequest) -> None:
     command = common_args + [
         "--query-type",
         "use_video",
@@ -87,7 +91,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_qwen3_omni_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
@@ -100,7 +104,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
     command = ["bash", os.path.join(example_dir, "qwen3_omni/run_curl_multimodal_generation.sh"), "use_image"]
@@ -115,7 +119,7 @@ def test_send_multimodal_request_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_001(omni_server) -> None:
     command = common_args + [
@@ -137,9 +141,9 @@ def test_modality_control_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_modality_control_002(omni_server) -> None:
+def test_modality_control_002(omni_server, request: pytest.FixtureRequest) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -152,16 +156,16 @@ def test_modality_control_002(omni_server) -> None:
     result = run_cmd(command)
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_qwen3_omni_audio(f"./{wav_path}", request.node.name, result)
     print(f"audio content is: {audio_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
 
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_modality_control_003(omni_server) -> None:
+def test_modality_control_003(omni_server, request: pytest.FixtureRequest) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -178,7 +182,7 @@ def test_modality_control_003(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_qwen3_omni_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
     print(f"audio content is: {audio_content}")
@@ -189,9 +193,9 @@ def test_modality_control_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_stream_001(omni_server) -> None:
+def test_stream_001(omni_server, request: pytest.FixtureRequest) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -207,7 +211,7 @@ def test_stream_001(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_qwen3_omni_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
     print(f"audio content is: {audio_content}")

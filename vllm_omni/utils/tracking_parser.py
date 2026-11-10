@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 from typing import Any
@@ -52,12 +52,28 @@ class TrackingNamespace(argparse.Namespace):
         else:
             setattr(self.unfiltered_ns, name, value)
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Preserve wrapper state when API workers use ``spawn``.
+
+        Our __dict__ property exposes the inner namespace, so default state
+        serialization would lose unfiltered_ns and explicit_keys.
+        """
+        return {
+            "unfiltered_ns": self.unfiltered_ns,
+            "explicit_keys": self.explicit_keys,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        object.__setattr__(self, "unfiltered_ns", state["unfiltered_ns"])
+        object.__setattr__(self, "explicit_keys", state["explicit_keys"])
+
     def get_explicit_kwargs_dict(self):
         """Return a dict containing only the explicitly passed key-value pairs."""
         return {k: v for k, v in vars(self.unfiltered_ns).items() if k in self.explicit_keys}
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.unfiltered_ns, name)
+        namespace = object.__getattribute__(self, "unfiltered_ns")
+        return getattr(namespace, name)
 
     @property
     def __dict__(self):
@@ -101,9 +117,11 @@ class TrackingSubparsers:
         self._real = real_sub
         self._shadow = shadow_sub
 
-    def add_parser(self, name, *args, **kwargs):
+    def add_parser(self, name: str, *args: Any, **kwargs: Any) -> "TrackingArgumentParser":
         """Add a parser to the encapsulated real parser and its shadow."""
         real_parser = self._real.add_parser(name, *args, **kwargs)
+        if not isinstance(real_parser, TrackingArgumentParser):
+            raise TypeError("Tracking subparsers must create TrackingArgumentParser instances")
         # real_parser is a TrackingArgumentParser with its own _shadow.
         # Reuse that shadow as the parent shadow's child — so when
         # real_parser.add_argument() mirrors to real_parser._shadow,
@@ -140,6 +158,35 @@ class TrackingArgumentParser(FlexibleArgumentParser):
         action = super().add_argument(*args, **kwargs)
         shadow_kwargs = build_shadow_kwargs(kwargs)
         self._shadow.add_argument(*args, **shadow_kwargs)
+        return action
+
+    def maybe_override_argument(
+        self,
+        group: TrackingGroup,
+        option_string: str,
+        *,
+        argument_type: Any,
+        default: Any,
+        help: str,
+    ) -> argparse.Action:
+        """Add an argument, or override it on both the real and shadow parsers."""
+        action = self._option_string_actions.get(option_string)
+        shadow_action = self._shadow._option_string_actions.get(option_string)
+        if action is None and shadow_action is None:
+            return group.add_argument(
+                option_string,
+                type=argument_type,
+                default=default,
+                help=help,
+            )
+        if action is None or shadow_action is None:
+            raise ValueError(f"{option_string} differs between the real and shadow parsers")
+        action.type = argument_type
+        action.default = default
+        action.help = help
+        shadow_action.type = argument_type
+        shadow_action.default = UNSET
+        shadow_action.help = help
         return action
 
     def add_argument_group(self, *args, **kwargs) -> TrackingGroup:

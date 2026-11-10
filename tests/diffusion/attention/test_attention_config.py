@@ -10,14 +10,27 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
+import copy
+import json
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.layer import Attention
+import vllm_omni.diffusion.attention.selector as selector_mod
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+    QueryRange,
+)
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
     get_current_diffusion_config_or_none,
@@ -25,13 +38,28 @@ from vllm_omni.diffusion.config import (
 )
 from vllm_omni.diffusion.data import (
     AttentionConfig,
+    AttentionScheduleConfig,
     AttentionSpec,
     OmniDiffusionConfig,
     build_attention_config,
     parse_attention_config,
+    parse_attention_schedule_config,
+)
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    request_denoise_progress,
+    set_forward_context,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _clear_inherited_attention_backend(monkeypatch):
+    # Weekly CPU exports DIFFUSION_ATTENTION_BACKEND; OmniDiffusionConfig
+    # treats that as an explicit default so auto-backend cases break.
+    # Tests that setenv the same variable still work: this fixture runs first.
+    monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
 
 class TestAttentionSpec:
@@ -72,6 +100,12 @@ class TestAttentionSpec:
         assert bk["dtype_vo"] == "fp8_e4m3"
         assert bk["flashinfer_backend"] == "trtllm-gen"
 
+    def test_quant_flashinfer_backend_serialized_without_dtype(self):
+        spec = AttentionSpec(backend="FLASHINFER_ATTN", quant={"flashinfer_backend": "fa2"})
+        assert spec.quant is not None
+        assert spec.quant.enabled is True
+        assert spec.backend_kwargs() == {"quant": {"flashinfer_backend": "fa2"}}
+
     def test_quant_and_skip_softmax_coexist(self):
         bk = AttentionSpec(
             backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
@@ -94,9 +128,68 @@ class TestAttentionSpec:
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
         assert spec.backend_kwargs() == {"topk": 96}
 
+    @pytest.mark.parametrize("provider", ["auto", "fastvideo", "flashinfer"])
+    def test_vsa_provider_round_trip_preserves_explicit_selection(self, provider):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider=provider)
+        assert spec.backend_kwargs() == (None if provider == "auto" else {"provider": provider})
+        assert AttentionSpec(backend="FASTVIDEO_VSA").fastvideo_vsa_provider == "auto"
+
+    def test_vsa_sage_can_select_provider_automatically(self):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")
+        assert spec.backend_kwargs() == {"precision": "sage"}
+        with pytest.raises(ValueError, match="requires the FlashInfer provider"):
+            AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider="fastvideo", fastvideo_vsa_precision="sage")
+
     def test_fastvideo_vsa_topk_rejected_for_other_backend(self):
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
+
+    def test_sparge_serialized_with_overrides(self):
+        spec = AttentionSpec(
+            backend="SPARGE_ATTN",
+            sparge={
+                "topk": 0.25,
+                "q_block_tokens": 256,
+                "k_block_tokens": 64,
+                "q_tile_override": 256,
+            },
+        )
+        assert spec.backend_kwargs() == {
+            "sparge_topk": 0.25,
+            "sparge_q_block_tokens": 256,
+            "sparge_k_block_tokens": 64,
+            "sparge_q_tile_override": 256,
+        }
+
+    def test_sparge_defaults_are_applied_by_backend(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN")
+        assert spec.sparge is None
+        assert spec.backend_kwargs() is None
+        assert AttentionSpec(backend="SPARGE_ATTN", sparge={}).backend_kwargs() == {"sparge_topk": 0.5}
+
+    def test_sparge_q_block_is_serialized_without_implicit_tile(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN", sparge={"q_block_tokens": 64})
+        assert spec.backend_kwargs() == {"sparge_topk": 0.5, "sparge_q_block_tokens": 64}
+
+    def test_sparge_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SPARGE_ATTN"):
+            AttentionSpec(backend="TORCH_SDPA", sparge={"topk": 0.25})
+
+    @pytest.mark.parametrize(
+        "sparge",
+        [
+            {"topk": 0.0},
+            {"topk": None},
+            {"topk": 1.5},
+            {"q_block_tokens": 32},
+            {"q_block_tokens": 128},
+            {"k_block_tokens": 128},
+            {"q_tile_override": 32},
+        ],
+    )
+    def test_sparge_invalid_values(self, sparge):
+        with pytest.raises(ValueError):
+            AttentionSpec(backend="SPARGE_ATTN", sparge=sparge)
 
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
@@ -149,8 +242,8 @@ class TestAttentionSpec:
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.
 
-        Regression: the str,Enum members passed the value check but str() later
-        produced "RainFusionPrecision.MIX" instead of "mix" (StrEnum fixes it).
+        Regression: ``str(str, Enum)`` later produced ``RainFusionPrecision.MIX``
+        instead of ``mix``. ``BlockSparseSpec`` stores ``member.value``.
         """
         from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
         from vllm_omni.diffusion.data import RainFusionPrecision
@@ -165,6 +258,97 @@ class TestAttentionSpec:
         cfg = RainFusionConfig.from_backend_kwargs(kwargs)
         assert cfg.precision == "mix"
         assert type(cfg.precision) is str
+
+
+class TestAttentionScheduleConfig:
+    @pytest.mark.parametrize(
+        "raw",
+        [None, {}, {"profiles": {}}, {"profiles": {}, "default": []}, "{}", AttentionScheduleConfig()],
+        ids=["none", "empty", "no-profiles", "no-profiles-empty-default", "json", "typed"],
+    )
+    def test_schedule_without_profiles_is_no_schedule(self, raw):
+        # No schedule adds no compile boundary; a config that can select nothing is no schedule.
+        assert parse_attention_schedule_config(raw) is None
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is None
+
+    def test_profiles_resolve_roles_without_baseline_or_environment_merging(self, monkeypatch):
+        monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "SAGE_ATTN")
+        config = OmniDiffusionConfig(
+            diffusion_attention_config={"per_role": {"baseline.only": "FLASH_ATTN"}},
+            diffusion_attention_schedule={
+                "profiles": {
+                    "named": {
+                        "default": "TORCH_SDPA",
+                        "per_role": {"video.self": "FLASH_ATTN", "self": "TRTLLM_ATTN"},
+                    },
+                    "platform": {},
+                }
+            },
+        )
+        profile = config.diffusion_attention_schedule.profiles["named"]
+        assert profile.resolve_with_source("video.self", "self")[0].backend == "FLASH_ATTN"
+        assert profile.resolve_with_source("other.self", "self")[0].backend == "TRTLLM_ATTN"
+        assert profile.resolve_with_source("baseline.only")[0].backend == "TORCH_SDPA"
+        assert config.diffusion_attention_schedule.profiles["platform"].resolve_with_source("baseline.only") == (
+            None,
+            None,
+        )
+        assert config.diffusion_attention_config.default.backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("typed", [False, True])
+    def test_schedule_profiles_are_detached_and_round_trip(self, typed):
+        raw = {
+            "profiles": {"sparse": {"default": {"backend": "TRTLLM_ATTN", "skip_softmax": {"threshold": 0.1}}}},
+            "default": [{"start": 3, "end": None, "profile": "sparse"}],
+        }
+        source = AttentionScheduleConfig(**raw) if typed else raw
+        saved = copy.deepcopy(source)
+        config = parse_attention_schedule_config(source)
+        config.profiles["sparse"].default.skip_softmax.threshold = 0.2
+        assert source == saved
+        restored = parse_attention_schedule_config(json.loads(json.dumps(asdict(config))))
+        assert restored == config
+        assert restored is not config
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"profiles": {"bad.name": {}}},
+            {"profiles": {"3bad": {}}},
+            {"profiles": {"sparse": None}},
+            {"profiles": []},
+            {"profiles": {"sparse": "TRTLLM_ATTN"}},
+            {"default": [{"start": 0, "end": None, "profile": "unknown"}]},
+            {"default": None},
+            {"profiles": {}, "typo": []},
+        ],
+    )
+    def test_invalid_server_schedules_fail_during_config_creation(self, raw):
+        with pytest.raises((TypeError, ValueError)):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw)
+
+    def test_unused_profiles_still_validate_backend_parameters(self):
+        with pytest.raises(ValueError, match="skip_softmax"):
+            OmniDiffusionConfig(
+                diffusion_attention_schedule={
+                    "profiles": {"unused": {"default": {"backend": "TORCH_SDPA", "skip_softmax": {"threshold": 0.1}}}}
+                }
+            )
+
+    def test_schedule_profiles_reject_full_compile_granularity(self):
+        # The scheduled_attention op and its eager fallback are tested only under regional
+        # compilation, so config creation rejects profiles with 'full', as it rejects 'full' with
+        # HSDP, sequence parallelism or offload.
+        raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
+        with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")
+        # The same profiles load with regional compilation, and a schedule without profiles is no
+        # schedule, so it loads with 'full'.
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is not None
+        unscheduled = OmniDiffusionConfig(
+            diffusion_attention_schedule={"profiles": {}}, diffusion_compile_granularity="full"
+        )
+        assert unscheduled.diffusion_attention_schedule is None
 
 
 class TestAttentionConfig:
@@ -197,6 +381,29 @@ class TestAttentionConfig:
         )
         assert config.per_role["ltx2.audio_self"].backend == "FLASH_ATTN"
         assert config.per_role["ltx2.audio_to_video"].backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_vsa_provider_precision_in_per_role_mapping(self, nested):
+        spec = {
+            "backend": "FASTVIDEO_VSA",
+            "fastvideo_vsa_provider": "flashinfer",
+            "fastvideo_vsa_precision": "sage",
+            "fastvideo_vsa_topk": 32,
+        }
+        roles: dict[str, Any] = {"minimax_h3": {"main": spec}} if nested else {"minimax_h3.main": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["minimax_h3.main"].backend_kwargs() == {
+            "provider": "flashinfer",
+            "precision": "sage",
+            "topk": 32,
+        }
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sparge_config_in_per_role_mapping(self, nested):
+        spec = {"backend": "SPARGE_ATTN", "sparge": {"topk": 0.25}}
+        roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["wan.self"].backend_kwargs() == {"sparge_topk": 0.25}
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
@@ -402,13 +609,6 @@ class TestBuildAttentionConfig:
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
 
-    @pytest.fixture(autouse=True)
-    def _clear_diffusion_attention_backend_env(self, monkeypatch):
-        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
-        # build_attention_config(); clear it so these tests assert config defaults,
-        # not whatever the process inherited from CI / sibling tests.
-        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
-
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")
         assert isinstance(config.diffusion_attention_config, AttentionConfig)
@@ -466,6 +666,265 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
+    @pytest.mark.parametrize("mindiesd_available", [False, True])
+    def test_paged_npu_memory_profile_uses_sdpa_only_without_mindiesd(self, monkeypatch, mindiesd_available):
+        attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = True
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        flash_output = torch.ones(1)
+        sdpa_output = torch.zeros(1)
+        dense_flash = Mock(return_value=flash_output)
+        sdpa = Mock(return_value=sdpa_output)
+        attention.attention = SimpleNamespace(forward=dense_flash)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
+        )
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: True)
+        monkeypatch.setattr(
+            layer_mod.current_omni_platform,
+            "supports_diffusion_dense_flash_attention",
+            lambda: mindiesd_available,
+        )
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        if mindiesd_available:
+            assert result is flash_output
+            dense_flash.assert_called_once()
+            sdpa.assert_not_called()
+        else:
+            assert result is sdpa_output
+            dense_flash.assert_not_called()
+            sdpa.assert_called_once()
+
+    @pytest.mark.parametrize("fa4_available", [False, True])
+    def test_paged_cuda_memory_profile_uses_sdpa_without_dense_fa4(self, monkeypatch, fa4_available):
+        attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = True
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        flash_output = torch.ones(1)
+        sdpa_output = torch.zeros(1)
+        dense_flash = Mock(return_value=flash_output)
+        sdpa = Mock(return_value=sdpa_output)
+        attention.attention = SimpleNamespace(forward=dense_flash)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
+        )
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(
+            layer_mod.current_omni_platform,
+            "supports_diffusion_dense_flash_attention",
+            lambda: fa4_available,
+        )
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        if fa4_available:
+            assert result is flash_output
+            dense_flash.assert_called_once()
+            sdpa.assert_not_called()
+        else:
+            assert result is sdpa_output
+            dense_flash.assert_not_called()
+            sdpa.assert_called_once()
+
+    def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
+        attention = Attention.__new__(Attention)
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attention = SimpleNamespace(
+            forward=Mock(side_effect=ModuleNotFoundError("No module named 'mindiesd'", name="mindiesd"))
+        )
+        attention.sdpa_fallback = SimpleNamespace(forward=Mock(side_effect=AssertionError("must not fall back")))
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        with pytest.raises(ModuleNotFoundError, match="mindiesd"):
+            attention._run_local_attention(
+                torch.zeros(1, dtype=torch.bfloat16),
+                torch.zeros(1, dtype=torch.bfloat16),
+                torch.zeros(1, dtype=torch.bfloat16),
+                AttentionMetadata(),
+            )
+
+    def test_paged_marker_does_not_change_dense_backend(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _DenseBackend:
+            supports_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "TORCH_SDPA"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        calls = []
+
+        def _fake_get_attn_backend_for_role(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _DenseBackend, None
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attention = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
+        assert len(calls) == 1
+        assert attention.attn_backend is _DenseBackend
+        # Auto path records the resolved backend name for Ring/SP; it is not explicit.
+        assert attention.backend_pref == _DenseBackend.get_name()
+        assert attention.backend_explicit is False
+
+    def test_internal_paged_selector_does_not_require_dense_fa4(self, monkeypatch):
+        """Blackwell CUDNN default + marked paged layer must not act as explicit FLASH_ATTN."""
+
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _CuDNNBackend:
+            supports_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "CUDNN_ATTN"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        def _fake_get_attn_backend_for_role(*args, attention_config=None, **kwargs):
+            if attention_config is not None:
+                spec, _ = attention_config.resolve_with_source(role="self", role_category=None)
+                if spec is not None and spec.backend.upper() == "FLASH_ATTN":
+                    raise ValueError(
+                        "FLASH_ATTN was explicitly selected but is unsupported "
+                        "(Blackwell requires CuTe FlashAttention-4 "
+                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). "
+                        "Select a compatible backend."
+                    )
+            return _CuDNNBackend, None
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attention = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
+        assert attention.attn_backend is FlashAttentionBackend
+        assert attention.backend_pref == "FLASH_ATTN"
+        assert attention.backend_explicit is False
+        assert attention.attn_spec is None
+
+    def test_user_explicit_flash_attn_still_requires_dense_fa4(self, monkeypatch):
+        def _fake_get_attn_backend_for_role(*args, attention_config=None, **kwargs):
+            if attention_config is not None:
+                spec, _ = attention_config.resolve_with_source(role="self", role_category=None)
+                if spec is not None and spec.backend.upper() == "FLASH_ATTN":
+                    raise ValueError(
+                        "FLASH_ATTN was explicitly selected but is unsupported "
+                        "(Blackwell requires CuTe FlashAttention-4 "
+                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). "
+                        "Select a compatible backend."
+                    )
+            raise AssertionError("explicit FLASH_ATTN must not fall through to the platform default")
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN")),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config), pytest.raises(ValueError, match="explicitly selected"):
+            Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:
             def __init__(self, **kwargs):
@@ -499,9 +958,10 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             return _FakeBackend, AttentionSpec(backend="TRTLLM_ATTN", skip_softmax={"target_sparsity": 0.5})
 
         class _FakeRingParallelAttention:
-            def __init__(self, sp_group, attn_backend_pref=None):
+            def __init__(self, sp_group, attn_backend_pref=None, attn_backend_explicit=False):
                 self.sp_group = sp_group
                 self.attn_backend_pref = attn_backend_pref
+                self.attn_backend_explicit = attn_backend_explicit
 
         monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
         monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
@@ -547,17 +1007,316 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert attn.use_ring is True
         assert attn.ring_runner is not None
         assert attn.ring_runner.attn_backend_pref == "TRTLLM_ATTN"
+        assert attn.ring_runner.attn_backend_explicit is True
+
+    def test_attention_init_forwards_flashinfer_backend_without_dtype(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class _FakeBackend:
+            @staticmethod
+            def get_name() -> str:
+                return "FLASHINFER_ATTN"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        spec = AttentionSpec(backend="FLASHINFER_ATTN", quant={"flashinfer_backend": "fa2"})
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", lambda **kwargs: (_FakeBackend, spec))
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "get_sp_group", lambda: None)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default=spec),
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attn = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                role="self",
+            )
+
+        assert attn.backend_pref == "FLASHINFER_ATTN"
+        assert attn.attention.kwargs["backend_kwargs"] == {"quant": {"flashinfer_backend": "fa2"}}
+        assert attn.attention.kwargs["backend_explicit"] is True
+
+    def test_attention_init_propagates_ring_setup_failure(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                pass
+
+        class _FakeBackend:
+            @staticmethod
+            def get_name() -> str:
+                return "TORCH_SDPA"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        monkeypatch.setattr(
+            layer_mod,
+            "get_attn_backend_for_role",
+            lambda **kwargs: (_FakeBackend, AttentionSpec(backend="TORCH_SDPA")),
+        )
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(
+            layer_mod,
+            "get_sp_group",
+            lambda: (_ for _ in ()).throw(RuntimeError("SP group is not initialized")),
+        )
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+            parallel_config=SimpleNamespace(ring_degree=2),
+        )
+        with set_current_diffusion_config(od_config):
+            with pytest.raises(RuntimeError, match="SP group is not initialized"):
+                Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0)
+
+    def test_float32_main_dispatch_does_not_override_selected_backend(self):
+        sentinel = torch.randn(1, 2, 4, 8)
+        selected_calls = []
+
+        def _selected_forward(*args):
+            selected_calls.append(args)
+            return sentinel
+
+        fake_attention = SimpleNamespace(
+            allow_fp32_fallback=False,
+            attention=SimpleNamespace(
+                forward=_selected_forward,
+            ),
+            sdpa_fallback=SimpleNamespace(
+                forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
+            ),
+            _assert_metadata_compatible=lambda metadata, **kwargs: None,
+            _has_custom_attention=False,
+            _scheduler_paged_kv=False,
+            paged_kv_cache_role=None,
+        )
+        fake_attention.effective_attention = lambda: (fake_attention.attention, None, None)
+        query = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+
+        output = Attention._run_local_attention(fake_attention, query, query, query, None)
+
+        assert output is sentinel
+        assert len(selected_calls) == 1
+
+    def test_unsupported_attention_mask_is_rejected_before_backend_call(self):
+        fake_backend = SimpleNamespace(
+            get_name=lambda: "NO_MASK_BACKEND",
+            supports_attention_mask=lambda *args, **kwargs: False,
+        )
+        fake_attention = SimpleNamespace(attn_backend=fake_backend)
+        metadata = AttentionMetadata(attn_mask=torch.ones(1, 2, dtype=torch.bool))
+
+        with pytest.raises(ValueError, match="does not support attn_mask"):
+            Attention._assert_metadata_compatible(fake_attention, metadata)
+
+    def test_ring_attention_rejects_mask_instead_of_ignoring_it(self):
+        fake_attention = SimpleNamespace(attention=SimpleNamespace(skip=None), ring_runner=None)
+        query = torch.randn(1, 2, 4, 8)
+        metadata = AttentionMetadata(attn_mask=torch.ones(1, 2, dtype=torch.bool))
+
+        with pytest.raises(ValueError, match="Ring attention does not support attn_mask"):
+            Attention._run_ring_attention(fake_attention, query, query, query, metadata)
+
+    def test_ring_attention_rejects_sparge_instead_of_running_dense(self):
+        fake_attention = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_name=lambda: "SPARGE_ATTN"),
+            attention=SimpleNamespace(skip=None),
+            ring_runner=None,
+        )
+        query = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(NotImplementedError, match="SPARGE_ATTN is not supported with ring sequence parallelism"):
+            Attention._run_ring_attention(fake_attention, query, query, query, None)
+
+
+class TestOptInFloat32Fallback:
+    @staticmethod
+    def _make_attention(monkeypatch, *, backend=None, allow=True, kv_cache_dtype=None):
+        events, state = [], {}
+        context = object()
+
+        class _SelectedImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            @staticmethod
+            def supports_kv_cache_dtype(*args):
+                return True
+
+            def forward(self, query, key, value, metadata):
+                events.append("selected")
+                state["kernel_call"] = (query, key, value, metadata)
+                state["kernel_output"] = query + 4
+                return state["kernel_output"]
+
+        class _FallbackImpl(_SelectedImpl):
+            def forward(self, query, key, value, metadata):
+                output = super().forward(query, key, value, metadata)
+                events[-1] = "fallback"
+                return output
+
+        class _FlashBackend(FlashAttentionBackend):
+            @staticmethod
+            def get_impl_cls():
+                return _SelectedImpl
+
+        class _SDPABackend(layer_mod.SDPABackend):
+            @staticmethod
+            def get_impl_cls():
+                return _SelectedImpl
+
+        class _Strategy:
+            def pre_attention(self, query, key, value, metadata):
+                events.append("pre")
+                state["prepared"] = (
+                    query + 1,
+                    key + 2,
+                    value + 3,
+                    replace(metadata) if metadata is not None else None,
+                )
+                return (*state["prepared"], context)
+
+            def post_attention(self, output, ctx):
+                events.append("post")
+                assert output is state["kernel_output"]
+                assert ctx is context
+                return output + 7
+
+        # Keep real role/config resolution and construction; replace hardware
+        # lookup and kernels. These are CPU dispatch tests, not SP collectives.
+        monkeypatch.setattr(
+            selector_mod,
+            "_cached_get_backend_cls",
+            lambda name, *args, **kwargs: _SDPABackend if name == "TORCH_SDPA" else _FlashBackend,
+        )
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FallbackImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: _Strategy())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+        config = OmniDiffusionConfig(
+            diffusion_attention_config={"default": backend} if backend else {},
+            diffusion_kv_cache_dtype=kv_cache_dtype,
+        )
+        with set_current_diffusion_config(config):
+            attention = Attention(
+                num_heads=4,
+                num_kv_heads=2,
+                head_size=8,
+                causal=False,
+                softmax_scale=0.25,
+                **({"allow_fp32_fallback": True} if allow else {}),
+            )
+        return attention, events, state
+
+    @pytest.mark.parametrize(
+        "backend,allow,dtype,is_cuda,expected",
+        [
+            pytest.param(None, True, torch.float32, True, "fallback", id="auto-fp32"),
+            pytest.param(None, False, torch.float32, True, "selected", id="default-opt-out"),
+            pytest.param("FLASH_ATTN", True, torch.float32, True, "selected", id="explicit-flash"),
+            pytest.param("TORCH_SDPA", True, torch.float32, True, "selected", id="explicit-sdpa"),
+            pytest.param(None, True, torch.bfloat16, True, "selected", id="bf16"),
+            pytest.param(None, True, torch.float32, False, "selected", id="cpu-fp32"),
+        ],
+    )
+    def test_public_forward_preserves_strategy_and_backend_choice(
+        self, monkeypatch, backend, allow, dtype, is_cuda, expected
+    ):
+        attention, events, state = self._make_attention(monkeypatch, backend=backend, allow=allow)
+        # Only the dispatch predicate is simulated; every tensor stays on CPU.
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: is_cuda))
+        query = torch.ones(1, 2, 4, 8, dtype=dtype)
+        key = torch.full((1, 2, 2, 8), 2, dtype=dtype)
+        value = torch.full_like(key, 3)
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False]]))
+
+        output = attention(query, key, value, metadata)
+
+        assert events == ["pre", expected, "post"]
+        assert all(got is prepared for got, prepared in zip(state["kernel_call"], state["prepared"]))
+        assert state["kernel_call"][3] is not metadata
+        assert state["kernel_call"][3].attn_mask is metadata.attn_mask
+        torch.testing.assert_close(output, query + 12)
+        assert attention.backend_explicit is (backend is not None)
+        impl = attention.sdpa_fallback if expected == "fallback" else attention.attention
+        assert impl.kwargs["num_kv_heads"] == 2
+        assert impl.kwargs["softmax_scale"] == 0.25
+
+    def test_explicit_backend_failure_is_not_retried_with_sdpa(self, monkeypatch):
+        attention, events, _ = self._make_attention(monkeypatch, backend="FLASH_ATTN")
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        selected = Mock(side_effect=RuntimeError("selected backend rejects this dtype"))
+        monkeypatch.setattr(attention.attention, "forward", selected)
+        query = torch.ones(1, 2, 4, 8)
+
+        with pytest.raises(RuntimeError, match="selected backend rejects this dtype"):
+            attention(query, query, query)
+
+        selected.assert_called_once()
+        assert events == ["pre"]
+
+    @pytest.mark.parametrize("contract", ["packed", "packed-padding", "piecewise", "quantized-kv"])
+    def test_backend_metadata_is_not_silently_sent_to_dense_sdpa(self, monkeypatch, contract):
+        quant_dtype = "fp8" if contract == "quantized-kv" else None
+        attention, events, state = self._make_attention(monkeypatch, kv_cache_dtype=quant_dtype)
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        lengths = torch.tensor([0, 1, 2], dtype=torch.int32)
+        metadata = AttentionMetadata()
+        if contract == "packed":
+            metadata.extra = {
+                "cu_seqlens_q": lengths,
+                "cu_seqlens_k": lengths,
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 1,
+            }
+        elif contract == "packed-padding":
+            metadata.packed_padding = PackedPaddingMetadata(1, 1, lengths[:2], lengths[:2])
+        elif contract == "piecewise":
+            metadata.full_attn_spans = [[(0, 1)]]
+            metadata.query_ranges = (QueryRange(0, 2, 0),)
+        query = torch.ones(1, 2, 4, 8)
+
+        attention(query, query, query, metadata)
+
+        assert events == ["pre", "selected", "post"]
+        forwarded = state["kernel_call"][3]
+        if quant_dtype:
+            # Quantization is injected by the public forward from config.
+            assert forwarded.extra == {"kv_cache_dtype": "fp8"}
+            assert metadata.extra == {}
+        else:
+            assert forwarded is state["prepared"][3]
 
 
 class TestDiffusionKvCacheQuantization:
     @staticmethod
-    def _install_attention_init_stubs(monkeypatch):
+    def _install_attention_init_stubs(monkeypatch, *, supports_kv_cache_dtype=True):
         class _FakeAttentionImpl:
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
 
             def forward(self, query, key, value, attn_metadata=None):
                 return query
+
+            @staticmethod
+            def supports_kv_cache_dtype(kv_cache_dtype, platform_key) -> bool:
+                return supports_kv_cache_dtype
 
         class _FakeBackend:
             @staticmethod
@@ -568,14 +1327,11 @@ class TestDiffusionKvCacheQuantization:
             def get_impl_cls():
                 return _FakeAttentionImpl
 
-            @staticmethod
-            def supports_kv_cache_dtype(kv_cache_dtype, platform_key) -> bool:
-                return True
-
         class _FakeRingParallelAttention:
-            def __init__(self, sp_group, attn_backend_pref=None):
+            def __init__(self, sp_group, attn_backend_pref=None, attn_backend_explicit=False):
                 self.sp_group = sp_group
                 self.attn_backend_pref = attn_backend_pref
+                self.attn_backend_explicit = attn_backend_explicit
 
         monkeypatch.setattr(
             layer_mod,
@@ -649,3 +1405,512 @@ class TestDiffusionKvCacheQuantization:
                     causal=False,
                     softmax_scale=1.0,
                 )
+
+    def test_explicit_unsupported_kv_cache_dtype_raises(self, monkeypatch):
+        self._install_attention_init_stubs(monkeypatch, supports_kv_cache_dtype=False)
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype="fp8",
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            with pytest.raises(ValueError, match="does not support kv_cache_dtype='fp8'"):
+                Attention(
+                    num_heads=4,
+                    head_size=64,
+                    causal=False,
+                    softmax_scale=1.0,
+                )
+
+
+class TestDense4DMaskRouting:
+    """Route a dense 4D mask away from backends that only implement a 2D mask.
+
+    ``Attention._run_local_attention`` must divert exactly one call to
+    ``sdpa_fallback`` when an automatically selected backend reports
+    ``supports_dense_4d_mask() is False``. An explicit selection, an active
+    paged-KV adapter, or a missing SDPA fallback must fail closed instead of
+    reaching the backend kernel. Without these cases the original
+    FlashAttention "attention_mask must be 2D" assertion can come back
+    unnoticed.
+    """
+
+    @staticmethod
+    def _backend(*, supports_4d_mask: bool, piecewise: bool = False):
+        class _Backend:
+            supports_piecewise_spans = piecewise
+
+            @classmethod
+            def supports_dense_4d_mask(cls, attention_spec=None):
+                del attention_spec
+                return supports_4d_mask
+
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return True
+
+            @staticmethod
+            def get_name() -> str:
+                return "FAKE_FLASH_BACKEND"
+
+        return _Backend
+
+    def _make_attention(
+        self,
+        monkeypatch,
+        *,
+        supports_4d_mask: bool = False,
+        piecewise: bool = False,
+        backend_explicit: bool = False,
+        paged_kv: bool = False,
+        with_sdpa: bool = True,
+    ):
+        attention = Attention.__new__(Attention)
+        attention._has_custom_attention = False
+        attention._explicit_cross_contract = False
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.role = "self"
+        attention.attn_spec = None
+        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask, piecewise=piecewise)
+        attention.backend_explicit = backend_explicit
+        attention.paged_kv_cache_role = "primary" if paged_kv else None
+        backend_forward = Mock(return_value=torch.ones(1))
+        sdpa_forward = Mock(return_value=torch.zeros(1))
+        attention.attention = SimpleNamespace(forward=backend_forward)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa_forward) if with_sdpa else None
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(paged_kv_adapter=object(), in_diffusion_kv_memory_profile=False),
+        )
+        return attention, backend_forward, sdpa_forward
+
+    @staticmethod
+    def _tensors():
+        return torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8)
+
+    @staticmethod
+    def _dense_4d_mask():
+        return torch.zeros(2, 1, 4, 4, dtype=torch.bool)
+
+    def test_auto_selected_backend_diverts_dense_4d_mask_to_sdpa(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        sdpa_forward.assert_called_once()
+        forwarded = sdpa_forward.call_args.args
+        assert forwarded[0] is query
+        assert forwarded[1] is key
+        assert forwarded[2] is value
+        assert forwarded[3] is metadata
+        backend_forward.assert_not_called()
+
+    def test_explicit_backend_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_active_paged_kv_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, paged_kv=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="paged_kv=True"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_missing_sdpa_fallback_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, _ = self._make_attention(monkeypatch, with_sdpa=False)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+
+    def test_2d_mask_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False, True, False]]))
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_dense_4d_mask_capable_backend_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, supports_4d_mask=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    def test_piecewise_spans_reach_backend_despite_dense_4d_mask(self, monkeypatch, backend_explicit):
+        # HunyuanImage3 sends a dense 4D mask together with full_attn_spans; a piecewise
+        # backend honors the spans and never reads the mask, so the call must not be
+        # diverted to SDPA or rejected for an explicit FLASH_ATTN selection.
+        attention, backend_forward, sdpa_forward = self._make_attention(
+            monkeypatch, piecewise=True, backend_explicit=backend_explicit
+        )
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_piecewise_backend_without_spans_still_diverts_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, piecewise=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        backend_forward.assert_not_called()
+
+    def test_spans_on_non_piecewise_backend_still_fail_closed(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("is_npu", [False, True])
+    def test_flash_attention_capability_matches_platform(self, monkeypatch, is_npu):
+        from vllm_omni.diffusion.attention.backends import flash_attn as flash_attn_mod
+
+        # Tie the capability bit to the shipped backend so the routing branch
+        # above cannot become dead code after a platform check regresses.
+        monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
+        assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu
+
+
+class TestScheduledDense4DMaskRouting:
+    """Route a dense 4D mask by the backend that runs the scheduled step.
+
+    Inside a scheduled step the layer runs the step's candidate, so the dense 4D
+    diversion, its explicit-selection error and the metadata check must read the
+    candidate's backend and spec, not the baseline's. A backend named by the
+    profile (the candidate has a spec) is an explicit selection and fails closed;
+    a role the profile leaves on the platform default (no spec) falls back to
+    SDPA. Gap steps keep the baseline rule covered by ``TestDense4DMaskRouting``.
+    """
+
+    _SPEC = AttentionSpec(backend="FLASH_ATTN")
+    _SPANS = [[(1, 3)], [(1, 3)]]
+
+    @staticmethod
+    def _backend(
+        name: str,
+        *,
+        supports_4d_mask: bool = False,
+        piecewise: bool = False,
+        mask: bool = True,
+        probed_specs: list | None = None,
+    ):
+        class _Backend:
+            supports_piecewise_spans = piecewise
+
+            @classmethod
+            def supports_dense_4d_mask(cls, attention_spec=None):
+                if probed_specs is not None:
+                    probed_specs.append(attention_spec)
+                return supports_4d_mask
+
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return mask
+
+            @staticmethod
+            def get_name() -> str:
+                return name
+
+        return _Backend
+
+    def _make_attention(
+        self,
+        monkeypatch,
+        *,
+        baseline: type,
+        candidate: type | None,
+        baseline_explicit: bool = False,
+        candidate_explicit: bool = False,
+        paged_kv: bool = False,
+        with_sdpa: bool = True,
+    ):
+        attention = Attention.__new__(Attention)
+        attention._has_custom_attention = False
+        attention._explicit_cross_contract = False
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.role = "self"
+        attention.attn_spec = None
+        attention.attn_backend = baseline
+        attention.backend_explicit = baseline_explicit
+        attention.paged_kv_cache_role = "primary" if paged_kv else None
+        forwards = SimpleNamespace(
+            baseline=Mock(return_value=torch.ones(1)),
+            candidate=Mock(return_value=torch.full((1,), 2.0)),
+            sdpa=Mock(return_value=torch.zeros(1)),
+        )
+        attention.attention = SimpleNamespace(forward=forwards.baseline)
+        attention.sdpa_fallback = SimpleNamespace(forward=forwards.sdpa) if with_sdpa else None
+        attention._schedule_configured = True
+        attention._schedule_candidates = {}
+        if candidate is not None:
+            spec = self._SPEC if candidate_explicit else None
+            attention._schedule_candidates["p"] = ScheduleCandidate(
+                backend_cls=candidate,
+                spec=spec,
+                impl=SimpleNamespace(forward=forwards.candidate),
+                backend_explicit=spec is not None,
+            )
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(paged_kv_adapter=object(), in_diffusion_kv_memory_profile=False),
+        )
+        return attention, forwards
+
+    @staticmethod
+    @contextmanager
+    def _step(step_idx: int):
+        """Publish ``step_idx`` under a schedule that selects profile "p" from step 1 on."""
+        schedule = (AttentionScheduleRange(start=1, end=None, profile="p"),)
+        with set_forward_context(), bind_attention_schedule(schedule), request_denoise_progress(step_idx, 4):
+            yield
+
+    @staticmethod
+    def _dense_4d_mask():
+        return torch.zeros(2, 1, 4, 4, dtype=torch.bool)
+
+    @staticmethod
+    def _call(attention, metadata):
+        query, key, value = torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8)
+        return attention._run_local_attention(query, key, value, metadata)
+
+    def _assert_routed(self, attention, forwards, metadata, expected: str) -> None:
+        """Assert that one call runs the ``expected`` forward, or raises naming a backend.
+
+        ``expected`` is "baseline", "candidate" or "sdpa", or "raises <BACKEND>" for the
+        explicit-selection NotImplementedError.
+        """
+        for forward in vars(forwards).values():
+            forward.reset_mock()
+        if expected.startswith("raises "):
+            backend_name = expected.removeprefix("raises ")
+            with pytest.raises(
+                NotImplementedError,
+                match=rf"Attention backend '{backend_name}' does not support a dense 4D attn_mask.*"
+                r"backend_explicit=True",
+            ):
+                self._call(attention, metadata)
+            ran = set()
+        else:
+            output = self._call(attention, metadata)
+            forward = getattr(forwards, expected)
+            assert output is forward.return_value
+            forward.assert_called_once()
+            assert forward.call_args.args[3] is metadata
+            ran = {expected}
+        assert {name for name, forward in vars(forwards).items() if forward.called} == ran
+
+    @pytest.mark.parametrize(
+        ("baseline_4d", "baseline_explicit", "candidate_4d", "candidate_explicit", "in_step", "in_gap"),
+        [
+            (True, False, False, False, "sdpa", "baseline"),
+            (True, False, False, True, "raises CANDIDATE", "baseline"),
+            (False, False, False, True, "raises CANDIDATE", "sdpa"),
+            (False, True, False, False, "sdpa", "raises BASELINE"),
+            (False, False, True, False, "candidate", "sdpa"),
+            (False, True, True, True, "candidate", "raises BASELINE"),
+        ],
+        ids=[
+            "automatic-candidate-over-capable-baseline",
+            "explicit-candidate-over-capable-baseline",
+            "explicit-candidate-over-automatic-baseline",
+            "automatic-candidate-over-explicit-baseline",
+            "capable-candidate-over-automatic-baseline",
+            "capable-candidate-over-explicit-baseline",
+        ],
+    )
+    def test_dense_4d_mask_follows_the_step_backend(
+        self, monkeypatch, baseline_4d, baseline_explicit, candidate_4d, candidate_explicit, in_step, in_gap
+    ):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=baseline_4d),
+            candidate=self._backend("CANDIDATE", supports_4d_mask=candidate_4d),
+            baseline_explicit=baseline_explicit,
+            candidate_explicit=candidate_explicit,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        # The scheduled step runs first, so a decision kept from it would show in the gap step.
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, in_step)
+        with self._step(0):
+            self._assert_routed(attention, forwards, metadata, in_gap)
+
+    @pytest.mark.parametrize(
+        (
+            "baseline_piecewise",
+            "baseline_4d",
+            "baseline_explicit",
+            "candidate_piecewise",
+            "candidate_explicit",
+            "spans",
+            "expected",
+        ),
+        [
+            (True, False, False, False, True, True, "raises CANDIDATE"),
+            (True, False, False, False, False, True, "sdpa"),
+            (False, False, True, True, False, True, "candidate"),
+            (False, True, False, True, False, False, "sdpa"),
+        ],
+        ids=[
+            "explicit-candidate-without-piecewise-spans",
+            "automatic-candidate-without-piecewise-spans",
+            "piecewise-candidate-honors-spans",
+            "piecewise-candidate-without-spans",
+        ],
+    )
+    def test_spans_precedence_follows_the_step_backend(
+        self,
+        monkeypatch,
+        baseline_piecewise,
+        baseline_4d,
+        baseline_explicit,
+        candidate_piecewise,
+        candidate_explicit,
+        spans,
+        expected,
+    ):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=baseline_4d, piecewise=baseline_piecewise),
+            candidate=self._backend("CANDIDATE", piecewise=candidate_piecewise),
+            baseline_explicit=baseline_explicit,
+            candidate_explicit=candidate_explicit,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=self._SPANS if spans else None)
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, expected)
+
+    def test_capability_probe_receives_the_candidate_spec(self, monkeypatch):
+        probed_specs: list = []
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE"),
+            candidate=self._backend("CANDIDATE", supports_4d_mask=True, probed_specs=probed_specs),
+            candidate_explicit=True,
+        )
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, AttentionMetadata(attn_mask=self._dense_4d_mask()), "candidate")
+
+        assert len(probed_specs) == 1
+        assert probed_specs[0] is self._SPEC
+
+    @pytest.mark.parametrize(
+        ("paged_kv", "with_sdpa", "detail"),
+        [(True, True, "paged_kv=True"), (False, False, "backend_explicit=False, paged_kv=False")],
+        ids=["paged-kv", "no-sdpa-fallback"],
+    )
+    def test_automatic_candidate_still_fails_closed(self, monkeypatch, paged_kv, with_sdpa, detail):
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", supports_4d_mask=True),
+            candidate=self._backend("CANDIDATE"),
+            paged_kv=paged_kv,
+            with_sdpa=with_sdpa,
+        )
+
+        with (
+            self._step(1),
+            pytest.raises(NotImplementedError, match=rf"'CANDIDATE' does not support a dense 4D attn_mask.*{detail}"),
+        ):
+            self._call(attention, AttentionMetadata(attn_mask=self._dense_4d_mask()))
+
+        assert not any(forward.called for forward in vars(forwards).values())
+
+    def test_unprepared_profile_raises_before_dense_4d_routing(self, monkeypatch):
+        attention, forwards = self._make_attention(monkeypatch, baseline=self._backend("BASELINE"), candidate=None)
+
+        with (
+            self._step(1),
+            pytest.raises(RuntimeError, match="attention schedule profile 'p' was not prepared on this layer"),
+        ):
+            self._call(attention, AttentionMetadata(attn_mask=self._dense_4d_mask()))
+
+        assert not any(forward.called for forward in vars(forwards).values())
+
+    @pytest.mark.parametrize("explicit", [False, True], ids=["automatic", "explicit"])
+    @pytest.mark.parametrize("scheduled", [False, True], ids=["gap-step", "scheduled-step"])
+    def test_dense_4d_routing_runs_before_the_mask_check(self, monkeypatch, scheduled, explicit):
+        # A backend without any attn_mask support is still a dense 4D case: it is
+        # diverted or fails as one, instead of failing the generic attn_mask check.
+        no_mask = self._backend("NO_MASK", mask=False)
+        capable = self._backend("CAPABLE", supports_4d_mask=True)
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=capable if scheduled else no_mask,
+            candidate=no_mask if scheduled else capable,
+            baseline_explicit=explicit and not scheduled,
+            candidate_explicit=explicit and scheduled,
+        )
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with self._step(1 if scheduled else 0):
+            self._assert_routed(attention, forwards, metadata, "raises NO_MASK" if explicit else "sdpa")
+
+    def test_2d_mask_is_checked_against_the_step_backend(self, monkeypatch):
+        # MiniMax-H3 builds a 2D key mask for a mask-capable profile over a mask-free
+        # baseline such as TRTLLM_ATTN; the step must not be rejected for the baseline.
+        attention, forwards = self._make_attention(
+            monkeypatch,
+            baseline=self._backend("BASELINE", mask=False),
+            candidate=self._backend("CANDIDATE"),
+            candidate_explicit=True,
+        )
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False, True, False]]))
+
+        with self._step(1):
+            self._assert_routed(attention, forwards, metadata, "candidate")
+        with self._step(0), pytest.raises(ValueError, match="'BASELINE' does not support attn_mask"):
+            self._call(attention, metadata)

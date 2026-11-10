@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Forced-aligner config + word-timestamp decoding for TTS.
 
 The aligner runs as a pooling stage appended to the pipeline by
@@ -153,6 +153,7 @@ def inject_forced_aligner_stage(
         # Pooling is one-shot -> sync AR scheduler (the async one assumes
         # token-by-token generation).
         async_scheduling=False,
+        async_chunk=False,
     )
     deploy = replace(deploy, stages=list(deploy.stages) + [aligner_ds])
     logger.info("[stage_init] Injected forced-aligner stage %d (model=%s)", new_id, fa.model)

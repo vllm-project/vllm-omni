@@ -60,6 +60,48 @@ HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
     "<img_ratio_36>": 130106,
 }
 
+
+def validate_special_token_ids(tokenizer: Any) -> None:
+    """Fail fast if a real tokenizer's ids drift from the hardcoded table.
+
+    ``HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS`` exists so stop-token / trigger-tag
+    resolution doesn't need a tokenizer round-trip, but that only holds as
+    long as the ids match ``tokenizer.json`` for whatever model repo/revision
+    is actually loaded. Call this once a real tokenizer is available (the
+    example scripts do, right after loading it) to catch drift immediately
+    instead of silently producing a request that runs to completion with the
+    wrong stop tokens. Not wired into ``build_prompt_tokens`` itself: callers
+    that intentionally pass a stand-in tokenizer with different ids (e.g.
+    this module's own unit tests) must not be forced through this check.
+
+    Both ``tencent/HunyuanImage-3.0`` (base) and ``-Instruct`` report the
+    same ``model_class_name`` (``HunyuanImage3ForCausalMM``), so this hook
+    fires for either checkpoint -- but the base tokenizer's vocab doesn't
+    include the Instruct-only ``<img_ratio_33>``-``<img_ratio_36>`` tokens
+    (added for it2i's second aspect-ratio range). A token the tokenizer
+    doesn't recognize at all (``convert_tokens_to_ids`` returning
+    ``unk_token_id``, or ``None`` for tokenizers without an unk concept) is
+    "not part of this checkpoint's vocab," not "drifted"; only an id that
+    resolves to something *else* indicates the hardcoded table is stale.
+    """
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    mismatches: dict[str, tuple[int, int]] = {}
+    for tok, expected_id in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.items():
+        actual_id = tokenizer.convert_tokens_to_ids(tok)
+        if actual_id is None or (unk_id is not None and actual_id == unk_id):
+            continue  # not in this checkpoint's vocab -- nothing to compare
+        if actual_id != expected_id:
+            mismatches[tok] = (expected_id, actual_id)
+    if mismatches:
+        details = ", ".join(f"{tok!r}: expected {exp}, got {act}" for tok, (exp, act) in mismatches.items())
+        raise ValueError(
+            "HunyuanImage-3.0 tokenizer special-token ids no longer match "
+            f"HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS ({details}). The loaded "
+            "tokenizer/model revision has likely changed; update the hardcoded "
+            "table in prompt_utils.py to match."
+        )
+
+
 # bot_task -> (sys_type, trigger_tag).
 # ``vanilla`` is special-cased downstream: it bypasses the chat template
 # (no ``User:`` / ``Assistant:`` framing) and is only valid with
@@ -317,12 +359,106 @@ def build_prompt_tokens(
     )
 
 
+@dataclass
+class ARPromptInputs:
+    """Fully-resolved AR-stage inputs for one HunyuanImage3 request.
+
+    Consolidates the three things every caller (offline example, OpenAI
+    server) must compute before submitting an AR request: the AR prefill
+    (as segment-tokenized ``prompt_token_ids`` when a tokenizer is
+    available, else a formatted ``prompt`` string), the resolved DiT
+    system-prompt type, and the AR ``stop_token_ids``.
+    """
+
+    prompt: str | None
+    prompt_token_ids: list[int] | None
+    system_prompt_type: str
+    stop_token_ids: list[int]
+
+
+def build_ar_prompt_inputs(
+    user_prompt: str,
+    task: str = "t2i",
+    bot_task: str | None | _DefaultBotTask = _DEFAULT_BOT_TASK,
+    sys_type: str | None = None,
+    custom_system_prompt: str | None = None,
+    num_images: int = 1,
+    tokenizer: Any | None = None,
+    image_size: str | None = None,
+) -> ARPromptInputs:
+    """Build the complete AR-stage inputs for a HunyuanImage3 request.
+
+    Wraps :func:`build_prompt_tokens` (byte-for-byte HF parity when
+    ``tokenizer`` is given), the :func:`build_prompt` string fallback (when
+    no tokenizer is available), and :func:`resolve_stop_token_ids` behind
+    one call, so a caller doesn't have to re-derive the AR prefill/stop-token
+    logic -- and, critically, doesn't have to independently resolve
+    ``bot_task`` for the prompt-building call vs. the stop-token call, which
+    can silently diverge if a caller passes the same nominal ``bot_task``
+    value to both but resolves "omitted" vs. "explicit None" differently for
+    each (this seam always forwards the identical resolved value to both).
+
+    Used by all four offline shared task examples: ``text_to_image.py`` /
+    ``image_edit.py`` (via ``model_extras.hunyuan_image3.build_ar_stage_inputs``)
+    and ``x_to_text.py`` (via ``build_x_to_text_prompt``, which also calls
+    ``build_ar_stage_inputs``). The OpenAI server's ``serving_chat.py`` does
+    not currently call this seam -- it still independently calls
+    ``build_prompt``/``build_prompt_tokens``/``resolve_stop_token_ids``, and
+    can hit exactly the divergence described above when ``bot_task`` is
+    omitted from ``extra_body`` (pre-existing, unrelated to this module).
+    ``image_size`` follows the same convention as :func:`resolve_stop_token_ids`
+    (``None``/``"auto"`` lets the AR predict the aspect ratio; an explicit
+    ``"{w}x{h}"`` makes it stop at the terminator).
+    """
+    if tokenizer is not None:
+        result = build_prompt_tokens(
+            user_prompt,
+            tokenizer,
+            task=task,
+            bot_task=bot_task,
+            sys_type=sys_type,
+            custom_system_prompt=custom_system_prompt,
+            num_images=num_images,
+        )
+        prompt_str: str | None = None
+        prompt_token_ids: list[int] | None = result.token_ids
+        system_prompt_type = result.system_prompt_type
+    else:
+        prompt_str = build_prompt(
+            user_prompt,
+            task=task,
+            bot_task=bot_task,
+            sys_type=sys_type,
+            custom_system_prompt=custom_system_prompt,
+            num_images=num_images,
+        )
+        prompt_token_ids = None
+        _, resolved_bot_task = _normalize_task_and_bot_task(task, bot_task)
+        system_prompt_type = sys_type or resolve_sys_type(resolved_bot_task)
+
+    stop_token_ids = resolve_stop_token_ids(
+        task=task,
+        bot_task=bot_task,
+        tokenizer=tokenizer,
+        image_size=image_size,
+    )
+    return ARPromptInputs(
+        prompt=prompt_str,
+        prompt_token_ids=prompt_token_ids,
+        system_prompt_type=system_prompt_type,
+        stop_token_ids=stop_token_ids,
+    )
+
+
 __all__ = [
     "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
+    "validate_special_token_ids",
     "MAX_IMAGES_PER_REQUEST",
     "_TASK_PRESETS",
+    "ARPromptInputs",
     "available_bot_tasks",
     "available_tasks",
+    "build_ar_prompt_inputs",
     "build_prompt",
     "build_prompt_tokens",
     "resolve_stop_token_ids",

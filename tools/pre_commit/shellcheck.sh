@@ -62,7 +62,9 @@ run_shellcheck() {
     local f
     for f in "$@"; do
         if should_lint "$f"; then
-            "$SHELLCHECK_BIN" -s bash "$f"
+            # -x honors `# shellcheck source=` so sourced helpers are followed
+            # (avoids SC1091 / false SC2034 on BUILDKITE_REL in entry scripts).
+            "$SHELLCHECK_BIN" -s bash -x "$f"
         fi
     done
 }
@@ -75,5 +77,5 @@ fi
 # Direct invocation with no args: lint every tracked *.sh.
 while IFS= read -r -d '' f || [ -n "$f" ]; do
     git check-ignore -q "$f" && continue
-    "$SHELLCHECK_BIN" -s bash "$f"
+    "$SHELLCHECK_BIN" -s bash -x "$f"
 done < <(find . -path ./.git -prune -o -name "*.sh" -print0)

@@ -1,28 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     RequestBatchSamplingParamsKey,
+    SchedulerRequestState,
     _AdmissionWaitDecision,
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.data import AttentionScheduleConfig
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
-# on sampling params, so it must be resolved separately from the bulk lookup.
+# on sampling params, and the attention schedule is resolved first, so both
+# must be resolved separately from the bulk lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {
+    "attention_schedule",
+    "attention_schedule_explicit",
+    "condition_key",
+    "flow_shift",
+    "lora_int_id",
+    "sample_solver",
+}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -32,15 +43,22 @@ def _normalize_explicit_sample_solver(value: object | None) -> str | None:
     return str(value).strip().lower()
 
 
-def _normalize_explicit_flow_shift(value: object | None) -> float | None:
+def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     """Normalize an explicitly provided flow shift without selecting a default."""
     if value is None:
         return None
     return float(value)
 
 
-def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-    """Build the compatibility key shared by scheduling and DP dispatch."""
+def build_request_batch_sampling_params_key(
+    request: OmniDiffusionRequest, attention_schedule_config: AttentionScheduleConfig | None = None
+) -> RequestBatchSamplingParamsKey:
+    """Build the compatibility key shared by scheduling and DP dispatch.
+
+    ``attention_schedule_config`` is the service's ``diffusion_attention_schedule``. The key carries
+    the request's resolved schedule and whether the request sent it, so a request that inherits the
+    default and one that sends the same ranges explicitly stay in separate batches.
+    """
     sampling = request.sampling_params
     # LoRA identity is optional on sampling params (and on test stubs).
     lora_request = getattr(sampling, "lora_request", None)
@@ -53,11 +71,25 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
+    key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
 class RequestScheduler(BaseScheduler):
     """Scheduler for static request waves, including admission coalescing."""
+
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        if not super()._can_schedule_waiting(state):
+            return False
+        manager = self._diffusion_kv_manager
+        if not self._running or manager is None or not manager.has_request(state.request_id):
+            return True
+        # The request-level runner uses one first-step query boundary per wave.
+        # The Manager already aligns all CFG sequences within each request.
+        current = manager.get_metadata(self._running[0]).sequences[0].cached_prefix_len
+        candidate = manager.get_metadata(state.request_id).sequences[0].cached_prefix_len
+        return candidate == current
 
     def get_admission_wait_decision(
         self,
@@ -96,11 +128,13 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        return build_request_batch_sampling_params_key(request)
+        return build_request_batch_sampling_params_key(
+            request, getattr(self.od_config, "diffusion_attention_schedule", None)
+        )
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
-        if not scheduled_request_ids:
+        if not scheduled_request_ids and not sched_output.finished_req_ids:
             return set()
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}

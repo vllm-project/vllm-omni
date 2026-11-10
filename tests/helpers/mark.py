@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import pytest
 
+    # CUDA (and only CUDA) may list several SKUs so one item matches H100 nightly
+    # and B200 mirror collection: ``res={"cuda": ["H100", "B200"]}``.
+    # Kept under TYPE_CHECKING so Python 3.9 agents do not evaluate ``str | list``.
+    SkuSpec = str | list[str] | tuple[str, ...]
+
 # Marker description tags in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
 # Example: ``"H100: [hardware-resource] [cuda] Tests that require H100 GPU"``.
 _HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
@@ -108,16 +113,23 @@ def get_level_markers() -> frozenset[str]:
 
 
 @lru_cache(maxsize=8)
-def _skus_for_platform(platform: str) -> frozenset[str]:
+def get_skus_for_platform(platform: str) -> frozenset[str]:
     """SKU names tagged ``[hardware-resource]`` and ``[platform]`` (e.g. ``[cuda]``)."""
     return get_hardware_mark_list() & _marker_names_with_tag(f"[{platform}]")
 
 
 def _require_sku(platform: str, res: str) -> None:
-    allowed = _skus_for_platform(platform)
+    allowed = get_skus_for_platform(platform)
     if res not in allowed:
         supported = ", ".join(sorted(allowed)) or f"(none tagged [hardware-resource] [{platform}])"
         raise ValueError(f"Invalid {platform} resource type: {res}. Supported: {supported}")
+
+
+def _as_sku_list(res: SkuSpec) -> list[str]:
+    skus = [res] if isinstance(res, str) else list(res)
+    if not skus:
+        raise ValueError("resource list must not be empty")
+    return skus
 
 
 def _cards_mark(num_cards: int) -> pytest.MarkDecorator:
@@ -137,14 +149,15 @@ def _cards_mark(num_cards: int) -> pytest.MarkDecorator:
     return getattr(pytest.mark, f"cards_{num_cards}")
 
 
-def _cuda_marks(*, res: str, num_cards: int):
+def _cuda_marks(*, res: SkuSpec, num_cards: int):
     import pytest
     from vllm.platforms import current_platform
 
-    _require_sku("cuda", res)
-    test_resource = getattr(pytest.mark, res)
-    test_platform_detail = pytest.mark.cuda
-    marks = [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    skus = _as_sku_list(res)
+    for sku in skus:
+        _require_sku("cuda", sku)
+    marks = [getattr(pytest.mark, sku) for sku in skus]
+    marks.extend([pytest.mark.cuda, _cards_mark(num_cards)])
     if num_cards == 1 or not current_platform.is_cuda():
         return marks
     return marks + [
@@ -157,9 +170,18 @@ def _cuda_marks(*, res: str, num_cards: int):
 
 def _rocm_marks(*, res: str, num_cards: int):
     import pytest
+    from vllm.platforms import current_platform
 
     _require_sku("rocm", res)
-    return [getattr(pytest.mark, res), pytest.mark.rocm, _cards_mark(num_cards)]
+    marks = [getattr(pytest.mark, res), pytest.mark.rocm, _cards_mark(num_cards)]
+    if num_cards == 1 or not current_platform.is_rocm():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_platform.device_count() < num_cards,
+            reason=f"Need at least {num_cards} ROCm GPUs to run the test.",
+        )
+    ]
 
 
 def _xpu_marks(*, res: str, num_cards: int):
@@ -182,7 +204,19 @@ def _musa_marks(*, res: str, num_cards: int):
     import pytest
 
     _require_sku("musa", res)
-    return [getattr(pytest.mark, res), pytest.mark.musa, _cards_mark(num_cards)]
+    marks = [getattr(pytest.mark, res), pytest.mark.musa, _cards_mark(num_cards)]
+    if num_cards == 1:
+        return marks
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_musa():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_omni_platform.get_device_count() < num_cards,
+            reason=f"Need at least {num_cards} MUSA GPUs to run the test.",
+        )
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -195,7 +229,19 @@ def _npu_marks(*, res: str, num_cards: int):
     import pytest
 
     _require_sku("npu", res)
-    return [pytest.mark.npu, getattr(pytest.mark, res), _cards_mark(num_cards)]
+    marks = [pytest.mark.npu, getattr(pytest.mark, res), _cards_mark(num_cards)]
+    if num_cards == 1:
+        return marks
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_npu():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_omni_platform.get_device_count() < num_cards,
+            reason=f"Need at least {num_cards} NPUs to run the test.",
+        )
+    ]
 
 
 def _res_platforms() -> frozenset[str]:
@@ -204,17 +250,20 @@ def _res_platforms() -> frozenset[str]:
     A ``[hardware-platform]`` name is a ``res`` key only if some SKU is tagged
     with that platform (``[cuda]``, ``[npu]``, …). ``cpu`` / ``gpu`` have no SKUs.
     """
-    return frozenset(p for p in get_supported_platforms() if _skus_for_platform(p))
+    return frozenset(p for p in get_supported_platforms() if get_skus_for_platform(p))
 
 
-def _normalize_num_cards(res: dict[str, str], num_cards: int | dict[str, int]) -> dict[str, int]:
+def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int]) -> dict[str, int]:
     allowed = _res_platforms()
     device_class = get_supported_platforms() - allowed
     for platform in res:
         if platform in device_class:
+            accelerators = ", ".join(sorted(allowed))
+            if platform == "cpu":
+                raise ValueError(f"{platform!r} is not a res dict key; use pytest.mark.cpu.")
             raise ValueError(
-                f"{platform!r} is not a res dict key; use pytest.mark.{platform} "
-                f"or an accelerator key ({', '.join(sorted(allowed))})."
+                f"{platform!r} is not a res dict key. It is auto-added for [gpu] platforms; "
+                f"use an accelerator key ({accelerators})."
             )
         if platform not in allowed:
             supported = ", ".join(sorted(allowed)) or "(none)"
@@ -232,20 +281,24 @@ def _normalize_num_cards(res: dict[str, str], num_cards: int | dict[str, int]) -
     return num_cards_dict
 
 
-def _marks_for_platform(platform: str, resource: str, num_cards: int) -> list[pytest.MarkDecorator]:
+def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> list[pytest.MarkDecorator]:
     import pytest
 
-    builders = {
-        "cuda": _cuda_marks,
-        "rocm": _rocm_marks,
-        "xpu": _xpu_marks,
-        "musa": _musa_marks,
-        "npu": _npu_marks,
-    }
-    builder = builders.get(platform)
-    if builder is None:
-        raise ValueError(f"Unsupported platform: {platform}")
-    marks = builder(res=resource, num_cards=num_cards)
+    if platform == "cuda":
+        marks = _cuda_marks(res=resource, num_cards=num_cards)
+    else:
+        if not isinstance(resource, str):
+            raise ValueError(f"{platform} resource must be a string, got {resource!r}")
+        builders = {
+            "rocm": _rocm_marks,
+            "xpu": _xpu_marks,
+            "musa": _musa_marks,
+            "npu": _npu_marks,
+        }
+        builder = builders.get(platform)
+        if builder is None:
+            raise ValueError(f"Unsupported platform: {platform}")
+        marks = builder(res=resource, num_cards=num_cards)
     if platform in _gpu_res_platforms():
         return [pytest.mark.gpu] + marks
     return marks
@@ -272,7 +325,7 @@ def _apply_marks(func, marks: list[pytest.MarkDecorator]):
     return func
 
 
-def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+def hardware_marks(*, res: dict[str, SkuSpec], num_cards: int | dict[str, int] = 1):
     """Return marks for a **single** pytest item.
 
     Different per-platform ``num_cards`` cannot share one item: ``cards_2`` and
@@ -295,7 +348,7 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     return all_marks
 
 
-def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+def hardware_test(*, res: dict[str, SkuSpec], num_cards: int | dict[str, int] = 1):
     """Apply hardware marks; split collected items when card counts differ by platform.
 
     A single item cannot carry both ``cards_4`` (CUDA) and ``cards_2`` (ROCm):

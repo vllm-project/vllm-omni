@@ -6,22 +6,17 @@
 from __future__ import annotations
 
 import torch
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 def is_310p(device: torch.device | None = None) -> bool:
+    """Return True on Ascend 310P devices, False otherwise."""
     if device is not None and device.type != "npu":
         return False
     try:
-        from vllm_ascend.utils import is_310p as ascend_is_310p
+        from vllm_ascend.device.device_config import is_310p as ascend_is_310p
 
         return bool(ascend_is_310p())
     except (ImportError, AttributeError):
-        return False
-    except Exception:
-        logger.debug("Failed to detect Ascend 310P device.", exc_info=True)
         return False
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -26,6 +26,7 @@ def _make_pipeline():
     pipeline.default_image_negative_prompt = "default image negative"
     pipeline.img_prompt_template = "<image>"
     pipeline.od_config = SimpleNamespace(flow_shift=None)
+    pipeline.enable_diffusion_pipeline_profiler = False
     return pipeline
 
 
@@ -147,7 +148,8 @@ def test_postprocess_keeps_torch_by_default_and_converts_np_when_requested():
     assert array.shape == (2, 4, 4, 3)
     video = post({"video": frames}, SimpleNamespace(output_type="pt"))
     assert set(video) == {"video"}
-    assert video["video"] is frames
+    assert isinstance(video["video"], np.ndarray)
+    np.testing.assert_array_equal(video["video"], frames.numpy())
     image = post(
         {"image": torch.ones(4, 4, 3)},
         SimpleNamespace(output_type="pt"),
@@ -161,6 +163,40 @@ def test_postprocess_keeps_torch_by_default_and_converts_np_when_requested():
     assert latent_output["image"] is latent
 
 
+@pytest.mark.parametrize("output_type", [None, "pt", "np"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_postprocess_preserves_video_range_for_serving(output_type: str | None, dtype: torch.dtype) -> None:
+    from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
+    from vllm_omni.entrypoints.openai.video_api_utils import _coerce_video_to_frames
+
+    # Include black and midtones: all-white frames cannot expose double normalization.
+    frames = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], dtype=dtype)
+    frames = frames.reshape(5, 1, 1, 1).expand(5, 2, 4, 3).clone()
+    expected = frames.float().numpy().copy()
+    sampling = None if output_type is None else OmniDiffusionSamplingParams(output_type=output_type)
+    post = get_lingbot_video_post_process_func(None)
+
+    processed = post({"video": frames}, sampling)
+    encoded_frames = np.stack(_coerce_video_to_frames(processed["video"]))
+
+    assert set(processed) == {"video"}
+    assert encoded_frames.dtype == np.float32
+    np.testing.assert_array_equal(encoded_frames, expected)
+    np.testing.assert_array_equal(frames.float().numpy(), expected)
+
+
+@pytest.mark.parametrize("output_key", ["image", "video"])
+def test_postprocess_preserves_latent_payload(output_key: str) -> None:
+    from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
+
+    latents = torch.tensor([-2.0, 0.0, 2.0]).reshape(1, 3, 1, 1, 1)
+    sampling = OmniDiffusionSamplingParams(output_type="latent")
+    processed = get_lingbot_video_post_process_func(None)({output_key: latents}, sampling)
+
+    assert set(processed) == {output_key}
+    assert processed[output_key] is latents
+
+
 def test_postprocess_preserves_image_contract_for_serving():
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
@@ -168,7 +204,7 @@ def test_postprocess_preserves_image_contract_for_serving():
         format_diffusion_outputs,
         normalize_diffusion_postprocess_output,
     )
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+    from vllm_omni.entrypoints.openai.images.helpers import _extract_images_from_result
 
     sampling = OmniDiffusionSamplingParams(
         num_inference_steps=1,
@@ -180,7 +216,9 @@ def test_postprocess_preserves_image_contract_for_serving():
         sampling_params=sampling,
         request_id="lingbot-image-contract-test",
     )
-    raw_output = {"image": torch.ones(8, 12, 3)}
+    image = torch.zeros(8, 12, 3)
+    image[4:] = 1.0
+    raw_output = {"image": image}
     processed = get_lingbot_video_post_process_func(SimpleNamespace())(raw_output, sampling)
     normalized = normalize_diffusion_postprocess_output(processed)
 
@@ -198,6 +236,8 @@ def test_postprocess_preserves_image_contract_for_serving():
     endpoint_images = _extract_images_from_result(result)
     assert len(endpoint_images) == 1
     assert endpoint_images[0].size == (12, 8)
+    assert endpoint_images[0].getpixel((0, 0)) == (0, 0, 0)
+    assert endpoint_images[0].getpixel((0, 7)) == (255, 255, 255)
 
 
 def test_forward_resolves_t2v_sampling_and_flow_shift_alias():
@@ -572,3 +612,72 @@ def test_load_weights_rejects_external_weight_stream():
     assert pipeline.load_weights([]) == set()
     with pytest.raises(RuntimeError, match="components are loaded directly"):
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+def test_pipeline_profiler_records_executed_stages_per_request(monkeypatch, enabled):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+    from vllm_omni.diffusion.profiler import diffusion_pipeline_profiler as profiler_module
+    from vllm_omni.diffusion.worker.utils import consume_pipeline_stage_durations
+
+    class TextEncoder(nn.Module):
+        def forward(self):
+            return torch.ones(1, 2, 4), torch.ones(1, 2, dtype=torch.long)
+
+    class VAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+
+        def encode(self, value):
+            return value
+
+        def decode(self, latents):
+            return (latents.repeat(1, 3, 1, 1, 1),)
+
+    components = [
+        (module.LingBotVideoTransformer3DModel, _RecordingTransformer()),
+        (module.Qwen3VLForConditionalGeneration, TextEncoder()),
+        (module.Qwen3VLProcessor, SimpleNamespace()),
+        (module.AutoencoderKLWan, VAE()),
+        (module.FlowUniPCMultistepScheduler, _CorruptingScheduler()),
+    ]
+    for component_class, component in components:
+        monkeypatch.setattr(component_class, "from_pretrained", lambda *args, value=component, **kwargs: value)
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(module.LingBotVideoPipeline, "encode_prompt", lambda self, *args, **kwargs: self.text_encoder())
+    monkeypatch.setattr(profiler_module.current_omni_platform, "is_available", lambda: False)
+    ticks = iter(range(100))
+    monkeypatch.setattr(profiler_module.time, "perf_counter", lambda: float(next(ticks)))
+    pipeline = module.LingBotVideoPipeline(
+        od_config=SimpleNamespace(
+            model="unused", dtype=torch.float32, enable_diffusion_pipeline_profiler=enabled, flow_shift=None
+        )
+    )
+    request = _make_request_batch(
+        {"prompt": "a robot", "modalities": ["video"]},
+        height=16,
+        width=16,
+        num_frames=9,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        seed=42,
+    )
+    prefix = "LingBotVideoPipeline."
+    expected = {prefix + "text_encoder.forward": 1.0, prefix + "transformer.forward": 2.0, prefix + "vae.decode": 1.0}
+    first = pipeline(request)
+    assert first.stage_durations == (expected if enabled else {})
+    assert first.output["video"].shape == (3, 2, 2, 3)
+    # A latent-only request must not inherit the previous request's VAE timing.
+    request.requests[0].sampling_params.output_type = "latent"
+    second = pipeline(request)
+    latent_expected = {key: value for key, value in expected.items() if not key.endswith("vae.decode")}
+    assert second.stage_durations == (latent_expected if enabled else {})
+    assert first.stage_durations == (expected if enabled else {})
+    consumed = consume_pipeline_stage_durations(pipeline)
+    if enabled:
+        assert consumed == {**latent_expected, prefix + "forward": 7.0}
+    else:
+        assert consumed == {}
+    assert consume_pipeline_stage_durations(pipeline) == {}

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -27,24 +28,40 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
+from vllm_omni.diffusion.lora.loader import (
+    LoraLoaderMixin,
+    _apply_diffusers_lora_alpha_scaling,
+    _load_lora_state_dict,
+    _prepare_lora_delta,
+    _remap_state_dict_keys,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
 
+from .paged_decode import (
+    DecodeGraphRunner,
+    PagedDecodeCache,
+    dynamic_lora_wrappers_present,
+    paged_decode_supported,
+)
 from .sensenova_u1_transformer import (
+    SenseNovaU1CausalLMOutput,
     SenseNovaU1ForCausalLM,
     clear_flash_kv_cache,
     create_block_causal_mask,
@@ -95,7 +112,9 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
         return model_path
-    return snapshot_download(model_path)
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    return hf_api().snapshot_download(model_path)
 
 
 def _round_by_factor(number: float, factor: int) -> int:
@@ -216,6 +235,16 @@ def _build_abs_positions_from_grid_hw(grid_hw, device=None):
     return pid % W_per_patch, pid // W_per_patch
 
 
+@dataclass(frozen=True)
+class VisionGrid:
+    sizes: list[tuple[int, int]]
+    positions: tuple[torch.Tensor, torch.Tensor]
+
+    @classmethod
+    def from_tensor(cls, grid_hw: torch.Tensor) -> VisionGrid:
+        return cls([tuple(size) for size in grid_hw.tolist()], _build_abs_positions_from_grid_hw(grid_hw))
+
+
 class NEOVisionEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -251,12 +280,14 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", cos_y, persistent=False)
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
-    def forward(self, pixel_values, grid_hw=None):
+    def forward(self, pixel_values, grid_hw=None, grid: VisionGrid | None = None):
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
 
         # 2D RoPE
-        abs_x, abs_y = _build_abs_positions_from_grid_hw(grid_hw)
+        if grid is None:
+            grid = VisionGrid.from_tensor(grid_hw)
+        abs_x, abs_y = grid.positions
         dim_half = self.embed_dim // 2
         p1 = _apply_rotary_emb_1d(
             patch_embeds[:, :dim_half].float(),
@@ -274,8 +305,7 @@ class NEOVisionEmbeddings(nn.Module):
 
         patches_list = []
         cur = 0
-        for i in range(grid_hw.shape[0]):
-            h, w = grid_hw[i]
+        for h, w in grid.sizes:
             pe = patch_embeds[cur : cur + h * w].view(h, w, -1).unsqueeze(0)
             pe = self.dense_embedding(pe.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             patches_list.append(pe.view(-1, pe.shape[-1]))
@@ -289,8 +319,8 @@ class NEOVisionModel(nn.Module):
         super().__init__()
         self.embeddings = NEOVisionEmbeddings(config)
 
-    def forward(self, pixel_values=None, grid_hw=None, **_kwargs):
-        return self.embeddings(pixel_values, grid_hw=grid_hw)
+    def forward(self, pixel_values=None, grid_hw=None, grid: VisionGrid | None = None, **_kwargs):
+        return self.embeddings(pixel_values, grid_hw=grid_hw, grid=grid)
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +476,13 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin, CFGParallelMixin):
+class SenseNovaU1Pipeline(
+    nn.Module,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+    CFGParallelMixin,
+    LoraLoaderMixin,
+):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -476,7 +512,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "language_model")
         self.od_config = od_config
+        self._unsupported_quant_methods_check(quant_config)
         self.device = get_local_device()
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
@@ -492,6 +530,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the
@@ -555,16 +594,38 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         ]
 
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix_forward",
+                "_it2i_prefix_forward",
+                "_generate_think",
+                "_generate_text",
+                "_run_denoising_loop",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
 
-    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
+    def _unsupported_quant_methods_check(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject online FP8 combined with distilled LoRA."""
+        if (
+            quant_config is None
+            or quant_config.get_name() != "fp8"
+            or getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        ):
+            return
+
+        if self.od_config.lora_backend == "distill" and self.od_config.lora_path:
+            raise ValueError(
+                "SenseNova does not support online FP8 with distilled LoRA "
+                "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
+            )
+
+    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None, grid: VisionGrid | None = None):
         if gen_model:
-            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw)
+            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw, grid=grid)
         return self.vision_model(pixel_values=pixel_values, grid_hw=grid_hw)
 
     def _build_t2i_text_inputs(self, query):
@@ -670,9 +731,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         denoising_model = self.language_model if cache_dit_skip else self.denoising_transformer
         outputs = denoising_model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
-            ),
+            exist_und=False,
+            exist_gen=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -709,8 +769,71 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         sigma = shift * sigma / (1 + (shift - 1) * sigma)
         return 1 - sigma
 
-    def _ar_step(self, next_token, t_idx, past_key_values):
+    def _decode_context(self, past_key_values):
+        """Paged cache plus a captured graph for the AR loop, or ``None``.
+
+        Decode is where a think request spends most of its time, and every step
+        issues the same work at the same shapes, so it is worth capturing. The
+        cache has to be paged for that: it keeps the buffers a fixed size while
+        the kernel reads only ``seqused_k`` of them, which is what lets one
+        capture serve every step until the next bucket.
+
+        Both live on the pipeline and are reused across requests unless a LoRA
+        adapter is being served dynamically. A capture binds the addresses it
+        recorded, so a cache built per request forces a capture per request:
+        measured, that left about 40 MiB of device memory behind on every
+        request and re-captured every time. Reuse rests on the same thing the
+        paged path already rests on -- one sequence in flight per pipeline
+        forward.
+        """
+        if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
+            return None
+        head_dim = self.language_model.model.layers[0].self_attn.head_dim
+        if not paged_decode_supported(torch.device(self.device), head_dim):
+            return None
+        if past_key_values is None or not past_key_values.layers:
+            return None
+        layer0 = past_key_values.layers[0]
+        if layer0.keys is None:
+            return None
+        _, kv_heads, prefix, kv_head_dim = layer0.keys.shape
+        device = torch.device(self.device)
+        num_layers = len(self.language_model.model.layers)
+        # Reuse is off once the LoRA manager holds the decode path: the test
+        # below sees shape, dtype and bucket, none of which move when an adapter
+        # is bound, rescaled or reset between requests.
+        reuse = not dynamic_lora_wrappers_present(self.language_model)
+        decode = getattr(self, "_paged_decode", None) if reuse else None
+        if decode is None or not decode[0].reusable_for(
+            num_layers, kv_heads, kv_head_dim, layer0.keys.dtype, prefix + 1
+        ):
+            cache = PagedDecodeCache(num_layers, kv_heads, kv_head_dim, prefix + 1, device, layer0.keys.dtype)
+            decode = (cache, DecodeGraphRunner(self.language_model, cache, device))
+            self._paged_decode = decode if reuse else None
+        if not decode[0].load_prefix(past_key_values):
+            return None
+        return decode
+
+    def release_captured_graphs(self) -> None:
+        """Drop the reused paged cache and the graphs captured against it.
+
+        Sleep level 2 discards the memory a capture recorded, so anything held
+        across requests has to go with it. The next request rebuilds both.
+        """
+        self._paged_decode = None
+
+    def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
         """One autoregressive token step. Constructs single-token `indexes` explicitly."""
+        if decode is not None:
+            cache, runner = decode
+            if cache.length + 1 > cache.bucket:
+                cache.grow(cache.length + 1)
+            cache.set_length(cache.length + 1)
+            logits = runner.step(int(next_token), t_idx + 1)
+            # The caller reassigns its cache handle from this field; the paged
+            # tokens are merged into it once, at the hand-off below.
+            return SenseNovaU1CausalLMOutput(logits=logits, past_key_values=past_key_values)
+
         indexes = torch.tensor([[t_idx + 1], [0], [0]], dtype=torch.long, device=self.device)
         outputs = self.language_model(
             input_ids=next_token.unsqueeze(0),
@@ -725,23 +848,27 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         think_token_ids = []
         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+        decode = self._decode_context(past_key_values)
 
         for _ in range(max_think_tokens):
             token_item = next_token.item()
             if token_item == eos_token_id:
                 break
             if token_item == think_end_token_id:
-                outputs = self._ar_step(next_token, t_idx, past_key_values)
+                outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
                 past_key_values = outputs.past_key_values
                 t_idx += 1
                 think_token_ids.append(token_item)
                 break
 
             think_token_ids.append(token_item)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             t_idx += 1
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+
+        if decode is not None:
+            decode[0].to_dynamic_cache(past_key_values)
 
         # Append "\n\n<img>" tokens to cache
         append_ids = self.tokenizer(
@@ -797,6 +924,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         """Autoregressive text decoding seeded from prefix logits."""
         eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         generated_ids: list[int] = []
+        # Same paged decode as the think loop. No write-back at the end: the
+        # caller returns the decoded string and never reads the cache again,
+        # unlike the think path, which hands it to the generation stage.
+        decode = self._decode_context(past_key_values)
 
         logits = prefix_logits[:, -1, :]
         for _ in range(max_tokens):
@@ -810,7 +941,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             if token_id == eos_token_id:
                 break
             generated_ids.append(token_id)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
             t_idx += 1
@@ -1042,15 +1173,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             kwargs["cache_dit_skip"] = True
         return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg: bool):
         if not is_it2i:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            if not (in_interval and p.cfg_scale > 1):
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
@@ -1064,14 +1193,11 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             )
             return noise_pred
         else:
-            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-            needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
-            has_cached_partner = use_cfg and needs_cfg
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            if not use_cfg or not needs_cfg:
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
@@ -1174,8 +1300,37 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
+    @staticmethod
+    def _is_warmup_request(req) -> bool:
+        is_dummy_run = getattr(req, "is_dummy_run", None)
+        if callable(is_dummy_run):
+            return bool(is_dummy_run())
+        return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
+
+    def _warm_ar_decode(self) -> None:
+        """Run one single-token decode at startup so its compiled region is built.
+
+        The engine's dummy request is a text-to-image run with think off. It
+        exercises the prefill shape but never the decode one, so whatever the
+        deploy config compiles for decode lands on the first real request
+        instead of on readiness. Warmup is best effort and must not fail startup.
+        """
+        try:
+            lm = self.language_model
+            device = torch.device(self.device)
+            ids = torch.zeros(1, 2, dtype=torch.long, device=device)
+            idx = torch.zeros(3, 2, dtype=torch.long, device=device)
+            prefill = lm(input_ids=ids, indexes=idx, use_cache=True)
+            nxt = torch.zeros(1, 1, dtype=torch.long, device=device)
+            nidx = torch.tensor([[2], [0], [0]], dtype=torch.long, device=device)
+            lm(input_ids=nxt, indexes=nidx, past_key_values=prefill.past_key_values, use_cache=True)
+        except Exception as exc:  # pragma: no cover - warmup is best effort
+            logger.warning("Autoregressive decode warmup skipped: %s", exc)
+
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if self._is_warmup_request(req):
+            self._warm_ar_decode()
         p = self._parse_request(req)
 
         input_images = self._extract_input_images(p.first_prompt)
@@ -1354,6 +1509,27 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         """Shared denoising loop for both T2I and IT2I."""
         merge_size = self.merge_size
         image_prediction = ns.image_prediction
+        grid = VisionGrid.from_tensor(ns.grid_hw)
+        times = ns.timesteps[:-1]
+        if is_it2i:
+            cfg_steps = ((times > p.cfg_interval[0]) & (times < p.cfg_interval[1])) | (p.cfg_interval[0] == 0)
+            cfg_steps &= p.cfg_scale != 1 or p.img_cfg_scale != 1
+        else:
+            cfg_steps = (times >= p.cfg_interval[0]) & (times <= p.cfg_interval[1])
+            cfg_steps &= p.cfg_scale > 1
+        cfg_steps = cfg_steps.tolist()
+
+        noise_scale_emb = None
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full(
+                (p.batch_size * ns.token_h * ns.token_w,),
+                ns.noise_scale / self.model_cfg.noise_scale_max_value,
+                dtype=ns.timesteps.dtype,
+                device=ns.timesteps.device,
+            )
+            noise_scale_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                p.batch_size, ns.token_h * ns.token_w, -1
+            )
 
         for step_i in range(p.num_steps):
             t = ns.timesteps[step_i]
@@ -1365,6 +1541,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
                 gen_model=True,
                 grid_hw=ns.grid_hw,
+                grid=grid,
             ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
             t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
@@ -1373,17 +1550,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.model_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                    p.batch_size,
-                    ns.token_h * ns.token_w,
-                    -1,
-                )
-                timestep_embeddings = timestep_embeddings + ns_emb
+            if noise_scale_emb is not None:
+                timestep_embeddings = timestep_embeddings + noise_scale_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+            v_pred = self._denoise(
+                image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, cfg_steps[step_i]
+            )
             z = z + (t_next - t) * v_pred
             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
 
@@ -1408,42 +1581,164 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     # Weight loading
     # -----------------------------------------------------------------------
 
+    # Shard name -> fused parameter, used by weight loading and LoRA loading.
+    # More specific _mot_gen patterns FIRST to avoid substring ambiguity
+    # (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
+    stacked_params_mapping: ClassVar[list[tuple[str, str, str | int]]] = [
+        (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
+        (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
+        (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        # MLP gate/up fused into MergedColumnParallelLinear
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+
+    def load_lora_weights(
+        self,
+        pretrained_model_name_or_path: str | list[str],
+        adapter_name: str | None = None,
+    ) -> None:
+        """Fuse a distilled few-step LoRA into the weights.
+
+        The checkpoints ship kohya `lora_down`/`lora_up`/`alpha` names, renamed
+        here to the Diffusers names before `load_lora_into_module` routes each
+        delta into its slice of the fused projections.
+        """
+        if adapter_name in self.lora_loaded:
+            return
+
+        paths = (
+            [pretrained_model_name_or_path]
+            if isinstance(pretrained_model_name_or_path, str)
+            else list(pretrained_model_name_or_path)
+        )
+        if len(paths) != 1:
+            raise ValueError(f"Expected exactly one distilled LoRA file, got {len(paths)}: {paths}")
+
+        state_dict = _load_lora_state_dict(paths[0])
+        state_dict = _remap_state_dict_keys(
+            state_dict,
+            [(".lora_down.weight", ".lora_A.weight"), (".lora_up.weight", ".lora_B.weight")],
+        )
+        # Fold alpha and the low-rank product in fp32; scaling B in bf16 would
+        # round once before the matmul and once after.
+        state_dict = {k: v.to(torch.float32) for k, v in state_dict.items()}
+        state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
+
+        applied = self._add_lora_deltas(state_dict)
+        if not applied:
+            raise ValueError(f"Distilled LoRA {paths[0]} matched no parameter of this pipeline.")
+        logger.info("Fused distilled LoRA %s into %d parameters", paths[0], applied)
+        # Fusion is one-way and there is no unload path, so keep only a sentinel;
+        # the fp32 state dict is ~1.5 GiB and would stay resident for the process.
+        self.lora_loaded[adapter_name] = paths[0]
+
+    def _fused_shards(self, base_key: str) -> list[tuple[str, str | int]] | None:
+        """Unfused source names and shard ids for a fused parameter, else None."""
+        for param_name, weight_name, shard_id in self.stacked_params_mapping:
+            if base_key.endswith(param_name):
+                return [
+                    (base_key[: -len(param_name)] + w, sid)
+                    for p, w, sid in self.stacked_params_mapping
+                    if p == param_name
+                ]
+        return None
+
+    def _add_lora_deltas(self, state_dict: dict[str, torch.Tensor]) -> int:
+        """Add every matching delta into its parameter, sharding through vLLM.
+
+        The delta read from the checkpoint spans the whole layer. A parameter of
+        a parallel layer only holds this rank's slice of it, so the delta goes
+        through the layer's own weight loader -- into a zeroed copy of the
+        parameter, which is then added -- instead of being added directly.
+
+        Each parameter is fused in place as it is reached, so a failure part way
+        through leaves the earlier ones fused and the pipeline has to be
+        reloaded. Deferring the writes would mean holding every delta at once,
+        and the deltas are full rank: 15.09 GiB for the 8B checkpoint, against
+        the 192 MiB one parameter costs here. Fusion runs at load time, before
+        the pipeline serves anything, so a partially fused model is never
+        reachable from a request.
+        """
+        applied = 0
+        for name, param in self.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            base_key = name[: -len(".weight")]
+            shards = self._fused_shards(base_key)
+
+            deltas: list[tuple[torch.Tensor, str | int | None]] = []
+            for src, shard_id in shards or [(base_key, None)]:
+                delta, _ = _prepare_lora_delta(state_dict, src, None)
+                if delta is None:
+                    deltas = []
+                    break
+                deltas.append((delta, shard_id))
+            if not deltas:
+                continue
+
+            weight_loader = getattr(param, "weight_loader", None)
+            buffer = torch.zeros_like(param.data)
+            if weight_loader is None:
+                # Not a parallel layer: the delta is already rank-local.
+                buffer = torch.cat([d for d, _ in deltas]).to(device=param.device, dtype=param.dtype)
+            else:
+                saved = param.data
+                try:
+                    param.data = buffer
+                    for delta, shard_id in deltas:
+                        delta = delta.to(device=param.device, dtype=param.dtype)
+                        if shard_id is None:
+                            weight_loader(param, delta)
+                        else:
+                            weight_loader(param, delta, shard_id)
+                finally:
+                    param.data = saved
+            with torch.no_grad():
+                param.data.add_(buffer)
+            applied += 1
+        return applied
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_experts = max(
+            getattr(self.llm_cfg, "num_experts", 0) or 0,
+            getattr(self.llm_cfg, "gen_num_experts", 0) or 0,
+        )
+        if num_experts <= 1:
+            return []
+        return FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # More specific _mot_gen patterns FIRST to avoid substring
-            # ambiguity (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
-            (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
-            (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
-            (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            # MLP gate/up fused into MergedColumnParallelLinear
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        self.stacked_params_mapping = stacked_params_mapping
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            loaded = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    break
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(stacked_name)
-                loaded = True
-                break
+            # Expert FFN shards must skip the stacked mapping: ``.gate_proj`` is
+            # a substring of ``experts.{i}.gate_proj``, which would fuse them
+            # into a dense gate_up_proj instead of reaching the FusedMoE loader.
+            is_expert_weight = ".experts." in name
 
-            if loaded:
+            if not is_expert_weight and self._load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping, loaded_params
+            ):
+                continue
+
+            if is_expert_weight:
+                # A shard that matches no mapping belongs to an expert this rank
+                # does not own, so dropping it here is expected under TP/EP.
+                self._load_expert_weight(name, loaded_weight, params_dict, expert_params_mapping, loaded_params)
                 continue
 
             if name not in params_dict:
@@ -1461,3 +1756,54 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             loaded_params.add(name)
 
         return loaded_params
+
+    @staticmethod
+    def _load_stacked_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        stacked_params_mapping: list[tuple[str, str, str | int]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            if stacked_name not in params_dict:
+                return False
+            param = params_dict[stacked_name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(stacked_name)
+            return True
+        return False
+
+    @staticmethod
+    def _load_expert_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        expert_params_mapping: list[tuple[str, str, int, str]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            param = params_dict.get(stacked_name)
+            weight_loader = getattr(param, "weight_loader", None) if param is not None else None
+            if weight_loader is None:
+                continue
+            success = weight_loader(
+                param,
+                loaded_weight,
+                stacked_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_params.add(stacked_name)
+                return True
+        return False

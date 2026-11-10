@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/istft.py
 
 import torch
 import torch.nn as nn
+
+
+class ISTFTEnvelopeError(RuntimeError):
+    """Invalid overlap state, optionally identifying deferred check indices."""
+
+    def __init__(self, indices: list[int] | None = None):
+        super().__init__("ISTFT window envelope underflowed; invalid overlap-add state.")
+        self.indices = indices
 
 
 class ISTFT(nn.Module):
@@ -60,6 +68,31 @@ class ISTFT(nn.Module):
         return x, buffer
 
     def forward(
+        self,
+        spec: torch.Tensor,
+        audio_buffer: torch.Tensor | None = None,
+        window_buffer: torch.Tensor | None = None,
+        streaming: bool = False,
+        last_chunk: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self.padding == "same" and spec.is_cuda and not torch.is_grad_enabled():
+            try:
+                from .fused_istft import fused_istft, fused_istft_supported
+            except ImportError:
+                # The acceleration backend is optional for direct talker
+                # inference in the original AntOC environment.
+                return self.forward_native(spec, audio_buffer, window_buffer, streaming, last_chunk)
+
+            if fused_istft_supported(
+                spec, self.window, self.n_fft, self.hop_length, audio_buffer, window_buffer, streaming
+            ):
+                frames = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+                return fused_istft(
+                    frames, self.window, self.hop_length, audio_buffer, window_buffer, streaming, last_chunk
+                )
+        return self.forward_native(spec, audio_buffer, window_buffer, streaming, last_chunk)
+
+    def forward_native(
         self,
         spec: torch.Tensor,
         audio_buffer: torch.Tensor | None = None,
@@ -129,7 +162,7 @@ class ISTFT(nn.Module):
 
         # Normalize
         if not (window_envelope > 1e-11).all():
-            raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+            raise ISTFTEnvelopeError()
         y = y / window_envelope
 
         return y, audio_buffer, window_buffer
@@ -168,6 +201,16 @@ class ISTFTHead(FourierHead):
         self.out = torch.nn.Linear(dim, out_dim)
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding)
 
+    def spectrum(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return complex spectrum and raw coefficients for ``[..., frames, dim]``."""
+        x_pred = self.out(x).transpose(-1, -2)
+        mag, phase = x_pred.chunk(2, dim=-2)
+        mag = torch.clip(torch.exp(mag), max=1e2)
+        # Keep exp and trigonometry in the projection dtype. Float32 operands
+        # then produce complex64, avoiding bcomplex32 unsupported by torch.fft.
+        spectrum = mag.float() * (torch.cos(phase).float() + 1j * torch.sin(phase).float())
+        return spectrum, x_pred
+
     def forward(
         self,
         x: torch.Tensor,
@@ -186,22 +229,9 @@ class ISTFTHead(FourierHead):
         Returns:
             Audio, predicted spectrogram coefficients, and streaming buffers.
         """
-        x_pred = self.out(x)
-        x_pred = x_pred.transpose(1, 2)
-        mag, p = x_pred.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(mag, max=1e2)  # safeguard to prevent excessively large magnitudes
-        # wrapping happens here. These two lines produce real and imaginary value
-        x = torch.cos(p)
-        y = torch.sin(p)
-        # recalculating phase here does not produce anything new
-        # only costs time
-        # phase = torch.atan2(y, x)
-        # S = mag * torch.exp(phase * 1j)
-        # better directly produce the complex value
-        S = mag * (x + 1j * y)
+        spectrum, x_pred = self.spectrum(x)
         audio, audio_buffer, window_buffer = self.istft(
-            S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
+            spectrum, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
         )
         return audio.unsqueeze(1), x_pred, audio_buffer, window_buffer
 

@@ -195,14 +195,54 @@ def test_ce_direct_copies_match_independent_4d_exchange(monkeypatch, size, batch
                     torch.testing.assert_close(part.view(output_shape), expected, rtol=0, atol=0)
 
 
-def test_ce_fake_ops_preserve_functional_output_metadata():
+@pytest.mark.parametrize("kv_heads", [4, 8])
+def test_ce_fake_ops_preserve_functional_output_metadata(kv_heads):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode():
         x = torch.empty(2, 17, 8, 64, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 17, kv_heads, 64, dtype=x.dtype, device=x.device)
+        q, k, v = a2a_permute.ulysses_qkv_fwd_group(x, k, k, "fake-only", 2)
+        assert q.shape == (2, 34, 4, 64)
+        assert k.shape == v.shape == (2, 34, kv_heads // 2, 64)
+        gate = a2a_permute.ulysses_qkv_fwd(x, "fake-only", 2)
+        assert gate.shape == q.shape
         packed = a2a_permute.ulysses_qkv_ce(x, x, x, "fake-only", 2)
         assert packed.shape == (3 * x.numel(),) and packed.dtype == x.dtype
         y = packed[: x.numel()].view(2, 34, 4, 64)
         z = a2a_permute.ulysses_o_rev(y, "fake-only", 2)
         assert y.shape == (2, 34, 4, 64)
         assert z.shape == x.shape and z.dtype == x.dtype and z.device == x.device
+
+
+def test_npu_initialization_never_builds_cuda(monkeypatch):
+    import sys
+
+    calls = []
+    module = SimpleNamespace(ensure_a2a_permute_available=lambda: calls.append("npu"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+
+    def unexpected():
+        pytest.fail("NPU initialization must not compile CUDA")
+
+    monkeypatch.setattr(a2a_permute, "_ce_runtime", unexpected)
+    a2a_permute.ensure_a2a_permute_available()
+    assert calls == ["npu"]
+
+
+def test_grouped_npu_dispatch_preserves_fused_qkv(monkeypatch):
+    import sys
+
+    query, key, value = (SimpleNamespace(device=SimpleNamespace(type="npu")) for _ in range(3))
+    outputs = (object(), object(), object())
+
+    def forward(q, k, v, group_name, world_size):
+        assert (q, k, v) == (query, key, value)
+        assert (group_name, world_size) == ("ulysses", 4)
+        return outputs
+
+    module = SimpleNamespace(ulysses_qkv_fwd_group=forward)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.qkv_a2a", None)
+    assert a2a_permute.ulysses_qkv_fwd_group(query, key, value, "ulysses", 4) is outputs

@@ -10,6 +10,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -19,7 +21,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.local_model, pytest.mark.cuda, pytest.mark.gpu, pytest.mark.cards_4]
+pytestmark = [pytest.mark.local_model, *hardware_marks(res={"cuda": "H100"}, num_cards=4)]
 
 
 def _reference(x, mode, pg):
@@ -42,6 +44,10 @@ def _worker(rank, init_method, world_size=4):
     try:
         group = get_sp_group()
         strategy = UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_backend="ce")
+
+        def exchange_qkv(q, k, v):
+            return a2a_permute.ulysses_qkv_fwd_group(q, k, v, group.ulysses_group.group_name, world_size)
+
         checks = 0
         torch.manual_seed(1234 + rank)
         stream = torch.cuda.Stream(device=device)
@@ -52,7 +58,12 @@ def _worker(rank, init_method, world_size=4):
                     x = torch.randn(batch, sequence, heads, 128, device=device, dtype=dtype)[..., ::2]
                     # CE groups Q/K/V while allowing fewer K/V heads (GQA).
                     kv = x[:, :, :4]
-                    q, k, v, _, ctx = strategy.pre_attention(x, kv + 1, kv + 2, None)
+                    gate = x + 3
+                    metadata = AttentionMetadata(extra={"gate_compress": gate})
+                    q, k, v, metadata, ctx = strategy.pre_attention(x, kv + 1, kv + 2, metadata)
+                    torch.testing.assert_close(
+                        metadata.extra["gate_compress"], _reference(gate, 0, group.ulysses_group), rtol=0, atol=0
+                    )
                     torch.testing.assert_close(q, _reference(x, 0, group.ulysses_group), rtol=0, atol=0)
                     torch.testing.assert_close(k, _reference(kv + 1, 0, group.ulysses_group), rtol=0, atol=0)
                     torch.testing.assert_close(v, _reference(kv + 2, 0, group.ulysses_group), rtol=0, atol=0)
@@ -63,19 +74,19 @@ def _worker(rank, init_method, world_size=4):
                         result, _reference(arbitrary_output, 1, group.ulysses_group), rtol=0, atol=0
                     )
                     torch.testing.assert_close(q, retained, rtol=0, atol=0)
-                    checks += 5
+                    checks += 6
             # Full-graph Dynamo capture must keep the group-bound op opaque.
-            compiled_exchange = torch.compile(strategy._ce_qkv_exchange, backend="eager", fullgraph=True)
+            compiled_exchange = torch.compile(exchange_qkv, backend="eager", fullgraph=True)
             for actual, source in zip(compiled_exchange(x, kv + 1, kv + 2), (x, kv + 1, kv + 2)):
                 torch.testing.assert_close(actual, _reference(source, 0, group.ulysses_group), rtol=0, atol=0)
                 checks += 1
             # Capture without nesting the transport-local graph, then replay
             # with new input values.
-            strategy._ce_qkv_exchange(x, kv + 1, kv + 2)
+            exchange_qkv(x, kv + 1, kv + 2)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                captured_q, _, _ = strategy._ce_qkv_exchange(x, kv + 1, kv + 2)
-                captured_round_trip = strategy._ce_output_exchange(captured_q)
+                captured_q, _, _ = exchange_qkv(x, kv + 1, kv + 2)
+                captured_round_trip = a2a_permute.ulysses_o_rev(captured_q, group.ulysses_group.group_name, world_size)
             x.add_(1)
             graph.replay()
             torch.testing.assert_close(captured_q, _reference(x, 0, group.ulysses_group), rtol=0, atol=0)

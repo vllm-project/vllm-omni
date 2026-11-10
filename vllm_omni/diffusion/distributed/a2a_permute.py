@@ -13,12 +13,17 @@ and transport) lives *inside* the ops, so from torch.compile's point
 of view each op is an opaque ``input -> output`` function: no graph break, no
 visible buffer mutation, no Python control flow in the traced graph. A
 ``register_fake`` provides output metadata so Dynamo keeps the op in-graph.
+
+NPU tensors retain their platform symmetric-memory implementation and eager
+execution constraints. Grouped QKV and single-tensor gate exchanges dispatch
+through the same platform entry points.
 """
 
 from __future__ import annotations
 
 import ctypes
 import math
+import sys
 import threading
 from dataclasses import dataclass, field
 from functools import cache
@@ -32,6 +37,8 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -84,8 +91,6 @@ class _Memcpy3DParams(ctypes.Structure):
 def _ce_runtime() -> CudaRTLibrary:
     from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 
-    from vllm_omni.platforms import current_omni_platform
-
     if not current_omni_platform.is_cuda():
         raise ValueError("CE Ulysses requires the CUDA platform")
     device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -110,9 +115,50 @@ def _ce_runtime() -> CudaRTLibrary:
     return runtime
 
 
+def validate_a2a_permute_config(
+    *,
+    enforce_eager: bool | None = None,
+    ulysses_mode: str | None = None,
+    ulysses_degree: int | None = None,
+    ring_degree: int | None = None,
+    allgather_degree: int | None = None,
+    scatter_idx: int | None = None,
+    gather_idx: int | None = None,
+) -> None:
+    """Validate resolved NPU constraints without initializing the backend.
+
+    Only supplied values are checked: the factory supplies configuration,
+    direct strategy construction supplies initialized group sizes/layout,
+    and each forward supplies its current mode. Callers own context lookup.
+    """
+    if not current_omni_platform.is_npu():
+        return
+    if enforce_eager is False:
+        raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
+    if (
+        (ulysses_mode is not None and ulysses_mode != "strict")
+        or (ulysses_degree is not None and ulysses_degree <= 1)
+        or (ring_degree is not None and ring_degree != 1)
+        or (allgather_degree is not None and allgather_degree != 1)
+    ):
+        raise ValueError(
+            "NPU ulysses_a2a_permute requires strict, pure Ulysses with "
+            "ulysses_mode='strict', ulysses_degree > 1, ring_degree = 1 and allgather_degree = 1"
+        )
+    if (scatter_idx is not None and scatter_idx != 2) or (gather_idx is not None and gather_idx != 1):
+        raise ValueError("NPU ulysses_a2a_permute requires scatter_idx=2, gather_idx=1")
+
+
 def ensure_a2a_permute_available() -> None:
-    """Initialize the CUDA copy runtime before serving requests."""
-    _ce_runtime()
+    """Initialize the platform transport before serving requests."""
+    if current_omni_platform.is_npu():
+        from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import (
+            ensure_a2a_permute_available as ensure_npu,
+        )
+
+        ensure_npu()
+    else:
+        _ce_runtime()
 
 
 def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -182,7 +228,12 @@ def _get_symm_buffer(
 
 def clear_a2a_permute_workspaces() -> None:
     """Release cached symmetric-memory workspaces during worker shutdown."""
+    npu_transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu")
+    if npu_transport is not None:
+        npu_transport.clear_ulysses_symmetric_memory_workspace()
     with _WORKSPACE_LOCK:
+        if not _SYMM_WORKSPACES:
+            return
         devices = {workspace.allocation.device for workspace in _SYMM_WORKSPACES.values()}
         for device in devices:
             torch.accelerator.synchronize(device)
@@ -360,3 +411,55 @@ def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Te
 def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     B, s_global, Hl, D = y.shape
     return y.new_empty(B, s_global // world_size, Hl * world_size, D)
+
+
+@torch.library.custom_op("vllm_omni_a2a::ulysses_qkv_fwd", mutates_args=(), device_types="cuda")
+def ulysses_qkv_fwd(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    """Exchange one forward tensor, including optional attention gates."""
+    b, s, h, d = x.shape
+    return _exchange_ce((x,), group_name, world_size).view(b, s * world_size, h // world_size, d)
+
+
+@ulysses_qkv_fwd.register_fake
+def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    b, s, h, d = x.shape
+    return x.new_empty(b, s * world_size, h // world_size, d)
+
+
+@ulysses_qkv_fwd.register_kernel("privateuseone")
+def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_qkv_fwd as npu_fwd
+
+    return npu_fwd(x, group_name, world_size)
+
+
+def ulysses_qkv_fwd_group(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    group_name: str,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange Q/K/V together using the platform transport."""
+    if query.device.type == "npu":
+        from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_qkv_fwd_group as npu_fwd_group
+
+        return npu_fwd_group(query, key, value, group_name, world_size)
+    inputs = (query, key, value)
+    packed = ulysses_qkv_ce(*inputs, group_name, world_size)
+    if query.shape == key.shape == value.shape:
+        b, s, h, d = query.shape
+        query, key, value = packed.view(3, b, s * world_size, h // world_size, d).unbind(0)
+    else:
+        query, key, value = (
+            part.view(x.size(0), x.size(1) * world_size, x.size(2) // world_size, x.size(3))
+            for part, x in zip(packed.split([x.numel() for x in inputs]), inputs)
+        )
+    return query, key, value
+
+
+@ulysses_o_rev.register_kernel("privateuseone")
+def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_o_rev as npu_rev
+
+    return npu_rev(y, group_name, world_size)

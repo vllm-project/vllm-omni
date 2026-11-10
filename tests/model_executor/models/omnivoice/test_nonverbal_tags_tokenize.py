@@ -1,12 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import pytest
-from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer as HFTokenizer
 
 from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
     _tokenize_with_nonverbal_tags,
 )
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -18,7 +21,7 @@ def _ids(tok: HFTokenizer, s: str) -> list[int]:
 class TestNonVerbalTags:
     @classmethod
     def setup_class(cls):
-        tokenizer_path = hf_hub_download(repo_id="k2-fsa/OmniVoice", filename="tokenizer.json")
+        tokenizer_path = hf_api().hf_hub_download(repo_id="k2-fsa/OmniVoice", filename="tokenizer.json")
         cls.tokenizer = HFTokenizer.from_file(tokenizer_path)
 
     def test_plain_text_fallback(self):

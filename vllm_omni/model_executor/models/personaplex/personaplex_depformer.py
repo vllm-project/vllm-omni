@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex depformer: the per-step audio code predictor.
 
 The depformer is the small autoregressive head that, conditioned on one temporal
@@ -26,11 +26,12 @@ Faithful-port details (all measured from ``nvidia/personaplex-7b-v1``):
 * **ScaledEmbedding** with ``zero_idx = -1`` (the special token maps to the zero
   vector); audio table is ``card + 1`` rows, text table ``text_card + 1``.
 
-The checkpoint ships ``dep_q = 8`` weight sets; the production loader (Moshi's
-``get_moshi_lm``) overrides ``dep_q = 16`` and fills sets 8..15 by copying 0..7.
-:meth:`PersonaPlexDepformer.load_weights` replicates that expansion so the module
-loads directly from the raw ``model.safetensors`` as well as from an
-already-expanded Moshi instance.
+``nvidia/personaplex-7b-v1`` ships all 16 weight sets (15 ``depformer_emb``
+tables). For an 8-set checkpoint, the production loader (Moshi's
+``get_moshi_lm``) overrides ``dep_q = 16`` and fills sets 8..15 by copying 0..7;
+:meth:`PersonaPlexDepformer.load_weights` replicates that expansion. A module
+built with fewer steps (the duplex talker only runs the 8 agent steps) loads
+the leading sets.
 """
 
 from __future__ import annotations
@@ -83,8 +84,7 @@ class _ScaledEmbedding(nn.Embedding):
     def forward(self, idx: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         is_zero = idx == self.zero_idx
         y = super().forward(idx.clamp(min=0))
-        zero = torch.zeros(1, dtype=y.dtype, device=y.device)
-        return torch.where(is_zero[..., None], zero, y)
+        return y.masked_fill(is_zero[..., None], 0.0)
 
 
 class _DepformerLayer(nn.Module):
@@ -203,8 +203,9 @@ class PersonaPlexDepformer(nn.Module):
         audio_tokens: torch.Tensor | None = None,
         audio_provided: torch.Tensor | None = None,
         return_logits: bool = False,
+        num_steps: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict the ``dep_q`` audio codes for one frame.
+        """Predict the first ``num_steps`` (default ``dep_q``) audio codes for one frame.
 
         Args:
             text_token: ``[B]`` sampled text token for the frame.
@@ -213,19 +214,26 @@ class PersonaPlexDepformer(nn.Module):
             audio_provided: optional ``[B, dep_q]`` bool mask; where True the
                 corresponding ``audio_tokens`` entry overrides the sampled code as
                 the next-step input (partial teacher forcing, as in Moshi).
-            return_logits: also return the per-step logits ``[B, dep_q, card]``.
+            return_logits: also return the per-step logits ``[B, num_steps, card]``.
+            num_steps: stop after this many inner steps. The loop is causal, so the
+                first ``num_steps`` codes are identical to a full ``dep_q`` run;
+                the trailing steps predict the user's codebooks, which the serving
+                path never consumes.
 
         Returns:
-            ``[B, dep_q]`` long tensor of sampled (greedy) audio codes, plus the
+            ``[B, num_steps]`` long tensor of sampled (greedy) audio codes, plus the
             per-step logits when ``return_logits`` is set.
         """
         if transformer_out.dim() != 3 or transformer_out.shape[1] != 1:
             raise ValueError(f"transformer_out must be [B, 1, H]; got {tuple(transformer_out.shape)}")
+        steps = self.dep_q if num_steps is None else int(num_steps)
+        if not 1 <= steps <= self.dep_q:
+            raise ValueError(f"num_steps must be in [1, {self.dep_q}]; got {num_steps}")
         prev = text_token
         kv = [{"k": None, "v": None} for _ in self.layers]
         codes: list[torch.Tensor] = []
         logits_all: list[torch.Tensor] = []
-        for step in range(self.dep_q):
+        for step in range(steps):
             x = self.depformer_in[step](transformer_out)  # [B, 1, dim]
             if step == 0:
                 cond = self.depformer_text_emb(prev.unsqueeze(1))
@@ -235,7 +243,7 @@ class PersonaPlexDepformer(nn.Module):
             for li, layer in enumerate(self.layers):
                 x = layer(x, step, kv[li])
             logits = self.linears[step](x).squeeze(1)  # [B, card]
-            sampled = logits.float().argmax(dim=-1)  # greedy [B]
+            sampled = logits.argmax(dim=-1)  # greedy [B]; the exact fp32 upcast gives the same index
             codes.append(sampled)
             if return_logits:
                 logits_all.append(logits.float())
@@ -243,9 +251,9 @@ class PersonaPlexDepformer(nn.Module):
                 prev = torch.where(audio_provided[:, step], audio_tokens[:, step], sampled)
             else:
                 prev = sampled
-        stacked = torch.stack(codes, dim=1)  # [B, dep_q]
+        stacked = torch.stack(codes, dim=1)  # [B, steps]
         if return_logits:
-            return stacked, torch.stack(logits_all, dim=1)  # [B, dep_q, card]
+            return stacked, torch.stack(logits_all, dim=1)  # [B, steps, card]
         return stacked
 
     # ------------------------------------------------------------------
@@ -312,7 +320,7 @@ class PersonaPlexDepformer(nn.Module):
                 if steps < self.dep_q:
                     reps = (self.dep_q + steps - 1) // steps
                     t = t.repeat(reps, 1)[: self.dep_q * per_step_rows]
-                return t
+                return t[: self.dep_q * per_step_rows]
 
             return build
 

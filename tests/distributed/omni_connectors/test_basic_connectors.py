@@ -33,6 +33,56 @@ def test_tensor_serialization():
     assert torch.equal(tensor, deserialized)
 
 
+def test_serialize_into_matches_serialize():
+    """The caller-owned buffer path produces the same wire bytes."""
+    data = {"key": "value", "nested": [1, 2, {"x": True}]}
+    expected = OmniSerializer.serialize(data)
+
+    buffer = bytearray(b"stale" * 8)
+    size = OmniSerializer.serialize_into(data, buffer)
+
+    assert size == len(expected)
+    assert bytes(buffer) == expected
+    assert OmniSerializer.deserialize(buffer) == data
+
+
+def test_tensor_serialize_into_round_trip():
+    """The tensor fast path preserves dtype, shape, and values."""
+    import torch
+
+    tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    expected = OmniSerializer.serialize({"embeds": tensor})
+    buffer = bytearray()
+
+    size = OmniSerializer.serialize_into({"embeds": tensor}, buffer)
+    deserialized = OmniSerializer.deserialize(buffer[:size])
+
+    assert bytes(buffer) == expected
+    assert deserialized["embeds"].dtype == torch.bfloat16
+    assert torch.equal(deserialized["embeds"], tensor)
+
+
+def test_shared_memory_connector_owns_serde():
+    """The connector must not share the module-level encoder/decoder state."""
+    connector = SharedMemoryConnector({})
+    try:
+        assert connector._serde is not OmniSerializer
+    finally:
+        connector.close()
+
+
+def test_bfloat16_tensor_serialization():
+    """The raw tensor serializer preserves the Mammoth BF16 wire dtype."""
+    import torch
+
+    tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    serialized = OmniSerializer.serialize({"text_prompt_embeds": tensor})
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert deserialized["text_prompt_embeds"].dtype == torch.bfloat16
+    assert torch.equal(deserialized["text_prompt_embeds"], tensor)
+
+
 def test_noncontiguous_tensor_serialization():
     """Test torch.Tensor serialization for strided views."""
     import torch
@@ -232,3 +282,23 @@ def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
     assert connector._metrics == {"errors": 1, "timeouts": 0}
     recv_buffer.release.assert_called_once()
     connector._closed = True
+
+
+def test_tensor_serialize_into_edge_shapes():
+    """0-dim, empty, and non-contiguous tensors keep their wire bytes and shape."""
+    import torch
+
+    cases = [
+        torch.tensor(1.5, dtype=torch.bfloat16),
+        torch.empty((0, 3), dtype=torch.bfloat16),
+        torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t(),
+    ]
+    for tensor in cases:
+        expected = OmniSerializer.serialize(tensor)
+        buffer = bytearray()
+        size = OmniSerializer.serialize_into(tensor, buffer)
+        assert bytes(buffer) == expected
+        decoded = OmniSerializer.deserialize(buffer[:size])
+        assert decoded.dtype == tensor.dtype
+        assert decoded.shape == tensor.shape
+        assert torch.equal(decoded, tensor)

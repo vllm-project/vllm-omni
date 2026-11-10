@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Generic Cache-DiT backend lifecycle and integration."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -28,7 +29,58 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
-CacheDiTEnabler: TypeAlias = Callable[[Any, DiffusionCacheConfig], RefreshCacheContextFunc]
+
+
+def _cfg_parallel_world_size() -> int:
+    """Return the CFG-parallel world size, or 1 when the parallel state is not initialized."""
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_classifier_free_guidance_world_size,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return 1
+    return get_classifier_free_guidance_world_size()
+
+
+def resolve_has_separate_cfg(has_separate_cfg: bool) -> bool:
+    """Return the ``has_separate_cfg`` value to hand Cache-DiT on this rank.
+
+    Cache-DiT tells the conditional and unconditional passes apart purely by transformer-call parity:
+    with ``has_separate_cfg`` it advances its step counter only on every other call and keeps the
+    odd calls in separate ``*_cfg`` buffers. Under CFG parallel each rank runs one branch, i.e. one
+    transformer call per denoise step, so the parity bookkeeping halves the step counter: warm-up
+    and the cached-step limits cover twice as many real steps and residuals are compared two steps
+    apart, which caches far fewer steps. One call per step is the non-separate-CFG contract.
+
+    Multi-branch CFG with more branches than CFG ranks would put two calls on one rank;
+    ``CFGParallelMixin`` rejects that topology while Cache-DiT is active (see
+    ``_cache_dit_one_call_per_cfg_rank``).
+    """
+    if not has_separate_cfg:
+        return False
+    cfg_world_size = _cfg_parallel_world_size()
+    if cfg_world_size == 1:
+        return True
+    logger.info(
+        "CFG parallel (size %d) runs one branch per rank: Cache-DiT uses has_separate_cfg=False",
+        cfg_world_size,
+    )
+    return False
+
+
+@dataclass(frozen=True)
+class CacheDiTEnableResult:
+    """Custom-enabler result with the exact targets needed for teardown."""
+
+    refresh: RefreshCacheContextFunc
+    targets: tuple[Any, ...]
+
+
+CacheDiTEnabler: TypeAlias = Callable[
+    [Any, DiffusionCacheConfig],
+    RefreshCacheContextFunc | CacheDiTEnableResult,
+]
 
 # Model-specific implementations register themselves when the package loads.
 CUSTOM_DIT_ENABLERS: dict[str, CacheDiTEnabler] = {}
@@ -56,13 +108,15 @@ def _dit_module_names(pipeline: SupportsComponentDiscovery) -> tuple[str, ...]:
 def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) -> None:
     """Log Cache-DiT statistics for every transformer on the pipeline."""
 
-    transformers = [attrgetter(name)(pipeline) for name in _dit_module_names(pipeline)]
-    for transformer in transformers:
-        if not BlockAdapter.is_cached(transformer):
+    targets = getattr(pipeline, "_cache_dit_targets", None)
+    if targets is None:
+        targets = tuple(attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
+    for target in targets:
+        if not BlockAdapter.is_cached(target):
             continue
-        cache_dit.summary(transformer, details=details)
+        cache_dit.summary(target, details=details)
 
-    if not transformers:
+    if not targets:
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
@@ -157,6 +211,12 @@ def enable_cache_for_dit(
     )
 
     transformer = get_pipeline_transformer(pipeline)
+    if block_adapter is not None:
+        block_adapter.has_separate_cfg = resolve_has_separate_cfg(block_adapter.has_separate_cfg)
+    elif not resolve_has_separate_cfg(True):
+        # Cache-DiT's built-in registry adapters (e.g. QwenImage) hard-code has_separate_cfg=True; an
+        # explicit enable_separate_cfg on the cache config takes precedence over the adapter's value.
+        db_cache_config.enable_separate_cfg = False
     cache_target = transformer if block_adapter is None else block_adapter
     if adapter_cls is not None:
         adapter_cls.apply(
@@ -212,13 +272,20 @@ def _maybe_build_block_adapter(
     if missing_attributes:
         raise AttributeError(f"Missing Cache-DiT block attributes: {missing_attributes}")
 
-    return BlockAdapter(
+    block_adapter = BlockAdapter(
         transformer=transformer,
         blocks=[getattr(transformer, block_attribute) for block_attribute in block_attributes],
         forward_pattern=list(forward_patterns),
-        has_separate_cfg=adapter_config.has_separate_cfg,
+        has_separate_cfg=resolve_has_separate_cfg(adapter_config.has_separate_cfg),
         check_forward_pattern=adapter_config.check_forward_pattern,
     )
+    # cache_dit marks the wrapper pipe's class as cached, and for bare-transformer
+    # adapters that class is shared process-wide; a marker left by a previous
+    # engine would make this enable skip cache-context installation.
+    pipe_cls = type(block_adapter.pipe)
+    if "_is_cached" in vars(pipe_cls):
+        del pipe_cls._is_cached
+    return block_adapter
 
 
 def _maybe_get_cached_adapter_cls(
@@ -254,8 +321,25 @@ class CacheDiTBackend(CacheBackend):
         self._cache_targets = []
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
-            self._refresh_funcs = [custom_enabler(pipeline, self.config)]
-            self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
+            result = custom_enabler(pipeline, self.config)
+            if isinstance(result, CacheDiTEnableResult):
+                self._refresh_funcs = [result.refresh]
+                self._cache_targets = list(result.targets)
+            else:
+                self._refresh_funcs = [result]
+                # An enabler that only returns a refresh func decides for itself
+                # which DiT modules it wraps, so discover the targets rather than
+                # assuming ``pipeline.transformer``: that attribute is None for a
+                # Wan2.2 MoE run with boundary_ratio pinned to 1.0 (low-noise
+                # expert only), and it also misses ``transformer_2`` in the normal
+                # dual-expert case, leaving the second expert's hooks installed
+                # after ``disable()``.  ``is_cached`` keeps enablers that
+                # intentionally wrap a subset out of the target list.
+                self._cache_targets = [
+                    transformer
+                    for transformer in (attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
+                    if BlockAdapter.is_cached(transformer)
+                ]
         else:
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
@@ -274,6 +358,11 @@ class CacheDiTBackend(CacheBackend):
                 self._cache_targets.append(cache_target)
             if not self._refresh_funcs:
                 raise ValueError(f"Pipeline {pipeline_name} has no declared DiT modules for Cache-DiT")
+
+        pipeline._cache_dit_targets = tuple(self._cache_targets)
+        # Under CFG parallel, Cache-DiT counts one transformer call per rank as one denoise step
+        # (resolve_has_separate_cfg), so CFGParallelMixin must not run two branches on one rank.
+        pipeline._cache_dit_one_call_per_cfg_rank = _cfg_parallel_world_size() > 1
 
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)
@@ -295,6 +384,11 @@ class CacheDiTBackend(CacheBackend):
         finally:
             self._refresh_funcs = []
             self._cache_targets = []
+            if hasattr(pipeline, "_cache_dit_targets"):
+                del pipeline._cache_dit_targets
+            pipeline._cache_dit_one_call_per_cfg_rank = False
+            if hasattr(pipeline, "_cache_dit_refresh_for_schedule"):
+                del pipeline._cache_dit_refresh_for_schedule
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
@@ -313,6 +407,7 @@ class CacheDiTBackend(CacheBackend):
 
 __all__ = [
     "CUSTOM_DIT_ENABLERS",
+    "CacheDiTEnableResult",
     "CacheDiTBackend",
     "cache_summary",
     "enable_cache_for_dit",

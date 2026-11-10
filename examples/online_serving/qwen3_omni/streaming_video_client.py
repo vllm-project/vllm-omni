@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Example WebSocket client for the /v1/video/chat/stream endpoint.
 
 Sends video frames from a local file (or generates synthetic ones), submits a
@@ -164,11 +164,6 @@ async def run(args: argparse.Namespace) -> None:
                 print(data.get("delta", ""), end="", flush=True)
             elif msg_type == "response.text.done":
                 print()  # newline
-            elif msg_type == "response.evs_stats":
-                retained = data.get("retained_count", 0)
-                dropped = data.get("dropped_count", 0)
-                rate = data.get("drop_rate", 0)
-                print(f"\nEVS stats: retained={retained} dropped={dropped} drop_rate={rate:.1%}")
             elif msg_type == "session.done":
                 print("Session complete.")
                 break

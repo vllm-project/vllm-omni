@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CoVo-Audio serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -15,6 +16,10 @@ class CovoAudioAdapter(ARTTSAdapter):
     stage_keys = frozenset({"fused_thinker_talker"})
     name = "covo_audio"
 
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._tokenizer = None
+
     @classmethod
     def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
         """``fused_thinker_talker`` is a generic stage key that non-CoVo fused
@@ -30,5 +35,21 @@ class CovoAudioAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt = self.ctx.server._build_covo_audio_prompt(request)
-        return PreparedRequest(prompt=prompt, tts_params={}, model_type="covo_audio")
+        """Build the tokenized chat prompt expected by Covo-Audio-Chat.
+
+        The model requires a specific system prompt instructing it to
+        interleave text and audio tokens. Passing token IDs avoids a second
+        engine-side tokenization step.
+        """
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.covo_audio.prompt_utils import build_covo_audio_prompt_token_ids
+
+        if self._tokenizer is None:
+            model_name = self.ctx.engine_client.model_config.model
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load Covo-Audio tokenizer from '{model_name}': {exc}") from exc
+        prompt_ids = build_covo_audio_prompt_token_ids(self._tokenizer, request.input)
+        return PreparedRequest(prompt={"prompt_token_ids": prompt_ids}, tts_params={}, model_type="covo_audio")

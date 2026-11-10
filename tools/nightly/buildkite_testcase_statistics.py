@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Parse pytest commands from Buildkite .buildkite/cuda/test-{ready,merge,nightly,weekly}.yml;
 collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.

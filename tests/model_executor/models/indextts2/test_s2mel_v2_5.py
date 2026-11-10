@@ -838,6 +838,16 @@ def test_v25_resolved_vocoder_source_is_cached(monkeypatch):
     assert calls == [("/models/indextts25", "fake-bigvgan")]
 
 
+def test_bigvgan_source_falls_back_to_hub_repo_for_local_model_dir(tmp_path):
+    assert (
+        indextts2_s2mel_decoder._resolve_bigvgan_source(
+            str(tmp_path),
+            "nvidia/bigvgan_v2_22khz_80band_256x",
+        )
+        == "nvidia/bigvgan_v2_22khz_80band_256x"
+    )
+
+
 def test_stage1_preload_does_not_swallow_cuda_runtime_failure(monkeypatch):
     decoder = object.__new__(IndexTTS2S2MelDecoder)
     torch.nn.Module.__init__(decoder)

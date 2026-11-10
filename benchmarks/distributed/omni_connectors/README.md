@@ -31,6 +31,7 @@ docker run -it \
 ```
 
 Parameter explanation:
+
 - `--cap-add=SYS_PTRACE`: Allow reading system topology information
 - `--cap-add=IPC_LOCK`: Allow memory locking (required for RDMA memory registration)
 - `--security-opt seccomp=unconfined`: Disable seccomp restrictions
@@ -60,6 +61,7 @@ When running single-node tests (producer and consumer on the same machine), ensu
 InfiniBand devices use LID (Local Identifier) for routing. Different devices have different LIDs and cannot communicate directly. If no device is specified, Mooncake may assign different devices to connectors, causing handshake failures.
 
 Common error:
+
 ```
 [Handshake] Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num: Invalid argument [22]
 ```
@@ -249,7 +251,7 @@ python cross_node_mooncake_transfer_engine.py \
 ### Transfer Modes
 
 | Mode | Description | Example |
-|------|-------------|---------|
+| ------ | ------------- | --------- |
 | `copy` | Normal path — tensor copied to RDMA pool (default) | `--mode copy` |
 | `zerocopy` | Zero-copy path — data created directly in RDMA pool | `--mode zerocopy` |
 | `gpu` | GPU transfer — RDMA pool on GPU, uses GPUDirect | `--mode gpu --gpu-id 0` |
@@ -281,7 +283,7 @@ python cross_node_mooncake_transfer_engine.py \
 ### Cross-Node Test Options
 
 | Option | Description | Default |
-|--------|-------------|---------|
+| -------- | ------------- | --------- |
 | `--role` | `producer` or `consumer` | Required |
 | `--local-host` | Local RDMA IP address | Required |
 | `--remote-host` | Remote RDMA IP address | Required |
@@ -303,6 +305,7 @@ python cross_node_mooncake_transfer_engine.py \
 **Cause**: QP handshake failed, usually due to device configuration mismatch.
 
 **Solution**:
+
 ```bash
 # Force using the same device
 export RDMA_DEVICE_NAME='mlx5_0'
@@ -313,6 +316,7 @@ export RDMA_DEVICE_NAME='mlx5_0'
 **Cause**: Mooncake not installed or import failed.
 
 **Solution**:
+
 ```bash
 # Check Mooncake installation
 python -c "from mooncake.engine import TransferEngine; print('OK')"
@@ -329,6 +333,7 @@ uv pip install mooncake-transfer-engine
 **Cause**: Container lacks IB device access permissions.
 
 **Solution**:
+
 ```bash
 docker run --device=/dev/infiniband --cap-add=IPC_LOCK ...
 ```
@@ -338,6 +343,7 @@ docker run --device=/dev/infiniband --cap-add=IPC_LOCK ...
 **Cause**: RDMA connection establishment failed or network latency.
 
 **Solution**:
+
 ```bash
 # Check network status
 ibstat
@@ -349,6 +355,7 @@ ibstatus
 **Cause**: CUDA environment not configured or GPU unavailable.
 
 **Solution**:
+
 ```bash
 # Check CUDA
 python -c "import torch; print(torch.cuda.is_available())"
@@ -362,7 +369,7 @@ docker run --gpus all ...
 ## Environment Variables Reference
 
 | Variable | Description | Example |
-|----------|-------------|---------|
+| ---------- | ------------- | --------- |
 | `RDMA_DEVICE_NAME` | Specify RDMA device name | `mlx5_0` |
 | `RDMA_TEST_HOST` | Specify test host IP | `10.0.0.1` |
 | `MC_TE_METRIC` | Enable Mooncake metrics | `1` |
@@ -373,7 +380,7 @@ docker run --gpus all ...
 ## Test Files Overview
 
 | File | Description | Auto-discovered by pytest |
-|------|-------------|--------------------------|
+| ------ | ------------- | -------------------------- |
 | `test_mooncake_transfer_engine_rdma.py` | Integration tests for MooncakeTransferEngineConnector (basic, E2E, lifecycle, GPU) | Yes |
 | `test_mooncake_transfer_engine_buffer.py` | Memory pool and buffer management unit tests | Yes |
 | `cross_node_mooncake_transfer_engine.py` | Cross-node (multi-machine) testing script — run manually | No (filename does not start with `test_`) |
@@ -381,7 +388,7 @@ docker run --gpus all ...
 ### test_mooncake_transfer_engine_rdma.py — Test Classes
 
 | Test Class | Memory Pool | Marker | Description |
-|------------|-------------|--------|-------------|
+| ------------ | ------------- | -------- | ------------- |
 | `TestBasicConnector` | CPU | — | Initialization, put tensor/bytes/object, cleanup, pool exhaustion |
 | `TestEndToEnd` | CPU | — | E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload (100MB), mixed types, concurrency |
 | `TestLifecycle` | CPU | — | Close, context manager, double-close safety |
@@ -391,7 +398,7 @@ docker run --gpus all ...
 ### test_mooncake_transfer_engine_buffer.py — Test Classes
 
 | Test Class | Marker | Description |
-|------------|--------|-------------|
+| ------------ | -------- | ------------- |
 | `TestBufferAllocator` | — | Basic alloc/free, alignment, exhaustion/recovery, thread safety |
 | `TestAllocatorInvariants` | `slow` | Double-free safety, overlap corruption detection, adjacent-block merging, fragmentation/defrag |
 | `TestManagedBuffer` | — | Tensor views, context manager |

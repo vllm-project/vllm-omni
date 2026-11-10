@@ -7,14 +7,15 @@ L4 expansion coverage for ``Boogu/Boogu-Image-0.1-Base`` (text-to-image).
 The nightly smoke module (``test_boogu_image.py``) already covers the default
 512x512 single request and a concurrent batch. This expansion module adds the
 request-level paths that smoke does not exercise, run against every currently
-supported single-GPU server configuration:
+supported server configuration:
 
-Server rows (single card):
+Server rows:
 - ``default`` — no extra ``server_args``.
 - ``vae_slicing_tiling`` — ``--vae-use-slicing --vae-use-tiling`` (the recipe's
   OOM mitigation; applied generically in ``registry.initialize_model``).
+- ``cfg_parallel_2`` — two-card CFG branch parallelism.
 
-Cases (one per test, each parametrized over both server rows):
+Cases (one per test, each parametrized over all server rows):
 - ``test_non_square_resolution`` — 768x1024, exercises the patchify / RoPE path
   at a non-square aspect ratio.
 - ``test_cfg_off`` — ``guidance_scale=1.0``, exercises the no-CFG denoise branch
@@ -24,8 +25,7 @@ Cases (one per test, each parametrized over both server rows):
 Boogu-Image reads ``sp.guidance_scale`` (not ``true_cfg_scale``). These stay
 smoke-depth (``num_inference_steps=2``); numeric parity vs. Diffusers is covered
 by the local parity harness (support plan, step 14). CPU offload, Cache-DiT, and
-multi-GPU parallelism are not yet supported for this model and are intentionally
-omitted (add rows here when those features land).
+non-CFG multi-GPU parallelism remain unsupported.
 
 From ``tests/``::
 
@@ -49,10 +49,11 @@ T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"
 NEGATIVE_PROMPT = ""
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):
-    """Return the single-card server configurations supported for Boogu-Image today."""
+    """Return the validated single-card and CFG-parallel configurations."""
     return [
         pytest.param(
             OmniServerParams(model=model),
@@ -66,6 +67,11 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="vae_slicing_tiling",
             marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--cfg-parallel-size", "2"]),
+            id="cfg_parallel_2",
+            marks=PARALLEL_2_FEATURE_MARKS,
         ),
     ]
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-VoiceGenerator (MossTTSDelayModel, 1.7B).
 
 Weekly expansion coverage (``pytest.mark.slow``) for the delay-model path.
@@ -8,11 +8,11 @@ Upstream keeps the same tests in ``test_moss_tts.py``; this branch uses the
 
 MOSS-VoiceGenerator synthesizes speech from a text *instruction* that describes
 the desired voice (e.g. "a warm female voice with an American accent").  It does
-NOT accept a reference audio clip.  The request format requires running
-AutoProcessor.from_pretrained once per call to encode the (text, instruction)
-pair into the (prompt_token_ids, codes.ref) grid that the MossTTSDelayModel
-talker expects — same as examples/offline_inference/text_to_speech/moss_tts/
-end2end.py:_build_unified_codes.
+NOT accept a reference audio clip.  The request format requires loading the
+checkpoint's ``MossTTSDelayProcessor`` once per call to encode the (text,
+instruction) pair into the (prompt_token_ids, codes.ref) grid that the
+MossTTSDelayModel talker expects — same as examples/offline_inference/
+text_to_speech/moss_tts/end2end.py:_build_unified_codes.
 
 Realtime coverage: ``test_moss_tts_realtime_expansion.py``.
 
@@ -74,7 +74,6 @@ def _get_test_config() -> str:
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_runner",
@@ -85,13 +84,17 @@ pytestmark = [
 
 
 def _build_request(text: str, instruction: str) -> dict:
-    """Build a VoiceGenerator request using AutoProcessor."""
-    from transformers import AutoProcessor
+    """Build a VoiceGenerator request using its custom delay processor."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     try:
-        proc = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
+        processor_cls = get_class_from_dynamic_module(
+            "processing_moss_tts.MossTTSDelayProcessor",
+            MODEL,
+        )
+        proc = processor_cls.from_pretrained(MODEL, trust_remote_code=True)
     except Exception as exc:
-        msg = f"Cannot load AutoProcessor for {MODEL}: {exc}"
+        msg = f"Cannot load MossTTSDelayProcessor for {MODEL}: {exc}"
         if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
             pytest.skip(msg)
         pytest.fail(msg)
@@ -137,7 +140,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
     return torch.cat(chunks, dim=0), sr_final
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_english(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: English instruction produces non-empty 24 kHz audio."""
     req = _build_request(
@@ -151,7 +154,7 @@ def test_moss_tts_delay_english(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_chinese(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: Chinese input produces non-empty audio."""
     req = _build_request(
@@ -165,7 +168,7 @@ def test_moss_tts_delay_chinese(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_batch(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: batch of two requests each returns non-empty audio."""
     requests = [

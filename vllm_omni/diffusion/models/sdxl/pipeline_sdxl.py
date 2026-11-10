@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -22,7 +22,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sdxl.sdxl_unet import SDXLUNet2DConditionModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ class StableDiffusionXLPipeline(
     _encoder_modules: list[str] = ["text_encoder", "text_encoder_2"]
     _vae_modules: list[str] = ["vae"]
     _resident_modules: list[str] = []
+    supports_request_batch = True
 
     def __init__(
         self,
@@ -306,23 +307,29 @@ class StableDiffusionXLPipeline(
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         negative_prompt = [
             "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
         ] or negative_prompt
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        generator = req.sampling_params.generator or generator
+        # Request-batch-wide fields are guaranteed identical across the batch by
+        # RequestBatchSamplingParamsKey, so the first request carries them.
+        common_sampling_params = req.sampling_params_list[0]
+
+        height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
+            common_sampling_params.num_outputs_per_prompt
+            if common_sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
+        # Seeds/generators and latents are request-local: collate them per request.
+        generator = req.collate_request_generators(num_images_per_prompt, generator)
+        latents = req.collate_request_tensors("latents", latents)
 
-        self._guidance_scale = req.sampling_params.guidance_scale
+        self._guidance_scale = common_sampling_params.guidance_scale
         self._current_timestep = None
         self._interrupt = False
 
@@ -412,9 +419,13 @@ class StableDiffusionXLPipeline(
             latents = latents / self.vae.config.scaling_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        return split_diffusion_output_by_request(
+            DiffusionOutput(
+                output=image,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

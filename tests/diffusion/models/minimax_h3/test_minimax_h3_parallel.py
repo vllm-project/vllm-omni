@@ -67,6 +67,33 @@ def test_packed_attention_is_a_regional_compile_boundary():
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
+def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MiniMaxH3DenoiseBranch,
+    )
+
+    packed = {
+        "seq_len": torch.tensor(9),
+        "img_pos": torch.arange(4),
+        "audio_pos": torch.empty(0, dtype=torch.long),
+        "text_pos": torch.arange(2),
+        "update_mask": torch.ones(4, dtype=torch.bool),
+        "cu_seqlens": torch.tensor([0, 9, 9], dtype=torch.int32),
+        "img_position_ids": torch.zeros(9, 3, dtype=torch.long),
+        "video_spans": ({"start": 5, "latent_grid": (1, 2, 2), "role": "target"},),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, 4),
+        token_tags=torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2]),
+        device=torch.device("cpu"),
+    )
+
+    layout = branch.static_kwargs["video_token_layout"]
+    assert not hasattr(layout, "prefix_segments")
+    assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
+
+
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     from vllm_omni.diffusion.layers.rope import RotaryEmbedding
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
@@ -414,8 +441,9 @@ def test_sp_output_boundary_preserves_logits_and_minimizes_gather(
             return torch.cat((tensor, self.remote_rows), dim=0)
 
     class _FinalLayer(nn.Module):
-        def forward(self, hidden, *, t_emb, inverse_indices):
+        def forward(self, hidden, *, t_emb, inverse_indices, pdd_step=None):
             del t_emb
+            assert pdd_step is None
             inverse = inverse_indices.to(torch.float32).unsqueeze(-1)
             return (
                 hidden[:, :2].to(torch.float32) + inverse,

@@ -7,7 +7,8 @@
 - Vendor: Qwen
 - Model: `Qwen/Qwen-Image`
 - Task: Text-to-image generation
-- Mode: Online serving with optional step-wise continuous batching
+- Mode: Online serving with optional step-wise continuous batching; offline
+  inference
 - Maintainer: Community
 
 ## When to use this recipe
@@ -25,11 +26,14 @@ the benchmark assets already bundled in this repository.
   [`examples/online_serving/text_to_image/README.md`](../../examples/online_serving/text_to_image/README.md)
 - Related benchmark:
   [`benchmarks/diffusion/diffusion_benchmark_serving.py`](../../benchmarks/diffusion/diffusion_benchmark_serving.py)
+- Offline inference example used by the XPU section:
+  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 
 ## Hardware Support
 
-This recipe currently documents one CUDA GPU serving configuration. Extend it
-with more hardware sections as community validation lands.
+This recipe documents CUDA GPU serving configurations and one Intel XPU
+offline-inference configuration. Extend it with more hardware sections as
+community validation lands.
 
 ## GPU
 
@@ -235,3 +239,59 @@ CUTLASS was the fastest validated backend for this checkpoint.
 - The benchmark table intentionally reports Qwen-Image-2512 as
   concurrency-1 request-level data; do not compare it directly with an online
   HTTP concurrency benchmark.
+
+## XPU
+
+### 1x Intel Arc Pro B70 (32 GB)
+
+Offline text-to-image at 1024x1024, with layerwise offload streaming the
+transformer blocks so the 20B model fits one card.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.13.0+xpu
+- vLLM: 0.29.0 (`98dff2a8`)
+- vLLM-Omni: `main` at `4c7a98c2`
+
+#### Command
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Qwen/Qwen-Image \
+  --prompt "a cup of coffee on the table" \
+  --num-inference-steps 50 \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output qwen_image_output.png
+```
+
+Given spare cards, `--enable-cpu-offload` shards the transformer instead of
+streaming it. It shortens the denoise loop but not the run, because the
+per-request model swap costs more than the loop saves.
+
+```bash
+  --tensor-parallel-size 4 \
+  --enable-cpu-offload
+```
+
+| Offload | Cards | Peak VRAM | Time |
+| --- | ---: | ---: | ---: |
+| `--enable-layerwise-offload` | 1 | 16.6 GiB | 50 s |
+| `--enable-cpu-offload` | 2 | 26.4 GiB | 85 s |
+| `--enable-cpu-offload` | 4 | 19.8 GiB | 70 s |
+| `--enable-cpu-offload` | 8 | 16.9 GiB | 87 s |
+
+#### Verification
+
+Confirm `qwen_image_output.png` is written and looks coherent for the prompt.
+
+#### Notes
+
+- Memory usage: peak 16.6 GiB, about 55 s per image.
+- Known limitations: only offline generation was qualified. Step-wise continuous
+  batching, ModelOpt quantization, and online serving are out of scope for this
+  profile.

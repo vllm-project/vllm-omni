@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Camera trajectory loading and geometry for LingBot World v2 conditioning."""
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import torch
 
 _REFERENCE_HEIGHT = 480
 _REFERENCE_WIDTH = 832
-_MAX_ACTION_FRAMES = 117
 _MAX_SOURCE_ACTION_FRAMES = 4096
 _MAX_NPY_HEADER_BYTES = 10_000
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -207,9 +206,7 @@ def _load_bounded_npy(
             array = np.load(snapshot_file, allow_pickle=False)
         except (EOFError, TypeError, ValueError):
             raise ValueError(f"{filename} does not contain a valid numeric NPY array.") from None
-    # Official LingBot trajectories may be longer than one request. Only
-    # materialize the bounded prefix that any supported request can consume.
-    result: np.ndarray = np.asarray(array[:_MAX_ACTION_FRAMES], dtype=np.float32)
+    result: np.ndarray = np.asarray(array, dtype=np.float32)
     return result
 
 
@@ -392,7 +389,11 @@ def _invert_camera_poses(poses: torch.Tensor) -> torch.Tensor:
     return inverse
 
 
-def _prepare_framewise_poses(raw_poses: torch.Tensor) -> torch.Tensor:
+def _prepare_framewise_poses(
+    raw_poses: torch.Tensor,
+    *,
+    translation_scale: float | None = None,
+) -> torch.Tensor:
     """Convert raw C2W poses to normalized first-relative framewise deltas."""
 
     # Remove global placement, then convert the sequence to framewise deltas.
@@ -405,12 +406,19 @@ def _prepare_framewise_poses(raw_poses: torch.Tensor) -> torch.Tensor:
             relative_poses[1:],
         )
 
-    # Only relative direction/magnitude matters to the checkpoint; normalizing
-    # by the largest step removes the trajectory's arbitrary translation scale.
+    # Normalizing the control's scale. Different between scripted and realtime input.
     translations = relative_poses[:, :3, 3]
-    max_translation_norm = torch.linalg.vector_norm(translations, dim=-1).max()
-    if max_translation_norm > 0:
-        relative_poses[:, :3, 3] = translations / max_translation_norm
+    if translation_scale is None:
+        # Scripted action_path input: divide by the largest step so an arbitrary recording scale becomes 1.
+        scale = torch.linalg.vector_norm(translations, dim=-1).max()
+    else:
+        # Realtime interaction input: use the controller translation unit (one WASD step = full speed).
+        # It cannot see future motion or normalize globally.
+        if translation_scale <= 0:
+            raise ValueError(f"translation_scale must be > 0, got {translation_scale}")
+        scale = translation_scale
+    if float(scale) > 0:
+        relative_poses[:, :3, 3] = translations / scale
     return relative_poses
 
 
@@ -423,6 +431,7 @@ def build_plucker_embedding(
     target_width: int,
     device: torch.device,
     dtype: torch.dtype,
+    translation_scale: float | None = None,
 ) -> torch.Tensor:
     """Build checkpoint-ordered ``(ray origin, ray direction)`` channels."""
 
@@ -441,7 +450,10 @@ def build_plucker_embedding(
 
     # Compute geometry in at least FP32, then cast at the model boundary.
     compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-    poses = _prepare_framewise_poses(trajectory.poses.to(device=device, dtype=compute_dtype))
+    poses = _prepare_framewise_poses(
+        trajectory.poses.to(device=device, dtype=compute_dtype),
+        translation_scale=translation_scale,
+    )
     intrinsics = trajectory.intrinsics.to(device=device, dtype=compute_dtype).clone()
     intrinsics[:, (0, 2)] *= width / _REFERENCE_WIDTH
     intrinsics[:, (1, 3)] *= height / _REFERENCE_HEIGHT

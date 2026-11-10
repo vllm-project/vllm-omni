@@ -57,3 +57,11 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # MIOPEN_FIND_MODE=FAST changes solver selection, not HIP graph safety.
+        # Keep the Conv1d codec outside the outer vLLM graph on ROCm.
+        enforce_eager: true

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,10 +14,17 @@ from vllm.config import VllmConfig
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    require_attention_schedule_fits,
+    select_attention_profile,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
     import torch
+
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
 
 
 @dataclass
@@ -29,17 +36,39 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Runner-owned paged execution metadata/runtime. Attention resolves the
+    # active Worker adapter from it; model code must not construct BlockTable
+    # rows or activate the runtime directly.
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
+    # Block-aligned prefix already resident in Scheduler-owned pages for the
+    # active request-level prefill. Zero keeps the cold/full-prefill path.
+    paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+    # Startup-only memory profiling runs before Scheduler-owned pages exist.
+    # Attention layers use this explicit scope to distinguish that probe from
+    # a malformed paged request whose Worker adapter was not activated.
+    in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
+    # Bound request schedule. None means unbound. () disables. A non-empty tuple
+    # selects prepared profiles while a denoise step is published.
+    attention_schedule: AttentionSchedule | None = None
+    # Whether the bound schedule is the request's own rather than an inherited service default.
+    attention_schedule_from_request: bool = False
+    # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
+    # every scheduled layer in one step reads it instead of selecting again.
+    _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
+    _attention_profile: str | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
+    direct_condition: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -49,6 +78,10 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Pre-padding global sequence length per SequenceParallelInput shard_group,
+    # for models that auto-pad several independent sequences in one boundary.
+    # The singleton fields above remain for single-sequence models.
+    sp_shard_metadata: dict[str, int] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -58,6 +91,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # One entry per active SP split boundary: whether it auto-pads, which makes
+    # every rank's shard the same length and lets attention collectives skip a
+    # runtime length all-gather. Pushed on split, popped on gather.
+    _sp_equal_pad_stack: list[bool] = field(default_factory=list)
 
     @property
     def sp_active(self) -> bool:
@@ -80,6 +117,15 @@ class ForwardContext:
         sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
         return sp_size is not None and sp_size > 1
 
+    @property
+    def sp_rank_local_seq_lens_equal(self) -> bool:
+        """Whether every active SP boundary guarantees equal local shard sizes.
+
+        Only framework-managed auto_pad boundaries provide this contract; a
+        region that also shards manually keeps the dynamic length exchange.
+        """
+        return bool(self._sp_equal_pad_stack) and all(self._sp_equal_pad_stack)
+
     def __post_init__(self):
         pass
 
@@ -97,6 +143,13 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def get_sp_shard_original_seq_len(shard_group: str) -> int | None:
+    """Pre-padding global length of `shard_group`, or None if it was not split."""
+    if not is_forward_context_available():
+        return None
+    return get_forward_context().sp_shard_metadata.get(shard_group)
 
 
 def build_local_sp_padding_mask(
@@ -154,6 +207,9 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -161,6 +217,9 @@ def create_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -186,6 +245,9 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -197,6 +259,9 @@ def set_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -242,10 +307,155 @@ def override_paged_kv_adapter(adapter: Any | None):
         _forward_context.paged_kv_adapter = previous
 
 
+@contextmanager
+def bind_attention_schedule(schedule: AttentionSchedule | None, *, from_request: bool = False):
+    """Install one request schedule and restore the previous one on any exit.
+
+    ``from_request`` marks ranges the request sent itself; begin_scheduled_denoise checks only those.
+    """
+    if _forward_context is None:
+        raise RuntimeError("bind_attention_schedule requires an active forward context")
+    previous = _forward_context.attention_schedule, _forward_context.attention_schedule_from_request
+    _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_schedule_from_request = from_request
+    try:
+        yield
+    finally:
+        _forward_context.attention_schedule, _forward_context.attention_schedule_from_request = previous
+
+
+def get_attention_schedule_profile() -> str | None:
+    """Return the profile the bound schedule selects for the published step, or None.
+
+    The selection is computed once per (schedule, step, total) and reused by every
+    scheduled layer in that step.
+    """
+    ctx = _forward_context
+    if ctx is None or not ctx.attention_schedule or ctx.denoise_step_idx is None:
+        return None
+    total = ctx.total_denoise_steps
+    if total is None:
+        raise RuntimeError("an attention schedule needs total_denoise_steps published with denoise_step_idx")
+    key = (ctx.attention_schedule, ctx.denoise_step_idx, total)
+    if key != ctx._attention_profile_key:
+        ctx._attention_profile = select_attention_profile(
+            ctx.attention_schedule, ctx.denoise_step_idx, total_steps=total
+        )
+        ctx._attention_profile_key = key
+    return ctx._attention_profile
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+        if step_idx is not None:
+            paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
+            ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
+            if callable(ensure_active):
+                ensure_active(step_idx)
+
+
+def begin_scheduled_denoise(total_steps: int) -> int | None:
+    """Check the request's own bound schedule against one denoise sequence before its first forward.
+
+    An inherited service default is not checked: it serves requests of any length, and a range that
+    ends after this sequence applies up to its last step.
+    Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
+    publishes a total only for schedules passes the result through, so an unscheduled run
+    keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
+    Call it once per sequence that restarts at step 0.
+    """
+    if _forward_context is None or not _forward_context.attention_schedule:
+        return None
+    if _forward_context.attention_schedule_from_request:
+        require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    return total_steps
+
+
+@contextmanager
+def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
+    """Clear the step, timestep and total a scheduled denoise loop published, on any exit of the loop.
+
+    ``total_steps`` is the result of ``begin_scheduled_denoise``. Work after the loop, such as VAE
+    decode, runs outside the denoise schedule, and a forward that raises mid-loop leaves no step
+    published either. Without a schedule (None) the context is left as the loop left it.
+    Unlike HunyuanImage-3.0's ``_clear_denoise_progress_on_exit``, which restores the timestep and
+    total on every run, this keeps unscheduled Wan2.2 runs unchanged; do not merge the two.
+    """
+    try:
+        yield
+    finally:
+        if total_steps is not None and _forward_context is not None:
+            set_forward_context_denoise_step_idx(None)
+            set_forward_context_denoise_timestep(None)
+            set_forward_context_denoise_total_steps(None)
+
+
+@contextmanager
+def request_denoise_progress(step_idx: int, total_steps: int, timestep: float | None = None):
+    """Publish one request's progress around its own forward and restore the previous values on any exit.
+
+    For scheduled requests that share a denoise_step call but not their progress: each request
+    is evaluated separately under its own step, total and timestep. Restoring assigns the saved
+    fields directly, so a restore never calls the paged runtime's ensure_active.
+    """
+    if _forward_context is None:
+        raise RuntimeError("request_denoise_progress requires an active forward context")
+    ctx = _forward_context
+    previous_step = ctx.denoise_step_idx
+    previous_timestep = ctx.denoise_timestep
+    previous_total = ctx.total_denoise_steps
+    try:
+        set_forward_context_denoise_step_idx(step_idx)
+        ctx.denoise_timestep = None if timestep is None else float(timestep)
+        ctx.total_denoise_steps = total_steps
+        yield
+    finally:
+        ctx.denoise_step_idx = previous_step
+        ctx.denoise_timestep = previous_timestep
+        ctx.total_denoise_steps = previous_total
+
+
+def get_paged_kv_computed_tokens() -> tuple[int, ...]:
+    runtime = _forward_context.paged_kv_runtime if _forward_context is not None else None
+    if runtime is None:
+        return ()
+    return tuple(row.kv_start_pos for row in runtime.metadata.prefill_rows)
+
+
+@contextmanager
+def paged_kv_prefill(sequence_id: int, num_tokens: int):
+    from dataclasses import replace
+
+    runtime = get_forward_context().paged_kv_runtime
+    if runtime is None:
+        raise RuntimeError("Paged KV prefill requires an active runtime")
+    rows = runtime.metadata.prefill_rows
+    matching_rows = [row for row in rows if row.sequence_id == sequence_id]
+    if len(matching_rows) != 1:
+        raise ValueError(
+            f"Paged KV prefill requires exactly one active row for sequence {sequence_id}; found {len(matching_rows)}"
+        )
+    row = matching_rows[0]
+    if type(num_tokens) is not int or not row.kv_start_pos < num_tokens <= row.seq_len:
+        raise ValueError(
+            "Paged KV prefill target must extend the active prefix without exceeding its allocation: "
+            f"start={row.kv_start_pos}, target={num_tokens!r}, allocated={row.seq_len}"
+        )
+    prefill = replace(row, query_len=num_tokens - row.kv_start_pos, seq_len=num_tokens)
+    batch = runtime.adapter.prepare_batch((prefill,))
+    with runtime.adapter.activate(batch):
+        yield
+    runtime.metadata = replace(
+        runtime.metadata,
+        prefill_rows=tuple(
+            replace(item, kv_start_pos=num_tokens, query_len=item.seq_len - num_tokens)
+            if item.sequence_id == sequence_id
+            else item
+            for item in rows
+        ),
+    )
 
 
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
@@ -302,3 +512,9 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.ref_latent = ref_latent
+
+
+def set_forward_context_direct_condition(direct_condition: torch.Tensor | None) -> None:
+    """Set the projected direct-VLM condition on the active context."""
+    if _forward_context is not None:
+        _forward_context.direct_condition = direct_condition

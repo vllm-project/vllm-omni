@@ -61,4 +61,4 @@ def test_ce_rejects_unsupported_layout_before_initialization(monkeypatch, scatte
     with pytest.raises(ValueError, match="strict 4D"):
         ulysses.UlyssesParallelAttention(sp, scatter, gather, False, ulysses_a2a_backend="ce")
     strategy = ulysses.UlyssesParallelAttention(sp, scatter, gather, False, ulysses_a2a_permute=True)
-    assert not strategy._use_ce
+    assert not ulysses._a2a_permute_enabled(strategy._ulysses_a2a_permute, scatter, gather, size)

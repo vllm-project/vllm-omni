@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -12,12 +16,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class FakeGr00tPolicy:
-    instances = []
+    instances: list["FakeGr00tPolicy"] = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.reset_calls = 0
-        self.seen_obs = None
+        self.seen_obs: dict[str, Any] | None = None
         self.embodiment_tag = SimpleNamespace(value="fake_embodiment")
         self.language_key = "annotation.language.language_instruction"
         self.modality_configs = {
@@ -40,7 +44,7 @@ class FakeGr00tPolicy:
         )
         FakeGr00tPolicy.instances.append(self)
 
-    def get_action(self, obs):
+    def get_action(self, obs, options=None):
         self.seen_obs = obs
         return {
             "arm": np.array([[[1.0, 2.0]]], dtype=np.float64),
@@ -107,6 +111,7 @@ def test_forward_returns_dict_actions_in_output():
     assert actions["arm"].dtype == np.float32
     np.testing.assert_allclose(actions["arm"], np.array([[[1.0, 2.0]]], dtype=np.float32))
     policy = FakeGr00tPolicy.instances[0]
+    assert policy.seen_obs is not None
     assert "video" in policy.seen_obs
     assert policy.seen_obs["language"] == {"annotation.language.language_instruction": [["pick the cube"]]}
     assert "images" not in policy.seen_obs

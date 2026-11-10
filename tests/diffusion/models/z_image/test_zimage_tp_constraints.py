@@ -1,8 +1,45 @@
-import pytest
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from vllm_omni.diffusion.models.z_image.z_image_transformer import validate_zimage_tp_constraints
+import pytest
+import torch
+
+from vllm_omni.diffusion.models.z_image.z_image_transformer import (
+    UnifiedPrepare,
+    validate_zimage_tp_constraints,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_unified_prepare_applies_padding_masks_before_sharding():
+    x = torch.zeros((2, 4, 2))
+    cap = torch.zeros((2, 3, 2))
+    x_rope = torch.zeros((2, 4, 1))
+    cap_rope = torch.zeros((2, 3, 1))
+    x_mask = torch.tensor([[1, 0, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
+    cap_mask = torch.tensor([[1, 1, 0], [1, 0, 1]], dtype=torch.bool)
+
+    *_, unified_mask = UnifiedPrepare()(
+        x,
+        x_rope,
+        x_rope,
+        cap,
+        cap_rope,
+        cap_rope,
+        [4, 2],
+        [3, 3],
+        x_mask,
+        cap_mask,
+    )
+
+    assert torch.equal(
+        unified_mask,
+        torch.tensor(
+            [[1, 0, 1, 0, 1, 1, 0], [1, 1, 1, 0, 1, 0, 0]],
+            dtype=torch.bool,
+        ),
+    )
 
 
 def test_validate_zimage_tp_constraints_tp2_ok():

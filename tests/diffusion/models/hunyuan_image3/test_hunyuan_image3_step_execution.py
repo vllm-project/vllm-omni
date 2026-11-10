@@ -1,16 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
+from tests.diffusion.attention.test_attention_schedule_candidates import _make_metadata_candidate
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    InvalidAttentionScheduleError,
+)
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    HunyuanImage3Text2ImagePipeline,
+    ImageInfo,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -37,7 +54,9 @@ def _pipeline():
         parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_schedule=None,
     )
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
     return pipeline
 
@@ -144,6 +163,80 @@ def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):
     assert model_inputs["batch_gen_image_info"] == [prepared.generated_image_info]
     assert rope_kwargs["image_infos"] is prepared.rope_image_info
     torch.testing.assert_close(model_inputs["input_ids"], prepared.tokenizer_output.tokens)
+
+
+def test_slice_cached_prefix_inputs_keeps_full_kv_axis() -> None:
+    inputs_embeds = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    attention_mask = torch.arange(36).reshape(1, 1, 6, 6)
+    position_ids = torch.arange(6).reshape(1, 6)
+    custom_pos_emb = (torch.arange(6).reshape(1, 6), torch.arange(10, 16).reshape(1, 6))
+    image_mask = torch.tensor([[False, False, True, True, True, True]])
+    gen_timestep_scatter_index = torch.tensor([[2]])
+
+    sliced = HunyuanImage3Pipeline._slice_cached_prefix_inputs(
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        custom_pos_emb,
+        image_mask,
+        gen_timestep_scatter_index,
+        [6],
+        [6],
+        2,
+    )
+
+    (
+        sliced_embeds,
+        sliced_mask,
+        sliced_positions,
+        sliced_rope,
+        sliced_image_mask,
+        sliced_scatter,
+        sliced_query_lens,
+        sliced_seq_len,
+    ) = sliced
+    torch.testing.assert_close(sliced_embeds, inputs_embeds[:, 2:])
+    torch.testing.assert_close(sliced_mask, attention_mask[:, :, 2:, :])
+    torch.testing.assert_close(sliced_positions, position_ids[:, 2:])
+    torch.testing.assert_close(sliced_rope[0], custom_pos_emb[0][:, 2:])
+    torch.testing.assert_close(sliced_rope[1], custom_pos_emb[1][:, 2:])
+    torch.testing.assert_close(sliced_image_mask, image_mask[:, 2:])
+    torch.testing.assert_close(sliced_scatter, torch.tensor([[0]]))
+    assert sliced_query_lens == [4]
+    assert sliced_seq_len == 4
+
+
+@pytest.mark.parametrize("local_prefix_hit", [True, False])
+def test_ar_reuse_does_not_consume_local_prefix_hits(local_prefix_hit):
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Text2ImagePipeline,
+    )
+
+    pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    input_ids = torch.arange(12).reshape(1, 12)
+    cond_image = torch.ones(1, 1)
+    kwargs = dict(
+        query_lens=[12],
+        attention_mask=torch.ones(1, 1, 12, 12),
+        position_ids=input_ids.clone(),
+        image_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        gen_timestep_scatter_index=torch.tensor([[8]]),
+        cond_vae_images=cond_image,
+    )
+    runtime = SimpleNamespace(metadata=SimpleNamespace(prefill_rows=[SimpleNamespace(kv_start_pos=4)]))
+    with set_forward_context(paged_kv_runtime=runtime, paged_kv_cached_prefix_len=4 if local_prefix_hit else 0):
+        output, ar_reuse_len = pipe._maybe_handle_ar_kv_reuse(input_ids, kwargs, 1, False, None, torch.device("cpu"))
+    if local_prefix_hit:
+        assert ar_reuse_len == 0
+        assert output is input_ids
+        assert kwargs["query_lens"] == [12]
+        assert kwargs["cond_vae_images"] is cond_image
+    else:
+        assert ar_reuse_len == 4
+        torch.testing.assert_close(output, input_ids[:, 4:])
+        assert kwargs["query_lens"] == [8]
+        assert "cond_vae_images" not in kwargs
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
@@ -268,6 +361,17 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline = _pipeline()
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_scheduler_paged_step_execution_is_rejected():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    state = _state("paged-step", 0)
+
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.prepare_encode(state)
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
@@ -404,7 +508,7 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
             }
         ]
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def fake_restore_prompt_kv_cache(states_arg, row_state_indexes, row_branches):
         del states_arg
@@ -431,7 +535,9 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert captured["row_state_indexes"] == [0, 1, 0, 1]
     assert captured["row_branches"] == [0, 0, 1, 1]
     assert captured["input_ids"] is None
+    assert isinstance(captured["images"], torch.Tensor)
     assert tuple(captured["images"].shape) == (4, 1)
+    assert isinstance(captured["timestep"], torch.Tensor)
     assert captured["timestep"].tolist() == [0.5, 0.0, 0.5, 0.0]
     assert captured["merged_attention_mask_shape"] == (4, 1, 2, 6)
     assert captured["merged_full_attn_spans"] == [[(4, 6)], [(4, 6)], [(4, 6)], [(4, 6)]]
@@ -440,3 +546,302 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=True, use_meanflow=True)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("distilled", 1)
+    state.latents = torch.zeros(1, 1)
+    state.extra[_STEP_GUIDANCE_SCALE] = 2.5
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 4, dtype=torch.bool),
+            "full_attn_spans": [[(2, 4)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 2, 1, 1),
+            "value": torch.zeros(1, 2, 1, 1),
+            "lens": torch.tensor([2]),
+        }
+    ]
+    state.scheduler = SimpleNamespace(get_timestep_r=lambda _timestep: torch.tensor(0.25))
+    captured = {}
+
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        del input_ids, images, timestep
+        captured.update(model_kwargs)
+        return {"model_kwargs": model_kwargs}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {"diffusion_prediction": torch.tensor([[1.0]])}
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    output = pipeline.denoise_step(InputBatch.make_batch([state]))
+
+    torch.testing.assert_close(output, torch.tensor([[1.0]]))
+    torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))
+
+
+# Attention schedule integration. Step-mode tests evaluate A at step 2 of 8 and B at step 5 of 10.
+_STEP_SCHEDULE = (AttentionScheduleRange(start=3, end=6, profile="sparse"),)
+_REQUEST_SCHEDULE = (AttentionScheduleRange(start=1, end=3, profile="sparse"),)
+
+
+def _progress(ctx) -> tuple:
+    return ctx.denoise_step_idx, ctx.total_denoise_steps, ctx.denoise_timestep, get_attention_schedule_profile()
+
+
+@contextmanager
+def _denoise_context(schedule, *, stale_timestep=None, stale_total=None, from_request=False):
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=from_request):
+        ctx = get_forward_context()
+        ctx.denoise_timestep = stale_timestep
+        ctx.total_denoise_steps = stale_total
+        yield ctx
+
+
+def _scheduled_state(request_id: str, step_index: int, total_steps: int, latent: float) -> StepRequestState:
+    state = _state(request_id, step_index)
+    # Step k has timestep (total_steps - k) * 100, normalized by num_train_timesteps=1000.
+    state.timesteps = torch.arange(total_steps, 0, -1, dtype=torch.float32) * 100.0
+    state.scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    state.latents = torch.full((1, 1), latent)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 4, dtype=torch.bool),
+            "full_attn_spans": [[(2, 4)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 2, 1, 1),
+            "value": torch.zeros(1, 2, 1, 1),
+            "lens": torch.tensor([2]),
+        }
+    ]
+    return state
+
+
+def _recording_step_pipeline(monkeypatch, records: list, *, fail_on_call: int | None = None):
+    pipeline = _pipeline()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+
+    def fake_forward_call(images, first_step):
+        del first_step
+        records.append((*_progress(get_forward_context()), images.flatten().tolist()))
+        if len(records) == fail_on_call:
+            raise RuntimeError("forward failed")
+        return {"diffusion_prediction": images * 10.0}
+
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+    pipeline.prepare_inputs_for_generation = lambda input_ids, images, timestep, **kwargs: {"images": images}
+    pipeline.forward_call = fake_forward_call
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+    return pipeline
+
+
+def test_scheduled_step_requests_run_separately_with_their_own_progress(monkeypatch):
+    records: list = []
+    pipeline = _recording_step_pipeline(monkeypatch, records)
+    states = [_scheduled_state("req-a", 2, 8, 1.0), _scheduled_state("req-b", 5, 10, 2.0)]
+
+    with _denoise_context(_STEP_SCHEDULE, stale_timestep=0.9, stale_total=99) as ctx:
+        out = pipeline.denoise_step(InputBatch.make_batch(states))
+        after = _progress(ctx)
+
+    assert records == [
+        (2, 8, 0.6, None, [1.0]),
+        (5, 10, 0.5, "sparse", [2.0]),
+    ]
+    torch.testing.assert_close(out, torch.tensor([[10.0], [20.0]]))
+    assert after == (None, 99, 0.9, None)
+
+
+def test_scheduled_step_rejects_a_scheduler_it_cannot_normalize(monkeypatch):
+    pipeline = _recording_step_pipeline(monkeypatch, [])
+    state = _scheduled_state("req-a", 2, 8, 1.0)
+    state.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+
+    with _denoise_context(_STEP_SCHEDULE):
+        with pytest.raises(RuntimeError, match="needs a current timestep and a flow-matching scheduler"):
+            pipeline.denoise_step(InputBatch.make_batch([state]))
+
+
+def test_scheduled_step_restores_context_when_second_request_fails(monkeypatch):
+    records: list = []
+    pipeline = _recording_step_pipeline(monkeypatch, records, fail_on_call=2)
+    states = [_scheduled_state("req-a", 2, 8, 1.0), _scheduled_state("req-b", 5, 10, 2.0)]
+
+    with _denoise_context(_STEP_SCHEDULE, stale_timestep=0.9, stale_total=99) as ctx:
+        with pytest.raises(RuntimeError, match="forward failed"):
+            pipeline.denoise_step(InputBatch.make_batch(states))
+        after = _progress(ctx)
+
+    assert [record[:4] for record in records] == [(2, 8, 0.6, None), (5, 10, 0.5, "sparse")]
+    assert after == (None, 99, 0.9, None)
+
+
+class _FakeFlowScheduler:
+    order = 1
+    config = SimpleNamespace(num_train_timesteps=1000)
+
+    def step(self, model_output, timestep, sample, return_dict=False):
+        del model_output, timestep, return_dict
+        return (sample,)
+
+
+def _request_mode_pipeline(monkeypatch, *, num_steps: int, events: list, fail_at_step: int | None = None):
+    def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas):
+        del scheduler, num_inference_steps, device, timesteps, sigmas
+        return torch.arange(num_steps, 0, -1, dtype=torch.float32) * 100.0, num_steps
+
+    def fake_forward_call(images, first_step):
+        ctx = get_forward_context()
+        events.append(("forward", *_progress(ctx), first_step))
+        if ctx.denoise_step_idx == fail_at_step:
+            raise RuntimeError("forward failed")
+        return {"diffusion_prediction": torch.zeros_like(images)}
+
+    def fake_prepare_latents(**_kwargs):
+        events.append("prepare_latents")
+        return torch.zeros(1, 1)
+
+    def fake_ar_kv_reuse(input_ids, model_kwargs, batch_size, cfg_parallel_ready, cfg_rank, device):
+        del model_kwargs, batch_size, cfg_parallel_ready, cfg_rank, device
+        events.append("ar_kv_reuse")
+        return input_ids, 0
+
+    cpu = property(lambda self: torch.device("cpu"))
+    monkeypatch.setattr(hy3_transformer_module, "retrieve_timesteps", fake_retrieve_timesteps)
+    monkeypatch.setattr(HunyuanImage3Text2ImagePipeline, "_execution_device", cpu)
+    monkeypatch.setattr(HunyuanImage3Text2ImagePipeline, "device", cpu)
+
+    # The request-mode pipeline publishes through its model, which is the HunyuanImage3Pipeline itself.
+    model = _pipeline()
+    model.config = hy3_transformer_module.HunyuanImage3Config(
+        cfg_distilled=False, use_meanflow=False, vae={"latent_channels": 1}
+    )
+    model.generation_config = None
+    mask = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+    model._prepare_attention_mask_for_generation = lambda input_ids, generation_config, model_kwargs: mask
+    model.prepare_inputs_for_generation = lambda input_ids, images, timestep, **kwargs: {"images": images}
+    model.forward_call = fake_forward_call
+    model._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    pipe.model = model
+    pipe.scheduler = _FakeFlowScheduler()
+    pipe.vae = SimpleNamespace(config=SimpleNamespace(), decode=lambda latents, return_dict, generator: (latents,))
+    pipe.progress_bar = lambda total: nullcontext(SimpleNamespace(update=lambda: None))
+    pipe.prepare_latents = fake_prepare_latents
+    pipe._maybe_handle_ar_kv_reuse = fake_ar_kv_reuse
+    return pipe
+
+
+def _run_request_loop(pipe, *, num_inference_steps: int = 4):
+    return pipe(
+        batch_size=1,
+        image_size=[16, 16],
+        num_inference_steps=num_inference_steps,
+        guidance_scale=1.0,
+        return_dict=False,
+        model_kwargs={"input_ids": None},
+    )
+
+
+def test_request_loop_publishes_actual_total_and_timestep_when_scheduled(monkeypatch):
+    events: list = []
+    pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
+
+    with _denoise_context(_REQUEST_SCHEDULE) as ctx:
+        _run_request_loop(pipe)
+        after = _progress(ctx)
+
+    assert events == [
+        "prepare_latents",
+        "ar_kv_reuse",
+        ("forward", 0, 4, 0.4, None, True),
+        ("forward", 1, 4, 0.3, "sparse", False),
+        ("forward", 2, 4, 0.2, "sparse", False),
+        ("forward", 3, 4, 0.1, None, False),
+    ]
+    assert after == (None, None, None, None)
+
+
+def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monkeypatch):
+    events: list = []
+    pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
+
+    # 8 steps are requested but the sequence built has 4, so [3, 6) does not fit.
+    with (
+        _denoise_context(_STEP_SCHEDULE, from_request=True),
+        pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"),
+    ):
+        _run_request_loop(pipe, num_inference_steps=8)
+
+    assert events == []
+
+
+class _SpecDependentMaskBackend:
+    supports_piecewise_spans = False
+
+    @classmethod
+    def supports_attention_mask(cls, attention_spec=None) -> bool:
+        return attention_spec.backend == "TORCH_SDPA"
+
+    @classmethod
+    def supports_dense_4d_mask(cls, attention_spec=None) -> bool:
+        return attention_spec.backend == "TORCH_SDPA"
+
+
+def test_image_attention_mask_check_rejects_candidates_without_mask_support():
+    check = hy3_transformer_module._require_attention_mask_support
+
+    masked = _make_metadata_candidate(_SpecDependentMaskBackend, AttentionSpec(backend="TORCH_SDPA"))
+    plain = _make_metadata_candidate(_SpecDependentMaskBackend, AttentionSpec(backend="TRTLLM_ATTN"))
+    assert check(masked) is None
+    reason = check(plain)
+    assert reason is not None and "4D attention mask" in reason
+
+
+def _capture_hy3_log(caplog, monkeypatch):
+    # Whether vllm loggers reach the root logger that caplog listens on depends on the vllm
+    # version, so attach caplog's handler directly and stop propagation: each record is seen once.
+    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    monkeypatch.setattr(hy3_module.logger, "propagate", False)
+
+
+@pytest.mark.parametrize(
+    ("default", "logged"),
+    [
+        ((AttentionScheduleRange(start=0, end=2, profile="approx"),), True),
+        ((AttentionScheduleRange(start=2, end=None, profile="approx"),), False),
+        ((), False),
+    ],
+    ids=["covers-step-0", "starts-later", "empty"],
+)
+def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, caplog, monkeypatch):
+    _capture_hy3_log(caplog, monkeypatch)
+    schedule = SimpleNamespace(default=default)
+    with caplog.at_level("INFO", logger=hy3_module.logger.name):
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=None))
+    messages = [record.getMessage() for record in caplog.records if "step-0 prompt K/V" in record.getMessage()]
+    assert len(messages) == (1 if logged else 0)
+    assert all("profile 'approx'" in message for message in messages)
+
+
+def test_startup_step_0_note_logs_only_on_rank_0(caplog, monkeypatch):
+    _capture_hy3_log(caplog, monkeypatch)
+    monkeypatch.setattr(hy3_module, "_is_rank_zero", lambda: False)
+    schedule = SimpleNamespace(default=(AttentionScheduleRange(start=0, end=2, profile="approx"),))
+    with caplog.at_level("INFO", logger=hy3_module.logger.name):
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
+    assert "step-0 prompt K/V" not in caplog.text

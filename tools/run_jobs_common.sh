@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Shared helpers for tools/run_*_jobs.sh (source this file; do not execute).
 #
@@ -15,7 +15,7 @@
 # metadata.
 
 if [[ -n "${_RUN_JOBS_COMMON_LOADED:-}" ]]; then
-  return 0 2>/dev/null || exit 0
+  return 0
 fi
 _RUN_JOBS_COMMON_LOADED=1
 

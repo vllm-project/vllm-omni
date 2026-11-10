@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Entrypoint contract tests for ``AsyncOmni.submit_interaction_async``."""
 
 from __future__ import annotations
@@ -44,11 +44,64 @@ def _make_async_omni(*, num_stages: int = 1, stage_type: str = "diffusion") -> A
     return omni
 
 
+@pytest.mark.asyncio
+async def test_playback_feedback_maps_session_id_and_ignores_finished_session(mocker) -> None:
+    omni = _make_async_omni()
+    omni.request_states.pop("external-abc-uuid-2")
+    rpc = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock())
+    await omni.update_streaming_playback("external-abc", 0.5)
+    rpc.assert_awaited_once_with("update_streaming_playback", stage_ids=[0], args=("external-abc-uuid-1", 0.5))
+    await omni.update_streaming_playback("finished", 9.0)
+    assert rpc.await_count == 1
+
+
 def _prompt_interaction(prompt: str = "new prompt", transition_chunks: int | None = None) -> OmniInteractionPrompt:
     interaction: OmniInteractionPrompt = {"event_id": "ui-update-1", "event": {"prompt": prompt}}
     if transition_chunks is not None:
         interaction["transition_chunks"] = transition_chunks
     return interaction
+
+
+@pytest.mark.asyncio
+async def test_paced_interaction_uses_engine_stamp_and_releases_failed_reservation(mocker):
+    omni = _make_async_omni()
+    omni.request_states.pop("external-abc-uuid-2")
+    rpc = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock(return_value=[12.0]))
+    interaction = {**_prompt_interaction(), "received_at": 0.0}
+    assert await omni.submit_interaction_async("external-abc", interaction=interaction, track_playback=True) == 12.0
+    payload = omni.engine.submit_interaction_async.call_args.kwargs["interaction"]
+    assert payload["received_at"] == 12.0
+    assert interaction["received_at"] == 0.0
+    omni.engine.submit_interaction_async.side_effect = ValueError("failed")
+    with pytest.raises(ValueError, match="failed"):
+        await omni.submit_interaction_async("external-abc", interaction=interaction, track_playback=True)
+    assert rpc.call_args.args == ("track_streaming_interaction",)
+    assert rpc.call_args.kwargs["args"] == ("external-abc-uuid-1", "ui-update-1", False)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_ingress_reservation_releases_it(mocker):
+    import asyncio
+
+    omni = _make_async_omni()
+    omni.request_states.pop("external-abc-uuid-2")
+    entered = asyncio.Event()
+
+    async def rpc(method, *, stage_ids, args):
+        if len(args) == 2:
+            entered.set()
+            await asyncio.Event().wait()
+
+    reserve = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock(side_effect=rpc))
+    task = asyncio.create_task(
+        omni.submit_interaction_async("external-abc", interaction=_prompt_interaction(), track_playback=True)
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert reserve.call_args.kwargs["args"] == ("external-abc-uuid-1", "ui-update-1", False)
+    omni.engine.submit_interaction_async.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -77,6 +130,18 @@ async def test_submit_interaction_async_passes_missing_transition_chunks() -> No
         "external-abc-uuid-1",
         interaction=_prompt_interaction(),
     )
+
+
+@pytest.mark.asyncio
+async def test_submit_interaction_async_ignores_direct_received_at() -> None:
+    omni = _make_async_omni()
+    omni.request_states.pop("external-abc-uuid-2")
+    interaction = {**_prompt_interaction(), "received_at": 0.0}
+
+    await omni.submit_interaction_async("external-abc", interaction=interaction)
+
+    forwarded = omni.engine.submit_interaction_async.call_args.kwargs["interaction"]
+    assert "received_at" not in forwarded
 
 
 @pytest.mark.asyncio
