@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -931,7 +932,7 @@ class WanTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        # Optional Cell / Noisy KV layer split by (rank, world) without mocking
+        # Optional Cell / Noisy PP layer split by (rank, world) without mocking
         # Omni's S·G process group. When unset, use the live pipeline-parallel group.
         if layer_pp_world is not None:
             if layer_pp_world < 1:
@@ -978,6 +979,12 @@ class WanTransformer3DModel(nn.Module):
         # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
         self.preserve_vsa_all_blocks = False
 
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
+
         # 3. Transformer blocks — partitioned across PP stages.
         def _make_block(prefix: str) -> WanTransformerBlock:
             return WanTransformerBlock(
@@ -992,7 +999,7 @@ class WanTransformer3DModel(nn.Module):
             )
 
         if pp_world is not None:
-            # Explicit (rank, world) slice — used by Cell / Noisy KV layer groups.
+            # Explicit (rank, world) slice — used by Cell / Noisy PP layer groups.
             start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_world)
             blocks: list[nn.Module] = []
             for idx in range(num_layers):

@@ -62,6 +62,7 @@ def install_decode_allocate_fast_path(kv_cache_manager: KVCacheManager) -> bool:
         full_sequence_must_fit=False,
         reserved_blocks=0,
         has_scheduled_reqs=True,
+        skip_zeroing_group_ids: tuple[int, ...] = (),
     ):
         if (
             num_new_tokens > 0
@@ -87,6 +88,7 @@ def install_decode_allocate_fast_path(kv_cache_manager: KVCacheManager) -> bool:
             full_sequence_must_fit=full_sequence_must_fit,
             reserved_blocks=reserved_blocks,
             has_scheduled_reqs=has_scheduled_reqs,
+            skip_zeroing_group_ids=skip_zeroing_group_ids,
         )
 
     kv_cache_manager.allocate_slots = allocate_slots

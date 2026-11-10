@@ -3,9 +3,9 @@
 
 import json
 import os
-import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,6 @@ from tests.helpers.hardware import get_runtime_resource_label as get_runtime_res
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
-from vllm_omni.platforms import current_omni_platform
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -294,17 +293,6 @@ def _create_unique_server_params(
     return unique_params
 
 
-def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Resolve stage config for XPU vs CUDA/ROCm."""
-    out: list[dict[str, Any]] = []
-    for config in configs:
-        config_copy = json.loads(json.dumps(config))
-        if current_omni_platform.is_xpu():
-            config_copy["server_params"]["stage_config_name"] = "xpu/qwen3_omni_ci.yaml"
-        out.append(config_copy)
-    return out
-
-
 def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[str] | None]:
     mapping: dict[str, list[str] | None] = {}
     for cfg in configs:
@@ -318,9 +306,8 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
 def create_reliability_omni_server_params(
     configs: list[dict[str, Any]], stage_configs_dir: Path
 ) -> list[OmniServerParams]:
-    adjusted_configs = configs_with_platform_stage_configs(configs)
-    unique_params = _create_unique_server_params(adjusted_configs, stage_configs_dir)
-    server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
+    unique_params = _create_unique_server_params(configs, stage_configs_dir)
+    server_args_by_name = extract_server_args_by_test_name(configs)
     return [
         OmniServerParams(
             model=model,
@@ -338,20 +325,16 @@ def supports_video_generation(model_name: str) -> bool:
 
 
 def parse_stage_devices(stage_config_path: str) -> str:
-    text = Path(stage_config_path).read_text(encoding="utf-8")
-    raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
-    devices: set[int] = set()
-    for item in raw_devices:
-        for token in item.split(","):
-            token = token.strip()
-            if token:
-                devices.add(int(token))
-    if not devices:
-        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
-    return ",".join(str(x) for x in sorted(devices))
+    """Devices for the runtime platform, ignoring other ``platforms:`` blocks."""
+    from tests.dfx.reliability.helpers import stage_config_device_spec
+    from vllm_omni.platforms import current_omni_platform
+
+    device_name = current_omni_platform.device_name
+    platform = device_name.lower() if isinstance(device_name, str) and device_name.strip() else None
+    return stage_config_device_spec(stage_config_path, platform)
 
 
-def resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | None) -> str:
+def resolve_oom_device_spec(config: Mapping[str, Any], stage_config_path: str | None) -> str:
     explicit = config.get("device")
     if explicit is not None:
         return str(explicit)
@@ -576,6 +559,7 @@ def run_benchmark(
     resource_label: str | None = None,
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
+    accuracy_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -590,7 +574,8 @@ def run_benchmark(
     under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
     1280x720).
     """
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started_at = datetime.now()
+    current_dt = started_at.strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
     hw = resource_label_for_filename(resource_label)
@@ -613,6 +598,10 @@ def run_benchmark(
         ]
     )
     result_filename = "_".join(name_parts) + ".json"
+    result_dir = os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results")
+    result_path = os.path.join(result_dir, result_filename)
+    # A failed CLI invocation must never reuse an earlier run's result.
+    Path(result_path).unlink(missing_ok=True)
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -623,7 +612,7 @@ def run_benchmark(
             str(num_warmups),
             "--save-result",
             "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
+            result_dir,
             "--result-filename",
             result_filename,
         ]
@@ -648,7 +637,7 @@ def run_benchmark(
     stderr_thread.start()
     stdout_thread.join()
     stderr_thread.join()
-    process.wait()
+    returncode = process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")
@@ -682,11 +671,62 @@ def run_benchmark(
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
     result["Hardware"] = hardware_json_value(resource_label)
+    result["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+        from tests.e2e.accuracy.helpers import _acc_result_filename
+
+        def argument(name: str, default: str = "") -> str:
+            return args[args.index(name) + 1] if name in args else default
+
+        model_id = result.get("model_id") or argument("--model")
+        dataset = "omni_duplex_eval"
+        accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
+        accuracy_dir.mkdir(parents=True, exist_ok=True)
+        accuracy_path = accuracy_dir / _acc_result_filename(model_id, dataset, when=started_at)
+        # Persist before quality assertions, including partial or failed judging.
+        duplex = result.get("omni_duplex_eval")
+        accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
+        if not isinstance(accuracy, dict):
+            accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+        accuracy_path.write_text(
+            json.dumps(
+                {
+                    "test_name": test_name,
+                    "name": benchmark_params_name,
+                    "model_id": model_id,
+                    "dataset": dataset,
+                    "dataset_path": argument("--dataset-path", dataset_name),
+                    "date": result.get("date") or current_dt,
+                    "Hardware": result["Hardware"],
+                    "baseline": accuracy_baseline or {},
+                    "branch": result["branch"],
+                    "num_prompts": num_prompt,
+                    "max_concurrency": int(argument("--max-concurrency")) if "--max-concurrency" in args else None,
+                    "benchmark_exit_code": returncode,
+                    "generation": {
+                        "completed": result.get("completed", 0),
+                        "failed": result.get("failed", 0),
+                        **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
+                    },
+                    "accuracy": accuracy,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Accuracy result saved to {accuracy_path}")
+        from vllm_omni.platforms import current_omni_platform
+
+        # Preserve the accuracy job's torch_npu shutdown exception while
+        # requiring complete artifacts and scores in the caller's assertions.
+        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
     return result
 
 

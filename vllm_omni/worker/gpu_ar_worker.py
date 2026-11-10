@@ -20,6 +20,8 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker.moe_prefill_warmup import warm_up_moe_prefill_kernels
+from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 
 logger = init_logger(__name__)
 
@@ -138,7 +140,15 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
-    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
+    def compile_or_warm_up_model(self):
+        # Runs before the upstream warmup so the prefill fused-MoE configs and
+        # the seeded-sampling Triton kernel are compiled before vLLM activates
+        # its JIT monitor (#9069).
+        warm_up_moe_prefill_kernels(self)
+        register_top_k_top_p_warmup(self)
+        return super().compile_or_warm_up_model()
+
+    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         """
         Explicitly handle sleep commands.
         Calls the implementation in the base class OmniGPUWorkerBase.
@@ -148,7 +158,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             task = OmniSleepTask(**task)
         return super().handle_sleep_task(task)
 
-    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK | None:
         """
         Explicitly handle wake-up commands.
         Calls the implementation in the base class OmniGPUWorkerBase.

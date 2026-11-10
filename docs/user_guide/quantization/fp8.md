@@ -21,7 +21,7 @@ in deep DiT blocks.
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
-| AMD ROCm | ⭕ |
+| AMD ROCm | ✅ ([configurable online blocks](rocm_online_fp8.md) are available for quality-sensitive models) |
 | Intel XPU | ⭕ |
 | Ascend NPU | ❌ |
 
@@ -97,9 +97,9 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable. On H200 (1024×1024, teapot prompt) DiT FP8-all is ~30.4 GB / 6.06 s vs BF16 ~36.9 GB / 7.34 s (~33 dB vs BF16). Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
-| LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
+| LTX-2 | `Lightricks/LTX-2` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
-| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
+| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | Use the checked-in quality-test exclusions; ROCm additionally uses `online_block_size=64` | See the quality configuration | ✅︎ |
 | FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | ✅︎ |
 | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | Yes | Not validated | All layers | None | ✅︎ |
 | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None | |
@@ -119,12 +119,13 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+### Multi-Stage Diffusion Model (BAGEL, GLM-Image, MammothModa2)
 
-| Model     | Scope                                    | Status        | Notes                                           |
-| --------- | ---------------------------------------- | ------------- | ----------------------------------------------- |
-| BAGEL     | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline          |
+| Model        | Scope                                    | Status               | Notes                                                                           |
+| ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
+| GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Use `quantization: fp8` on stage 1; run the AR stage in BF16                    |
 
 ## Configuration
 
@@ -209,6 +210,10 @@ on every rank. Runtime DLO host residency is sharded normally. Use
 `--dlo-no-use-allgather` when the synchronized AllGather request-wave contract
 does not fit the workload.
 
+This DLO path supports per-tensor online FP8 only. Configurable
+`online_block_size` layouts fail closed for DLO AllGather and HSDP until their
+weight and scale sharding contracts are qualified.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
@@ -217,6 +222,7 @@ does not fit the workload.
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16 |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling, or `"static"` when scales are available |
 | `weight_block_size` | list[int] \| None | `None` | Block size for block-wise weight quantization |
+| `online_block_size` | int \| None | `None` | ROCm-only online weight/activation group size (`32`, `64`, or `128`); see [Online FP8 Block Scaling](rocm_online_fp8.md) |
 
 The available `ignored_layers` names depend on the model architecture, for
 example `to_qkv`, `to_out`, `img_mlp`, or `txt_mlp`.

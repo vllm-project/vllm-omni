@@ -4,12 +4,15 @@
 import importlib
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -479,6 +482,61 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
+    """Each expert's refreshed Cache-DiT budget must equal the steps diffuse() routes to it.
+
+    Consecutive requests on one server with no pinned boundary omit
+    num_inference_steps and change the boundary, sample solver and flow shift;
+    the budgets must follow each request's own schedule, not the previous one.
+    """
+    pipeline = _make_pipeline()
+    pipeline.transformer_2 = _StubTransformer()
+    for expert in (pipeline.transformer, pipeline.transformer_2):
+        expert.blocks = nn.ModuleList()
+    pipeline.boundary_ratio = None
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+
+    refreshed: dict[str, list[int]] = {"transformer": [], "transformer_2": []}
+
+    def _fake_build_refresh(cache_config, get_pipeline_transformer=None):
+        name = "transformer" if get_pipeline_transformer is None else "transformer_2"
+        return lambda pipeline, num_inference_steps, verbose=True: refreshed[name].append(num_inference_steps)
+
+    monkeypatch.setattr(cd_model_specific, "_build_cache_context_refresh", _fake_build_refresh)
+    monkeypatch.setattr(cd_model_specific, "cache_dit", Mock())
+    monkeypatch.setattr(cd_model_specific, "BlockAdapter", Mock())
+    cd_model_specific.enable_cache_for_wan22(pipeline, DiffusionCacheConfig())
+
+    routed: list[str] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        current_model = kwargs["positive_kwargs"]["current_model"]
+        routed.append("transformer_2" if current_model is pipeline.transformer_2 else "transformer")
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, latents, do_true_cfg: latents  # type: ignore[method-assign]
+
+    for overrides in (
+        {},
+        {"boundary_ratio": 0.9},
+        {"extra_args": {"sample_solver": "euler", "flow_shift": 12.0}},
+        {"boundary_ratio": 0.5, "extra_args": {"sample_solver": "unipc", "flow_shift": 3.0}},
+    ):
+        routed.clear()
+        for counts in refreshed.values():
+            counts.clear()
+        sampling = _make_sampling(num_inference_steps=None, **overrides)
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+        assert len(routed) == pipeline.default_num_inference_steps
+        for name in ("transformer", "transformer_2"):
+            expected = routed.count(name)
+            assert refreshed[name] == ([expected] if expected else []), (overrides, name)
 
 
 @pytest.mark.parametrize("fail_first_request", [False, True])

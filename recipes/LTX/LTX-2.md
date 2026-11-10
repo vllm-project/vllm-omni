@@ -8,8 +8,6 @@
 | --- | --- | --- |
 | `LTX2Pipeline` | LTX-2 one-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
-| `LTX2DistilledOneStagePipeline` | LTX-2 merged-distilled one-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
-| `LTX2DistilledTwoStagePipeline` | LTX-2 merged-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
 | `LTX2TextToAudioPipeline` | LTX-2 T2A | `Lightricks/LTX-2` |
 | `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
 | `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
@@ -165,8 +163,6 @@ vllm serve diffusers/LTX-2.3-Diffusers --omni --stage-init-timeout 600
 Start a two-stage checkpoint with its explicit class:
 
 ```bash
-vllm serve rootonchair/LTX-2-19b-distilled --omni \
-  --model-class-name LTX2DistilledTwoStagePipeline --stage-init-timeout 600
 # LTX-2.3 full-distilled; the v1.1 x2 upsampler is resolved when absent
 vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
   --model-class-name LTX2DistilledTwoStagePipeline --stage-init-timeout 600
@@ -262,8 +258,6 @@ because their preset defaults to 1536x1024:
 
 Each command writes its `--output` MP4. Confirm it decodes and that the sampled
 frames match the prompt.
-
-
 
 ## Guidance
 

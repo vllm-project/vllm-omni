@@ -29,11 +29,47 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --output output.mp4
 ```
 
+## Client Frame Diagnostics
+
+The generic streaming client counts decoded frames on a background worker so
+accounting does not hold up reception or scheduled controls. Its chunk log
+fields have distinct meanings:
+
+- `frames` is the server-declared `num_frames`, or `unknown` when absent.
+- `total_frames` is an asynchronous snapshot of frames actually decoded so far.
+  It may lag reception; differences between snapshots are not per-chunk frame
+  counts or instantaneous generation FPS.
+
+The final `[decode]` line follows end-of-input draining and includes decodable
+trailer frames. For interrupted streams it counts only decodable received media.
+Its elapsed time includes reception and draining, rather than model inference
+alone. Accounting failure, a 64 MiB pending-input overflow, cancellation during
+the drain, or a five-second worker shutdown timeout reports
+`total_frames=unknown` with a status reason. These accounting limits do not bound
+the whole-session bytes retained for saving or change the final save path.
+
+See the [streaming video example README](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/streaming_video_generation/README.md#run-the-client)
+for commands, buffering, and cancellation details.
+
 ## Protocol
 
 Control events are JSON text frames. Each `video.chunk_metadata` event is
 immediately followed by one binary WebSocket frame containing fragmented MP4
-bytes.
+bytes. If an encoding call emits no bytes yet, the server still sends its
+metadata followed by an empty binary frame (`byte_length: 0`). This preserves
+source counts and interaction events. Empty binary frames add no media to the
+stream and do not indicate completion; wait for `session.done`.
+
+An append-only decoder can produce a generation chunk with no stable frames
+yet. Its metadata is still sent with `num_frames=0` and `byte_length=0`, followed
+by an empty binary frame. This preserves chunk positions and interaction
+acknowledgements while the decoder holds future-dependent pixels.
+
+Models may also provide `frame_start` (the cumulative visible output position),
+`generated_raw_frames` (decoder positions before segment padding is omitted),
+`generated_frames` (available visible frames), and `withheld_frames` (available
+frames waiting for future context). Normal completion flushes withheld frames;
+cancellation discards them.
 
 | Direction | Event or frame | Purpose |
 | ----------- | ---------------- | --------- |
@@ -67,6 +103,48 @@ Start a minimal session with:
 Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
+
+### Audio and chunk boundaries
+
+A generation result containing audio must contain exactly one video; multiple
+videos with one audio payload are rejected before encoding any of that result.
+Video-only results may contain multiple videos. Their generation chunk index,
+interaction event IDs, pacing fields and output chunk index are reported only
+with the first video. Each video retains its own submitted frame count and
+emitted byte length.
+
+If the first video chunk includes audio, the server creates an AAC track. Every
+later video chunk must then include nonempty audio. An explicit sample rate must
+be a positive integer and must match the track's initial rate; invalid chunks
+are rejected before advancing either media timeline. Omitting a later sample
+rate keeps the track's rate. If no initial rate is provided, the server uses
+24,000 Hz. Audio cannot be added after a video-only MP4 header has been emitted.
+
+The binary frames form one continuous fMP4 stream, rather than independently
+decodable files. In `video.chunk_metadata`, `byte_length` describes the following
+binary frame. `num_frames`, `num_audio_samples`, `generation_chunk_index` and
+interaction event IDs describe the source media submitted during that encoding
+call; they do not count the media packets already present in those bytes.
+`audio_sample_rate` reports the rate used for the audio track.
+
+The audio/video muxer uses a 100 ms fragment-duration threshold and retains an
+incomplete final fragment. AAC also buffers incomplete 1024-sample frames and
+encoder delay. A chunk's tail can therefore arrive with the next chunk or the
+final trailer. This is buffering across chunk boundaries, not an additional
+100 ms of timestamp drift accumulated on every chunk. A trailer reports zero
+submitted frames but can contain buffered media. Clients must append bytes in
+receive order and use the MP4 timestamps for playback and playback feedback,
+rather than treating the source counts or event IDs as exact playback markers.
+When progressive-MP4 finalization fails, saving retains the received fMP4 bytes.
+
+AAC encoder priming is represented by the MP4 edit list, rather than by dropping
+generated samples. The initialization header is delayed until FFmpeg has the
+initial timestamps. Encoded AAC packets can start at negative timestamps;
+presented audio and video start at zero after the player's priming adjustment.
+Clients must honor the edit list (`elst`) in the fMP4 initialization segment,
+including when using Media Source Extensions (MSE). Ignoring it can delay audio
+by one AAC frame (1024 samples, or 32 ms at 32 kHz). Playback checks here use
+PyAV/FFmpeg; browser MSE playback has not been validated.
 
 ## Playback Backpressure
 
@@ -163,6 +241,12 @@ native camera frame). WASD key tokens are not admitted by the engine:
 `mode` is `target` (lerp to an absolute pose over `transition_chunks`) or
 `velocity` (hold a per-frame SE3 delta until replaced). Prompt and camera may
 be combined in one interaction event.
+
+The example client's `--prompt-updates` and `--camera-updates` schedules assign
+a distinct `event_id` to each entry within the session, including entries with
+equal timestamps or timestamps less than a millisecond apart. These IDs are
+opaque identifiers; `at` still determines the scheduled send time. The server
+continues to reject repeated IDs with `event_id_conflict`.
 
 This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.

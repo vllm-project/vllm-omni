@@ -27,6 +27,7 @@ from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 from . import triton_data_movement as dm
 from . import triton_rms_norm_cl as cl
+from ._utils import on_kernel_device
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Grid axis 1 (tiles per plane) is limited by CUDA; larger planes decline.
@@ -72,13 +73,13 @@ if HAS_TRITON:
             d = tl.load(DENOM + (b * T + t) * S + s, mask=mask, other=1)
             g = tl.load(GAMMA + c).to(tl.float32)
             # Same operations and materialization boundaries as rms_norm_scale.
-            v = tl.math.div_rn(x, d).to(dtype).to(tl.float32)
+            v = rn.div_rn(x, d).to(dtype).to(tl.float32)
             v = (v * scale).to(dtype).to(tl.float32)
             v = (v * g).to(dtype).to(tl.float32)
             v = (v + 0.0).to(dtype)
             if SILU:
                 v32 = v.to(tl.float32)
-                v = tl.math.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
+                v = rn.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
             value = v
         elif TC > 0:
             cached_frame = frame - (PAD - TC)
@@ -158,7 +159,7 @@ def norm_act_cat_time(
     """
     if (
         not HAS_TRITON
-        or not x.is_cuda
+        or not on_kernel_device(x)
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or x.ndim != 5

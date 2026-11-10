@@ -59,6 +59,23 @@ python openai_speech_client.py \
     --max-new-tokens 200
 ```
 
+To use speaker-only cloning with an uploaded voice that already has a saved transcript, set `x_vector_only_mode` to `true`:
+
+```bash
+curl http://localhost:8091/v1/audio/speech \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "model": "inclusionAI/Ming-omni-tts-16.8B-A3B",
+        "input":"你好，这是音色克隆测试。",
+        "voice":"my_voice",
+        "x_vector_only_mode":true,
+        "response_format":"wav"
+    }' \
+    --output ming_speaker_only.wav
+```
+
+The reference audio still provides the speaker embedding, but its transcript and audio latents are omitted from the prompt. This is an opt-in workaround for the silent output reported in [#5419](https://github.com/vllm-project/vllm-omni/issues/5419).
+
 Podcast-style multi-speaker prompt:
 
 ```bash
@@ -94,13 +111,14 @@ REF_AUDIO=/path/to/reference.wav REF_TEXT="在此奉劝大家别乱打美白针�
 ## Request Fields
 
 | Field | Ming meaning |
-|-------|--------------|
+| ------- | -------------- |
 | `input` | target text |
 | `instructions` | plain style text, or JSON object for structured Ming controls |
 | `voice` | Ming IP voice label unless it resolves to an uploaded speaker |
 | `language` | Ming `方言` control |
 | `ref_audio` | speaker reference; with `ref_text`, also supplies the prompt waveform |
 | `ref_text` | transcript enabling zero-shot or podcast prompt-latent conditioning |
+| `x_vector_only_mode` | `true` uses only the speaker embedding, overriding explicit or saved `ref_text` |
 | `speaker_embedding` | 192-d Ming speaker embedding |
 | `max_new_tokens` | Ming `max_decode_steps` |
 

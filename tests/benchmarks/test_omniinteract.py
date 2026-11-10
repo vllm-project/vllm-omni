@@ -200,7 +200,6 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
         # Without server request metrics, TTFT already starts at response.created.
         "client_ttft_ms": {"count": 2, "mean": 100.0, "p50": 100.0, "p99": 100.0},
-        "client_ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "stages": {
             "0": {
                 "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
