@@ -585,26 +585,53 @@ def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
         serve_module._build_multi_api_stage_runtime(args, 2)
 
 
-def _pd_pair_stage_configs() -> tuple[Any, Any]:
-    """Resolved stage configs whose pd_role marks a prefill/decode pair."""
+def _pd_stage_configs(prefill_role: str | None, decode_role: str | None) -> tuple[Any, Any]:
+    """Resolved stage configs for stages 0 and 1 with the given pd_role on each (None = no role)."""
     from vllm_omni.config.omni_config import VllmOmniARStageConfig
     from vllm_omni.config.stage_config import PDRole, StagePipelineConfig
 
     return (
         VllmOmniARStageConfig(
-            stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="thinker", pd_role=PDRole.PREFILL)
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0, model_stage="thinker", pd_role=PDRole(prefill_role) if prefill_role else None
+            )
         ),
         VllmOmniARStageConfig(
             stage_pipeline_config=StagePipelineConfig(
-                stage_id=1, model_stage="thinker", pd_role=PDRole.DECODE, input_sources=(0,)
+                stage_id=1,
+                model_stage="thinker",
+                pd_role=PDRole(decode_role) if decode_role else None,
+                input_sources=(0,),
             )
         ),
     )
 
 
-def test_run_multi_api_server_omni_refuses_a_pd_pair_before_launching_engines(mocker: MockerFixture) -> None:
+# (prefill_role, decode_role, startup error): a complete pair and each lone half.
+_REFUSED_PD_ROLES = [
+    pytest.param("prefill", "decode", r"prefill stage 0, decode stage 1.*KV handoff", id="pair"),
+    pytest.param(
+        "prefill",
+        None,
+        r"Stage\(s\) \[0\] declare the prefill role, but no stage declares the decode role.*KV handoff",
+        id="lone-prefill",
+    ),
+    pytest.param(
+        None,
+        "decode",
+        r"Stage\(s\) \[1\] declare the decode role, but no stage declares the prefill role.*KV handoff",
+        id="lone-decode",
+    ),
+]
+
+
+@pytest.mark.parametrize(("prefill_role", "decode_role", "expected"), _REFUSED_PD_ROLES)
+def test_run_multi_api_server_omni_refuses_a_pd_pair_before_launching_engines(
+    mocker: MockerFixture, prefill_role: str | None, decode_role: str | None, expected: str
+) -> None:
     """With --api-server-count >= 2 the parent launches the stage engines before
-    any API worker builds an OmniEngineBase, so the PD guard must run here."""
+    any API worker builds an OmniEngineBase, so the PD guard must run here.
+    A lone prefill or decode role is refused like a complete pair."""
     from vllm_omni.entrypoints.cli import serve as serve_module
 
     args = TrackingNamespace(
@@ -628,7 +655,9 @@ def test_run_multi_api_server_omni_refuses_a_pd_pair_before_launching_engines(mo
     mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
     mocker.patch(
         "vllm_omni.config.resolver.resolve_omni_config",
-        return_value=OmniConfigResolution(config_path="dummy-config", stage_configs=_pd_pair_stage_configs()),
+        return_value=OmniConfigResolution(
+            config_path="dummy-config", stage_configs=_pd_stage_configs(prefill_role, decode_role)
+        ),
     )
     stage_runtime_cls = mocker.patch("vllm_omni.engine.stage_runtime.StageRuntime")
     mocker.patch("signal.signal")
@@ -636,7 +665,7 @@ def test_run_multi_api_server_omni_refuses_a_pd_pair_before_launching_engines(mo
     mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
     start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager")
 
-    with pytest.raises(NotImplementedError, match=r"prefill stage 0, decode stage 1.*KV handoff"):
+    with pytest.raises(NotImplementedError, match=expected):
         serve_module.run_multi_api_server_omni(args)
 
     stage_runtime_cls.assert_not_called()
@@ -1056,20 +1085,25 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
         run_headless(args)
 
 
+@pytest.mark.parametrize(("prefill_role", "decode_role", "expected"), _REFUSED_PD_ROLES)
 @pytest.mark.parametrize("stage_id", [0, 1])
-def test_run_headless_refuses_a_pd_pair_before_launching_the_stage(mocker: MockerFixture, stage_id: int) -> None:
+def test_run_headless_refuses_a_pd_pair_before_launching_the_stage(
+    mocker: MockerFixture, stage_id: int, prefill_role: str | None, decode_role: str | None, expected: str
+) -> None:
     """A headless prefill or decode stage never builds an OmniEngineBase, so the
-    PD guard must stop it before the stage's engine is prepared or launched."""
+    PD guard must stop it before the stage's engine is prepared or launched.
+    A lone prefill or decode role is refused like a complete pair, whichever
+    stage this process would run."""
     mocker.patch(
         "vllm_omni.config.resolver.resolve_omni_config",
-        return_value=_resolved(*_pd_pair_stage_configs()),
+        return_value=_resolved(*_pd_stage_configs(prefill_role, decode_role)),
     )
     prepare_env = mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     launch_llm = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_llm_replicas")
     launch_diffusion = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_diffusion_replicas")
     mocker.patch("signal.signal")
 
-    with pytest.raises(NotImplementedError, match=r"prefill stage 0, decode stage 1.*KV handoff"):
+    with pytest.raises(NotImplementedError, match=expected):
         run_headless(_make_headless_args(stage_id=stage_id))
 
     prepare_env.assert_not_called()

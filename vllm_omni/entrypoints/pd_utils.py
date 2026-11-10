@@ -11,6 +11,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
 
+from vllm_omni.config.stage_config import PDRole
+
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
@@ -36,8 +38,38 @@ def mooncake_prefill_bootstrap_addr(kv_cfg: Mapping[str, Any], replica_id: int =
     return f"http://{host}:{port}"
 
 
+def _stage_label(stage: Any, index: int) -> int:
+    """Declared ``stage_id`` of a stage config, or its position when it has none."""
+    return getattr(stage, "stage_id", index)
+
+
+def _stage_pd_roles(stage: Any, index: int) -> tuple[bool, bool]:
+    """``(is_prefill, is_decode)`` for one stage config.
+
+    ``pd_role`` wins when it is set; the legacy ``is_prefill_only`` /
+    ``is_decode_only`` markers are read only for hand-built stage configs
+    that do not carry it.
+
+    Raises:
+        ValueError: if ``pd_role`` is set to something that is not a ``PDRole``
+            value. A misspelled role must not make the stage look like an
+            ordinary one.
+    """
+    pd_role = getattr(stage, "pd_role", None)
+    if pd_role is None:
+        return bool(getattr(stage, "is_prefill_only", False)), bool(getattr(stage, "is_decode_only", False))
+    try:
+        role = PDRole(pd_role)
+    except ValueError:
+        allowed = ", ".join(repr(r.value) for r in PDRole)
+        raise ValueError(
+            f"Stage {_stage_label(stage, index)} has unknown pd_role {pd_role!r}; allowed values are {allowed}"
+        ) from None
+    return role is PDRole.PREFILL, role is PDRole.DECODE
+
+
 def reject_pd_until_runtime_ready(stage_configs: Sequence[Any]) -> None:
-    """Refuse to launch a detected PD pair: its prefill->decode handoff is not implemented.
+    """Refuse to launch a pipeline that declares a PD role: the prefill->decode handoff is not implemented.
 
     The orchestrator needs ``remote_request_id`` from the prefill output, which
     the pinned MooncakeConnector never returns, so every request would fail at
@@ -47,17 +79,56 @@ def reject_pd_until_runtime_ready(stage_configs: Sequence[Any]) -> None:
     (``Omni``/``AsyncOmni`` and ``vllm serve`` with one API server), the
     ``--api-server-count`` > 1 parent in ``_build_multi_api_stage_runtime`` and
     ``run_headless``.
+
+    Any declared role is refused, not only a complete pair: a lone prefill or
+    decode stage, or a pair whose decode stage does not consume the prefill
+    stage, would otherwise launch as ordinary stages and look like a working
+    PD deployment. The message names stages by their declared ``stage_id``.
+
+    Raises:
+        ValueError: if a stage sets ``pd_role`` to an unknown value, or the
+            stages form more than one PD pair.
+        NotImplementedError: if any stage declares a PD role.
     """
     # TODO: remove once the PD runtime handoff lands (Mooncake transfer_id
     # contract, decode request rebuilt from the processed prefill request),
     # tracked in https://github.com/vllm-project/vllm-omni/pull/2947.
-    pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(list(stage_configs))
-    if pair is None:
+    stages = list(stage_configs)
+    prefill_ids: list[int] = []
+    decode_ids: list[int] = []
+    for i, stage in enumerate(stages):
+        is_prefill, is_decode = _stage_pd_roles(stage, i)
+        if is_prefill:
+            prefill_ids.append(_stage_label(stage, i))
+        if is_decode:
+            decode_ids.append(_stage_label(stage, i))
+    if not prefill_ids and not decode_ids:
         return
+
+    pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(stages)
+    if pair is not None:
+        found = (
+            "Stages declared with a PD role form a PD pair "
+            f"(prefill stage {_stage_label(stages[pair[0]], pair[0])}, "
+            f"decode stage {_stage_label(stages[pair[1]], pair[1])})"
+        )
+        consequence = "so requests would fail at the handoff"
+    else:
+        if not decode_ids:
+            found = f"Stage(s) {prefill_ids} declare the prefill role, but no stage declares the decode role"
+        elif not prefill_ids:
+            found = f"Stage(s) {decode_ids} declare the decode role, but no stage declares the prefill role"
+        else:
+            found = (
+                f"Stage(s) {prefill_ids} declare the prefill role and stage(s) {decode_ids} the decode role, "
+                "but no decode stage lists a prefill stage in its input sources"
+            )
+        consequence = "and these stages would launch as ordinary stages"
     raise NotImplementedError(
-        f"Stages declared with pd_role form a PD pair (prefill stage {pair[0]}, decode stage {pair[1]}), "
-        "but PD disaggregation cannot run yet: the prefill->decode KV handoff is not implemented, so "
-        "requests would fail at the handoff. Remove pd_role from these stages to launch the pipeline."
+        f"{found}. PD disaggregation cannot run yet: the prefill->decode KV handoff is not implemented, "
+        f"{consequence}. The current design is also single host only: the decode stage reaches the prefill "
+        "stage through a Mooncake bootstrap address on 127.0.0.1. Remove pd_role (or the legacy "
+        "is_prefill_only / is_decode_only markers) from these stages to launch the pipeline."
     )
 
 
@@ -99,25 +170,17 @@ class PDDisaggregationMixin:
             (prefill_idx, decode_idx) if one pair exists, None if not found.
 
         Raises:
-            ValueError: if multiple candidate PD pairs are found.
+            ValueError: if a stage has an unknown ``pd_role``, or multiple
+                candidate PD pairs are found.
         """
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
         for i, stage in enumerate(stage_configs):
-            pd_role = getattr(stage, "pd_role", None)
-            pd_role_value = getattr(pd_role, "value", pd_role)
-            is_prefill = pd_role_value == "prefill"
-            is_decode = pd_role_value == "decode"
-
-            # Keep the legacy boolean markers as a fallback for hand-built
-            # stage configs that do not carry ``pd_role``.
-            if pd_role_value is None:
-                is_prefill = bool(getattr(stage, "is_prefill_only", False))
-                is_decode = bool(getattr(stage, "is_decode_only", False))
+            is_prefill, is_decode = _stage_pd_roles(stage, i)
 
             if is_prefill:
                 prefill_by_id[i] = i
-                sid = getattr(stage, "stage_id", i)
+                sid = _stage_label(stage, i)
                 if sid != i:
                     prefill_by_id[sid] = i
             if is_decode:
@@ -132,8 +195,10 @@ class PDDisaggregationMixin:
                     break
 
         if len(pd_pairs) > 1:
+            named = [(_stage_label(stage_configs[p], p), _stage_label(stage_configs[d], d)) for p, d in pd_pairs]
             raise ValueError(
-                f"Multiple PD pairs detected ({pd_pairs}); only a single PD pair per pipeline is supported"
+                f"Multiple PD pairs detected (prefill stage, decode stage): {named}; "
+                "only a single PD pair per pipeline is supported"
             )
         return pd_pairs[0] if pd_pairs else None
 
