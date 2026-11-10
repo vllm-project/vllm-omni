@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
@@ -354,6 +354,17 @@ class OutputScaleShiftPrepare(nn.Module):
         return shift, scale
 
 
+def _reject_vsa_candidate_without_gate(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for a WanSelfAttention built without to_gate_compress."""
+    if record.backend_cls.get_name() != "FASTVIDEO_VSA":
+        return None
+    return (
+        "Wan builds the learned to_gate_compress projection only when the baseline backend is FASTVIDEO_VSA, "
+        "so this profile would run without it; set FASTVIDEO_VSA as the baseline backend or select another "
+        "backend for the profile"
+    )
+
+
 class WanSelfAttention(nn.Module):
     """
     Optimized self-attention module using vLLM layers.
@@ -440,6 +451,11 @@ class WanSelfAttention(nn.Module):
             nn.init.zeros_(self.to_gate_compress.weight)
             if self.to_gate_compress.bias is not None:
                 nn.init.zeros_(self.to_gate_compress.bias)
+        else:
+            # The gate exists only under a FASTVIDEO_VSA baseline. A FASTVIDEO_VSA schedule candidate
+            # would run without it, so startup validation rejects that candidate. A dense candidate
+            # under a VSA baseline ignores the gate in its metadata and needs no check.
+            self.attn.add_schedule_candidate_check(_reject_vsa_candidate_without_gate)
 
     def forward(
         self,

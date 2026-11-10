@@ -43,9 +43,9 @@ PERSONAPLEX_TEMPORAL_ARTIFACTS = "artifacts/personaplex-temporal-streaming/**/*"
 DIFFUSION_CPU_MARKERS = (
     "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
-DIFFUSION_CPU_ARTIFACTS = "artifacts/amd-diffusion-cpu-shards/*.xml"
+DIFFUSION_CPU_ARTIFACTS = "artifacts/amd-cpu-suites/**/*"
 DIFFUSION_SLOW_CPU_LABEL = "Simple · Diffusion Slow CPU Test"
-DIFFUSION_SLOW_CPU_ARTIFACTS = "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+DIFFUSION_SLOW_CPU_ARTIFACTS = "artifacts/amd-cpu-suites/**/*"
 DIFFUSION_SLOW_CPU_NODES = [
     "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
     "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]",
@@ -359,16 +359,16 @@ def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                split(command)[:6]
+                split(command)[:7]
                 == [
                     "python",
                     "-u",
                     ".buildkite/amd/scripts/run_cpu_suite.py",
+                    "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
                     "model-executor",
                     "-sv",
                     "tests/model_executor",
                 ]
-                and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
                 for command in commands
             ):
                 matches.append(step)
@@ -387,7 +387,8 @@ def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                "pytest -sv tests/diffusion" in command and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in command
+                "diffusion -sv tests/diffusion" in command
+                and "--timing-profile=.buildkite/amd/cpu-timings/diffusion-v1.json" in command
                 for command in commands
             ):
                 matches.append(step)
@@ -531,11 +532,12 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
     argv = split(pytest_command)
 
-    assert step["parallelism"] == 3
-    assert argv[:6] == [
+    assert step["parallelism"] == 5
+    assert argv[:7] == [
         "python",
         "-u",
         ".buildkite/amd/scripts/run_cpu_suite.py",
+        "--timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json",
         "model-executor",
         "-sv",
         "tests/model_executor",
@@ -546,8 +548,7 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         PERSONAPLEX_TEMPORAL_STRESS_NODES
     )
-    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
-    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
+    assert not any(arg.startswith(("--num-shards", "--shard-id")) for arg in argv)
     assert "-k" not in argv
 
 
@@ -1173,32 +1174,29 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
 )
 def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     step = _find_diffusion_cpu_shard_step(pipeline_path)
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    pytest_command = next(command for command in step["commands"] if "run_cpu_suite.py" in command)
     argv = split(pytest_command)
 
     assert step["label"].endswith("Shard %N/%t")
     assert step["parallelism"] == 5
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == [DIFFUSION_CPU_ARTIFACTS]
-    assert (
-        'export DIFFUSION_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-cpu-shards"'
-        in step["commands"]
-    )
-    assert 'mkdir -p "$$DIFFUSION_CPU_ARTIFACT_DIR"' in step["commands"]
-    assert argv[:3] == ["pytest", "-sv", "tests/diffusion"]
+    assert argv[:7] == [
+        "python",
+        "-u",
+        ".buildkite/amd/scripts/run_cpu_suite.py",
+        "--timing-profile=.buildkite/amd/cpu-timings/diffusion-v1.json",
+        "diffusion",
+        "-sv",
+        "tests/diffusion",
+    ]
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
     assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         DIFFUSION_SLOW_CPU_NODES
     )
-    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in pytest_command
-    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
-    assert "--durations=50" in argv
-    assert (
-        "--junitxml=$$DIFFUSION_CPU_ARTIFACT_DIR/"
-        "pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml" in argv
-    )
+    assert not any(arg.startswith(("--num-shards", "--shard-id", "--junitxml")) for arg in argv)
     assert "|| true" not in pytest_command
 
 
@@ -1209,10 +1207,9 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
 )
 def test_diffusion_slow_cpu_cases_have_one_blocking_owner(pipeline_path: Path) -> None:
     step = _find_step(DIFFUSION_SLOW_CPU_LABEL, pipeline_path)
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    pytest_command = next(command for command in step["commands"] if "run_cpu_suite.py" in command)
     argv = split(pytest_command)
-    option_at = next(index for index, arg in enumerate(argv) if arg.startswith("-") and arg != "-sv")
-    nodes = argv[2:option_at]
+    nodes = argv[argv.index("-sv") + 1 : argv.index("-m")]
 
     assert step["agent_pool"] == "mi300_1"
     assert step["depends_on"] == "amd-build"
@@ -1222,21 +1219,15 @@ def test_diffusion_slow_cpu_cases_have_one_blocking_owner(pipeline_path: Path) -
     assert step["artifact_paths"] == [DIFFUSION_SLOW_CPU_ARTIFACTS]
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
     assert "export VLLM_ROCM_USE_AITER=0" in step["commands"]
-    assert (
-        'export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"'
-        in step["commands"]
-    )
-    assert 'mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"' in step["commands"]
-    assert argv[:2] == ["pytest", "-sv"]
+    assert argv[:5] == ["python", "-u", ".buildkite/amd/scripts/run_cpu_suite.py", "diffusion", "-sv"]
     assert nodes == DIFFUSION_SLOW_CPU_NODES
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
-    assert "--durations=20" in argv
-    assert "--junitxml=$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml" in argv
+    assert not any(arg.startswith(("--timing-profile", "--junitxml")) for arg in argv)
     assert "--num-shards" not in pytest_command
     assert "|| true" not in pytest_command
 
     shard = _find_diffusion_cpu_shard_step(pipeline_path)
-    shard_argv = split(next(command for command in shard["commands"] if "pytest" in command))
+    shard_argv = split(next(command for command in shard["commands"] if "run_cpu_suite.py" in command))
     shard_nodes = [arg.removeprefix("--deselect=") for arg in shard_argv if arg.startswith("--deselect=")]
     assert shard_nodes == nodes
 
