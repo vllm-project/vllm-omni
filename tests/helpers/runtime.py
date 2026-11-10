@@ -1218,14 +1218,43 @@ def _deploy_config_value(server_args: list[str], index: int) -> str:
     return server_args[index + 1]
 
 
+def _resolve_server_deploy_args(
+    server_args: list[str] | None,
+    stage_config_path: str | None,
+    run_level: str,
+) -> tuple[list[str], str | None, bool]:
+    """Return launch args, the deploy path, and whether args already carry it.
+
+    A ``--deploy-config`` that exists only in ``server_args`` is rewritten when
+    the weekly runner override is set. Otherwise that argument, including its
+    ``load_format``, is left as the test wrote it.
+    """
+    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
+
+    args = list(server_args or [])
+    deploy_arg_index = None
+    deploy_path = stage_config_path
+    if deploy_path is None and _ci_model_runner_override() is not None:
+        deploy_arg_index = _deploy_config_arg_index(args)
+        if deploy_arg_index is not None:
+            deploy_path = _deploy_config_value(args, deploy_arg_index)
+    resolved = stage_config_path_for_run_level(deploy_path, run_level)
+    replaced = False
+    if deploy_arg_index is not None and resolved is not None:
+        if args[deploy_arg_index].startswith("--deploy-config="):
+            args[deploy_arg_index] = f"--deploy-config={resolved}"
+        else:
+            args[deploy_arg_index + 1] = resolved
+        replaced = True
+    return args, resolved, replaced
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
-
     model_prefix = get_model_prefix()
     with omni_fixture_lock, _whisper_device_free_around():
         params: OmniServerParams = request.param
@@ -1242,23 +1271,9 @@ def iter_omni_server(
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
-        server_args = list(params.server_args or [])
-        # Only the weekly runner override rewrites a deploy YAML that was passed
-        # solely as ``--deploy-config``. Regular CI leaves that argument untouched,
-        # including its load_format. With the env set and no deploy YAML at all,
-        # stage_config_path_for_run_level fails instead of staying on V1.
-        deploy_arg_index = None
-        deploy_path = params.stage_config_path
-        if deploy_path is None and _ci_model_runner_override() is not None:
-            deploy_arg_index = _deploy_config_arg_index(server_args)
-            if deploy_arg_index is not None:
-                deploy_path = _deploy_config_value(server_args, deploy_arg_index)
-        stage_config_path = stage_config_path_for_run_level(deploy_path, run_level)
-        if deploy_arg_index is not None and stage_config_path is not None:
-            if server_args[deploy_arg_index].startswith("--deploy-config="):
-                server_args[deploy_arg_index] = f"--deploy-config={stage_config_path}"
-            else:
-                server_args[deploy_arg_index + 1] = stage_config_path
+        server_args, stage_config_path, deploy_arg_replaced = _resolve_server_deploy_args(
+            params.server_args, params.stage_config_path, run_level
+        )
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni:
@@ -1293,7 +1308,7 @@ def iter_omni_server(
                 yield server
                 print("OmniServer stopping...")
         else:
-            if stage_config_path is not None and deploy_arg_index is None:
+            if stage_config_path is not None and not deploy_arg_replaced:
                 server_args += ["--deploy-config", stage_config_path]
 
             with (

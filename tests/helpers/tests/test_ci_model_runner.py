@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.helpers.runtime import _resolve_server_deploy_args
 from tests.helpers.stage_config import stage_config_path_for_run_level
 from vllm_omni.config.stage_config import (
     _apply_platform_overrides,
@@ -50,9 +51,7 @@ def test_ci_model_runner_env_rewrites_deploy_choice(tmp_path: Path, monkeypatch:
     assert resolve_stage_model_runner(deploy, deploy.stages[1]) == "v1"
 
 
-def test_ci_model_runner_env_overrides_inherited_cuda_platform(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ci_model_runner_env_overrides_inherited_cuda_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "base.yaml").write_text(
         "model_runner: v1\n"
         "stages:\n"
@@ -104,3 +103,35 @@ def test_ci_model_runner_env_requires_a_deploy_config(monkeypatch: pytest.Monkey
 
     with pytest.raises(ValueError, match="did not provide a deploy config"):
         stage_config_path_for_run_level(None, "full_model")
+
+
+@pytest.mark.parametrize("equals_form", [False, True])
+def test_server_args_deploy_config_is_rewritten_only_for_the_weekly_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, equals_form: bool
+) -> None:
+    source = tmp_path / "demo.yaml"
+    source.write_text(_DEPLOY, encoding="utf-8")
+    original = source.read_text(encoding="utf-8")
+    if equals_form:
+        server_args = [f"--deploy-config={source}", "--host", "127.0.0.1"]
+    else:
+        server_args = ["--deploy-config", str(source), "--host", "127.0.0.1"]
+
+    monkeypatch.delenv("VLLM_OMNI_CI_MODEL_RUNNER", raising=False)
+    untouched, launch_path, replaced = _resolve_server_deploy_args(server_args, None, "full_model")
+    assert untouched == server_args
+    assert launch_path is None
+    assert not replaced
+
+    monkeypatch.setenv("VLLM_OMNI_CI_MODEL_RUNNER", "v2")
+    rewritten_args, launch_path, replaced = _resolve_server_deploy_args(server_args, None, "full_model")
+    assert replaced
+    assert launch_path is not None
+    assert Path(launch_path) != source
+    if equals_form:
+        assert rewritten_args == [f"--deploy-config={launch_path}", "--host", "127.0.0.1"]
+    else:
+        assert rewritten_args == ["--deploy-config", launch_path, "--host", "127.0.0.1"]
+    loaded = yaml.safe_load(Path(launch_path).read_text(encoding="utf-8"))
+    assert loaded["model_runner"] == "v2"
+    assert source.read_text(encoding="utf-8") == original
