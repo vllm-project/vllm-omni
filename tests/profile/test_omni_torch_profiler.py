@@ -18,6 +18,11 @@ from vllm_omni.profiler.omni_torch_profiler import OmniTorchProfilerWrapper
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# Captured before any fixture runs: the real base-class __init__, which the
+# autouse patch_worker_profiler_init fixture replaces for the direct-call
+# tests. Tests that drive the public start()/step() lifecycle restore it.
+_REAL_WORKER_PROFILER_INIT = profiler_mod.WorkerProfiler.__init__
+
 
 @pytest.fixture(autouse=True)
 def patch_worker_profiler_init(monkeypatch):
@@ -43,6 +48,8 @@ class DummyProfilerConfig:
     wait_iterations: int = 0
     warmup_iterations: int = 0
     active_iterations: int = 5
+    delay_iterations: int = 0
+    max_iterations: int = 0
 
 
 class FakeEvent:
@@ -789,6 +796,10 @@ def test_profiler_step_stops_session_once_schedule_cycle_exhausted(fake_config, 
     fake_config.wait_iterations = 1
     fake_config.warmup_iterations = 2
     fake_config.active_iterations = 3
+    # Drive the exhaustion through the public step() with the real stop():
+    # restore the base-class __init__ the autouse fixture replaces, so the
+    # lifecycle lock and the session counters are the real ones.
+    monkeypatch.setattr(profiler_mod.WorkerProfiler, "__init__", _REAL_WORKER_PROFILER_INIT)
 
     wrapper = OmniTorchProfilerWrapper(
         profiler_config=fake_config,
@@ -796,16 +807,29 @@ def test_profiler_step_stops_session_once_schedule_cycle_exhausted(fake_config, 
         local_rank=0,
         activities=["CPU", "CUDA"],
     )
-    stops: list[int] = []
-    monkeypatch.setattr(wrapper, "stop", lambda: stops.append(1))
+    wrapper.set_trace_filename("case_schedule_exhaustion")
 
-    results = [wrapper._profiler_step() for _ in range(6)]
+    wrapper.start()
+    for _ in range(6):
+        wrapper.step()
+
     # wait+warmup-1 non-active steps then 3 active steps exhaust the
-    # repeat=1 cycle; the next call must stop the session instead of
-    # advancing the profiler past RECORD_AND_SAVE.
-    assert results == [False, False, True, True, True, False]
+    # repeat=1 cycle; the 6th worker step stopped the session through the
+    # public stop() instead of advancing the profiler past RECORD_AND_SAVE.
+    # Fails on a46ba0adb, which stepped a 6th time and never stopped.
     assert wrapper.profiler.step_calls == 5
-    assert stops == [1]
+    assert wrapper.profiler.stopped is True
+    assert wrapper.is_running is False
+    assert wrapper._profiling_for_iters == 0
+    # The stop() from inside the hook is observable through the base class:
+    # later worker steps are no-ops, and the reset counters let a later
+    # start() open a fresh session instead of being ignored.
+    wrapper.step()
+    assert wrapper.profiler.step_calls == 5
+    wrapper.start()
+    assert wrapper.is_running is True
+    assert wrapper.profiler.step_calls == 0
+    assert wrapper.profiler.started is True
 
 
 def test_start_rebuilds_profiler_and_resets_warmup_with_schedule(fake_config, fake_profiler_factory, monkeypatch):
