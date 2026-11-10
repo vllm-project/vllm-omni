@@ -59,7 +59,8 @@ class SeaCacheRootHook(ModelHook):
         current_step_callback: Callable[[], int | torch.Tensor | None] | None = None,
         current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
         num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
-        extractor_fn: Callable[..., CacheContext] | None = None,
+        extractor_fn: Callable[..., CacheContext | None] | None = None,
+        can_cache_callback: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -71,8 +72,11 @@ class SeaCacheRootHook(ModelHook):
         self.full_count = 0
         self.skip_count = 0
         self.extractor_fn = extractor_fn
+        self.can_cache_callback = can_cache_callback
         self._parameter_sharded = False
         self._collective_skip_groups: list[torch.distributed.ProcessGroup] = []
+        # Request-wide spatial metadata shared by all CFG contexts.
+        self._image_grid_shape: tuple[int, int] | None = None
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         if self.extractor_fn is None:
@@ -230,15 +234,33 @@ class SeaCacheRootHook(ModelHook):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        if self.state_manager._current_context is None:
+            branch = getattr(module, "cfg_branch", None)
+            if branch in ("positive", "negative"):
+                with self.cache_context("cond" if branch == "positive" else "uncond"):
+                    return self._forward(module, *args, **kwargs)
+        return self._forward(module, *args, **kwargs)
+
+    def _forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
+        if self.can_cache_callback is not None and not self.can_cache_callback():
+            self._warn_once(
+                "SeaCache is disabled for this parallel/offload configuration; running the original forward."
+            )
+            return getattr(self, "fn_ref").original_forward(*args, **kwargs)
         if self.extractor_fn is None:
             raise RuntimeError("SeaCache extractor was not initialized")
         ctx = self.extractor_fn(module, *args, **kwargs)
+        if ctx is None:
+            # Invalidate every CFG history across this native-forward fallback.
+            self.state_manager.reset()
+            self._warn_once("SeaCache does not support this input layout; running the original forward.")
+            return getattr(self, "fn_ref").original_forward(*args, **kwargs)
 
         if torch.is_grad_enabled():
             self._warn_once("SeaCache is inference-only; autograd-enabled calls run in full.")
             return self._run_uncached(ctx)
         if self.state_manager._current_context is None:
-            self._warn_once("SeaCache requires an explicit cache context; running full.")
+            self._warn_once("SeaCache requires an explicit cache context or CFG branch; running full.")
             return self._run_uncached(ctx)
         callbacks = (
             self.current_step_callback,
@@ -368,6 +390,7 @@ class SeaCacheRootHook(ModelHook):
 
     def reset_state(self, module: torch.nn.Module) -> torch.nn.Module:
         self.state_manager.reset()
+        self._image_grid_shape = None
         self.full_count = 0
         self.skip_count = 0
         return module
@@ -383,7 +406,8 @@ def apply_sea_cache_hook(
     current_step_callback: Callable[[], int | torch.Tensor | None] | None = None,
     current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
     num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
-    extractor_fn: Callable[..., CacheContext] | None = None,
+    extractor_fn: Callable[..., CacheContext | None] | None = None,
+    can_cache_callback: Callable[[], bool] | None = None,
 ) -> SeaCacheRootHook:
     registry = HookRegistry.get_or_create(module)
     hook = SeaCacheRootHook(
@@ -392,6 +416,7 @@ def apply_sea_cache_hook(
         current_sigma_callback=current_sigma_callback,
         num_inference_steps_callback=num_inference_steps_callback,
         extractor_fn=extractor_fn,
+        can_cache_callback=can_cache_callback,
     )
     registry.register_hook(SeaCacheRootHook._HOOK_NAME, hook)
     return hook

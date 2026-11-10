@@ -6,7 +6,8 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -90,6 +91,37 @@ class CFGParallelMixin(metaclass=ABCMeta):
     """
 
     transformer: torch.nn.Module
+
+    @property
+    def current_step_index(self) -> int | None:
+        return getattr(self, "_current_step_index", None)
+
+    @property
+    def current_sigma(self) -> float | torch.Tensor | None:
+        return getattr(self, "_current_sigma", None)
+
+    @contextmanager
+    def _cache_step_metadata(self, step_index: int, num_timesteps: int) -> Iterator[None]:
+        """Expose the scheduler's actual sigma while cache hooks run."""
+        if not callable(getattr(self, "_cache_context_factory", None)):
+            yield
+            return
+
+        self._current_step_index: int | None = step_index
+        self._num_timesteps = num_timesteps
+        try:
+            # Before the first scheduler step, begin_index includes any
+            # img2img strength offset. Later steps use the scheduler's cursor.
+            scheduler = getattr(self, "scheduler", None)
+            sigma_index = getattr(scheduler, "step_index", None)
+            if sigma_index is None:
+                sigma_index = (getattr(scheduler, "begin_index", None) or 0) + step_index
+            sigmas = getattr(scheduler, "sigmas", None)
+            self._current_sigma = sigmas[sigma_index] if sigmas is not None else None
+            yield
+        finally:
+            self._current_step_index = None
+            self._current_sigma = None
 
     def _set_transformer_do_true_cfg(self, do_true_cfg: bool) -> None:
         transformer = getattr(self, "transformer", None)
