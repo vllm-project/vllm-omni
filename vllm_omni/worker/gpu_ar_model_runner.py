@@ -1058,7 +1058,11 @@ class GPUARModelRunner(
         valid_sampled_token_ids: list[list[int]],
     ) -> list[int] | None:
         """Return verifier-committed token IDs for this speculative step."""
-        if self.speculative_config is None or not self.speculative_config.use_dflash():
+        if (
+            self.speculative_config is None
+            or not self.speculative_config.use_dflash()
+            or not self._runner_model_omni_flag("supports_speculative_payload")
+        ):
             return None
 
         if not scheduler_output.scheduled_spec_decode_tokens.get(rid):
@@ -1177,22 +1181,11 @@ class GPUARModelRunner(
         )
 
         if has_speculative_token_delta:
-            # Keep the DFlash-to-Talker contract at the model boundary.  The
-            # adapter receives verifier-committed token IDs and returns only
-            # their Thinker embeddings; query/mask rows never become payload
-            # rows.  The fallback preserves compatibility with other Omni
-            # models that have not implemented the optional adapter.
-            materialize = getattr(self.model, "materialize_thinker_token_embeddings", None)
+            # Only opted-in models provide the committed-token adapter.
             if committed_token_embeddings is not None:
                 token_embeds = committed_token_embeddings
-            elif callable(materialize):
-                token_embeds = materialize(committed_token_ids or [])
             else:
-                token_ids = torch.as_tensor(committed_token_ids or [], dtype=torch.long, device=self.device)
-                token_embeds = self.model.embed_input_ids(input_ids=token_ids)
-                if token_embeds.ndim == 3 and token_embeds.shape[0] == 1:
-                    token_embeds = token_embeds[0]
-                token_embeds = token_embeds.reshape(-1, token_embeds.shape[-1])
+                token_embeds = self.model.materialize_thinker_token_embeddings(committed_token_ids or [])
             mm_payload["hidden_states.layer_0"] = _to_cpu_contiguous(token_embeds)
             # The captured target hidden rows belong to DFlash query/mask
             # positions.  They are not post-consumption hidden states for the

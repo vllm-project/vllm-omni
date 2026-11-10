@@ -15,16 +15,23 @@ from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_payload_adapter_uses_committed_tokens_and_drops_dflash_mask_rows() -> None:
+@pytest.mark.parametrize("model_support", [False, True])
+def test_payload_adapter_uses_committed_tokens_and_drops_dflash_mask_rows(model_support) -> None:
     """DFlash query/mask rows must not become Talker condition rows."""
 
     class _Model:
-        def embed_input_ids(self, input_ids):
-            return input_ids.to(dtype=torch.float32).view(-1, 1)
+        supports_speculative_payload = model_support
+
+        def materialize_thinker_token_embeddings(self, token_ids):
+            assert model_support, "non-opted-in model must retain its payload"
+            return torch.tensor(token_ids, dtype=torch.float32).view(-1, 1)
 
     runner = object.__new__(GPUARModelRunner)
     runner.model = _Model()
     runner.device = torch.device("cpu")
+    runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
+    scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"r1": [1, 2]})
+    committed = runner._get_speculative_committed_token_ids("r1", 0, scheduler, [[101, 102]])
     payload = runner._build_omni_pooler_payload(
         rid="r1",
         idx=0,
@@ -42,9 +49,16 @@ def test_payload_adapter_uses_committed_tokens_and_drops_dflash_mask_rows() -> N
         sparse_mm_index={},
         hidden_seq_len=3,
         scheduled_seq_len=3,
-        committed_token_ids=[101, 102],
+        committed_token_ids=committed,
     )
 
+    if not model_support:
+        assert torch.equal(payload["hidden_states.layer_0"], torch.full((3, 2), 8.0))
+        assert torch.equal(payload["hidden_states.layer_24"], torch.full((3, 2), 7.0))
+        assert torch.equal(payload["hidden"], torch.full((3, 2), 9.0))
+        assert "meta" not in payload
+        assert "ids" not in payload
+        return
     assert torch.equal(payload["hidden_states.layer_0"], torch.tensor([[101.0], [102.0]]))
     assert "hidden_states.layer_24" not in payload
     assert "hidden" not in payload
@@ -53,15 +67,17 @@ def test_payload_adapter_uses_committed_tokens_and_drops_dflash_mask_rows() -> N
 
 
 @pytest.mark.parametrize(
-    ("use_dflash", "sampled", "expected"),
+    ("use_dflash", "model_support", "sampled", "expected"),
     [
-        (True, [10, 11], [10, 11]),
-        (True, [], []),
-        (False, [10, 11], None),
+        (True, True, [10, 11], [10, 11]),
+        (True, True, [], []),
+        (False, True, [10, 11], None),
+        (True, False, [10, 11], None),
     ],
 )
-def test_speculative_token_selection_tracks_committed_rows(use_dflash, sampled, expected) -> None:
+def test_speculative_token_selection_tracks_committed_rows(use_dflash, model_support, sampled, expected) -> None:
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_speculative_payload=model_support)
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: use_dflash)
     scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={"r1": [1, 2, 3]})
 
@@ -72,6 +88,7 @@ def test_speculative_token_selection_tracks_committed_rows(use_dflash, sampled, 
 @pytest.mark.parametrize("prior_rows", [0, 3, 4])
 def test_first_speculative_delta_seeds_prefill_sampled_token(first_committed, prior_rows) -> None:
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_speculative_payload=True)
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner._pending_full_payload_send = {"r1": ({}, {}, {"hidden_states.layer_0": prior_rows}, object())}
@@ -85,6 +102,7 @@ def test_first_speculative_delta_seeds_prefill_sampled_token(first_committed, pr
 
 def test_async_speculative_delta_seeds_only_the_first_prefill_sample() -> None:
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(supports_speculative_payload=True)
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
     runner.model_config = SimpleNamespace(async_chunk=True)
     runner.requests = {
@@ -286,10 +304,11 @@ def test_async_processor_flushes_held_prefill_with_first_decode_span() -> None:
 
 
 def test_async_decode_span_metadata_survives_payload_wire_round_trip() -> None:
+    decode = torch.tensor([[1.0], [2.0]])
     payload = {
         "meta": {"decode_span": True, "committed_token_count": 2},
         "ids": {"output": [11, 12]},
-        "embed": {"decode": torch.tensor([[1.0], [2.0]])},
+        "embed": {"decode": decode},
     }
 
     wire = serialize_payload(payload)
@@ -298,7 +317,7 @@ def test_async_decode_span_metadata_survives_payload_wire_round_trip() -> None:
     assert restored["meta"]["decode_span"] is True
     assert restored["meta"]["committed_token_count"] == 2
     assert restored["ids"]["output"] == [11, 12]
-    assert torch.equal(restored["embed"]["decode"], payload["embed"]["decode"])
+    assert torch.equal(restored["embed"]["decode"], decode)
 
 
 def _async_speculative_runner():

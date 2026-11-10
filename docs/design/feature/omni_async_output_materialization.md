@@ -422,6 +422,12 @@ subsequent rows use explicit decode ranges. This requires no request-local
 pending sample or send-offset state. Routing is captured on the execution
 thread; connector cancellation still controls which payloads can be sent.
 The synchronous speculative path retains committed-ID embedding lookup.
+It requires the model's `supports_speculative_payload` opt-in and
+`materialize_thinker_token_embeddings` adapter; other models retain their
+existing payload layout. There is no generic embedding fallback.
+Qwen3-Omni auxiliary hidden-state speculation currently supports only DFlash
+with explicit, non-empty checkpoint `dflash_config.target_layer_ids`.
+EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load.
 
 When the output processor accumulates full payloads, `meta.decode_span`,
 `meta.consumed_input_span`, and `meta.committed_token_count` retain the latest

@@ -272,6 +272,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     if not isinstance(dflash_config, dict) or not dflash_config.get("target_layer_ids"):
                         raise ValueError("Qwen3-Omni DFlash requires non-empty dflash_config.target_layer_ids")
             self.use_async_omni_output = True
+            self.supports_speculative_payload = True
             self.supports_async_speculative_payload = True
             # MRv2: the Talker's prompt ends with the first generated token's
             # embedding; publishing it with the prefill output lets the first
