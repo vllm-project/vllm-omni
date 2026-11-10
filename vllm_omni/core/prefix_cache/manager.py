@@ -53,6 +53,7 @@ from __future__ import annotations
 import bisect
 import logging
 import threading
+import time
 from collections import deque
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -587,6 +588,22 @@ class OmniPrefixCacheManager:
             self._session_store.invalidate(session_id)
             self._session_store.set_epoch(session_id, epoch)
 
+    def _reap_idle_sessions(self, now_s: float | None = None) -> None:
+        """Drop sessions idle longer than the configured TTL.
+
+        Called at the top of new_step_starts, under _state_lock: the
+        reaper is the only worker-visible session-end signal for
+        ephemeral sessions (their termination only unbinds), so without
+        it a finished session's rows would occupy the shared budget
+        until restart. ``now_s`` is injectable for tests.
+        """
+        dropped = self._session_store.drop_idle_sessions(
+            time.monotonic() if now_s is None else now_s,
+            self._config.session_store_idle_ttl_s,
+        )
+        if dropped:
+            logger.info("reaped idle prefix-cache sessions: %s", dropped)
+
     @torch.inference_mode()
     def new_step_starts(self, step: PrefixCacheStep) -> None:
         """Handle one immutable adapter-produced step.
@@ -604,6 +621,11 @@ class OmniPrefixCacheManager:
         events = step.events
         to_escalate: list[int] = []
         with self._state_lock:
+            # 0. Reap sessions idle past the TTL first: a finished
+            #    ephemeral session's rows would otherwise occupy the
+            #    shared budget until restart.
+            self._reap_idle_sessions()
+
             # 1. Publish writes the committer has already written into the pool.
             self._commit_drained_writes()
 

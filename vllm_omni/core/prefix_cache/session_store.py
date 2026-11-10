@@ -48,9 +48,13 @@ into the manager.
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 SessionId = str
 ReqId = str
@@ -88,6 +92,13 @@ class SessionPrefixStore:
         # invalidate keeps the generation (the session continues under
         # the same generation with a fresh stream).
         self._epochs: dict[SessionId, int] = {}
+        # session -> monotonic seconds of its last activity (bind, append,
+        # serve, invalidate). The reaper drops sessions idle longer than
+        # the configured TTL; drop() forgets the record.
+        self._last_touch: dict[SessionId, float] = {}
+        # Sessions already warned once about a budget-refused append;
+        # cleared on drop/invalidate so a refilled session can warn again.
+        self._refusal_warned: set[SessionId] = set()
         self._stored_bytes = 0
         self.refused_appends = 0
 
@@ -102,6 +113,7 @@ class SessionPrefixStore:
         with self._lock:
             self._bindings[req_id] = session_id
             self._resumable[req_id] = resumable
+            self._touch_locked(session_id)
 
     def unbind(self, req_id: ReqId) -> None:
         """Drop a request's binding. Segments are untouched: a finished
@@ -146,6 +158,10 @@ class SessionPrefixStore:
         """History generation recorded for a session, or None when unknown."""
         with self._lock:
             return self._epochs.get(session_id)
+
+    def _touch_locked(self, session_id: SessionId) -> None:
+        """Mark a session live; the caller must hold ``_lock``."""
+        self._last_touch[session_id] = time.monotonic()
 
     # ------------------------------------------------------------ stream
 
@@ -217,6 +233,7 @@ class SessionPrefixStore:
             raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
         entry = (session_id, key)
         with self._lock:
+            self._touch_locked(session_id)
             stored = self._lengths.get(entry, 0)
             batch_end = batch_start + int(rows.shape[0])
             if batch_end <= stored:
@@ -299,6 +316,7 @@ class SessionPrefixStore:
         if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
             raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
         with self._lock:
+            self._touch_locked(session_id)
             return self._append_locked(session_id, key, rows, expected_length=expected_length)
 
     def _append_locked(
@@ -322,6 +340,22 @@ class SessionPrefixStore:
         nbytes = rows.numel() * rows.element_size()
         if self._stored_bytes + nbytes > self._max_bytes:
             self.refused_appends += 1
+            if session_id not in self._refusal_warned:
+                self._refusal_warned.add(session_id)
+                logger.warning(
+                    "session %s append refused: session store budget %s bytes would be "
+                    "exceeded (stored %s bytes); falling back to the slot pool",
+                    session_id,
+                    self._max_bytes,
+                    self._stored_bytes,
+                )
+            else:
+                logger.debug(
+                    "session %s append refused again (stored %s of %s bytes)",
+                    session_id,
+                    self._stored_bytes,
+                    self._max_bytes,
+                )
             return False
         stored = rows.detach().clone()
         if segments is None:
@@ -379,6 +413,7 @@ class SessionPrefixStore:
                 remaining -= take
             if remaining > 0:
                 return None
+            self._touch_locked(session_id)
             return parts
 
     def snapshot_range(self, session_id: SessionId, key: TensorName, start: int, end: int) -> list[torch.Tensor] | None:
@@ -411,6 +446,7 @@ class SessionPrefixStore:
                 pos = seg_end
             if sum(int(p.shape[0]) for p in parts) != end - start:
                 return None
+            self._touch_locked(session_id)
             return parts
 
     # -------------------------------------------------------- lifecycle
@@ -434,6 +470,10 @@ class SessionPrefixStore:
         so an invalidate keeps it; only ``drop`` forgets it.
         """
         dropped = 0
+        # The session continues with a fresh stream, so it is alive
+        # again — and a refilled stream may warn about the budget again.
+        self._touch_locked(session_id)
+        self._refusal_warned.discard(session_id)
         for entry in [e for e in self._segments if e[0] == session_id]:
             segments = self._segments.pop(entry)
             self._lengths.pop(entry, None)
@@ -443,14 +483,41 @@ class SessionPrefixStore:
 
     def drop(self, session_id: SessionId) -> int:
         """End a session: invalidate its segments, unbind its requests,
-        and forget its recorded epoch."""
+        and forget its recorded epoch and last-touch record."""
         dropped = self.invalidate(session_id)
         with self._lock:
-            self._epochs.pop(session_id, None)
-            for req_id in [r for r, s in self._bindings.items() if s == session_id]:
-                del self._bindings[req_id]
-                self._resumable.pop(req_id, None)
+            self._drop_locked(session_id)
         return dropped
+
+    def _drop_locked(self, session_id: SessionId) -> None:
+        """Drop body; the caller must hold ``_lock`` (``drop`` /
+        ``drop_idle_sessions``). ``invalidate`` already ran: this only
+        forgets the session's bookkeeping and unbinds its requests."""
+        self._epochs.pop(session_id, None)
+        self._last_touch.pop(session_id, None)
+        self._refusal_warned.discard(session_id)
+        for req_id in [r for r, s in self._bindings.items() if s == session_id]:
+            del self._bindings[req_id]
+            self._resumable.pop(req_id, None)
+
+    def drop_idle_sessions(self, now: float, ttl_s: float) -> list[SessionId]:
+        """Drop sessions idle longer than ``ttl_s``; return those dropped.
+
+        A session is idle when no touch (bind, append, serve,
+        invalidate) happened within ``ttl_s``. The reaper is the only
+        worker-visible session-end signal for ephemeral sessions, whose
+        termination only unbinds. Scan and drops run atomically under
+        the store lock, so a touch racing the reap lands after the drop
+        instead of resurrecting a half-dropped session. (The invalidate
+        below touches, and ``_drop_locked`` immediately forgets that
+        touch again — net effect is no touch record, as intended.)
+        """
+        with self._lock:
+            idle = [s for s, t in self._last_touch.items() if now - t > ttl_s]
+            for session_id in idle:
+                self._invalidate_locked(session_id)
+                self._drop_locked(session_id)
+        return idle
 
     def session_ids(self) -> list[SessionId]:
         """Sessions with at least one stored segment."""

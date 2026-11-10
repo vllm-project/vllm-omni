@@ -368,3 +368,56 @@ def test_session_epoch_survives_invalidate_but_not_drop():
     store.append("S", "hidden", _rows(0, 2))
     store.drop("S")
     assert store.epoch_of("S") is None
+
+
+def test_drop_idle_sessions_reaps_only_idle():
+    """7: the reaper drops sessions idle past the TTL and keeps live ones."""
+    store = SessionPrefixStore()
+    store.append("S-old", "hidden", _rows(0, 3))
+    store.append("S-live", "hidden", _rows(0, 2))
+    store.set_epoch("S-old", 1)
+    store.bind("r-old", "S-old")
+    store._last_touch["S-old"] = 99.0
+    store._last_touch["S-live"] = 690.0
+    dropped = store.drop_idle_sessions(now=700.0, ttl_s=600.0)
+    assert dropped == ["S-old"]
+    assert store.stored_tokens("S-old", "hidden") == 0
+    assert store.stored_tokens("S-live", "hidden") == 2
+    assert store.epoch_of("S-old") is None
+    assert store.session_of("r-old") is None
+    assert "S-old" not in store._last_touch
+
+
+def test_serve_refreshes_idle_touch():
+    """7: serving a session's rows marks it live, so the reap skips it."""
+    store = SessionPrefixStore()
+    store.append("S", "hidden", _rows(0, 3))
+    store._last_touch["S"] = 100.0
+    assert store.fetch("S", "hidden", 3) is not None
+    touched = store._last_touch["S"]
+    assert touched > 100.0
+    assert store.drop_idle_sessions(now=touched + 100.0, ttl_s=600.0) == []
+    assert store.stored_tokens("S", "hidden") == 3
+
+
+def test_refused_append_warns_once_per_session(caplog):
+    """7: a budget-refused append warns once per session (later refusals
+    only debug), and warns again after the session is invalidated."""
+    store = SessionPrefixStore(max_bytes=32)
+    assert store.append("S", "hidden", _rows(0, 2))
+    with caplog.at_level(logging.DEBUG, logger="vllm_omni.core.prefix_cache.session_store"):
+        assert not store.append("S", "hidden", _rows(2, 1))
+        assert not store.append("S", "hidden", _rows(2, 1))
+    assert store.refused_appends == 2
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG"]
+    assert len(warnings) == 1
+    assert "S" in warnings[0].getMessage()
+    assert len(debugs) == 1
+    # After invalidate the session may warn again.
+    store.invalidate("S")
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="vllm_omni.core.prefix_cache.session_store"):
+        assert not store.append("S", "hidden", _rows(0, 3))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
