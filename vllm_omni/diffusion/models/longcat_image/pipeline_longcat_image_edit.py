@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import math
@@ -25,6 +25,7 @@ from transformers import (
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cache.cachedit import set_separate_cfg
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -592,6 +593,7 @@ class LongCatImageEditPipeline(
         )
 
         do_true_cfg = guidance_scale > 1 and negative_prompt is not None
+        set_separate_cfg(self.transformer, do_true_cfg)
         if do_true_cfg:
             (negative_prompt_embeds, negative_text_ids) = self.encode_prompt(
                 prompt=negative_prompt,
