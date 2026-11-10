@@ -376,12 +376,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             if lightvae_decoder_path is not None:
                 from .lightvae import install_h3_lite_decoder, read_h3_lite_decoder_checkpoint
 
-                checkpoint = read_h3_lite_decoder_checkpoint(lightvae_decoder_path)
+                teacher_num_layers = len(self.remote.model.decoder.transformer_blocks)
+                checkpoint = read_h3_lite_decoder_checkpoint(
+                    lightvae_decoder_path,
+                    teacher_num_layers=teacher_num_layers,
+                )
                 install_h3_lite_decoder(self.remote.model, checkpoint, native_config=self.config_dict)
                 logger.info(
-                    "Loaded H3 Lite video decoder: path=%s layers=%d device=%s",
+                    "Loaded H3 Lite video decoder: path=%s student_layers=%d teacher_layers=%d device=%s",
                     lightvae_decoder_path,
                     len(checkpoint.kept_layers),
+                    teacher_num_layers,
                     device,
                 )
                 del checkpoint
