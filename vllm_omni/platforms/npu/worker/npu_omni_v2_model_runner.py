@@ -366,7 +366,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # model_config) and nothing on this path reads it: the two-wide
         # control logits are consumed by the talker's device-side sampler
         # stages, the duplex K-step dispatch installs no rejection speculator
-        # (mrv2_custom_sampler returns no speculator for K > 0), and the
+        # (minicpmo_4_5_omni_tts.py:2041 returns no speculator for K > 0), and the
         # frame loop's stop-row guard raises the batch's own vocab_size to
         # STOP_ROW_WIDTH itself when it is missing (talker_multiframe.py).
         # Setting the field here would only create an attribute no one reads,
