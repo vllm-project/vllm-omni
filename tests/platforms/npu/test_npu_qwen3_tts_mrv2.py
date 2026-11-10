@@ -55,8 +55,8 @@ def test_npu_talker_state_combines_omni_lifecycle_and_ascend_attention():
 
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_generation_worker_selects_stage_runner(monkeypatch, use_v2):
+    import vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 as npu_v2_runner
     import vllm_omni.platforms.npu.worker.npu_generation_worker as generation_worker
-    import vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner as npu_v2_runner
 
     class FakeV1Runner:
         def __init__(self, config, device):
@@ -67,12 +67,13 @@ def test_generation_worker_selects_stage_runner(monkeypatch, use_v2):
         pass
 
     monkeypatch.setattr(generation_worker.NPUGenerationWorker, "model_runner_cls", FakeV1Runner)
-    monkeypatch.setattr(npu_v2_runner, "NPUOmniGenerationModelRunner", FakeV2Runner)
+    monkeypatch.setattr(npu_v2_runner, "NPUGenerationModelRunnerV2", FakeV2Runner)
     monkeypatch.setattr(generation_worker, "init_workspace_manager", lambda *args: None)
     monkeypatch.setattr(generation_worker.NPUGenerationWorker, "_init_device", lambda self: "npu:0")
 
     worker = object.__new__(generation_worker.NPUGenerationWorker)
     worker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=use_v2))
+    worker.use_v2_model_runner = use_v2
     worker.init_device()
 
     expected_runner = FakeV2Runner if use_v2 else FakeV1Runner

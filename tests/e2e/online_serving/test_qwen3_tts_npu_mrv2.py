@@ -21,8 +21,8 @@ SERVER_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("qwen3_tts_mrv2.yaml"),
-            server_args=["--trust-remote-code"],
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         False,
         id="mrv2-full-payload",
@@ -30,7 +30,7 @@ SERVER_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("qwen3_tts_mrv2.yaml"),
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
             server_args=["--trust-remote-code"],
         ),
         True,
@@ -83,7 +83,13 @@ def _wait_for_no_running_requests(metrics_url: str, timeout_s: float = 120.0) ->
             return
         time.sleep(1)
 
-    pytest.fail(f"Omni did not release the aborted request within {timeout_s:.0f}s; latest request gauges: {latest}")
+    missing_metrics = [name for name, values in latest.items() if not values]
+    if missing_metrics:
+        pytest.fail(
+            "Cannot verify that Omni released the aborted request: "
+            f"metrics endpoint did not expose {missing_metrics}; latest request gauges: {latest}"
+        )
+    pytest.fail(f"Omni still reports active or queued requests after {timeout_s:.0f}s; latest request gauges: {latest}")
 
 
 @pytest.mark.advanced_model
@@ -95,7 +101,7 @@ def _wait_for_no_running_requests(metrics_url: str, timeout_s: float = 120.0) ->
         pytest.param(
             OmniServerParams(
                 model=MODEL,
-                stage_config_path=get_deploy_config_path("qwen3_tts_mrv2.yaml"),
+                stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
                 server_args=["--trust-remote-code"],
             ),
             id="mrv2-abort-and-long-input",
@@ -110,7 +116,18 @@ def test_qwen3_tts_npu_mrv2_stream_abort_and_long_input(omni_server, openai_clie
     url = f"{openai_client.base_url.rstrip(chr(47))}/v1/audio/speech"
     sentence = "The weather is nice today, and the warm sunlight makes the garden feel peaceful."
     long_text = " ".join([sentence] * 64)
-    assert len(long_text.split()) > 512
+
+    import transformers
+    from transformers import AutoTokenizer
+
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
+
+    tokenizer_kwargs = {"trust_remote_code": True, "use_fast": True}
+    if transformers.__version__ < "5":
+        tokenizer_kwargs["fix_mistral_regex"] = True
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, **tokenizer_kwargs)
+    talker_prompt_tokens = len(tokenizer(build_assistant_text(long_text), padding=False)["input_ids"])
+    assert talker_prompt_tokens > 512, f"Expected >512 Talker prompt tokens, got {talker_prompt_tokens}"
     payload = {
         "model": omni_server.model,
         "input": long_text,

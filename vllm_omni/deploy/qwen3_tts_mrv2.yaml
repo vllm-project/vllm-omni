@@ -1,5 +1,5 @@
-# Explicit Model Runner V2 profile for CUDA and NPU. The shipped default
-# keeps NPU on V1 until the NPU MRv2 hardware acceptance is complete.
+# Explicit Model Runner V2 profile for CUDA and NPU. The default profile also
+# selects MRv2 on NPU; keep this file for callers that select the profile by name.
 base_config: qwen3_tts.yaml
 model_runner: v2
 

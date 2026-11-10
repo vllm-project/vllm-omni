@@ -23,6 +23,7 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/model_executor/models/common/alias_free_activation.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
   - vllm_omni/deploy/qwen3_tts.yaml
+  - vllm_omni/deploy/qwen3_tts_high_concurrency.yaml
   - vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/

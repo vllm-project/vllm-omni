@@ -189,6 +189,10 @@ def install() -> None:
 
     def swt_init(self, size, dtype, device, max_concurrency=None, uva_instead_of_gpu=False):
         orig_init(self, size, dtype, device, max_concurrency, uva_instead_of_gpu)
+        # Upstream stores pending values in array.array; Omni's deferred writer
+        # batches NumPy arrays and Python lists together, so normalize its buffer.
+        self._staged_write_contents = []
+        self._staged_write_chunks = []
         self._np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         self._staged_len = 0
         if self.write_contents is None:
