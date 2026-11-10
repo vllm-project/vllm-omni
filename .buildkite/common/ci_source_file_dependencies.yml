@@ -274,7 +274,7 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
   - .buildkite/common/ci_mirror_hardwares.yml
 
 # GPU V1 workers are shared by CUDA/ROCm; NPU has its own workers/runners.
-x-omni-gpu: &omni_gpu
+x-gpu-v1-workers: &gpu_v1_workers
   - vllm_omni/worker/base.py
   - vllm_omni/worker/encoder_cudagraph.py
   - vllm_omni/worker/gpu_ar_model_runner.py
@@ -560,9 +560,9 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
     - tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
 
-  # Qwen CUDA nightly deployments enable V2 and prefix caching. Keep these
-  # runtime choices separate from platform dependencies; NPU/ROCm use V1.
-  omni_qwen3_omni_cuda_runtime:
+  # Reusable V2/prefix-cache runtime dependencies. Currently composed only by
+  # Qwen CUDA nightly jobs; NPU/ROCm still use V1.
+  omni_v2_runtime:
     - vllm_omni/core/prefix_cache/
     - vllm_omni/worker_v2/__init__.py
     - vllm_omni/worker_v2/delivery.py
@@ -586,7 +586,7 @@ source_file_dependencies:
 
   # Reusable platform dependencies, composed explicitly by each model job.
   ci_cuda:
-    - *omni_gpu
+    - *gpu_v1_workers
     - vllm_omni/platforms/cuda/platform.py
     - docker/Dockerfile.ci
     - docker/Dockerfile.ci.dockerignore
@@ -616,7 +616,7 @@ source_file_dependencies:
     - .buildkite/npu/test-npu-nightly.yml
 
   ci_rocm:
-    - *omni_gpu
+    - *gpu_v1_workers
     - vllm_omni/platforms/rocm/platform.py
     - vllm_omni/platforms/rocm/patch/
     - docker/Dockerfile.rocm

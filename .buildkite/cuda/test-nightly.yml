@@ -56,7 +56,7 @@ steps:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
       - label: ":full_moon: Omni · Accuracy Test"
-        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_cuda, omni_qwen3_omni_cuda_runtime]
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_cuda, omni_v2_runtime]
         timeout_in_minutes: 180
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
@@ -93,7 +93,7 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_cuda, omni_qwen3_omni_cuda_runtime]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 300
         artifact_paths:
@@ -103,7 +103,7 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json -m "H100 and B200 and cards_2"
 
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_cuda, omni_qwen3_omni_cuda_runtime]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
         artifact_paths:
@@ -113,7 +113,7 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and B200 and full_model and cards_2"
 
       - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Perf Test"
-        source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_qwen3_omni_cuda_runtime]
+        source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-qwen3-omni-duplex-omniinteract
         timeout_in_minutes: 180
         artifact_paths:
@@ -123,7 +123,7 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
 
       - label: ":full_moon: Omni · Qwen3-Omni · Duplex Omni-DuplexEval Perf Test"
-        source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_qwen3_omni_cuda_runtime]
+        source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval
         timeout_in_minutes: 180
         artifact_paths:

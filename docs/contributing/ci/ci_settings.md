@@ -452,7 +452,7 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 
 Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
 with the reusable platform key `ci_cuda`, `ci_npu`, or `ci_rocm`. CUDA jobs also
-compose `omni_qwen3_omni_cuda_runtime` for their V2 and prefix-cache dependencies.
+compose `omni_v2_runtime` for their V2 and prefix-cache dependencies.
 Other models can opt into a platform key without inheriting these runtime choices.
 Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
 benchmark infrastructure, and test fixtures select both accuracy and performance
