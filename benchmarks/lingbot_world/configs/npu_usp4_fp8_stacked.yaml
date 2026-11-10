@@ -1,0 +1,55 @@
+# Accuracy-changing performance candidates, eager TP1/Ulysses4.
+# MXFP8 Linear and native Q/K RMSNorm change output; quality unvalidated.
+# Set VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 for staged history reuse.
+# No sparse BSA selection or VAE normalization restoration/fusion.
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    diffusion_attention_config:
+      per_role:
+        self:
+          backend: FLASH_ATTN
+          npu_quant:
+            precision: fp8
+            fp8_fa_mode: C8V16_TILING512
+            qk_rotation: none
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 464
+      ar_diffusion_width: 832
+      lingbot_npu_host_lengths: true
+      lingbot_npu_host_timestep: true
+      lingbot_cache_block_conditions: true
+      lingbot_npu_fused_rmsnorm: true
+      # Stacked experimental providers. See README for validation limits.
+      lingbot_npu_fused_adaln: true
+      lingbot_npu_fused_residual: true
+      lingbot_npu_fused_mxfp8_ffn: true
+      lingbot_npu_online_quant: mxfp8
+      lingbot_vae_spatial_sharding: true
+      lingbot_vae_decode_fast_path: exact
+      lingbot_npu_pixel_output_mode: root_uint8_p2p
+      lingbot_reuse_last_step_kv: true
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: false
+        reuse_history_staging: true

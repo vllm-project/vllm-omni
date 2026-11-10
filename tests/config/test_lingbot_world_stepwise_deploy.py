@@ -9,10 +9,13 @@ pinned here rather than left to drift.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.diffusion.data import build_attention_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -50,3 +53,13 @@ def test_stage_declares_the_fixed_ar_cache_geometry() -> None:
     assert model_config["ar_diffusion_height"] == 480
     assert model_config["ar_diffusion_width"] == 832
     assert model_config["ar_diffusion_kv_config"]["gpu_memory_fraction"] == 0.6
+
+
+def test_stacked_deploy_selects_tiling512_for_self_attention() -> None:
+    root = Path(__file__).resolve().parents[2]
+    deploy = load_deploy_config(root / "benchmarks/lingbot_world/configs/npu_usp4_fp8_stacked.yaml")
+    config = build_attention_config(deploy.stages[0].diffusion_attention_config)
+    spec = config.per_role["self"]
+    assert spec.backend == "FLASH_ATTN"
+    assert spec.npu_quant.fp8_fa_mode == "C8V16_TILING512"
+    assert spec.npu_quant.qk_rotation == "none"

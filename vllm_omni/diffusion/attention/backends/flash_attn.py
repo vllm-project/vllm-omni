@@ -281,8 +281,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else "aiter" if IS_AITER else None
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
-        if backend_kwargs:
-            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+        options = dict(backend_kwargs or {})
+        self.npu_quant = options.pop("npu_quant", None)
+        if self.npu_quant is not None:
+            if not current_omni_platform.is_npu():
+                raise ValueError("FLASH_ATTN npu_quant requires an NPU platform")
+            # Load before CANN snapshots the custom-op registry.
+            self._load_quant_runtime(self.npu_quant.precision)
+        if options:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(options))
 
     def resolve_execution_path(
         self,
@@ -381,6 +388,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
             or context.paged_kv
+            or self.npu_quant is not None
             or extra.get("kv_cache_dtype") not in (None, "float", "auto")
         ):
             return result
@@ -1051,7 +1059,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype")
-        if method not in (None, "float", "auto"):
+        if self.npu_quant is not None or method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
@@ -1080,9 +1088,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         elif attn_metadata is not None and attn_metadata.attn_mask is not None:
             reason = "caller masks require the float attention path"
         elif method in ("fp8", "mxfp8", "mxfp4") and (
-            query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
+            query.ndim != 4
+            or (
+                (self.npu_quant is None or self.npu_quant.qk_rotation == "hadamard")
+                and (query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1))
+            )
         ):
-            reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+            reason = "quantized FA requires rank-four input and Hadamard rotation requires power-of-two head size"
         if reason is not None:
             raise ValueError(
                 f"NPU attention precision {method!r} is unavailable: {reason}. "
@@ -1098,9 +1110,16 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         extra = attn_metadata.extra if attn_metadata else {}
-        method = extra.get("kv_cache_dtype", "fp8")
+        spec = self.npu_quant
+        legacy_method = extra.get("kv_cache_dtype")
+        if spec is not None and legacy_method not in (None, "float", "auto", spec.precision):
+            raise ValueError("FLASH_ATTN npu_quant conflicts with diffusion_kv_cache_dtype")
+        method = spec.precision if spec is not None else extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
         self._validate_quant_request(method, query, attn_metadata)
+        if spec is not None and spec.fp8_fa_mode == "C8V16_TILING512":
+            if any(t.dtype != torch.bfloat16 or t.shape[-1] != 128 for t in (query, key, value)):
+                raise ValueError("C8V16_TILING512 requires BF16 Q/K/V and head_dim=128")
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
@@ -1110,16 +1129,20 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "diffusion_kv_cache_dtype, or set it to 'auto'. Automatic precision "
                 "fallback is not performed."
             ) from exc
-        kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
-        # Apply Omni's deterministic Q/K rotation before every Dense quantized path.
-        if method in ("fp8", "mxfp8", "mxfp4"):
-            from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
+        from vllm_omni.platforms.npu.attention.eagle_fp8_fia import quant_attention_npu
 
-            rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
-            kwargs.update(q_rot=rotation, k_rot=rotation)
         logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
-        # Execution errors propagate. Never retry with another precision.
-        return runtime(query, key, value, **kwargs)
+        return quant_attention_npu(
+            runtime,
+            query,
+            key,
+            value,
+            precision=method,
+            layout=layout,
+            scale=self.softmax_scale,
+            fp8_fa_mode=spec.fp8_fa_mode if spec is not None else None,
+            rotate_qk=spec is None or spec.qk_rotation == "hadamard",
+        )
 
     @staticmethod
     def _npu_fusion_attention(

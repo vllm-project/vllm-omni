@@ -947,6 +947,35 @@ def test_npu_contract_dense_dispatch(npu_contract, kv_cache_dtype):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("rotation", ["none", "hadamard"])
+def test_explicit_npu_fp8_mode_without_legacy_kv_quant(monkeypatch, mocker, rotation):
+    from vllm_omni.diffusion.data import AttentionSpec
+    from vllm_omni.platforms.npu.quant import kv_quant_npu
+
+    rotation_matrix = torch.eye(128)
+    monkeypatch.setattr(kv_quant_npu, "get_quant_attention_rotation", lambda *args: rotation_matrix)
+    spec = AttentionSpec(
+        backend="FLASH_ATTN",
+        npu_quant={"fp8_fa_mode": "C8V16_TILING512", "qk_rotation": rotation},
+    )
+    runtime = mocker.Mock(side_effect=lambda query, key, value, **kwargs: query)
+    monkeypatch.setattr(FlashAttentionImpl, "_load_quant_runtime", staticmethod(lambda method: runtime))
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    impl = FlashAttentionImpl(num_heads=2, head_size=128, softmax_scale=0.125, backend_kwargs=spec.backend_kwargs())
+    query = torch.zeros(1, 8, 2, 128, dtype=torch.bfloat16)
+    assert impl.forward_npu(query, query, query) is query
+    expected = {
+        "precision": "fp8",
+        "layout": "BSND",
+        "scale": 0.125,
+        "fp8_fa_mode": "C8V16_TILING512",
+    }
+    if rotation == "hadamard":
+        expected.update(q_rot=rotation_matrix, k_rot=rotation_matrix)
+    assert runtime.call_args.kwargs == expected
+
+
+@pytest.mark.cpu
 def test_npu_contract_mask_layout(npu_contract):
     impl, query, dense, packed = npu_contract
     mask = torch.arange(8)[None] < 5

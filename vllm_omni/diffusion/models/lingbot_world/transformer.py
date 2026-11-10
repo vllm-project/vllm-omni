@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -101,6 +102,7 @@ class _LingBotRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = eps
+        self.npu_fused = False
         self.weight = nn.Parameter(torch.ones(hidden_size))
         set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
@@ -123,6 +125,15 @@ class _LingBotRMSNorm(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         tp_size = get_tensor_model_parallel_world_size()
+        if (
+            self.npu_fused
+            and tp_size == 1
+            and value.device.type == "npu"
+            and value.dtype in (torch.float16, torch.bfloat16)
+        ):
+            from vllm_omni.platforms.npu.models.lingbot_world.norm import projection_rms_norm
+
+            return projection_rms_norm(value, self.weight, self.eps)
         value_float = value.float()
         sum_of_squares = value_float.pow(2).sum(dim=-1, keepdim=True)
         element_count = value.shape[-1]
@@ -208,6 +219,7 @@ class LingBotSelfAttention(nn.Module):
             )
         self.num_sp_heads = self.num_local_heads // self.ulysses_world_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
+        self.npu_host_lengths = False
         self.o = RowParallelLinear(
             dim,
             dim,
@@ -231,6 +243,10 @@ class LingBotSelfAttention(nn.Module):
             prefix=prefix,
             skip_sequence_parallel=True,
         )
+        quant = getattr(getattr(self.attn, "attn_spec", None), "npu_quant", None)
+        self.configured_fp8_fa_mode = quant.fp8_fa_mode if quant is not None else ""
+        self.fp8_fa_mode = self.configured_fp8_fa_mode
+        self.rotate_qk = quant is not None and quant.qk_rotation == "hadamard"
 
     def _update_cache(
         self,
@@ -364,6 +380,8 @@ class LingBotSelfAttention(nn.Module):
                 None,
                 None,
                 self.head_dim**-0.5,
+                fp8_fa_mode=self.fp8_fa_mode,
+                rotate_qk=self.rotate_qk,
             ).unsqueeze(0)
         else:
             # The direct path sees history + current K/V even when the caller
@@ -411,6 +429,11 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
+                    npu_lengths=(query.shape[1], visible_key.shape[1])
+                    if self.npu_host_lengths and query.device.type == "npu"
+                    else None,
+                    fp8_fa_mode=self.fp8_fa_mode,
+                    rotate_qk=self.rotate_qk,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -559,6 +582,9 @@ class LingBotAttentionBlock(nn.Module):
         ffn_dim = ffn_dim or dim * 4
         self.dim = dim
         self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.npu_fused_adaln = False
+        self.npu_fused_residual = False
+        self.npu_fused_mxfp8_ffn = False
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
@@ -628,6 +654,48 @@ class LingBotAttentionBlock(nn.Module):
         camera_features = camera_features + camera_hidden_states
         return self.cam_scale_layer(camera_features), self.cam_shift_layer(camera_features)
 
+    def _adaln(
+        self,
+        norm: nn.Module,
+        hidden: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        num_frames: int,
+        tokens_per_frame: int,
+    ) -> torch.Tensor:
+        if self.npu_fused_adaln and hidden.device.type == "npu":
+            from vllm_omni.platforms.npu.models.lingbot_world.modulation import adaln
+
+            result = adaln(norm, hidden, scale, shift, tokens_per_frame)
+            if result is not None:
+                return result
+        normalized = norm(hidden.float()).unflatten(1, (num_frames, tokens_per_frame))
+        return (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden.dtype)
+
+    def _gated_residual(
+        self,
+        hidden: torch.Tensor,
+        update: torch.Tensor,
+        gate: torch.Tensor,
+        tokens_per_frame: int,
+        *,
+        scale: torch.Tensor | None = None,
+        shift: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.npu_fused_residual and hidden.device.type == "npu":
+            from vllm_omni.platforms.npu.models.lingbot_world.modulation import residual_camera
+
+            result = residual_camera(hidden, update, gate, tokens_per_frame, scale=scale, shift=shift)
+            if result is not None:
+                return result
+        grid = hidden.unflatten(1, (gate.shape[1], tokens_per_frame))
+        update_grid = update.unflatten(1, (gate.shape[1], tokens_per_frame))
+        result = (grid + update_grid * gate).flatten(1, 2).to(hidden.dtype)
+        if scale is not None:
+            assert shift is not None
+            result = ((1 + scale) * result + shift).to(hidden.dtype)
+        return result
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -642,15 +710,19 @@ class LingBotAttentionBlock(nn.Module):
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        timestep_projection_packed: bool = False,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
+        frame_axis = 2 if timestep_projection_packed else 1
+        modulation_axis = 1 if timestep_projection_packed else 2
         if (
             timestep_projection.ndim != 4
             or timestep_projection.shape[0] != batch_size
-            or timestep_projection.shape[2:] != (6, dim)
+            or timestep_projection.shape[modulation_axis] != 6
+            or timestep_projection.shape[-1] != dim
         ):
-            raise ValueError("LingBot timestep projection must have shape (batch, frames or tokens, 6, dim).")
-        num_frames = timestep_projection.shape[1]
+            raise ValueError("LingBot timestep projection must have six modulation lanes and match the hidden shape.")
+        num_frames = timestep_projection.shape[frame_axis]
         if num_frames == 0 or token_count % num_frames:
             raise ValueError("LingBot timestep projection must align with hidden tokens.")
         if self.self_attn.ulysses_world_size > 1 and num_frames != token_count:
@@ -658,12 +730,17 @@ class LingBotAttentionBlock(nn.Module):
         # Without SP, broadcast per frame. With SP, each entry represents one token.
         tokens_per_frame = token_count // num_frames
         # Timestep, camera, and text remain separate conditioning paths.
-        modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
-        shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation.chunk(6, dim=2)
+        if timestep_projection_packed:
+            # Each lane is dense [B, F, D], so the AdaLN provider can read
+            # scale/shift without materializing the strided token views.
+            modulation = self.modulation.unsqueeze(2) + timestep_projection
+            lanes = (lane.unsqueeze(2) for lane in modulation.unbind(dim=1))
+        else:
+            modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
+            lanes = modulation.chunk(6, dim=2)
+        shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = lanes
 
-        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-        normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
+        normalized = self._adaln(self.norm1, hidden_states, scale_msa, shift_msa, num_frames, tokens_per_frame)
         if hasattr(self, "_lingbot_leased_post_attention"):
             from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import acquire
 
@@ -686,13 +763,13 @@ class LingBotAttentionBlock(nn.Module):
                 **projection_kwargs,
             )
             if lease is None:
-                hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
-                hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
                 if camera_scale is None:
                     camera_scale, camera_shift = (
                         self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
                     )
-                hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+                hidden_states = self._gated_residual(
+                    hidden_states, attention_output, gate_msa, tokens_per_frame, scale=camera_scale, shift=camera_shift
+                )
                 cross_normalized = self.norm3(hidden_states)
             else:
                 _, hidden_states, cross_normalized = lease.consume()
@@ -700,11 +777,15 @@ class LingBotAttentionBlock(nn.Module):
             # This independent tensor is the final consumer; graph views never enter long-lived state.
             hidden_states = hidden_states + attention_output
 
-        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
-        normalized = self.norm2(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(hidden_states.dtype)
-        ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
-        hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
+        normalized = self._adaln(self.norm2, hidden_states, scale_ffn, shift_ffn, num_frames, tokens_per_frame)
+        ffn_output = None
+        if self.npu_fused_mxfp8_ffn and get_tensor_model_parallel_world_size() == 1:
+            from vllm_omni.platforms.npu.models.lingbot_world.ffn import fused_mxfp8_ffn
+
+            ffn_output = fused_mxfp8_ffn(normalized, self.ffn[0], self.ffn[2])
+        if ffn_output is None:
+            ffn_output = self.ffn(normalized)
+        hidden_states = self._gated_residual(hidden_states, ffn_output, gate_ffn, tokens_per_frame)
         return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
 
@@ -822,10 +903,11 @@ class CameraModulationCache:
     block, ``generate_block`` one per loop, and nothing here checks the camera tensor for change.
     """
 
-    __slots__ = ("entries",)
+    __slots__ = ("entries", "prepared")
 
     def __init__(self) -> None:
         self.entries: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.prepared: tuple[tuple, tuple[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
 
 
 class CausalLingBotWorldTransformer3DModel(nn.Module):
@@ -978,6 +1060,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             ]
         )
         self.head = _LingBotHead(dim, out_channels, patch_size, eps)
+        self.npu_host_lengths = False
+        self.cache_block_conditions = False
 
         temporal_dim = attention_head_dim - 4 * (attention_head_dim // 6)
         height_dim = width_dim = 2 * (attention_head_dim // 6)
@@ -1006,6 +1090,48 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             self._timestep_projection_buffers[key] = buffer
         buffer.copy_(projection)
         return buffer
+
+    def configure_npu_optimizations(
+        self,
+        *,
+        host_lengths: bool = False,
+        fused_rmsnorm: bool = False,
+        cache_block_conditions: bool = False,
+        fused_adaln: bool = False,
+        fused_residual: bool = False,
+        fused_mxfp8_ffn: bool = False,
+    ) -> None:
+        """Enable experimental providers without changing checkpoint parameters.
+
+        Configure before compilation/capture. Numerical and performance
+        acceptance on the deployment's NPU remains a separate requirement.
+        """
+        if any(
+            type(option) is not bool
+            for option in (
+                host_lengths,
+                fused_rmsnorm,
+                cache_block_conditions,
+                fused_adaln,
+                fused_residual,
+                fused_mxfp8_ffn,
+            )
+        ):
+            raise ValueError("LingBot NPU optimization options must be booleans")
+        self.cache_block_conditions = cache_block_conditions
+        self.npu_host_lengths = host_lengths
+        legacy_mode = os.environ.get("VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE", "") if host_lengths else ""
+        if legacy_mode not in ("", "C8V16_TILING512"):
+            raise ValueError("Legacy FP8 FIA mode must be C8V16_TILING512")
+        for block in self.blocks:
+            block.self_attn.fp8_fa_mode = block.self_attn.configured_fp8_fa_mode or legacy_mode
+            block.self_attn.npu_host_lengths = host_lengths
+            block.npu_fused_adaln = fused_adaln
+            block.npu_fused_residual = fused_residual
+            block.npu_fused_mxfp8_ffn = fused_mxfp8_ffn
+        for module in self.modules():
+            if isinstance(module, _LingBotRMSNorm):
+                module.npu_fused = fused_rmsnorm
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1209,6 +1335,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         batch_size: int,
         frames: int,
         dtype: torch.dtype,
+        frequency_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if timestep.ndim == 0:
             if batch_size != 1:
@@ -1224,7 +1351,14 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         else:
             raise ValueError("timestep must be scalar, rank 1 [batch], or rank 2 [batch, frames].")
 
-        frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
+        if frequency_embedding is None:
+            frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
+        elif (
+            frequency_embedding.shape != (batch_size * frames, self.config.freq_dim)
+            or frequency_embedding.device != timestep.device
+            or frequency_embedding.dtype != dtype
+        ):
+            raise ValueError("Prepared timestep frequencies must match batch/frames, freq_dim, device and dtype")
         timestep_embedding = self.time_embedding(frequency_embedding).unflatten(0, (batch_size, frames))
         timestep_projection = self.time_projection(timestep_embedding).unflatten(2, (6, self.dim))
         return timestep_embedding, timestep_projection
@@ -1263,6 +1397,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         start_frame: int,
         update_cache: bool,
         camera_modulation_cache: CameraModulationCache | None = None,
+        timestep_frequency_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
@@ -1282,24 +1417,41 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         patched_start_frame = start_frame // patch_frames
         current_start = patched_start_frame * tokens_per_frame
         sink_tokens = self.config.sink_size * tokens_per_frame
-        # Phase 1: create absolute 3D positions for this causal block. The
-        # spatial coordinates restart for every frame; temporal coordinates
-        # begin at ``start_frame`` so cached blocks retain their true ordering.
-        rotary_emb = self._rotary_embedding(
-            frames=patched_frames,
-            height=patched_height,
-            width=patched_width,
-            start_frame=patched_start_frame,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        # The caller owns an immutable camera condition for the lifetime of
+        # CameraModulationCache (one AR block). Cache before SP sharding, so
+        # every forward still passes through the same SP hooks and layouts.
+        prepared = None
+        if self.cache_block_conditions and camera_modulation_cache is not None and not torch.is_grad_enabled():
+            prepared = camera_modulation_cache.prepared
+        signature = (
+            id(self),
+            patched_frames,
+            patched_height,
+            patched_width,
+            patched_start_frame,
+            hidden_states.dtype,
+            hidden_states.device,
         )
-        # Phase 2: independently patchify video and camera grids to identical
-        # token layouts, then project timestep and text conditions.
+        if prepared is not None and prepared[0] != signature:
+            raise ValueError("CameraModulationCache must be recreated for each AR block and model")
+        if prepared is None:
+            rotary_emb = self._rotary_embedding(
+                frames=patched_frames,
+                height=patched_height,
+                width=patched_width,
+                start_frame=patched_start_frame,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
+            camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
+                F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
+            )
+            if self.cache_block_conditions and camera_modulation_cache is not None and not torch.is_grad_enabled():
+                camera_modulation_cache.prepared = (signature, rotary_emb, camera_hidden_states)
+        else:
+            _, rotary_emb, camera_hidden_states = prepared
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
-        camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
-        camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
-            F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
-        )
         if hidden_states.shape != camera_hidden_states.shape:
             raise ValueError("Patched video and camera token shapes must match.")
 
@@ -1308,6 +1460,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             batch_size=batch_size,
             frames=patched_frames,
             dtype=hidden_states.dtype,
+            frequency_embedding=timestep_frequency_embedding,
         )
         projected_text = (
             self.text_embedding(encoder_hidden_states)
@@ -1331,6 +1484,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if self.npu_host_lengths and hidden_states.device.type == "npu":
+                # prepare() already owns these exact valid lengths on the CPU.
+                # Keep them forward-local: max_seq_len includes padded capacity.
+                lengths = (int(forward_context.query_len), int(forward_context.kv_len))
+                cache.self_attention = [entry._replace(npu_lengths=lengths) for entry in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
         hidden_dim = hidden_states.shape[-1]
@@ -1357,6 +1515,16 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     "LingBot SP input hooks did not shard all conditioning tensors consistently; "
                     f"expected {local_tokens} tokens per rank. Check SP hook registration and input dimensions."
                 )
+        timestep_projection_packed = (
+            batch_size == 1
+            and sp_size > 1
+            and self.blocks[0].npu_fused_adaln
+            and timestep_projection.device.type == "npu"
+        )
+        if timestep_projection_packed:
+            # Pack once per forward after SP sharding, before adding each
+            # block's learned modulation. Retain FP32 addition semantics.
+            timestep_projection = timestep_projection.transpose(1, 2).contiguous().float()
         timestep_projection = self._stage_timestep_projection(timestep_projection)
         rotary_emb = (cosine, sine)
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
@@ -1382,6 +1550,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
                 rotary_emb=rotary_emb,
+                timestep_projection_packed=timestep_projection_packed,
             )
             cache.cross_attention[index] = cross_cache
 

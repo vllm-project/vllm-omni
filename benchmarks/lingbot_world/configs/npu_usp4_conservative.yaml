@@ -1,0 +1,39 @@
+# Opt-in precision-preserving NPU operator configuration, eager TP1/Ulysses4.
+# Set VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 for staged history reuse.
+# Leave VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE unset for BF16 attention.
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 464
+      ar_diffusion_width: 832
+      lingbot_npu_host_lengths: true
+      lingbot_npu_host_timestep: true
+      lingbot_cache_block_conditions: true
+      lingbot_npu_fused_rmsnorm: false
+      lingbot_vae_spatial_sharding: false
+      lingbot_npu_vae_spatial_padding: true
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: false
+        reuse_history_staging: true

@@ -463,6 +463,74 @@ def test_lingbot_rms_norm_uses_global_tp_square_mean(monkeypatch) -> None:
 
 
 @pytest.mark.cpu
+def test_npu_rms_norm_provider_normalizes_flat_projection(monkeypatch) -> None:
+    import sys
+    from types import ModuleType
+
+    module = attention_tests._load_module()
+    norm = module._LingBotRMSNorm(hidden_size=8, eps=1e-6)
+    norm.weight.data.copy_(torch.linspace(0.5, 1.5, 8))
+    # Unequal scales in the two hypothetical heads distinguish global RMSNorm
+    # from the incorrect per-head 4-D reduction.
+    value = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]]])
+    calls = []
+    provider = ModuleType("torch_npu")
+
+    def rms_norm(x, weight, *, epsilon):
+        calls.append((x.shape, weight.shape, epsilon))
+        return (torch.nn.functional.rms_norm(x, (8,), weight, epsilon),)
+
+    provider.npu_rms_norm = rms_norm
+    monkeypatch.setitem(sys.modules, "torch_npu", provider)
+    expected = norm(value)
+    from vllm_omni.platforms.npu.models.lingbot_world.norm import projection_rms_norm
+
+    torch.testing.assert_close(projection_rms_norm(value, norm.weight, norm.eps), expected)
+    assert calls == [(torch.Size([1, 1, 8]), torch.Size([8]), 1e-6)]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_npu_rms_norm_option_keeps_cpu_and_tp_reference(monkeypatch, tp_size) -> None:
+    module = attention_tests._load_module()
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(module, "tensor_model_parallel_all_reduce", lambda x: x * tp_size)
+    norm = module._LingBotRMSNorm(hidden_size=8, eps=1e-6)
+    value = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    expected = norm(value)
+    norm.npu_fused = True
+
+    def forbidden(*args):
+        raise AssertionError("CPU and distributed RMSNorm must retain the reference provider")
+
+    from vllm_omni.platforms.npu.models.lingbot_world import norm as npu_norm
+
+    monkeypatch.setattr(npu_norm, "projection_rms_norm", forbidden)
+    torch.testing.assert_close(norm(value), expected, rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_configure_npu_optimizations_is_explicit_and_preserves_state_dict() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module)
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    assert not model.npu_host_lengths
+    assert not model.blocks[0].self_attn.norm_q.npu_fused
+    model.configure_npu_optimizations(host_lengths=True, fused_rmsnorm=True)
+    for block in model.blocks:
+        assert block.self_attn.npu_host_lengths
+        for norm in (block.self_attn.norm_q, block.self_attn.norm_k, block.cross_attn.norm_q, block.cross_attn.norm_k):
+            assert norm.npu_fused
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    model.configure_npu_optimizations()
+    assert not model.npu_host_lengths
+    assert not model.blocks[0].cross_attn.norm_q.npu_fused
+    with pytest.raises(ValueError, match="booleans"):
+        model.configure_npu_optimizations(host_lengths="true")
+
+
+@pytest.mark.cpu
 def test_attention_rejects_heads_not_divisible_by_tp_size(monkeypatch) -> None:
     module = attention_tests._load_module()
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
@@ -1132,3 +1200,70 @@ def test_timestep_projection_is_staged_into_one_static_buffer_per_shape() -> Non
     # A different shape gets its own buffer; the first one is kept.
     other = model._stage_timestep_projection(torch.randn(1, 4, 6, model.dim))
     assert other is not staged_first and len(model._timestep_projection_buffers) == 2
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_packed_timestep_projection_preserves_block_output():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    block = model.blocks[0]
+    hidden = torch.randn(1, 4, model.dim)
+    text = torch.randn(1, 3, model.dim)
+    camera = torch.randn_like(hidden)
+    projection = torch.randn(1, 4, 6, model.dim)
+
+    def run(value, packed):
+        return block(
+            hidden,
+            text,
+            value,
+            camera,
+            self_cache=_cache(module, model).self_attention[0],
+            cross_cache=None,
+            current_start=0,
+            sink_tokens=0,
+            update_cache=False,
+            rotary_emb=None,
+            timestep_projection_packed=packed,
+        )[0]
+
+    torch.testing.assert_close(
+        run(projection, False), run(projection.transpose(1, 2).contiguous(), True), rtol=0, atol=0
+    )
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_block_condition_cache_reuses_pre_sp_projections_without_changing_output():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    video = torch.randn(1, 36, 1, 4, 4)
+    camera = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+    text = torch.randn(1, 3, 6)
+
+    def run(held):
+        return model(
+            video,
+            torch.tensor([1.0]),
+            text,
+            camera,
+            cache=_cache(module, model),
+            start_frame=0,
+            update_cache=False,
+            camera_modulation_cache=held,
+        )
+
+    reference = run(None)
+    model.configure_npu_optimizations(cache_block_conditions=True)
+    calls = attention_tests._record_outputs(model.c2ws_hidden_states_layer1)
+    held = module.CameraModulationCache()
+    for _ in range(3):
+        torch.testing.assert_close(run(held), reference, rtol=0, atol=0)
+    assert len(calls) == 1
+    assert held.prepared is not None
+    run(module.CameraModulationCache())
+    assert len(calls) == 2
+    model.configure_npu_optimizations()
+    run(held)
+    assert len(calls) == 3

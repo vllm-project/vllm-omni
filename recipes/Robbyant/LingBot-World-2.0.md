@@ -73,6 +73,30 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
+## Experimental NPU primitives
+
+Two independent, default-disabled `model_config` options are available for
+device validation. Neither requires the proposed MindIE-SD compile backend:
+
+```yaml
+model_config:
+  lingbot_npu_host_lengths: false
+  lingbot_npu_fused_rmsnorm: false
+```
+
+`lingbot_npu_host_lengths` passes the singleton forward's valid query/KV
+lengths from the CPU context to NPU paged attention, avoiding per-layer
+device-to-host length reads. Padded block-table capacity is not a valid KV
+length. CUDA/ROCm keep their existing custom-op schema. The non-paged replay
+path uses the visible tensor lengths instead.
+
+`lingbot_npu_fused_rmsnorm` selects `torch_npu.npu_rms_norm` for BF16/FP16 NPU
+projections at TP1. It normalizes across the flattened projection width,
+not separately within each attention head. TP greater than one and other
+devices/dtypes retain the original global-square-sum implementation. Different
+reduction/rounding can change outputs; enabling the flag requires numerical
+and full-session quality validation, not just successful inference.
+
 ## Experimental Ascend SP8 output paths
 
 Two independent, default-disabled options are available for the eight-rank
@@ -369,7 +393,10 @@ tested commit.
   latent chunks.
 - SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization methods other than online FP8,
   Cache-DiT, TeaCache, causal-pretrain, and the 1.3B checkpoint are not claimed.
-- No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
+- No AMD GPU or Intel GPU support is claimed. This branch includes opt-in
+  Ascend NPU optimizations with separate accuracy and validation limits; see
+  [the NPU optimization series](../../benchmarks/lingbot_world/NPU_OPTIMIZATIONS.md).
+  This does not establish upstream NPU production acceptance.
 
 ## References
 

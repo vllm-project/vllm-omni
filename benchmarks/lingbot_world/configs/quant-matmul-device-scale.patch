@@ -1,0 +1,6 @@
+--- a/csrc/quant_matmul_activation_quant.cpp
++++ b/csrc/quant_matmul_activation_quant.cpp
+@@ -176,2 +176 @@
+-    at::Tensor scale_cpu = at::zeros(scale_size, at::TensorOptions().dtype(c10::ScalarType::Float8_e8m0fnu));
+-    at::Tensor scale = scale_cpu.to(at::TensorOptions().device(at::kPrivateUse1));
++    at::Tensor scale = at::empty(scale_size, x1.options().dtype(c10::ScalarType::Float8_e8m0fnu));

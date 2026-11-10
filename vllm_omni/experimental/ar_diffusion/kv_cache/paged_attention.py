@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import contiguous_kv_gather_enabled
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping, visible_window_blocks
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
+    _stage_window,
+    compute_slot_mapping,
+    visible_window_blocks,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
@@ -75,6 +79,9 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # Index of the current chunk's first block within the staged window: right after the visible history,
     # which is not the end of the padded block table (that carries at least one action-capacity block).
     stage_first_block: int = 0
+    # Opt-in NPU eager metadata, owned by this forward. CUDA/compiled callers
+    # retain None so growing sequence lengths do not introduce Python guards.
+    npu_lengths: tuple[int, int] | None = None
 
 
 @dataclass
@@ -421,10 +428,10 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
-        self._prepare_history_staging(action_len)
+        self._prepare_history_staging(action_len, allow_partial_blocks=torch.device(device).type == "npu")
         self._prepared = True
 
-    def _prepare_history_staging(self, action_len: int) -> None:
+    def _prepare_history_staging(self, action_len: int, *, allow_partial_blocks: bool = False) -> None:
         """Decide whether this forward can keep the history already staged, and from where.
 
         The staged window is only reusable when nothing about it moved: the same session adapter, the same
@@ -456,14 +463,16 @@ class ARDiffusionPagedForwardContext:
             int(self.adapter.num_computed_tokens),
             tuple(self.history_block_ids),
             int(self.max_seq_len),
+            int(self.kv_len),
             int(self.seq_len),
         )
         same_session = state.adapter is not None and state.adapter() is self.adapter
         # A chunk that is not a whole number of blocks shares its first block with the history's tail (see
-        # ensure_video_slots), and the attention op restages the current chunk in whole blocks of its own,
-        # so such a forward restages the whole window instead.
+        # ensure_video_slots). CUDA/ROCm retain their full-restage policy. NPU
+        # explicitly refreshes whole current blocks, including this boundary,
+        # so it can retain the earlier complete history blocks.
         block_aligned = self.start_offset == 0 and self.seq_len % self.block_size == 0
-        reuse = same_session and state.signature == signature and block_aligned
+        reuse = same_session and state.signature == signature and (block_aligned or allow_partial_blocks)
         state.adapter = weakref.ref(self.adapter)
         state.signature = signature
         self.staging_enabled = True
@@ -471,7 +480,9 @@ class ARDiffusionPagedForwardContext:
         # ``kv_len`` is the visible video window here (no action tokens on this path): the current chunk's
         # blocks are its last ``num_current_video_blocks`` entries, and the table's trailing padding blocks
         # come after them.
-        self.stage_first_block = self.kv_len // self.block_size - self.num_current_video_blocks
+        # NPU copies whole current blocks, including a boundary shared with history.
+        # Ceil is essential when the last current block is partially occupied.
+        self.stage_first_block = (self.kv_len + self.block_size - 1) // self.block_size - self.num_current_video_blocks
 
     def history_staging(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return the manager-owned tensors marked static for CUDA Graph input mutation.
@@ -624,22 +635,6 @@ def _reference_paged_attention(
 _FA_VERSION_BY_HEAD_SIZE: dict[int, int] = {}
 
 
-def _stage_window(stage_key, stage_value, key_cache, value_cache, block_ids, n_blocks, block_size, *, first_block):
-    """Gather visible blocks from ``first_block`` onward into the staging buffers.
-
-    ``first_block`` is 0 for a full restage and the index of the current chunk's first block when the
-    history is already staged. Skipping the leading blocks is the whole point: they were gathered by an
-    earlier forward of the same AR block and cannot have changed since.
-    """
-    ids = block_ids[first_block:]
-    # Write directly into the caller-owned window, avoiding an intermediate
-    # gathered tensor and its copy on every layer and denoising step.
-    torch.index_select(key_cache, 0, ids, out=stage_key.view(n_blocks, block_size, *key_cache.shape[2:])[first_block:])
-    torch.index_select(
-        value_cache, 0, ids, out=stage_value.view(n_blocks, block_size, *value_cache.shape[2:])[first_block:]
-    )
-
-
 def _resolve_fa_version(head_size: int) -> int:
     # get_flash_attn_version -> current_platform.get_device_capability() is not
     # dynamo-traceable, and the answer is fixed per head size for the process.
@@ -718,6 +713,9 @@ def ar_diffusion_paged_attention(
     reuse_history: bool = False,
     current_tokens: int = 0,
     stage_first_block: int = 0,
+    npu_lengths: tuple[int, int] | None = None,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
     """Run non-causal paged attention over a vLLM block table.
 
@@ -732,43 +730,26 @@ def ar_diffusion_paged_attention(
         query_flat = query
 
     if query_flat.device.type == "npu":
-        # NPU: gather the visible blocks on device, then run the fused
-        # npu_fusion_attention kernel over the packed (contiguous) window.
-        # Mirrors the ROCm gather path; the reference implementation below is
-        # the correctness oracle but pays per-block gathers and fp32 einsum.
-        import torch_npu
+        from vllm_omni.platforms.npu.attention.ar_diffusion_paged import npu_paged_attention
 
-        # Gather whole blocks in one index_select instead of per-token
-        # advanced indexing: the block-major flatten + truncate is byte-identical
-        # (same block_table row mapping) and measurably faster on NPU
-        # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
-        # SP8 on 910C; 477-frame precodec output bit-identical).
-        block_size = key_cache.shape[1]
-        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
-        block_ids = block_table[0, :num_blocks].long()
-        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        kv_len = int(seq_lens[0].item())
-        packed_k = gathered_k[:kv_len]
-        packed_v = gathered_v[:kv_len]
-        # TND layout: per-sequence lengths and their cu_seqlens prefixes.
-        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
-        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
-        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
-        out = torch_npu.npu_fusion_attention(
-            query_flat.contiguous(),
-            packed_k.contiguous(),
-            packed_v.contiguous(),
-            head_num=query_flat.shape[1],
-            input_layout="TND",
-            actual_seq_qlen=actual_seq_q,
-            actual_seq_kvlen=actual_seq_kv,
-            scale=float(softmax_scale),
-            keep_prob=1.0,
-        )[0]
-        if batched:
-            return out.reshape(query.shape)
-        return out
+        return npu_paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            block_table=block_table,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            host_lengths=npu_lengths,
+            fp8_fa_mode=fp8_fa_mode,
+            rotate_qk=rotate_qk,
+            stage_key=stage_key,
+            stage_value=stage_value,
+            reuse_history=reuse_history,
+            stage_first_block=stage_first_block,
+        )
 
     if not query_flat.is_cuda:
         out = _reference_paged_attention(
@@ -942,12 +923,17 @@ def _paged_write_attn_impl(
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
     stage_first_block: int = 0,
+    npu_lengths: tuple[int, int] | None = None,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
-    key_pool[video_slots] = k_curr.to(key_pool.dtype)
-    value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    from vllm_omni.experimental.ar_diffusion.kv_cache.slot_write import write_kv_slots
+
+    write_kv_slots(key_pool, video_slots, k_curr)
+    write_kv_slots(value_pool, video_slots, v_curr)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        key_pool[action_slots] = k_act.to(key_pool.dtype)
-        value_pool[action_slots] = v_act.to(value_pool.dtype)
+        write_kv_slots(key_pool, action_slots, k_act)
+        write_kv_slots(value_pool, action_slots, v_act)
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(
@@ -966,6 +952,9 @@ def _paged_write_attn_impl(
         reuse_history=reuse_history,
         current_tokens=int(k_curr.shape[0]),
         stage_first_block=stage_first_block,
+        npu_lengths=npu_lengths,
+        fp8_fa_mode=fp8_fa_mode,
+        rotate_qk=rotate_qk,
     )
 
 
@@ -1050,10 +1039,136 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         return torch.empty_like(query)
 
 
+if not hasattr(torch.ops.vllm_omni, "ar_diffusion_npu_paged_write_attn"):
+    # Separate schema keeps CUDA/ROCm's compiled operator and its Python guards
+    # unchanged. NPU staging is explicit mutable state of this operator.
+    @torch.library.custom_op(
+        "vllm_omni::ar_diffusion_npu_paged_write_attn",
+        mutates_args=("key_pool", "value_pool", "stage_key", "stage_value"),
+    )
+    def _npu_paged_write_attn_op(
+        query: torch.Tensor,
+        k_curr: torch.Tensor,
+        v_curr: torch.Tensor,
+        k_act: torch.Tensor | None,
+        v_act: torch.Tensor | None,
+        key_pool: torch.Tensor,
+        value_pool: torch.Tensor,
+        block_size: int,
+        video_slots: torch.Tensor,
+        action_slots: torch.Tensor,
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_query_len: int,
+        max_seq_len: int,
+        softmax_scale: float,
+        query_len: int,
+        kv_len: int,
+        stage_key: torch.Tensor,
+        stage_value: torch.Tensor,
+        reuse_history: bool,
+        stage_first_block: int,
+        fp8_fa_mode: str = "",
+        rotate_qk: bool = False,
+    ) -> torch.Tensor:
+        return _paged_write_attn_impl(
+            query,
+            k_curr,
+            v_curr,
+            k_act,
+            v_act,
+            key_pool,
+            value_pool,
+            block_size,
+            video_slots,
+            action_slots,
+            block_table,
+            query_start_loc,
+            seq_lens,
+            max_query_len,
+            max_seq_len,
+            softmax_scale,
+            stage_key=stage_key,
+            stage_value=stage_value,
+            reuse_history=reuse_history,
+            stage_first_block=stage_first_block,
+            npu_lengths=(query_len, kv_len),
+            fp8_fa_mode=fp8_fa_mode,
+            rotate_qk=rotate_qk,
+        )
+
+    @_npu_paged_write_attn_op.register_fake
+    def _(
+        query,
+        k_curr,
+        v_curr,
+        k_act,
+        v_act,
+        key_pool,
+        value_pool,
+        block_size,
+        video_slots,
+        action_slots,
+        block_table,
+        query_start_loc,
+        seq_lens,
+        max_query_len,
+        max_seq_len,
+        softmax_scale,
+        query_len,
+        kv_len,
+        stage_key,
+        stage_value,
+        reuse_history,
+        stage_first_block,
+        fp8_fa_mode="",
+        rotate_qk=False,
+    ):
+        return torch.empty_like(query)
+
+
 def paged_write_attn(
-    inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act, softmax_scale: float
+    inputs: ARDiffusionPagedLayerInputs,
+    query,
+    k_curr,
+    v_curr,
+    k_act,
+    v_act,
+    softmax_scale: float,
+    *,
+    fp8_fa_mode: str = "",
+    rotate_qk: bool = False,
 ) -> torch.Tensor:
     """Model-facing entry: routes through the custom op (traceable in fullgraph)."""
+    if fp8_fa_mode and inputs.npu_lengths is None:
+        raise ValueError("Paged FP8 FIA requires lingbot_npu_host_lengths")
+    if inputs.npu_lengths is not None and query.device.type == "npu":
+        return torch.ops.vllm_omni.ar_diffusion_npu_paged_write_attn(
+            query,
+            k_curr,
+            v_curr,
+            k_act,
+            v_act,
+            inputs.key_pool,
+            inputs.value_pool,
+            inputs.block_size,
+            inputs.video_slots,
+            inputs.action_slots,
+            inputs.block_table,
+            inputs.query_start_loc,
+            inputs.seq_lens,
+            inputs.max_query_len,
+            inputs.max_seq_len,
+            softmax_scale,
+            *inputs.npu_lengths,
+            inputs.stage_key,
+            inputs.stage_value,
+            inputs.reuse_history,
+            inputs.stage_first_block,
+            fp8_fa_mode,
+            rotate_qk,
+        )
     return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
         query,
         k_curr,

@@ -71,9 +71,10 @@ def test_allgather_preserves_source_order_and_trim(pixel_modules, monkeypatch, d
     assert all(torch.equal(value, old) for value, old in zip(shards, snapshots, strict=True))
 
 
-def test_root_batch_receive_order_and_wait(pixel_modules, monkeypatch):
+@pytest.mark.parametrize("degree", [2, 4, 8])
+def test_root_batch_receive_order_and_wait(pixel_modules, monkeypatch, degree):
     pixels, _ = pixel_modules
-    shards = [torch.full((1, 3, 2, 3, 2), rank / 8, dtype=torch.bfloat16) for rank in range(8)]
+    shards = [torch.full((1, 3, 2, 3, 2), rank / degree, dtype=torch.bfloat16) for rank in range(degree)]
     ordered = []
 
     class Work:
@@ -86,16 +87,17 @@ def test_root_batch_receive_order_and_wait(pixel_modules, monkeypatch):
         tensor.copy_(pixels.exact_planar_pixels(shards[peer - 10]))
         return object()
 
-    policy = pixels.PixelOutputPolicy("root_uint8_p2p", object(), 0, 8)
+    policy = pixels.PixelOutputPolicy("root_uint8_p2p", object(), 0, degree)
     monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: rank + 10)
     monkeypatch.setattr(torch.distributed, "P2POp", op)
     monkeypatch.setattr(torch.distributed, "batch_isend_irecv", lambda ops: [Work() for _ in ops])
-    out = pixels.gather_final_pixels(shards[0], policy=policy, split_dim="width", expected_extent=16)
-    assert ordered == list(range(11, 18)) + ["wait"] * 7
+    out = pixels.gather_final_pixels(shards[0], policy=policy, split_dim="width", expected_extent=2 * degree)
+    assert ordered == list(range(11, 10 + degree)) + ["wait"] * (degree - 1)
     assert torch.equal(out, pixels.exact_planar_pixels(torch.cat(shards, dim=4)))
 
 
-def test_nonprimary_batch_sends_only_to_group_primary(pixel_modules, monkeypatch):
+@pytest.mark.parametrize("degree", [2, 4, 8])
+def test_nonprimary_batch_sends_only_to_group_primary(pixel_modules, monkeypatch, degree):
     pixels, _ = pixel_modules
     shard = torch.full((1, 3, 2, 3, 2), 0.25, dtype=torch.bfloat16)
     old = shard.clone()
@@ -112,11 +114,11 @@ def test_nonprimary_batch_sends_only_to_group_primary(pixel_modules, monkeypatch
         operations.append((fn, peer, group))
         return operations[-1]
 
-    policy = pixels.PixelOutputPolicy("root_uint8_p2p", object(), 5, 8)
+    policy = pixels.PixelOutputPolicy("root_uint8_p2p", object(), degree - 1, degree)
     monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: rank + 10)
     monkeypatch.setattr(torch.distributed, "P2POp", op)
     monkeypatch.setattr(torch.distributed, "batch_isend_irecv", lambda ops: [Work() for _ in ops])
-    out = pixels.gather_final_pixels(shard, policy=policy, split_dim="width", expected_extent=16)
+    out = pixels.gather_final_pixels(shard, policy=policy, split_dim="width", expected_extent=2 * degree)
     assert out.numel() == 0 and len(operations) == len(waits) == 1
     assert torch.equal(shard, old)
 

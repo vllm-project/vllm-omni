@@ -317,3 +317,19 @@ class ChunkWindowSpec(SlidingWindowSpec):
                 f"window_chunks * chunk_size ({self.window_chunks} * "
                 f"{self.chunk_size}), got {self.sliding_window}"
             )
+
+
+def _stage_window(stage_key, stage_value, key_cache, value_cache, block_ids, n_blocks, block_size, *, first_block):
+    """Gather visible blocks from ``first_block`` onward into the staging buffers.
+
+    ``first_block`` is 0 for a full restage and the index of the current chunk's first block when the
+    history is already staged. Skipping the leading blocks is the whole point: they were gathered by an
+    earlier forward of the same AR block and cannot have changed since.
+    """
+    ids = block_ids[first_block:]
+    # Write directly into the caller-owned window, avoiding an intermediate
+    # gathered tensor and its copy on every layer and denoising step.
+    torch.index_select(key_cache, 0, ids, out=stage_key.view(n_blocks, block_size, *key_cache.shape[2:])[first_block:])
+    torch.index_select(
+        value_cache, 0, ids, out=stage_value.view(n_blocks, block_size, *value_cache.shape[2:])[first_block:]
+    )

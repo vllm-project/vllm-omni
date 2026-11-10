@@ -222,3 +222,10 @@ handling against a scripted WebSocket server. It needs no GPU:
 ```bash
 pytest tests/benchmarks/test_lingbot_world_realtime.py
 ```
+# Ascend SP4 stacked experiment
+
+`configs/npu_usp4_fp8_stacked.yaml` adds last-step KV reuse, spatially sharded exact Wan decoding, and rank-zero uint8 P2P to the experimental MXFP8 stack. Use the official Example 03 image, prompt and action trajectory for the realtime workload. Use physical device visibility to map the four local ranks. The preset selects C8V16 Tiling512 through the self-attention deploy configuration. Set `VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1` to enable compatible head-major staging.
+
+For the fused FFN, copy the matching CANN 9.2 `cann_ops_nn` package to an isolated overlay. From the copy's package root apply `configs/quant-matmul-device-scale.patch` with `git apply --unidiff-zero`, then prepend the overlay parent to `PYTHONPATH`. Use a separate `TORCH_EXTENSIONS_DIR` for the modified wrapper. The device allocation patch was checked for widths divisible by 64, including LingBot's 13824-wide FFN. The fused path changes intermediate rounding compared with the separate BF16 GELU path.
+
+The preset is experimental. Last-step KV reuse changes which denoising state is stored, and sharded decode can differ at shard borders. The combined preset requires separate end-to-end and video-quality validation.

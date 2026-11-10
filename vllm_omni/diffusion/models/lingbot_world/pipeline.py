@@ -612,6 +612,21 @@ class LingBotWorldCausalDMDPipeline(
         parallel_config = getattr(od_config, "parallel_config", None)
         self.od_config = od_config
         model_config = getattr(od_config, "model_config", None) or {}
+        cache_block_conditions = model_config.get("lingbot_cache_block_conditions", False)
+        if type(cache_block_conditions) is not bool:
+            raise ValueError("lingbot_cache_block_conditions must be a boolean")
+        npu_host_lengths = model_config.get("lingbot_npu_host_lengths", False)
+        npu_fused_rmsnorm = model_config.get("lingbot_npu_fused_rmsnorm", False)
+        npu_fused_adaln = model_config.get("lingbot_npu_fused_adaln", False)
+        npu_fused_residual = model_config.get("lingbot_npu_fused_residual", False)
+        npu_fused_mxfp8_ffn = model_config.get("lingbot_npu_fused_mxfp8_ffn", False)
+        if any(type(option) is not bool for option in (npu_fused_adaln, npu_fused_residual, npu_fused_mxfp8_ffn)):
+            raise ValueError("LingBot NPU fusion options must be booleans")
+        self._lingbot_npu_host_timestep = model_config.get("lingbot_npu_host_timestep", False)
+        if type(self._lingbot_npu_host_timestep) is not bool:
+            raise ValueError("lingbot_npu_host_timestep must be boolean")
+        if type(npu_host_lengths) is not bool or type(npu_fused_rmsnorm) is not bool:
+            raise ValueError("lingbot_npu_host_lengths and lingbot_npu_fused_rmsnorm must be booleans")
         from vllm_omni.diffusion.models.lingbot_world.pixel_output import validate_mode
 
         self._lingbot_pixel_output_mode = validate_mode(model_config.get("lingbot_npu_pixel_output_mode", "native"))
@@ -632,6 +647,10 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
         self.device = get_local_device()
+        if self._lingbot_npu_host_timestep and (
+            not od_config.enforce_eager or self.device.type not in ("npu", "privateuseone")
+        ):
+            raise ValueError("lingbot_npu_host_timestep requires eager NPU execution")
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -682,11 +701,40 @@ class LingBotWorldCausalDMDPipeline(
             self.vae = self.vae.to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        online_quant = model_config.get("lingbot_npu_online_quant")
+        self._lingbot_online_quant = online_quant
+        quant_config = getattr(od_config, "quantization_config", None)
+        if online_quant is not None:
+            if self.device.type not in ("npu", "privateuseone"):
+                raise ValueError("lingbot_npu_online_quant requires the NPU backend")
+            from vllm_omni.platforms.npu.models.lingbot_world.quantization import online_mxfp8_config
+
+            quant_config = online_mxfp8_config(
+                online_quant, quant_config, num_layers=transformer_config.get("num_layers", 40)
+            )
         self.transformer = CausalLingBotWorldTransformer3DModel.from_config(
             transformer_config,
-            quant_config=getattr(od_config, "quantization_config", None),
+            quant_config=quant_config,
             prefix="transformer",
         )
+        if any(
+            (
+                npu_host_lengths,
+                npu_fused_rmsnorm,
+                cache_block_conditions,
+                npu_fused_adaln,
+                npu_fused_residual,
+                npu_fused_mxfp8_ffn,
+            )
+        ):
+            self.transformer.configure_npu_optimizations(
+                host_lengths=npu_host_lengths,
+                fused_rmsnorm=npu_fused_rmsnorm,
+                cache_block_conditions=cache_block_conditions,
+                fused_adaln=npu_fused_adaln,
+                fused_residual=npu_fused_residual,
+                fused_mxfp8_ffn=npu_fused_mxfp8_ffn,
+            )
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)
@@ -741,6 +789,15 @@ class LingBotWorldCausalDMDPipeline(
         if sequence_parallel_size > 1 and vae_sharding:
             self._install_sharded_vae_decode(sequence_parallel_size)
         fast_path_level = _vae_decode_fast_path(model_config)
+        npu_spatial_padding = model_config.get("lingbot_npu_vae_spatial_padding", False)
+        if type(npu_spatial_padding) is not bool:
+            raise ValueError("lingbot_npu_vae_spatial_padding must be boolean")
+        if npu_spatial_padding:
+            if vae_sharding or fast_path_level is not None:
+                raise ValueError("NPU VAE spatial padding requires unsharded VAE and no other decoder fast path")
+            from vllm_omni.platforms.npu.models.lingbot_world.vae import install_spatial_padding
+
+            logger.info("LingBot NPU VAE padding: %d convolutions", install_spatial_padding(self.vae))
         if fast_path_level is not None:
             # Install after sharding so its conv wrappers get persistent buffers. The VAE parameters
             # already use the stage dtype, so no autocast parameter cast is needed.
@@ -1448,6 +1505,7 @@ class LingBotWorldCausalDMDPipeline(
                 enforce_eager=bool(self.od_config.enforce_eager),
                 reuse_last_step_kv=self._reuse_last_step_kv,
                 first_block_kv_cpu_limit_bytes=self._first_block_kv_cpu_limit_bytes,
+                npu_host_timestep=getattr(self, "_lingbot_npu_host_timestep", False),
             )
             self._dmd_block_runner = runner
         return runner
@@ -1905,7 +1963,7 @@ class LingBotWorldCausalDMDPipeline(
             from vllm_omni.diffusion.models.lingbot_world.pixel_output import PixelOutputPolicy
 
             group, degree = self._vae_shard_group()
-            if degree == 8:
+            if degree == 8 or (degree in (2, 4) and mode == "root_uint8_p2p"):
                 pixel_policy = PixelOutputPolicy(mode, group, dist.get_rank(group), degree)
         if decoder is None:
             video = self.vae.decode(vae_latents, return_dict=False)[0]
@@ -2327,6 +2385,10 @@ class LingBotWorldCausalDMDPipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded = cast(set[str], loader.load_weights(weights))
+        if self._lingbot_online_quant == "mxfp8":
+            from vllm_omni.platforms.npu.models.lingbot_world.quantization import validate_online_mxfp8_weights
+
+            validate_online_mxfp8_weights(self.transformer)
         self.advance_conditioning_projection_revision()
         if self._lingbot_leased_post_attention:
             from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import install
