@@ -41,10 +41,20 @@ flowchart LR
 | `models/diffusion_models/` | [rt_detr_v4-x-hgnet_fp16.safetensors](https://huggingface.co/Comfy-Org/SDPose/resolve/main/diffusion_models/rt_detr_v4-x-hgnet_fp16.safetensors) |
 
 H3 generation runs on the server. Preprocessing runs on the ComfyUI host;
-SDPose benefits from a GPU. The initial server configuration uses resident BF16
-weights and two-way tensor parallelism. Keep the Base configuration while
-validating this workflow; Turbo and other acceleration settings need their own
-validation.
+SDPose benefits from a GPU. The template defaults to Base40 with video/audio
+flow shifts 12/3. The single-GPU Turbo regression below uses a separate, explicit
+LoRA and sampling configuration.
+
+On a shared server, select a result directory writable by the account running
+vLLM-Omni before starting the service:
+
+```bash
+export VLLM_OMNI_SERVER_STORAGE__PATH="$HOME/.cache/vllm-omni/storage"
+mkdir -p "$VLLM_OMNI_SERVER_STORAGE__PATH"
+```
+
+The default `/tmp/storage` may belong to another account. If it is unwritable,
+inference can finish but saving the generated video fails with HTTP 500.
 
 ## Prepare the default source
 
@@ -100,9 +110,10 @@ and generated audio returned by H3. Input hints are encoded by CTRL-02 as
 H.264 at CRF 0; static masks use thresholded PNG.
 
 Generate Video uses **duration** in seconds. Set it to **5.167** at 24 FPS
-for a 124-frame request. H3 Params contains only the two flow shifts; the client
-derives `16:9` from the generation width and height. Keep the optional FastH3
-input disconnected for this ordinary H3 + Union deployment.
+for a 124-frame request. H3 Params supplies the video/audio flow shifts and
+`audio_mode=native`; the client derives `16:9` from the generation width and
+height. Keep the optional FastH3 input disconnected for this ordinary H3 +
+Union deployment.
 
 ## Switch modes
 
@@ -255,13 +266,35 @@ synchronization still need listening review.
 This workflow remains under development. Track the downstream observations
 in [CTRL-01 #7479](https://github.com/vllm-project/vllm-omni/pull/7479#discussion_r4000369021)
 and the client dependency in [CTRL-02 #7492](https://github.com/vllm-project/vllm-omni/pull/7492).
-The updated workflow targets the duration input introduced by main #7456 and
-CTRL-02 `562cf1f74`. It uses the shared audio rewind fix from main and the
-real audio regression tests now included in CTRL-02. The results above describe
-the earlier implementation; real UI and GPU validation of the migrated graph
-remain pending. Before delivery, compare
-Canny/Inpaint with the reference runtime using matching inputs and effective
-sampling schedules, and repeat the affected quality checks.
+The current graph uses the duration input, `audio_mode=native`, and the final
+`Generate Video.control` port. It retains main's audio rewind fix and the real
+audio regression tests included in CTRL-02. The results above retain their
+original revision and sampling convention.
+
+### Canny regression (2026-11-08)
+
+Revision `9c1344e39`, including CTRL-02 `7d7966e7`, completed real ComfyUI Canny
+generation and save/close/reopen checks. The run used H3 FL2VA, original Union v1,
+and LightX2V Turbo 4-step v1.0 768p BF16 LoRA: 4 forwards, seed 43, video/audio
+shifts 6/3, CFG/control/LoRA scales 1, and 124 frames at 1344x768/24 FPS. It used
+one GPU, CUDNN_ATTN, eager execution, VAE tiling and no offload or exact AdaLN
+cache. Backend versions were vLLM 0.33.0 and Torch 2.14.0; ComfyUI 0.35.0,
+frontend 1.52.7 and PyAV 18.0.0 were used for the client.
+
+All 124 uploaded Canny frames matched independent extraction. Output frame
+count, timestamps and generated audio were preserved, and saved node values
+and links survived reopening. The first attempt failed when saving to an
+unwritable default storage directory. After configuring a writable directory,
+the same request succeeded: API inference 48.7 seconds, sampling about
+27.5 seconds and sampled GPU peak 134.0 GiB. The successful UI retry took
+57.4 seconds with cached Canny; the initial uncached pre-POST preparation took
+406.6 seconds. These are single-case regression timings.
+
+The dancer still deviates from the source pose around one second and the
+server audio remains very quiet (RMS about `6.03e-5`). Motion/face/audio quality
+acceptance and a matched author-native Turbo comparison remain open. The
+ordinary no-Control and minimum Inpaint regressions after the November rebase
+also remain pending.
 
 ## References
 
