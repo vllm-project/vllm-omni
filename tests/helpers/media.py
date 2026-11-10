@@ -891,13 +891,16 @@ def _whisper_transcribe_in_current_process(
         # tuple, so temperature_fallback is intentionally ignored on this path.
         text = _hf_whisper_transcribe(output_path, model_size, language)
     else:
+        model = _get_whisper_model(model_size)
         if temperature_fallback:
             import torch
 
             # Seed only the isolated ASR worker. This keeps fallback sampling
             # reproducible without modifying the model server or pytest RNG state.
+            # Load first: the first call constructs Whisper(dims) and draws from
+            # the CPU generator during nn init, so seeding before it would make
+            # the first fallback transcription differ from later cached ones.
             torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
-        model = _get_whisper_model(model_size)
         text = model.transcribe(
             output_path,
             temperature=WHISPER_TEMPERATURE_FALLBACK if temperature_fallback else 0.0,
