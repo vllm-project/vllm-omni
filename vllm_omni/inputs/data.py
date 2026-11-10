@@ -415,6 +415,10 @@ class OmniDiffusionSamplingParams:
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
 
+    def resolve_true_cfg_scale(self, default: float) -> float:
+        """Return the explicit true CFG scale or a model-owned default."""
+        return default if self.true_cfg_scale is None else self.true_cfg_scale
+
     @property
     def batch_size(self):
         # This class is changed to only represent a single prompt request
