@@ -559,19 +559,12 @@ class AudioCrossAttention(WanS2VCrossAttention):
 
 
 def _quantize_audio_injector(quant_config: QuantizationConfig | None) -> bool:
-    """Whether the audio injector cross-attentions take the DiT's quant config.
+    """Whether the audio injector cross-attentions take the DiT's quant config (opt-in, default off).
 
-    Default: only online MXFP8 (a BF16 checkpoint quantized at load), where the injector's q/k/v/out GEMMs over
-    every noisy token are the largest S2V-only cost. Pre-quantized checkpoints carry no injector scales, and
-    other methods are unmeasured here, so they keep a BF16 injector.
-    VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1 / =0 forces it on / off.
+    VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1 quantizes the injector's q/k/v/out GEMMs with the DiT's method.
+    Pre-quantized checkpoints carry no injector scales, so this is only meant for online quantization.
     """
-    if quant_config is None:
-        return False
-    forced = os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR")
-    if forced is not None:
-        return forced == "1"
-    return quant_config.get_name() == "mxfp8" and not getattr(quant_config, "is_checkpoint_mxfp8_serialized", True)
+    return quant_config is not None and os.environ.get("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR") == "1"
 
 
 class WanS2VAudioInjectLayer(nn.Module):
@@ -1384,6 +1377,12 @@ class WanS2VTransformer3DModel(nn.Module):
         )
 
         all_modules, all_modules_names = torch_dfs(self.blocks, parent_name="root.transformer_blocks")
+        quantize_injector = _quantize_audio_injector(quant_config)
+        if quantize_injector:
+            # A quantized injector stays out of the compiled regions: on XPU (Arc Pro B70, TP4) online MXFP8
+            # GEMMs inside the compiled WanS2VAudioInjectLayer region lose the device on the first step, while
+            # the same injector run eagerly is fine.
+            self._repeated_blocks = ["WanS2VTransformerBlock"]
         self.audio_injector = AudioInjector_WAN(
             all_modules,
             all_modules_names,
@@ -1394,7 +1393,7 @@ class WanS2VTransformer3DModel(nn.Module):
             enable_adain=enable_adain,
             adain_dim=dim,
             need_adain_ont=adain_mode != "attn_norm",
-            quant_config=quant_config if _quantize_audio_injector(quant_config) else None,
+            quant_config=quant_config if quantize_injector else None,
         )
         self.adain_mode = adain_mode
         # Parameter-free; listed in _repeated_blocks so regional compile covers the audio injection too.

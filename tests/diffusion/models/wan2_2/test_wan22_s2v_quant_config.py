@@ -9,7 +9,7 @@ transformer linear was built with ``quant_config=None``. These tests cover:
   to the S2V transformer, and the default (no quantization) path stays BF16
 - auto-detected startup metadata defers to the checkpoint's own config.json
 - the quant config reaches every transformer-block linear with its module path
-  as prefix, while the audio injector (except under online MXFP8), embedders and proj_out stay unquantized
+  as prefix, while the audio injector (unless VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1), embedders and proj_out stay unquantized
 - the transformer binds its packed QKV mapping to the quant config, so a real
   ignored_layers skip policy on to_q/to_k/to_v covers the fused to_qkv
 
@@ -377,12 +377,9 @@ def test_s2v_audio_injection_matches_inline_reference(tp1_group, monkeypatch, en
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize(
-    ("serialized", "env", "expected"),
-    [(False, None, True), (True, None, False), (False, "0", False), (True, "1", True)],
-)
-def test_s2v_audio_injector_follows_online_mxfp8(tp1_group, monkeypatch, serialized, env, expected):
-    """Online MXFP8 quantizes the injector by default; a pre-quantized MXFP8 checkpoint keeps it BF16; env overrides."""
+@pytest.mark.parametrize(("env", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_s2v_audio_injector_quant_is_opt_in(tp1_group, monkeypatch, env, expected):
+    """The injector stays BF16 under any quant config unless VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1."""
     from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import _quantize_audio_injector
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
@@ -390,6 +387,13 @@ def test_s2v_audio_injector_follows_online_mxfp8(tp1_group, monkeypatch, seriali
         monkeypatch.delenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", raising=False)
     else:
         monkeypatch.setenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", env)
-    config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=serialized)
-    assert _quantize_audio_injector(config) is expected
+    assert _quantize_audio_injector(DiffusionMXFP8Config()) is expected
     assert _quantize_audio_injector(None) is False
+
+
+def test_s2v_quantized_audio_injection_is_not_compiled(tp1_group, monkeypatch):
+    """A quantized injector keeps the injection out of the regionally compiled blocks."""
+    monkeypatch.setenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", "1")
+    model = _tiny_s2v_transformer(_RecordingQuantConfig())
+    assert model._repeated_blocks == ["WanS2VTransformerBlock"]
+    assert "WanS2VAudioInjectLayer" in type(model)._repeated_blocks
