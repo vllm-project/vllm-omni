@@ -14,6 +14,11 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 RATE_KEYS = ("sr", "sample_rate", "audio_sample_rate")
+SPAN_SNAPSHOTS = (
+    ("meta.decode_span", False, True),
+    ("meta.consumed_input_span", False, True),
+    ("meta.committed_token_count", 3, 1),
+)
 
 
 def _state(kind: RequestOutputKind) -> OmniRequestState:
@@ -159,3 +164,59 @@ def test_minicpmo_finished_snapshot_preserves_all_codec_frames(kind):
     assert payload["meta"]["finished"].ndim == 0
     assert payload["meta"]["finished"].item() is True
     torch.testing.assert_close(payload["codes"]["audio"], torch.tensor([10, 11, 12]))
+
+
+@pytest.mark.parametrize("key,first,last", SPAN_SNAPSHOTS)
+@pytest.mark.parametrize("tensor_first", [False, True])
+def test_speculative_span_metadata_replaces_across_representations(key, first, last, tensor_first):
+    first = torch.tensor(first) if tensor_first else first
+    last = last if tensor_first else torch.tensor(last)
+    accumulated = MultimodalPayload.from_dict({key: first})
+    incoming = MultimodalPayload.from_dict({key: last})
+    assert accumulated is not None and incoming is not None
+    accumulated = accumulated.merged_with(incoming)
+    assert accumulated[key] is last
+    assert (key in accumulated.tensors) != (key in accumulated.metadata)
+    accumulated.consolidate_tensors(OutputModality.LATENT)
+    assert accumulated[key] is last
+
+
+@pytest.mark.parametrize("kind", [RequestOutputKind.FINAL_ONLY, RequestOutputKind.CUMULATIVE])
+def test_full_payload_speculative_spans_preserve_ids_embeddings_and_latest_metadata(kind):
+    state = _state(kind)
+    for token_ids in ([10, 11, 12], [13]):
+        ids = torch.tensor(token_ids)
+        state.add_multimodal_tensor(
+            {
+                "ids.output": ids,
+                "hidden_states.layer_0": ids[:, None].expand(-1, 2).float(),
+                "meta.decode_span": torch.tensor(True),
+                "meta.consumed_input_span": torch.tensor(True),
+                "meta.committed_token_count": torch.tensor(len(token_ids)),
+            },
+            "latent",
+        )
+    # These control fields describe the latest span, not concatenated content
+    # or the total number of tokens accumulated for the request.
+    for key, _, last in SPAN_SNAPSHOTS:
+        value = state.mm_accumulated[key]
+        assert isinstance(value, torch.Tensor) and value.ndim == 0
+        assert value.item() == last
+    output = state.make_request_output([], None, FinishReason.STOP, None)
+    assert output is not None and not isinstance(output, PoolingRequestOutput)
+    payload = output.outputs[0].multimodal_output
+    ids = torch.tensor([10, 11, 12, 13])
+    torch.testing.assert_close(payload["ids"]["output"], ids)
+    torch.testing.assert_close(payload["hidden_states"]["layers"][0], ids[:, None].expand(-1, 2).float())
+    for key, _, last in SPAN_SNAPSHOTS:
+        value = payload["meta"][key.removeprefix("meta.")]
+        assert isinstance(value, torch.Tensor) and value.ndim == 0
+        assert value.item() == last
+
+
+@pytest.mark.parametrize("key,first,last", SPAN_SNAPSHOTS)
+def test_deferred_scalar_span_metadata_consolidates_without_cat(key, first, last):
+    payload = MultimodalPayload(tensors={key: [torch.tensor(first), torch.tensor(last)]})
+    payload.consolidate_tensors(OutputModality.LATENT)
+    assert payload[key].ndim == 0
+    assert payload[key].item() == last

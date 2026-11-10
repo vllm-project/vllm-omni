@@ -423,6 +423,13 @@ pending sample or send-offset state. Routing is captured on the execution
 thread; connector cancellation still controls which payloads can be sent.
 The synchronous speculative path retains committed-ID embedding lookup.
 
+When the output processor accumulates full payloads, `meta.decode_span`,
+`meta.consumed_input_span`, and `meta.committed_token_count` retain the latest
+step's values, including when represented as scalar tensors. They are control
+snapshots, not concatenated content; the count describes the latest span rather
+than the accumulated request. Token IDs and layer-0 embedding rows continue to
+accumulate along dimension 0.
+
 Both speculative span formats clip token IDs and embedding rows before the
 first `<tool_call>` marker. The sender retains the existing request-local
 speech-cut state so later tool-argument chunks cannot become Talker input.
