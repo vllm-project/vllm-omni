@@ -34,3 +34,5 @@ Follow-up benchmark should compare BF16 FA, KV-index-copy-only, and dense FP8
 EagleFIA with identical model settings, and report quantization/layout overhead
 separately. Preserve short and long KV cases, three timing trials, independent
 profiling, and output accuracy. Do not combine two changes in one attribution.
+
+EagleFIA requires `model_config.lingbot_npu_host_lengths: true`. Generic NPU paged attention retains its default backend when the environment variable is set.

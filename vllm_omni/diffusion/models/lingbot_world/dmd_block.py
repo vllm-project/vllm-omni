@@ -79,7 +79,7 @@ class LingBotDMDBlockRunner:
             raise ValueError("NPU host timestep frequencies require eager NPU execution")
         self._host_timestep_cache = None
         if npu_host_timestep:
-            from .npu_timestep import HostTimestepFrequencyCache
+            from vllm_omni.platforms.npu.models.lingbot_world.timestep import HostTimestepFrequencyCache
 
             self._host_timestep_cache = HostTimestepFrequencyCache(_sinusoidal_embedding)
         # Experimental approximation: cache x_t/t_last features instead of x0/t=0.

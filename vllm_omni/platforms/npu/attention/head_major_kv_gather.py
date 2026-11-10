@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gather paged BF16 K/V directly into dense head-major EagleFIA inputs."""
 
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit

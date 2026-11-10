@@ -19,3 +19,22 @@ def online_mxfp8_config(mode, existing, *, num_layers: int):
     # Plain nn.Linear time/gate/camera-scale/head modules never enter LinearBase
     # dispatch. Explicitly exclude the parallel camera linears as well.
     return DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=False, ignored_layers=ignored)
+
+
+
+def validate_online_mxfp8_weights(transformer) -> None:
+    from vllm.logger import init_logger
+
+    from vllm_omni.quantization.mxfp8_config import NPUMxfp8OnlineLinearMethod
+
+    quantized = [
+        module
+        for module in transformer.modules()
+        if type(getattr(module, "quant_method", None)) is NPUMxfp8OnlineLinearMethod
+    ]
+    expected = len(transformer.blocks) * 8
+    if len(quantized) != expected or any(
+        module.weight.device.type == "meta" or "float8_e4m3" not in str(module.weight.dtype) for module in quantized
+    ):
+        raise RuntimeError("LingBot online MXFP8 did not materialize all attention/FFN weights")
+    init_logger(__name__).info("LingBot online MXFP8: %d attention/FFN linears; conditioning/gates unchanged", expected)

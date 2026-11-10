@@ -483,7 +483,9 @@ def test_npu_rms_norm_provider_normalizes_flat_projection(monkeypatch) -> None:
     provider.npu_rms_norm = rms_norm
     monkeypatch.setitem(sys.modules, "torch_npu", provider)
     expected = norm(value)
-    torch.testing.assert_close(norm._forward_npu(value), expected)
+    from vllm_omni.platforms.npu.models.lingbot_world.norm import projection_rms_norm
+
+    torch.testing.assert_close(projection_rms_norm(value, norm.weight, norm.eps), expected)
     assert calls == [(torch.Size([1, 1, 8]), torch.Size([8]), 1e-6)]
 
 
@@ -498,10 +500,12 @@ def test_npu_rms_norm_option_keeps_cpu_and_tp_reference(monkeypatch, tp_size) ->
     expected = norm(value)
     norm.npu_fused = True
 
-    def forbidden(x):
+    def forbidden(*args):
         raise AssertionError("CPU and distributed RMSNorm must retain the reference provider")
 
-    monkeypatch.setattr(norm, "_forward_npu", forbidden)
+    from vllm_omni.platforms.npu.models.lingbot_world import norm as npu_norm
+
+    monkeypatch.setattr(npu_norm, "projection_rms_norm", forbidden)
     torch.testing.assert_close(norm(value), expected, rtol=0, atol=0)
 
 

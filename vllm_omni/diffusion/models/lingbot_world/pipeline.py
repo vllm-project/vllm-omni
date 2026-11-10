@@ -701,17 +701,17 @@ class LingBotWorldCausalDMDPipeline(
             self.vae = self.vae.to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        from .npu_quantization import online_mxfp8_config
-
         online_quant = model_config.get("lingbot_npu_online_quant")
         self._lingbot_online_quant = online_quant
-        if online_quant is not None and self.device.type not in ("npu", "privateuseone"):
-            raise ValueError("lingbot_npu_online_quant requires the NPU backend")
-        quant_config = online_mxfp8_config(
-            online_quant,
-            getattr(od_config, "quantization_config", None),
-            num_layers=transformer_config.get("num_layers", 40),
-        )
+        quant_config = getattr(od_config, "quantization_config", None)
+        if online_quant is not None:
+            if self.device.type not in ("npu", "privateuseone"):
+                raise ValueError("lingbot_npu_online_quant requires the NPU backend")
+            from vllm_omni.platforms.npu.models.lingbot_world.quantization import online_mxfp8_config
+
+            quant_config = online_mxfp8_config(
+                online_quant, quant_config, num_layers=transformer_config.get("num_layers", 40)
+            )
         self.transformer = CausalLingBotWorldTransformer3DModel.from_config(
             transformer_config,
             quant_config=quant_config,
@@ -795,7 +795,7 @@ class LingBotWorldCausalDMDPipeline(
         if npu_spatial_padding:
             if vae_sharding or fast_path_level is not None:
                 raise ValueError("NPU VAE spatial padding requires unsharded VAE and no other decoder fast path")
-            from .npu_vae import install_spatial_padding
+            from vllm_omni.platforms.npu.models.lingbot_world.vae import install_spatial_padding
 
             logger.info("LingBot NPU VAE padding: %d convolutions", install_spatial_padding(self.vae))
         if fast_path_level is not None:
@@ -2386,18 +2386,9 @@ class LingBotWorldCausalDMDPipeline(
         loader = AutoWeightsLoader(self)
         loaded = cast(set[str], loader.load_weights(weights))
         if self._lingbot_online_quant == "mxfp8":
-            quantized = [
-                (name, module)
-                for name, module in self.transformer.named_modules()
-                if type(getattr(module, "quant_method", None)).__name__ == "NPUMxfp8OnlineLinearMethod"
-            ]
-            expected = len(self.transformer.blocks) * 8
-            if len(quantized) != expected or any(
-                module.weight.device.type == "meta" or "float8_e4m3" not in str(module.weight.dtype)
-                for _, module in quantized
-            ):
-                raise RuntimeError("LingBot online MXFP8 did not materialize all attention/FFN weights")
-            logger.info("LingBot online MXFP8: %d attention/FFN linears; conditioning/gates unchanged", expected)
+            from vllm_omni.platforms.npu.models.lingbot_world.quantization import validate_online_mxfp8_weights
+
+            validate_online_mxfp8_weights(self.transformer)
         self.advance_conditioning_projection_revision()
         if self._lingbot_leased_post_attention:
             from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import install

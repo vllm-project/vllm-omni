@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _cache(embedding, **kwargs):
-    path = Path(__file__).parents[4] / "vllm_omni/diffusion/models/lingbot_world/npu_timestep.py"
+    path = Path(__file__).parents[4] / "vllm_omni/platforms/npu/models/lingbot_world/timestep.py"
     spec = importlib.util.spec_from_file_location("_host_timestep", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

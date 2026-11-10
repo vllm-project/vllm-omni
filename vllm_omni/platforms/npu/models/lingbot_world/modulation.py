@@ -3,8 +3,7 @@
 """Opt-in LingBot NPU modulation kernels."""
 
 import torch
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit

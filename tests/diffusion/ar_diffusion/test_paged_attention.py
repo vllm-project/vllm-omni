@@ -29,6 +29,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as page
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import KV_GATHER_ENV
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import ChunkWindowManager
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.platforms.npu.attention.ar_diffusion_paged import npu_paged_attention
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -70,7 +71,12 @@ def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, b
         max_seq_len=12,
         softmax_scale=HEAD_DIM**-0.5,
     )
-    reference = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+    reference = npu_paged_attention(query, keys, values, **kwargs)
+    seen.clear()
+    # A process-wide LingBot FP8 option must not change the generic NPU path.
+    with monkeypatch.context() as scoped:
+        scoped.setenv("VLLM_OMNI_AR_DIFFUSION_FP8_FIA_MODE", "C8V16_TILING512")
+        torch.testing.assert_close(npu_paged_attention(query, keys, values, **kwargs), reference)
 
     def readback(*args, **kwargs):
         raise AssertionError("host-length fast path must not read metadata from the device")
@@ -78,7 +84,7 @@ def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, b
     with monkeypatch.context() as guard:
         for name in ("item", "cpu", "tolist"):
             guard.setattr(torch.Tensor, name, readback)
-        actual = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs, host_lengths=(3, 5))
+        actual = npu_paged_attention(query, keys, values, **kwargs, host_lengths=(3, 5))
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     assert seen[0] == seen[1]
     assert seen[1]["actual_seq_qlen"] == [3]
@@ -90,7 +96,7 @@ def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, b
 def test_npu_host_lengths_reject_invalid_singleton_metadata(monkeypatch, lengths):
     monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     with pytest.raises(ValueError, match="matching singleton"):
-        paged_attention_module._npu_paged_attention(
+        npu_paged_attention(
             torch.zeros(3, N_HEADS, HEAD_DIM),
             torch.zeros(3, 4, N_HEADS, HEAD_DIM),
             torch.zeros(3, 4, N_HEADS, HEAD_DIM),
@@ -1438,18 +1444,18 @@ def test_npu_host_lengths_staging_refreshes_partial_boundary_and_reuses_prefix(m
         stage_first_block=1,
     )
     query = torch.randn(11, 1, 2)
-    paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+    npu_paged_attention(query, keys, values, **kwargs)
     prefix = stages[0][:4].clone()
     # Current tokens begin inside logical block 1; restage that whole block,
     # including its history prefix, and the partial last block (logical 2).
     keys[0].add_(2)
     keys[3].sub_(3)
-    output = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs, reuse_history=True)
+    output = npu_paged_attention(query, keys, values, **kwargs, reuse_history=True)
     torch.testing.assert_close(output, keys[table[0]].flatten(0, 1)[:11], rtol=0, atol=0)
     torch.testing.assert_close(stages[0][:4], prefix, rtol=0, atol=0)
     # New session/window restages even the prefix.
     keys[2].add_(7)
-    output = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+    output = npu_paged_attention(query, keys, values, **kwargs)
     torch.testing.assert_close(output, keys[table[0]].flatten(0, 1)[:11], rtol=0, atol=0)
 
 

@@ -9,7 +9,7 @@ from types import ModuleType
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-ROOT = Path(__file__).parents[4] / "vllm_omni/diffusion/models/lingbot_world"
+ROOT = Path(__file__).parents[4] / "vllm_omni/platforms/npu/models/lingbot_world"
 
 
 def load(name):
@@ -20,7 +20,7 @@ def load(name):
 
 
 def test_online_mxfp8_selects_only_attention_and_ffn(monkeypatch):
-    module = load("npu_quantization")
+    module = load("quantization")
     provider = ModuleType("vllm_omni.quantization.mxfp8_config")
     seen = []
     setattr(provider, "DiffusionMXFP8Config", lambda **kw: seen.append(kw) or kw)
@@ -40,4 +40,4 @@ def test_online_mxfp8_selects_only_attention_and_ffn(monkeypatch):
 @pytest.mark.parametrize("mode", ["int8", "fp8", True, ""])
 def test_online_quant_rejects_non_mxfp8(mode):
     with pytest.raises(ValueError, match="mxfp8"):
-        load("npu_quantization").online_mxfp8_config(mode, None, num_layers=40)
+        load("quantization").online_mxfp8_config(mode, None, num_layers=40)

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-ROOT = Path(__file__).parents[4] / "vllm_omni/diffusion/models/lingbot_world"
+ROOT = Path(__file__).parents[4] / "vllm_omni/platforms/npu/models/lingbot_world"
 
 
 def load(name):
@@ -35,7 +35,7 @@ class WanLikeConv(torch.nn.Conv3d):
 
 @pytest.mark.parametrize("history", [0, 1, 2, 3])
 def test_vae_padding_preserves_temporal_cache_and_crop(history):
-    module = load("npu_vae")
+    module = load("vae")
     conv = WanLikeConv()
     x = torch.randn(1, 2, 3, 7, 9)
     cache = torch.randn(1, 2, history, 7, 9) if history else None
@@ -45,7 +45,7 @@ def test_vae_padding_preserves_temporal_cache_and_crop(history):
 
 
 def test_vae_padding_mismatch_returns_reference_and_remembers_fallback(monkeypatch):
-    module = load("npu_vae")
+    module = load("vae")
     conv = WanLikeConv()
     x = torch.randn(1, 2, 3, 7, 9)
     calls = []

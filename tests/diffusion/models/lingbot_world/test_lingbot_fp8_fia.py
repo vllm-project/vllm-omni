@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def load():
-    path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/lingbot_world/npu_fp8_fia.py"
+    path = Path(__file__).resolve().parents[4] / "vllm_omni/platforms/npu/attention/eagle_fp8_fia.py"
     spec = importlib.util.spec_from_file_location("_fp8_fia", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

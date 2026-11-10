@@ -130,7 +130,9 @@ class _LingBotRMSNorm(nn.Module):
             and value.device.type == "npu"
             and value.dtype in (torch.float16, torch.bfloat16)
         ):
-            return self._forward_npu(value)
+            from vllm_omni.platforms.npu.models.lingbot_world.norm import projection_rms_norm
+
+            return projection_rms_norm(value, self.weight, self.eps)
         value_float = value.float()
         sum_of_squares = value_float.pow(2).sum(dim=-1, keepdim=True)
         element_count = value.shape[-1]
@@ -139,13 +141,6 @@ class _LingBotRMSNorm(nn.Module):
             element_count *= tp_size
         rms = torch.sqrt(sum_of_squares / element_count + self.eps)
         return (value_float / rms * self.weight.float()).to(value.dtype)
-
-    def _forward_npu(self, value: torch.Tensor) -> torch.Tensor:
-        # Normalize the flat TP-local projection, NOT each 128-D head. TP>1
-        # must retain the global-square-sum all-reduce in forward().
-        import torch_npu
-
-        return torch_npu.npu_rms_norm(value, self.weight, epsilon=self.eps)[0]
 
 
 def _projection_prefix(prefix: str, name: str) -> str:
@@ -650,9 +645,17 @@ class LingBotAttentionBlock(nn.Module):
         camera_features = camera_features + camera_hidden_states
         return self.cam_scale_layer(camera_features), self.cam_shift_layer(camera_features)
 
-    def _adaln(self, norm, hidden, scale, shift, num_frames, tokens_per_frame):
+    def _adaln(
+        self,
+        norm: nn.Module,
+        hidden: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        num_frames: int,
+        tokens_per_frame: int,
+    ) -> torch.Tensor:
         if self.npu_fused_adaln and hidden.device.type == "npu":
-            from .npu_modulation import adaln
+            from vllm_omni.platforms.npu.models.lingbot_world.modulation import adaln
 
             result = adaln(norm, hidden, scale, shift, tokens_per_frame)
             if result is not None:
@@ -660,9 +663,18 @@ class LingBotAttentionBlock(nn.Module):
         normalized = norm(hidden.float()).unflatten(1, (num_frames, tokens_per_frame))
         return (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden.dtype)
 
-    def _gated_residual(self, hidden, update, gate, tokens_per_frame, *, scale=None, shift=None):
+    def _gated_residual(
+        self,
+        hidden: torch.Tensor,
+        update: torch.Tensor,
+        gate: torch.Tensor,
+        tokens_per_frame: int,
+        *,
+        scale: torch.Tensor | None = None,
+        shift: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.npu_fused_residual and hidden.device.type == "npu":
-            from .npu_modulation import residual_camera
+            from vllm_omni.platforms.npu.models.lingbot_world.modulation import residual_camera
 
             result = residual_camera(hidden, update, gate, tokens_per_frame, scale=scale, shift=shift)
             if result is not None:
@@ -671,6 +683,7 @@ class LingBotAttentionBlock(nn.Module):
         update_grid = update.unflatten(1, (gate.shape[1], tokens_per_frame))
         result = (grid + update_grid * gate).flatten(1, 2).to(hidden.dtype)
         if scale is not None:
+            assert shift is not None
             result = ((1 + scale) * result + shift).to(hidden.dtype)
         return result
 
@@ -758,7 +771,7 @@ class LingBotAttentionBlock(nn.Module):
         normalized = self._adaln(self.norm2, hidden_states, scale_ffn, shift_ffn, num_frames, tokens_per_frame)
         ffn_output = None
         if self.npu_fused_mxfp8_ffn and get_tensor_model_parallel_world_size() == 1:
-            from .npu_ffn import fused_mxfp8_ffn
+            from vllm_omni.platforms.npu.models.lingbot_world.ffn import fused_mxfp8_ffn
 
             ffn_output = fused_mxfp8_ffn(normalized, self.ffn[0], self.ffn[2])
         if ffn_output is None:
