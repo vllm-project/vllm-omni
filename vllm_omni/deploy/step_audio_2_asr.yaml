@@ -6,6 +6,11 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
+    # Optional: encoder length bucketing (off by default; encoder output
+    # numerically unchanged for this mask-aware encoder). See
+    # docs/features/encoder_length_bucketing.md
+    # additional_config:
+    #   audio_bucket_seconds: [2, 4, 8, 16, 30]
     devices: "0,1"
     tensor_parallel_size: 2
     max_num_seqs: 1

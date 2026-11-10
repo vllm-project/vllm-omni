@@ -413,6 +413,66 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
+### Encoder length bucketing
+
+For a quick start (enable via deploy YAML or `--stage-overrides`), see the
+[Encoder Length Bucketing](../features/encoder_length_bucketing.md) user guide.
+
+`stages[].additional_config.audio_bucket_seconds` enables length bucketing for
+variable-length encoders on that stage. The feature is **off by default** —
+unset (or `[]`) disables it — because the path is lossy for some encoder
+classes (see the numerical classification below), so each deployment opts in
+explicitly. Enable it on the encoder-owning stage only:
+
+```yaml
+stages:
+  - stage_id: 0
+    additional_config:
+      audio_bucket_seconds: [2, 4, 8, 16, 30]
+```
+
+It applies only to encoder call sites that feed one globally padded batch
+(inputs at a non-true, batch/global padded length); call sites already feeding
+true-length or length-packed inputs have no padding waste to recover and fall
+back to the original forward — and the wrapper enforces this per batch, not
+just per call site: each rung window is capped at the batch's time extent, and
+the bucketed path runs only when the capped windows are strictly shorter in
+aggregate, so batches with no padding waste to recover (single audio, uniform
+lengths) compute exactly as they do with the feature off. When a wrapped
+encoder's call is ineligible (keyword args, non-CUDA, no per-item lengths
+carried on the call, unsupported output, no matching fixed-window recipe, or
+over-long/empty batches), the wrapper returns the untouched forward unchanged;
+the missing-lengths fallback warns once per encoder, so a feature that never
+engages is visible instead of silent.
+
+Numerically, the path is **lossy for unmasked, absolute-positional encoders**
+(the fixed-window Whisper family, e.g. Covo-Audio-Chat): feature-off attends
+over the full extractor padding while the bucketed path attends over the
+smaller rung window, so the two outputs differ. **Mask-aware encoders keep the
+encoder output numerically unchanged** (e.g. Step-Audio-2-mini, whose
+`AudioEncoder` masks padding via `make_non_pad_mask`).
+
+The bucketed copy never drops real frames. The rung window is the model's own
+per-item length, carried on the encoder call as an argument (Step-Audio-2's
+`audio_lens`; Covo's `audio_num_tokens`, scaled by 16 to mel frames) plus a
+per-model `context_margin` covering the frames the model carries past its
+reported length and the front conv's boundary read, so the window never
+truncates real content and overshoots it by at most one frame (Covo's
+token-scaled length bounds the frames from above instead, over-copying at most
+15 frames of the extractor's own padding). Each rung window is a slice of the
+carried input: the frames past an item's real content keep the extractor's own
+pad value — Whisper-style extraction pads at the log-mel silence floor
+`(max - 4) / 4`, not 0 — and are never zero-filled, so the window frames are
+exactly the ones the un-bucketed forward would read. Per-model derivations
+live next to `_VERIFIED_MODELS` in `vllm_omni/worker/bucketed_encoder.py`; the
+window properties are swept in `tests/worker/test_bucketed_encoder.py`. These
+are mel-window and encoder-boundary guarantees only; neither establishes
+end-to-end transcript equivalence.
+
+| `additional_config.audio_bucket_seconds` | List of float seconds; unset or `[]` disables bucketing — the feature is off by default | Enables length bucketing for encoders on that stage; each rung is `seconds * frames_per_second` mel frames, where `frames_per_second` is the model's verified mel frame rate (see `_VERIFIED_MODELS`). Read when the encoder-owning model installs bucketed encoders at construction | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). The encoder-owning model declares its encoder to the installer at construction — nothing is discovered by name — and a model not in the whitelist means the feature is a no-op with a warning at install. A malformed value (non-list, or a non-numeric / non-positive entry) raises `ValueError` at model construction. | Experimental |
+
+> The per-model knobs (`frames_per_second`, `frames_per_length`, `context_margin`, `time_axis`, `output_kind`) are not user-facing settings — they live in the verified-model whitelist `_VERIFIED_MODELS`, keyed by pipeline `model_type`. Only `audio_bucket_seconds` is a user-facing deployment setting; a model not in the whitelist cannot enable bucketing.
+
 ### CLI flags
 
 | Flag | Description |
