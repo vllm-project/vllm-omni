@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
 from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
 from vllm_omni.diffusion.models.physis.wan.pipeline_config import PHYSIS_WAN_PIPELINE
@@ -215,6 +216,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
+    "moss_image": MOSS_IMAGE_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
