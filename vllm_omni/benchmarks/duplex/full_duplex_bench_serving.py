@@ -73,9 +73,7 @@ def get_full_duplex_bench_samples(args: argparse.Namespace) -> list[SampleReques
     requested_sessions = args.num_prompts
     sessions_per_source = 2 if args.fdb_version == "1.5" else 1
     if requested_sessions and requested_sessions % sessions_per_source:
-        raise ValueError(
-            "Full-Duplex-Bench v1.5 --num-prompts must be even so input/clean_input pairs stay complete"
-        )
+        raise ValueError("Full-Duplex-Bench v1.5 --num-prompts must be even so input/clean_input pairs stay complete")
     sources = discover_full_duplex_bench(
         args.dataset_path,
         version=args.fdb_version,
@@ -145,9 +143,7 @@ def attach_full_duplex_bench(sample: SampleRequest, request: RequestFuncInput) -
         setattr(request, "duplex_eval_sample", sample)
 
 
-def annotate_full_duplex_bench_result(
-    request: FullDuplexBenchSampleRequest, result: GenerateSampleResult
-) -> None:
+def annotate_full_duplex_bench_result(request: FullDuplexBenchSampleRequest, result: GenerateSampleResult) -> None:
     result.metadata.update(
         {
             "dataset": "full-duplex-bench",

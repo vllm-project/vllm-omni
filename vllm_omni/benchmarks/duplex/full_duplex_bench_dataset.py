@@ -74,8 +74,7 @@ def _version_root(root: Path, version: str) -> Path:
     if any((nested / subset).is_dir() for subset in subsets):
         return nested
     raise FileNotFoundError(
-        f"Full-Duplex-Bench v{version} subsets were not found under {root} "
-        f"or {nested}; expected one of {subsets}"
+        f"Full-Duplex-Bench v{version} subsets were not found under {root} or {nested}; expected one of {subsets}"
     )
 
 
@@ -110,11 +109,7 @@ def _select_ids(
     names = _sample_names(root, subsets)
     available = [f"{subset}/{name}" for subset in subsets for name in names[subset]]
     if sample_ids is None:
-        return [
-            f"{subset}/{name}"
-            for subset in subsets
-            for name in names[subset][:max_per_subset]
-        ]
+        return [f"{subset}/{name}" for subset in subsets for name in names[subset][:max_per_subset]]
     duplicates = sorted(sample_id for sample_id, count in Counter(sample_ids).items() if count > 1)
     unknown = sorted(set(sample_ids) - set(available))
     if duplicates:
