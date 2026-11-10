@@ -6,6 +6,9 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.codec_registry import (
+    OmniCodecRegistry,
+)
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 
@@ -302,3 +305,49 @@ def test_tensor_serialize_into_edge_shapes():
         assert decoded.dtype == tensor.dtype
         assert decoded.shape == tensor.shape
         assert torch.equal(decoded, tensor)
+
+
+def test_codec_registry_mro_and_tag_lookup():
+    class Base:
+        pass
+
+    class Child(Base):
+        pass
+
+    registry = OmniCodecRegistry()
+    registry.register(Base, "base", encode=lambda value: value)
+
+    assert registry.lookup(Child) is registry.lookup(Base)
+    assert registry.lookup_tag("base") is registry.lookup(Base)
+
+
+def test_codec_registry_rejects_duplicate_unless_overridden():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "dict", encode=lambda value: value)
+
+    with pytest.raises(ValueError):
+        registry.register(dict, "dict", encode=lambda value: value)
+
+    def replacement(value):
+        return value
+
+    registry.register(dict, "dict", encode=replacement, override=True)
+    assert registry.lookup(dict).encode is replacement
+
+
+def test_codec_registry_override_removes_the_previous_tag():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "dict", encode=lambda value: value)
+    registry.register(dict, "mapping", encode=lambda value: value, override=True)
+
+    assert registry.lookup_tag("dict") is None
+    assert registry.lookup_tag("mapping") is registry.lookup(dict)
+
+
+def test_codec_registry_override_tag_removes_the_previous_type():
+    registry = OmniCodecRegistry()
+    registry.register(dict, "shared", encode=lambda value: value)
+    registry.register(list, "shared", encode=lambda value: value, override=True)
+
+    assert registry.lookup(dict) is None
+    assert registry.lookup_tag("shared") is registry.lookup(list)
