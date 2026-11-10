@@ -150,6 +150,22 @@ def test_view_derives_slots_from_ledger_and_batch():
     assert slots.tolist() == [37, 38, 14, 15, 20, 21, 22]
 
 
+def test_view_slots_follow_block_math_across_mixed_rows():
+    """Decode deep in a long ledger, a chunk starting mid-block, a chunk
+    ending on a block boundary and a zero-token row, in batch order."""
+    ledgers = {"a": list(range(100, 612)), "b": [7, 3, 9, 1], "c": [5], "d": [11, 13]}
+    adapter = PrefixCacheSchedulerAdapter(track_requests=True)
+    adapter.translate_step(
+        sched_output(new=[(r, 0, b) for r, b in ledgers.items()], scheduled=dict.fromkeys(ledgers, 1))
+    )
+    rows = [("a", 2045, 1), ("c", 1, 0), ("b", 2, 9), ("d", 4, 4)]
+    view = MRv2FullAttentionGroupView(adapter, BLOCK_SIZE)
+    view.bind(input_batch(rows))
+    slots = view.step_slots_cpu([r for r, _, _ in rows], {r: n for r, _, n in rows})
+    expected = [ledgers[r][p // BLOCK_SIZE] * BLOCK_SIZE + p % BLOCK_SIZE for r, s, n in rows for p in range(s, s + n)]
+    assert slots.tolist() == expected
+
+
 def test_view_refuses_disagreeing_or_unbound_state():
     adapter = PrefixCacheSchedulerAdapter(track_requests=True)
     adapter.translate_step(sched_output(new=[("a", 0, [3])], scheduled={"a": 4}))
