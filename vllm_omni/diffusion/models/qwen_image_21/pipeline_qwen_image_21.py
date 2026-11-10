@@ -315,6 +315,12 @@ class QwenImage21Pipeline(
 
     supports_request_batch = True
     supports_step_execution: ClassVar[bool] = True
+    # Block-causal prefill policy:
+    # - "auto": use piecewise when padding-free and supported; otherwise use a dense mask.
+    # - "mask": materialize a dense block-causal attention mask.
+    # - "piecewise": compute block-causal attention from full-attention spans.
+    # - "flex": use MindIE-SD CATLASS DSL FlexAttention on supported NPUs.
+    _DEFAULT_ATTN_PATH: ClassVar[str] = "auto"
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -1176,7 +1182,7 @@ class QwenImage21Pipeline(
             for entry in per_request_images
         ]
         homogeneous = all(sig == signatures[0] for sig in signatures)
-        attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
+        attention_kwargs = {"attn_path": self._DEFAULT_ATTN_PATH if homogeneous else "mask"}
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -1251,7 +1257,7 @@ class QwenImage21Pipeline(
             true_cfg_scale=sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 1.0,
             max_sequence_length=sampling.max_sequence_length or self._max_length,
             per_request_images=per_request_images,
-            attention_kwargs=kwargs.get("attention_kwargs"),
+            attention_kwargs=kwargs.get("attention_kwargs") or {"attn_path": self._DEFAULT_ATTN_PATH},
         )
 
         # prepare_timesteps() has already materialized request-specific timestep
