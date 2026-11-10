@@ -4,12 +4,11 @@ trust_remote_code: true
 
 stages:
   - stage_id: 0
-    model_runner: v2
     num_replicas: 2
     devices: "0,1,2,3"
     tensor_parallel_size: 2
     max_num_seqs: 1
-    max_num_batched_tokens: 8192
+    max_num_batched_tokens: 32768
     kv_cache_memory_bytes: 2147483648
     gpu_memory_utilization: 0.95
     enforce_eager: true
@@ -75,3 +74,13 @@ stages:
 edges:
   - from: 0
     to: 1
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        model_runner: v2
+  npu:
+    stages:
+      - stage_id: 0
+        model_runner: v2

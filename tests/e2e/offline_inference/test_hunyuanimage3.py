@@ -339,7 +339,7 @@ def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
     assert ar_vllm_config.model_config.trust_remote_code is True
     assert ar_vllm_config.parallel_config.tensor_parallel_size == 2
     assert ar_vllm_config.scheduler_config.max_num_seqs == 1
-    assert ar_vllm_config.scheduler_config.max_num_batched_tokens == 8192
+    assert ar_vllm_config.scheduler_config.max_num_batched_tokens == 32768
     assert ar_vllm_config.cache_config.gpu_memory_utilization == 0.95
     ar_omni_config = ar_vllm_config.model_config.omni_config
     assert ar_omni_config.omni_kv_config["need_send_cache"] is True

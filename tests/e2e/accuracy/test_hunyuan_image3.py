@@ -203,7 +203,7 @@ _DEPLOY_CONFIG = {
             "gpu_memory_utilization": 0.95,
             "enforce_eager": True,
             "trust_remote_code": True,
-            "max_num_batched_tokens": 8192,
+            "max_num_batched_tokens": 32768,
             "devices": AR_DEVICES,
             "tensor_parallel_size": AR_TP_SIZE,
             "hf_overrides": {

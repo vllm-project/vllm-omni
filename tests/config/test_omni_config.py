@@ -139,7 +139,7 @@ def test_hunyuan_ar_runner_selection(pipeline_key, runner):
         assert stages[1].stage_type == "diffusion"
 
 
-@pytest.mark.parametrize("platform", ["cuda", "npu"])
+@pytest.mark.parametrize("platform,runner", [("cuda", "v2"), ("npu", "v2"), ("xpu", "v1")])
 @pytest.mark.parametrize(
     "deploy_name,pipeline_key",
     [
@@ -148,12 +148,11 @@ def test_hunyuan_ar_runner_selection(pipeline_key, runner):
         ("hunyuan-image-3-mooncakeconnector.yaml", "hunyuan_image_3_moe"),
     ],
 )
-def test_hunyuan_ar_defaults_to_mrv2(platform, deploy_name, pipeline_key):
+def test_hunyuan_ar_platform_runner_defaults(platform, runner, deploy_name, pipeline_key):
     pipeline = _resolve_pipeline_or_skip(pipeline_key)
     deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / deploy_name), platform=platform)
     stages = merge_pipeline_deploy(pipeline, deploy)
-    assert stages[0].yaml_engine_args["use_v2_model_runner"] is True
-    assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 8192
+    assert stages[0].yaml_engine_args["use_v2_model_runner"] is (runner == "v2")
     assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
 
 

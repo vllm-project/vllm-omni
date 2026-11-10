@@ -30,11 +30,10 @@ connectors:
 
 stages:
   - stage_id: 0
-    model_runner: v2
     max_num_seqs: 1
     gpu_memory_utilization: 0.95
     enforce_eager: true
-    max_num_batched_tokens: 8192
+    max_num_batched_tokens: 32768
     devices: "0,1"
     tensor_parallel_size: 2
     hf_overrides:
@@ -73,9 +72,15 @@ stages:
       guidance_scale: 0
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        model_runner: v2
+
   npu:
     stages:
       - stage_id: 0
+        model_runner: v2
         gpu_memory_utilization: 0.8
         devices: "0,1,2,3"
         tensor_parallel_size: 4
@@ -94,7 +99,6 @@ platforms:
     stages:
       # Both stages stay resident, so they cannot share cards.
       - stage_id: 0
-        model_runner: v1
         gpu_memory_utilization: 0.95
         devices: "0,1,2,3"
         tensor_parallel_size: 4
