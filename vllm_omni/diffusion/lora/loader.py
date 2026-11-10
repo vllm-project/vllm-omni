@@ -318,6 +318,14 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            # Quantized weights (int8, fp8, packed int32) hold scaled and possibly
+            # transposed data; adding a delta cast to that dtype is wrong.
+            if not params.dtype.is_floating_point or params.dtype.itemsize == 1:
+                raise ValueError(
+                    f"Distilled LoRA cannot be fused into quantized parameter {name} ({params.dtype}). "
+                    "The distill LoRA backend fuses only into unquantized weights: remove --quantization "
+                    "and --diffusion-quantization-config, and use a checkpoint that is not pre-quantized."
+                )
             lora_loaded_keys.update(used_keys)
 
             delta = delta.to(device=params.device, dtype=params.dtype)
