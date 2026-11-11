@@ -535,6 +535,8 @@ source_file_dependencies:
     - tests/e2e/accuracy/qwen3_omni/
     - tests/e2e/accuracy/conftest.py
     - tests/e2e/accuracy/helpers.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/benchmarks/validation.py
     - vllm_omni/benchmarks/data_modules/daily_omni_dataset.py
     - vllm_omni/benchmarks/data_modules/daily_omni_eval.py
     - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
@@ -543,6 +545,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_perf:
     - *qwen3_omni_evaluation
+    - tests/e2e/accuracy/qwen3_omni/
+    - vllm_omni/benchmarks/validation.py
     - .buildkite/amd/scripts/assert-pytest-collection.sh
     - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/dfx/conftest.py

@@ -1,5 +1,11 @@
 When you want to add L4-level ***performance test*** cases, add entries to JSON files under `tests/dfx/perf/tests/` and run them via `tests/dfx/perf/scripts/run_benchmark.py` (omni / TTS) or `run_diffusion_benchmark.py` (diffusion).
 
+Qwen3-Omni CUDA/A3 nightly uses a
+[combined accuracy and performance suite](../qwen3_omni_nightly.md) so the
+concurrency-64 requests run only once. Its smaller performance runs use the
+same benchmark CLI. The older random workload JSON files remain available to
+other pipelines and manual callers.
+
 #### Config file layout (in-tree examples)
 
 | Model type | Runner | Example JSON files |

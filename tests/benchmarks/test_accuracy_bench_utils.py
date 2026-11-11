@@ -55,6 +55,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
 )
 from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
+    _validate_daily_omni,
     _validate_seed_tts,
     _write_accuracy_result_metadata,
     parse_acc_benchmark_args,
@@ -62,6 +63,24 @@ from tests.e2e.accuracy.helpers import (
     sync_dataset_env_from_ns,
 )
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
+
+
+@pytest.mark.parametrize("key", ["daily_omni_request_failed", "daily_omni_no_gold", "timed_out_requests"])
+def test_daily_omni_high_score_cannot_hide_incomplete_requests(key):
+    result = {"daily_omni_accuracy": 0.99, "daily_omni_evaluated_ok": 1000, key: 1}
+    assert any(key in error for error in _validate_daily_omni(result, min_accuracy=0.69))
+
+
+def test_daily_omni_unparsable_answer_remains_an_accuracy_error():
+    result = {"daily_omni_accuracy": 0.75, "daily_omni_evaluated_ok": 100, "daily_omni_parse_failed": 25}
+    assert _validate_daily_omni(result, min_accuracy=0.69) == []
+
+
+@pytest.mark.parametrize("key", ["seed_tts_request_failed", "seed_tts_no_pcm", "seed_tts_asr_failed"])
+def test_seed_high_score_cannot_hide_missing_utterances(key):
+    result = {"seed_tts_content_evaluated": 1000, "seed_tts_content_error_mean": 0.01, key: 1}
+    errors = _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=None, min_mean_utmos=None)
+    assert any(key in error for error in errors)
 
 
 def test_videomme_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
@@ -286,8 +305,8 @@ def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
     )
 
 
-def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
-    """ASR failures skip SIM, empty audio skips UTMOS; neither is a coverage gap."""
+def test_seed_tts_rejects_scorer_failures_without_double_counting_coverage():
+    """ASR/empty audio fail completeness; downstream coverage counts eligible rows."""
     result = {
         "seed_tts_turn_count": 1088,
         "seed_tts_request_failed": 0,
@@ -304,7 +323,10 @@ def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
         "seed_tts_utmos_evaluated": 1087,
         "seed_tts_utmos_failed": 0,
     }
-    assert _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10) == []
+    errors = _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+    assert len(errors) == 2
+    assert any("seed_tts_asr_failed=2" in error for error in errors)
+    assert any("seed_tts_empty_audio=1" in error for error in errors)
 
     short = _validate_seed_tts(
         {**result, "seed_tts_sim_evaluated": 1082, "seed_tts_utmos_evaluated": 1086},

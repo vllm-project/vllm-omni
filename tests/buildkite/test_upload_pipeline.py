@@ -527,7 +527,7 @@ def _iter_steps(doc: dict):
 
 
 @pytest.mark.parametrize(
-    "pipeline_path,legacy_keys",
+    "pipeline_path,perf_keys",
     [
         (
             NIGHTLY_YAML,
@@ -540,11 +540,14 @@ def _iter_steps(doc: dict):
     ],
 )
 @pytest.mark.parametrize(
-    "changed_file,select_legacy",
+    "changed_file,select_perf",
     [
         ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
         ("vllm_omni/benchmarks/patch/patch.py", True),
-        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", True),
+        ("vllm_omni/benchmarks/data_modules/daily_omni_dataset.py", True),
+        ("vllm_omni/benchmarks/validation.py", True),
+        ("tests/e2e/accuracy/qwen3_omni/nightly.py", True),
         ("vllm_omni/clients/duplex.py", False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
@@ -557,11 +560,11 @@ def _iter_steps(doc: dict):
 def test_qwen3_perf_pipeline_selection(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_path: Path,
-    legacy_keys: set[str],
+    perf_keys: set[str],
     changed_file: str,
-    select_legacy: bool,
+    select_perf: bool,
 ) -> None:
-    """Keep realtime-only inputs from selecting legacy CUDA/NPU perf jobs."""
+    """Select combined dataset jobs while excluding realtime-only inputs."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -569,8 +572,8 @@ def test_qwen3_perf_pipeline_selection(
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
     # Compare the dependency-filtered Qwen perf jobs.
-    expected_keys = set(legacy_keys) if select_legacy else set()
-    assert surviving_keys & legacy_keys == expected_keys
+    expected_keys = set(perf_keys) if select_perf else set()
+    assert surviving_keys & perf_keys == expected_keys
 
 
 @pytest.mark.parametrize(

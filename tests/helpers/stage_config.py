@@ -259,6 +259,20 @@ _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 # CI overlays as Python dicts (LSP-friendly). Materialized on demand to
 # tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
 _CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "qwen3_omni_nightly_default": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "model_runner": "v2",
+        "async_chunk": False,
+        "stages": [{"stage_id": stage, "enable_prefix_caching": False} for stage in range(3)],
+        "platforms": {"npu": {"stages": [{"stage_id": 0, "enable_prefix_caching": False}]}},
+    },
+    "qwen3_omni_nightly_async_prefix": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "model_runner": "v2",
+        "async_chunk": True,
+        "stages": [{"stage_id": stage, "enable_prefix_caching": stage == 0} for stage in range(3)],
+        "platforms": {"npu": {"stages": [{"stage_id": 0, "enable_prefix_caching": True}]}},
+    },
     "qwen2_5_omni": {
         "base_config": "qwen2_5_omni.yaml",
         "async_chunk": False,

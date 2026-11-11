@@ -231,6 +231,12 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
     group.add_argument(
+        "--omni-isolate-prefix-cache",
+        action="store_true",
+        help="Give measured chat requests a shared, fresh prefix-cache salt per run. "
+        "Ready checks and warmups keep independent salts. Does not isolate multimodal processor caches.",
+    )
+    group.add_argument(
         "--print-stage",
         action="store_true",
         default=False,

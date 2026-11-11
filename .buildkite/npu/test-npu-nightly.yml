@@ -6,37 +6,45 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Omni · Perf Test · No Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
+      - label: ":full_moon: Omni · Qwen3-Omni Accuracy + Perf · default"
+        source_file_dependencies:
+          - omni_qwen3_omni_accuracy
+          - omni_qwen3_omni_perf
+          - ci_npu
         key: nightly-omni-performance-no-async-chunk
-        timeout_in_minutes: 180
+        timeout_in_minutes: 300
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/dfx/perf/results
+          - export SEED_TTS_EVAL_DEVICE=npu:3
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
+            pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni_nightly.py -k "default" -m "full_model and npu and A3 and cards_4" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-      - label: ":full_moon: Omni · Perf Test · Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
+      - label: ":full_moon: Omni · Qwen3-Omni Accuracy + Perf · async-prefix"
+        source_file_dependencies:
+          - omni_qwen3_omni_accuracy
+          - omni_qwen3_omni_perf
+          - ci_npu
         key: nightly-omni-performance-async-chunk
-        timeout_in_minutes: 180
+        timeout_in_minutes: 360
         mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/dfx/perf/results
+          - export SEED_TTS_EVAL_DEVICE=npu:3
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+            pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni_nightly.py -k "async-prefix" -m "full_model and npu and A3 and cards_4" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -96,28 +104,6 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
-      - label: ":full_moon: Omni · Qwen3-Omni · Accuracy Test"
-        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_npu]
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
-        artifact_paths:
-          - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-        commands:
-          # Pin the Seed-TTS scorer to the 4th card: _get_eval_device() otherwise
-          # auto-picks npu:0, which the omni server under test already fills with its
-          # KV cache (thinker TP=2 on npu:0-1, talker/code2wav on npu:2), so Whisper
-          # OOMs on `.to(device)` and every clip reports "ASR / WER failed".
-          - export SEED_TTS_WER_EVAL=1
-          - export SEED_TTS_SIM_EVAL=1
-          - export SEED_TTS_EVAL_DEVICE=npu:3
-          # UTMOS is intentionally off on A3: balacoon/utmos is not in the offline
-          # runner cache and no A3 MOS baseline exists yet, so the test skips the
-          # MOS floor on NPU. Re-enable both once the asset is cached.
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and npu and A3" --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu
