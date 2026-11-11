@@ -325,10 +325,13 @@ def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferre
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("control_token", [None, TOKEN_IDS["tts_bos_token_id"]])
+@pytest.mark.parametrize("control_token", [None, TOKEN_IDS["tts_bos_token_id"], 30])
 def test_turn_eos_without_text_progress_ends_the_turn(monkeypatch, deferred, control_token):
     """An unpunctuated answer gets one continuation attempt, not 16 empty chunks."""
     model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    # Like <|spk_bos|>: a tokenizer special ID outside the duplex field map,
+    # permitted by the sampler but omitted from decoded text.
+    model._minicpmo45_tokenizer_cache.all_special_ids = [*TOKEN_IDS.values(), 30]
     state = _MiniCPMO45Stage0SessionState(session_id="no-progress", current_turn_ended=False)
     model._minicpmo45_duplex_state_for_row = lambda row: state
     model.max_speak_chars_per_chunk = 0
