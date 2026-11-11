@@ -110,14 +110,20 @@ guide: |
 
   ## Performance (one H100 80 GB)
 
+  `sophon-realtime` 1.1.2 from a clean `pip install "sophon-realtime[trt]"`, default `serve` (TensorRT and CUDA MPS on),
+  `/v1/chat/completions` with a short spoken question (replies of about 5 s of speech), users arriving within 10 s,
+  measured after warm-up. First audio = time from sending the request to the first audio chunk.
+
   | concurrent users | first audio median / max |
   |---|---|
-  | 1 | 0.67 s |
-  | 8 | 0.61 / 0.76 s |
-  | 16 | 0.75 / 1.07 s |
+  | 1 | 0.61 s |
+  | 8 | 0.64 / 0.70 s |
+  | 16 | 0.69 / 0.98 s |
+  | 24 | 0.72 / 1.02 s |
 
-  Measured with TensorRT and CUDA MPS (the repository's one-command scripts) on the v1.0 release, users arriving within
-  10 s; not yet re-measured on sophon-realtime 1.1.2.
+  With longer replies (16 public spoken questions, about 20 s of speech per reply), first audio at 16 users is
+  0.87 / 1.76 s. The first one or two requests after a start can take several seconds while the server finishes
+  warming up.
 
   ## References
 
