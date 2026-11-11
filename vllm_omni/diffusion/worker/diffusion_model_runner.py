@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
@@ -32,6 +33,7 @@ from vllm_omni.diffusion.attention.schedule import (
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
     resolve_request_attention_schedule,
+    stage_runs_denoising,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -51,11 +53,13 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
+from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
+    SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
@@ -165,11 +169,13 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
-def _attention_schedule_scope(schedule: AttentionSchedule) -> AbstractContextManager[Any]:
+def _attention_schedule_scope(
+    schedule: AttentionSchedule, *, from_request: bool = False
+) -> AbstractContextManager[Any]:
     """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
     if not schedule:
         return nullcontext()
-    return bind_attention_schedule(schedule)
+    return bind_attention_schedule(schedule, from_request=from_request)
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -267,16 +273,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        graph_layer = None
         if getattr(model, "enable_cuda_graph_decode", False):
-            # Decode-graph models still compile their blocks: graph capture
-            # records the compiled (fused) kernels. Scope inductor cudagraphs
-            # to this compile so the two graph layers never stack, without
-            # changing torch.compile for every other model in the process.
+            graph_layer = "CUDA graph decode"
+        elif getattr(self.od_config, "diffusion_use_graph", False):
+            graph_layer = "denoise graphs"
+        if graph_layer is not None:
+            # Graph capture records the compiled (fused) kernels. Scope inductor
+            # cudagraphs to this compile so the two graph layers never stack,
+            # without changing torch.compile for every other model in the process.
             compile_kwargs["options"] = {
                 "triton.cudagraphs": False,
                 "triton.cudagraph_trees": False,
             }
-            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+            logger.info("Model runner: %s combines %s with torch.compile.", attr_name, graph_layer)
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         try:
@@ -406,6 +416,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -414,7 +425,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "prepare_encode(), denoise_step(), post_decode(), and either "
+                "step_scheduler() or denoise_step_updates_state=True; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -500,10 +512,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Initialization complete.")
 
     def _require_attention_schedule_pipeline(self, load_format: str) -> None:
-        """Fail startup, before any weight is loaded, when configured profiles target an unsupported model.
+        """Fail startup, before any weight is loaded, when configured profiles cannot apply to this stage.
 
         Only registered pipeline classes known to publish denoise progress on every denoise forward
-        are accepted; a custom pipeline is not.
+        are accepted; a custom pipeline is not. A stage that runs no denoising, such as the encode
+        stage of a disaggregated deployment, is also rejected: its schedule would never apply.
         """
         if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
             return
@@ -513,6 +526,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             registered = DiffusionModelRegistry.models.get(model_class_name)
             pipeline_class_name = registered.class_name if registered is not None else None
         require_attention_schedule_pipeline(pipeline_class_name, model_class_name)
+        role = resolve_diffusion_stage_role(self.od_config.stage_role, self.od_config.model_stage).value
+        if not stage_runs_denoising(model_class_name, role):
+            raise ValueError(
+                f"diffusion_attention_schedule is set on stage {self.od_config.stage_id} ({model_class_name}, "
+                f"role {role!r}), which runs no denoising. Configure the schedule only on the denoising stage; in a "
+                "disaggregated deployment, set it on that stage in the deploy YAML or with --stage-overrides, "
+                "not with the global --diffusion-attention-schedule flag."
+            )
 
     def _validate_service_attention_schedule(self) -> None:
         """Fail startup when configured profiles meet a cache backend.
@@ -946,7 +967,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
                 ),
-                _attention_schedule_scope(attention_schedule),
+                # Batch keys carry whether each request sent its own schedule, so every request in a batch
+                # shares one source and any() equals all(). Only a request's own ranges are checked
+                # against the sequence; an inherited default is not.
+                _attention_schedule_scope(
+                    attention_schedule,
+                    from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
+                ),
             ):
                 with record_function(record_name):
                     try:
@@ -1542,7 +1569,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ):
                 clear_pipeline_stage_durations(pipeline)
                 with _attention_schedule_scope(attention_schedule):
-                    noise_pred = pipeline.denoise_step(input_batch, states=states)
+                    sample_results = None
+                    if isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state:
+                        sample_results = pipeline.denoise_step(input_batch, states=states)
+                        if set(sample_results) != {state.request_id for state in states}:
+                            raise ValueError("denoise_step must return a result for every active request")
+                        noise_pred = None
+                    else:
+                        noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -1569,9 +1603,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if sample_results is not None:
+                                error = sample_results[req.request_id]
+                                if error is not None:
+                                    raise error
+                            else:
+                                pipeline.step_scheduler(
+                                    req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:

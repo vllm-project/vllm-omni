@@ -116,7 +116,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_accuracy
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm]
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
@@ -140,6 +140,8 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 120
         source_file_dependencies: omni_qwen3_omni_doc
+        artifact_paths:
+          - qwen3-omni-doc-artifacts/**/*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
@@ -183,7 +185,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 300
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -204,7 +206,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -1789,7 +1791,7 @@ steps:
       - label: "Qwen-Image Diffusers Backend Similarity"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_accuracy
         env:
@@ -1866,7 +1868,7 @@ steps:
       - label: "Qwen3-Omni Duplex Playback"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_qwen3_omni_duplex_playback_function
         artifact_paths:
@@ -1990,7 +1992,7 @@ steps:
       - label: "Wan2.2 Function 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_function
         env:
@@ -2081,7 +2083,7 @@ steps:
       - label: "Wan2.2 Function 2 GPU"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_function
         env:
@@ -2190,7 +2192,7 @@ steps:
       - label: "Qwen-Image Expansion 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_function
         env:
@@ -2275,7 +2277,7 @@ steps:
       - label: "Qwen-Image Expansion 2 GPU"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_function
         env:
