@@ -385,6 +385,32 @@ def test_reference_sampling_slots_hold_the_request_top_k_uncapped_and_its_epsilo
     assert state._pending_epsilon_cutoffs == {}
 
 
+def test_a_request_removed_before_a_step_leaves_its_slot_untouched(make_state, monkeypatch):
+    """A request aborted between add_request and the next step writes nothing to its freed slot."""
+    monkeypatch.setattr(OmniModelState, "remove_request", lambda self, req_index_or_id: None)
+    state = _reference_state(make_state)
+    state._slot_pool = SimpleNamespace(copy_to_uva=torch.from_numpy, size=(4, 5 + state.buffers.slot_ras.shape[1]))
+    state._epsilon_pool = SimpleNamespace(copy_to_uva=torch.from_numpy, size=(4, 2))
+    buffers = state.buffers
+
+    def slot_one():
+        return [
+            values[1].item() for values in (buffers.slot_temperature, buffers.slot_top_p, buffers.slot_epsilon_cutoff)
+        ]
+
+    before = slot_one()
+    aborted = _sampled_request("a", 30, {"epsilon_cutoff": 0.02})
+    aborted.sampling_params.temperature, aborted.sampling_params.top_p = 0.5, 0.7
+
+    state.add_request(1, aborted)
+    state.add_request(2, _sampled_request("b", 30, None))
+    state.remove_request(1)
+    state._flush_slot_writes()
+
+    assert slot_one() == before
+    assert buffers.slot_epsilon_cutoff[2].item() == pytest.approx(1e-3)
+
+
 def test_an_epsilon_cutoff_without_reference_sampling_is_refused_not_ignored(make_state):
     state = make_state()
     state.add_request(0, _sampled_request("a", 30, {"epsilon_cutoff": 0}))
