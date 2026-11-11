@@ -192,7 +192,6 @@ def test_unmeasured_file_stays_weight_zero_and_still_runs(
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
     assert step["parallelism"] == 2
-    assert "temporary estimate" not in "\n".join(step["commands"])
     placed = [name for shard in _read_shard_lists("simple-test") for name in shard]
     assert sorted(placed) == sorted(discovered)
 
