@@ -7,7 +7,7 @@ steps:
       build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -24,7 +24,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -97,7 +97,7 @@ steps:
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · Qwen3-Omni · Accuracy Test"
-        source_file_dependencies: omni_qwen3_omni_accuracy
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         artifact_paths:
