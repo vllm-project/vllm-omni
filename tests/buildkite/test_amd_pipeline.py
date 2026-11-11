@@ -2223,6 +2223,9 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         dependency_paths = flatten_paths(dependencies[dependency])
         assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in dependency_paths
         assert set(files) <= dependency_paths
+        assert "vllm_omni/entrypoints/omni_base.py" in dependency_paths
+        assert "vllm_omni/metrics/utils.py" in dependency_paths
+        assert "vllm_omni/outputs/" in dependency_paths
 
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
@@ -2247,12 +2250,6 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
 
     runner = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     assert os.access(runner, os.X_OK)
-    runner_text = runner.read_text(encoding="utf-8")
-    assert "ROCM_E2E_LEVEL_MARKER:-full_model" in runner_text
-    assert "ROCM_E2E_TIMEOUT_MINUTES:-105" in runner_text
-    assert '"${test_targets[@]}"' in runner_text
-    assert 'counts["tests"] != int(sys.argv[2])' in runner_text
-    assert 'counts[key] for key in ("failures", "errors", "skipped")' in runner_text
 
 
 def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:

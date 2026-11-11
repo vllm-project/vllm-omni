@@ -11,6 +11,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.metrics.utils import iter_request_output_items
 
 
 @dataclass(frozen=True)
@@ -237,12 +238,7 @@ class OmniRequestOutput(RequestOutput):
                     # paths that require list semantics, so normalize at the
                     # wrapping boundary instead of making every consumer
                     # special-case pooling output.
-                    if value is None:
-                        value = []
-                    elif isinstance(value, tuple):
-                        value = list(value)
-                    elif not isinstance(value, list):
-                        value = [value]
+                    value = list(iter_request_output_items(source))
                 setattr(self, name, value)
 
         # Omni-specific fields — only present when the source is itself an
