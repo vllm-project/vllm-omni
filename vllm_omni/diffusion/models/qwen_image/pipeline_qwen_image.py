@@ -24,6 +24,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -346,7 +347,8 @@ class QwenImagePipeline(
         # offload, CPU for layerwise / unquantized HSDP defer).
         cpu_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
         enc_vae_device = torch.device("cpu") if cpu_offload else self.device
-        self.text_encoder = self.text_encoder.to(enc_vae_device)
+        # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+        self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(enc_vae_device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,

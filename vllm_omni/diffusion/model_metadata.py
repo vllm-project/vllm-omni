@@ -55,9 +55,12 @@ HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -148,6 +151,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "Flux3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
+        final_output_type="image",
+    ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
@@ -170,6 +178,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),

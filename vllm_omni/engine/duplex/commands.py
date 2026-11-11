@@ -103,7 +103,8 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
     audio: bytes = b""
 
-    def payload(self) -> dict[str, object]:
+    def payload(self, *, encode_audio: bool = True) -> dict[str, object]:
+        """The legacy append dict; ``encode_audio=False`` keeps ``audio`` as the decoded bytes."""
         data = DuplexCommand.payload(self)
         hints = data.pop("hints", None)
         if isinstance(hints, Mapping):
@@ -117,7 +118,7 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged.update(data)
             data = merged
         if self.audio:
-            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+            data["audio"] = base64.b64encode(self.audio).decode("ascii") if encode_audio else self.audio
         else:
             data.pop("audio", None)
         if not data.get("video_frames"):

@@ -13,7 +13,7 @@ from torch import nn
 from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -60,6 +60,10 @@ from vllm.transformers_utils.config import (
     set_default_rope_theta,
 )
 
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+    MoERoutingKey,
+    get_moe_routing_key,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
@@ -71,6 +75,28 @@ def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
     """Accept both legacy flat metadata and the canonical nested payload."""
     meta = runtime_info.get("meta")
     return meta if isinstance(meta, dict) else runtime_info
+
+
+def _enable_moe_routing_cudagraph_specialize(vllm_config: VllmConfig) -> None:
+    """Turn on mask-keyed FULL MoE graphs when the stage uses FULL capture (#9865).
+
+    Auto-enables for any cudagraph mode that includes FULL. An in-process
+    ``object.__setattr__(..., False)`` before model load is still honored as
+    an opt-out for tests / tooling; ``CompilationConfig`` forbids this key in
+    deploy YAML / ``--compilation-config`` JSON, so user-facing remediation is
+    V1 ``MammothGPUARModelRunner`` or a cudagraph mode without FULL.
+    """
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return
+    cg_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cg_mode is None or not cg_mode.has_mode(CUDAGraphMode.FULL):
+        return
+    if hasattr(compilation_config, "cudagraph_specialize_moe_routing") and (
+        compilation_config.cudagraph_specialize_moe_routing is False
+    ):
+        return
+    object.__setattr__(compilation_config, "cudagraph_specialize_moe_routing", True)
 
 
 def _first_int(value: Any) -> int:
@@ -242,10 +268,10 @@ def moe_forward(
     if gen_expert is None:
         return und_expert(hidden_states)
 
-    # FULL capture must record both experts. If input_ids were dropped
-    # (gen_token_mask is None), falling through to und_expert would bake
-    # the understanding path into the graph. Fail closed instead of
-    # silently replaying the understanding expert for gen tokens.
+    # Capture path: specialty selects which experts are recorded (#9865).
+    # Default specialty is BLEND (#9764 dual-expert + torch.where). ALL_UND /
+    # ALL_GEN graphs record a single expert; host dispatch picks the graph
+    # via MoERoutingKey before replay (outside the captured region).
     if _is_graph_capturing(hidden_states.device):
         if gen_token_mask is None or gen_token_mask.numel() == 0:
             raise RuntimeError(
@@ -256,6 +282,11 @@ def moe_forward(
                 "PIECEWISE is not a workaround: MoE still hits this path whenever "
                 "the current stream is capturing."
             )
+        specialty = get_moe_routing_key()
+        if specialty is MoERoutingKey.ALL_UND:
+            return und_expert(hidden_states)
+        if specialty is MoERoutingKey.ALL_GEN:
+            return gen_expert(hidden_states)
         return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 
     if gen_token_mask is None or not gen_token_mask.any():
@@ -547,6 +578,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             # table being indexed: base ids clamp to base_vocab_size-1, gen ids
             # clamp to [0, gen_embed_tokens.num_embeddings-1]. Those rows are
             # ignored by where().
+            #
+            # Deliberately unconditional: the MoE routing specialty
+            # (moe_cudagraph.MoERoutingKey) specializes the experts, not this
+            # lookup, so ALL_UND / ALL_GEN graphs still embed both tables at
+            # capture and on every replay. Specializing embeddings too would
+            # need a second key family; until then this is the known tax.
             base_ids = input_ids.clamp(max=self.base_vocab_size - 1)
             base_emb = self.embed_tokens(base_ids)
             gen_ids = (input_ids - int(self.gen_vocab_start_index)).clamp(
@@ -930,6 +967,7 @@ class MammothModa2ARForConditionalGeneration(_MammothModa2T2ITokenConstraints, Q
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        _enable_moe_routing_cudagraph_specialize(vllm_config)
         # Switch hf_config to the AR sub-config to ensure the Qwen2.5-VL path receives the correct type.
         mammoth_cfg = vllm_config.model_config.hf_config
         ar_hf_config = getattr(mammoth_cfg, "llm_config", mammoth_cfg)
@@ -1051,6 +1089,7 @@ class MammothModa2Qwen3ARForConditionalGeneration(_MammothModa2T2ITokenConstrain
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        _enable_moe_routing_cudagraph_specialize(vllm_config)
         mammoth_cfg = vllm_config.model_config.hf_config
         ar_hf_config = getattr(mammoth_cfg, "llm_config", mammoth_cfg)
         ar_vllm_config = vllm_config.with_hf_config(

@@ -356,12 +356,25 @@ class DiffusionWorker:
             return
         from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
+        if wt_config.backend == "omni_lora_ipc":
+            from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
+
+            with set_current_vllm_config(self.vllm_config):
+                self.init_lora_manager()
         pipeline = cast(DiffusionModelRunner, self.model_runner).pipeline
         if not getattr(pipeline, "_omni_weight_reload_prepared", False):
             raise RuntimeError("The active diffusion pipeline has no weight-reload metadata")
         self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
             wt_config, self.vllm_config, self.device, pipeline
         )
+        if wt_config.backend == "omni_lora_ipc":
+            assert isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine)
+            assert self.lora_manager is not None
+            self.weight_transfer_engine.lora_manager = self.lora_manager
+            if torch.distributed.is_initialized():
+                from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+                self.weight_transfer_engine.cpu_group = get_world_group().cpu_group
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -667,6 +680,7 @@ class DiffusionWorker:
                 lora_path=lora_path,
                 lora_scale=lora_scale,
                 max_num_batched_tokens=max_num_batched_tokens,
+                lora_application=self.od_config.lora_application,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
@@ -788,9 +802,11 @@ class DiffusionWorker:
         engine = self._get_weight_transfer_engine()
         if not self._weight_update_active:
             raise RuntimeError("finish_weight_update called without a matching start_weight_update.")
-        engine.finish_weight_update()
-        engine.reset_weight_update_target()
-        self._weight_update_active = False
+        try:
+            engine.finish_weight_update()
+        finally:
+            engine.reset_weight_update_target()
+            self._weight_update_active = False
 
     def execute_model(
         self,
@@ -1842,7 +1858,12 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        set_death_signal(signal.SIGTERM)
+        # Normal executor shutdown still reaches the handlers above and cleans
+        # up gracefully. If the API-server parent is already gone, however, no
+        # manager remains to escalate a worker that stalls during cleanup. Use
+        # a hard parent-death signal so an abrupt parent exit cannot orphan a
+        # GPU-owning diffusion worker.
+        set_death_signal(signal.SIGKILL)
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,
