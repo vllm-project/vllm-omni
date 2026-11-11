@@ -6,8 +6,8 @@
 # Directory sweeps set `automatic_shard: true`. The uploader reads a per-step
 # profile from the last 20 passed main builds' raw `timings/jobs` artifacts
 # (or VLLM_OMNI_SHARD_TIMINGS). It uses that as a greedy estimate of how many
-# jobs fit `timeout_in_minutes`. pytest-shard then hashes collected tests, so
-# the bins are not packed by those measured files. No profile means one job.
+# jobs fit `timeout_in_minutes`, then writes each bin as a file list. A shard
+# runs only that list. No profile means one job.
 # Enrolled steps always write `timings/jobs/*.json`. E2E model jobs stay one
 # job: each case loads a server, and splitting them repeats that startup.
 

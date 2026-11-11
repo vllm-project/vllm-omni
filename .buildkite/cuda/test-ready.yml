@@ -5,9 +5,9 @@
 # profile from the last 20 passed non-main builds of this pipeline
 # (or VLLM_OMNI_SHARD_TIMINGS). Those builds are other pull requests, so the
 # estimate includes whatever those pull requests changed. The profile is a
-# greedy estimate of how many jobs fit `timeout_in_minutes`. pytest-shard
-# then hashes collected tests, so the bins are not packed by those measured
-# files. No profile means one job: a pool is not reserved
+# greedy packing of measured files into bins that fit `timeout_in_minutes`.
+# Each bin is a file list and that shard runs only those files. No profile
+# means one job: a pool is not reserved
 # up front. Enrolled steps always write
 # `timings/jobs/*.json`. A one-node process (the entrypoint VRAM workaround)
 # runs when BUILDKITE_PARALLEL_JOB is unset or 0.

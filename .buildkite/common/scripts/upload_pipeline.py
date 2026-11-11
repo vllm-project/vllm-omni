@@ -27,10 +27,10 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
     tries to build a per-step profile from recent passed ``timings/jobs``
     artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). Ready excludes ``main`` and uses
-    pull-request builds; merge stays on ``main``. That profile is a greedy
-    estimate of how many jobs fit ``timeout_in_minutes``; pytest-shard then
-    hashes collected tests, so the bins are not packed by those measured files.
-    With no profile the step stays one job and still records ``timings/jobs/*.json``.
+    pull-request builds; merge stays on ``main``. That profile packs measured
+    files into bins that fit ``timeout_in_minutes``. Each bin is uploaded as a
+    file list and the shard runs only that list. With no profile the step stays
+    one job and still records ``timings/jobs/*.json``.
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -985,10 +985,24 @@ def main() -> int:
 
     rendered = _render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
     if args.upload:
+        _upload_shard_file_lists()
         _upload_to_buildkite(rendered)
     else:
         sys.stdout.write(rendered)
     return 0
+
+
+def _upload_shard_file_lists() -> None:
+    """Publish packed file lists before shard jobs start."""
+    root = ROOT / "timings" / "file-shards"
+    if not root.is_dir() or not any(root.rglob("*.txt")):
+        return
+    _log(f"automatic-shard: uploading file lists from {root}")
+    subprocess.run(
+        ["buildkite-agent", "artifact", "upload", "timings/file-shards/**/*.txt"],
+        cwd=ROOT,
+        check=True,
+    )
 
 
 if __name__ == "__main__":

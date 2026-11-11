@@ -4,9 +4,8 @@
 
 ``automatic_shard: true`` does not reserve agents. With no timing profile the
 uploader leaves one job (and still records ``timings/jobs/*.json``). A profile
-that exceeds ``timeout_in_minutes`` sets a greedy ``parallelism`` estimate,
-capped, and only then adds pytest-shard flags. pytest-shard hashes node ids;
-it does not place the files that estimate packed.
+that exceeds ``timeout_in_minutes`` packs files into bins, writes each bin as a
+file list, and sets ``parallelism``. A shard runs only its list.
 """
 
 from __future__ import annotations
@@ -27,18 +26,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 import pytest_file_timings  # noqa: E402
 import upload_pipeline as upload_pipeline_mod  # noqa: E402
 from merge_shard_timings import (  # noqa: E402
+    _TEMPORARY_READY_BUILD,
     HISTORY_LOOKUP_BUDGET_SECONDS,
     MAX_CONSECUTIVE_MISSES,
+    build_incomplete_steps,
     build_step_observations,
     list_recent_build_ids,
     merge_build_observations,
+    merge_incomplete_steps,
     merge_step_observations,
     observations_from_download,
     percentile,
     prepare_profile_from_history,
     write_merged_profile,
 )
-from runtime_shard import PLUGIN_MODULE, _inject_plugin, plan_shard_count  # noqa: E402
+from runtime_shard import PLUGIN_MODULE, _file_shard_command, _inject_plugin, pack_files, plan_shard_count  # noqa: E402
 from upload_pipeline import _render_test_pipeline  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -49,13 +51,20 @@ SHARD_ID = "--shard-id=$$BUILDKITE_PARALLEL_JOB"
 
 
 @pytest.fixture(autouse=True)
-def _skip_timing_download(monkeypatch: pytest.MonkeyPatch) -> None:
+def _skip_timing_download(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "1")
     monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
     monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
     monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
     upload_pipeline_mod._shard_timings_prepared = False
     upload_pipeline_mod._shard_timings_pipeline = None
+    yield
+    shards = Path("timings/file-shards")
+    if shards.exists():
+        shutil.rmtree(shards)
+    timings = Path("timings")
+    if timings.is_dir() and not any(timings.iterdir()):
+        timings.rmdir()
 
 
 def _leaves(steps: list) -> list[dict]:
@@ -116,9 +125,80 @@ def test_uploader_splits_simple_test_when_durations_exceed_the_budget(
     assert step["label"] == "Simple Test · Shard %N/%t"
     assert "automatic_shard" not in step
     assert "timings/jobs/*.json" in step["artifact_paths"]
-    assert NUM_SHARDS in step["commands"][-1]
-    assert SHARD_ID in step["commands"][-1]
-    assert PLUGIN_MODULE in step["commands"][-1]
+    command = step["commands"][-1]
+    assert NUM_SHARDS not in command
+    assert SHARD_ID not in command
+    assert "timings/file-shards/simple-test/$${BUILDKITE_PARALLEL_JOB:-0}.txt" in command
+    assert PLUGIN_MODULE in command
+    lists = _read_shard_lists("simple-test")
+    assert lists == [["tests/a_test.py"], ["tests/b_test.py"]]
+
+
+def _read_shard_lists(slug: str) -> list[list[str]]:
+    directory = Path("timings/file-shards") / slug
+    lists = []
+    for path in sorted(directory.glob("*.txt"), key=lambda item: int(item.stem)):
+        lists.append([line for line in path.read_text(encoding="utf-8").splitlines() if line])
+    return lists
+
+
+def test_packed_bins_separate_slow_files() -> None:
+    bins = pack_files({"a.py": 8, "b.py": 7, "c.py": 3, "d.py": 2}, budget_seconds=15)
+    assert bins == [["a.py", "d.py"], ["b.py", "c.py"]]
+
+
+def test_unmeasured_file_stays_weight_zero_and_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    discovered = ["tests/a_test.py", "tests/b_test.py", "tests/new_test.py"]
+    timings = tmp_path / "timings.json"
+    timings.write_text(
+        json.dumps({"steps": {"Simple Test": {"tests/a_test.py": 1000, "tests/b_test.py": 1000}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(timings))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files", lambda command, root: list(discovered) if "tests/" in command else []
+    )
+
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    assert step["parallelism"] == 2
+    assert "temporary estimate" not in "\n".join(step["commands"])
+    placed = [name for shard in _read_shard_lists("simple-test") for name in shard]
+    assert sorted(placed) == sorted(discovered)
+
+
+def test_killed_session_estimates_selected_files_that_did_not_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # TEMPORARY: delete with the killed-session estimate.
+    discovered = ["tests/a_test.py", "tests/b_test.py", "tests/c_test.py"]
+    timings = tmp_path / "timings.json"
+    timings.write_text(
+        json.dumps(
+            {
+                "steps": {"Simple Test": {"tests/a_test.py": 1000}},
+                "incomplete_steps": {"Simple Test": {"selected_files": discovered}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(timings))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files", lambda command, root: list(discovered) if "tests/" in command else []
+    )
+
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    assert step["parallelism"] == 3
+    assert [shard for shard in _read_shard_lists("simple-test")] == [[name] for name in discovered]
 
 
 def test_one_over_budget_file_does_not_open_extra_jobs() -> None:
@@ -513,39 +593,125 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     assert "parallelism" not in step
 
 
-def test_shard_flags_expand_to_numeric_argv(tmp_path: Path) -> None:
+def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     bash = _shell_bash()
+    slug = "simple-test"
+    shard_dir = tmp_path / "timings" / "file-shards" / slug
+    shard_dir.mkdir(parents=True)
+    (shard_dir / "1.txt").write_text("tests/b_test.py\n", encoding="utf-8")
     dumper = tmp_path / "dump_argv.py"
     dumper.write_text("import sys\nprint('\\n'.join(sys.argv[1:]))\n", encoding="utf-8")
     interpreter = _shell_python(bash)
     dumper_arg = _bash_command(dumper, bash=bash)
-    commands = (
-        "pytest -sv tests/ --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB",
-        "timeout 55m pytest -s -v tests/distributed --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT"
-        " --shard-id=$$BUILDKITE_PARALLEL_JOB",
+    rendered = _inject_plugin(_file_shard_command("pytest -sv tests/ -m 'core_model and cpu'", slug))
+    assert NUM_SHARDS not in rendered
+    assert SHARD_ID not in rendered
+    assert "'$" not in rendered
+    assert PLUGIN_MODULE in rendered
+    expanded = rendered.replace("$$", "$").replace("pytest ", f"{interpreter} {dumper_arg} ", 1)
+    if sys.platform == "win32" and "system32" in bash.lower():
+        expanded = expanded.replace("$", r"\$")
+    shell = "buildkite-agent() { return 0; }; export BUILDKITE_PARALLEL_JOB=1; " + expanded
+    completed = subprocess.run(
+        [bash, "-c", shell],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
     )
-    for command in commands:
-        rendered = _inject_plugin(command)
-        assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in rendered
-        assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in rendered
-        assert "'$" not in rendered and '"$' not in rendered
-        expanded = rendered.replace("$$", "$").replace("pytest ", f"{interpreter} {dumper_arg} ", 1)
-        if sys.platform == "win32" and "system32" in bash.lower():
-            # wsl.exe expands $VAR from the Windows environment before bash.
-            expanded = expanded.replace("$", r"\$")
-        shell = "export BUILDKITE_PARALLEL_JOB_COUNT=2 BUILDKITE_PARALLEL_JOB=1; " + expanded
-        completed = subprocess.run(
-            [bash, "-c", shell],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+    argv = completed.stdout.splitlines()
+    assert "tests/b_test.py" in argv, completed.stderr
+    assert "tests/" not in argv, completed.stderr
+    assert "pytest_file_timings" in argv
+
+
+def test_legacy_killed_simple_test_is_incomplete_and_a_finished_job_is_not(tmp_path: Path) -> None:
+    # TEMPORARY: delete with the killed-session estimate.
+    killed = tmp_path / "simple.json"
+    killed.write_text(
+        json.dumps(
+            {
+                "build_id": _TEMPORARY_READY_BUILD[0],
+                "label": "Simple Test",
+                "file_seconds": {"tests/a_test.py": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    finished = tmp_path / "engine.json"
+    finished.write_text(
+        json.dumps(
+            {
+                "build_id": _TEMPORARY_READY_BUILD[0],
+                "label": "Engine&Model Executor&Work Test · L4",
+                "file_seconds": {"tests/b_test.py": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorded = tmp_path / "recorded.json"
+    recorded.write_text(
+        json.dumps(
+            {
+                "label": "Simple Test",
+                "complete": False,
+                "selected_files": ["tests/a_test.py", "tests/c_test.py"],
+                "file_seconds": {"tests/a_test.py": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert build_incomplete_steps([killed, finished]) == {"Simple Test": {"selected_files": None}}
+    assert build_incomplete_steps([finished]) == {}
+    assert build_incomplete_steps([recorded]) == {
+        "Simple Test": {"selected_files": ["tests/a_test.py", "tests/c_test.py"]}
+    }
+    assert (
+        merge_incomplete_steps(
+            [
+                ({"Simple Test": ({"tests/a_test.py": 3.0}, "l4-k8s")}, {"Simple Test": {"selected_files": None}}),
+                ({"Simple Test": ({"tests/a_test.py": 9.0}, "l4-k8s")}, {}),
+            ]
         )
-        argv = completed.stdout.splitlines()
-        assert "--num-shards=2" in argv, completed.stderr
-        assert "--shard-id=1" in argv, completed.stderr
-        assert "pytest_file_timings" in argv
+        == {}
+    )
+
+
+def test_timing_plugin_records_completion_and_selected_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # TEMPORARY: delete with the killed-session estimate.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BUILDKITE_JOB_ID", "job-1")
+    monkeypatch.setenv("BUILDKITE_LABEL", "Simple Test")
+    pytest_file_timings._timings.clear()
+    pytest_file_timings._selected.clear()
+    pytest_file_timings._started.clear()
+    pytest_file_timings._complete = False
+    pytest_file_timings._interrupted = False
+
+    class _Item:
+        nodeid = "tests/a_test.py::test_one"
+
+    try:
+        pytest_file_timings.pytest_collection_modifyitems([_Item(), _Item()])
+        pytest_file_timings.pytest_runtest_logstart("tests/a_test.py::test_one", None)
+        pytest_file_timings.pytest_runtest_logfinish("tests/a_test.py::test_one", None)
+        pytest_file_timings._interrupted = True
+        pytest_file_timings._write()
+        payload = json.loads(next((tmp_path / "timings" / "jobs").glob("*.json")).read_text(encoding="utf-8"))
+        assert payload["complete"] is False
+        assert payload["selected_files"] == ["tests/a_test.py"]
+        pytest_file_timings._interrupted = False
+        pytest_file_timings.pytest_sessionfinish(None, 0)
+        payload = json.loads(next((tmp_path / "timings" / "jobs").glob("*.json")).read_text(encoding="utf-8"))
+        assert payload["complete"] is True
+    finally:
+        pytest_file_timings._timings.clear()
+        pytest_file_timings._selected.clear()
+        pytest_file_timings._started.clear()
+        pytest_file_timings._complete = False
+        pytest_file_timings._interrupted = False
 
 
 def test_simple_test_ignores_durations_recorded_by_another_step(

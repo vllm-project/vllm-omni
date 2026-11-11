@@ -21,7 +21,7 @@ stays on one job.
 
 Within one build, invocations that share a job id are summed. Retries of the
 same ``parallel_job`` index then keep the max. Different indexes are
-complementary pytest-shard slices of a file, so those durations are summed.
+complementary slices of a file, so those durations are summed.
 Jobs with no index keep the older max-across-jobs rule. A step later ignores a
 profile recorded on a different agent queue.
 """
@@ -41,6 +41,7 @@ import urllib.request
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 DEFAULT_BUILDS = 20
 # Many passed builds have no timing artifacts. Scan a wider window, then keep
@@ -133,8 +134,8 @@ def build_step_details(job_files: list[Path]) -> dict[str, tuple[dict[str, float
     """Per-step ``(file seconds, queue)`` for one build.
 
     Same-job invocations are summed. A ``parallel_job`` index then keeps the
-    max across retries and sums those indexes, because pytest-shard gives each
-    index a different slice of the file. Jobs without an index stay on the max
+    max across retries and sums those indexes, because each index runs a
+    different slice of the file. Jobs without an index stay on the max
     rule and are ignored when indexed jobs exist for that step.
     """
     per_job: dict[tuple[str, str], tuple[dict[str, float], int | None, str]] = {}
@@ -174,6 +175,81 @@ def build_step_details(job_files: list[Path]) -> dict[str, tuple[dict[str, float
         if files:
             details[label] = (files, queue)
     return details
+
+
+def load_job_session(path: Path) -> tuple[str, bool, list[str] | None]:
+    """TEMPORARY: delete with the killed-session estimate.
+
+    Returns ``(label, complete, selected_files)``. Artifacts written before
+    ``complete`` existed are finished sessions, except Simple Test on the
+    forced-in build 19202, which was killed before the rest of the marker
+    selection ran and did not record that selection.
+    """
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: expected object")
+    label = _base_label(str(payload.get("label") or ""))
+    if "complete" not in payload:
+        build_id = str(payload.get("build_id") or "")
+        if build_id == _TEMPORARY_READY_BUILD[0] and label == "Simple Test":
+            return label, False, None
+        return label, True, None
+    raw = payload.get("selected_files")
+    selected = None
+    if isinstance(raw, list):
+        selected = [str(item).replace("\\", "/") for item in raw]
+    return label, bool(payload.get("complete")), selected
+
+
+def build_incomplete_steps(job_files: list[Path]) -> dict[str, dict[str, Any]]:
+    """TEMPORARY: steps whose session was killed, keyed by label.
+
+    ``selected_files`` is null when the artifact did not record the marker
+    selection. Delete with :func:`load_job_session`.
+    """
+    grouped: dict[str, list[tuple[bool, list[str] | None]]] = defaultdict(list)
+    for path in job_files:
+        label, complete, selected = load_job_session(path)
+        if label:
+            grouped[label].append((complete, selected))
+    incomplete: dict[str, dict[str, Any]] = {}
+    for label, sessions in grouped.items():
+        if all(complete for complete, _selected in sessions):
+            continue
+        selections = [selected for _complete, selected in sessions]
+        if any(selected is None for selected in selections):
+            incomplete[label] = {"selected_files": None}
+            continue
+        union = sorted({name for selected in selections if selected for name in selected})
+        incomplete[label] = {"selected_files": union}
+    return incomplete
+
+
+def merge_incomplete_steps(
+    per_build: list[tuple[dict[str, tuple[dict[str, float], str]], dict[str, dict[str, Any]]]],
+) -> dict[str, dict[str, Any]]:
+    """TEMPORARY: keep a killed step only when no finished observation exists."""
+    finished: set[str] = set()
+    for details, incomplete in per_build:
+        for label in details:
+            if label not in incomplete:
+                finished.add(label)
+    merged: dict[str, dict[str, Any]] = {}
+    for _details, incomplete in per_build:
+        for label, info in incomplete.items():
+            if label in finished:
+                continue
+            current = merged.get(label)
+            selected = info.get("selected_files")
+            if current is None:
+                merged[label] = {"selected_files": None if selected is None else list(selected)}
+                continue
+            previous = current.get("selected_files")
+            if previous is None or selected is None:
+                current["selected_files"] = None
+            else:
+                current["selected_files"] = sorted(set(previous) | set(selected))
+    return merged
 
 
 def build_step_observations(job_files: list[Path]) -> dict[str, dict[str, float]]:
@@ -235,9 +311,10 @@ def write_merged_profile(
     builds: int,
     build_ids: list[str] | None = None,
     step_queues: dict[str, str] | None = None,
+    incomplete_steps: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, Any] = {
         "schema": SCHEMA,
         "measurement": "p80_over_passed_builds_of_raw_job_file_seconds",
         "builds": builds,
@@ -245,6 +322,9 @@ def write_merged_profile(
         "steps": steps,
         "step_queues": {label: queue for label, queue in sorted((step_queues or {}).items()) if queue},
     }
+    # TEMPORARY: delete with the killed-session estimate.
+    if incomplete_steps:
+        payload["incomplete_steps"] = incomplete_steps
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return output
 
@@ -463,6 +543,7 @@ def prepare_profile_from_history(
     changes did to the step. Merge planning stays on ``main``.
     """
     per_build: list[dict[str, tuple[dict[str, float], str]]] = []
+    per_incomplete: list[dict[str, dict[str, Any]]] = []
     build_ids: list[str] = []
     current = _env("BUILDKITE_BUILD_ID")
     candidates = max(builds * HISTORY_CANDIDATE_FACTOR, builds)
@@ -496,6 +577,8 @@ def prepare_profile_from_history(
                 continue
             misses = 0
             per_build.append(observed)
+            # TEMPORARY: delete with the killed-session estimate.
+            per_incomplete.append(build_incomplete_steps(_job_files(root)))
             build_ids.append(build_id)
             if len(build_ids) >= builds:
                 break
@@ -511,4 +594,5 @@ def prepare_profile_from_history(
         builds=len(per_build),
         build_ids=build_ids,
         step_queues=queues,
+        incomplete_steps=merge_incomplete_steps(list(zip(per_build, per_incomplete, strict=True))),
     )

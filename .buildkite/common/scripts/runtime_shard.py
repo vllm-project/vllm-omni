@@ -4,12 +4,12 @@
 
 ``automatic_shard: true`` does not reserve a pool. The uploader keeps one job
 unless this step's own timings show its measured files would miss
-``timeout_in_minutes``. It then sets ``parallelism`` from a greedy
-longest-processing-time estimate, never more than ``MAX_AUTOMATIC_SHARDS``.
-That count is only a budget guess: pytest-shard hashes collected node ids and
-does not place the files the estimate packed. The packing itself is not the
-smallest possible. Unmeasured files add no weight, so a missing profile stays
-one job.
+``timeout_in_minutes``. It then packs those files with a greedy
+longest-processing-time assignment, never more than ``MAX_AUTOMATIC_SHARDS``,
+and each shard runs only the files in its bin. The packing is not the smallest
+possible. Unmeasured files add no weight, so a missing profile stays one job.
+A finished session's unmeasured files were filtered by ``-m`` and stay at
+weight 0; they are still placed in a bin so a new file keeps running.
 
 Durations are keyed by step label, with a `` · Shard N/M`` suffix removed, so
 one step does not inherit another step's time for the same path.
@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Any
 
 MAX_AUTOMATIC_SHARDS = 4
-SHARD_FLAGS = "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 PLUGIN_MODULE = "pytest_file_timings"
 PLUGIN_FLAG = f"-p {PLUGIN_MODULE}"
 SCRIPTS_DIR = ".buildkite/common/scripts"
@@ -39,6 +38,8 @@ PYTHONPATH_EXPORT = f'export PYTHONPATH="{SCRIPTS_DIR}$${{PYTHONPATH:+:$$PYTHONP
 ARTIFACT_PATHS = ["timings/jobs/*.json"]
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _SHELL_EXPAND_ARG = re.compile(r"^(?:--(?:num-shards|shard-id)=)?\${1,2}[A-Za-z_][A-Za-z0-9_]*$")
+_SHARD_FILE_ARG = '"$${_shard_files[@]}"'
+FILE_SHARD_ROOT = Path("timings/file-shards")
 _VALUE_OPTIONS = {
     "-m",
     "--run-level",
@@ -98,6 +99,29 @@ def _profile_payload() -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+def load_incomplete_steps() -> dict[str, dict[str, Any]]:
+    """TEMPORARY: delete after the CI check.
+
+    Keyed by step label. ``selected_files`` is the marker selection, or None
+    when the killed job's artifact did not record it. Absent labels finished.
+    """
+    payload = _profile_payload()
+    raw = payload.get("incomplete_steps") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[str, dict[str, Any]] = {}
+    for label, info in raw.items():
+        if not isinstance(info, dict) or "selected_files" not in info:
+            continue
+        selected = info.get("selected_files")
+        if selected is None:
+            parsed[base_label(str(label))] = {"selected_files": None}
+            continue
+        if isinstance(selected, list):
+            parsed[base_label(str(label))] = {"selected_files": [str(item).replace("\\", "/") for item in selected]}
+    return parsed
+
+
 def load_step_queues() -> dict[str, str]:
     """Agent queue recorded for each step label, if the profile has one."""
     payload = _profile_payload()
@@ -118,7 +142,7 @@ def plan_shard_count(
     This is not the smallest packing. Weights ``[8, 6, 5, 5, 4, 4]`` fit a
     budget of 16 in two bins, and this search returns three. A file that
     already exceeds the budget does not add shards, because extra bins cannot
-    shorten it. pytest-shard then hashes node ids instead of placing these files.
+    shorten it. ``pack_files`` places paths into the bins this count selects.
     """
     if budget_seconds <= 0 or not weights or max_shards < 1:
         return 1
@@ -134,6 +158,25 @@ def plan_shard_count(
         if load <= budget_seconds:
             return count
     return best_n
+
+
+def pack_files(
+    weights: dict[str, float],
+    budget_seconds: float,
+    *,
+    max_shards: int = MAX_AUTOMATIC_SHARDS,
+) -> list[list[str]]:
+    """Place each path into the bins selected by :func:`plan_shard_count`."""
+    if not weights:
+        return []
+    count = plan_shard_count(list(weights.values()), budget_seconds, max_shards=max_shards)
+    loads = [0.0] * count
+    bins: list[list[str]] = [[] for _ in range(count)]
+    for name, weight in sorted(weights.items(), key=lambda item: (-item[1], item[0])):
+        index = min(range(count), key=loads.__getitem__)
+        bins[index].append(name)
+        loads[index] += weight
+    return [names for names in bins if names]
 
 
 def apply_automatic_shard(
@@ -194,31 +237,36 @@ def apply_automatic_shard(
     if step_timings is not None and recorded_queue and step_queue and recorded_queue != step_queue:
         log(f"automatic-shard: {label!r} ignores timings recorded on {recorded_queue}")
         step_timings = None
-    weights = _measured_weights(files, step_timings)
-    count = 1 if weights is None else plan_shard_count(weights, budget_seconds)
-    measured = 0 if weights is None else len(weights)
-    if count <= 1:
-        if weights is None:
-            reason = "no timings for this step" if timings else "no timing profile"
-        else:
-            reason = f"measured {measured}/{len(files)} files fit"
+    planned = _plan_weights(files, step_timings, load_incomplete_steps().get(base_label(label)))
+    if planned is None:
+        reason = "no timings for this step" if timings else "no timing profile"
+        log(f"automatic-shard: {label!r} stays 1 job ({reason}; budget {timeout_min} min)")
+        step["commands"] = _instrument_commands(commands, instrumentable)
+        return step
+    weights, measured, estimated = planned
+    bins = pack_files(weights, budget_seconds)
+    if len(bins) <= 1:
+        reason = f"measured {measured}/{len(files)} files fit"
         log(f"automatic-shard: {label!r} stays 1 job ({reason}; budget {timeout_min} min)")
         step["commands"] = _instrument_commands(commands, instrumentable)
         return step
 
-    step["parallelism"] = count
+    slug = _shard_slug(label)
+    _write_file_shards(root, slug, bins)
+    step["parallelism"] = len(bins)
     if "Shard %N/%t" not in label:
         step["label"] = f"{label} · Shard %N/%t"
     rewritten: list[Any] = []
     for index, command in enumerate(commands):
-        if index in shardable and isinstance(command, str) and SHARD_FLAGS not in command:
-            rewritten.append(f"{command.rstrip()} {SHARD_FLAGS}")
+        if index in shardable and isinstance(command, str):
+            rewritten.append(_file_shard_command(command, slug))
         else:
             rewritten.append(command)
-    # Instrument after shard flags so command indexes stay stable.
     step["commands"] = _instrument_commands(rewritten, instrumentable)
+    estimate = f", temporary estimate {estimated} unfinished" if estimated else ""
     log(
-        f"automatic-shard: {label!r} -> {count} jobs (measured {measured}/{len(files)} files, budget {timeout_min} min)"
+        f"automatic-shard: {label!r} -> {len(bins)} jobs "
+        f"(measured {measured}/{len(files)} files{estimate}, budget {timeout_min} min)"
     )
     return step
 
@@ -278,6 +326,90 @@ def _inject_plugin(command: str) -> str:
     return "".join(out)
 
 
+def _plan_weights(
+    files: list[str],
+    timings: dict[str, float] | None,
+    incomplete: dict[str, Any] | None,
+) -> tuple[dict[str, float], int, int] | None:
+    """Weight for every discovered file, plus measured and estimated counts.
+
+    A file with no duration stays at 0. TEMPORARY: when ``incomplete`` is set,
+    selected files that never finished take the mean of the files that did.
+    ``selected_files is None`` means the killed artifact did not record the
+    marker selection, so every unmeasured discovered file is estimated.
+    Delete this estimate with ``incomplete_steps``.
+    """
+    measured_list = _measured_weights(files, timings)
+    if measured_list is None or timings is None:
+        return None
+    measured = {name: float(timings[name]) for name in files if name in timings and float(timings[name]) > 0}
+    weights = {name: measured.get(name, 0.0) for name in files}
+    estimated = 0
+    if incomplete is not None and measured:
+        selected = incomplete.get("selected_files")
+        if selected is None:
+            pending = [name for name in files if name not in measured]
+        else:
+            chosen = {str(name).replace("\\", "/") for name in selected}
+            pending = [name for name in files if name in chosen and name not in measured]
+        if pending:
+            mean = sum(measured.values()) / len(measured)
+            for name in pending:
+                weights[name] = mean
+            estimated = len(pending)
+    return weights, len(measured), estimated
+
+
+def _shard_slug(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", base_label(label).lower()).strip("-")
+    return slug[:80] or "step"
+
+
+def _write_file_shards(root: Path, slug: str, bins: list[list[str]]) -> None:
+    dest = root / FILE_SHARD_ROOT / slug
+    if dest.exists():
+        for old in dest.glob("*.txt"):
+            old.unlink()
+    dest.mkdir(parents=True, exist_ok=True)
+    for index, names in enumerate(bins):
+        (dest / f"{index}.txt").write_text("".join(f"{name}\n" for name in names), encoding="utf-8")
+
+
+def _file_shard_command(command: str, slug: str) -> str:
+    """Run one packed bin. ``$$`` survives Buildkite interpolation."""
+    argv = _pytest_argv(command)
+    if argv is None:
+        return command
+    kept = [argv[0]]
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg in _VALUE_OPTIONS:
+            if index + 1 < len(argv):
+                kept.extend((arg, argv[index + 1]))
+            else:
+                kept.append(arg)
+            index += 2
+            continue
+        if arg.startswith("-"):
+            kept.append(arg)
+            index += 1
+            continue
+        index += 1
+    kept.append(_SHARD_FILE_ARG)
+    pytest_line = _shell_join(kept)
+    return "\n".join(
+        (
+            "set -eu",
+            f'shard_list="{FILE_SHARD_ROOT.as_posix()}/{slug}/$${{BUILDKITE_PARALLEL_JOB:-0}}.txt"',
+            'buildkite-agent artifact download "$$shard_list" .',
+            'mapfile -t _shard_files < "$$shard_list"',
+            'test "$${#_shard_files[@]}" -gt 0',
+            pytest_line,
+        )
+    )
+
+
 def _shell_join(argv: list[str]) -> str:
     """Quote like a shell, but leave ``$BUILDKITE_*`` shard flags for expansion.
 
@@ -287,7 +419,7 @@ def _shell_join(argv: list[str]) -> str:
     """
     parts: list[str] = []
     for arg in argv:
-        if _SHELL_EXPAND_ARG.fullmatch(arg):
+        if arg == _SHARD_FILE_ARG or _SHELL_EXPAND_ARG.fullmatch(arg):
             parts.append(arg)
         else:
             parts.append(shlex.quote(arg))
