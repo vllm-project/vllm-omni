@@ -24,7 +24,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -697,6 +697,31 @@ def test_processed_stage_request_preserves_metadata_forms(metadata_kind):
     request = _processed_request("metadata-forms", _sampling_params())
     upgraded = orchestrator._upgrade_processed_stage_request(request, {"additional_information": raw_info})
     assert deserialize_additional_information(getattr(upgraded, "additional_information", None)) == (info or {})
+
+
+@pytest.mark.parametrize("buffer", [{"duplex": {"perf_chunk": [0, 7]}}, {}, None, [], "invalid"])
+def test_processed_stage_request_preserves_runtime_buffer(buffer):
+    orchestrator = object.__new__(Orchestrator)
+    request = _processed_request("runtime-buffer", _sampling_params())
+    upgraded = orchestrator._upgrade_processed_stage_request(request, {"model_intermediate_buffer": buffer})
+    assert upgraded.prompt_token_ids == request.prompt_token_ids
+    assert upgraded.sampling_params is request.sampling_params
+    if isinstance(buffer, dict):
+        assert upgraded.model_intermediate_buffer is buffer
+    else:
+        assert upgraded is request
+
+
+def test_processed_stage_request_keeps_already_processed_runtime_buffer():
+    orchestrator = object.__new__(Orchestrator)
+    buffer = {"duplex": {"perf_chunk": [0, 7]}}
+    request = OmniEngineCoreRequest.from_request(
+        _processed_request("processed-buffer", _sampling_params()), model_intermediate_buffer=buffer
+    )
+    upgraded = orchestrator._upgrade_processed_stage_request(
+        request, {"model_intermediate_buffer": {"duplex": {"perf_chunk": [0, 99]}}}
+    )
+    assert upgraded.model_intermediate_buffer is buffer
 
 
 @pytest.mark.asyncio

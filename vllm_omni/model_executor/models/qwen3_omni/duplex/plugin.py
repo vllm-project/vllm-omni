@@ -1673,6 +1673,7 @@ class Qwen3OmniDuplexPlugin(QwenContextMemoryMixin, DuplexModelPlugin):
             context_selection=DuplexContextSelection(
                 tuple(card.node_id for card in selection.cards),
                 selection.summary.node_id if selection.summary is not None else None,
+                tuple(ref.source_id for ref in selection.omitted),
             )
             if selection is not None and self._context_config.context_memory_tokens
             else None,

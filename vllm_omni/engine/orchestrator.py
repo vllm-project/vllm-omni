@@ -2273,8 +2273,16 @@ class OrchestratorBase:
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)
         additional_information = None
+        model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
 
         if isinstance(raw_prompt, dict):
+            # Upstream InputProcessor returns a base EngineCoreRequest, which
+            # cannot carry the renderer's Omni-only runtime payload. Restore it
+            # at the same boundary as the other Omni fields.
+            if model_intermediate_buffer is None:
+                raw_buffer = raw_prompt.get("model_intermediate_buffer")
+                if isinstance(raw_buffer, dict):
+                    model_intermediate_buffer = raw_buffer
             if prompt_embeds is None:
                 raw_prompt_embeds = raw_prompt.get("prompt_embeds")
                 if isinstance(raw_prompt_embeds, torch.Tensor):
@@ -2290,13 +2298,14 @@ class OrchestratorBase:
                 log_prefix="Orchestrator stage input",
             )
 
-        if prompt_embeds is None and additional_information is None:
+        if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
             return request
 
         return OmniEngineCoreRequest.from_request(
             request,
             prompt_embeds=prompt_embeds,
             additional_information=additional_information,
+            model_intermediate_buffer=model_intermediate_buffer,
         )
 
     async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:

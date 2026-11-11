@@ -587,15 +587,26 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 # leave it unset: their prompt is one append with Stage0's duplex
                 # buffer, which the async-chunk prewarm would copy downstream.
                 request_state.prompt = dict(submission.prompt)
-                # Use the ordinary multimodal input processor for turn-model plugins.
-                # Its CPU preprocessing runs off the session/orchestrator event loop.
-                request = await self._build_next_stage_request(
-                    context.request_id,
-                    context.stage_id,
-                    dict(submission.prompt),
-                    context.stage_sampling_params,
-                    resumable=False,
-                )
+                if duplex_is_auxiliary_request(context.request_id):
+                    # Private token prompts still need native sampling setup,
+                    # including tokenizer EOS and generation-config stop IDs.
+                    # The entry builder also carries the owner's final stage.
+                    request = await self._build_entry_stage_request(
+                        context.request_id,
+                        context.stage_id,
+                        dict(submission.prompt),
+                        request_state,
+                        replica_id=pinned_replica_id,
+                    )
+                else:
+                    # Turn-model preprocessing runs off the session loop.
+                    request = await self._build_next_stage_request(
+                        context.request_id,
+                        context.stage_id,
+                        dict(submission.prompt),
+                        context.stage_sampling_params,
+                        resumable=False,
+                    )
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
             request.external_req_id = request.request_id

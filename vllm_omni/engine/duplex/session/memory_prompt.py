@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
+from vllm_omni.engine.duplex.session.memory_context import omitted_user_sources_covered
 from vllm_omni.engine.duplex.session.memory_retrieval import DuplexRetrievedCard, retrieve_memory_cards
 
 if TYPE_CHECKING:
@@ -58,7 +59,12 @@ class DuplexMemoryPromptState:
         )
 
     def matches(
-        self, session: DuplexEngineSession, capture: DuplexMemoryPromptCapture, node_ids: tuple[int, ...]
+        self,
+        session: DuplexEngineSession,
+        capture: DuplexMemoryPromptCapture,
+        node_ids: tuple[int, ...],
+        *,
+        omitted_source_ids: tuple[int, ...] = (),
     ) -> bool:
         if (
             not isinstance(capture, DuplexMemoryPromptCapture)
@@ -73,6 +79,16 @@ class DuplexMemoryPromptState:
         ):
             return False
         snapshot = session.history_snapshot()
+        if (
+            not isinstance(omitted_source_ids, tuple)
+            or len(omitted_source_ids) > len(snapshot.source_ids)
+            or any(type(source_id) is not int or source_id < 0 for source_id in omitted_source_ids)
+            or len(set(omitted_source_ids)) != len(omitted_source_ids)
+            or not set(omitted_source_ids).issubset(snapshot.source_ids)
+        ):
+            return False
+        if node_ids and not omitted_user_sources_covered(session, omitted_source_ids):
+            return False
         if not self._eligible(session, snapshot):
             return False
         session.context_ledger.refresh(snapshot)

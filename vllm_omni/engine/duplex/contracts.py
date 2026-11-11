@@ -38,6 +38,7 @@ class DuplexContextSelection:
 
     card_node_ids: tuple[int, ...]
     summary_node_id: int | None
+    omitted_source_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

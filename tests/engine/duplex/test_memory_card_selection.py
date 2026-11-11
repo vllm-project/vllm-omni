@@ -87,6 +87,21 @@ def test_ordinary_tail_append_does_not_invalidate_an_unchanged_card(session):
     assert session.memory_prompt_matches(receipt, (node_id,))
 
 
+@pytest.mark.parametrize("omitted", [[0], (True,), (-1,), (9999,), (0, 0), "0", None])
+def test_omitted_source_references_are_validated_on_the_owner(session, omitted):
+    node_id = _card(session, "city", "I live in Hangzhou.")
+    assert not session.memory_prompt_matches(capture(session), (node_id,), omitted_source_ids=omitted)
+
+
+def test_no_background_coverage_is_not_a_freshness_certificate(session):
+    node_id = _card(session, "city", "I live in Hangzhou.")
+    receipt = capture(session)
+    sources = session.history_snapshot().source_ids
+    assert not session.memory_prompt_matches(receipt, (node_id,), omitted_source_ids=sources)
+    # The existing no-card fallback remains usable with that same base.
+    assert session.memory_prompt_matches(receipt, (), omitted_source_ids=sources)
+
+
 def test_changed_heard_cutoff_rejects_same_text_selection(session):
     from tests.engine.duplex.test_memory_card_auxiliary import _spoken
     from tests.engine.duplex.test_memory_card_ledger import _admit, _operation

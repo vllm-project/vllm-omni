@@ -86,6 +86,25 @@ def _legal_text(session: DuplexEngineSession, item_id: str | None, message: dict
     return text, False
 
 
+def omitted_user_sources_covered(session: DuplexEngineSession, source_ids: tuple[int, ...]) -> bool:
+    """A pending or partial window cannot certify omitted user text as processed.
+
+    Read only the completed frontier, including edits waiting to rewind it.
+    This does not invalidate cards on tail append when that text is retained
+    in the foreground prompt, nor advance/refund any background work.
+    """
+    state = session._memory_context
+    frontier = 0 if state is None else state._cursor.slot_order
+    if state is not None and state._dirty_order is not None:
+        frontier = min(frontier, state._dirty_order)
+    omitted = frozenset(source_ids)
+    return all(
+        source.slot_order < frontier or source.message.get("role") != "user" or not _text(source.message)
+        for source in session._conversation.sources.values()
+        if source.source_id in omitted
+    )
+
+
 class DuplexMemoryContextState:
     """One bounded pending window; no history, media or node store of its own."""
 

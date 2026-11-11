@@ -516,11 +516,17 @@ class ModelChannel:
                         if not isinstance(selection, DuplexContextSelection) or snapshot is None:
                             raise DuplexRuntimeConfigError("Invalid context selection", code="context_changed")
                         ids = selection.card_node_ids
+                        omitted_ids = selection.omitted_source_ids
                         if (
                             not isinstance(ids, tuple)
                             or len(ids) > 16
                             or any(type(node_id) is not int or node_id < 0 for node_id in ids)
                             or len(set(ids)) != len(ids)
+                            or not isinstance(omitted_ids, tuple)
+                            or len(omitted_ids) > len(snapshot.source_ids)
+                            or any(type(source_id) is not int or source_id < 0 for source_id in omitted_ids)
+                            or len(set(omitted_ids)) != len(omitted_ids)
+                            or not set(omitted_ids).issubset(snapshot.source_ids)
                             or (
                                 selection.summary_node_id is not None
                                 and (type(selection.summary_node_id) is not int or selection.summary_node_id < 0)
@@ -574,7 +580,10 @@ class ModelChannel:
                             # Empty selections still validate their base. Pending
                             # reconciliation must not block a no-card foreground.
                             if ids and (
-                                memory_capture is None or not session.memory_prompt_matches(memory_capture, ids)
+                                memory_capture is None
+                                or not session.memory_prompt_matches(
+                                    memory_capture, ids, omitted_source_ids=omitted_ids
+                                )
                             ):
                                 raise _CardSelectionChangedError()
 
@@ -605,7 +614,7 @@ class ModelChannel:
                             turn_seq=reservation.update.turn_seq,
                             submitted_ns=accepted_ns,
                         )
-                        prompt = with_perf_chunk(prompt, perf_chunk)
+                        prompt = with_perf_chunk(prompt, perf_chunk, create_envelope=not resumable)
                     runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
                     submission = DuplexStageSubmission(
                         context=request_context,

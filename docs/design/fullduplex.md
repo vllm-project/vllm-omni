@@ -498,6 +498,15 @@ provide remote execution atomicity. Qwen retains receipts on the owner and
 returns selected node references separately from the model prompt. Its final
 guard checks history, settings, epoch, response/request identity and selected
 summary validity, then the materialized input tokens plus generation reserve.
+The formatter also returns omitted source IDs. Before consuming cards, the
+owner requires completed background coverage of omitted user text/transcripts.
+Pending windows, partially covered sources and edits awaiting a coverage rewind
+do not establish freshness. Retained user input does not invalidate an unchanged
+card merely by being appended. When omitted user evidence is still unprocessed,
+the existing no-card rebuild applies; it does not spend extra auxiliary budget
+or change the base history/summary selection. This conservative fallback can
+reduce recall while processing lags and does not guarantee a correction becomes
+answerable within a fixed number of seconds.
 Only a stale card selection with an unchanged base can trigger one complete
 no-card rebuild, after successful cleanup of the unaccepted attempt. History,
 summary or lifecycle changes remain errors. Empty selections validate the base

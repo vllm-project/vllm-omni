@@ -598,8 +598,16 @@ class DuplexEngineSession:
             self._memory_prompt_state = DuplexMemoryPromptState()
         return self._memory_prompt_state.capture(self, query=query, max_candidates=max_candidates)
 
-    def memory_prompt_matches(self, capture: DuplexMemoryPromptCapture, node_ids: tuple[int, ...]) -> bool:
-        return self._memory_prompt_state is not None and self._memory_prompt_state.matches(self, capture, node_ids)
+    def memory_prompt_matches(
+        self,
+        capture: DuplexMemoryPromptCapture,
+        node_ids: tuple[int, ...],
+        *,
+        omitted_source_ids: tuple[int, ...] = (),
+    ) -> bool:
+        return self._memory_prompt_state is not None and self._memory_prompt_state.matches(
+            self, capture, node_ids, omitted_source_ids=omitted_source_ids
+        )
 
     def rechunk_memory_context(self, context: DuplexContextAuxiliaryInput) -> bool:
         return self._memory_context is not None and self._memory_context.rechunk(self, context)

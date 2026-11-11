@@ -171,7 +171,7 @@ def test_selection_dto_is_frozen_and_contains_only_references():
     selection = contracts.DuplexContextSelection((1, 2), 3)
     plan = contracts.DuplexAppendPlan(prompt={}, context_selection=selection)
     assert plan.context_selection is selection
-    assert vars(selection) == {"card_node_ids": (1, 2), "summary_node_id": 3}
+    assert vars(selection) == {"card_node_ids": (1, 2), "summary_node_id": 3, "omitted_source_ids": ()}
     with pytest.raises(FrozenInstanceError):
         selection.card_node_ids = ()
 

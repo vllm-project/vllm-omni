@@ -405,6 +405,20 @@ async def test_pinned_processor_card_reaches_the_actual_stage_port(monkeypatch, 
 @pytest.mark.parametrize("change", ["summary_discard", "heard_prefix"])
 async def test_changed_summary_or_heard_prefix_is_not_a_card_only_retry(monkeypatch, change):
     async with _case(monkeypatch, summary=change == "summary_discard", heard=change == "heard_prefix") as env:
+        if change == "summary_discard":
+            from vllm_omni.engine.duplex.memory_types import DuplexMemoryProposalBatch
+
+            # This case isolates late summary invalidation. Its seeded card
+            # needs completed coverage before testing the stage-accept fence;
+            # otherwise the earlier freshness guard correctly rebuilds first.
+            for _ in range(8):
+                context = env.session.capture_memory_context()
+                if context is None:
+                    break
+                result = env.session.admit_memory_result(context=context, proposal=DuplexMemoryProposalBatch(()))
+                assert result.status == "no_change"
+            else:
+                pytest.fail("summary fixture coverage did not complete")
         entered, release = asyncio.Event(), asyncio.Event()
         pool = env.orch.stage_pools[0]
         original = pool._pick_or_select
