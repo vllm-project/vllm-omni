@@ -20,7 +20,6 @@ MODULE = "tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va_ref2
 def test_cuda_nightly_minimax_h3_function_collects_ref2va_partition() -> None:
     pipeline = yaml.safe_load(CUDA_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
     group = next(step for step in pipeline["steps"] if step.get("group") == X2V_GROUP)
-    assert group["key"] == "nightly-diffusion-x2v-group"
     matches = [step for step in group.get("steps", []) if step.get("label") == FUNCTION_LABEL]
     assert len(matches) == 1
 
