@@ -511,8 +511,19 @@ class DenoiseProgressMixin:
         scheduler=None,
         normalized_timestep: float | None = None,
         total_steps: int | None = None,
+        request_ids: tuple[str, ...] | list[str] | None = None,
+        paged_row_keys: tuple[tuple[str, int | None], ...] | list[tuple[str, int | None]] | None = None,
+        paged_step_idx: int | None = None,
     ) -> None:
-        set_forward_context_denoise_step_idx(step_idx)
+        # Optional paged selectors stay with this publish so a scheduled
+        # attention path cannot activate the full Scheduler batch and then
+        # overwrite a later filtered activation.
+        set_forward_context_denoise_step_idx(
+            step_idx,
+            request_ids=request_ids,
+            paged_row_keys=paged_row_keys,
+            paged_step_idx=paged_step_idx,
+        )
         if _forward_context is not None:
             _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:

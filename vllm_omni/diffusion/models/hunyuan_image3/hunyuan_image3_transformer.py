@@ -2972,6 +2972,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 k: v[s.start : s.stop] if isinstance(v, list) else v[s] for k, v in model_kwargs["vit_kwargs"].items()
             }
 
+        # CFG-major paged metadata mirrors the tensor batch: cond of every
+        # request, then uncond. Keep original sequence_id values for the
+        # rank-local Scheduler rows (rank r owns sequence_id == r).
+        if isinstance(model_kwargs.get("paged_row_keys"), list | tuple):
+            model_kwargs["paged_row_keys"] = list(model_kwargs["paged_row_keys"][s.start : s.stop])
+        prefix_cut = model_kwargs.get("hunyuan_paged_prefix_cut")
+        if isinstance(prefix_cut, list | tuple) and not isinstance(prefix_cut, str):
+            model_kwargs["hunyuan_paged_prefix_cut"] = tuple(prefix_cut[s.start : s.stop])
+
     # ==========================================================
     # Positive/ Negative Reuse Length
     # ==========================================================
@@ -3401,15 +3410,26 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
+                paged_request_ids = model_kwargs.get("paged_request_ids")
+                paged_row_keys = model_kwargs.get("paged_row_keys")
+                paged_step_idx = 0 if i == 0 else 1
                 if scheduled_total is None:
                     set_forward_context_denoise_step_idx(
                         i,
-                        request_ids=model_kwargs.get("paged_request_ids"),
-                        paged_row_keys=model_kwargs.get("paged_row_keys"),
-                        paged_step_idx=0 if i == 0 else 1,
+                        request_ids=paged_request_ids,
+                        paged_row_keys=paged_row_keys,
+                        paged_step_idx=paged_step_idx,
                     )
                 else:
-                    self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
+                    self.model.record_denoise_step(
+                        i,
+                        t,
+                        scheduler=self.scheduler,
+                        total_steps=scheduled_total,
+                        request_ids=paged_request_ids,
+                        paged_row_keys=paged_row_keys,
+                        paged_step_idx=paged_step_idx,
+                    )
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents

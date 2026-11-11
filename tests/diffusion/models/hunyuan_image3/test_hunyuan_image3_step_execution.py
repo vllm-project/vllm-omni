@@ -1363,3 +1363,98 @@ def test_forward_request_batch_preserves_order_when_groups_split(monkeypatch):
 
     assert [output.output["payload"]["image"].tolist() for output in outputs] == [[ord("p")], [ord("a")]]
     assert generate_ids == [["plain"], ["ar"]]
+
+
+def test_record_denoise_step_forwards_paged_row_selection(monkeypatch):
+    """Scheduled publish must keep the active group's row keys (review P1)."""
+    from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, set_forward_context
+
+    captured: list[dict[str, object]] = []
+
+    class _Runtime:
+        def ensure_active(self, step_idx, request_ids=None, row_keys=None):
+            captured.append(
+                {
+                    "step_idx": step_idx,
+                    "request_ids": None if request_ids is None else list(request_ids),
+                    "row_keys": None if row_keys is None else list(row_keys),
+                }
+            )
+            return object()
+
+    class _Pipe(DenoiseProgressMixin):
+        pass
+
+    with set_forward_context(paged_kv_runtime=_Runtime()):
+        _Pipe().record_denoise_step(
+            2,
+            total_steps=8,
+            request_ids=["req-a", "req-b"],
+            paged_row_keys=[("req-a", 0), ("req-b", 0), ("req-a", 1), ("req-b", 1)],
+            paged_step_idx=1,
+        )
+
+    assert captured == [
+        {
+            "step_idx": 1,
+            "request_ids": ["req-a", "req-b"],
+            "row_keys": [("req-a", 0), ("req-b", 0), ("req-a", 1), ("req-b", 1)],
+        }
+    ]
+
+
+def test_scheduled_generate_path_keeps_paged_row_keys_for_split_groups(monkeypatch):
+    """Nonempty schedule must not activate the full Scheduler batch without row keys."""
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+    from vllm_omni.diffusion.forward_context import (
+        DenoiseProgressMixin,
+        bind_attention_schedule,
+        set_forward_context,
+    )
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Text2ImagePipeline,
+    )
+
+    captured: list[list[tuple[str, int]] | None] = []
+
+    class _Runtime:
+        def ensure_active(self, step_idx, request_ids=None, row_keys=None):
+            captured.append(None if row_keys is None else list(row_keys))
+            return object()
+
+    class _Model(DenoiseProgressMixin):
+        pass
+
+    pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    pipe.model = _Model()
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    pipe.progress_bar = lambda total: nullcontext()
+
+    # Drive only the denoise-step publish branch used under a bound schedule.
+    model_kwargs = {
+        "paged_request_ids": ["short", "long"],
+        "paged_row_keys": [("short", 0), ("long", 0)],
+    }
+    with (
+        set_forward_context(paged_kv_runtime=_Runtime()),
+        bind_attention_schedule((AttentionScheduleRange(start=0, end=None, profile="sparse"),)),
+    ):
+        from vllm_omni.diffusion.forward_context import begin_scheduled_denoise
+
+        scheduled_total = begin_scheduled_denoise(2)
+        assert scheduled_total == 2
+        for i in range(2):
+            pipe.model.record_denoise_step(
+                i,
+                torch.tensor(100.0 * (2 - i)),
+                scheduler=pipe.scheduler,
+                total_steps=scheduled_total,
+                request_ids=model_kwargs.get("paged_request_ids"),
+                paged_row_keys=model_kwargs.get("paged_row_keys"),
+                paged_step_idx=0 if i == 0 else 1,
+            )
+
+    assert captured == [
+        [("short", 0), ("long", 0)],
+        [("short", 0), ("long", 0)],
+    ]
