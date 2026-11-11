@@ -23,8 +23,8 @@ from vllm_omni.engine.stage_pool import StagePool
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _pool() -> StagePool:
-    client = SimpleNamespace(stage_type="llm", final_output_type="audio")
+def _pool(final_output_type: str = "audio") -> StagePool:
+    client = SimpleNamespace(stage_type="llm", final_output_type=final_output_type)
     return StagePool(0, [client])  # type: ignore[arg-type]
 
 
@@ -57,3 +57,50 @@ def test_has_non_empty_output_accepts_scalar_pooling_output() -> None:
     pool = _pool()
 
     assert pool.has_non_empty_output(_pooling_request_output(torch.zeros(()))) is True
+
+
+def test_has_non_empty_output_reads_generator_backed_outputs_once() -> None:
+    # The pooled check must not consume ``outputs`` before the text check reads
+    # them: a generator-backed container would be exhausted by then and the
+    # completion would be reported as empty.
+    pool = _pool(final_output_type="text")
+    completion = SimpleNamespace(text="hello", token_ids=[1, 2])
+    request_output = SimpleNamespace(outputs=iter([completion]))
+
+    assert pool.has_non_empty_output(request_output) is True
+
+
+def test_record_output_timestamps_records_populated_pooling_output() -> None:
+    pool = _pool()
+    assert pool.collect_stage_metrics is True
+
+    request_output = _pooling_request_output(torch.zeros(2, 2))
+    output_ts = 1000.0
+    pool.record_output_timestamps([request_output], output_ts=output_ts)
+
+    metrics = pool.build_stage_metrics(
+        [request_output],
+        submit_ts=output_ts,
+        request_timestamp=output_ts - 0.5,
+        replica_id=0,
+    )
+
+    assert metrics.serving_time_to_first_output_ms == pytest.approx(500.0)
+
+
+def test_record_output_timestamps_skips_empty_pooling_output() -> None:
+    pool = _pool()
+    assert pool.collect_stage_metrics is True
+
+    request_output = _pooling_request_output(torch.zeros(0, 2))
+    output_ts = 1000.0
+    pool.record_output_timestamps([request_output], output_ts=output_ts)
+
+    metrics = pool.build_stage_metrics(
+        [request_output],
+        submit_ts=output_ts,
+        request_timestamp=output_ts - 0.5,
+        replica_id=0,
+    )
+
+    assert metrics.serving_time_to_first_output_ms == 0.0

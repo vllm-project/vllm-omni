@@ -19,6 +19,7 @@ from vllm_omni.metrics.utils import (
     count_video_frames,
     extract_diffusion_vae_decode_ms,
     extract_mm_output,
+    is_pooled_output,
     iter_mm_outputs,
     iter_output_entries,
 )
@@ -203,6 +204,16 @@ def test_iter_output_entries_wraps_single_pooling_output() -> None:
 
     assert len(entries) == 1
     assert entries[0] is source.outputs
+
+
+def test_is_pooled_output_recognizes_a_single_pooled_entry() -> None:
+    # The stage pool reads the pooled payload off the attribute directly, so
+    # the check must tell one pooled entry from a list of completions.
+    pooled = PoolingOutput(data=torch.zeros(2, 2))
+
+    assert is_pooled_output(pooled) is True
+    assert is_pooled_output([pooled]) is False
+    assert is_pooled_output(SimpleNamespace(text="a")) is False
 
 
 def test_iter_output_entries_keeps_completion_list() -> None:

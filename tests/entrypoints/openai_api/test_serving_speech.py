@@ -32,7 +32,7 @@ from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.outputs import CompletionOutput
+from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -6906,3 +6906,33 @@ def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixtu
     used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
     used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
     unused.assert_not_called()
+
+
+def _pooling_stage_output() -> PoolingRequestOutput:
+    """A forced-aligner stage's output: ``outputs`` holds one PoolingOutput."""
+    return PoolingRequestOutput(
+        request_id="req-1",
+        outputs=PoolingOutput(data=torch.zeros(2, 2)),
+        prompt_token_ids=[1, 2],
+        num_cached_tokens=0,
+        finished=True,
+    )
+
+
+def test_extract_audio_output_ignores_pooling_stage_output() -> None:
+    """The aligner stage's pooling output must not break the audio path."""
+    pooling_output = _pooling_stage_output()
+    res = OmniRequestOutput.from_stage_output(
+        pooling_output,
+        request_id="req-1",
+        stage_id=2,
+        final_output_type="timestamps",
+    )
+
+    assert res.outputs == [pooling_output.outputs]
+    assert OmniOpenAIServingSpeech._extract_audio_output(res) == (None, None)
+
+
+def test_extract_audio_output_ignores_raw_pooling_stage_output() -> None:
+    """A raw (unwrapped) pooling output must not break the audio path."""
+    assert OmniOpenAIServingSpeech._extract_audio_output(_pooling_stage_output()) == (None, None)

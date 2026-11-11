@@ -4,8 +4,9 @@
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput, RequestOutput
 
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
@@ -154,6 +155,27 @@ class TestFromStageOutput:
         assert len(out.outputs) == 1
         assert out.outputs[0].text == "hello"
         assert out.outputs[0].token_ids == [1, 2, 3]
+
+    def test_pooling_output_is_wrapped_in_a_list(self):
+        """A pooling stage's single PoolingOutput becomes a one-element list.
+
+        vLLM's ``OutputProcessor._new_request_output`` unwraps the one-element
+        list before building ``PoolingRequestOutput``, so its ``outputs`` is a
+        single ``PoolingOutput``. Every consumer of ``OmniRequestOutput``
+        iterates that attribute, so it is normalized when the stage output is
+        wrapped.
+        """
+        source = PoolingRequestOutput(
+            request_id="req-1",
+            outputs=PoolingOutput(data=torch.zeros(2, 2)),
+            prompt_token_ids=[1, 2],
+            num_cached_tokens=0,
+            finished=True,
+        )
+        out = OmniRequestOutput.from_stage_output(source, request_id="r1", final_output_type="timestamps")
+
+        assert out.outputs == [source.outputs]
+        assert out.multimodal_output == {}
 
 
 # ── dataclass safety ────────────────────────────────────────────────────────

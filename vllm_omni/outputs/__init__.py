@@ -125,6 +125,30 @@ _REQUEST_OUTPUT_CONTENT_ATTRS = (
     "ec_transfer_params",
 )
 
+
+def _as_output_entries(value: Any) -> list[Any]:
+    """Return a request output's ``outputs`` attribute as a list of entries.
+
+    A generation ``RequestOutput`` carries a list of ``CompletionOutput`` in
+    ``outputs``, but a pooling stage's ``PoolingRequestOutput`` carries a
+    single ``PoolingOutput`` there: upstream ``_new_request_output`` unwraps
+    the one-element list before building it. Normalize that shape here so the
+    declared ``list[CompletionOutput]`` field holds and every consumer can
+    iterate ``outputs``.
+
+    ``vllm_omni.metrics.utils.iter_output_entries`` does the same for
+    duck-typed containers; it cannot be imported here because the metrics and
+    outputs packages import each other.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
 # Omni-specific content copied when the wrapped stage output is itself an
 # OmniRequestOutput (e.g. a diffusion stage inside a multi-stage pipeline).
 _OMNI_CONTENT_ATTRS = (
@@ -229,7 +253,13 @@ class OmniRequestOutput(RequestOutput):
         # dataclass defaults (e.g. ``outputs=[]``, ``finished=True``).
         for name in _REQUEST_OUTPUT_CONTENT_ATTRS:
             if hasattr(source, name):
-                setattr(self, name, getattr(source, name))
+                value = getattr(source, name)
+                if name == "outputs":
+                    # A pooling stage's output holds a single PoolingOutput
+                    # instead of a list of completions; normalize it so the
+                    # consumers can iterate it.
+                    value = _as_output_entries(value)
+                setattr(self, name, value)
 
         # Omni-specific fields — only present when the source is itself an
         # OmniRequestOutput (e.g. a diffusion stage inside a pipeline).
@@ -365,7 +395,7 @@ class OmniRequestOutput(RequestOutput):
 
         Returns either a MultimodalPayload (Phase 3+) or a plain dict (legacy).
         """
-        for output in self.outputs:
+        for output in _as_output_entries(self.outputs):
             if mm := getattr(output, "multimodal_output", None):
                 return mm
         return self._multimodal_output

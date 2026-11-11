@@ -74,6 +74,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditi
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
+from vllm_omni.metrics.utils import iter_output_entries
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -2238,13 +2239,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         mm = getattr(res, "multimodal_output", None)
         if not mm:
             # MultimodalOutputProcessor attaches mm_accumulated on per-completion outputs.
-            outputs = getattr(res, "outputs", None)
-            if outputs:
-                for completion_output in outputs:
-                    completion_mm = getattr(completion_output, "multimodal_output", None)
-                    if completion_mm:
-                        mm = completion_mm
-                        break
+            # A pooling stage's output carries a single PoolingOutput instead of a
+            # list of completions, so read the entries through the shared helper.
+            for completion_output in iter_output_entries(res):
+                completion_mm = getattr(completion_output, "multimodal_output", None)
+                if completion_mm:
+                    mm = completion_mm
+                    break
         if not mm:
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)

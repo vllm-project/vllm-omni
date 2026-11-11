@@ -235,8 +235,10 @@ def extract_word_timestamps(res: Any, text: str, language: str | None = None) ->
         outs = getattr(res, "outputs", None)
         if outs is None:
             return None
-        # The aligner stage's res.outputs is a single PoolingOutput (not a list).
-        # Its .data is a [n_words, 2] int32 tensor of [start_ms, end_ms] per word.
+        # The aligner stage's res.outputs holds one PoolingOutput, which
+        # upstream leaves unwrapped (not a list). Its .data is a [n_words, 2]
+        # int32 tensor of [start_ms, end_ms] per word. The serving layer wraps
+        # the stage output in a one-element list, so accept both shapes.
         out0 = outs[0] if isinstance(outs, (list, tuple)) else outs
         ms = getattr(out0, "data", None)
         if ms is None or not hasattr(ms, "tolist"):

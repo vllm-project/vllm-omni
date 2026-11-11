@@ -46,6 +46,7 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    is_pooled_output,
     iter_mm_outputs,
     iter_output_entries,
 )
@@ -1008,21 +1009,25 @@ class StagePool:
         return self._has_non_empty_output(request_output)
 
     def _has_non_empty_output(self, request_output: Any) -> bool:
+        outs = getattr(request_output, "outputs", None)
         # A pooling stage returns a single PoolingOutput whose payload is
-        # ``data``; it has no text, token ids, or multimodal Mapping, so check
-        # it before the text-only shortcut below. A completion that also
-        # carries ``data`` is judged by its text and token ids instead.
-        for output in iter_output_entries(request_output):
-            if getattr(output, "text", None) or getattr(output, "token_ids", None):
-                continue
-            if self._is_non_empty_value(getattr(output, "data", None)):
-                return True
+        # ``data``; it has no text, token ids, or multimodal Mapping, so read
+        # it directly, before the text-only shortcut below. Reading the
+        # attribute (instead of scanning the entries) leaves a
+        # generator-backed ``outputs`` unconsumed for the checks below.
+        if is_pooled_output(outs):
+            return self._is_non_empty_value(getattr(outs, "data", None))
+
+        # Materialize the entries once: a non-sequence ``outputs`` may be a
+        # generator, and consuming it twice would hide the completions from
+        # the checks below.
+        entries = iter_output_entries(request_output)
 
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
-            return any(bool(getattr(output, "text", "")) for output in iter_output_entries(request_output))
+            return any(bool(getattr(output, "text", "")) for output in entries)
 
         if getattr(request_output, "images", None):
             return True
@@ -1036,7 +1041,7 @@ class StagePool:
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
-        for output in iter_output_entries(request_output):
+        for output in entries:
             if getattr(output, "text", None):
                 return True
             token_ids = getattr(output, "token_ids", None)

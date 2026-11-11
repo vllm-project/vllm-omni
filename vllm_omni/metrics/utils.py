@@ -304,7 +304,7 @@ def resolve_int_by_sequential_keys(
     return None
 
 
-def _is_pooled_output(candidate: object) -> bool:
+def is_pooled_output(candidate: object) -> bool:
     """Whether ``candidate`` is one pooled output rather than a list of them.
 
     A ``PoolingOutput`` carries the pooled ``data`` and no per-completion
@@ -314,6 +314,10 @@ def _is_pooled_output(candidate: object) -> bool:
     pooled entry instead of being iterated. That is the safer direction: a
     pooled entry is never mistaken for a sequence of completions, while the
     reverse would lose the completions' text and finish reason.
+
+    Read the attribute directly when only the pooled payload is needed: it
+    leaves a generator-backed ``outputs`` unconsumed for the callers that
+    still need the completions.
     """
     return hasattr(candidate, "data") and not isinstance(candidate, Sequence)
 
@@ -344,7 +348,7 @@ def iter_output_entries(mm_source: object) -> list[Any]:
         return []
     if isinstance(outs, (list, tuple)):
         return list(outs)
-    if _is_pooled_output(outs):
+    if is_pooled_output(outs):
         return [outs]
     try:
         return list(outs)
