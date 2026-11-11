@@ -8,10 +8,14 @@ Please refer to [README.md](../../../README.md)
 
 ## Launch the Server
 
+Run these commands from the repository root. For Chat Completions, `--chat-template`
+selects Step-Audio2's native `<|BOT|>` / `<|EOT|>` format and maps `user` to `human`.
+
 ```bash
 # Async chunk mode (recommended — lower first-packet latency for TTS)
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2_async_chunk.yaml \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 
@@ -19,12 +23,14 @@ Sequential mode:
 ```bash
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
     --deploy-config vllm_omni/deploy/step_audio_2.yaml \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 
 With local model:
 ```bash
 vllm serve /path/to/Step-Audio-2-mini --omni --port 8092 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
     --trust-remote-code --enforce-eager
 ```
 

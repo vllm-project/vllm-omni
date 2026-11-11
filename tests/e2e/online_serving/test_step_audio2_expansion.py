@@ -8,6 +8,7 @@ Request shape follows examples/online_serving/step_audio2/openai_chat_completion
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
 DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
+CHAT_TEMPLATE = Path(__file__).resolve().parents[3] / "vllm_omni/transformers_utils/chat_templates/step_audio2.jinja"
 SAMPLE_RATE = 16000
 SEED = 42
 SYNTH_PHRASE = "how are you"
@@ -28,7 +30,7 @@ TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            server_args=["--deploy-config", DEPLOY_CONFIG, "--trust-remote-code"],
+            server_args=["--deploy-config", DEPLOY_CONFIG, "--trust-remote-code", "--chat-template", str(CHAT_TEMPLATE)],
             env_dict={"VLLM_IMAGE_FETCH_TIMEOUT": "60"},
         ),
         id="step_audio2",
