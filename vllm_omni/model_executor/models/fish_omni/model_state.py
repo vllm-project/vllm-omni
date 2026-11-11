@@ -237,6 +237,10 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
             self.prompts.pop(index, None)
+            # A request removed before the next step must not write to its freed slot.
+            self._pending_slots.pop(index, None)
+            self._pending_history.pop(index, None)
+            self._pending_epsilon_cutoffs.pop(index, None)
         super().remove_request(req_index_or_id)
 
     def on_request_preempted(self, req_id: str, req_index: int) -> None:

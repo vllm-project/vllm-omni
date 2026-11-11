@@ -159,6 +159,8 @@ class ReferenceFrameSampler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         draw = candidate_ids[truncated_sample(candidate_logits, temperature, top_k, top_p, epsilon_cutoff, noise[:, 0])]
         if self.fallback == "argmax":
+            # As in the reference: a repeated draw that is itself the most probable
+            # candidate is kept; the ras fallback re-draws instead.
             alternative = candidate_ids[candidate_logits.float().argmax(dim=-1)]
         else:
             alternative = candidate_ids[
