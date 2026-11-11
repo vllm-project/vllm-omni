@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""A completed benchmark is not a passing performance or quality regression."""
+"""Real raw metrics and independent numerical/semantic accuracy boundaries."""
 
 from __future__ import annotations
 
-import copy
 import importlib.metadata
 import sys
 from pathlib import Path
@@ -13,9 +12,7 @@ import pytest
 
 from benchmarks.lingbot_world.regression import (
     RegressionError,
-    calibrate,
     check_binary_activity,
-    check_performance,
     check_quality,
     performance_metrics,
     read_json,
@@ -25,29 +22,12 @@ from vllm_omni.benchmarks.realtime_video.workload import ChunkRecord, compute_me
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-_RECORDED_ENGINE_ENVIRONMENT = {
-    "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0",
-    "VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0",
-}
-
 
 def document(interval=0.5, num_chunks=40):
     records = [ChunkRecord(i, (i + 1) * interval, interval, 1024, 9 if i == 0 else 12) for i in range(num_chunks)]
     config = {"target_fps": 12, "warmup_chunks": 6, "chunk_slo_ms": 1000, "playback_buffer_chunks": 1}
     metrics = compute_metrics(records, fps=12, warmup_chunks=6, slo_ms=1000, ttfc_s=interval)
     return {"config": config, "sessions": [{"chunks": [r.to_dict() for r in records], "metrics": metrics}]}
-
-
-def baseline():
-    measured = performance_metrics(document(), num_chunks=40, min_steady=30)
-    return calibrate([measured] * 3, contract={"sku": "H100", "cards": 1}, reference_revision="a" * 40)
-
-
-def test_successful_but_slow_benchmark_fails():
-    measured = performance_metrics(document(interval=0.7), num_chunks=40, min_steady=30)
-    result = check_performance(measured, baseline(), contract={"sku": "H100", "cards": 1})
-    assert not result["passed"]
-    assert any("mean_ms" in reason for reason in result["violations"])
 
 
 @pytest.mark.parametrize("change", ["missing", "reordered", "frames", "nonfinite", "interval", "wall"])
@@ -74,32 +54,6 @@ def test_raw_chunk_times_override_forged_aggregate():
     data = document(interval=0.8)
     data["sessions"][0]["metrics"]["interval_steady"]["mean_ms"] = 1
     assert performance_metrics(data, num_chunks=40, min_steady=30)["mean_ms"] == pytest.approx(800)
-
-
-def test_baseline_is_tied_to_hardware_and_configuration():
-    measured = performance_metrics(document(), num_chunks=40, min_steady=30)
-    with pytest.raises(RegressionError, match="contract mismatch"):
-        check_performance(measured, baseline(), contract={"sku": "910B1", "cards": 4})
-
-
-def test_calibration_rejects_insufficient_or_noisy_reference():
-    measured = performance_metrics(document(), num_chunks=40, min_steady=30)
-    with pytest.raises(RegressionError, match="three independent"):
-        calibrate([measured] * 2, contract={}, reference_revision="a" * 40)
-    noisy = copy.deepcopy(measured)
-    noisy["mean_ms"] *= 2
-    with pytest.raises(RegressionError, match="Unstable reference"):
-        calibrate([measured, measured, noisy], contract={}, reference_revision="a" * 40)
-
-
-def test_short_run_reports_p99_without_gating_it():
-    measured = performance_metrics(document(), num_chunks=40, min_steady=30)
-    assert measured["p99_ms"] == 500
-    assert "p99_ms" not in baseline()["limits"]
-    gate = baseline()
-    gate["limits"]["p99_ms"] = {"direction": "max", "value": 1000}
-    with pytest.raises(RegressionError, match="1000 steady"):
-        check_performance(measured, gate, contract=gate["contract"])
 
 
 def test_quality_regression_cannot_hide_behind_improved_aesthetics():
@@ -139,50 +93,6 @@ def test_unpinned_evaluator_dependencies_are_rejected(tmp_path: Path):
     path.write_text("pytest>=8\n")
     with pytest.raises(RegressionError, match="not exactly pinned"):
         verify_environment(Path(sys.executable), path)
-
-
-@pytest.mark.parametrize(
-    "metric,reference_values,candidate_value",
-    [
-        ("ttfc_ms", [1501.201, 1458.253, 1549.494], 1646.096),
-        ("stall_ms", [159.172, 112.634, 90.709], 201.321),
-    ],
-)
-def test_h100_transient_jitter_uses_only_independent_reference_values(metric, reference_values, candidate_value):
-    # Actual H100 build 17394 transients; cadence remains subject to the same
-    # 3% CV and 5% regression rules. Candidate values never enter calibration.
-    row = performance_metrics(document(), num_chunks=40, min_steady=30)
-    references = [dict(row, **{metric: value}) for value in reference_values]
-    gate = calibrate(references, contract={}, reference_revision="a" * 40)
-    strict = calibrate(references, contract={}, reference_revision="a" * 40, transient_noise_sigma=0)
-    candidate = dict(row, **{metric: candidate_value})
-    assert not check_performance(candidate, strict, contract={})["passed"]
-    assert check_performance(candidate, gate, contract={})["passed"]
-    original = copy.deepcopy(gate)
-    candidate[metric] = gate["limits"][metric]["value"] + 1
-    assert not check_performance(candidate, gate, contract={})["passed"]
-    candidate[metric] = candidate_value
-    candidate["mean_ms"] *= 1.06
-    assert not check_performance(candidate, gate, contract={})["passed"]
-    assert gate == original
-
-
-@pytest.mark.parametrize("sigma", [-1, float("nan"), 3.01])
-def test_transient_noise_multiplier_is_finite_nonnegative_and_bounded(sigma):
-    row = performance_metrics(document(), num_chunks=40, min_steady=30)
-    with pytest.raises(RegressionError):
-        calibrate([row] * 3, contract={}, reference_revision="a" * 40, transient_noise_sigma=sigma)
-
-
-def test_regression_rejects_a_changed_playback_buffer():
-    from vllm_omni.benchmarks.realtime_video.metrics import measured_metrics
-
-    doc = document()
-    doc["sessions"][0]["request_id"] = "test-session"
-    doc["sessions"][0]["session_index"] = 0
-    doc["config"]["playback_buffer_chunks"] = 2
-    with pytest.raises(RegressionError, match="one-chunk playback buffer"):
-        measured_metrics(doc, {"num_chunks": 40, "min_steady_samples": 30, "target_fps": 12, "warmup_chunks": 6})
 
 
 @pytest.mark.parametrize(

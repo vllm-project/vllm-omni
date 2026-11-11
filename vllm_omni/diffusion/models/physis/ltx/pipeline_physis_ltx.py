@@ -15,6 +15,12 @@ from torch import nn
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
     DistributedAutoencoderKLLTX2Video,
 )
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_timing import CellTiming
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+    resolve_pp_rank_and_group,
+    run_cell_pipeline,
+)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CausVidWanPipeline,
@@ -30,12 +36,6 @@ from vllm_omni.diffusion.models.physis.common import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
-from vllm_omni.experimental.ar_diffusion.cell_executor import (
-    resolve_pp_rank_and_group,
-    run_cell_pipeline,
-)
-from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
 from .sampler import LTXFourStepSampler
@@ -231,7 +231,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
         return self.vae.decode(latent.to(torch.bfloat16), temb, return_dict=False)[0].clamp(-1, 1)
 
     def forward(self, req):
-        assert self._chunk_ctx is not None
+        ctx = self._execution_context()
         _, pp = resolve_pp_rank_and_group()
         device = next(self.transformer.parameters()).device
         outputs = []
@@ -266,7 +266,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                 pp=pp,
             )
             tf.capture_sink = False
-            self._chunk_ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
+            ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
             adapter = PhysisLTXCell(
                 tf,
                 sampler=sampler,
@@ -277,7 +277,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                 dtype=torch.float32,
                 on_finished=timing.mark,
             )
-            run_cell_pipeline(ctx=self._chunk_ctx, adapter=adapter)
+            run_cell_pipeline(ctx=ctx, adapter=adapter)
             finished = self._gather_finished(adapter.finished, pp)
             durations = timing.durations(pp)
             if self.pp_rank == 0:

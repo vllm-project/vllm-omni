@@ -24,6 +24,14 @@ The hook moves parameters and buffers without recursively calling
 other transformer blocks. Host tensors are pinned when configured; DTensors
 are not pinned through the ordinary tensor path.
 
+On ROCm, pinned host copies of dense local modules share allocator-aware slabs
+when that reduces or preserves the estimated backing size. The packed path
+preserves physical-storage aliases, offsets, strides, dtypes, and the values at
+each offload. Ordinary sequential movement falls back before module storage
+changes for unsupported layouts, mixed residency, distributed tensors, and
+slab-allocation failures. Persistent module-residency stagers use the same
+packing for their immutable pinned masters.
+
 Before forward returns control to the model, the hook synchronizes the active
 platform so compute cannot race the transfer. XPU uses blocking device-to-host
 copies because its allocator cannot safely evict storage while an asynchronous

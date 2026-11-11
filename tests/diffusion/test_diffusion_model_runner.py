@@ -11,9 +11,17 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionOutput,
+    VideoOutputTransportConfig,
+)
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import set_forward_context as real_set_forward_context
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -306,6 +314,54 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
     assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
 
 
+class _ScheduleSourcePipeline:
+    """Records the schedule and its source that the runner binds around the batch forward."""
+
+    supports_request_batch = True
+
+    def __init__(self):
+        self.bound = None
+
+    def forward(self, batch):
+        context = get_forward_context()
+        self.bound = (context.attention_schedule, context.attention_schedule_from_request)
+        return [DiffusionOutput(output=prompt) for prompt in batch.prompts]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("explicit", [False, True], ids=["all-inherited", "all-explicit"])
+def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, monkeypatch):
+    # Batch keys keep requests that sent a schedule apart from requests that inherit one, so a batch
+    # has one source; only a request's own ranges are checked against its denoise sequence.
+    ranges = [{"start": 0, "end": 40, "profile": "sparse"}]
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SDPA"))}, default=ranges
+    )
+    runner.pipeline = _ScheduleSourcePipeline()
+    requests = []
+    for req_id in ("a", "b"):
+        request = _make_request()
+        request.request_id = req_id
+        request.sampling_params.attention_schedule = list(ranges) if explicit else None
+        requests.append(request)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
+
+    runner._execute_request_list(
+        requests,
+        od_config=runner.od_config,
+        allow_single_output=False,
+        require_request_batch_support=True,
+        record_name="test_schedule_source",
+        record_output_peak_memory=False,
+    )
+
+    schedule, from_request = runner.pipeline.bound
+    assert schedule == runner.od_config.diffusion_attention_schedule.default
+    assert from_request is explicit
+
+
 def _make_compile_runner(
     model=None,
     *,
@@ -532,9 +588,15 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
-    model = SimpleNamespace(enable_cuda_graph_decode=True)
+@pytest.mark.parametrize(
+    ("decode_graph", "denoise_graph"),
+    [(True, False), (False, True)],
+    ids=["decode-graph", "denoise-graph"],
+)
+def test_compile_transformer_scopes_inductor_cudagraphs_to_graph_layers(monkeypatch, decode_graph, denoise_graph):
+    model = SimpleNamespace(enable_cuda_graph_decode=decode_graph)
     runner = _make_compile_runner(model)
+    runner.od_config.diffusion_use_graph = denoise_graph
     compile_calls = []
 
     def _regionally_compile(target, *args, **kwargs):

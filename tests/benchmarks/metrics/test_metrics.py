@@ -137,6 +137,18 @@ def test_unmeasured_audio_ttfp_does_not_pass_goodput() -> None:
     assert combined.request_goodput == 0.0
 
 
+def test_unmeasured_audio_rtf_is_not_a_zero_sample() -> None:
+    text_only = _make_output(100)
+    spoken = _make_output(100)
+    spoken.audio_rtf = 0.4
+    spoken.audio_duration = 2.0
+
+    metrics = _calculate_test_metrics([text_only, spoken])
+
+    assert metrics.num_audio_rtf_samples == 1
+    assert metrics.mean_audio_rtf == pytest.approx(0.4)
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================

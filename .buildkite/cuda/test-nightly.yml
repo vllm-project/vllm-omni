@@ -52,6 +52,8 @@ steps:
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         source_file_dependencies: omni_qwen3_omni_doc
         timeout_in_minutes: 90
+        artifact_paths:
+          - qwen3-omni-doc-artifacts/**/*
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
@@ -432,6 +434,18 @@ steps:
             VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
               pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and H100 and B200 and cuda and cards_1" --run-level "full_model"
 
+      - label: ":full_moon: Diffusion Image · Flux3 Single-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cpu_offload or cache_dit" -m "full_model and diffusion" --run-level "full_model"
+        mirror_hardwares: h100_1
+      - label: ":full_moon: Diffusion Image · Flux3 Multi-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cfg_parallel or tp_2 or hsdp" -m "full_model and diffusion" --run-level "full_model"
+        mirror_hardwares: h100_1
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
         timeout_in_minutes: 180
@@ -514,6 +528,25 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json -m "H100 and B200 and cards_1"
+      - label: ":full_moon: Diffusion X2V · Perf Test · LingBot World · 2-GPU"
+        key: lingbot-cuda-nightly-performance
+        source_file_dependencies: lingbot_world_perf
+        timeout_in_minutes: 180
+        mirror_hardwares: h100_2
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json -m "full_model and diffusion and cuda and H100 and cards_2" --run-level full_model
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test"
+        key: lingbot-cuda-nightly-accuracy
+        source_file_dependencies: lingbot_world_accuracy
+        timeout_in_minutes: 480
+        mirror_hardwares: h100_2
+        artifact_paths:
+          - "lingbot-artifacts/cuda-accuracy/**/*"
+        commands:
+          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/cuda.json --lingbot-output=lingbot-artifacts/cuda-accuracy --run-level full_model
 
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
@@ -630,85 +663,3 @@ steps:
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
     agents:
       queue: "medium_cpu_queue_premerge"
-
-  - group: ":card_index_dividers: World Model Test"
-    depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
-    steps:
-      - label: "LingBot World · CUDA paired measurements"
-        key: lingbot-cuda-nightly-generation
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/cuda-generation
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        timeout_in_minutes: 240
-        mirror_hardwares: h100_8
-        artifact_paths:
-          - "lingbot-artifacts/cuda-nightly/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh generate tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly
-      - label: "LingBot World · CUDA numeric precision"
-        key: lingbot-cuda-nightly-precision
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-cuda-nightly-generation
-            allow_failure: true
-        timeout_in_minutes: 60
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/cuda-nightly-precision/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh precision tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-precision lingbot-artifacts/cuda-nightly
-      - label: "LingBot World · CUDA performance regression"
-        key: lingbot-cuda-nightly-performance
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-cuda-nightly-generation
-            allow_failure: true
-        timeout_in_minutes: 60
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/cuda-nightly-performance/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh performance tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-performance lingbot-artifacts/cuda-nightly
-      - label: "LingBot World · CUDA WBench accuracy"
-        key: lingbot-cuda-nightly-wbench
-        concurrency: 2
-        concurrency_group: vllm-omni/lingbot-world/quality
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-cuda-nightly-generation
-            allow_failure: true
-        timeout_in_minutes: 480
-        mirror_hardwares: h100_1
-        artifact_paths:
-          - "lingbot-artifacts/cuda-nightly-wbench/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh wbench tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-wbench lingbot-artifacts/cuda-nightly
-      - label: "LingBot World · CUDA VBench accuracy"
-        key: lingbot-cuda-nightly-vbench
-        concurrency: 2
-        concurrency_group: vllm-omni/lingbot-world/quality
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-cuda-nightly-generation
-            allow_failure: true
-        timeout_in_minutes: 480
-        mirror_hardwares: h100_1
-        artifact_paths:
-          - "lingbot-artifacts/cuda-nightly-vbench/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh vbench tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-vbench lingbot-artifacts/cuda-nightly

@@ -1233,3 +1233,136 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
+
+
+def _realtime_video_perf_record():
+    return {
+        "completed": 3,
+        "mean_e2el_ms": 1000.0,
+        "request_throughput": 1.0,
+        "mean_video_ttfc_ms": 100.0,
+        "min_video_fps": 20.0,
+        "mean_video_steady_interval_ms": 500.0,
+        "p95_video_steady_interval_ms": 600.0,
+        "mean_video_rtf": 0.5,
+        "realtime_video": {
+            "passed": True,
+            "finalization_errors": [],
+            "sessions": [{"success": True, "error": ""} for _ in range(3)],
+            "warmups": [{"success": True, "error": ""}],
+        },
+    }
+
+
+def test_realtime_video_json_uses_standard_candidate_runner_without_a_numeric_baseline(monkeypatch):
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
+
+    configs = load_benchmark_configs(str(Path(__file__).with_name("test_lingbot_world_realtime.json")))
+    assert len(configs) == 2 and all(not is_diffusion_perf_config(row) for row in configs)
+    monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", configs)
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        args = build_serve_args([*kwargs["args"], "--num-warmups", str(kwargs["num_warmups"])])
+        assert (args.num_prompts, args.max_concurrency, args.num_warmups) == (3, 1, 1)
+        assert args.realtime_video_num_chunks == 40 and args.realtime_video_warmup_num_chunks == 8
+        assert args.realtime_video_warmup_chunks == 6 and args.ready_check_timeout_sec == 0
+        assert args.realtime_video_image == (
+            "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/"
+            "2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+        )
+        assert f"workload_image={args.realtime_video_image}" in args.metadata
+        assert "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2" in args.metadata
+        assert kwargs["baseline_config"] is None
+        assert args.backend == args.dataset_name == "realtime-video"
+        return _realtime_video_perf_record()
+
+    monkeypatch.setattr(runner, "run_benchmark", benchmark)
+    expected = [("cuda", "H100", 2, "usp2_compiled.yaml"), ("npu", "A2", 4, "npu_usp4_eager.yaml")]
+    for config, (platform, resource, cards, deploy) in zip(configs, expected, strict=True):
+        assert config["mark"][0]["hardware_marks"] == {"res": {platform: resource}, "num_cards": cards}
+        assert config["server_params"]["serve_args"]["deploy-config"].endswith(deploy)
+        params = config["benchmark_params"][0]
+        assert "baseline" not in params
+        monkeypatch.setattr(runner, "get_runtime_resource_label", lambda resource=resource: resource)
+        runner.test_performance_benchmark(
+            SimpleNamespace(host="localhost", port=8000, model="fixture-model"),
+            {"test_name": config["test_name"], "params": params},
+        )
+    assert len(calls) == 2  # One candidate recipe per hardware, with no reference loop.
+
+
+@pytest.mark.parametrize("failure", ["warmup", "session", "finalization", "missing_scalar", "nonfinite"])
+def test_realtime_video_perf_cannot_pass_an_invalid_record(failure):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _realtime_video_perf_record()
+    video = result["realtime_video"]
+    if failure in {"warmup", "session"}:
+        key = "warmups" if failure == "warmup" else "sessions"
+        video[key][0]["success"] = False
+    elif failure == "finalization":
+        video["finalization_errors"] = ["media save failed"]
+    elif failure == "missing_scalar":
+        del result["min_video_fps"]
+    else:
+        result["mean_video_steady_interval_ms"] = float("nan")
+    with pytest.raises(AssertionError, match="Realtime video"):
+        assert_result(result, {"dataset_name": "realtime-video", "num_warmups": 1}, 3)
+
+
+def test_recorded_video_json_keeps_raw_metrics_hardware_and_recipe(tmp_path, monkeypatch):
+    """Only the CLI subprocess is stubbed; exercise the shared JSON postprocessor."""
+    import io
+    from pathlib import Path
+
+    from tests.dfx import conftest as dfx
+
+    record = _realtime_video_perf_record()
+    record.update(dataset_name="realtime-video", model_revision="fixture-model-revision", recipe="fixture-recipe")
+    record["realtime_video"]["raw_marker"] = ["synthetic subprocess payload"]
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+            assert command[:4] == ["vllm", "bench", "serve", "--omni"]
+            out = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(record))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    actual = dfx.run_benchmark(
+        args=["--backend", "realtime-video", "--dataset-name", "realtime-video"],
+        test_name="test_lingbot_world_realtime_cuda",
+        flow=1,
+        dataset_name="realtime-video",
+        num_prompt=3,
+        num_warmups=1,
+        resource_label="H100",
+        benchmark_params_name="fixture-recipe",
+    )
+    [saved_path] = tmp_path.glob("result_*.json")
+    saved = json.loads(saved_path.read_text())
+    assert saved == actual
+    assert saved["realtime_video"] == record["realtime_video"]
+    assert saved["Hardware"] == "H100" and saved["baseline"] == {}
+    assert saved["model_revision"] == "fixture-model-revision" and saved["recipe"] == "fixture-recipe"
+    for key in (
+        "mean_e2el_ms",
+        "request_throughput",
+        "mean_video_ttfc_ms",
+        "min_video_fps",
+        "mean_video_steady_interval_ms",
+        "p95_video_steady_interval_ms",
+        "mean_video_rtf",
+    ):
+        assert saved[key] == record[key]

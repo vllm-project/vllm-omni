@@ -490,119 +490,48 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-
-  - group: ":card_index_dividers: World Model Test"
-    depends_on: upload-nightly-pipeline
-    if: (build.pull_request.id == null || build.pull_request.labels includes "npu-test") && (build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test")
-    steps:
-      - label: "Build shared CUDA test image for NPU results"
-        key: lingbot-npu-nightly-ci-image
-        source_file_dependencies: lingbot_world_regression
+      - label: ":full_moon: Diffusion X2V · Perf Test · LingBot World · A2 4-NPU"
+        key: lingbot-npu-nightly-performance
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_perf
+        timeout_in_minutes: 180
+        mirror_hardwares: a2b3_npu_4
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json -m "full_model and diffusion and npu and A2 and cards_4" --run-level full_model
+      - label: "Build CUDA test image for LingBot NPU accuracy"
+        key: lingbot-npu-accuracy-ci-image
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
         timeout_in_minutes: 90
         agents:
           queue: medium_cpu_queue_premerge
         commands:
           - bash .buildkite/cuda/scripts/build-ci-image.sh
-      - label: "LingBot World · NPU paired measurements"
-        key: lingbot-npu-nightly-generation
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/npu-generation
-        concurrency_method: eager
-        priority: 0
-        matrix:
-          setup:
-            repeat: ["0", "1", "2"]
-        env:
-          LINGBOT_MEASUREMENT_REPEAT: "{{matrix.repeat}}"
-        source_file_dependencies: lingbot_world_regression
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy · NPU Data"
+        key: lingbot-npu-nightly-accuracy-data
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
         timeout_in_minutes: 240
-        mirror_hardwares: a2b3_npu_8
+        mirror_hardwares: a2b3_npu_4
         artifact_paths:
-          - "lingbot-artifacts/npu-nightly-measurements/**/*"
+          - "lingbot-artifacts/npu-accuracy/**/*"
         commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh collect tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-measurements/pair-{{matrix.repeat}}
-      - label: "LingBot World · NPU measurement data"
-        key: lingbot-npu-nightly-data
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
+          - python -m tests.e2e.accuracy.lingbot_world.prepare capture --profile tests/e2e/accuracy/lingbot_world/configs/npu.json --output lingbot-artifacts/npu-accuracy
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test · NPU Outputs"
+        key: lingbot-npu-nightly-accuracy
+        if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
+        source_file_dependencies: lingbot_world_accuracy
         depends_on:
-          - step: lingbot-npu-nightly-generation
+          - step: lingbot-npu-nightly-accuracy-data
             allow_failure: true
-          - lingbot-npu-nightly-ci-image
-        timeout_in_minutes: 60
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/npu-nightly/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh aggregate tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly lingbot-artifacts/npu-nightly-measurements
-      - label: "LingBot World · NPU numeric precision"
-        key: lingbot-npu-nightly-precision
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-npu-nightly-data
-            allow_failure: true
-          - lingbot-npu-nightly-ci-image
-        timeout_in_minutes: 60
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/npu-nightly-precision/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh precision tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-precision lingbot-artifacts/npu-nightly
-      - label: "LingBot World · NPU performance regression"
-        key: lingbot-npu-nightly-performance
-        concurrency: 1
-        concurrency_group: vllm-omni/lingbot-world/l4-cpu
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-npu-nightly-data
-            allow_failure: true
-          - lingbot-npu-nightly-ci-image
-        timeout_in_minutes: 60
-        mirror_hardwares: l4_1
-        artifact_paths:
-          - "lingbot-artifacts/npu-nightly-performance/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh performance tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-performance lingbot-artifacts/npu-nightly
-      - label: "LingBot World · NPU WBench accuracy"
-        key: lingbot-npu-nightly-wbench
-        concurrency: 2
-        concurrency_group: vllm-omni/lingbot-world/quality
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-npu-nightly-data
-            allow_failure: true
-          - lingbot-npu-nightly-ci-image
+          - lingbot-npu-accuracy-ci-image
         timeout_in_minutes: 480
-        mirror_hardwares: h100_1
+        mirror_hardwares: h100_2
         artifact_paths:
-          - "lingbot-artifacts/npu-nightly-wbench/**/*"
+          - "lingbot-artifacts/npu-accuracy-results/**/*"
         commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh wbench tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-wbench lingbot-artifacts/npu-nightly
-      - label: "LingBot World · NPU VBench accuracy"
-        key: lingbot-npu-nightly-vbench
-        concurrency: 2
-        concurrency_group: vllm-omni/lingbot-world/quality
-        concurrency_method: eager
-        priority: 0
-        source_file_dependencies: lingbot_world_regression
-        depends_on:
-          - step: lingbot-npu-nightly-data
-            allow_failure: true
-          - lingbot-npu-nightly-ci-image
-        timeout_in_minutes: 480
-        mirror_hardwares: h100_1
-        artifact_paths:
-          - "lingbot-artifacts/npu-nightly-vbench/**/*"
-        commands:
-          - bash tests/dfx/lingbot_world/run_ci.sh vbench tests/dfx/lingbot_world/configs/npu_nightly.json lingbot-artifacts/npu-nightly-vbench lingbot-artifacts/npu-nightly
+          - buildkite-agent artifact download "lingbot-artifacts/npu-accuracy/**" . --step lingbot-npu-nightly-accuracy-data || echo "Accuracy data download failed; each test will validate its required inputs"
+          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json --lingbot-generation=lingbot-artifacts/npu-accuracy --lingbot-output=lingbot-artifacts/npu-accuracy-results --run-level full_model

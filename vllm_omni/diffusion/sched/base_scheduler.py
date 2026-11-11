@@ -15,10 +15,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.schedule import (
-    DECODE_ONLY_PIPELINES,
     InvalidAttentionScheduleError,
     resolve_request_attention_schedule,
+    stage_runs_denoising,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -67,6 +68,7 @@ class BaseScheduler(ABC):
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
+        self._runs_denoising: bool = True
         self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
@@ -96,6 +98,11 @@ class BaseScheduler(ABC):
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         self.od_config = od_config
+        # Fixed for the stage's lifetime; admission drops request schedules on a stage without denoising.
+        stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None), getattr(od_config, "model_stage", None)
+        )
+        self._runs_denoising = stage_runs_denoising(getattr(od_config, "model_class_name", None), stage_role.value)
         self._native_prefetch_enabled = native_prefetch_enabled(od_config)
         self._native_prefetch_request_id = None
         self._request_states.clear()
@@ -168,7 +175,7 @@ class BaseScheduler(ABC):
             # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
             # rebuilds the params and absorbs it. Normalize here so topology cannot change the result.
             absorb_attention_schedule_extra_args(request.sampling_params)
-            if getattr(self.od_config, "model_class_name", None) in DECODE_ONLY_PIPELINES:
+            if not self._runs_denoising:
                 request.sampling_params.attention_schedule = None
             resolve_request_attention_schedule(
                 request.sampling_params,

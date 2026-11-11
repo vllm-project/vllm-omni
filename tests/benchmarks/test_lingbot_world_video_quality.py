@@ -84,7 +84,7 @@ def test_noisy_reference_budget_cannot_hide_a_spatially_empty_window(tmp_path: P
     measured = quality.compare_video_pair(paths[0], candidate, window_seconds=2, ssim_stride=24)
     assert measured["uniform_frame_indices"]["reference"] == []
     assert measured["uniform_frame_indices"]["candidate"] == list(range(128, 160))
-    policy = json.loads((Path(__file__).parents[2] / "tests/dfx/lingbot_world/quality.json").read_text())
+    policy = json.loads((Path(__file__).parents[2] / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
     options = {"min_psnr_db": policy["min_psnr_db"], **policy["pixel_budgets"][platform]}
     assert check_video_precision(references, measured, **options)["passed"]
     strict = {**options, "reject_uniform_frames": policy["reject_uniform_frames"]}
@@ -123,7 +123,7 @@ def test_late_corruption_fails_even_when_global_pixel_scores_pass(tmp_path: Path
     measured = quality.compare_video_pair(reference, candidate, window_seconds=2, ssim_stride=16)
     assert measured["total"]["psnr_db"] > 40
     assert measured["ssim"]["mean"] >= 0.99
-    limits = json.loads((Path(__file__).parents[2] / "tests/dfx/lingbot_world/quality.json").read_text())
+    limits = json.loads((Path(__file__).parents[2] / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
     result = check_video_precision(
         repeats,
         measured,

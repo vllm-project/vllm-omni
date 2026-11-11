@@ -375,7 +375,8 @@ def test_model_level_persistent_staging_gated_on_decode_graph(
     backend.enable(pipeline)
 
     hook = pipeline.transformer._hook_registry.get_hook(SequentialOffloadHook._HOOK_NAME)
-    assert (hook._stager is not None) is expect_stager
+    expected_stager = expect_stager and accelerator_device.type == "cuda"
+    assert (hook._stager is not None) is expected_stager
 
     backend.disable()
 
@@ -460,12 +461,10 @@ class TestMoveParamsPinMemory:
         )
         assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
-        """Regular tensor should call pin_memory when moving to CPU."""
+    def test_regular_tensor_is_pinned(self, accelerator_device):
+        """Regular tensors remain pinned regardless of allocation strategy."""
         module = _create_simple_module().to(accelerator_device)
-        tracker, mock_pin = _track_pin_memory_calls()
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
         hook = SequentialOffloadHook(
             offload_targets=[],
             device=accelerator_device,
@@ -478,7 +477,7 @@ class TestMoveParamsPinMemory:
             non_blocking=False,
             pin_memory=True,
         )
-        assert tracker["called"], "pin_memory should be called for regular tensors"
+        assert all(tensor.is_pinned() for tensor in module.parameters())
 
     def test_pin_memory_skipped_when_disabled(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """pin_memory should not be called when pin_memory=False."""

@@ -96,6 +96,12 @@ def _get_quantization_config(method: str) -> type[QuantizationConfig]:
 
 
 def _build_fp8(**kw: Any) -> QuantizationConfig:
+    if kw.get("online_block_size") is not None:
+        if kw.get("weight_scheme") is not None:
+            raise ValueError("online_block_size requires ordinary BF16/FP16 checkpoint weights")
+        from .fp8_config import DiffusionFp8Config
+
+        return DiffusionFp8Config(**kw)
     if kw.get("weight_scheme") == "per_channel":
         from .fp8_config import SerializedPerChannelFp8Config
 
@@ -599,7 +605,15 @@ def resolve_quant_config_from_disk(
         # Smooth. Per-expert rebuilds must never weaken that requirement.
         qc_kwargs["require_smooth_scale"] = quant_config.require_smooth_scale or disk_requires_smooth
 
-    if _disk_marks_serialized(qc_kwargs, quant_config):
+    disk_marks_serialized = _disk_marks_serialized(qc_kwargs, quant_config)
+    if (
+        not disk_marks_serialized
+        and qc_kwargs.get("weight_block_size") is None
+        and getattr(quant_config, "online_block_size", None) is not None
+    ):
+        qc_kwargs["online_block_size"] = quant_config.online_block_size
+
+    if disk_marks_serialized:
         logger.info(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
             qc_method,

@@ -26,7 +26,7 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
-    positive ``cards_*`` uses that chip's highest inferable preset). An explicit
+    positive ``cards_*`` uses that chip's highest existing preset). An explicit
     preset string (``h100_2``) is used as-is (marks are ignored). Names that
     are not keys in ``ci_mirror_hardwares.yml`` fail the upload.
 
@@ -76,8 +76,6 @@ from ci_conditions import (
     MERGE_UPLOAD_IF,
     NIGHTLY_LABEL_IF,
     NIGHTLY_MAIN_IF,
-    NPU_WEEKLY_LABEL_IF,
-    NPU_WEEKLY_MAIN_IF,
     READY_LABEL_IF,
     READY_UPLOAD_IF,
     ROOT,
@@ -133,23 +131,21 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     if platform == "npu":
         ready_upload = READY_LABEL_IF
         merge_upload = BOOTSTRAP_DISABLED_IF
-        weekly_main_if = NPU_WEEKLY_MAIN_IF
-        weekly_label_if = NPU_WEEKLY_LABEL_IF
+        weekly_label_if = BOOTSTRAP_DISABLED_IF
     else:
         ready_upload = READY_UPLOAD_IF
         merge_upload = MERGE_UPLOAD_IF
-        weekly_main_if = WEEKLY_MAIN_IF
         weekly_label_if = WEEKLY_LABEL_IF
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4 and WEEKLY=1 runs L5. CUDA also retains
-        # NON_CRITICAL=1 and main+WEEKLY=1 L2/L3 (with --e2e).
-        image_expr = f"({NIGHTLY_MAIN_IF}) || ({weekly_main_if})"
+        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
+        # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
+        image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
         ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_MAIN_IF
-        weekly_expr = weekly_main_if
+        weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
@@ -157,9 +153,11 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
         merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
-        image_parts = [f"({NIGHTLY_LABEL_IF})", f"({weekly_label_if})"]
+        image_parts = [f"({NIGHTLY_LABEL_IF})"]
+        if platform == "cuda":
+            image_parts.append(f"({weekly_label_if})")
         if l2_enabled:
             image_parts.insert(0, f"({ready_upload})")
         if l3_enabled:
@@ -170,7 +168,7 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_expr = ready_upload
         merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
     return {
         "image": _format_bootstrap_if(image_expr),
@@ -470,7 +468,7 @@ def _compose_mirror_hardware_name(
     Unset ``MIRROR_HW``: ``H100`` if in ``-m``, else ``L4``, else skip.
     Set ``MIRROR_HW``: that chip if in ``-m``, else skip.
     ``cards`` is a registered ``cards_n``, ``"max"`` for that chip's highest
-    inferable preset, or None (error after a chip matched — no ``cards_*``).
+    existing preset, or None (error after a chip matched — no ``cards_*``).
     """
     selector = _get_mirror_hw_selector()
     if selector:
@@ -498,11 +496,7 @@ def _compose_mirror_hardware_name(
         )
     known = _load_mirror_hardwares()
     if count is None:
-        available = [
-            n
-            for n in sorted(registered)
-            if f"{chip}_{n}" in known and known[f"{chip}_{n}"].get("infer_from_marks", True)
-        ]
+        available = [n for n in sorted(registered) if f"{chip}_{n}" in known]
         if not available:
             raise ValueError(
                 f"{count_source} in step {step_label!r} has no CUDA count presets for {chip}",
@@ -512,10 +506,6 @@ def _compose_mirror_hardware_name(
     if chosen not in known:
         raise ValueError(
             f"{count_source} in step {step_label!r} has no preset {chosen!r}",
-        )
-    if not known[chosen].get("infer_from_marks", True):
-        raise ValueError(
-            f"preset {chosen!r} reserves isolation capacity; select it explicitly with mirror_hardwares",
         )
     _log(f"{step_label}: {count_source} → {chosen!r}")
     return chosen
@@ -596,7 +586,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             f"unknown mirror_hardwares {preset_name!r} in step {step_label!r}; known: {known}",
         )
 
-    expanded = {key: copy.deepcopy(value) for key, value in preset.items() if key != "infer_from_marks"}
+    expanded = copy.deepcopy(preset)
     merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
     # A scheduled build's HF_TOKEN may override a pod env entry with the same
     # name. The preset injects the Kubernetes secret under a collision-proof

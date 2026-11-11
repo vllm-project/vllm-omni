@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_omni.diffusion.distributed import a2a_permute
 
@@ -44,6 +45,7 @@ def test_jit_build_prefers_toolkit_and_keeps_wheel_headers(tmp_path, monkeypatch
     )
     monkeypatch.setattr(a2a_permute.symm_mem, "set_backend", lambda _backend: None)
     monkeypatch.setattr(a2a_permute, "_BUILT", False)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
 
     a2a_permute.ensure_a2a_permute_available()
 
@@ -65,6 +67,85 @@ def test_jit_build_prefers_toolkit_and_keeps_wheel_headers(tmp_path, monkeypatch
     expected_cusparse = toolkit_include if toolkit_has_cusparse else cu13_include
     assert selected_header("cusparse.h") == expected_cusparse / "cusparse.h"
     assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
+
+
+def test_npu_initialization_never_builds_cuda(monkeypatch):
+    import sys
+
+    calls = []
+    module = SimpleNamespace(ensure_a2a_permute_available=lambda: calls.append("npu"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+
+    def unexpected():
+        pytest.fail("NPU initialization must not compile CUDA")
+
+    monkeypatch.setattr(a2a_permute, "_ensure_built", unexpected)
+    a2a_permute.ensure_a2a_permute_available()
+    assert calls == ["npu"]
+
+
+def test_grouped_npu_dispatch_preserves_fused_qkv(monkeypatch):
+    import sys
+
+    query, key, value = (SimpleNamespace(device=SimpleNamespace(type="npu")) for _ in range(3))
+    outputs = (object(), object(), object())
+
+    def forward(q, k, v, group_name, world_size):
+        assert (q, k, v) == (query, key, value)
+        assert (group_name, world_size) == ("ulysses", 4)
+        return outputs
+
+    module = SimpleNamespace(ulysses_qkv_fwd_group=forward)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.qkv_a2a", None)
+    assert a2a_permute.ulysses_qkv_fwd_group(query, key, value, "ulysses", 4) is outputs
+
+
+@pytest.mark.parametrize("eligible", [False, True])
+def test_grouped_cuda_dispatch_preserves_batched_exchange_and_fallback(monkeypatch, eligible):
+    import sys
+
+    tensors = tuple(SimpleNamespace(device=SimpleNamespace(type="cuda")) for _ in range(3))
+    outputs = (object(), object(), object())
+    calls = []
+
+    def check(q, k, v, world_size):
+        assert (q, k, v) == tensors
+        assert world_size == 4
+        return eligible
+
+    def batched(q, k, v, group_name, world_size):
+        assert (q, k, v) == tensors
+        assert (group_name, world_size) == ("ulysses", 4)
+        calls.append("batched")
+        return outputs
+
+    def single(tensor, group_name, world_size):
+        assert (group_name, world_size) == ("ulysses", 4)
+        index = len(calls)
+        assert tensor is tensors[index]
+        calls.append("single")
+        return outputs[index]
+
+    module = SimpleNamespace(eligible=check, qkv_fwd_batched=batched)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.qkv_a2a", module)
+    monkeypatch.setattr(a2a_permute, "ulysses_qkv_fwd", single)
+    assert a2a_permute.ulysses_qkv_fwd_group(*tensors, "ulysses", 4) == outputs
+    assert calls == (["batched"] if eligible else ["single"] * 3)
+
+
+def test_shared_fake_metadata_supports_gqa_and_batch():
+    with FakeTensorMode():
+        query = torch.empty(2, 17, 8, 32, dtype=torch.bfloat16)
+        key = torch.empty(2, 17, 4, 32, dtype=torch.bfloat16)
+        value = torch.empty_like(key)
+        q, k, v = a2a_permute.ulysses_qkv_fwd_group(query, key, value, "ulysses", 4)
+        assert q.shape == (2, 68, 2, 32)
+        assert k.shape == v.shape == (2, 68, 1, 32)
+        output = a2a_permute.ulysses_o_rev(q, "ulysses", 4)
+        assert output.shape == query.shape
+        assert output.dtype == query.dtype
 
 
 @dataclass

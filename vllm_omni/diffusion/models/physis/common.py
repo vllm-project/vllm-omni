@@ -4,8 +4,13 @@
 from dataclasses import replace
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    CellPlan,
+    CellSchedule,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellPlan, CellSchedule, Ordering, build_cell_plan
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 

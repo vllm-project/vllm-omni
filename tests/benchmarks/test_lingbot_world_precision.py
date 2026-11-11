@@ -23,6 +23,22 @@ def _pair(tmp_path: Path, expected, actual, *, reference_inputs=None, candidate_
     return reference, candidate
 
 
+def test_migrated_capture_loads_candidate_format_without_importing_a_model(tmp_path):
+    from tests.e2e.accuracy.lingbot_world.capture_precision import load_capture_format
+
+    precision = load_capture_format()
+    sample = tmp_path / "capture.npz"
+    precision.save_tensor_sample(
+        sample,
+        inputs={"latent": np.ones((1, 2), dtype=np.float32)},
+        outputs={"decoded": np.ones((1, 3), dtype=np.float32)},
+        metadata={"context": {"operation": "wan_vae_decode", "dtype": "bfloat16", "seed": 42}},
+    )
+    report = compare_tensor_samples(sample, sample, atol=0, rtol=0)
+    assert report["status"] == "passed" and report["inputs_match"]
+    assert report["candidate_metadata"]["context"]["operation"] == "wan_vae_decode"
+
+
 def test_explicit_precision_gates_and_json_report(tmp_path: Path) -> None:
     reference, candidate = _pair(tmp_path, np.array([1.0, 2.0]), np.array([1.01, 2.0]))
     result = compare_tensor_samples(reference, candidate, atol=0.02, rtol=0, min_cosine=0.99, max_relative_l2=0.01)

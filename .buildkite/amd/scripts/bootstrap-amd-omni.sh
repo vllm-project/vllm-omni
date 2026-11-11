@@ -139,16 +139,28 @@ upload_pipeline() {
     local combined_test_yaml=""
     local filtered_test_yaml=""
     local has_nightly_suite=0
+    local minijinja_asset_url
     local suite_spec
     local -a filter_args=()
 
     echo "Uploading pipeline..."
     # Install minijinja
     ls .buildkite || buildkite-agent annotate --style error 'Please merge upstream main branch for buildkite CI'
-    curl -sSfL https://github.com/mitsuhiko/minijinja/releases/download/2.3.1/minijinja-cli-installer.sh | sh
-    # Installed by the minijinja bootstrap above and only present on the CI agent.
-    # shellcheck disable=SC1091
-    source /var/lib/buildkite-agent/.cargo/env
+    if ! command -v minijinja-cli >/dev/null 2>&1; then
+        # AMD bootstrap agents are x86_64 Linux. Resolve the pinned binary
+        # through GitHub's release API because the browser URL can return an
+        # edge 504.
+        minijinja_asset_url=$(curl -sSfL --retry 3 --retry-delay 2 \
+            https://api.github.com/repos/mitsuhiko/minijinja/releases/tags/2.3.1 \
+            | jq -er '.assets[] | select(.name == "minijinja-cli-x86_64-unknown-linux-gnu.tar.xz") | .url')
+        mkdir -p "$HOME/.cargo/bin"
+        curl -sSfL --retry 3 --retry-delay 2 \
+            -H "Accept: application/octet-stream" \
+            "$minijinja_asset_url" \
+            | tar -xJf - -C "$HOME/.cargo/bin" --strip-components=1 \
+                minijinja-cli-x86_64-unknown-linux-gnu/minijinja-cli
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
 
     if [[ $BUILDKITE_PIPELINE_SLUG == "fastcheck" ]]; then
         AMD_MIRROR_HW="amdtentative"
