@@ -1071,6 +1071,15 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 if metadata is not None:
                     attn_bias = metadata.attn_bias
                     streaming_attention = getattr(self, "_streaming_attention", None)
+                    if (
+                        attn_bias is not None
+                        and q.device.type == "npu"
+                        and q.dtype in (torch.float16, torch.bfloat16)
+                        and not (streaming_attention is not None and q.dtype == torch.bfloat16 and q.shape[-1] == 64)
+                    ):
+                        # Shared metadata uses True=attend. Convert to True=masked
+                        # once, before caching the bias for the remaining layers.
+                        attn_bias = ~attn_bias
                 elif self.causal:
                     # Reuse cached arange(T) — keyed by (device, T) so that changing
                     # T never frees a previous allocation (CUDA graph safety: a
