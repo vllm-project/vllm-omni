@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -1159,6 +1160,42 @@ def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monke
     monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", unexpected_estimator_resolution)
     model._maybe_enable_code2wav_trt()
     assert model._code2wav_trt_done
+
+
+@pytest.mark.parametrize("compile_dit", [None, False, True], ids=["missing", "disabled", "enabled"])
+def test_dit_compile_selection_controls_only_the_flow_trt_swap(monkeypatch, compile_dit):
+    from vllm_omni.model_executor.models.cosyvoice3 import flow_estimator_trt
+
+    model = _make_code2wav_model()
+    if compile_dit is not None:
+        model.config.cosyvoice3_compile_dit = compile_dit
+    model._code2wav_trt_done = False
+    decoder = nn.Module()
+    estimator = nn.Linear(2, 2)
+    decoder.estimator = estimator
+    model.code2wav.flow_model = SimpleNamespace(decoder=decoder)
+    resolver = Mock(return_value="flow.decoder.estimator.fp32.onnx")
+    wrapper = object()
+    builder = Mock(return_value=wrapper)
+    monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", resolver)
+    monkeypatch.setattr(flow_estimator_trt, "build_flow_estimator_trt", builder)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: False)
+    monkeypatch.setattr(cosyvoice3.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setenv("COSYVOICE3_TRT", "1")
+
+    model._maybe_enable_code2wav_trt()
+    model._maybe_enable_code2wav_trt()
+
+    assert model._code2wav_trt_done
+    assert cosyvoice3._cosyvoice3_trt_enabled()
+    if compile_dit:
+        assert decoder.estimator is estimator
+        resolver.assert_not_called()
+        builder.assert_not_called()
+    else:
+        assert decoder.estimator is wrapper
+        resolver.assert_called_once_with()
+        builder.assert_called_once_with("flow.decoder.estimator.fp32.onnx", device="cuda")
 
 
 def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):

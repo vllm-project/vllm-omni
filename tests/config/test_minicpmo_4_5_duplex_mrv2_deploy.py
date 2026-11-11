@@ -42,9 +42,18 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
+@pytest.mark.parametrize("platform", ["xpu", "rocm", "musa"])
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    # The non-CUDA, non-NPU platforms still resolve to the v1 data plane.
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
+
+
+def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
+    # PR #10062 enables full-MRv2 three-stage serving on NPU.
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="npu")
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]

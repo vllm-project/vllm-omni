@@ -26,6 +26,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=["eager", "depth", "optimized"], default="eager")
     parser.add_argument("--audio-temperature", type=float, nargs="+", default=[0.0, 0.4])
     parser.add_argument("--text", default="The quick brown fox jumps over the lazy dog.")
+    parser.add_argument(
+        "--deploy-config",
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / "vllm_omni/deploy/lfm3_omni.yaml",
+        help="vllm_omni/deploy/lfm3_audio.yaml for LiquidAI/LFM3-Audio-2B",
+    )
     args = parser.parse_args()
     if args.repeats < 1 or any(n < 1 or n > 4 for n in args.concurrency):
         parser.error("repeats must be positive; the bundled deployment supports concurrency 1 through 4")
@@ -40,7 +46,7 @@ def main() -> None:
         add_generation_prompt=True,
     )
     prompt_ids = tokenizer.encode(prompt + "<|audio_start|>", add_special_tokens=False)
-    deploy = Path(__file__).resolve().parents[2] / "vllm_omni/deploy/lfm3_omni.yaml"
+    deploy = args.deploy_config
     manifest = {
         "model": args.model,
         "revision": args.revision,
