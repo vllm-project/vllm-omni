@@ -17,6 +17,7 @@ Supported model types:
   - Wan2.2-T2V-A14B   (MoE cascade: transformer + transformer_2)
   - Wan2.2-I2V-A14B   (MoE cascade: transformer + transformer_2)
   - Wan2.2-TI2V-5B    (single transformer)
+  - MiniMax-H3        (FL2VA partition, transformer at FL2VA/transformer)
 
 Usage:
   python vllm_omni/quantization/tools/merge_mxfp8_checkpoint.py \\
@@ -34,6 +35,7 @@ import pathlib
 import shutil
 from typing import Any
 
+import torch
 from safetensors.torch import load_file, save_file
 
 # ---------------------------------------------------------------------------
@@ -80,10 +82,32 @@ TRANSFORMER_KEYS_RENAME_DICT: dict[str, str] = {
     "img_emb.emb_pos": "condition_embedder.image_embedder.pos_embed",
 }
 
-SUPPORTED_MODEL_TYPES = ["Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B", "Wan2.2-TI2V-5B"]
+SUPPORTED_MODEL_TYPES = ["Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B", "Wan2.2-TI2V-5B", "MiniMax-H3"]
 
 # MoE cascade models have high_noise_model + low_noise_model
 CASCADE_MODEL_TYPES = {"Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B"}
+
+# MiniMax-H3 keeps the DiT under the FL2VA partition; the other FL2VA
+# components (text encoder, VAEs, processor, tokenizer) are reused verbatim
+# and only referenced via symlinks so the merge does not copy ~73 GiB.
+MINIMAX_H3_TRANSFORMER_DIR = "FL2VA/transformer"
+MINIMAX_H3_SYMLINK_DIRS = ("text_encoder", "video_vae", "audio_vae", "processor", "tokenizer")
+
+# Wan checkpoints rename tensors before the runtime sees them (e.g.
+# ``ffn.0.weight`` becomes ``ffn.net.0.proj.weight``), and the model's weight
+# loader then translates those diffusers-style names into the runtime parameter
+# names it actually constructs (``ffn.net_0.proj``, ``ffn.net_2``, ``to_out``).
+# Quantization methods are selected *before* that loader runs, so
+# ``ignored_layers`` has to carry the runtime spelling already, otherwise the
+# layer is not skipped and a BF16 tensor is fed to the MXFP8 loader.
+RUNTIME_LAYER_NAME_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
+    "Wan2.2": (
+        (".ffn.net.0.", ".ffn.net_0."),
+        (".ffn.net.2", ".ffn.net_2"),
+        (".to_out.0", ".to_out"),
+    ),
+}
+
 
 # quantization_config injected into each transformer's config.json.
 # is_checkpoint_mxfp8_serialized=True triggers NPUMxfp8LinearMethod (offline path)
@@ -102,7 +126,21 @@ MXFP8_QUANT_CONFIG: dict[str, Any] = {
 def _get_transformer_dirs(model_type: str) -> list[str]:
     if model_type in CASCADE_MODEL_TYPES:
         return ["transformer", "transformer_2"]
+    if model_type == "MiniMax-H3":
+        return [MINIMAX_H3_TRANSFORMER_DIR]
     return ["transformer"]
+
+
+def _get_rename_dict(model_type: str) -> dict[str, str]:
+    """Return the msModelSlim→runtime rename table for a model type.
+
+    MiniMax-H3 shares the vLLM-Omni checkpoint names directly; it only needs
+    the generic ``.div.mul_scale`` / ``.linear.`` unwrap performed by
+    ``_remap_keys``, so its rename table is empty.
+    """
+    if model_type == "MiniMax-H3":
+        return {}
+    return TRANSFORMER_KEYS_RENAME_DICT
 
 
 def _get_quant_subdir(model_type: str, quant_path: pathlib.Path, transformer_dir: str) -> pathlib.Path:
@@ -112,20 +150,58 @@ def _get_quant_subdir(model_type: str, quant_path: pathlib.Path, transformer_dir
     return quant_path
 
 
-def _remap_keys(state_dict: dict, quant_meta: dict) -> tuple[dict, dict]:
-    """Apply TRANSFORMER_KEYS_RENAME_DICT to both state_dict and quant_meta."""
+def _remap_keys(state_dict: dict, quant_meta: dict, rename_dict: dict[str, str] | None = None) -> tuple[dict, dict]:
+    """Apply the model rename table to both state_dict and quant_meta."""
+    if rename_dict is None:
+        rename_dict = TRANSFORMER_KEYS_RENAME_DICT
+    renamed_state_keys: dict[str, str] = {}
+    for key in state_dict:
+        new_key = key
+        for src, dst in rename_dict.items():
+            new_key = new_key.replace(src, dst)
+        renamed_state_keys[key] = new_key
+
+    # msModelSlim wraps a smoothed linear module as ``<prefix>.linear`` and
+    # writes the multiplier beside it as ``<prefix>.div.mul_scale``. Only
+    # unwrap prefixes that have this marker, so ordinary ``.linear.`` names
+    # remain unchanged.
+    smooth_prefixes = {
+        new_key[: -len(".div.mul_scale")]
+        for new_key in renamed_state_keys.values()
+        if new_key.endswith(".div.mul_scale")
+    }
+
+    def normalize_key(new_key: str) -> str:
+        # msModelSlim represents SmoothQuant metadata as a sibling ``div``
+        # module. Runtime linear layers consume it as ``mul_scale``.
+        if new_key.endswith(".div.mul_scale"):
+            new_key = new_key[: -len(".div.mul_scale")] + ".mul_scale"
+
+        for prefix in smooth_prefixes:
+            wrapper = f"{prefix}.linear."
+            if new_key.startswith(wrapper):
+                return prefix + "." + new_key[len(wrapper) :]
+        return new_key
+
     new_state: dict = {}
     new_meta: dict = {}
-
     for key, tensor in state_dict.items():
-        new_key = key
-        for src, dst in TRANSFORMER_KEYS_RENAME_DICT.items():
-            new_key = new_key.replace(src, dst)
+        new_key = normalize_key(renamed_state_keys[key])
         new_state[new_key] = tensor
         if key in quant_meta:
             new_meta[new_key] = quant_meta[key]
 
     return new_state, new_meta
+
+
+def _has_complete_mxfp8_smooth_scales(state_dict: dict[str, object], quant_meta: dict[str, object]) -> bool:
+    """Return whether every serialized MXFP8 weight has a paired smooth scale."""
+    mxfp8_layers = {
+        key[: -len(".weight")]
+        for key, qtype in quant_meta.items()
+        if key.endswith(".weight") and isinstance(qtype, str) and qtype.startswith("W8A8_MXFP8")
+    }
+    return bool(mxfp8_layers) and all(f"{name}.mul_scale" in state_dict for name in mxfp8_layers)
 
 
 def _load_safetensors(directory: pathlib.Path, glob: str = "*.safetensors") -> dict:
@@ -160,12 +236,70 @@ def _load_quant_meta(directory: pathlib.Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _reverse_qkv_grouped_reorder(
+    state_dict: dict,
+    num_query_groups: int,
+    heads_per_group: int,
+    head_dim: int,
+) -> dict:
+    """Reverse vLLM-Omni's grouped-QKV -> QKV reorder for MiniMax-H3.
+
+    msModelSlim captures the vLLM-Omni loaded model, whose fused QKV weights are
+    already in the ``(Q | K | V)`` row order.  The native H3 checkpoint stores
+    them grouped per query group (``(q,k,v)`` per group) and omni's load_weights
+    reorders them again.  Convert the captured tensors back to the grouped
+    layout before overlaying onto the BF16 base so load_weights restores the
+    correct order.  Applies to weight and per-row weight_scale (NOT the
+    per-input-channel mul_scale).
+    """
+    for name in list(state_dict):
+        if not (name.endswith(".attn.qkv_proj.weight") or name.endswith(".attn.qkv_proj.weight_scale")):
+            continue
+        weight = state_dict[name]
+        per_group = (heads_per_group + 2) * head_dim
+        if weight.shape[0] != num_query_groups * per_group:
+            continue
+        rest = weight.shape[1:]
+        q, k, v = torch.split(
+            weight,
+            [
+                num_query_groups * heads_per_group * head_dim,
+                num_query_groups * head_dim,
+                num_query_groups * head_dim,
+            ],
+            dim=0,
+        )
+        q = q.reshape(num_query_groups, heads_per_group * head_dim, *rest)
+        k = k.reshape(num_query_groups, head_dim, *rest)
+        v = v.reshape(num_query_groups, head_dim, *rest)
+        state_dict[name] = torch.cat([q, k, v], dim=1).reshape(-1, *rest).contiguous()
+    return state_dict
+
+
+def _runtime_ignored_layer_name(module_name: str, model_type: str) -> str:
+    """Translate a checkpoint module name into the runtime layer prefix.
+
+    ``ignored_layers`` is matched against the prefixes the model builds, not
+    against checkpoint tensor names. Model families whose loader renames layers
+    declare those renames here; unknown families pass through unchanged.
+    """
+    for family, fixups in RUNTIME_LAYER_NAME_FIXUPS.items():
+        if not model_type.startswith(family):
+            continue
+        for checkpoint_form, runtime_form in fixups:
+            module_name = module_name.replace(checkpoint_form, runtime_form)
+    return module_name
+
+
 def _convert_transformer(
     model_type: str,
     quant_subdir: pathlib.Path,
     output_dir: pathlib.Path,
     original_transformer_dir: pathlib.Path,
+    rename_dict: dict[str, str] | None = None,
 ) -> None:
+    if rename_dict is None:
+        rename_dict = _get_rename_dict(model_type)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load original BF16 weights as the merge base so that tensors msModelSlim
@@ -179,8 +313,27 @@ def _convert_transformer(
     quant_meta = _load_quant_meta(quant_subdir)
     print(f"  {len(quant_state_dict)} quant tensors, {len(quant_meta)} meta entries")
 
-    # Rename keys from msModelSlim convention to diffusers convention
-    quant_state_dict, quant_meta = _remap_keys(quant_state_dict, quant_meta)
+    # Rename keys from msModelSlim convention to runtime convention
+    quant_state_dict, quant_meta = _remap_keys(quant_state_dict, quant_meta, rename_dict)
+
+    # MiniMax-H3: undo the fused-QKV reorder that omni applies at load time.
+    # The modelslim export captures the already-reordered (Q|K|V) layout, so it
+    # must be converted back to the checkpoint's grouped layout before the
+    # overlay; omni's load_weights then reorders it to the runtime layout.
+    if model_type == "MiniMax-H3":
+        src_config = original_transformer_dir / "config.json"
+        if src_config.is_file():
+            with open(src_config) as f:
+                arch_cfg = json.load(f)
+            num_heads = int(arch_cfg.get("num_attention_heads", 0))
+            head_dim = int(arch_cfg.get("attention_head_dim", 0))
+            if num_heads and head_dim:
+                quant_state_dict = _reverse_qkv_grouped_reorder(
+                    quant_state_dict,
+                    num_query_groups=num_heads,
+                    heads_per_group=1,
+                    head_dim=head_dim,
+                )
 
     # Overlay: start from BF16 base, then apply all msModelSlim tensors on top.
     # Quantized weight tensors + their scale tensors override the BF16 originals.
@@ -207,7 +360,19 @@ def _convert_transformer(
     if src_config.is_file():
         with open(src_config) as f:
             config = json.load(f)
-        config["quantization_config"] = MXFP8_QUANT_CONFIG
+        quant_config = dict(MXFP8_QUANT_CONFIG)
+        ignored_layers = sorted(
+            {
+                _runtime_ignored_layer_name(key[: -len(".weight")], model_type)
+                for key, qtype in quant_meta.items()
+                if key.endswith(".weight") and qtype == "FLOAT" and quant_state_dict[key].ndim == 2
+            }
+        )
+        if ignored_layers:
+            quant_config["ignored_layers"] = ignored_layers
+        if _has_complete_mxfp8_smooth_scales(quant_state_dict, quant_meta):
+            quant_config["require_smooth_scale"] = True
+        config["quantization_config"] = quant_config
         with open(output_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
         print(f"  Injected quantization_config into config.json → {output_dir / 'config.json'}")
@@ -220,12 +385,58 @@ def _convert_transformer(
 # ---------------------------------------------------------------------------
 
 
+def _repack_minimax_h3(
+    original_model_path: pathlib.Path,
+    quant_path: pathlib.Path,
+    output_path: pathlib.Path,
+) -> None:
+    """Repack MiniMax-H3 FL2VA: reuse untouched components via symlinks.
+
+    Only the DiT transformer is materialized (BF16 base overlaid with the
+    msModelSlim MXFP8 tensors); text encoder, VAEs, processor and tokenizer are
+    symlinked so the merge avoids copying ~73 GiB of untouched weights.
+    """
+    output_path.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(original_model_path / "model_index.json", output_path / "model_index.json")
+
+    # Resolve the source so every symlink target is absolute. A relative target
+    # is stored verbatim and then interpreted against the link's own parent
+    # (output/FL2VA/), which leaves all five component links dangling when the
+    # caller passes a relative --original-model.
+    fl2va_src = (original_model_path / "FL2VA").resolve()
+    fl2va_out = output_path / "FL2VA"
+    fl2va_out.mkdir(exist_ok=True)
+    shutil.copy2(fl2va_src / "model_index.json", fl2va_out / "model_index.json")
+
+    for sub in MINIMAX_H3_SYMLINK_DIRS:
+        dst = fl2va_out / sub
+        if not (dst.exists() or dst.is_symlink()):
+            dst.symlink_to(fl2va_src / sub, target_is_directory=True)
+
+    _convert_transformer(
+        model_type="MiniMax-H3",
+        quant_subdir=quant_path,
+        output_dir=fl2va_out / "transformer",
+        original_transformer_dir=fl2va_src / "transformer",
+        rename_dict={},
+    )
+
+
 def repack(
     model_type: str,
     original_model_path: pathlib.Path,
     quant_path: pathlib.Path,
     output_path: pathlib.Path,
 ) -> None:
+    # Normalise to absolute paths so relative CLI arguments cannot leak into
+    # generated symlink targets or loader paths.
+    original_model_path = original_model_path.resolve()
+    quant_path = quant_path.resolve()
+
+    if model_type == "MiniMax-H3":
+        _repack_minimax_h3(original_model_path, quant_path, output_path)
+        return
+
     transformer_dirs = _get_transformer_dirs(model_type)
 
     # Step 1: Copy original model, skipping transformer dirs (will be replaced).
@@ -237,12 +448,13 @@ def repack(
     )
 
     # Step 2+: Convert each transformer.
+    rename_dict = _get_rename_dict(model_type)
     for tdir in transformer_dirs:
         q_subdir = _get_quant_subdir(model_type, quant_path, tdir)
         out_tdir = output_path / tdir
         orig_tdir = original_model_path / tdir
         print(f"\nConverting {tdir} (quant source: {q_subdir.name}) …")
-        _convert_transformer(model_type, q_subdir, out_tdir, orig_tdir)
+        _convert_transformer(model_type, q_subdir, out_tdir, orig_tdir, rename_dict)
 
     print(f"\nDone. Merged model → {output_path}")
     print("\nRun inference (no --quantization flag needed; auto-detected from config.json):")

@@ -203,6 +203,73 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `require_smooth_scale` | bool | `False` | Offline checkpoint only. Set by the merge tool when every MXFP8 linear has a calibrated `mul_scale`; missing scales then fail checkpoint loading. |
+
+### SmoothQuant checkpoint support (NPU)
+
+Offline MXFP8 checkpoints can carry one floating-point `mul_scale` vector per
+linear layer. Before MXFP8 quantization, the exporter must apply the paired
+transform to the original weights and activation:
+
+```text
+x_smoothed = x * mul_scale
+w_smoothed = w / mul_scale[None, :]
+```
+
+The runtime applies `mul_scale` before activation quantization. The weight
+checkpoint must contain the MXFP8 quantization of `w_smoothed`; adding a scale
+to an already quantized weight is not equivalent. For msModelSlim checkpoints,
+the merge tool maps `layer.div.mul_scale` and `layer.linear.weight*` to the
+runtime names `layer.mul_scale` and `layer.weight*`, then marks scales required
+only when all MXFP8 weights have a corresponding scale. Older
+checkpoints without scales continue to use an identity multiplier.
+
+#### Flex Smooth checkpoints
+
+Run Flex Smooth calibration and quantization independently in msModelSlim.
+In its `modelslim_v1` recipe, select MXFP8 simulation for alpha/beta search
+and follow it with MXFP8 linear quantization:
+
+```yaml
+spec:
+  process:
+    - type: flex_smooth_quant
+      search_dtype: mxfp8
+    - type: linear_quant
+      qconfig:
+        act:
+          dtype: mxfp8
+          scope: per_block
+          symmetric: true
+          method: minmax
+          ext: {axes: -1}
+        weight:
+          dtype: mxfp8
+          scope: per_block
+          symmetric: true
+          method: minmax
+          ext: {axes: -1}
+  save:
+    - type: ascendv1_saver
+```
+
+This is a recipe fragment: use the target model's adapter, calibration dataset,
+and supported smoothing subgraphs. MXFP8 search requires input widths divisible
+by 32; exclude incompatible layers in both processors. Non-fused smoothing
+exports `layer.div.mul_scale` alongside `layer.linear.weight` and
+`layer.linear.weight_scale`. Fused smoothing absorbs the input transform into
+the preceding module and does not require a separate multiplier for that layer.
+
+Pass the exported directory to the existing `merge_mxfp8_checkpoint.py` tool
+described in Offline Mode. It remaps the tensors, preserves layers marked
+`FLOAT` through `ignored_layers`, and writes the deployment configuration.
+Its model-name mapping currently supports the Wan2.2 variants listed above;
+other model layouts need their own checkpoint mapping.
+
+Omni consumes the weights, block scales, and any non-fused `mul_scale` vectors.
+Alpha/beta selection belongs to msModelSlim and is not required at deployment.
+The search RMSE is a layer simulation score; target-model quality and
+performance still need A/B validation on NPU.
 
 ## Validation and Notes
 

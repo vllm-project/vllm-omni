@@ -258,3 +258,38 @@ passing factory tests alone does not establish production support.
 - Method implementations own platform-specific capability checks and kernels.
 - User-facing support claims require model, hardware, numerical, and memory
   validation in addition to configuration-level tests.
+
+## MXFP8 SmoothQuant boundary
+
+The native NPU MXFP8 path supports an optional per-input-channel multiplier
+named `mul_scale`. For a linear layer, the exporter preserves the original
+operator by pairing these transforms:
+
+```text
+x_smoothed = x * mul_scale
+w_smoothed = w / mul_scale[None, :]
+```
+
+The runtime applies the activation-side multiplier before dynamic MXFP8
+activation quantization. The checkpoint must already contain MXFP8 weights
+quantized from `w_smoothed`; runtime code does not dequantize and requantize
+weights. The multiplier follows the input dimension and is therefore sharded
+with RowParallelLinear input channels while replicated by ColumnParallelLinear.
+
+`mul_scale` is optional for backwards compatibility and defaults to an identity
+vector. The merge tool also unwraps msModelSlim's `layer.linear.weight*` names
+when the matching `layer.div.mul_scale` marker is present. A merged checkpoint
+that contains a multiplier for every MXFP8 linear sets
+`require_smooth_scale=true`, making missing metadata a load error.
+
+## Offline Flex Smooth ownership
+
+msModelSlim owns activation collection, alpha/beta search, smoothing,
+quantization, and export. Its native `flex_smooth_quant` processor uses
+`search_dtype=mxfp8` for MXFP8 simulation and runs before `linear_quant` and
+`ascendv1_saver`. Omni consumes exported checkpoint files through
+`merge_mxfp8_checkpoint.py`; it has no calibration API or ModelSlim dependency.
+The converter maps non-fused `mul_scale` and weight names, retains `FLOAT`
+linear layers through `ignored_layers`, and writes the offline runtime config.
+Alpha/beta and calibration diagnostics have no deployment semantics. Ordinary
+SmoothQuant and Flex Smooth share the same runtime tensor contract.

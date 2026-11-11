@@ -1138,6 +1138,20 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        # msModelSlim writes ``quantization_config`` into the merged transformer
+        # config.json (see merge_mxfp8_checkpoint.py). Auto-detect it the same way
+        # the Wan2.2 path does; otherwise offline MXFP8 checkpoints load their FP8
+        # weights as un-quantized BF16 and the smooth scales are ignored.
+        _transformer_cfg_path = model_path / transformer_component / "config.json"
+        if _transformer_cfg_path.is_file():
+            with open(_transformer_cfg_path, encoding="utf-8") as _transformer_cfg_fh:
+                _transformer_cfg_json = json.load(_transformer_cfg_fh)
+            from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+            transformer_quant_config = resolve_quant_config_from_disk(
+                transformer_quant_config,
+                _transformer_cfg_json.get("quantization_config"),
+            )
         from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
 
         if isinstance(transformer_quant_config, SerializedPerChannelFp8Config):
