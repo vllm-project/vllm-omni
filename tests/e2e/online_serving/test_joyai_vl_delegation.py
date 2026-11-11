@@ -261,7 +261,7 @@ async def run_delegation(url, model, output_dir):
             model="jdopensource/JoyAI-VL-Interaction-Preview",
             stage_config_path=modify_stage_config(
                 get_deploy_config_path("joyai_vl_interaction.yaml"),
-                updates={"session_mode": "duplex"},
+                updates={"session_mode": "duplex", "async_chunk": True},
             ),
         )
     ],

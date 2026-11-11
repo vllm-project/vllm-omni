@@ -19,7 +19,7 @@ from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
 
 
-async def run_observations(url, model, output_dir):
+async def run_observations(url, model, output_dir, *, expect_streaming=False):
     config = SessionConfig(
         auto_response=False,
         temperature=0.0,
@@ -68,6 +68,14 @@ async def run_observations(url, model, output_dir):
                 assert terminal.raw["response"]["status"] == "completed", terminal.raw
                 pcm = collector.audio_bytes(terminal.response_id)
                 assert len(pcm) >= 2400 and len(pcm) % 2 == 0, "Expected nonempty PCM16 speech"
+                if expect_streaming:
+                    chunks = [
+                        event
+                        for event in collector.events
+                        if event.get("type") == "response.output_audio.delta"
+                        and event.get("response_id") == terminal.response_id
+                    ]
+                    assert len(chunks) > 1, "Expected streamed audio before the final waveform"
                 with wave.open(str(output_dir / f"observation-{index}.wav"), "wb") as wav:
                     wav.setnchannels(1)
                     wav.setsampwidth(2)
@@ -99,7 +107,7 @@ async def run_observations(url, model, output_dir):
             # duplex override on the same base used by joyai_vl_interaction_duplex.yaml.
             stage_config_path=modify_stage_config(
                 get_deploy_config_path("joyai_vl_interaction.yaml"),
-                updates={"session_mode": "duplex"},
+                updates={"session_mode": "duplex", "async_chunk": True},
             ),
         )
     ],
@@ -111,5 +119,6 @@ def test_committed_video_observations_produce_speech_and_release_session(omni_se
             f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
             omni_server.model,
             tmp_path,
+            expect_streaming=True,
         )
     )
