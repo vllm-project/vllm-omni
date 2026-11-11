@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Several codec frames inside one stage-1 ``execute_model``.
 
 One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
@@ -350,7 +353,7 @@ def begin_narrow_step(
     try:
         from vllm_omni.platforms.npu.attention import static_shape_decode
     except Exception:
-        static_shape_decode = None
+        static_shape_decode = None  # type: ignore[assignment]
 
     if static_shape_decode is None:
         return _decline("the static-shape decode backend is not present in this build")
@@ -430,7 +433,7 @@ def end_narrow_step(forward_context: Any, narrow: NarrowStep | None) -> None:
         forward_context.cudagraph_runtime_mode = narrow.saved_runtime_mode
 
 
-def _decline(reason: str) -> None:
+def _decline(reason: str) -> NarrowStep | None:
     """Say each distinct decline reason once; silence is the worse failure.
 
     A set, not a single slot: the narrow path is re-decided every step, and one
@@ -476,7 +479,7 @@ def run(
         from vllm_omni.worker.talker_cuda_graph import run_cuda_fused_step
 
         fused = run_cuda_fused_step(
-            narrow,
+            narrow,  # type: ignore[arg-type]
             model=model,
             model_kwargs={**model_kwargs, **model_kwargs_extra},
             intermediate_tensors=model_kwargs.get("intermediate_tensors"),
@@ -490,7 +493,7 @@ def run(
         # every frame eagerly under CUDAGraphMode.NONE (2.2x slower than the
         # dispatcher graph the plain path replays). Restore the original
         # context and fall through to the plain frame loop.
-        narrow.restore()
+        narrow.restore()  # type: ignore[attr-defined]
         narrow = None
 
     frame_outputs = []

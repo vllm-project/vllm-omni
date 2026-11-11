@@ -300,18 +300,16 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     assert torch.equal(scalar_embeds[0], embeds[0])
 
 
-def test_multi_frame_decode_is_rejected_under_v2_model_runner():
+def test_multi_frame_decode_arms_under_both_model_runners():
     def _config(*, use_v2_model_runner: bool):
         return SimpleNamespace(
             model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2_model_runner),
             speculative_config={"method": "ngram", "num_speculative_tokens": 7},
         )
 
-    # The same config arms eight frames on V1 and is refused on Model Runner
-    # V2, whose decode preprocess cannot re-embed the real previous frame.
+    # Both runners arm K=8; MRv2 replays one forward per frame.
     assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
-    with pytest.raises(ValueError, match="Model Runner V2"):
-        MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True))
+    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True)) == 8
 
 
 def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):

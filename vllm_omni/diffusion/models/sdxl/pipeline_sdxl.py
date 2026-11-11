@@ -47,6 +47,8 @@ class StableDiffusionXLPipeline(
     _encoder_modules: list[str] = ["text_encoder", "text_encoder_2"]
     _vae_modules: list[str] = ["vae"]
     _resident_modules: list[str] = []
+    # Both CFG branches share latents and timestep and have fixed 77-token prompts.
+    supports_cfg_batching = True
     supports_request_batch = True
 
     def __init__(
