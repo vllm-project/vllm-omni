@@ -32,6 +32,8 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.mixfusion.request import relax_step_batch_key
+from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -60,6 +62,7 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "condition_key",
     "lora_int_id",
     "use_step_execution",
+    "mixfusion_key",
 }
 
 
@@ -68,6 +71,10 @@ class BaseScheduler(ABC):
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
+        # Fail-safe default until initialize() resolves the pipeline class:
+        # without the MixFusion capability, resolution must keep splitting the
+        # batch key.
+        self._mixfusion_supported: bool = False
         self._runs_denoising: bool = True
         self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
@@ -98,6 +105,7 @@ class BaseScheduler(ABC):
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         self.od_config = od_config
+        self._mixfusion_supported = supports_mixfusion(od_config)
         # Fixed for the stage's lifetime; admission drops request schedules on a stage without denoising.
         stage_role = resolve_diffusion_stage_role(
             getattr(od_config, "stage_role", None), getattr(od_config, "model_stage", None)
@@ -773,11 +781,15 @@ class BaseScheduler(ABC):
 
     def _build_sampling_params_key(
         self, request: OmniDiffusionRequest
-    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
+    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None:  # return type loosened for subclassing
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        relaxed_key = relax_step_batch_key(request, key_kwargs, self.od_config, supported=self._mixfusion_supported)
+        if relaxed_key is None:
+            return None
         return StepBatchSamplingParamsKey(
             attention_schedule=resolve_request_attention_schedule(
                 sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
@@ -786,7 +798,7 @@ class BaseScheduler(ABC):
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            **relaxed_key,
         )
 
 

@@ -30,6 +30,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -163,6 +164,7 @@ def _make_request():
         prompt="a prompt",
         sampling_params=sampling_params,
         kv_sender_info=None,
+        mixfusion_info=None,
     )
 
 
@@ -560,6 +562,132 @@ def test_update_states_carries_prepared_layout() -> None:
 
     assert new_request_ids == [request.request_id]
     assert states[0].prepared_layout is prepared_layout
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("fail", [False, True])
+def test_step_runner_binds_schedule_around_mixfusion_driver(monkeypatch, fail):
+    """The driver and dense denoise share the same request schedule scope."""
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+    from vllm_omni.diffusion.forward_context import is_forward_context_available
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.vllm_config = None
+    runner.pipeline = _FinalOnlyStepPipeline()
+    request = OmniDiffusionRequest(
+        request_id="scheduled-driver",
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            attention_schedule=[{"start": 0, "end": 1, "profile": "dense"}],
+        ),
+    )
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"dense": AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))},
+    )
+    expected = (AttentionScheduleRange(0, 1, "dense"),)
+    observed = []
+
+    class Driver:
+        def run(self, batch, states, denoise):
+            observed.append(get_forward_context().attention_schedule)
+            assert states[0].attention_schedule == expected
+            if fail:
+                raise RuntimeError("driver failed")
+            return denoise(batch, states=states)
+
+    monkeypatch.setattr(runner.pipeline, "mixfusion_driver", Driver(), raising=False)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
+    output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="driver failed"):
+            runner._execute_stepwise_core(output, record_output_peak_memory=False)
+    else:
+        result = runner._execute_stepwise_core(output, record_output_peak_memory=False)
+        assert result.get_request_output(request.request_id).finished
+    assert observed == [expected]
+    assert not is_forward_context_available()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_does_not_choose_packing_from_request_flag() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline.supports_mixfusion = True
+    runner.od_config.enable_mixfusion = True
+    runner.od_config.mixfusion_min_chunk_tokens = 64
+    runner.od_config.mixfusion_max_chunks = 16
+    request = _make_request()
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    states, _ = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert "use_ragged_latents" not in states[0].extra
+
+    # A pipeline without the capability never gets the ragged opt-in, even
+    # when the server-level default is on.
+    unsupported = _make_runner(cache_backend=None, cache_backend_name=None)
+    unsupported.od_config.enable_mixfusion = True
+    states, _ = DiffusionModelRunner._update_states(unsupported, scheduler_output)
+
+    assert "use_ragged_latents" not in states[0].extra
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_after_list_latents_releases_finished_step_requests():
+    """Ragged (list-latent) batches must retire finished requests through
+    ``release_step_requests`` so the pipeline sees ``release_step_request``
+    and the cached batch is invalidated, matching the tensor branch."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    released = []
+    runner.pipeline = SimpleNamespace(release_step_request=lambda state: released.append(state.request_id))
+
+    finished_state = StepRequestState(
+        request_id="finished-request",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 2),
+        timesteps=torch.ones(2),
+        step_index=1,
+        extra={"use_ragged_latents": True},
+    )
+    active_state = StepRequestState(
+        request_id="active-request",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 3),
+        timesteps=torch.ones(2),
+        step_index=1,
+    )
+    runner.state_cache = {state.request_id: state for state in (finished_state, active_state)}
+    input_batch = InputBatch.make_batch([finished_state, active_state], use_mixfusion=True)
+    assert isinstance(input_batch.latents, list)
+    runner.input_batch = input_batch
+    # step_scheduler() advanced the first request past its last timestep.
+    finished_state.step_index = 2
+
+    runner._update_states_after([finished_state, active_state], input_batch)
+
+    assert released == ["finished-request"]
+    assert runner.state_cache == {"active-request": active_state}
+    # The retired request was still in the cached batch, so it must be dropped.
+    assert runner.input_batch is None
+    # Surviving requests keep their scattered latents.
+    assert active_state.latents.shape == (1, 3)
 
 
 @pytest.mark.core_model
@@ -1643,3 +1771,79 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_preserves_prepared_packing_contract(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id, requests[1].request_id = "a", "b"
+    requests[0].mixfusion_info = MixFusionRequestInfo(1, 8, 1, 8)
+    requests[1].mixfusion_info = MixFusionRequestInfo(1, 12, 1, 8)
+    captured = []
+
+    def execute(output, **kwargs):
+        captured.append(output.use_mixfusion)
+
+    runner._execute_stepwise = execute
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
+    runner.profile_run(requests)
+    assert captured == [True]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_preparation_failure_recomputes_layout_for_surviving_request():
+    import inspect
+
+    from vllm_omni.diffusion.mixfusion.chunked import ChunkedJointAdapter
+    from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+
+    class PreparePipeline:
+        def prepare_encode(self, state):
+            if state.request_id == "bad":
+                raise ValueError("bad input")
+            state.latents = torch.zeros(1, 12, 4)
+            state.timesteps = torch.tensor([1.0])
+
+    runner.pipeline = PreparePipeline()
+    states = [
+        StepRequestState(
+            request_id=rid,
+            sampling=OmniDiffusionSamplingParams(),
+            mixfusion_info=MixFusionRequestInfo(1, tokens, 1, 8),
+        )
+        for rid, tokens in (("bad", 8), ("good", 12))
+    ]
+    runner.state_cache = {s.request_id: s for s in states}
+    prepared, batch, errors = runner._prepare_batch_inputs(states, ["bad", "good"], use_mixfusion=True)
+    assert [s.request_id for s in prepared] == ["good"]
+    assert batch.use_mixfusion and batch.request_ids == ["good"]
+    assert len(batch.latents) == 1 and batch.latents[0].shape == (1, 12, 4)
+    assert [e.request_id for e in errors] == ["bad"]
+
+    class Transformer(torch.nn.Module):
+        def forward(self, hidden_states, encoder_hidden_states, encoder_hidden_states_mask=None):
+            return hidden_states
+
+    transformer = Transformer()
+    adapter = ChunkedJointAdapter(MixFusionRoot())
+    signature = inspect.signature(transformer.forward)
+    # Cached layout for an earlier full batch must not survive removal of the
+    # failed request. No scheduled chunk_size is available to the adapter.
+    previous = adapter.pack_inputs(
+        transformer,
+        signature.bind([torch.zeros(1, 8, 4), torch.zeros(1, 12, 4)], torch.zeros(2, 3, 4)),
+        cache=None,
+    )
+    actual = adapter.pack_inputs(
+        transformer,
+        signature.bind(batch.latents, torch.zeros(1, 3, 4)),
+        cache=previous,
+    )
+    assert previous.plan.chunk_size == 4
+    assert actual.plan.chunk_size == 12 and actual.plan.num_chunks == 1
