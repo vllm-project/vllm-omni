@@ -9,6 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+    ARDiffusionCellContext,
+    CellRunSpec,
+    CellTopology,
+)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_DENOISE_STEPS,
     CAUSVID_DEFAULT_SHIFT,
@@ -17,8 +23,6 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -156,7 +160,7 @@ def test_cell_schedule_rejects_unknown_values():
 
 @pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
 def test_cell_schedule_accepts_known_values(name, step_replicas):
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 
     pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
@@ -169,7 +173,6 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     plan, _, _ = pipeline._plan_for(req)
     assert plan.schedule.ordering is Ordering(name)
     assert plan.schedule.ordering.value == name
-    assert plan.schedule.has_clean is True
 
 
 @pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
@@ -264,22 +267,8 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
         assert plan.schedule.step_replicas == 1
 
 
-def test_causvid_rejects_explicit_has_clean():
-    """Clean derives from the topology; has_clean is no longer a request knob."""
-    pipeline = _bare_pipeline(step_replicas=1, history=6)
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="explicit-has-clean",
-        sampling_params=OmniDiffusionSamplingParams(
-            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2, "has_clean": True}
-        ),
-    )
-    with pytest.raises(ValueError, match="has_clean is derived from the topology"):
-        pipeline._plan_for(req)
-
-
 def test_causvid_rejects_explicit_s_eq_d():
-    """CausVidWan does not accept vertical S=D (Same-Step-only topology)."""
+    """Latest-KV does not accept the S=D Same-Step topology."""
     pipeline = _bare_pipeline(step_replicas=3, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
@@ -320,7 +309,7 @@ def test_causvid_rejects_s1_latest_kv():
         pipeline._plan_for(req)
 
 
-def test_cell_schedule_has_clean_s1_from_history():
+def test_cell_schedule_s1_steps_independent_of_history():
     """S=1 self_forcing always runs the clean step (ordering property)."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)
     sf = OmniDiffusionRequest(
@@ -331,7 +320,6 @@ def test_cell_schedule_has_clean_s1_from_history():
         ),
     )
     plan_sf, _, _ = pipeline._plan_for(sf)
-    assert plan_sf.schedule.has_clean is True
     assert plan_sf.schedule.num_schedule_steps == 4
 
 
@@ -362,7 +350,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
         request_id="different-shape",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"latent_shape": shape, "num_denoise_steps": 1}),
     )
-    with pipeline.bind_ar_diffusion_cell_context(ctx):
+    with pipeline.bind_ar_diffusion_noisy_kv(ctx.kv):
         with pytest.raises(ValueError, match="does not match preallocated NoisyKV"):
             pipeline.forward(req)
     assert pipeline.block_size == pipeline.max_chunk_tokens == cache.spec.max_chunk_tokens == 16

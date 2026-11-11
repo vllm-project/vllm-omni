@@ -11,7 +11,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
@@ -47,6 +47,7 @@ def _dist_env():
         cleanup_dist_env_and_memory()
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_packed_table_skipped_on_cpu():
     """No table (no allocation) where the fused kernel cannot run."""
 
@@ -69,6 +70,7 @@ def test_packed_table_video_rows_then_identity_text_rows():
     assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.float16) is None  # non-bf16 activations
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_identity_rotation_rows_are_exact():
