@@ -33,7 +33,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
 )
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import HistoryWork, Message
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import Message
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
@@ -396,13 +396,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         """Check current effective sources before submission or late-result application."""
         memory = state.history_policy_state
         memory.reconcile(history)
-        return isinstance(request.model_source, HistoryWork) and memory.matches(request.model_source, history)
+        return self._history_runtime.source_matches(memory, request.model_source)
 
     def apply_auxiliary_result(
         self, *, request: DuplexAuxiliaryRequest, output: object, state: QwenDuplexSessionState
     ) -> bool:
         """Apply a valid private summary on the session loop without emitting output."""
         return self._history_runtime.apply(state.history_policy_state, request, output)
+
+    def image_history_limits(self) -> tuple[int, int]:
+        if self._history_runtime.policy is None:
+            return super().image_history_limits()
+        limits = self._history_runtime.limits
+        return limits.max_session_images, limits.max_session_image_bytes
 
     def history_calibrator(self, runtime_config):
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
@@ -449,7 +455,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             session_admission_mode="engine_managed",
             supports_audio_truncate=True,
             supports_chat_completions=True,
-            supports_image_input=self._history_runtime.policy is None,
+            supports_image_input=True,
             # Frames arrive as input_image conversation items, never on an
             # audio append (QwenPcmBuffer.prepare_append refuses video_frames).
             optional_input_modalities=frozenset(),

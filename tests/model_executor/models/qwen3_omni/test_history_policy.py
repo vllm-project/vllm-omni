@@ -32,6 +32,7 @@ class Processor:
     """Count expanded audio as expensive, even when its placeholder is short."""
 
     audio_tokens = 100
+    image_tokens = 120
 
     def apply_chat_template(self, messages, **kwargs):
         return json.dumps(messages, ensure_ascii=False)
@@ -39,8 +40,12 @@ class Processor:
     def tokenizer(self, *, text):
         return {"input_ids": [list(range(max(1, len(value) // 4))) for value in text]}
 
-    def __call__(self, *, text, audio, return_tensors):
-        count = len(self.tokenizer(text=text)["input_ids"][0]) + len(audio) * self.audio_tokens
+    def __call__(self, *, text, audio=(), images=(), return_tensors):
+        count = (
+            len(self.tokenizer(text=text)["input_ids"][0])
+            + len(audio) * self.audio_tokens
+            + len(images) * self.image_tokens
+        )
         return {"input_ids": [list(range(count))]}
 
 
@@ -374,15 +379,15 @@ def test_external_policy_is_loadable_without_modifying_plugin():
         load_history_policy("misspelled-policy")
 
 
-def test_policy_rejects_images_tools_and_leaves_default_capabilities_intact():
+def test_policy_accepts_images_but_rejects_tools_and_video_files():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     assert plugin.capabilities(max_sessions=1).supports_image_input
     plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "incremental"}))
-    assert not plugin.capabilities(max_sessions=1).supports_image_input
+    assert plugin.capabilities(max_sessions=1).supports_image_input
     with pytest.raises(DuplexRuntimeConfigError, match="tools"):
         plugin.validate_client_extra_body({"realtime_tools": [{"name": "refund"}]})
-    with pytest.raises(DuplexRuntimeConfigError, match="text and audio"):
-        plugin._history_runtime.validate_history([{"role": "user", "content": [{"type": "image_url"}]}])
+    with pytest.raises(DuplexRuntimeConfigError, match="video frames"):
+        plugin._history_runtime.validate_history([{"role": "user", "content": [{"type": "video_url"}]}])
 
 
 @pytest.mark.asyncio

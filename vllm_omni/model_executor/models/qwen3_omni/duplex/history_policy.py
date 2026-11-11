@@ -17,6 +17,8 @@ from collections import Counter, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import QwenVisualHistory, VisualWork
+
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
 
@@ -32,6 +34,14 @@ class HistoryLimits:
     max_audio_bytes: int = 32 * 1024 * 1024
     audio_summary_trigger_bytes: int = 8 * 1024 * 1024
     max_context_tokens: int | None = None
+    visual_chunk_images: int = 8
+    visual_mid_group: int = 5
+    visual_max_long: int = 15
+    max_visual_items: int = 200
+    max_visual_bytes: int = 32 * 1024 * 1024
+    max_visual_pixel_bytes: int = 150 * 1024 * 1024
+    max_session_images: int = 200
+    max_session_image_bytes: int = 32 * 1024 * 1024
 
     def __post_init__(self) -> None:
         """Reject nonintegral or unbounded deployment settings at initialization."""
@@ -51,24 +61,31 @@ class CompressionAudioRef:
 
 
 @dataclass(frozen=True)
+class CompressionImageRef:
+    """Index into the runtime-owned images for this batch only."""
+
+    index: int
+
+
+@dataclass(frozen=True)
 class CompressionMessage:
-    """Detached source text and audio references; no mutable Session objects."""
+    """Detached source text and media references; no mutable Session objects."""
 
     role: str
-    content: tuple[str | CompressionAudioRef, ...]
+    content: tuple[str | CompressionAudioRef | CompressionImageRef, ...]
 
 
 @dataclass(frozen=True)
 class CompressionPrompt:
     """One Thinker request: instructions and quoted user-role source material.
 
-    Include every batch audio reference exactly once, in its original order.
-    The runtime supplies the corresponding PCM, context cap and output limit.
+    Include every batch media reference exactly once, in order per modality.
+    The runtime supplies the corresponding media, context cap and output limit.
     Hooks must not retain batch material or perform I/O.
     """
 
     instructions: str
-    content: tuple[str | CompressionAudioRef, ...]
+    content: tuple[str | CompressionAudioRef | CompressionImageRef, ...]
     temperature: float = 0.0
 
     def __post_init__(self) -> None:
@@ -76,8 +93,8 @@ class CompressionPrompt:
             raise ValueError("Compression instructions must be nonempty text")
         if not isinstance(self.content, tuple) or not self.content:
             raise ValueError("Compression content must be a nonempty tuple")
-        if any(not isinstance(part, (str, CompressionAudioRef)) for part in self.content):
-            raise ValueError("Compression content accepts only text and batch audio references")
+        if any(not isinstance(part, (str, CompressionAudioRef, CompressionImageRef)) for part in self.content):
+            raise ValueError("Compression content accepts only text and batch audio/image references")
         if (
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
@@ -136,6 +153,16 @@ class RetainedAudio:
 
 
 @dataclass(frozen=True)
+class HistoryFold:
+    """Unpublished memory for a source prefix that still needs more excerpts."""
+
+    end: int
+    digest: str
+    offset: int
+    text: str
+
+
+@dataclass(frozen=True)
 class HistoryWork:
     """Source range and memory generation that must still match at commit."""
 
@@ -144,6 +171,9 @@ class HistoryWork:
     digest: str
     generation: int
     previous_summary: str
+    previous_partial: HistoryFold | None = None
+    end_offset: int | None = None
+    complete: bool = True
 
 
 @dataclass
@@ -167,7 +197,9 @@ class QwenHistoryState:
     preparing: dict[int, RetainedAudio] = field(default_factory=dict)
     media_revision: int = 0
     policy_cache_key: tuple[object, int, int, int] | None = None
-    cached_work: HistoryWork | None = None
+    cached_work: HistoryWork | VisualWork | None = None
+    partial: HistoryFold | None = None
+    visual: QwenVisualHistory = field(default_factory=QwenVisualHistory)
 
     def reconcile(self, history: Sequence[Message]) -> None:
         """Bind effective history and invalidate memory whose prefix was edited.
@@ -185,8 +217,16 @@ class QwenHistoryState:
             self.processed_digest = ""
             self.generation += 1
             self.omissions.clear()
+            self.partial = None
             self.counts["invalidations"] += 1
+        if self.partial is not None and (
+            len(history) < self.partial.end or source_digest(history[: self.partial.end]) != self.partial.digest
+        ):
+            self.partial = None
+            self.generation += 1
+            self.counts["partial_invalidations"] += 1
         self.history = tuple(history)
+        self.visual.reconcile(history)
         live = {id(m.get("content")) for m in history if has_audio(m)}
         self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in live for c in a.contents)]
 
@@ -257,6 +297,7 @@ class QwenHistoryState:
             work.generation == self.generation
             and work.start == self.processed
             and work.previous_summary == self.summary
+            and work.previous_partial == self.partial
             and len(history) >= work.end
             and source_digest(history[: work.end]) == work.digest
         )
@@ -276,6 +317,7 @@ class QwenHistoryState:
             self.omissions.append((work.start, work.end, omission))
             self.counts["omissions"] += 1
         self.processed = work.end
+        self.partial = None
         self.processed_digest = work.digest
         self.generation += 1
         self.policy_cache_key = None
@@ -293,6 +335,8 @@ class QwenHistoryPolicy(ABC):
     as read-only. Compression hooks receive detached immutable source values.
     The plugin enforces source validity, media/input limits and memory size.
     """
+
+    compress_visual_history = True
 
     @abstractmethod
     def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
@@ -319,6 +363,8 @@ class QwenHistoryPolicy(ABC):
 
 class BoundedRecentPolicy(QwenHistoryPolicy):
     """Equal-budget clipping control: retain media, but never summarize it."""
+
+    compress_visual_history = False
 
     def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
         """Offer all turns; the renderer fits the most recent ones to context."""
@@ -348,6 +394,8 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
 
     def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
         """Prioritize completed media turns at the request limit or byte trigger."""
+        if state.partial is not None:
+            return state.processed, state.partial.end
         history = state.history
         cutoff = max(0, len(history) - limits.recent_messages)
         # Consolidate before the next input exceeds the renderer's audio limit,
@@ -393,7 +441,7 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
         self, batch: tuple[CompressionMessage, ...], previous_memory: str, limits: HistoryLimits
     ) -> CompressionPrompt:
         """Merge previous memory and new quoted dialogue in one Thinker request."""
-        parts: list[str | CompressionAudioRef] = [
+        parts: list[str | CompressionAudioRef | CompressionImageRef] = [
             "PREVIOUS_MEMORY\n" + previous_memory + "\nEND_PREVIOUS_MEMORY\nNEW_DIALOGUE\n"
         ]
         for message in batch:
@@ -417,6 +465,11 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
             "Use the dialogue language and return only the complete memory, at most "
             f"{limits.summary_tokens} tokens."
         )
+        if any(isinstance(part, CompressionImageRef) for message in batch for part in message.content):
+            instructions += (
+                " Images are also quoted source evidence. Preserve observable objects, attributes, "
+                "text, actions and changes with their source message labels."
+            )
         return CompressionPrompt(instructions, tuple(parts))
 
     def parse_compression(self, text: str) -> str | None:

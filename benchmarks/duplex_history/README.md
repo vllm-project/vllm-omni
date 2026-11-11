@@ -5,8 +5,9 @@ A private Thinker request reads the previous memory and original text/audio in
 one inference. It does not transcribe audio in a separate request or route its
 output to Talker. The default `recent` policy keeps existing behavior.
 
-This prototype supports text and native audio. Selecting `incremental` or
-`bounded_recent` disables image input and rejects tool configuration. Session
+This prototype supports text, native audio and `input_image` conversation items.
+`incremental` maintains separate hierarchical visual memory; `bounded_recent`
+clips original images without summarizing them. Both reject tool configuration. Session
 records retain their existing query, deletion and playback semantics. Their
 total storage is not bounded by this feature.
 
@@ -27,6 +28,14 @@ duplex_session:
       max_audio_bytes: 33554432
       audio_summary_trigger_bytes: 8388608
       max_context_tokens: 2048
+      visual_chunk_images: 8
+      visual_mid_group: 5
+      visual_max_long: 15
+      max_visual_items: 200
+      max_visual_bytes: 33554432
+      max_visual_pixel_bytes: 157286400
+      max_session_images: 200
+      max_session_image_bytes: 33554432
 ```
 
 Start the server through your GPU scheduler:
@@ -62,6 +71,48 @@ retries: one initial attempt and two retries after 1 and 3 seconds. If all fail,
 the same source remains parked until changed source selection or a new foreground
 submission allows another attempt. Idle time alone does not restart it. Audio
 retained solely for processed sources is released.
+
+## Long text and visual history
+
+An oversized text-only turn is folded through several compression requests.
+Each excerpt retains speaker labels and receives the preceding intermediate
+memory. Intermediate results stay private: foreground requests use the last
+published memory until the entire source turn is consumed. A failed excerpt
+retains its previous progress for retry. Editing its source revokes partial
+progress. If even a minimal excerpt cannot fit, the source stays pending rather
+than being marked summarized.
+
+Send photos or client-extracted video frames as JPEG/PNG data URLs in
+`input_image` conversation items. Qwen does not decode video files or accept
+`video_frames` on audio appends. Old completed images are summarized when they
+fall into a selected dialogue batch or leave the recent-message target; reaching
+the model image-count limit also makes completed sources eligible. Each request
+uses up to `visual_chunk_images` images and the exact processor-expanded token
+count. Images are normalized to RGB with a maximum side of 448, matching the
+existing Qwen duplex path.
+
+Successful image batches create intermediate visual summaries. Once
+`visual_mid_group` summaries accumulate, another request combines them into a
+long-term summary. At most `visual_max_long` long-term summaries are retained;
+older ones are dropped. Both levels use `summary_tokens` as their output cap.
+Foreground requests receive visual summaries plus uncompressed original images.
+Visual results use the same replaceable `build_compression` and
+`parse_compression` hooks as dialogue results, with batch-local
+`CompressionImageRef` references. The clipping control disables this work.
+
+The resource limits have different owners:
+
+| Limit | What it bounds |
+| --- | --- |
+| `max_visual_items`, `max_visual_bytes`, `max_visual_pixel_bytes` | Pending images in the shared visual store: count, lossless encoded PNG bytes, and RGB pixel bytes. Preparation admits bounded batches and joins its worker on cancellation. |
+| `max_session_images`, `max_session_image_bytes` | All original image records in Session: count and encoded data-URL bytes. Summarization does not free these slots. |
+| `limit_mm_per_prompt.image` | Actual images in one model request; the Qwen renderer additionally caps this at 8. |
+
+A full Session image store rejects new items. Deleting an old source also
+invalidates summaries derived from it; it is not a way to retain summaries while
+reclaiming originals. This implementation therefore supports a bounded number
+of original visual observations, not an indefinitely growing video stream.
+The existing evaluation cases below measure text/audio, not visual recall.
 
 ## Frozen evaluation inputs
 
@@ -163,7 +214,7 @@ An indivisible turn with too many distinct audio payloads records
 Consecutive commits before one response share a single payload. Deleting
 assistant replies between previously separate audio turns can join distinct
 payloads into a turn that exceeds the per-request limit. Such a turn is omitted
-without a summary; this prototype does not split a turn across summary requests.
+without a summary; this prototype does not split original audio across requests.
 The omission allows later turns to progress but cannot preserve the omitted
 turn's facts in memory.
 

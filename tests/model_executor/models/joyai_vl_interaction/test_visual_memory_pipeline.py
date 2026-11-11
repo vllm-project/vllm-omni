@@ -27,12 +27,14 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, duplex_text_history
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+from vllm_omni.engine.duplex.visual_memory import (
+    VisualSummary,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, WorkingChunk
 from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
 from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionSession
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import WorkingObservation
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import VisualSummary
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

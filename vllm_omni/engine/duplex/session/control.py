@@ -510,8 +510,12 @@ class SessionControl:
                     nested_url = image_url.get("url") if isinstance(image_url, dict) else None
                     if isinstance(nested_url, str):
                         existing.append(nested_url)
-            if len(existing) + len(urls) > 8 or sum(map(len, existing + urls)) > 4 * 1024 * 1024:
-                self._out.emit_error("input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items")
+            max_images, max_image_bytes = self._ctx.plugin.image_history_limits()
+            if len(existing) + len(urls) > max_images or sum(map(len, existing + urls)) > max_image_bytes:
+                self._out.emit_error(
+                    "input_backpressure",
+                    f"Image context exceeds {max_images} images or {max_image_bytes} encoded bytes; delete old items",
+                )
                 return
         message = realtime_item_to_history_message(item)
         item_id = item.get("id") if isinstance(item, dict) else None

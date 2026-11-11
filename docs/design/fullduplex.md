@@ -103,9 +103,12 @@ without calibration release stopped output immediately.
 Qwen can opt into a bounded history policy through server-owned
 `duplex_session.model_custom_options`. `recent` preserves the default clipping path;
 `bounded_recent` provides an equal-context/media-budget clipping control;
-`incremental` folds older text and original audio into a bounded text memory.
+`incremental` folds older text and original audio into a bounded text memory,
+and images into intermediate and long-term visual memories.
 Model-specific selection, source retention, prompt construction and validation
-remain in the Qwen plugin. `SessionMemoryRuntime` executes private requests
+remain in the Qwen plugin. Qwen and JoyAI share `engine/duplex/text_folding.py`
+for labeled text excerpts and `engine/duplex/visual_memory.py` for visual source
+retention and summary commits. `SessionMemoryRuntime` executes private requests
 with the Thinker as both entry and final stage.
 
 Each Session holds `QwenDuplexSessionState.history_policy_state`. Source
@@ -132,9 +135,12 @@ PCM binding, Qwen processing, actual token limits and committing valid results;
 extension does not implement a second model-execution loop.
 
 Compression builders run in the joined CPU preparation worker on frozen
-`CompressionMessage` values. Text and batch-local `CompressionAudioRef` indices
-replace borrowed Session objects and raw PCM. Every audio reference must appear
-once in source order in the returned `CompressionPrompt`. If a batch must shrink
+`CompressionMessage` values. Text, batch-local `CompressionAudioRef` and
+`CompressionImageRef` indices replace borrowed Session objects and media. Every
+reference must appear once in source order within its modality in the returned
+`CompressionPrompt`. The same compression hooks construct and parse visual
+summaries. `compress_visual_history=False` disables visual summarization;
+`bounded_recent` uses this setting. If a batch must shrink
 to fit context, the builder runs again on that actual smaller batch. Parsers
 run on the Session loop and must be small and nonblocking. Both hooks are
 stateless, perform no I/O and must not retain input material. Selection hooks
@@ -163,7 +169,7 @@ independently of the legacy recent cache. The policy receives the resolved
 per-request count as `next_batch(..., max_audio=...)`. A still-valid foreground
 source can be recovered for compression, but its worker references must fit the
 strategy limits and remain charged until
-feature preparation finishes. Current text/audio is preserved independently of
+feature preparation finishes. Current text/audio/image input is preserved independently of
 background retention capacity; unavailable current audio is an explicit error.
 
 Foreground rendering emits one debug record per successful prompt build with
@@ -171,7 +177,45 @@ Foreground rendering emits one debug record per successful prompt build with
 clipping, including plans cancelled before submission, rather than completed
 responses. Worker logging does not mutate Session state.
 
-The prototype accepts only text/audio when selected. The default policy
+When an indivisible text turn exceeds the compression input capacity, the
+runtime folds labeled excerpts using private `HistoryFold` state. Each request
+includes the previous intermediate memory. Only the final successful excerpt
+publishes replacement memory and advances the processed position. Failed or
+cancelled excerpts leave progress unchanged; source edits revoke partial state.
+Text folding uses the same custom compression builder and parser as whole
+batches. Raw audio is not split by the text algorithm.
+
+Visual input uses existing `input_image` items with JPEG/PNG data URLs, including
+client-extracted video frames. No video-file decoder or audio-append frame path
+is added. Completed visual sources become eligible when selected dialogue needs
+compression, when they leave the recent-message target, or when unsummarized
+images reach the per-request image limit. The runtime processes up to
+`visual_chunk_images` (default 8) at a time, shrinking to the actual processor
+capacity. Five intermediate summaries (`visual_mid_group`) trigger a long-term
+merge; at most 15 long-term summaries (`visual_max_long`) are retained. Each
+visual output is limited by `summary_tokens`, default 512. Oldest long-term
+summaries are retired beyond this bound. Source message positions label visual
+evidence; they are not video timestamps.
+
+Visual summaries are separate from dialogue memory. Source images remain
+available until a valid visual result commits; dialogue compression waits for
+its visual sources to be summarized. Foreground requests include visual memories
+and uncompressed images. If current input plus memories exceeds capacity, the
+runtime removes dialogue memory and then oldest visual memories before failing
+the current request. It subsequently adds older whole turns while they fit.
+Image edits or deletions revoke derived visual memory and stale results. Worker
+cancellation joins decoding/rendering before another preparation can own its
+materials.
+
+The plugin separately provides Session image admission limits. Opt-in Qwen
+policies default to 200 stored images / 32 MiB of encoded image URLs; default
+`recent` retains 8 images / 4 MiB. These records are not deleted by summarization.
+Reaching this limit rejects additional images; deleting source items also revokes
+memory derived from them. The visual preparation store has its own configurable
+image count, encoded PNG byte and decoded pixel byte bounds. These are not
+process RSS limits.
+
+Opt-in policies accept text/audio/images and reject tools. The default policy
 retains existing image/tool support. Implementation, configuration, evaluation
 scope and commands are in the
 [history experiment guide](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/duplex_history/README.md).

@@ -33,6 +33,15 @@ from vllm_omni.engine.duplex.plugin import (
     duplex_history_digest,
     duplex_text_history,
 )
+from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualClosureReason,
+    VisualFrame,
+    VisualMemoryCapacityError,
+    VisualMemorySource,
+    VisualSummary,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     LONG_TERM_COMPRESS_PROMPT,
@@ -67,15 +76,9 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
-    EncodedVisualImage,
     TextSummaryChunk,
     TextSummaryLimit,
     TextSummaryProgress,
-    VisualClosureReason,
-    VisualFrame,
-    VisualMemoryCapacityError,
-    VisualMemorySource,
-    VisualSummary,
 )
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
@@ -549,58 +552,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # bounded excerpts into private progress; publish coverage only
             # after the entire Q&A has been consumed.
             offset = continuation.offset if continuation else 0
-            low = offset + 1
-            high = min(len(transcript), offset + limit.max_chars) if limit else len(transcript)
-            # max_chars caps raw transcript progress. If it ends within a
-            # label, extend to the first evidence character so the fold can
-            # advance. Labels are rendered whole; fits() still enforces the
-            # model token budget, including the reserved summary output.
-            first_text = next((max(offset, text_start) for _, text_start, end, _ in spans if end > offset), offset)
-            high = max(high, first_text + 1)
-
-            def excerpt_prompt(stop: int) -> str | None:
-                fragments = []
-                for start, text_start, end, label in spans:
-                    if stop <= start or offset >= end:
-                        continue
-                    first, last = max(offset, text_start), min(stop, end)
-                    if first < last:
-                        continued = "(continued) " if offset > text_start else ""
-                        fragments.append(label + continued + transcript[first:last])
-                if not fragments:
-                    return None
-                excerpt = f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n" + "\n".join(
-                    fragments
-                )
-                return render(excerpt, target)
-
-            candidate = None
-            while low <= high:
-                stop = (low + high) // 2
-                prompt = excerpt_prompt(stop)
-                if prompt is None:
-                    low = stop + 1
-                elif fits(prompt):
-                    candidate = request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
-                    low = stop + 1
-                else:
-                    high = stop - 1
-            if candidate is None:
+            fitted = fit_text_excerpt(
+                transcript,
+                spans,
+                offset=offset,
+                max_chars=limit.max_chars if limit else None,
+                render=lambda excerpt: render(excerpt, target),
+                fits=fits,
+            )
+            if fitted is None:
                 return None
-            candidate_source = candidate.model_source
-            assert isinstance(candidate_source, TextSummaryChunk)
-            if not candidate_source.complete:
-                stop = candidate_source.end_offset
-                window = transcript[offset:stop]
-                boundary = window.rfind("\n")
-                if boundary <= 0:
-                    boundary = max(window.rfind(" "), window.rfind("\t"))
-                if boundary > 0:
-                    stop = offset + boundary
-                    prompt = excerpt_prompt(stop)
-                    if prompt is not None and fits(prompt):
-                        candidate = request(prompt, target, TextSummaryChunk(partial, stop, False))
-            return candidate
+            prompt, stop = fitted
+            return request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
 
         return await asyncio.to_thread(prepare)
 

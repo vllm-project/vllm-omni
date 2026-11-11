@@ -512,6 +512,14 @@ class DuplexModelPlugin(ABC):
         """Plan bounded background work from committed text; default opt-out."""
         return None
 
+    def image_history_limits(self) -> tuple[int, int]:
+        """Maximum stored image count and encoded URL bytes in Session records.
+
+        These admission limits are distinct from per-request media limits and
+        model-owned compression buffers. Summarization does not delete records.
+        """
+        return 8, 4 * 1024 * 1024
+
     def auxiliary_policy(
         self,
         *,
