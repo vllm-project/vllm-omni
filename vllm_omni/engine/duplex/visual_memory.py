@@ -49,6 +49,12 @@ class VisualFrame:
 
 @dataclass(frozen=True)
 class VisualSummary:
+    """A retained visual span and its summary cost.
+
+    Standalone stores keep summary text here. A ledger-backed adapter may keep
+    metadata-only entries and resolve text from its authority before rendering.
+    """
+
     first_id: int
     last_id: int
     start_s: float

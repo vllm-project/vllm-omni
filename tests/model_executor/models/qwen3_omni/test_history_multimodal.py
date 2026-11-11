@@ -20,7 +20,6 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.visual_memory import VisualMemory
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import QwenHistoryState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import VisualWork
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -43,7 +42,8 @@ def long_history():
 
 @pytest.mark.asyncio
 async def test_large_text_turn_folds_all_sources_before_publishing():
-    owner, state = runtime(summary_tokens=64, recent_messages=8), QwenHistoryState()
+    owner = runtime(summary_tokens=64, recent_messages=8)
+    state = owner.create_state()
     owner.max_model_len = 1200
     sync_history(state, long_history())
     requests = []
@@ -72,7 +72,8 @@ async def test_large_text_turn_folds_all_sources_before_publishing():
 
 @pytest.mark.asyncio
 async def test_partial_text_reject_retry_source_edit_and_late_result():
-    owner, state = runtime(summary_tokens=64), QwenHistoryState()
+    owner = runtime(summary_tokens=64)
+    state = owner.create_state()
     owner.max_model_len = 1200
     history = long_history()
     sync_history(state, history)
@@ -94,7 +95,8 @@ async def test_partial_text_reject_retry_source_edit_and_late_result():
 
 @pytest.mark.asyncio
 async def test_text_fold_preserves_custom_compressor_and_parser():
-    owner, state = runtime(summary_tokens=64), QwenHistoryState()
+    owner = runtime(summary_tokens=64)
+    state = owner.create_state()
     owner.policy = StructuredMemoryPolicy()
     owner.max_model_len = 800
     sync_history(state, long_history())
@@ -108,10 +110,8 @@ async def test_text_fold_preserves_custom_compressor_and_parser():
 
 @pytest.mark.asyncio
 async def test_visual_frames_to_mid_to_long_and_foreground_reuse():
-    owner, state = (
-        runtime(summary_tokens=128, recent_messages=2, visual_mid_group=2, visual_chunk_images=1),
-        QwenHistoryState(),
-    )
+    owner = runtime(summary_tokens=128, recent_messages=2, visual_mid_group=2, visual_chunk_images=1)
+    state = owner.create_state()
     history = [
         image_message(),
         {"role": "assistant", "content": "red"},
@@ -144,7 +144,8 @@ async def test_visual_frames_to_mid_to_long_and_foreground_reuse():
 
 @pytest.mark.asyncio
 async def test_visual_failure_retains_sources_edit_revokes_and_append_does_not():
-    owner, state = runtime(recent_messages=2), QwenHistoryState()
+    owner = runtime(recent_messages=2)
+    state = owner.create_state()
     history = [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]
     sync_history(state, history)
     request = await owner.prepare(state)
@@ -161,7 +162,8 @@ async def test_visual_failure_retains_sources_edit_revokes_and_append_does_not()
 
 @pytest.mark.asyncio
 async def test_visual_capacity_shrinks_batch_without_retiring_unprocessed_frames():
-    owner, state = runtime(summary_tokens=64, recent_messages=2), QwenHistoryState()
+    owner = runtime(summary_tokens=64, recent_messages=2)
+    state = owner.create_state()
     owner.processor.image_tokens = 1000
     owner.max_model_len = 1800
     sync_history(
@@ -184,7 +186,8 @@ async def test_visual_capacity_shrinks_batch_without_retiring_unprocessed_frames
 
 
 def test_current_mixed_audio_image_input_and_image_capacity():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     message, payload = audio_message(0)
     message["content"].extend(image_message()["content"])
     sync_history(state, [message])
@@ -196,7 +199,8 @@ def test_current_mixed_audio_image_input_and_image_capacity():
 
 
 def test_image_captions_remain_interleaved_in_foreground():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     content = [
         {"type": "text", "text": "before red"},
         *image_message("red")["content"],
@@ -215,7 +219,8 @@ def test_image_captions_remain_interleaved_in_foreground():
 
 @pytest.mark.asyncio
 async def test_unfinished_text_fold_continues_after_unrelated_tail_is_deleted():
-    owner, state = runtime(summary_tokens=64), QwenHistoryState()
+    owner = runtime(summary_tokens=64)
+    state = owner.create_state()
     owner.max_model_len = 1200
     history = long_history()
     sync_history(state, history)
@@ -229,7 +234,8 @@ async def test_unfinished_text_fold_continues_after_unrelated_tail_is_deleted():
 
 @pytest.mark.asyncio
 async def test_visual_preparation_cancellation_joins_worker(monkeypatch):
-    owner, state = runtime(recent_messages=2), QwenHistoryState()
+    owner = runtime(recent_messages=2)
+    state = owner.create_state()
     sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     entered, release = threading.Event(), threading.Event()
     original = owner._decode_visual_batch
@@ -256,7 +262,8 @@ async def test_visual_preparation_cancellation_joins_worker(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_bounded_recent_uses_images_without_creating_memory():
-    owner, state = runtime("bounded_recent"), QwenHistoryState()
+    owner = runtime("bounded_recent")
+    state = owner.create_state()
     sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(10)])
     assert await owner.prepare(state) is None
     prompt = owner.build_foreground(owner.foreground(state, {}), {}, 128)
@@ -321,7 +328,8 @@ async def test_visual_result_uses_session_runtime_and_releases_request():
 
 @pytest.mark.asyncio
 async def test_visual_memory_is_revoked_after_published_source_is_deleted():
-    owner, state = runtime(recent_messages=2, visual_mid_group=1), QwenHistoryState()
+    owner = runtime(recent_messages=2, visual_mid_group=1)
+    state = owner.create_state()
     history = [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]
     sync_history(state, history)
     for text in ("mid red", "long red"):
@@ -335,7 +343,8 @@ async def test_visual_memory_is_revoked_after_published_source_is_deleted():
 
 @pytest.mark.asyncio
 async def test_visual_byte_limit_keeps_source_pending_without_omission():
-    owner, state = runtime(recent_messages=2, max_visual_bytes=1), QwenHistoryState()
+    owner = runtime(recent_messages=2, max_visual_bytes=1)
+    state = owner.create_state()
     sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     assert await owner.prepare(state) is None
     assert state.visual.admitted == state.visual.covered == state.processed == 0
@@ -348,7 +357,8 @@ async def test_visual_compression_uses_custom_builder_parser_and_reference_guard
 
     from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import CompressionImageRef
 
-    owner, state = runtime(recent_messages=2), QwenHistoryState()
+    owner = runtime(recent_messages=2)
+    state = owner.create_state()
     owner.policy = StructuredMemoryPolicy()
     sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     request = await owner.prepare(state)

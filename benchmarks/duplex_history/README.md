@@ -114,10 +114,17 @@ Successful image batches create intermediate visual summaries. Once
 `visual_mid_group` summaries accumulate, another request combines them into a
 long-term summary. At most `visual_max_long` long-term summaries are retained;
 older ones are dropped. Both levels use `summary_tokens` as their output cap.
+The original-image marker does not promise that a corresponding summary is present
+in the final prompt: retention or context fitting may exclude that memory.
 Foreground requests receive visual summaries plus uncompressed original images.
 Visual results use the same replaceable `build_compression` and
 `parse_compression` hooks as dialogue results, with batch-local
 `CompressionImageRef` references. The clipping control disables this work.
+
+A completed image with an undecodable body is recorded as a visual omission, logged
+by source ID and skipped so later images and dialogue can be compressed. It is not
+claimed as summarized visual evidence. This does not delete the original Session
+item. Undecodable current input still fails foreground preparation explicitly.
 
 The resource limits have different owners:
 

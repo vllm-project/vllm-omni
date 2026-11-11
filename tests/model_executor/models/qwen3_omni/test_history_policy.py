@@ -139,7 +139,8 @@ def test_incomplete_external_policy_is_rejected_at_load():
 
 
 def test_unavailable_current_audio_cannot_silently_fall_back_to_old_question():
-    owner, state = runtime("bounded_recent"), QwenHistoryState()
+    owner = runtime("bounded_recent")
+    state = owner.create_state()
     missing, _ = audio_message(0)
     sync_history(state, [*text_history(2), missing, {"role": "user", "content": "current budget is 5000"}])
     with pytest.raises(DuplexRuntimeConfigError, match="Current.*audio"):
@@ -292,7 +293,8 @@ def test_unchanged_history_reconsiders_new_media_pressure():
 
 
 def test_foreground_clipping_records_one_degradation_event(caplog):
-    owner, state = runtime(summary_tokens=32), QwenHistoryState()
+    owner = runtime(summary_tokens=32)
+    state = owner.create_state()
     sync_history(state, text_history(20))
     context = owner.foreground(state, {})
     # Fit the latest turn, but not its predecessor or the summary.
@@ -312,7 +314,8 @@ def test_foreground_clipping_records_one_degradation_event(caplog):
 
 @pytest.mark.asyncio
 async def test_incremental_summary_reuses_previous_and_does_not_repeat_covered_sources():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     sync_history(state, text_history())
     first = await owner.prepare(state)
     assert first.history_length == 8
@@ -333,7 +336,8 @@ async def test_incremental_summary_reuses_previous_and_does_not_repeat_covered_s
 
 @pytest.mark.asyncio
 async def test_audio_pressure_precedes_text_window_and_uses_original_pcm_once():
-    owner, state = runtime(recent_messages=100), QwenHistoryState()
+    owner = runtime(recent_messages=100)
+    state = owner.create_state()
     history, retained = [], []
     for i in range(4):
         message, payload = audio_message(i)
@@ -351,7 +355,8 @@ async def test_audio_pressure_precedes_text_window_and_uses_original_pcm_once():
 
 @pytest.mark.asyncio
 async def test_permanently_missing_audio_does_not_block_following_text():
-    owner, state = runtime(recent_messages=2), QwenHistoryState()
+    owner = runtime(recent_messages=2)
+    state = owner.create_state()
     message, _ = audio_message(0)
     sync_history(
         state, [message, {"role": "assistant", "content": "answer without available evidence"}, *text_history(8)]
@@ -366,7 +371,8 @@ async def test_permanently_missing_audio_does_not_block_following_text():
 
 @pytest.mark.asyncio
 async def test_transient_failure_retries_same_source_and_preserves_summary():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     sync_history(state, text_history())
     request = await owner.prepare(state)
     assert not owner.apply(state, request, completion("", "length"))
@@ -378,7 +384,8 @@ async def test_transient_failure_retries_same_source_and_preserves_summary():
 
 @pytest.mark.asyncio
 async def test_cached_decision_reconsiders_rejected_summary_for_custom_policy():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     owner.policy = IdleHistoryPolicy()
     history = text_history()
     sync_history(state, history)
@@ -391,7 +398,8 @@ async def test_cached_decision_reconsiders_rejected_summary_for_custom_policy():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("edit", ["truncate", "delete", "replace_audio"])
 async def test_source_edits_reject_late_results_and_invalidate_derived_memory(edit):
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     history = text_history()
     if edit == "replace_audio":
         m, p = audio_message(1)
@@ -445,7 +453,8 @@ def test_policy_accepts_images_but_rejects_tools_and_video_files():
 
 @pytest.mark.asyncio
 async def test_expanded_audio_context_limit_and_oversize_batch_progress():
-    owner, state = runtime(summary_tokens=64, recent_messages=2), QwenHistoryState()
+    owner = runtime(summary_tokens=64, recent_messages=2)
+    state = owner.create_state()
     owner.max_model_len = 400
     owner.processor.audio_tokens = 500
     message, payload = audio_message(0)
@@ -462,7 +471,8 @@ async def test_expanded_audio_context_limit_and_oversize_batch_progress():
 
 @pytest.mark.asyncio
 async def test_new_tail_does_not_revoke_valid_summary_or_old_source_request():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     history = text_history()
     sync_history(state, history)
     request = await owner.prepare(state)
@@ -560,7 +570,8 @@ async def test_cancelled_preparation_keeps_media_charged_until_cpu_worker_finish
     import asyncio
     import threading
 
-    owner, state = runtime(recent_messages=2, max_audio_items=1), QwenHistoryState()
+    owner = runtime(recent_messages=2, max_audio_items=1)
+    state = owner.create_state()
     owner.policy = IdleHistoryPolicy()
     message, payload = audio_message(0)
     sync_history(state, [message, {"role": "assistant", "content": "heard"}, *text_history(4)])
@@ -602,7 +613,8 @@ async def test_cancelled_preparation_keeps_media_charged_until_cpu_worker_finish
 
 
 def test_identical_pcm_in_distinct_turns_is_not_confused_with_current_input():
-    owner, state = runtime(), QwenHistoryState()
+    owner = runtime()
+    state = owner.create_state()
     old, payload = audio_message(0)
     sync_history(state, [old, {"role": "assistant", "content": "old response"}])
     state.retain([((old["content"],), payload)], owner.limits)
@@ -633,7 +645,8 @@ def test_rebinding_audio_counts_source_still_held_by_preparation():
 
 @pytest.mark.asyncio
 async def test_audio_trigger_uses_bound_model_limit():
-    owner, state = runtime(recent_messages=100), QwenHistoryState()
+    owner = runtime(recent_messages=100)
+    state = owner.create_state()
     model = Mock(spec=ModelConfig, max_model_len=4096)
     model.multimodal_config.get_limit_per_prompt.return_value = 2
     owner.bind(Processor(), model)

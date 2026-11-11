@@ -9,16 +9,15 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import completio
 from vllm_omni.engine.duplex.config import DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLevel, source_refs
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import QwenHistoryState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def setup_history(messages):
+def setup_history(messages, *, owner):
     session = DuplexEngineSession(session_id="qwen-ledger", config=DuplexSessionConfig(model="test"))
     for index, message in enumerate(messages):
         session.register_history_item(str(index), message)
-    state = QwenHistoryState()
+    state = owner.create_state()
     refresh(state, session)
     return state, session
 
@@ -35,7 +34,7 @@ def summaries(session):
 @pytest.mark.parametrize("mutation", ["edit", "delete_recreate", "truncate"])
 async def test_rolling_summary_inherits_earliest_sources_and_rejects_late_result(mutation):
     owner = runtime(recent_messages=2, chunk_messages=2)
-    state, session = setup_history(text_history(1) if mutation == "truncate" else text_history(10))
+    state, session = setup_history(text_history(1) if mutation == "truncate" else text_history(10), owner=owner)
     if mutation == "truncate":
         response_id = session.begin_response()
         session.append_assistant_text("hello worlds")
@@ -74,7 +73,7 @@ async def test_rolling_summary_inherits_earliest_sources_and_rejects_late_result
 @pytest.mark.asyncio
 async def test_append_preserves_pending_sources_and_ledger_is_summary_authority():
     owner = runtime(recent_messages=2, chunk_messages=2)
-    state, session = setup_history(text_history(6))
+    state, session = setup_history(text_history(6), owner=owner)
     request = await owner.prepare(state)
     session.register_history_item("tail", {"role": "user", "content": "new question"})
     refresh(state, session)
@@ -94,7 +93,7 @@ async def test_omitted_audio_is_not_claimed_as_summary_evidence():
 
     missing, _ = audio_message(0)
     owner = runtime(recent_messages=2, chunk_messages=2)
-    state, session = setup_history([missing, {"role": "assistant", "content": "heard"}, *text_history(6)])
+    state, session = setup_history([missing, {"role": "assistant", "content": "heard"}, *text_history(6)], owner=owner)
     request = await owner.prepare(state)
     assert state.processed == 2 and request.model_source.start == 2
     assert owner.apply(state, request, completion("text facts"))
@@ -106,7 +105,7 @@ async def test_omitted_audio_is_not_claimed_as_summary_evidence():
 async def test_partial_text_is_unpublished_and_source_edit_discards_fold():
     owner = runtime(summary_tokens=64)
     owner.max_model_len = 720
-    state, session = setup_history(long_history())
+    state, session = setup_history(long_history(), owner=owner)
     request = await owner.prepare(state)
     assert not request.model_source.complete
     assert owner.apply(state, request, completion("partial"))
@@ -124,7 +123,7 @@ async def test_visual_merge_inherits_sources_l1_coexists_and_old_nodes_are_clean
     messages = []
     for color in ("red", "blue", "green", "yellow"):
         messages.extend([image_message(color), {"role": "assistant", "content": color}])
-    state, session = setup_history([*messages, *text_history(4)])
+    state, session = setup_history([*messages, *text_history(4)], owner=owner)
     session.render_history_view(DuplexContextViewPolicy(keep_media_user_turns=0))
     l1_ids = {n.node_id for n in session.context_ledger.nodes() if n.level is DuplexContextLevel.MEDIA_DROPPED}
     for index in range(2):

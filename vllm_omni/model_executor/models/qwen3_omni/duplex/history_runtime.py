@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import numpy as np
 import pybase64
+from PIL import Image
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -134,14 +135,25 @@ class QwenHistoryRuntime:
             if message.get("role") in {"tool", "function"} or message.get("tool_calls"):
                 raise DuplexRuntimeConfigError("Experimental Qwen history policies do not support tools")
 
+    def create_state(self) -> QwenHistoryState:
+        """Install deployment limits before any history admission or planning."""
+        return QwenHistoryState(limits=self.limits)
+
     def group(
-        self, state: QwenHistoryState, start: int, end: int, available_audio: Sequence[AudioEntry] = ()
+        self,
+        state: QwenHistoryState,
+        start: int,
+        end: int,
+        available_audio: Sequence[AudioEntry] = (),
+        *,
+        preserve_images: bool = False,
     ) -> PromptGroup | None:
         """Render a source range using retained or still-live foreground media.
 
         A missing source without a transcript returns None. Background callers
         must charge every returned audio reference before starting a worker.
-        Foreground callers enforce current-input completeness separately.
+        Foreground callers preserve original current images, even if deletion
+        made a previously summarized or omitted image current again.
         """
         messages, audio, seen, images = [], [], set(), []
         for index, message in enumerate(state.history[start:end], start):
@@ -176,9 +188,16 @@ class QwenHistoryRuntime:
             )
             for part_index, part in enumerate(content if isinstance(content, list) else ()):
                 if isinstance(part, dict) and part.get("type") == "image_url":
-                    if state.visual.covered_image(index, part_index):
+                    if not preserve_images and state.visual.omitted_image(index, part_index):
                         parts.append(
-                            {"type": "text", "text": f"[Visual source message {index + 1}; see visual memory.]"}
+                            {
+                                "type": "text",
+                                "text": f"[Visual source message {index + 1} unavailable: image decoding failed.]",
+                            }
+                        )
+                    elif not preserve_images and state.visual.covered_image(index, part_index):
+                        parts.append(
+                            {"type": "text", "text": f"[Original image from source message {index + 1} omitted.]"}
                         )
                     else:
                         images.append(part["image_url"]["url"])
@@ -219,7 +238,13 @@ class QwenHistoryRuntime:
             if (start, end) not in valid or start < last:
                 raise ValueError("History policy selected invalid or unordered turn ranges")
             last = end
-            group = self.group(state, start, end, sources)
+            group = self.group(
+                state,
+                start,
+                end,
+                sources,
+                preserve_images=end == len(state.history) and state.history[-1].get("role") == "user",
+            )
             if group is None and end == len(state.history) and state.history[-1].get("role") == "user":
                 raise DuplexRuntimeConfigError("Current input contains unavailable audio without a transcript")
             if group is not None:
@@ -448,14 +473,6 @@ class QwenHistoryRuntime:
         assert self.policy is not None
         if not self.policy.compress_visual_history or self.max_images <= 0:
             return None
-        memory = state.visual.memory
-        memory.chunk_frames = self.limits.visual_chunk_images
-        memory.mid_group = self.limits.visual_mid_group
-        memory.max_long = self.limits.visual_max_long
-        memory.max_pending = self.limits.max_visual_items
-        memory.max_encoded_bytes = self.limits.max_visual_bytes
-        memory.max_pixel_bytes = self.limits.max_visual_pixel_bytes
-        memory.mid_max_tokens = memory.long_max_tokens = self.limits.summary_tokens
         completed_end = len(state.history)
         if state.history and state.history[-1].get("role") == "user":
             completed_end = turn_ranges(state.history)[-1][0]
@@ -509,11 +526,18 @@ class QwenHistoryRuntime:
                 worker.exception()
             raise
 
-    def _decode_visual_batch(self, work: VisualWork) -> tuple[EncodedVisualImage, ...]:
+    def _decode_visual_batch(self, work: VisualWork) -> tuple[EncodedVisualImage | None, ...]:
         images = []
         encoded_bytes = pixel_bytes = 0
         for item in work.inputs[work.start : work.end]:
-            image = decode_image(item.url)
+            try:
+                image = decode_image(item.url)
+            except (ValueError, OSError, SyntaxError, Image.DecompressionBombError):
+                # An admitted image can have valid magic bytes but a corrupt
+                # body. Record only source failure; resource/programming errors
+                # must still fail the request rather than silently lose evidence.
+                images.append(None)
+                continue
             encoded = EncodedVisualImage.from_image(image)
             encoded_bytes += len(encoded.data)
             pixel_bytes += encoded.width * encoded.height * 3
@@ -561,11 +585,20 @@ class QwenHistoryRuntime:
             images = await self._joined_worker(self._decode_visual_batch, work)
             if not images or not visual.matches(work):
                 return None
-            visual.memory.check_capacity(images)
+            visual.memory.check_capacity([image for image in images if image is not None])
             for index, image in enumerate(images, work.start):
-                visual.memory.append(source_id=str(index), image=image, token_count=0)
+                if image is None:
+                    visual.omitted.add(index)
+                    state.counts["visual_omissions"] += 1
+                    logger.warning(
+                        "Skipping undecodable Qwen visual history source_id=%d", work.inputs[index].source.source_id
+                    )
+                else:
+                    visual.memory.append(source_id=str(index), image=image, token_count=0)
             visual.admitted += len(images)
             state.media_revision += 1
+            if not visual.memory.pending:
+                return None  # The next wake can select later images or dialogue.
             work = VisualWork(
                 visual.memory.generation,
                 visual.inputs[: visual.admitted],
@@ -596,7 +629,7 @@ class QwenHistoryRuntime:
                 detokenize=True,
             ),
             history_length=0,
-            history_digest="",
+            history_digest="",  # Qwen validates public source refs in model_source, not the base text digest.
             model_source=work,
             timeout_s=300.0,
             retry_delays_s=(1.0, 5.0, 30.0),
@@ -714,7 +747,7 @@ class QwenHistoryRuntime:
                             detokenize=True,
                         ),
                         history_length=candidate.end,
-                        history_digest="",
+                        history_digest="",  # Qwen overrides the base digest check with public source refs.
                         model_source=candidate,
                         retry_delays_s=(1.0, 3.0),
                     )
@@ -754,11 +787,11 @@ class QwenHistoryRuntime:
             state.counts["rejected_summaries"] += 1
             return False
         memory = (memory or "").strip()
-        if not memory or len(self.processor.tokenizer(text=[memory])["input_ids"][0]) > self.limits.summary_tokens:
+        tokens = len(self.processor.tokenizer(text=[memory])["input_ids"][0]) if memory else 0
+        if not memory or tokens > self.limits.summary_tokens:
             state.counts["rejected_summaries"] += 1
             return False
         if isinstance(work, VisualWork):
-            tokens = len(self.processor.tokenizer(text=[memory])["input_ids"][0])
             applied = state.visual.apply(work, text=memory, token_count=tokens)
             if applied:
                 state.media_revision += 1

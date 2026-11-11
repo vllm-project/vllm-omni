@@ -489,7 +489,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         )
 
     def create_session_state(self):
-        return QwenDuplexSessionState()
+        return QwenDuplexSessionState(history_policy_state=self._history_runtime.create_state())
 
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):

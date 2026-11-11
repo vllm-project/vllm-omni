@@ -141,9 +141,12 @@ The summary lifecycle is:
 Replacing summaries flattens their source dependencies, so obsolete summary
 nodes do not accumulate into a parent chain. Qwen rewinds its dialogue selection
 progress after invalidation; an invalidated visual batch resets its visual plan.
-Evicting a long-term visual summary also removes its ledger node. L1 nodes remain
-independent. A missing audio source records an omission and does not block later
-work; the omitted source is not claimed as summary evidence. Media eligibility
+Evicting a long-term visual summary also removes its ledger node. Visual writeback
+first stages batch/cursor changes using copies of the small metadata lists, sharing
+immutable encoded payloads. Only successful ledger publication adopts that state;
+either validation failure leaves the previous visual store and ledger intact.
+L1 nodes remain independent. A missing audio source records an omission and does
+not block later work; the omitted source is not claimed as summary evidence. Media eligibility
 remains independent of the recent text window.
 
 External policies inherit `QwenHistoryPolicy` and supply four methods:
@@ -223,12 +226,23 @@ capacity. Five intermediate summaries (`visual_mid_group`) trigger a long-term
 merge; at most 15 long-term summaries (`visual_max_long`) are retained. Each
 visual output is limited by `summary_tokens`, default 512. Oldest long-term
 summaries are retired beyond this bound. Source message positions label visual
-evidence; they are not video timestamps.
+evidence; they are not video timestamps. Qwen installs visual limits when the
+Session model state is constructed; planning does not rewrite live limits.
+
+An admitted JPEG/PNG can have a valid header but an undecodable body. For completed
+history, the preparation worker identifies that source as unavailable. After
+rechecking its identity on the owner loop, Qwen records a visual omission, advances
+past it and continues with valid images or dialogue. The failed image is not
+included in a visual summary's source dependencies. Resource/programming errors
+still fail the request. Original Session records remain intact, and an undecodable
+current input still fails foreground preparation rather than being silently omitted.
 
 Visual summaries are separate from dialogue memory. Source images remain
 available until a valid visual result commits; dialogue compression waits for
-its visual sources to be summarized. Foreground requests include visual memories
-and uncompressed images. If current input plus memories exceeds capacity, the
+its visual sources to be summarized or explicitly marked unavailable. Foreground requests include visual memories
+and uncompressed images. Consumed originals use a neutral “original image omitted”
+marker, which remains accurate if visual memory is retired or excluded from this
+request. If current input plus memories exceeds capacity, the
 runtime removes dialogue memory and then oldest visual memories before failing
 the current request. It subsequently adds older whole turns while they fit.
 Image edits or deletions revoke derived visual memory and stale results. Worker

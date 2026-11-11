@@ -15,7 +15,12 @@ import pybase64
 from PIL import Image
 from vllm.multimodal.image import open_image
 
-from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
+from vllm_omni.engine.duplex.session.context_ledger import (
+    DuplexContextLedger,
+    DuplexContextNodeRejectedError,
+    DuplexSourceRef,
+    source_refs,
+)
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 from vllm_omni.engine.duplex.visual_memory import VisualMemory, VisualMemorySource, VisualSummary
 
@@ -55,7 +60,8 @@ class QwenVisualHistory:
     inputs: tuple[VisualInput, ...] = ()
     admitted: int = 0
     covered: int = 0
-    # Shared VisualMemory keeps frame/batch metadata. Published text is read
+    omitted: set[int] = field(default_factory=set)
+    # This Qwen instance uses VisualMemory for frame/batch metadata. Text is read
     # exclusively from these Session ledger nodes, keyed by last frame ID.
     nodes: dict[int, int] = field(default_factory=dict)
     snapshot: DuplexHistorySnapshot | None = None
@@ -76,12 +82,19 @@ class QwenVisualHistory:
         if inputs[: len(self.inputs)] != self.inputs or any(not ledger.valid(node) for node in self.nodes.values()):
             ledger.remove(*self.nodes.values())
             self.nodes.clear()
+            self.omitted.clear()
             self.memory.clear()
             self.admitted = self.covered = 0
         self.inputs = inputs
 
-    def covered_image(self, message_index: int, part_index: int) -> bool:
+    def omitted_image(self, message_index: int, part_index: int) -> bool:
         return any(
+            self.inputs[index].message_index == message_index and self.inputs[index].part_index == part_index
+            for index in self.omitted
+        )
+
+    def covered_image(self, message_index: int, part_index: int) -> bool:
+        return not self.omitted_image(message_index, part_index) and any(
             item.message_index == message_index and item.part_index == part_index
             for item in self.inputs[: self.covered]
         )
@@ -118,7 +131,7 @@ class QwenVisualHistory:
         )
 
     def resolved(self, items: Sequence[VisualSummary]) -> tuple[VisualSummary, ...]:
-        """Detach ledger text for one worker; the shared store holds metadata."""
+        """Detach ledger text for one worker; Qwen's store holds metadata."""
         assert self.ledger is not None
         result = []
         for item in items:
@@ -152,13 +165,25 @@ class QwenVisualHistory:
             covered = int(frames[-1].source_id) + 1
         else:
             replaces = tuple(self.nodes[item.last_id] for item in self.memory.mid_term[:count])
-        # No yield between validation, shared batch advancement and publication.
-        # The owner refreshed the ledger and reconciled sources before apply.
-        if not self.memory.apply(work.source, text=text, token_count=token_count):
-            return False
-        node = self.ledger.replace_summary(
-            self.snapshot, sources=sources, replaces=replaces, message={"role": "system", "content": text}
+        # Stage only list/cursor changes; immutable frames keep the same encoded
+        # payloads. Either owner's validation can reject without retiring evidence.
+        candidate = replace(
+            self.memory,
+            pending=list(self.memory.pending),
+            mid_term=list(self.memory.mid_term),
+            long_term=list(self.memory.long_term),
         )
+        if not candidate.apply(work.source, text=text, token_count=token_count):
+            return False
+        try:
+            node = self.ledger.replace_summary(
+                self.snapshot, sources=sources, replaces=replaces, message={"role": "system", "content": text}
+            )
+        except DuplexContextNodeRejectedError:
+            return False
+        # No yield between successful ledger publication and adopting the staged
+        # visual state. The original store remains intact on either rejection.
+        self.memory = candidate
         target = self.memory.mid_term if work.source.kind == "frames" else self.memory.long_term
         published = target[-1]
         target[-1] = replace(published, text="")

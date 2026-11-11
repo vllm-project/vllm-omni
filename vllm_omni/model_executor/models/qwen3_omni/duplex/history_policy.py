@@ -14,10 +14,11 @@ import math
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+from vllm_omni.engine.duplex.visual_memory import VisualMemory
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import QwenVisualHistory, VisualWork
 
 Message = Mapping[str, object]
@@ -192,7 +193,22 @@ class QwenHistoryState:
     policy_cache_key: tuple[object, int, int, int] | None = None
     cached_work: HistoryWork | VisualWork | None = None
     partial: HistoryFold | None = None
-    visual: QwenVisualHistory = field(default_factory=QwenVisualHistory)
+    limits: InitVar[HistoryLimits] = HistoryLimits()
+    visual: QwenVisualHistory = field(init=False)
+
+    def __post_init__(self, limits: HistoryLimits) -> None:
+        self.visual = QwenVisualHistory(
+            memory=VisualMemory(
+                chunk_frames=limits.visual_chunk_images,
+                mid_group=limits.visual_mid_group,
+                max_long=limits.visual_max_long,
+                max_pending=limits.max_visual_items,
+                max_encoded_bytes=limits.max_visual_bytes,
+                max_pixel_bytes=limits.max_visual_pixel_bytes,
+                mid_max_tokens=limits.summary_tokens,
+                long_max_tokens=limits.summary_tokens,
+            )
+        )
 
     @property
     def summary(self) -> str:
