@@ -24,10 +24,10 @@ report times relative to the session's open time.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
-from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY
+from vllm_omni.core.sched.duplex_stage_work import buffer_with_perf_chunk
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_TURNS = 256
@@ -354,13 +354,10 @@ def _chunk_document(chunk: ChunkPerfRecord, origin: int, *, final: bool) -> dict
 def with_perf_chunk(prompt: dict[str, object], chunk: tuple[int, int]) -> dict[str, object]:
     """Return ``prompt`` with ``duplex.perf_chunk`` set, so stage schedulers time its steps.
 
-    Prompts without a duplex envelope are returned unchanged; their chunks get no spans.
+    A prompt without a duplex envelope gets a minimal one (see
+    ``buffer_with_perf_chunk``); a buffer of another type is left unchanged.
     """
-    buffer = prompt.get("model_intermediate_buffer")
-    duplex = buffer.get("duplex") if isinstance(buffer, Mapping) else None
-    if not isinstance(buffer, Mapping) or not isinstance(duplex, Mapping):
+    buffer = buffer_with_perf_chunk(prompt.get("model_intermediate_buffer"), chunk)
+    if buffer is None:
         return prompt
-    return {
-        **prompt,
-        "model_intermediate_buffer": {**buffer, "duplex": {**duplex, PERF_CHUNK_KEY: [int(chunk[0]), int(chunk[1])]}},
-    }
+    return {**prompt, "model_intermediate_buffer": buffer}
