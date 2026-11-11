@@ -3,8 +3,9 @@
 """Consumer isolation and malformed actual-measurement contracts, without model substitutes."""
 
 import copy
-import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,8 +13,7 @@ import pytest
 from benchmarks.lingbot_world.precision import save_tensor_sample
 from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
 from tests.benchmarks.test_lingbot_world_regression import document
-from tests.dfx.lingbot_world import checks, prepare, quality, runner
-from vllm_omni.benchmarks.realtime_video.metrics import measured_metrics
+from tests.e2e.accuracy.lingbot_world import checks, quality, runner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -34,9 +34,6 @@ def measurements(tmp_path, monkeypatch):
         "warmup_chunks": 6,
         "warmup_num_chunks": 8,
         "min_steady_samples": 33,
-        "max_reference_cv": 0.03,
-        "performance_regression_fraction": 0.05,
-        "transient_noise_sigma": 3,
         "precision_atol": 0,
         "precision_rtol": 0,
         "reference_revision": "a" * 40,
@@ -66,6 +63,8 @@ def measurements(tmp_path, monkeypatch):
                 "packages": {"vllm": "0.33.0", "torch": "2.14.0"},
             },
             "profile": read_json(profile),
+            "capture_recipe": dict(runner.CAPTURE_RECIPE),
+            "model_assets_sha256": sha256(runner.ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json"),
             "deploy_sha256": sha256(deploy),
             "engine_environment": runner.ENGINE_ENVIRONMENT,
         },
@@ -104,7 +103,7 @@ def fake_native_workers(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(quality, "verify_environment", lambda *args: {})
     monkeypatch.setattr(quality, "git_revision", lambda *args: "e" * 40)
-    monkeypatch.setattr(quality.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(quality.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=""))
     monkeypatch.setenv("LINGBOT_EVALUATOR_ROOT", str(tmp_path))
     monkeypatch.setenv("LINGBOT_EVALUATOR_PYTHON", "/unused/native-worker")
     monkeypatch.setattr(quality, "verify_video_coverage", lambda *args, **kwargs: {"decoded_frames": 477})
@@ -148,161 +147,172 @@ def fake_pixels(monkeypatch):
     monkeypatch.setattr(checks, "compare_video_pair", compare)
 
 
-def test_wbench_failure_does_not_block_other_real_consumer_checks(measurements, monkeypatch, tmp_path):
+def test_wbench_failure_does_not_block_other_accuracy_tests(measurements, monkeypatch, tmp_path):
     settings, data = measurements
     fake_native_workers(monkeypatch, tmp_path)
     fake_pixels(monkeypatch)
     assert not quality.evaluate_quality(settings, data, "wbench", monkeypatch)["passed"]
     assert quality.evaluate_quality(settings, data, "vbench", monkeypatch)["passed"]
     assert checks.numeric_report(settings, data)["passed"]
-    assert checks.performance_report(settings, data)["passed"]
-    assert all(
-        (settings["output"] / f"{name}.json").is_file() for name in ("wbench", "vbench", "precision", "performance")
-    )
+    assert all((settings["output"] / f"{name}.json").is_file() for name in ("wbench", "vbench", "precision"))
 
 
-def test_partial_aggregate_keeps_authenticated_inputs_for_independent_consumers(measurements, monkeypatch, tmp_path):
-    settings, (raw_root, manifest) = measurements
-    pairs = tmp_path / "pairs"
-    for repeat in range(3):
-        part = copy.deepcopy(manifest)
-        part["repeat"] = repeat
-        part["artifacts"] = {k: v for k, v in manifest["artifacts"].items() if k.split("/")[1] == str(repeat)}
-        if repeat == 0:
-            part["complete"] = False
-            part["errors"] = ["precision capture failed"]
-            del part["artifacts"]["candidate/0/precision.npz"]
-        destination = pairs / f"pair-{repeat}"
-        for name in part["artifacts"]:
-            target = destination / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(raw_root / name, target)
-        write_json(destination / "measurement.json", part)
-    aggregate = tmp_path / "aggregate"
-    result = runner.aggregate_measurements({**settings, "generation": pairs, "output": aggregate})
-    assert not result["complete"] and result["errors"]
-    assert any(row.get("producer_error") == "precision capture failed" for row in result["errors"])
-    assert (aggregate / "generation.json").is_file()
-    settings = {**settings, "generation": aggregate}
+def test_partial_producer_does_not_hide_complete_semantic_inputs(measurements, monkeypatch, tmp_path):
+    settings, (root, manifest) = measurements
+    manifest["complete"] = False
+    manifest["errors"] = ["precision capture failed"]
+    del manifest["artifacts"]["candidate/0/precision.npz"]
+    write_json(root / "generation.json", manifest)
     data = runner.measurement_data(settings)
     fake_native_workers(monkeypatch, tmp_path)
-    fake_pixels(monkeypatch)
-    assert checks.performance_report(settings, data)["passed"]
-    assert quality.evaluate_quality(settings, data, "vbench", monkeypatch)["passed"]
     assert not checks.numeric_report(settings, data)["passed"]
+    assert quality.evaluate_quality(settings, data, "vbench", monkeypatch)["passed"]
+    assert not quality.evaluate_quality(settings, data, "wbench", monkeypatch)["passed"]
 
 
-@pytest.mark.parametrize("change", ["missing", "duplicate", "warmup", "nonfinite", "measured_failed", "warmup_failed"])
-def test_performance_consumer_rejects_its_incomplete_population(measurements, change):
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "changed_bytes",
+        "wrong_source",
+        "wrong_profile",
+        "wrong_deploy",
+        "old_recipe",
+        "wrong_hardware",
+        "wrong_assets",
+    ],
+)
+def test_accuracy_rejects_unauthenticated_or_wrong_inputs(measurements, change):
     settings, (root, manifest) = measurements
-    name = "candidate/1/scene/benchmark.json"
+    name = "candidate/0/precision.npz"
     if change == "missing":
         del manifest["artifacts"][name]
+    elif change == "changed_bytes":
+        (root / name).write_bytes(b"changed input")
+    elif change == "wrong_source":
+        manifest["candidate_revision"] = "d" * 40
+    elif change == "wrong_profile":
+        manifest["contract"]["profile"]["num_chunks"] = 160
+    elif change == "wrong_deploy":
+        manifest["contract"]["deploy_sha256"] = "0" * 64
+    elif change == "old_recipe":
+        manifest["contract"]["capture_recipe"]["sessions_per_case"] = 7
+    elif change == "wrong_hardware":
+        manifest["contract"]["hardware"]["platform"] = "npu"
     else:
-        raw = read_json(root / name)
-        if change == "duplicate":
-            raw["sessions"][0]["request_id"] = "candidate-0"
-        elif change == "warmup":
-            raw["warmups"] = []
-        elif change == "measured_failed":
-            raw["sessions"][0]["success"] = False
-        elif change == "warmup_failed":
-            raw["warmups"][0]["success"] = False
-        else:
-            raw["sessions"][0]["chunks"][7]["arrival_s"] = "NaN"
-        write_json(root / name, raw)
-        manifest["artifacts"][name] = sha256(root / name)
-    assert not checks.performance_report(settings, (root, manifest))["passed"]
+        manifest["contract"]["model_assets_sha256"] = "0" * 64
+    write_json(root / "generation.json", manifest)
+    if change in ("missing", "changed_bytes"):
+        assert not checks.numeric_report(settings, runner.measurement_data(settings))["passed"]
+    else:
+        with pytest.raises(RegressionError, match="contract mismatch"):
+            runner.measurement_data(settings)
 
 
-def test_performance_uses_complete_timing_despite_unrelated_media_finalization_failure(measurements):
+def test_npu_results_keep_generation_identity_separate_from_h100_scorer(measurements, monkeypatch):
+    from tests.e2e.accuracy import helpers
+
     settings, (root, manifest) = measurements
-    name = "candidate/1/scene/benchmark.json"
-    raw = read_json(root / name)
-    raw["passed"] = False
-    raw["errors"] = ["media finalization failed"]
-    raw["sessions"][0]["success"] = True
-    raw["warmups"][0]["success"] = True
-    write_json(root / name, raw)
-    manifest["artifacts"][name] = sha256(root / name)
-    assert checks.performance_report(settings, (root, manifest))["passed"]
+    settings.update(platform="npu", hardware="A2", model_revision="59cccf49f2d2dd27418ae7a04b82b10868d455c2")
+    manifest["contract"]["hardware"].update(platform="npu", devices=["Ascend 910B"] * 4)
+    manifest["contract"]["profile"]["platform"] = "npu"
+    monkeypatch.setattr(helpers, "_accuracy_hardware_label", lambda: "H100")
+    path = checks.record_accuracy_result(settings, (root, manifest), "vbench", {"passed": False, "cases": {}})
+    result = read_json(path)
+    assert result["Hardware"] == "A2"
+    assert result["generation_platform"] == "npu"
+    assert result["generation_hardware"]["devices"] == ["Ascend 910B"] * 4
+    assert result["evaluator_hardware"] == "H100"
+    assert result["candidate_revision"] == "c" * 40 and result["reference_revision"] == "a" * 40
+    assert result["workload"]["platform"] == "npu" and not result["passed"]
+    assert set(result["baseline"]) == {"A2"}
 
 
-def test_valid_timing_and_npu_device_parser_execute_actual_helpers(measurements):
-    settings, (root, _) = measurements
-    raw = read_json(root / "candidate/0/scene/benchmark.json")
-    assert measured_metrics(raw, settings)["steady_samples"] == 33
-    assert prepare.select_npu_devices(8, "0,1,2,3,4,5,6,7", dies=4, reserved_cards=8) == "0,1,2,3"
-    with pytest.raises(RegressionError):
-        prepare.select_npu_devices(8, "0,0,2,3,4,5,6,7", dies=4, reserved_cards=8)
-
-
-@pytest.mark.parametrize("change", ["valid", "ack", "growth", "samples"])
-def test_stability_uses_observed_camera_and_memory_counters(tmp_path, monkeypatch, change):
-    from contextlib import contextmanager
-    from types import SimpleNamespace
-
-    from vllm_omni import platforms
-    from vllm_omni.benchmarks.realtime_video.client import SessionResult
-    from vllm_omni.benchmarks.realtime_video.workload import ChunkRecord
-
-    current = {"chunk": 0}
-
-    @contextmanager
-    def device(index):
-        yield
-
-    def memory():
-        used = 2**30 + (current["chunk"] * 2**20 if change == "growth" else 0)
-        return 64 * 2**30 - used, 64 * 2**30
-
-    monkeypatch.setattr(platforms, "current_omni_platform", SimpleNamespace(device=device, get_device_memory=memory))
-
-    async def session(*args, on_chunk, **kwargs):
-        records = [ChunkRecord(i, i + 1.0, 1.0, 1024, 9 if i == 0 else 12) for i in range(600)]
-        for row in records:
-            current["chunk"] = row.index
-            if change != "samples" or row.index == 0:
-                on_chunk(row)
-        events = [] if change == "ack" else [{"active_event_ids": ["camera-chunk-2"]}]
-        return SessionResult(
-            request_id="stability-session",
-            records=records,
-            media=b"",
-            ttfc_s=None,
-            video_start_s=None,
-            wall_s=600.0,
-            done_event={},
-            events=events,
-        )
-
-    monkeypatch.setattr(runner, "run_session", session)
-    settings = {
-        "num_chunks": 600,
-        "warmup_chunks": 6,
-        "dies": 2,
-        "height": 480,
-        "width": 832,
-        "mux_fps": 16,
-        "first_chunk_timeout_s": 900,
-        "chunk_timeout_s": 120,
-        "memory_growth_budget_bytes": 256 * 2**20,
-        "cases": [{"prompt": "scene", "seed": 42}],
-    }
-    server = SimpleNamespace(host="localhost", port=8000, model="fixture")
-    destination = tmp_path / "session.json"
-    (tmp_path / "image.jpg").write_bytes(b"first-frame fixture")
-    if change == "valid":
-        report = runner.stability_session(server, settings, tmp_path / "image.jpg", destination)
-        assert len(report["memory"]) >= 2 and report["events"] == 1
-        assert len(read_json(destination)["chunks"]) == 600
+@pytest.mark.parametrize("change", ["tracked_code", "untracked_code", "agent_metadata"])
+def test_evaluator_rejects_tracked_and_untracked_code_except_agent_metadata(tmp_path, change):
+    repository = tmp_path / "evaluator"
+    repository.mkdir()
+    (repository / "scorer.py").write_text("score = 1\n")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "scorer.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=CI fixture",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "-qm",
+            "Pinned scorer",
+        ],
+        check=True,
+    )
+    revision = runner.git_revision(repository)
+    quality.verify_evaluator_source(repository, revision)
+    if change == "tracked_code":
+        (repository / "scorer.py").write_text("score = 0\n")
+    elif change == "untracked_code":
+        (repository / "new_scorer.py").write_text("score = 0\n")
     else:
-        with pytest.raises(RegressionError):
-            runner.stability_session(server, settings, tmp_path / "image.jpg", destination)
-        assert destination.is_file()
+        (repository / ".claude").mkdir()
+        (repository / ".claude" / "instructions.md").write_text("Agent metadata, not evaluator code.\n")
+    if change == "agent_metadata":
+        quality.verify_evaluator_source(repository, revision)
+    else:
+        with pytest.raises(RegressionError, match="tracked or untracked"):
+            quality.verify_evaluator_source(repository, revision)
 
 
-def test_npu_three_pairs_use_shared_serving_bridge_and_preserve_source_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provided", [False, True])
+@pytest.mark.parametrize("phase", ["success", "checkout", "capture"])
+def test_accuracy_cleans_only_owned_temporary_reference_on_success_and_failure(tmp_path, monkeypatch, provided, phase):
+    from tests.e2e.accuracy.lingbot_world import prepare
+
+    reference = tmp_path / "caller-reference" if provided else None
+    if reference is not None:
+        reference.mkdir()
+        (reference / "keep.txt").write_text("caller-owned")
+    settings = runner.load_settings(
+        runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/cuda.json",
+        tmp_path / "accuracy",
+        reference_root=reference,
+    )
+    seen = []
+    monkeypatch.setattr(prepare, "prepare_cuda_allocation", lambda *args: "0,1")
+    monkeypatch.setattr(prepare, "verify_inference_runtime", lambda platform: {"packages": {"vllm": "0.33.0"}})
+    monkeypatch.setattr(prepare, "verify_source_imports", lambda source: None)
+    monkeypatch.setenv("LINGBOT_MODEL_PATH", str(tmp_path / "model"))
+
+    def checkout(path, *args, **kwargs):
+        seen.append(path)
+        assert path.is_dir()
+        (path / "source.txt").write_text("reference fixture")
+        if phase == "checkout":
+            raise RuntimeError("checkout failed")
+
+    def collect(actual):
+        assert actual["reference_root"] == seen[0] and seen[0].is_dir()
+        if phase == "capture":
+            raise RuntimeError("capture failed")
+        return {"complete": False, "errors": ["independent precision capture failed"]}
+
+    monkeypatch.setattr(prepare, "checkout", checkout)
+    monkeypatch.setattr(runner, "collect_measurements", collect)
+    if phase == "success":
+        assert prepare.prepare_capture(settings)["complete"] is False
+    else:
+        with pytest.raises(RuntimeError, match=f"{phase} failed"):
+            prepare.prepare_capture(settings)
+    assert seen[0].exists() is provided
+    if provided:
+        assert (reference / "keep.txt").read_text() == "caller-owned"
+
+
+def test_npu_accuracy_uses_three_fresh_starts_and_shared_serving_bridge(tmp_path, monkeypatch):
     """Only server/model boundaries are stubbed; parse the real serving options."""
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -311,8 +321,8 @@ def test_npu_three_pairs_use_shared_serving_bridge_and_preserve_source_environme
     from vllm_omni.benchmarks import serve
     from vllm_omni.benchmarks.realtime_video.serving import get_realtime_video_samples
 
-    settings = read_json(runner.ROOT / "tests/dfx/lingbot_world/configs/npu_nightly.json")
-    settings["profile_path"] = runner.ROOT / "tests/dfx/lingbot_world/configs/npu_nightly.json"
+    settings = read_json(runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/npu.json")
+    settings["profile_path"] = runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/npu.json"
     reference = tmp_path / "reference"
     model = tmp_path / "model"
     image = tmp_path / "frame.jpg"
@@ -345,18 +355,18 @@ def test_npu_three_pairs_use_shared_serving_bridge_and_preserve_source_environme
         calls.append(args)
         assert args.realtime_video_camera_pattern == settings["cases"][(len(calls) - 1) % 3]["camera_pattern"]
         assert args.backend == args.dataset_name == "realtime-video"
-        assert args.num_prompts == 7 and args.num_warmups == 1
+        assert args.num_prompts == 1 and args.num_warmups == 1
         assert args.realtime_video_warmup_num_chunks == 8 and args.realtime_video_warmup_chunks == 6
         assert args.realtime_video_target_fps == 12 and args.skip_tokenizer_init
         assert args.ready_check_timeout_sec == 0 and args.max_concurrency == 1
         samples = get_realtime_video_samples(args)
-        assert len(samples) == 7 and all(sample.workload.num_chunks == 40 for sample in samples)
+        assert len(samples) == 1 and all(sample.workload.num_chunks == 40 for sample in samples)
         raw = {**document(), "git_revision": "c" * 40, "passed": True}
         template = raw["sessions"][0]
-        raw["config"].update(sessions=7, warmup_sessions=1, warmup_num_chunks=8)
+        raw["config"].update(sessions=1, warmup_sessions=1, warmup_num_chunks=8)
         raw["sessions"] = [
             {**copy.deepcopy(template), "session_index": index, "request_id": f"call{len(calls)}-session{index}"}
-            for index in range(7)
+            for index in range(1)
         ]
         raw["warmups"] = [
             {
@@ -365,7 +375,6 @@ def test_npu_three_pairs_use_shared_serving_bridge_and_preserve_source_environme
                 "chunks": copy.deepcopy(template["chunks"][:8]),
             }
         ]
-        assert measured_metrics(raw, settings)["steady_samples"] == 231
         # The endpoint is stubbed here; real shared-lifecycle WS coverage lives
         # in test_realtime_video_serve.py and test_lingbot_world_realtime.py.
         result = {"realtime_video": raw}
@@ -374,11 +383,11 @@ def test_npu_three_pairs_use_shared_serving_bridge_and_preserve_source_environme
         return result
 
     monkeypatch.setattr(serve, "main", serving)
+    output = tmp_path / "accuracy"
+    result = runner.collect_measurements({**settings, "output": output})
+    assert result["complete"] and not result["errors"]
+    assert runner.generation_paths(settings) <= result["artifacts"].keys()
     for repeat in range(3):
-        output = tmp_path / f"pair-{repeat}"
-        result = runner.collect_measurements({**settings, "output": output}, measurement_repeat=repeat)
-        assert result["complete"] and not result["errors"]
-        assert runner.generation_paths(settings, [repeat]) <= result["artifacts"].keys()
         for role in ("reference", "candidate"):
             for case in settings["cases"]:
                 case_dir = output / role / str(repeat) / case["id"]

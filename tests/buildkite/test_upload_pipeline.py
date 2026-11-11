@@ -45,18 +45,6 @@ BOOTSTRAP_STEPS_TEMPLATE = """steps:
 """
 
 
-def test_exclusive_h100_reservation_keeps_four_card_inference_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MIRROR_HW", raising=False)
-    expanded = _expand_mirror_hardwares({"label": "LingBot performance", "mirror_hardwares": "h100_8"})
-    assert expanded is not None
-    assert "infer_from_marks" not in expanded
-    container = expanded["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
-    assert container["resources"]["limits"]["nvidia.com/gpu"] == 8
-    assert expanded["agents"]["queue"] == "mithril-h100-pool"
-    monkeypatch.setenv("MIRROR_HW", "b200")
-    assert _expand_mirror_hardwares({"mirror_hardwares": "h100_8"}) is None
-
-
 def _render(changed_files: list[str]) -> str:
     decision = resolve_ci_decision(changed_files)
     return _render_bootstrap_pipeline(
@@ -129,40 +117,6 @@ def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "upload-ready-pipeline" not in by_key
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
-
-
-@pytest.mark.parametrize(
-    "changed_files", [["tests/dfx/lingbot_world/runner.py"], [".buildkite/npu/test-npu-weekly.yml"]]
-)
-def test_npu_weekly_is_admitted_for_schedule_and_pr_label(changed_files: list[str]) -> None:
-    path = Path(".buildkite/npu/bootstrap-upload-steps.yml")
-    rendered = _render_bootstrap_pipeline(
-        _load_bootstrap_steps(path), decision=resolve_ci_decision(changed_files), path=path
-    )
-    by_key = {step["key"]: step for step in yaml.safe_load(rendered)["steps"]}
-    condition = by_key["upload-weekly-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in condition
-    assert 'labels includes "weekly-test"' in condition
-    assert "build.branch =~" in condition and "build.pull_request.id == null" in condition
-    assert "NON_CRITICAL" not in condition
-    command = by_key["upload-weekly-pipeline"]["commands"][0]
-    assert "source .buildkite/common/scripts/release_line_branch.sh" in command
-    assert '[ "${WEEKLY:-}" = "1" ] && is_release_line_push' in command
-    image_condition = by_key["image-build-a2"].get("if")
-    if image_condition is not None:
-        assert 'labels includes "weekly-test"' in image_condition
-
-
-def test_npu_docs_only_weekly_keeps_only_scheduled_admission() -> None:
-    path = Path(".buildkite/npu/bootstrap-upload-steps.yml")
-    rendered = _render_bootstrap_pipeline(
-        _load_bootstrap_steps(path), decision=resolve_ci_decision(["docs/foo.md"]), path=path
-    )
-    by_key = {step["key"]: step for step in yaml.safe_load(rendered)["steps"]}
-    assert 'build.env("WEEKLY") == "1"' in by_key["upload-weekly-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in by_key["image-build-a2"]["if"]
-    assert "weekly-test" not in rendered
-    assert "upload-ready-pipeline" not in by_key
 
 
 def test_nightly_label_if_is_only_nightly_test() -> None:
@@ -1216,174 +1170,88 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
 
 
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
 @pytest.mark.parametrize(
-    "platform,level", [("cuda", "nightly"), ("npu", "nightly"), ("cuda", "weekly"), ("npu", "weekly")]
-)
-@pytest.mark.parametrize(
-    "changed_path,selected",
+    "changed_path,roles",
     [
-        ("vllm_omni/benchmarks/realtime_video/client.py", True),
-        ("vllm_omni/benchmarks/serve.py", True),
-        ("vllm_omni/benchmarks/patch/patch.py", True),
-        ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", True),
-        ("vllm_omni/entrypoints/cli/benchmark/serve.py", True),
-        ("tests/benchmarks/test_realtime_video_serve.py", True),
-        ("tests/benchmarks/test_serve_cli.py", True),
-        ("vllm_omni/benchmarks/audio_continuity.py", False),
+        ("vllm_omni/benchmarks/realtime_video/client.py", {"performance", "accuracy"}),
+        ("vllm_omni/benchmarks/serve.py", {"performance", "accuracy"}),
+        ("vllm_omni/benchmarks/patch/patch.py", {"performance", "accuracy"}),
+        ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", {"performance", "accuracy"}),
+        ("tests/dfx/perf/tests/test_lingbot_world_realtime.json", {"performance"}),
+        ("tests/e2e/accuracy/lingbot_world/test_precision.py", {"accuracy"}),
+        ("requirements/lingbot-quality.txt", {"accuracy"}),
+        ("requirements/lingbot-quality.in", {"accuracy"}),
+        ("vllm_omni/benchmarks/audio_continuity.py", set()),
     ],
 )
-def test_lingbot_shared_benchmark_source_changes_select_regressions(
-    monkeypatch, platform, level, changed_path, selected
-):
+def test_lingbot_source_changes_select_existing_framework_jobs(monkeypatch, platform, changed_path, roles):
     monkeypatch.delenv("MIRROR_HW", raising=False)
-    path = Path(f".buildkite/{platform}/test-{'npu-' if platform == 'npu' else ''}{level}.yml")
-    # A known unrelated model match prevents the no-match fallback from
-    # disguising missing direct dependencies in the new packaged backend.
-    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
-    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files, pipeline_path=path)
+    path = Path(f".buildkite/{platform}/{'test-npu-nightly.yml' if platform == 'npu' else 'test-nightly.yml'}")
+    # A known unrelated match prevents the no-match fallback from hiding a missing dependency.
+    changed = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed, pipeline_path=path)
     keys = {step.get("key", "") for step in _iter_steps(rendered)}
-    selected_keys = {key for key in keys if key.startswith(f"lingbot-{platform}-{level}-")}
-    if level == "weekly":
-        roles = {"stability"}
-    else:
-        roles = {"generation", "precision", "performance", "wbench", "vbench"}
-        if platform == "npu":
-            roles.update({"ci-image", "data"})
-    expected_keys = {f"lingbot-{platform}-{level}-{role}" for role in roles}
-    assert selected_keys == (expected_keys if selected else set())
+    selected = {key for key in keys if key.startswith(f"lingbot-{platform}-")}
+    expected = {f"lingbot-{platform}-nightly-{role}" for role in roles}
+    if platform == "npu" and "accuracy" in roles:
+        expected.update({"lingbot-npu-accuracy-ci-image", "lingbot-npu-nightly-accuracy-data"})
+    assert selected == expected
 
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_lingbot_semantic_cases_have_independent_data_dependencies(monkeypatch, platform: str) -> None:
+def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypatch, platform):
     monkeypatch.delenv("MIRROR_HW", raising=False)
     path = Path(f".buildkite/{platform}/{'test-npu-nightly.yml' if platform == 'npu' else 'test-nightly.yml'}")
-    rendered = _render_test_pipeline(
-        yaml.safe_load(path.read_text()), ["tests/dfx/lingbot_world/runner.py"], pipeline_path=path
-    )
-    keyed = {step.get("key"): step for step in _iter_steps(rendered)}
-    data_key = f"lingbot-{platform}-nightly-{'data' if platform == 'npu' else 'generation'}"
-    outputs = set()
-    for role in ("precision", "performance", "wbench", "vbench"):
-        step = keyed[f"lingbot-{platform}-nightly-{role}"]
-        if platform == "npu":
-            assert step["depends_on"] == [{"step": data_key, "allow_failure": True}, "lingbot-npu-nightly-ci-image"]
-        else:
-            assert step["depends_on"] == [{"step": data_key, "allow_failure": True}]
-        command = next(command for command in step["commands"] if "run_ci.sh " in command).split()
-        assert command[1:3] == ["tests/dfx/lingbot_world/run_ci.sh", role]
-        assert command[-1] == f"lingbot-artifacts/{platform}-nightly"
-        outputs.add(command[-2])
-        assert step["artifact_paths"] == [command[-2] + "/**/*"]
-        if role in {"wbench", "vbench"}:
-            assert _gpu_limit(step) == 1
-            assert step["agents"]["queue"] == "mithril-h100-pool"
-    assert len(outputs) == 4
-    if platform == "npu":
-        pair = keyed["lingbot-npu-nightly-generation"]
-        assert pair["matrix"]["setup"]["repeat"] == ["0", "1", "2"]
-        assert pair["env"]["LINGBOT_MEASUREMENT_REPEAT"] == "{{matrix.repeat}}"
-        assert keyed[data_key]["depends_on"] == [
-            {"step": "lingbot-npu-nightly-generation", "allow_failure": True},
-            "lingbot-npu-nightly-ci-image",
-        ]
-
-
-@pytest.mark.parametrize("changed_files", [None, ["tests/dfx/lingbot_world/runner.py"]])
-@pytest.mark.parametrize(
-    "platform,level,count", [("cuda", "nightly", 5), ("npu", "nightly", 6), ("cuda", "weekly", 1), ("npu", "weekly", 1)]
-)
-def test_lingbot_resources_and_infrastructure_retry_survive_expansion(
-    monkeypatch, platform: str, level: str, count: int, changed_files: list[str] | None
-) -> None:
-    monkeypatch.delenv("MIRROR_HW", raising=False)
-    path = Path(f".buildkite/{platform}/test-{'npu-' if platform == 'npu' else ''}{level}.yml")
     source = yaml.safe_load(path.read_text())
-    rendered = _render_test_pipeline(source, changed_files, pipeline_path=path)
-    original = {step.get("key"): step for step in _iter_steps(source) if "key" in step}
-    jobs = [
-        step for step in _iter_steps(rendered) if any("run_ci.sh " in command for command in step.get("commands", []))
-    ]
-    assert len(jobs) == count
-    retry = _load_mirror_hardwares()["h100_8"]["retry"]
-    assert retry["manual"]["permit_on_passed"]
-    assert retry["automatic"] == [
-        {"exit_status": -1, "limit": 1},
-        {"exit_status": 128, "limit": 1},
-        {"signal_reason": "agent_stop", "limit": 1},
-        {"signal_reason": "agent_refused", "limit": 1},
-    ]
-    for step in jobs:
-        role = next(command for command in step["commands"] if "run_ci.sh " in command).split()[2]
-        if role in {"generate", "collect", "stability"}:
-            group, limit = f"{platform}-generation", 1
-        elif role in {"wbench", "vbench"}:
-            group, limit = "quality", 2
-        else:
-            group, limit = "l4-cpu", 1
-        assert step["concurrency_group"] == f"vllm-omni/lingbot-world/{group}"
-        assert step["concurrency"] == limit
-        assert step["concurrency_method"] == "eager" and step["priority"] == 0
-        assert step["retry"] == retry
-        assert "mirror_hardwares" not in step and "agents" in step
-        for field in ("matrix", "depends_on", "env", "timeout_in_minutes"):
-            assert step.get(field) == original[step["key"]].get(field)
-        assert not step.get("soft_fail") and not step.get("skip")
-        assert all("tee " not in command and "run-pytest-ci.sh" not in command for command in step["commands"])
-        if role == "generate" or platform == "cuda" and role == "stability":
-            assert _gpu_limit(step) == 8
-        if level == "weekly":
-            assert role == "stability" and "matrix" not in step
-            assert step["key"] == f"lingbot-{platform}-weekly-stability"
-
-
-@pytest.mark.parametrize("level", ["nightly", "weekly"])
-@pytest.mark.parametrize(
-    "is_pr,opt_in,labeled,scheduled,selected",
-    [
-        (True, False, True, False, False),
-        (True, True, True, False, True),
-        (True, True, False, False, False),
-        (True, False, False, False, False),
-        (True, False, False, True, False),
-        (True, True, False, True, True),
-        (False, False, False, True, True),
-        (False, False, False, False, False),
-    ],
-)
-def test_lingbot_npu_admission_requires_pr_opt_in_after_pipeline_expansion(
-    monkeypatch, level, is_pr, opt_in, labeled, scheduled, selected
-):
-    monkeypatch.delenv("MIRROR_HW", raising=False)
-    path = Path(f".buildkite/npu/test-npu-{level}.yml")
-    source = yaml.safe_load(path.read_text())
-    rendered = _render_test_pipeline(source, ["tests/dfx/lingbot_world/runner.py"], pipeline_path=path)
-    group = next(step for step in rendered["steps"] if step.get("group") == ":card_index_dividers: World Model Test")
-    condition = group["if"]
-    values = {
-        "build.pull_request.id == null": not is_pr,
-        'build.pull_request.labels includes "npu-test"': opt_in,
-        f'build.pull_request.labels includes "{level}-test"': labeled,
-        f'build.env("{level.upper()}") == "1"': scheduled,
+    rendered = _render_test_pipeline(source, None, pipeline_path=path)
+    jobs = {
+        step.get("key"): step
+        for step in _iter_steps(rendered)
+        if step.get("key", "").startswith(f"lingbot-{platform}-")
     }
-    for expression, value in values.items():
-        condition = condition.replace(expression, str(value))
-    parsed = ast.parse(condition.replace("&&", " and ").replace("||", " or "), mode="eval")
+    perf = jobs[f"lingbot-{platform}-nightly-performance"]
+    accuracy = jobs[f"lingbot-{platform}-nightly-accuracy"]
+    assert not perf.get("depends_on")
+    assert not perf.get("matrix")
+    command = " ".join(perf["commands"])
+    assert "tests/dfx/perf/scripts/run_benchmark.py" in command
+    assert "--test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json" in command
+    assert "run_ci.sh" not in command
+    assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
+    assert _gpu_limit(accuracy) == 2
+    assert accuracy["agents"]["queue"] == "mithril-h100-pool"
+    for name in ("precision", "wbench", "vbench"):
+        assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in " ".join(accuracy["commands"])
+    retry = _load_mirror_hardwares()["h100_2"]["retry"]
+    for job in jobs.values():
+        assert not job.get("matrix") and not job.get("soft_fail") and not job.get("skip")
+        assert "run_ci.sh" not in " ".join(job.get("commands", []))
+        if "plugins" in job:
+            assert job["retry"] == retry
+    if platform == "cuda":
+        assert len(jobs) == 2
+        assert _gpu_limit(perf) == 2
+        assert not accuracy.get("depends_on")
+    else:
+        assert len(jobs) == 4
+        assert perf["agents"] == {"queue": "ascend-a2b3", "resource_class": "npu-4"}
+        capture = jobs["lingbot-npu-nightly-accuracy-data"]
+        assert capture["agents"] == perf["agents"]
+        assert "prepare capture" in " ".join(capture["commands"])
+        assert accuracy["depends_on"] == [
+            {"step": "lingbot-npu-nightly-accuracy-data", "allow_failure": True},
+            "lingbot-npu-accuracy-ci-image",
+        ]
+        assert "--lingbot-generation=lingbot-artifacts/npu-accuracy" in " ".join(accuracy["commands"])
 
-    def boolean(node: ast.AST) -> bool:
-        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
-            return node.value
-        if isinstance(node, ast.BoolOp):
-            operands = [boolean(value) for value in node.values]
-            if isinstance(node.op, ast.And):
-                return all(operands)
-            if isinstance(node.op, ast.Or):
-                return any(operands)
-        raise AssertionError(f"Unsupported Buildkite condition: {ast.dump(node)}")
 
-    assert boolean(parsed.body) is selected
-
-
-def test_isolation_reservation_requires_an_explicit_preset(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lingbot_weekly_and_eight_device_reservations_are_absent(monkeypatch):
     monkeypatch.delenv("MIRROR_HW", raising=False)
-    with pytest.raises(ValueError, match="select it explicitly with mirror_hardwares"):
-        _expand_mirror_hardwares({"commands": ['pytest -sv tests/e2e -m "H100 and cards_8"']})
+    path = Path(".buildkite/cuda/test-weekly.yml")
+    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), None, pipeline_path=path)
+    assert not any(step.get("key", "").startswith("lingbot-") for step in _iter_steps(rendered))
+    assert not Path(".buildkite/npu/test-npu-weekly.yml").exists()
+    bootstrap = yaml.safe_load(Path(".buildkite/npu/bootstrap-upload-steps.yml").read_text())
+    assert not any(step.get("key") == "upload-weekly-pipeline" for step in bootstrap["steps"])
+    assert "h100_8" not in _load_mirror_hardwares()

@@ -65,7 +65,7 @@ Canonical layout (prefer these paths for new changes):
 | Platform | Bootstrap entry | Test job files | Upload mechanism | Job hardware in YAML |
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
-| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml`, `test-npu-weekly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
+| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml`, `test-amd-weekly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
@@ -97,7 +97,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
 
-    **Hardware in YAML:** omit `mirror_hardwares` to compose `{chip}_{n}` from pytest `-m` (SKU + `cards_n`). Several positive `cards_*` take the **max** n (`cards_2 and cards_3` → `{chip}_3`). `not cards_1` with no positive `cards_*` uses that chip's **highest inferable** preset in `ci_mirror_hardwares.yml` (L4 → `l4_4`, H100 → `h100_4`, B200 → `b200_4`). Set a **preset string** to force a pool (marks are ignored). Do **not** set `agents` / `plugins` on the same step as `mirror_hardwares`. `MIRROR_HW=b200` remaps inferred jobs whose `-m` includes `B200`, and omits CUDA `h100_*` / `l4_*` strings. Jobs whose `-m` does not match (unset: no H100/L4; set: no B200) are **skipped**.
+    **Hardware in YAML:** omit `mirror_hardwares` to compose `{chip}_{n}` from pytest `-m` (SKU + `cards_n`). Several positive `cards_*` take the **max** n (`cards_2 and cards_3` → `{chip}_3`). `not cards_1` with no positive `cards_*` uses that chip's **highest existing** preset in `ci_mirror_hardwares.yml` (L4 → `l4_4`, H100 → `h100_4`, B200 → `b200_4`). Set a **preset string** to force a pool (marks are ignored). Do **not** set `agents` / `plugins` on the same step as `mirror_hardwares`. `MIRROR_HW=b200` remaps inferred jobs whose `-m` includes `B200`, and omits CUDA `h100_*` / `l4_*` strings. Jobs whose `-m` does not match (unset: no H100/L4; set: no B200) are **skipped**.
 
     ```yaml
     # inferred: H100+B200 + cards_2 → h100_2, or b200_2 when MIRROR_HW=b200
@@ -114,8 +114,6 @@ Canonical layout (prefer these paths for new changes):
     ```
 
     Inferred form: unset/`empty` `MIRROR_HW` matches `H100` or `L4` in `-m` (both present → H100); no match skips the step. `MIRROR_HW=b200` must appear in `-m` or the step is skipped. The uploader does **not** rewrite pytest `-m`; B200 collection comes from the YAML expression and from tests that declare `B200` in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`. A `mirror_hardwares` name that is not a key in `ci_mirror_hardwares.yml` **fails the upload**.
-
-    A preset with uploader-only `infer_from_marks: false` must be selected explicitly. `h100_8` reserves a full node for the four-device LingBot performance workload; ordinary inferred H100 jobs retain the four-device maximum. The uploader strips this metadata before upload.
 
     **Path filter in YAML:** `source_file_dependencies: <preset>` (string, or a list of preset names)—preset names in [`common/ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). Required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; see [Step filtering](#step-filtering).
 
@@ -142,11 +140,9 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images, then uploads child test pipelines.
 
-    **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4), `test-npu-weekly.yml` (L5).
+    **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
     **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
-
-    **L5 trigger:** `weekly-test`, or a scheduled release line (`main` or `release/vX.Y.Z`) with `WEEKLY=1`. NPU weekly does not use `NON_CRITICAL=1`; docs-only PR labels still honor `skip_all`.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -166,7 +162,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Adding a job**
 
-    1. Edit `test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4), or `test-npu-weekly.yml` (L5).
+    1. Edit `test-npu-ready.yml` (L2) or `test-npu-nightly.yml` (L4).
     2. Add a step with `mirror_hardwares` (add a new preset in `ci_mirror_hardwares.yml` first if needed).
     3. Set `commands` to your pytest file and markers. For L4, set `source_file_dependencies` to a job key from `ci_source_file_dependencies.yml` that aliases the model anchor and lists that pytest file.
     4. Dry-run:
@@ -259,53 +255,154 @@ Canonical layout (prefer these paths for new changes):
     2. Match `agents`, `env`, `timeout_in_minutes`, and `command`/`commands` with sibling steps.
     3. Keep `pipeline-intel.yml` listed in `L2_YAML_FILES` in `ci_conditions.py`.
 
-## Opt-in AMD model-executor CPU partition qualification
+## AMD CPU duration partitions and qualification
 
-The timing-based partitioner is experimental. Production READY/MERGE retain their
-three hash shards, current selectors, exclusion, blocking grades, and timeouts.
-No measured timing profile or production activation is included with this feature.
-TIME-01 artifacts are the prerequisite for evaluating a new split; shard-level
-averages alone do not identify which test modules should move.
+READY/MERGE configure five duration-weighted Model Executor shards using
+`.buildkite/amd/cpu-timings/model-executor-v1.json`. Selectors, exclusions, blocking
+grades and timeouts are unchanged. The checked-in profile contains all 9,145
+selected nodes from the successful six-way target READY trial in
+[build #15651](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15651), merge
+commit `79b424021514b082757f60fbacf2fe010cdadd7c`. The trial used the same
+four-thread limit as production, selected every live node exactly once, and had
+no test, collection, or artifact failures. Repacking those measured phase totals
+into five module-preserving shards estimates 152.91 seconds per shard **before**
+collection and job overhead. This is a planning estimate until the five-way
+candidate completes target CI; it is not a measured p95.
+The Model Executor jobs also set OMP/MKL/OpenBLAS/NumExpr to four threads, matching
+their CPU quota. In the source CI image on an AMD EPYC 9965 host, with a four-CPU
+quota and 16 GiB memory, the four reference cases below all passed at 1/2/4 threads.
+Three measured fresh-process runs after one warmup averaged 31.32s, 22.73s and
+19.38s respectively (ranges 30.31–32.67s, 22.30–23.15s and 19.30–19.44s).
+This is a thread-count comparison, not a measured full-build speedup.
+Software: PyTorch `2.13.0+rocm10.0.0`, vLLM `0.33.0+rocm100`, Python 3.12.15,
+pytest 9.1.1; image digest
+`sha256:921f117d536431ea91bd2fbf08a74821af5738fb909aa48d557dd0bc5a564e14`.
+
+### Diffusion CPU: five-shard rebalance and bounded threads
+
+The five regular Diffusion shards use `diffusion-v1.json`, with 11,609 node
+timings from all five successful instrumented artifacts in
+[build #15658](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15658), merge
+commit `fb25dd4336fb2098e5a4de1d3fc90cf1b72ad4f4`. The first bounded-thread
+trial selected every live node exactly once, with no failures, incomplete tests,
+collection errors or artifact errors. Its legacy profile had 204 unknown and
+116 stale nodes; the regular job walls ranged from 4m42s to 7m42s. Repacking
+the measured setup + call + teardown totals estimates 255.19 seconds per shard
+before collection/overhead, with zero unknown or stale nodes. Exact refreshed-
+profile CI remains the qualification gate. Keep five shards; trial six only if
+future measured p95 rises above 20 minutes and queue capacity allows it.
+
+Regular and Slow CPU jobs bound OMP/MKL/OpenBLAS/NumExpr to two threads per
+process, allowing two gloo ranks to fit the observed four-CPU quota. Four unchanged
+reference cases (Wan fused/exact decode, long LingBot metadata rollout, and real
+causal-VAE continuation) passed at 1/2/4 threads. In the same image and host
+configuration documented above, three measured runs after a warmup averaged
+46.30s, 46.34s and 47.14s respectively (ranges 44.58–48.50s, 45.64–46.99s and
+46.03–48.20s). These results do not establish a meaningful advantage of two over
+one thread; two is a quota-bounded trial setting, including for spawned ranks.
+
+No network shape, rollout length, tolerance or assertion is reduced. Slow CPU
+retains exactly its six reference cases, blocking grade, 40-minute timeout and
+exit-134 retry rule. Regular shards retain their marker expression, both ignored
+files, six deselections, 60-minute timeout and retry rule. Whole modules retain
+fixture locality. Both jobs now emit phase, selection, CPU pressure and cgroup
+memory current/peak/limit/events artifacts under `artifacts/amd-cpu-suites/`.
+JUnit lives in each fresh run directory as `pytest.xml`.
+
+The π0 remapping fixture constructs the real full model hierarchy on `meta`,
+then allocates only the original vision/embedding target parameters on CPU,
+preserving tied aliases. The three remapping tests retain their original tensor
+shapes, payloads and assertions. They do not execute the unused backbone; the
+separate checkpoint/inference parity coverage is unchanged. Their shared mutable
+targets remain order-independent because each test loads a distinct constant.
+This avoids initializing unrelated full-network weights without shrinking the
+property under test. Reproduce the fixture check with the same dependencies as
+the reference benchmark:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
+  python -m pytest -q tests/diffusion/models/pi0/test_pi0_units.py \
+  -k 'remap' --durations=10
+```
+
+In paired fresh containers on the reference host/image above, with four CPUs,
+two threads and a 32 GiB memory limit, one warmup plus three measured runs per
+variant passed all three original tests. Mean process wall time fell from
+61.62s (61.11–62.18s) to 31.62s (31.52–31.83s). Peak pytest process RSS was
+26.33 GiB before and 15.24 GiB after. This measures the fixture change only;
+it does not establish the full shard p95 or a target-agent memory limit.
+
+Reproduce the initial profile from the original artifact filenames:
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py --suite diffusion \
+  --junit downloaded/pytest-*-of-5.xml \
+  --source-build-url https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15582 \
+  --source-commit 438155621484248827a30256e679cb4c84f544fb \
+  --output diffusion-v2.json
+```
+
+The importer rejects missing/duplicate shards, failures, unresolved modules and
+overlapping node IDs. Zero-duration collection skips are not executable node IDs.
+Only use legacy JUnit produced with pytest's total-duration setting. For new
+profiles, use the instrumented artifact builder below and provide the five
+regular job directories separately from Slow CPU.
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/diffusion-thread-trial -- \
+  -q 'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-fused]' \
+  'tests/diffusion/ar_diffusion/test_kv_orchestration.py::test_rollout_keeps_metadata_bounded[2-False-lingbot-two-minutes]' \
+  'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]' \
+  'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+```
+
+The refreshed profile must pass exact-head target CI with the bounded thread
+setting. Compare the exact executed node union and skip outcomes, and retain the
+original numerical checks. Measure concurrent five-shard plus Slow CPU memory
+peaks, CPU throttling, queue latency, summed agent-minutes and paired READY/MERGE
+wall time. The planning target remains p95 below 18 minutes for every regular
+shard and Slow CPU. Revert the pipeline thread export and timing-profile option
+to roll back; do not move Slow CPU cases or weaken their assertions to meet the
+target.
 
 ### Prepare a shared profile
 
-Download the artifact directories from successful TIME-01 **Model Executor** jobs.
+Download the artifact directories from successful instrumented CPU jobs.
 Supply exactly one successful attempt of every shard from each source build:
 
 ```bash
 python .buildkite/amd/scripts/cpu_shard_plan.py \
   downloaded/build-1/shard-0 downloaded/build-1/shard-1 downloaded/build-1/shard-2 \
-  --output model-executor-timings.json
+  --suite model-executor --output model-executor-timings-v2.json
 ```
 
 The tool consumes `invocation.json`, `selection.json`, `summary.json`, and
 `events.jsonl`. Failed/incomplete runs, missing or duplicate shards, overlapping
 selected nodes, and incomplete phase reports are rejected. It sums setup, call,
 and teardown per node, then takes the median across supplied builds. The output
-records `schema_version: 1`, `node_seconds`, and source build URLs/commits.
+records `schema_version: 1`, the suite, `node_seconds`, and source build URLs/commits.
+The same builder accepts `--suite other` and `--suite diffusion` with their
+existing marker and directory contracts. Do not combine different suites in one profile.
 Use a new output path; existing profiles are never overwritten.
 
 ### Run a candidate shard
 
 Run from the repository root in the AMD CI image with the normal test dependencies.
-Use the **same profile bytes and source revision** on all three workers, set the
-index to 0, 1, or 2, and choose a distinct output path for each invocation:
+Use the **same profile bytes and source revision** on all five workers. The runner
+reads the count/index from Buildkite and creates a fresh artifact directory:
 
 ```bash
-SHARD_INDEX=0
-PLAN_DIR=$(mktemp -d)
-pytest -sv tests/model_executor \
+BUILDKITE_PARALLEL_JOB_COUNT=5 BUILDKITE_PARALLEL_JOB=0 \
+python .buildkite/amd/scripts/run_cpu_suite.py \
+  --timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json \
+  model-executor -sv tests/model_executor \
   -m 'core_model and cpu and not omni' \
-  --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end \
-  --cpu-shard-profile=model-executor-timings.json \
-  --cpu-shard-count=3 --cpu-shard-index="$SHARD_INDEX" \
-  --cpu-shard-plan="$PLAN_DIR/plan.json" \
-  --durations=50 --junitxml="$PLAN_DIR/pytest.xml"
+  --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
 ```
 
 These options replace `--num-shards` / `--shard-id` for the qualification run.
 Combining the two partitioners or enabling xdist workers fails before execution.
-The opt-in scope is `core_model` + `cpu`, excluding `omni`, under
+The Model Executor scope is `core_model` + `cpu`, excluding `omni`, under
 `tests/model_executor/`. Marker, keyword, and explicit deselection filters run
 before partitioning. Without `--cpu-shard-profile`, collection behavior is unchanged.
 
@@ -323,17 +420,82 @@ inside each shard; an empty selected shard retains pytest's exit code 5.
 stale timing counts, source builds, the profile SHA-256, an eligible-node SHA-256,
 and algorithm version `module-lpt-v1`. The file is written before execution and
 is **not** an execution result. Invalid profiles or plan-write errors fail closed.
-All workers must report identical profile/eligible-node hashes and assignments;
-compare the executed JUnit node union and skip outcomes with the baseline too.
+All workers must report identical profile/eligible-node hashes and assignments.
+Compare one complete successful baseline build against one complete candidate
+build using the downloaded artifact directories:
+
+```bash
+python .buildkite/amd/scripts/verify_cpu_shards.py --suite model-executor \
+  --baseline downloaded/baseline/shard-* --candidate downloaded/candidate/shard-*
+```
+
+This rejects missing/duplicate attempts, failed or incomplete execution, changed
+node unions, changed skips, and execution that disagrees with the shared plan.
+Run baseline and candidate on the same source revision, image and resource limits.
 
 Shared fixture cost can be counted repeatedly in historical hash shards; collection,
 imports, and CPU contention are not modeled by the weights. Estimated loads and
-synthetic tests are not hardware speedup evidence. Before production activation,
-measure paired READY/MERGE runs, whole-build latency, CPU pressure, and aggregate
-job minutes. Proposed qualification goals are a median slowest/fastest ratio at
-most 1.20 and no more than 10% growth in aggregate job minutes. Keep the existing
-three-worker/thread policy and coverage contract while evaluating the candidate.
-Rollback is omission of the opt-in flags; TIME-01 instrumentation is independent.
+synthetic tests are not hardware speedup evidence. Before merging the five-worker
+trial, verify available `amd_mi300_1` capacity and queue latency at that concurrency.
+The source jobs expose 192 logical CPUs but have a four-CPU cgroup quota.
+An agent inventory alone cannot establish spare cluster capacity. Measure paired
+READY/MERGE runs, whole-build latency, queue latency, CPU pressure, peak memory,
+and summed agent-minutes. The planning target is each shard p95 below 18 minutes;
+also check a median slowest/fastest ratio at most 1.20 and no more than 10% growth
+in aggregate job minutes. Require unchanged coverage and numerical assertions.
+Rollback restores `parallelism: 3`, removes `--timing-profile`, and restores the
+original `--num-shards` / `--shard-id` arguments; timing instrumentation remains.
+
+Benchmark CPU thread counts without changing reference inputs or tolerances:
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/cpu-thread-trial -- \
+  -q tests/model_executor/models/ming3_tts/test_ming3_batched_campplus.py::test_batched_campplus_matches_per_clip_pipeline \
+  tests/model_executor/models/kokoro/test_kokoro.py::test_speed_shortens_durations \
+  tests/model_executor/models/cosyvoice3/test_speaker_embedding_capture_failure.py::test_first_replay_failure_leaves_no_bucket \
+  tests/model_executor/models/kokoro/test_kokoro.py::test_network_is_deterministic_per_generator
+```
+
+Use the CI image and its quota; the script interleaves 1/2/4 threads, with one
+warmup and three measured fresh processes per count. Logs, JUnit results and
+software versions are retained. A failure or skip invalidates the benchmark.
+
+### Other CPU: two-shard trial
+
+READY/MERGE split Other into two duration-weighted shards using
+`.buildkite/amd/cpu-timings/other-v1.json`, generated from all 8,954 selected
+nodes in the successful two-way target READY trial in
+[build #15655](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15655), merge
+commit `ae8a431e3e53b102b77b2e7ebdd2ad3dea31fe5f`. The first trial selected
+every live node exactly once with no test, collection, or artifact failures;
+both workers launched with seven-second queue delays and finished in 12m04s and
+14m50s. Repacking those measured setup + call + teardown totals estimates
+12m17s per shard before collection and job overhead. This remains a planning
+estimate until the refreshed profile completes target CI. A third shard should
+be considered only after measuring the two-shard p95 and queue/agent cost.
+
+The existing `core_model and cpu` expression and all five `--ignore` arguments
+are retained. Whole modules stay together, including expensive subprocess and
+import fixtures. Fixture scopes, mutation isolation and pass criteria do not
+change. New tests are assigned from live collection even without timing history.
+
+The historical artifact contains three zero-duration `unittest.subTest` call
+reports before one parent call. The importer accepts this passed zero-duration
+prefix only while requiring exactly one test start per selected node; repeated
+nonzero phase reports still fail. New artifacts record `subtest_report` separately,
+preserve subtest failures, and avoid double-counting parent call duration.
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py downloaded/other-job \
+  --suite other --output other-v2.json
+python .buildkite/amd/scripts/verify_cpu_shards.py --suite other \
+  --baseline downloaded/other-baseline --candidate downloaded/other-candidate-*
+```
+
+Before rollout, require the unchanged executed node union and skip outcomes,
+per-shard p95 below 18 minutes, and measured summed agent-minutes, build wall
+time and queue latency. Other retains its existing thread environment. Rollback
+removes `parallelism: 2` and `--timing-profile`, and restores the unsharded label.
 
 ## Cross-cutting conventions
 
@@ -371,7 +533,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on a release line (`main` or `release/vX.Y.Z`), scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` still builds the image and uploads L5; CUDA also uploads L5 for `NON_CRITICAL=1`. `WEEKLY=1` on a release line also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for a scheduled release line (`main` or `release/vX.Y.Z`) + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
+**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on a release line (`main` or `release/vX.Y.Z`), scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on a release line also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for a scheduled release line (`main` or `release/vX.Y.Z`) + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -389,7 +551,7 @@ Register new files in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `
 | L3 | `.buildkite/amd/test-amd-merge.yml` | amd |
 | L4/L5 | `.buildkite/cuda/test-nightly.yml`, `test-weekly.yml` | cuda |
 | L4/L5 | `.buildkite/amd/test-amd-nightly.yml`, `test-amd-weekly.yml` | amd |
-| L4/L5 | `.buildkite/npu/test-npu-nightly.yml`, `test-npu-weekly.yml` | npu |
+| L4/L5 | `.buildkite/npu/test-npu-nightly.yml` | npu |
 
 ##### Yaml-gated category branches
 
@@ -486,18 +648,6 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 
 - Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` weekly runs on a release line (`main` or `release/vX.Y.Z`, `WEEKLY=1`).
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
-
-### LingBot World regression cases
-
-The CUDA and NPU **World Model Test** groups define three categories:
-
-- Nightly accuracy has separate numeric precision, WBench and VBench tests.
-- Nightly performance compares three measured reference/candidate pairs with a 5% regression threshold. The 12 FPS SLO defines the reported measurement basis, not an additional absolute pass gate.
-- Weekly stability runs two candidate-only 600-chunk sessions with memory, camera, lifecycle and cleanup checks.
-
-Shared generation produces measurements without deciding semantic acceptance. Numeric, performance, WBench and VBench jobs depend only on completed generation and retain separate reports; one accuracy result does not block another. NPU measurements retain three producer jobs and a completion-only aggregate step to bound each producer's runtime. WBench/VBench prepare isolated evaluator environments in the ordinary CUDA CI image. NPU result checks share a CUDA test-image build because both the L4 CPU and H100 presets require that image; numeric and performance tests do not prepare evaluators.
-
-The cases retain ordinary pytest exits, JUnit and diagnostic artifacts. CPU contracts use the existing Simple jobs. CI maintainers own actual execution and scheduling; no reference-only calibration campaign is required to define these cases.
 
 ### Per-model coverage
 

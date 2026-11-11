@@ -1,19 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fail-closed per-run regression checks and reference baselines for real LingBot rollouts.
-
-The baseline uses independent starts of a frozen reference revision with a
-matching hardware and dependency contract.
-Neither a different accelerator topology nor another precision policy may reuse
-it. Reference limits are computed from the current paired measurements, never from candidate scores.
-"""
+"""Numerical and semantic accuracy checks over real LingBot references."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import statistics
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -53,10 +46,6 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def contract_digest(contract: Mapping[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(contract, sort_keys=True, allow_nan=False).encode()).hexdigest()
-
-
 def verify_environment(python: Path, requirements: Path) -> dict[str, str]:
     """Check the evaluator interpreter, including every resolved dependency."""
     expected = {}
@@ -80,101 +69,6 @@ def verify_environment(python: Path, requirements: Path) -> dict[str, str]:
     if actual != expected:
         raise RegressionError("Evaluator environment differs from requirements/lingbot-quality.txt")
     return actual
-
-
-def calibrate(
-    reference: Sequence[Mapping[str, float]],
-    *,
-    contract: Mapping[str, Any],
-    reference_revision: str,
-    max_cv: float = 0.03,
-    regression_fraction: float = 0.05,
-    transient_noise_sigma: float = 3.0,
-) -> dict[str, Any]:
-    """Freeze limits from >=3 independent reference server starts.
-
-    Unstable cadence rejects calibration. The worst reference value receives
-    a regression allowance; transient jitter is derived from these
-    same independent references only.
-    """
-    if len(reference) < 3:
-        raise RegressionError("Calibration needs three independent server starts")
-    if len(reference_revision) != 40 or any(c not in "0123456789abcdef" for c in reference_revision):
-        raise RegressionError("Freeze a full reference commit SHA")
-    for label, value in (("max_cv", max_cv), ("regression_fraction", regression_fraction)):
-        number(value, label, positive=True)
-        if value >= 1:
-            raise RegressionError(f"{label} must be below one")
-    number(transient_noise_sigma, "transient_noise_sigma")
-    if transient_noise_sigma > 3:
-        raise RegressionError("Transient noise allowance cannot exceed three reference standard deviations")
-    limits = {}
-    metrics = ["mean_ms", "p50_ms", "p95_ms", "ttfc_ms", "generated_fps", "stall_ms"]
-    for metric in metrics:
-        values = [number(row[metric], metric) for row in reference]
-        mean = statistics.mean(values)
-        cv = statistics.pstdev(values) / mean if mean else 0.0
-        # Startup and discrete playback stalls have measured reference jitter,
-        # unlike stationary cadence. Calibrate their allowance from references
-        # only; never use a failed candidate to raise a limit.
-        cv_ceiling = max_cv
-        if metric in {"mean_ms", "p50_ms", "p95_ms"} and cv > cv_ceiling:
-            raise RegressionError(f"Unstable reference {metric}: CV={cv:.3%} > {cv_ceiling:.3%}")
-        lower_is_better = metric != "generated_fps"
-        worst = max(values) if lower_is_better else min(values)
-        relative_allowance = worst * regression_fraction
-        jitter_allowance = (
-            statistics.pstdev(values) * transient_noise_sigma
-            if metric in {"ttfc_ms", "stall_ms", "steady_stall_ms"}
-            else 0.0
-        )
-        allowance = max(relative_allowance, jitter_allowance)
-        limits[metric] = {
-            "direction": "max" if lower_is_better else "min",
-            "value": worst + allowance if lower_is_better else worst - allowance,
-            "reference": values,
-            "cv": cv,
-            "relative_allowance": relative_allowance,
-            "reference_jitter_allowance": jitter_allowance,
-        }
-    if all(row["steady_samples"] >= 1000 for row in reference):
-        limits["p99_ms"] = {
-            "direction": "max",
-            "value": max(number(row["p99_ms"], "p99") for row in reference) * (1 + regression_fraction),
-        }
-    return {
-        "schema_version": 1,
-        "contract": dict(contract),
-        "contract_sha256": contract_digest(contract),
-        "reference_revision": reference_revision,
-        "independent_starts": len(reference),
-        "limits": limits,
-    }
-
-
-def check_performance(
-    measured: Mapping[str, float], baseline: Mapping[str, Any], *, contract: Mapping[str, Any]
-) -> dict[str, Any]:
-    if baseline.get("schema_version") != 1 or baseline.get("independent_starts", 0) < 3:
-        raise RegressionError("Missing calibrated baseline")
-    if baseline.get("contract") != contract or baseline.get("contract_sha256") != contract_digest(contract):
-        raise RegressionError("Baseline hardware/model/workload/environment contract mismatch")
-    limits = baseline.get("limits", {})
-    required = {"mean_ms", "p50_ms", "p95_ms", "ttfc_ms", "generated_fps", "stall_ms"}
-    if not required <= limits.keys():
-        raise RegressionError("Incomplete performance limits")
-    violations = []
-    for metric, limit in limits.items():
-        actual = number(measured[metric], metric)
-        threshold = number(limit["value"], f"{metric} limit")
-        direction = "min" if metric == "generated_fps" else "max"
-        if limit["direction"] != direction:
-            raise RegressionError(f"Invalid gate direction: {metric}")
-        if metric == "p99_ms" and measured["steady_samples"] < 1000:
-            raise RegressionError("P99 gate requires at least 1000 steady samples")
-        if (direction == "max" and actual > threshold) or (direction == "min" and actual < threshold):
-            violations.append(f"{metric}: {actual:.6g} violates {direction} {threshold:.6g}")
-    return {"passed": not violations, "violations": violations, "measured": dict(measured)}
 
 
 def check_quality(

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .client import BenchmarkError
+from .client import BenchmarkError, realtime_video_url
 from .workload import Workload
 
 _WORKLOAD_FLAGS = {
@@ -89,13 +89,7 @@ def build_workload(args: argparse.Namespace) -> Workload:
 
 
 def endpoint_url(args: argparse.Namespace) -> str:
-    base = (args.base_url or f"http://{args.host}:{args.port}").rstrip("/")
-    base = base.removesuffix("/v1/realtime/video")
-    for scheme, websocket in (("http://", "ws://"), ("https://", "wss://")):
-        if base.startswith(scheme):
-            base = websocket + base[len(scheme) :]
-            break
-    return base + "/v1/realtime/video"
+    return realtime_video_url(args.base_url or f"http://{args.host}:{args.port}")
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:

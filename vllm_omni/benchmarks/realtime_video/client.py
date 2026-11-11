@@ -8,10 +8,11 @@ import asyncio
 import json
 import mimetypes
 import os
+import ssl
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,26 @@ from .workload import ChunkRecord, Workload
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_IMAGE_ASSET = "2560px-Gfp-wisconsin-madison-the-nature-boardwalk"
+_WS_PATH = "/v1/realtime/video"
+
+
+def realtime_video_base_url(value: str) -> str:
+    """Normalize a base or full endpoint URL for the shared HTTP CLI."""
+    base = value.rstrip("/").removesuffix(_WS_PATH)
+    for scheme, replacement in (("wss://", "https://"), ("ws://", "http://")):
+        if base.startswith(scheme):
+            return replacement + base[len(scheme) :]
+    return base
+
+
+def realtime_video_url(value: str) -> str:
+    """Return the WS endpoint used by both the adapter and legacy CLI."""
+    base = realtime_video_base_url(value)
+    for scheme, replacement in (("https://", "wss://"), ("http://", "ws://")):
+        if base.startswith(scheme):
+            base = replacement + base[len(scheme) :]
+            break
+    return base + _WS_PATH
 
 
 class BenchmarkError(RuntimeError):
@@ -78,19 +99,32 @@ async def run_session(
     ping_interval: float,
     collect_media: bool,
     print_chunks: bool,
-    on_chunk: Callable[[ChunkRecord], None] | None = None,
-    interactions_after_chunk: dict[int, dict[str, Any]] | None = None,
     failure_output: Path | None = None,
     on_failure: Callable[[SessionResult, BaseException | None], None] | None = None,
+    extra_headers: Mapping[str, str] | None = None,
+    insecure: bool = False,
 ) -> SessionResult:
     """Drive one rollout and timestamp every chunk as its bytes land."""
     try:
         from websockets.asyncio.client import connect
+
+        header_option = "additional_headers"
     except ImportError:  # pragma: no cover - exercised only without websockets
         try:
             from websockets import connect  # type: ignore[attr-defined]
+
+            header_option = "extra_headers"
         except ImportError as exc:
             raise BenchmarkError("This benchmark needs the websockets package: pip install websockets") from exc
+
+    connect_options: dict[str, Any] = {"max_size": None, "ping_interval": None}
+    if extra_headers:
+        connect_options[header_option] = dict(extra_headers)
+    if insecure and url.startswith("wss://"):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connect_options["ssl"] = context
 
     payload = workload.session_start_payload(model)
     records: list[ChunkRecord] = []
@@ -111,7 +145,7 @@ async def run_session(
     started: float | None = None
     complete = False
     try:
-        async with connect(url, max_size=None, ping_interval=None) as websocket:
+        async with connect(url, **connect_options) as websocket:
             async with send_lock:
                 await websocket.send(json.dumps(payload, ensure_ascii=False))
             started = time.perf_counter()
@@ -156,15 +190,6 @@ async def run_session(
                                 )
                             )
                             last_arrival = arrival
-                            if on_chunk is not None:
-                                # Diagnostic observations may synchronize devices.
-                                # Performance runs never install this callback.
-                                on_chunk(records[-1])
-                            if interactions_after_chunk is not None and index in interactions_after_chunk:
-                                async with send_lock:
-                                    await websocket.send(
-                                        json.dumps(interactions_after_chunk[index], ensure_ascii=False)
-                                    )
                             if print_chunks:
                                 print(
                                     f"  chunk {index:3d}  t={arrival:8.3f}s  "

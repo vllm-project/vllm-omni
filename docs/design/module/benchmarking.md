@@ -47,31 +47,35 @@ outputs before using timings as performance evidence.
 Test workload parsing and metric calculations with deterministic fixtures. Do
 not compare materially different workloads or runtime settings.
 
-## LingBot CI measurements
+## LingBot performance and accuracy
 
 The packaged `realtime-video` backend uses the existing `vllm bench serve
 --omni` lifecycle and records real streamed chunk arrivals with explicit
-warmup/frame/playback policies. It supplies typed video workload and result
-records instead of treating frames as tokens. The standard benchmark saves the
-domain report under `realtime_video`; the legacy script only translates flags
-and projects that report after the shared lifecycle. CI collects current-run paired
-reference/candidate inputs without composing semantic acceptance. Numerical
-precision, WBench, VBench and relative performance are independent pytest cases
-and reports; a failure in one does not block the others through a semantic
-prerequisite. Each case fails on its own missing, invalid or incomplete inputs.
+warmup/frame/playback policies. Typed video workload/results keep frames
+separate from tokens. The common result retains `realtime_video` raw records;
+the legacy script translates flags and projects that result without a separate
+request loop.
 
-Each case uses a distinct excluded eight-chunk warmup; the attention-window
-warmup and terminal-chunk policy define the steady interval population.
-Readiness does not inject an unrecorded full rollout. Three independent paired
-server starts remain pytest-owned and define the per-run reference spread and 5%
-relative performance limits. The 12 FPS playback target is a measurement basis,
-not a new absolute pass threshold. Numerical checks retain VAE samples and
-full-video/window/content checks. Native semantic evaluators retain their own
-per-dimension/binary limits and complete input-frame coverage. No frozen cohort,
-held-out or external calibration-delivery workflow is part of these cases.
+LingBot performance is configured through `tests/dfx/perf` and its ordinary
+recorded JSON hardware baselines. Candidate runs do not restart a live reference
+or derive a calibration/CV limit. Each workload has a distinct excluded
+eight-chunk warmup; six attention-window chunks and the terminal chunk are
+excluded from steady cadence. Readiness does not inject an unrecorded full
+rollout. The 12 FPS playback target is a measurement basis, not an absolute
+acceptance gate. Missing real baseline numbers remain an explicit gap.
 
-Long stability uses two candidate-only 600-chunk sessions with observed memory,
-camera, lifecycle and cleanup assertions. Its instrumentation is excluded from
-speed measurements. CPU helper tests and CI rendering validate implementation
-contracts; only matching-source real hardware execution can establish native
-accuracy, speed or stability outcomes.
+`tests/e2e/accuracy/lingbot_world` contains three independent numerical, WBench
+and VBench tests. A session fixture records real accuracy reference/candidate
+inputs without judging them. Three fresh starts retain the original pixel and
+semantic repeatability/activity rules; no performance verdict depends on them.
+Each test checks its own complete input population, writes its own accuracy JSON
+before asserting, and does not read another test's verdict. Numerical checks
+retain fixed VAE samples and full-video/window/content checks; native evaluators
+retain per-dimension/binary limits and complete frame coverage.
+
+CUDA generation uses two H100 GPUs and SP=2. NPU uses its existing four-device A2
+profile, followed by CUDA evaluation; result metadata distinguishes generation
+and evaluator hardware. There is no long-stability, cohort, held-out or external
+calibration-delivery workflow. CPU tests/rendering establish implementation
+contracts; matching-source native runs are still needed to establish actual
+accuracy, performance and capacity.

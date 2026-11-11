@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import math
 import platform
+import statistics
 import time
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,10 +23,12 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput, RequestF
 from vllm_omni.benchmarks.realtime_video.client import (
     SessionResult,
     git_revision,
+    realtime_video_url,
     resolve_image_reference,
     run_session,
     save_video,
 )
+from vllm_omni.benchmarks.realtime_video.metrics import performance_metrics
 from vllm_omni.benchmarks.realtime_video.workload import (
     DEFAULT_FLOW_SHIFT,
     DEFAULT_FPS,
@@ -54,18 +59,13 @@ class RealtimeVideoOptions:
     save_video: str | None = None
     workload_file: str | None = None
     camera_pattern: str = "forward"
+    insecure: bool = False
 
 
 @dataclass
 class RealtimeVideoSampleRequest(SampleRequest):
     workload: Workload | None = None
     options: RealtimeVideoOptions = field(default_factory=RealtimeVideoOptions)
-
-
-@dataclass
-class RealtimeVideoRequestInput(RequestFuncInput):
-    video_sample: RealtimeVideoSampleRequest | None = None
-    measured: bool = True
 
 
 @dataclass
@@ -140,6 +140,7 @@ def get_realtime_video_samples(args: argparse.Namespace) -> list[SampleRequest]:
         save_video=args.realtime_video_save_video,
         workload_file=args.dataset_path,
         camera_pattern=args.realtime_video_camera_pattern,
+        insecure=args.insecure,
     )
     return [
         RealtimeVideoSampleRequest(
@@ -157,21 +158,23 @@ def get_realtime_video_samples(args: argparse.Namespace) -> list[SampleRequest]:
 def bind_realtime_video(sample: SampleRequest, request: RequestFuncInput) -> RequestFuncInput:
     if not isinstance(sample, RealtimeVideoSampleRequest):
         return request
-    return RealtimeVideoRequestInput(
-        **{item.name: getattr(request, item.name) for item in fields(RequestFuncInput)}, video_sample=sample
-    )
+    bound = copy.copy(request)
+    setattr(bound, "video_sample", sample)
+    setattr(bound, "measured", True)
+    return bound
 
 
 def make_realtime_video_warmup(request: RequestFuncInput) -> RequestFuncInput:
-    if not isinstance(request, RealtimeVideoRequestInput) or request.video_sample is None:
+    sample = getattr(request, "video_sample", None)
+    if not isinstance(sample, RealtimeVideoSampleRequest):
         return request
-    sample = request.video_sample
     assert sample.workload is not None
-    return replace(
-        request,
-        measured=False,
-        video_sample=replace(sample, workload=warmup_workload(sample.workload, sample.options.warmup_num_chunks)),
-    )
+    warmup = copy.copy(request)
+    warmup_sample = copy.copy(sample)
+    warmup_sample.workload = warmup_workload(sample.workload, sample.options.warmup_num_chunks)
+    setattr(warmup, "measured", False)
+    setattr(warmup, "video_sample", warmup_sample)
+    return warmup
 
 
 async def async_request_realtime_video(
@@ -180,9 +183,9 @@ async def async_request_realtime_video(
     pbar: Any = None,
 ) -> RealtimeVideoRequestOutput:
     """Execute one WS rollout; the shared benchmark owns scheduling and timing."""
-    if not isinstance(request_func_input, RealtimeVideoRequestInput) or request_func_input.video_sample is None:
+    sample = getattr(request_func_input, "video_sample", None)
+    if not isinstance(sample, RealtimeVideoSampleRequest):
         raise TypeError("realtime-video requires its typed dataset sample")
-    sample = request_func_input.video_sample
     assert sample.workload is not None
     options = sample.options
     output = RealtimeVideoRequestOutput(start_time=time.perf_counter())
@@ -190,7 +193,8 @@ async def async_request_realtime_video(
     def retain_partial(result: SessionResult, error: BaseException | None) -> None:
         output.session_result = result
 
-    url = request_func_input.api_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    url = realtime_video_url(request_func_input.api_url)
+    measured = getattr(request_func_input, "measured", True)
     try:
         output.session_result = await run_session(
             url,
@@ -199,9 +203,11 @@ async def async_request_realtime_video(
             first_chunk_timeout=options.first_chunk_timeout,
             chunk_timeout=options.chunk_timeout,
             ping_interval=options.ping_interval,
-            collect_media=request_func_input.measured and options.save_video is not None,
-            print_chunks=options.print_chunks and request_func_input.measured,
+            collect_media=measured and options.save_video is not None,
+            print_chunks=options.print_chunks and measured,
             on_failure=retain_partial,
+            extra_headers=request_func_input.extra_headers,
+            insecure=options.insecure,
         )
         output.success = True
     except Exception as error:
@@ -299,7 +305,7 @@ def finalize_realtime_video(
     document = {
         "benchmark": "lingbot_world_realtime",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "endpoint": endpoint.replace("https://", "wss://", 1).replace("http://", "ws://", 1),
+        "endpoint": realtime_video_url(endpoint),
         "model": model,
         "git_revision": git_revision(),
         "hostname": platform.node(),
@@ -315,6 +321,7 @@ def finalize_realtime_video(
             "mux_fps": workload.fps,
             "playback_buffer_chunks": options.playback_buffer_chunks,
             "workload_file": options.workload_file,
+            "insecure": options.insecure,
         },
         "warmups": warmup_payloads,
         "sessions": session_payloads,
@@ -328,9 +335,43 @@ def finalize_realtime_video(
         + finalization_errors,
     }
     print(f"Realtime video: {completed}/{len(requests)} measured sessions completed; {failed_warmups} failed warmups")
-    return {
+    result_json: dict[str, Any] = {
         "duration": duration,
         "completed": completed,
         "failed": len(requests) - completed,
+        "dataset_name": "realtime-video",
         "realtime_video": document,
     }
+    if completed == len(requests) and not failed_warmups:
+        try:
+            scalars = {
+                # These are full measured requests, including connection/setup,
+                # distinct from steady chunk cadence. Warmups enter neither.
+                "mean_e2el_ms": statistics.mean(output.latency for output in outputs) * 1000.0,
+                "request_throughput": completed / duration,
+                "mean_video_ttfc_ms": statistics.mean(row["ttfc_ms"] for row in session_metrics),
+                "min_video_fps": min(row["frames_per_second"] for row in session_metrics),
+                "mean_video_rtf": statistics.mean(row["video_rtf"] for row in session_metrics),
+            }
+            steady_per_session = max(0, workload.num_chunks - max(1, options.warmup_chunks) - 1)
+            if steady_per_session:
+                summary = performance_metrics(
+                    document, num_chunks=workload.num_chunks, min_steady=len(requests) * steady_per_session
+                )
+                scalars.update(
+                    mean_video_steady_interval_ms=summary["mean_ms"],
+                    p95_video_steady_interval_ms=summary["p95_ms"],
+                )
+            if any(not math.isfinite(value) or value < 0 for value in scalars.values()):
+                raise ValueError("Nonfinite or negative realtime-video summary")
+            result_json.update(scalars)
+            result_json["video_metric_scope"] = (
+                "e2el/request_throughput: whole measured rollouts; video TTFC/FPS/RTF: session records; "
+                "steady intervals: attention warmup and terminal excluded; session warmups excluded throughout"
+            )
+        except Exception as error:
+            message = f"recorded metrics: {type(error).__name__}: {error}"
+            finalization_errors.append(message)
+            document["errors"].append(message)
+            document["passed"] = False
+    return result_json

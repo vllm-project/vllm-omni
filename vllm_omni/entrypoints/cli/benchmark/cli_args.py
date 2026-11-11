@@ -608,6 +608,7 @@ def add_realtime_video_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
+    from vllm_omni.benchmarks.realtime_video.client import realtime_video_base_url
     from vllm_omni.benchmarks.realtime_video.workload import DEFAULT_MODEL
 
     explicit = getattr(args, "explicit_keys", ())
@@ -653,10 +654,7 @@ def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
     if args.model is None:
         args.model = DEFAULT_MODEL
     if args.base_url is not None:
-        base_url = args.base_url.rstrip("/")
-        if base_url.endswith(args.endpoint):
-            base_url = base_url[: -len(args.endpoint)]
-        args.base_url = base_url.replace("wss://", "https://", 1).replace("ws://", "http://", 1)
+        args.base_url = realtime_video_base_url(args.base_url)
 
 
 def add_omni_args(parser: argparse.ArgumentParser) -> None:

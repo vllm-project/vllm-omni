@@ -146,15 +146,19 @@ normal `vllm bench serve --omni` command for new uses.
 
 ## CI cases and local checks
 
-The [LingBot CI cases](../../tests/dfx/lingbot_world/README.md) keep numerical
-precision, WBench, VBench, performance and long stability independent. Shared
-collection uses this backend for three current-run reference/candidate starts;
-pytest owns source selection, server restarts, cleanup, CV and 5% relative
-performance checks. Twelve FPS remains a reported SLO basis, not a new absolute
-acceptance gate. Long stability retains two instrumented candidate-only
-600-chunk sessions and does not enter the speed samples.
+Performance uses the existing [`tests/dfx/perf`](../../tests/dfx/perf) JSON
+configuration and recorded hardware baseline workflow with this common backend.
+It runs the candidate without live A/B calibration or a separate scheduler.
+A missing recorded hardware baseline is reported as unavailable, not a fabricated
+regression pass. Twelve FPS remains a playback/SLO basis, not an absolute gate.
 
-CPU tests under `tests/benchmarks/test_lingbot_world_*.py` exercise metric math,
-real scripted WebSocket transport, argument compatibility, incomplete data and
-consumer independence. These checks do not establish real-model accuracy,
-speed or stability; matching-source native execution remains necessary.
+The [accuracy tests](../../tests/e2e/accuracy/lingbot_world/README.md) keep
+numerical precision, WBench and VBench as separate tests. Their shared real
+reference inputs serve only the numerical and semantic comparisons. CUDA uses
+two H100 GPUs; NPU capture uses the existing four-device A2 configuration before
+CUDA-based quality evaluation. Long-stability tests are not included.
+
+CPU tests under `tests/benchmarks/test_lingbot_world_*.py` exercise raw metrics,
+scripted WebSocket transport, argument compatibility, malformed inputs and
+independent accuracy results. They do not establish real-model accuracy,
+performance or accelerator capacity.

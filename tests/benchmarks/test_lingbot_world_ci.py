@@ -17,7 +17,7 @@ from typing import NamedTuple
 import pytest
 
 from benchmarks.lingbot_world.regression import RegressionError, check_binary_activity, check_quality
-from tests.dfx.lingbot_world.runner import server_arguments, server_environment
+from tests.e2e.accuracy.lingbot_world.runner import server_arguments, server_environment
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,7 +33,7 @@ class _DeviceProperties(NamedTuple):
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
 @pytest.mark.parametrize("state", ["released", "leaked", "unavailable"])
 def test_device_cleanup_is_a_blocking_single_probe(tmp_path, monkeypatch, mocker, device_env, state):
-    from tests.dfx.lingbot_world import runner
+    from tests.e2e.accuracy.lingbot_world import runner
     from tests.helpers import clean
 
     queried = []
@@ -79,7 +79,7 @@ def test_device_cleanup_is_a_blocking_single_probe(tmp_path, monkeypatch, mocker
 
 @pytest.mark.parametrize("dies", [0, True, 1.0])
 def test_device_cleanup_cannot_accept_empty_or_invalid_device_populations(tmp_path, dies):
-    from tests.dfx.lingbot_world import runner
+    from tests.e2e.accuracy.lingbot_world import runner
 
     report = tmp_path / "cleanup.json"
     with pytest.raises(RegressionError, match="positive integer die count"):
@@ -98,59 +98,53 @@ def test_server_initialization_and_stage_deadlines_use_the_explicit_profile_budg
     }
 
 
-@pytest.mark.parametrize("mask", [None, "7,6,5,4,3,2,1,0", ",".join(f"GPU-{index}" for index in range(8))])
-def test_reserved_cuda_allocation_preserves_the_original_device_mapping(mask):
-    from tests.dfx.lingbot_world.prepare import select_cuda_devices
+@pytest.mark.parametrize("mask", [None, "7,6", "GPU-0,GPU-1"])
+def test_cuda_allocation_uses_both_reserved_devices(mask):
+    from tests.e2e.accuracy.lingbot_world.prepare import select_cuda_devices
 
-    expected = "0,1,2,3" if mask is None else ",".join(mask.split(",")[:4])
-    assert select_cuda_devices(8, mask, dies=4, reserved_cards=8) == expected
+    assert select_cuda_devices(2, mask, dies=2, reserved_cards=2) == ("0,1" if mask is None else mask)
 
 
 @pytest.mark.parametrize(
     "available,mask,dies,reserved",
-    [(4, None, 4, 8), (16, None, 4, 8), (8, None, 9, 8), (8, "0,1,2,3", 4, 8), (8, "0," * 7 + "0", 4, 8)],
+    [(4, None, 2, 2), (1, None, 2, 2), (2, None, 4, 2), (2, "0", 2, 2), (2, "0,0", 2, 2)],
 )
-def test_reserved_cuda_allocation_rejects_incomplete_or_ambiguous_visibility(available, mask, dies, reserved):
-    from tests.dfx.lingbot_world.prepare import select_cuda_devices
+def test_cuda_allocation_rejects_incomplete_or_unused_devices(available, mask, dies, reserved):
+    from tests.e2e.accuracy.lingbot_world.prepare import select_cuda_devices
 
     with pytest.raises(RegressionError):
         select_cuda_devices(available, mask, dies=dies, reserved_cards=reserved)
 
 
-def test_exclusive_allocation_preflight_records_all_reserved_devices(tmp_path, monkeypatch):
+def test_cuda_allocation_records_both_used_devices(tmp_path, monkeypatch):
     import torch
 
-    from tests.dfx.lingbot_world.prepare import prepare_cuda_allocation
+    from tests.e2e.accuracy.lingbot_world.prepare import prepare_cuda_allocation
 
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7,6,5,4,3,2,1,0")
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7,6")
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 2)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "H100")
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: _DeviceProperties(uuid=f"GPU-{index}"))
     output = tmp_path / "allocation.json"
-    assert (
-        prepare_cuda_allocation({"platform": "cuda", "cards": 4, "dies": 4, "reserved_cards": 8}, output) == "7,6,5,4"
-    )
+    assert prepare_cuda_allocation({"platform": "cuda", "cards": 2, "dies": 2, "reserved_cards": 2}, output) == "7,6"
     evidence = json.loads(output.read_text())
-    assert evidence["reserved_cards"] == 8 and evidence["visible_dies"] == 4
-    assert [device["uuid"] for device in evidence["devices"]] == [f"GPU-{index}" for index in range(8)]
+    assert evidence["reserved_cards"] == evidence["visible_dies"] == 2
+    assert [device["uuid"] for device in evidence["devices"]] == ["GPU-0", "GPU-1"]
 
 
-@pytest.mark.parametrize("mask", [None, "7,6,5,4,3,2,1,0", "8,9,10,11,12,13,14,15"])
-def test_npu_allocation_preserves_cann_runtime_mapping(mask):
-    from tests.dfx.lingbot_world.prepare import select_npu_devices
+@pytest.mark.parametrize("mask", [None, "7,6,5,4", "8,9,10,11"])
+def test_npu_allocation_uses_all_four_reserved_devices(mask):
+    from tests.e2e.accuracy.lingbot_world.prepare import select_npu_devices
 
-    expected = "0,1,2,3" if mask is None else ",".join(mask.split(",")[:4])
-    assert select_npu_devices(8, mask, dies=4, reserved_cards=8) == expected
+    assert select_npu_devices(4, mask, dies=4, reserved_cards=4) == ("0,1,2,3" if mask is None else mask)
 
 
-@pytest.mark.parametrize(
-    "available,mask", [(4, None), (16, None), (8, "0,1,2,3"), (8, "0," * 7 + "0"), (8, "-1,1,2,3,4,5,6,7")]
-)
-def test_npu_allocation_rejects_partial_or_ambiguous_reservations(available, mask):
-    from tests.dfx.lingbot_world.prepare import select_npu_devices
+@pytest.mark.parametrize("available,mask", [(2, None), (8, None), (4, "0,1"), (4, "0,0,0,0"), (4, "-1,1,2,3")])
+def test_npu_allocation_rejects_partial_or_ambiguous_devices(available, mask):
+    from tests.e2e.accuracy.lingbot_world.prepare import select_npu_devices
 
     with pytest.raises(RegressionError):
-        select_npu_devices(available, mask, dies=4, reserved_cards=8)
+        select_npu_devices(available, mask, dies=4, reserved_cards=4)
 
 
 def test_reference_server_keeps_backend_import_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -221,7 +215,7 @@ def test_invalid_worker_thread_count_fails_before_launch(tmp_path: Path, threads
 
 @pytest.mark.parametrize("role", ["reference", "candidate"])
 def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monkeypatch, role: str):
-    from tests.dfx.lingbot_world import runner
+    from tests.e2e.accuracy.lingbot_world import runner
 
     calls = []
     monkeypatch.setenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", "1")
@@ -248,7 +242,7 @@ def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monke
 
 
 def evaluator_repository(root: Path):
-    directory = root / "tests/dfx/lingbot_world"
+    directory = root / "tests/e2e/accuracy/lingbot_world"
     directory.mkdir(parents=True)
     (directory / "evaluators.lock.json").write_text('{"repositories": {}, "files": {}}')
     (directory / "opencv_provider.py").write_text("# canonical provider policy\n")
@@ -258,7 +252,7 @@ def evaluator_repository(root: Path):
 
 @pytest.mark.parametrize("broken_role", [None, "reference", "candidate"])
 def test_source_import_preflight_uses_each_checkout(tmp_path, monkeypatch, broken_role):
-    from tests.dfx.lingbot_world import prepare
+    from tests.e2e.accuracy.lingbot_world import prepare
 
     for role in ("reference", "candidate"):
         package = tmp_path / role / "vllm_omni"
@@ -282,22 +276,24 @@ def test_source_import_preflight_uses_each_checkout(tmp_path, monkeypatch, broke
 
 
 def test_evaluator_cache_isolated_by_code_weights_and_dependencies(tmp_path: Path):
-    from tests.dfx.lingbot_world.prepare import evaluator_cache_key
+    from tests.e2e.accuracy.lingbot_world.prepare import evaluator_cache_key
 
     evaluator_repository(tmp_path)
     initial = evaluator_cache_key(tmp_path)
     (tmp_path / "requirements/lingbot-quality.txt").write_text("example==2\n")
     assert evaluator_cache_key(tmp_path) != initial
     (tmp_path / "requirements/lingbot-quality.txt").write_text("example==1\n")
-    (tmp_path / "tests/dfx/lingbot_world/evaluators.lock.json").write_text('{"revision": "different"}')
+    (tmp_path / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json").write_text('{"revision": "different"}')
     assert evaluator_cache_key(tmp_path) != initial
-    (tmp_path / "tests/dfx/lingbot_world/evaluators.lock.json").write_text('{"repositories": {}, "files": {}}')
-    (tmp_path / "tests/dfx/lingbot_world/opencv_provider.py").write_text("# changed canonical provider policy\n")
+    (tmp_path / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json").write_text('{"repositories": {}, "files": {}}')
+    (tmp_path / "tests/e2e/accuracy/lingbot_world/opencv_provider.py").write_text(
+        "# changed canonical provider policy\n"
+    )
     assert evaluator_cache_key(tmp_path) != initial
 
 
 def test_ready_evaluator_is_never_resynced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from tests.dfx.lingbot_world import prepare
+    from tests.e2e.accuracy.lingbot_world import prepare
 
     repository = tmp_path / "repository"
     evaluator_repository(repository)
@@ -359,7 +355,7 @@ def test_activity_is_not_a_higher_is_better_quality_score():
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 def test_every_configured_quality_dimension_rejects_a_collapse(platform):
-    limits = json.loads((ROOT / "tests/dfx/lingbot_world/quality.json").read_text())
+    limits = json.loads((ROOT / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
     # Both pinned evaluators return these dimensions on a [0, 1] scale.
     # A tolerance accidentally expressed as percentage points must not make
     # a dimension incapable of blocking a regression.
@@ -388,7 +384,7 @@ def opencv_provider_installation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     from importlib.metadata import PathDistribution
     from types import ModuleType
 
-    from tests.dfx.lingbot_world import opencv_provider
+    from tests.e2e.accuracy.lingbot_world import opencv_provider
 
     site = tmp_path / "site"
     module = site / "cv2"
@@ -472,7 +468,7 @@ def test_opencv_provider_record_rejects_incompatible_interpreter_or_owner(tmp_pa
 
 @pytest.mark.parametrize("mutation", ["binary", "record"])
 def test_ready_evaluator_rejects_changed_opencv_without_reinstall(tmp_path, monkeypatch, mutation):
-    from tests.dfx.lingbot_world import prepare
+    from tests.e2e.accuracy.lingbot_world import prepare
 
     repository = tmp_path / "repository"
     evaluator_repository(repository)
@@ -516,3 +512,27 @@ def test_ready_evaluator_rejects_changed_opencv_without_reinstall(tmp_path, monk
         prepare._prepare_evaluators(root)
     assert not any(command[:2] == ["uv", "pip"] for command in calls)
     assert all(p.read_bytes() == value for p, value in original.items())
+
+
+@pytest.mark.parametrize("platform,cards", [("cuda", 2), ("npu", 4)])
+def test_accuracy_and_perf_use_the_same_actual_device_topology(platform, cards):
+    import yaml
+
+    profile = json.loads((ROOT / f"tests/e2e/accuracy/lingbot_world/configs/{platform}.json").read_text())
+    tests = json.loads((ROOT / "tests/dfx/perf/tests/test_lingbot_world_realtime.json").read_text())
+    entry = next(
+        test
+        for test in tests
+        if any(
+            platform in mark.get("hardware_marks", {}).get("res", {}) for mark in test["mark"] if isinstance(mark, dict)
+        )
+    )
+    assert entry["server_params"]["serve_args"]["deploy-config"] == profile["deploy_config"]
+    assert profile["cards"] == profile["dies"] == profile.get("reserved_cards", cards) == cards
+    stage = yaml.safe_load((ROOT / profile["deploy_config"]).read_text())["stages"][0]
+    assert stage["devices"] == ",".join(map(str, range(cards)))
+    assert stage["parallel_config"]["sequence_parallel_size"] == cards
+    assert stage["parallel_config"]["ulysses_degree"] == cards
+    assert stage["parallel_config"]["tensor_parallel_size"] == stage["parallel_config"]["ring_degree"] == 1
+    assert stage["model_config"]["ar_diffusion_height"] == profile["height"] == 480
+    assert stage["model_config"]["ar_diffusion_width"] == profile["width"] == 832

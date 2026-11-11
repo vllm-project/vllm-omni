@@ -546,6 +546,30 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") == "realtime-video":
+        video = result.get("realtime_video")
+        assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
+        assert not video.get("finalization_errors"), "Realtime video finalization failed"
+        sessions = video.get("sessions")
+        assert isinstance(sessions, list) and len(sessions) == num_prompt, "Realtime video sessions are missing"
+        warmups = video.get("warmups")
+        assert isinstance(warmups, list) and len(warmups) == _resolve_num_warmups(params, default=2), (
+            "Realtime video warmups are missing"
+        )
+        assert all(row.get("success") is True and not row.get("error") for row in [*sessions, *warmups]), (
+            "Realtime video session or warmup failed"
+        )
+        for name in (
+            "mean_e2el_ms",
+            "request_throughput",
+            "mean_video_ttfc_ms",
+            "min_video_fps",
+            "mean_video_steady_interval_ms",
+            "p95_video_steady_interval_ms",
+            "mean_video_rtf",
+        ):
+            value = result.get(name)
+            assert _is_finite_number(value) and value >= 0, f"Realtime video has no valid {name} measurement"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)

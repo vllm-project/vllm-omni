@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellPlan,
     CellSchedule,
     Inflight,

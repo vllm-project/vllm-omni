@@ -489,7 +489,6 @@ def _run(coro):
 
 def test_session_records_one_chunk_per_block_and_ignores_the_trailer() -> None:
     workload = _workload(num_chunks=4)
-    observed = []
 
     async def scenario() -> None:
         server = _serve(_emit_rollout)
@@ -504,13 +503,11 @@ def test_session_records_one_chunk_per_block_and_ignores_the_trailer() -> None:
                 ping_interval=0,
                 collect_media=True,
                 print_chunks=False,
-                on_chunk=lambda record: observed.append(record.index),
             )
         finally:
             await server.__aexit__(None, None, None)
 
         assert [record.index for record in result.records] == [0, 1, 2, 3]
-        assert observed == [0, 1, 2, 3]
         assert [record.num_frames for record in result.records] == [9, 12, 12, 12]
         assert result.request_id == "req-1"
         assert result.ttfc_s is not None and result.ttfc_s > 0
@@ -717,42 +714,6 @@ def test_failed_trace_write_preserves_the_session_error(tmp_path: Path, capsys: 
     assert occupied.read_text() == "existing file"
 
 
-def test_cancelled_session_retains_chunks_and_propagates_cancellation(tmp_path: Path) -> None:
-    async def script(websocket, payload) -> None:
-        await _emit_rollout(websocket, payload, chunks=1, trailer=False, done=False)
-        await websocket.wait_closed()
-
-    async def scenario() -> None:
-        received = asyncio.Event()
-        trace_path = tmp_path / "cancelled.json"
-        async with _serve(script) as url:
-            task = asyncio.create_task(
-                run_session(
-                    url,
-                    "model",
-                    _workload(num_chunks=4),
-                    first_chunk_timeout=5,
-                    chunk_timeout=5,
-                    ping_interval=0.1,
-                    collect_media=False,
-                    print_chunks=False,
-                    on_chunk=lambda record: received.set(),
-                    failure_output=trace_path,
-                )
-            )
-            await asyncio.wait_for(received.wait(), timeout=5)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        trace = json.loads(trace_path.read_text())
-        assert trace["complete"] is False
-        assert trace["error"]["type"] == "CancelledError"
-        assert len(trace["chunks"]) == 1
-        assert trace["chunks"][0]["index"] == 0
-
-    _run(scenario())
-
-
 def test_a_server_error_event_aborts_the_session() -> None:
     workload = _workload(num_chunks=2)
 
@@ -850,25 +811,14 @@ def test_keepalive_pings_reach_the_server_during_a_slow_first_chunk() -> None:
     _run(scenario())
 
 
-@pytest.mark.parametrize("camera", [False, True])
-def test_interactions_are_sent_on_their_chunk_boundary(camera: bool) -> None:
+def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
     update = PromptUpdate(after_chunk=0, prompt="Rain begins", transition_chunks=1)
     payload = update.to_payload()
-    if camera:
-        payload["interaction"]["event"] = {
-            "multi_modal_data": {
-                "camera": {
-                    "mode": "target",
-                    "data": {"translation": [0.0, 0.0, 1.0], "rotation": [0.0, 0.0, 0.0, 1.0]},
-                }
-            }
-        }
     workload = Workload(
         prompt="start",
         image_reference=_IMAGE,
         camera_script=build_camera_script(3, "forward"),
-        prompt_updates=() if camera else (update,),
-        extra_params={"camera_action_script": None} if camera else {},
+        prompt_updates=(update,),
     )
     received: list[dict] = []
 
@@ -895,15 +845,12 @@ def test_interactions_are_sent_on_their_chunk_boundary(camera: bool) -> None:
                 ping_interval=0,
                 collect_media=False,
                 print_chunks=False,
-                interactions_after_chunk={0: payload} if camera else None,
             )
         finally:
             await server.__aexit__(None, None, None)
         interactions = [event for event in received if event.get("type") == "session.interaction"]
         assert len(interactions) == 1
         assert interactions[0] == payload
-        if camera:
-            assert server.start_payloads[0]["extra_params"]["camera_action_script"] is None
 
     _run(scenario())
 

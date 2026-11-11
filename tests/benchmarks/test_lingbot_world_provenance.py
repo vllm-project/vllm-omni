@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from benchmarks.lingbot_world.regression import RegressionError
-from tests.dfx.lingbot_world import runner
+from tests.e2e.accuracy.lingbot_world import runner
 from vllm_omni.benchmarks.realtime_video import client as realtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
