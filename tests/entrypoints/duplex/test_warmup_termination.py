@@ -62,4 +62,60 @@ async def test_timeout_is_never_reported_as_listen():
 
 
 def test_outcomes_are_distinct():
-    assert len({warmup.WARMUP_OUTCOME_AUDIO, warmup.WARMUP_OUTCOME_LISTEN, warmup.WARMUP_OUTCOME_TIMEOUT}) == 3
+    assert (
+        len(
+            {
+                warmup.WARMUP_OUTCOME_AUDIO,
+                warmup.WARMUP_OUTCOME_TEXT,
+                warmup.WARMUP_OUTCOME_LISTEN,
+                warmup.WARMUP_OUTCOME_TIMEOUT,
+            }
+        )
+        == 4
+    )
+
+
+@pytest.mark.asyncio
+async def test_text_probe_completed_response_ends_the_wait():
+    response = {
+        "status": "completed",
+        "output": [{"content": [{"type": "output_text", "text": "ready"}]}],
+    }
+    outcome = await warmup.wait_for_warmup_outcome(
+        _recv([{"type": "response.done", "response": response}]),
+        5.0,
+        kind="silent_frames",
+        text_only=True,
+    )
+    assert outcome == warmup.WARMUP_OUTCOME_TEXT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "completed", "output": []},
+        {"status": "completed", "output": [{"content": [{"type": "output_text", "text": ""}]}]},
+        {"status": "incomplete", "output": [{"content": [{"type": "output_text", "text": "ready"}]}]},
+    ],
+)
+async def test_text_probe_ignores_responses_without_completed_text(response):
+    events = [{"type": "response.done", "response": response}, {"type": "response.listen"}]
+    outcome = await warmup.wait_for_warmup_outcome(_recv(events), 5.0, kind="silent_frames", text_only=True)
+    assert outcome == warmup.WARMUP_OUTCOME_LISTEN
+
+
+@pytest.mark.asyncio
+async def test_audio_probe_ignores_completed_text_response():
+    events: list[Mapping[str, object]] = [
+        {
+            "type": "response.done",
+            "response": {
+                "status": "completed",
+                "output": [{"content": [{"type": "output_text", "text": "ready"}]}],
+            },
+        },
+        {"type": "response.output_audio.delta"},
+    ]
+    outcome = await warmup.wait_for_warmup_outcome(_recv(events), 5.0, kind="silent_frames", text_only=False)
+    assert outcome == warmup.WARMUP_OUTCOME_AUDIO

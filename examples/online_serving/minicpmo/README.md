@@ -23,6 +23,14 @@ including `librosa`.
 
 ## Start the backend server
 
+Realtime output defaults follow the deployment's advertised
+`default_output_modalities`. The profiles below retain the full speech pipeline.
+RFC #10143's capability negotiation and text history contracts do not yet supply
+a Thinker-only profile or Stage 0 text projection. When connecting to a future
+text-only deployment, typed clients that serialize an audio default must
+explicitly select `modalities=["text"]`; unavailable audio is rejected rather
+than silently downgraded. Text history does not require playback ACKs.
+
 The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
 logical device 0 with memory budgets of 55%, 15%, and 18%, leaving headroom
