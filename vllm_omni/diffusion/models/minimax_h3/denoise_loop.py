@@ -372,10 +372,11 @@ def minimax_h3_denoise_loop(
     # own num_steps. forward() runs one call per output seed and per
     # continuation window, all with the main num_steps, and with latent_refine
     # one more call per output seed over the tail of the sigma list, which has
-    # its own num_steps. An attention schedule selects profiles on each call
-    # from step 0. The pipeline checks the schedule against the main num_steps
-    # before the first call and rejects a schedule together with latent_refine,
-    # so a request with a schedule runs only calls with the main num_steps.
+    # its own num_steps. Step ranges select profiles on each call from step 0.
+    # The pipeline checks them against the main num_steps before the first call
+    # and rejects them together with latent_refine, so a request with step
+    # ranges runs only calls with the main num_steps. Sigma windows select from
+    # the sigma each call publishes, including the refine call.
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):

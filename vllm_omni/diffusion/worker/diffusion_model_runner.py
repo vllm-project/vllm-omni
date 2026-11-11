@@ -1593,7 +1593,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                with _attention_schedule_scope(attention_schedule):
+                with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
                     if getattr(input_batch, "use_mixfusion", False) and driver is None:
                         raise RuntimeError("Scheduler requested MixFusion without an installed driver")

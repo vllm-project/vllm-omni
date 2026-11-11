@@ -4235,6 +4235,7 @@ class MiniMaxH3Pipeline(
                         (request.extra.get(_STEP_VIDEO_EDIT), request.extra.get(_STEP_AUDIO_EDIT)),
                         model_rows=request.extra.get(_STEP_MODEL_ROWS),
                         attention_schedule=request.attention_schedule,
+                        attention_sigma_schedule=request.attention_sigma_schedule,
                     )
                     request.extra[_STEP_MODEL_ROWS] = adapter.model_rows
                     models[sample] = adapter
