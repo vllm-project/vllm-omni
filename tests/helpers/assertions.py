@@ -571,6 +571,13 @@ def assert_video_audio_valid(
         assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
 
 
+def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
+    """Assert a WAV body's native rate when the request did not ask the server for one."""
+    assert audio_bytes, "Expected WAV bytes"
+    info = sf.info(io.BytesIO(audio_bytes))
+    assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
+
+
 def assert_audio_valid(
     audio_or_path: Path | np.ndarray,
     *,
