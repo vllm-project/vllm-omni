@@ -817,3 +817,129 @@ def test_static_adapter_zero_startup_scale_stays_inactive(monkeypatch):
     manager.set_active_adapter(None, lora_scale=0.5)
     assert len(foo.set_calls) == 1
     assert torch.all(foo.set_calls[0][1] == 0.5)
+
+
+def test_resolve_adapter_reports_the_effective_request(monkeypatch):
+    """`resolve_adapter` must expose the adapter a request really runs with so
+    callers can tell whether an activation failure is fatal.
+    """
+    _patch_static_adapter_load(monkeypatch)
+
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        lora_path="/tmp/static_adapter",
+        lora_scale=0.25,
+    )
+
+    # A plain request resolves to the static adapter at its startup scale.
+    assert manager.resolve_adapter(None) == (manager._static_lora_request, 0.25)
+    assert manager.resolve_adapter(None, lora_scale=1.0) == (manager._static_lora_request, 0.25)
+
+    # An explicit request (and its scale) is never overridden by the default.
+    explicit = _dummy_lora_request(3)
+    assert manager.resolve_adapter(explicit, lora_scale=0.5) == (explicit, 0.5)
+
+    # Without a static adapter, a plain request resolves to "no adapter".
+    plain = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert plain.resolve_adapter(None) == (None, 1.0)
+
+
+class _AliasedComponentPipeline(torch.nn.Module):
+    """Mirrors SenseNovaU1Pipeline: the denoiser is reachable both as
+    `transformer` (a default component name) and as `language_model.model`
+    (the canonical path adapter checkpoint keys follow).
+    """
+
+    _lora_components = ("language_model",)
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = torch.nn.Module()
+        self.language_model.model = torch.nn.Module()
+        self.language_model.model.proj = _FakeLinearBase()
+        self.transformer = self.language_model.model
+
+
+def test_lora_manager_binds_nested_alias_under_canonical_component(monkeypatch):
+    """Regression: with an aliased denoiser, LoRA layers must be registered
+    under the canonical component path (`language_model.model.*`) so adapter
+    weights keyed by that path bind. Registering them under the inner alias
+    (`transformer.*`) made the adapter load and activate while applying to
+    zero layers, producing base-identical output. Ref: #4705.
+    """
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        if isinstance(layer, _FakeLinearBase):
+            return _DummyBaseLayerWithLoRA(layer)
+        return layer
+
+    replace_calls: list[str] = []
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
+    )
+
+    pipeline = _AliasedComponentPipeline()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    peft_helper = type("_PH", (), {"r": 2})()
+    manager._replace_layers_with_lora(peft_helper)
+
+    canonical_name = "language_model.model.proj"
+    aliased_name = "transformer.proj"
+    # The outer alias is scanned exactly once, under its canonical path.
+    assert set(manager._lora_modules) == {canonical_name}
+    assert replace_calls == ["model.proj"]
+    assert isinstance(pipeline.language_model.model.proj, _DummyBaseLayerWithLoRA)
+
+    def _adapter(adapter_id: int, module_name: str):
+        loras = {
+            module_name: LoRALayerWeights(
+                module_name=module_name,
+                rank=2,
+                lora_alpha=2,
+                lora_a=torch.ones((2, 4)),
+                lora_b=torch.ones((4, 2)),
+            )
+        }
+        return type(
+            "LM",
+            (),
+            {
+                "id": adapter_id,
+                "loras": loras,
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+
+    # Weights keyed by the canonical path bind to the layer.
+    manager._registered_adapters = {1: _adapter(1, canonical_name)}
+    manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
+
+    layer = manager._lora_modules[canonical_name]
+    assert manager._active_adapter_id == 1
+    assert len(layer.set_calls) == 1
+    assert layer.reset_calls == 0
+
+    # Weights keyed by the inner alias cannot match: the layer is reset rather
+    # than silently bound, which is the failure this PR makes visible.
+    manager._registered_adapters[2] = _adapter(2, aliased_name)
+    manager.set_active_adapter(_dummy_lora_request(2), lora_scale=1.0)
+    assert len(layer.set_calls) == 1
+    assert layer.reset_calls == 1

@@ -3,6 +3,7 @@
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import contextlib
+import math
 import os
 import queue
 import threading
@@ -891,11 +892,36 @@ class TestRunner:
 
 
 class _RecordingLoRAManager:
-    def __init__(self) -> None:
+    """Stand-in for ``DiffusionLoRAManager`` in worker-level tests.
+
+    Mirrors the real manager's static-adapter resolution (plain requests fall
+    back to the startup adapter and its startup scale) and can be told to fail
+    adapter binding so the worker's error policy can be asserted.
+    """
+
+    def __init__(
+        self,
+        static_request=None,
+        *,
+        fail: bool = False,
+        static_scale: float = 1.0,
+    ) -> None:
         self.calls: list[tuple[object | None, float]] = []
+        self.static_request = static_request
+        self.static_scale = static_scale
+        self.fail = fail
+
+    def resolve_adapter(self, adapter, scale: float = 1.0):
+        if adapter is None and self.static_request is not None:
+            adapter = self.static_request
+            if math.isclose(scale, 1.0):
+                scale = self.static_scale
+        return adapter, scale
 
     def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
+        if self.fail and adapter is not None and not math.isclose(scale, 0.0):
+            raise RuntimeError("LoRA binding failed")
 
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):
@@ -906,6 +932,38 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
     worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
     return worker
+
+
+def _make_lora_worker(lora_manager):
+    """Worker whose model runner records invocations instead of running."""
+    runner_calls: list[str] = []
+
+    def _recorder(name: str):
+        def _record(*_args, **_kwargs):
+            runner_calls.append(name)
+            return RunnerOutput(request_id="req-1")
+
+        return _record
+
+    worker = object.__new__(DiffusionWorker)
+    worker.lora_manager = lora_manager
+    worker._step_lora_state = {}
+    worker.model_runner = SimpleNamespace(
+        execute_model=_recorder("execute_model"),
+        execute_model_batch=_recorder("execute_model_batch"),
+        execute_stepwise=_recorder("execute_stepwise"),
+    )
+    worker._get_profiler = lambda: None
+    return worker, runner_calls
+
+
+def _run_worker_path(worker, path: str, request):
+    scheduler_output = _make_scheduler_output(request, request_id=request.request_id)
+    if path == "execute_model":
+        return DiffusionWorker.execute_model(worker, request, od_config=SimpleNamespace())
+    if path == "execute_model_batch":
+        return DiffusionWorker.execute_model_batch(worker, scheduler_output, SimpleNamespace())
+    return DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
 
 @pytest.mark.cpu
@@ -1012,6 +1070,92 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+
+    @pytest.mark.parametrize("path", ["execute_model", "execute_model_batch", "execute_stepwise"])
+    def test_failed_static_fallback_never_reaches_the_model_runner(self, path):
+        """Regression: a request without a LoRA request still runs with the
+        startup `--lora-path` adapter, so an activation failure there must not
+        be swallowed -- continuing would serve base-model output for a request
+        configured to use that adapter.
+        """
+        from vllm_omni.lora.request import LoRARequest
+
+        static_request = LoRARequest(lora_name="static", lora_int_id=5, lora_path="/tmp/static")
+        manager = _RecordingLoRAManager(static_request=static_request, fail=True)
+        worker, runner_calls = _make_lora_worker(manager)
+
+        with pytest.raises(RuntimeError, match="LoRA binding failed"):
+            _run_worker_path(worker, path, _make_engine_request("req-1"))
+
+        assert runner_calls == []
+        assert manager.calls == [(static_request, 1.0)]
+
+    @pytest.mark.parametrize("path", ["execute_model", "execute_model_batch", "execute_stepwise"])
+    def test_failed_explicit_adapter_never_reaches_the_model_runner(self, path):
+        from vllm_omni.lora.request import LoRARequest
+
+        adapter = LoRARequest(lora_name="adapter", lora_int_id=7, lora_path="/tmp/lora")
+        request = _make_engine_request("req-1")
+        request.sampling_params.lora_request = adapter
+        request.sampling_params.lora_scale = 0.5
+
+        manager = _RecordingLoRAManager(fail=True)
+        worker, runner_calls = _make_lora_worker(manager)
+
+        with pytest.raises(RuntimeError, match="LoRA binding failed"):
+            _run_worker_path(worker, path, request)
+
+        assert runner_calls == []
+        assert manager.calls == [(adapter, 0.5)]
+
+    @pytest.mark.parametrize("path", ["execute_model", "execute_model_batch", "execute_stepwise"])
+    def test_activation_failure_without_a_configured_adapter_is_tolerated(self, path):
+        """No static adapter and no request adapter: nothing is required, so a
+        failing activation must not break inference (the base model is what the
+        request asked for).
+        """
+        manager = _RecordingLoRAManager(fail=True)
+        worker, runner_calls = _make_lora_worker(manager)
+
+        _run_worker_path(worker, path, _make_engine_request("req-1"))
+
+        assert runner_calls == [path]
+        assert manager.calls == [(None, 1.0)]
+
+    @pytest.mark.parametrize("path", ["execute_model", "execute_model_batch", "execute_stepwise"])
+    def test_scale_zero_request_keeps_the_static_adapter_disabled(self, path):
+        """An explicit `scale: 0` opts out of the resident adapter for that
+        request instead of failing it.
+        """
+        from vllm_omni.lora.request import LoRARequest
+
+        static_request = LoRARequest(lora_name="static", lora_int_id=5, lora_path="/tmp/static")
+        request = _make_engine_request("req-1")
+        request.sampling_params.lora_scale = 0.0
+
+        manager = _RecordingLoRAManager(static_request=static_request, fail=True)
+        worker, runner_calls = _make_lora_worker(manager)
+
+        _run_worker_path(worker, path, request)
+
+        assert runner_calls == [path]
+        assert manager.calls == [(static_request, 0.0)]
+
+    @pytest.mark.parametrize("path", ["execute_model", "execute_model_batch", "execute_stepwise"])
+    def test_static_adapter_uses_startup_scale_for_plain_requests(self, path):
+        """The worker hands the manager the effective adapter *and* its startup
+        scale, not the sampling-params default of 1.0.
+        """
+        from vllm_omni.lora.request import LoRARequest
+
+        static_request = LoRARequest(lora_name="static", lora_int_id=5, lora_path="/tmp/static")
+        manager = _RecordingLoRAManager(static_request=static_request, static_scale=0.25)
+        worker, runner_calls = _make_lora_worker(manager)
+
+        _run_worker_path(worker, path, _make_engine_request("req-1"))
+
+        assert runner_calls == [path]
+        assert manager.calls == [(static_request, 0.25)]
 
 
 @pytest.mark.cpu

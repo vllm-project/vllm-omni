@@ -232,6 +232,34 @@ class DiffusionLoRAManager:
             return None
         return sub_suffixes
 
+    def resolve_adapter(
+        self, lora_request: LoRARequest | None, lora_scale: float = 1.0
+    ) -> tuple[LoRARequest | None, float]:
+        """Resolve the adapter a request actually runs with.
+
+        A request that carries no `lora_request` falls back to the static
+        adapter configured at startup (`--lora-path`). While falling back, the
+        sampling-params default scale of 1.0 is treated as "unspecified" and
+        the startup `--lora-scale` is restored, so a non-default (or zero)
+        startup scale survives the fallback.
+
+        Callers that must decide whether an activation failure is fatal should
+        use this instead of the raw request: a resolved adapter means one is
+        required, so falling back to the base model would silently change the
+        model the user asked for.
+
+        Returns:
+            The effective (lora_request, lora_scale) pair; `lora_request` is
+            None only when no adapter is required for this request.
+        """
+        if lora_request is None and self._static_lora_request is not None:
+            lora_request = self._static_lora_request
+            if math.isclose(lora_scale, 1.0):
+                # A plain request carries the sampling-params default scale,
+                # which is indistinguishable from an explicit scale=1.0.
+                lora_scale = self._static_lora_scale
+        return lora_request, lora_scale
+
     def set_active_adapter(self, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> None:
         """Set the active LoRA adapter for the pipeline.
 
@@ -245,14 +273,7 @@ class DiffusionLoRAManager:
                 `--lora-scale` is restored instead; any other value (including
                 0, the explicit opt-out) is honored as a per-request override.
         """
-        if lora_request is None and self._static_lora_request is not None:
-            lora_request = self._static_lora_request
-            if math.isclose(lora_scale, 1.0):
-                # A plain request carries the sampling-params default scale,
-                # which is indistinguishable from an explicit scale=1.0.
-                # Restore the scale the static adapter was started with so a
-                # non-default (or zero) startup scale survives the fallback.
-                lora_scale = self._static_lora_scale
+        lora_request, lora_scale = self.resolve_adapter(lora_request, lora_scale)
 
         if lora_request is None:
             if self._active_adapter_id is None:

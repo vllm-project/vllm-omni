@@ -646,12 +646,7 @@ class DiffusionWorker:
             diffusion_kv_metadata = new_req.diffusion_kv_metadata
 
         if self.lora_manager is not None:
-            try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
-            except Exception as exc:
-                if req.sampling_params.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            self._set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
@@ -679,12 +674,7 @@ class DiffusionWorker:
         # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
-            try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
-            except Exception as exc:
-                if sp.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            self._set_active_adapter(sp.lora_request, sp.lora_scale)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
         with ctx:
@@ -704,6 +694,26 @@ class DiffusionWorker:
         if profiler:
             profiler.step()
         return output
+
+    def _set_active_adapter(self, lora_request: LoRARequest | None, lora_scale: float) -> None:
+        """Activate the LoRA adapter the request will actually run with.
+
+        A request that carries no LoRA request still runs with the static
+        adapter configured at startup (`--lora-path`), so the raw request is
+        not a reliable signal of whether an adapter is required. Activation
+        failures are fatal whenever an adapter is required: the manager has
+        already reset the LoRA layers by then, so continuing would serve base
+        model output for a request that asked for -- or was configured with --
+        that adapter. Failures are only logged when no adapter is required.
+        """
+        assert self.lora_manager is not None, "LoRA manager not initialized"
+        effective_request, effective_scale = self.lora_manager.resolve_adapter(lora_request, lora_scale)
+        try:
+            self.lora_manager.set_active_adapter(effective_request, effective_scale)
+        except Exception as exc:
+            if effective_request is not None:
+                raise
+            logger.warning("LoRA activation skipped: %s", exc)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
@@ -735,12 +745,7 @@ class DiffusionWorker:
                 lora_request, lora_scale = entry
                 break
 
-        try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
-        except Exception as exc:
-            if lora_request is not None:
-                raise
-            logger.warning("LoRA activation skipped: %s", exc)
+        self._set_active_adapter(lora_request, lora_scale)
 
     def remove_lora(self, adapter_id: int) -> bool:
         if self.lora_manager is None:
