@@ -70,14 +70,16 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors.shm_connector import SharedMemoryConnector
+        from vllm_omni.platforms import current_omni_platform
     except ImportError:
         # Fallback import
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from omni_connectors.connectors.shm_connector import SharedMemoryConnector
-    return SharedMemoryConnector(config)
+
+        return SharedMemoryConnector(config)
+    return current_omni_platform.get_shared_memory_connector_cls()(config)
 
 
 def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:

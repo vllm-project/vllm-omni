@@ -1,20 +1,70 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import sys
 import types
+import weakref
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from vllm.logger import _print_warning_once, init_logger
 
+from vllm_omni.diffusion.attention.ops import block_sparse
 from vllm_omni.diffusion.attention.ops.block_sparse import (
     build_prefix_dense_block_map,
     fastvideo_block_sparse_attn_bshd,
     mean_pool_tiles,
+    resolve_block_sparse_provider,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_tile128_startup_honors_installed_native_capability(monkeypatch, capability):
+    native = pytest.importorskip("fastvideo_kernel.block_sparse_attn_sm100a")
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", lambda _: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+    resolve_block_sparse_provider.cache_clear()
+    try:
+        with FakeTensorMode():
+            device = torch.device("cuda:0")
+            query = torch.empty(1, 1, 256, 128, dtype=torch.bfloat16, device=device)
+            sizes = torch.empty(2, dtype=torch.int32, device=device)
+            # Exercise the dependency's real predicate; fake tensors avoid
+            # needing either architecture or launching a GPU kernel.
+            supported = native.is_supported(query, sizes)
+            if capability == (10, 3):
+                assert not supported
+                assert resolve_block_sparse_provider("auto", "bf16", device, torch.bfloat16, 128, 128) == "triton"
+            if supported:
+                assert (
+                    resolve_block_sparse_provider("fastvideo", "bf16", device, torch.bfloat16, 128, 128) == "fastvideo"
+                )
+            else:
+                with pytest.raises((ImportError, ValueError), match="FastVideo tile128"):
+                    resolve_block_sparse_provider("fastvideo", "bf16", device, torch.bfloat16, 128, 128)
+    finally:
+        resolve_block_sparse_provider.cache_clear()
+
+
+def test_tile128_startup_rejects_native_build_without_tile128(monkeypatch):
+    native = pytest.importorskip("fastvideo_kernel.block_sparse_attn_sm100a")
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setitem(native._FWD_BY_BLOCK, 128, None)
+    resolve_block_sparse_provider.cache_clear()
+    try:
+        with FakeTensorMode(), pytest.raises(ImportError, match="FastVideo tile128"):
+            resolve_block_sparse_provider("fastvideo", "bf16", torch.device("cuda:0"), torch.bfloat16, 128, 128)
+    finally:
+        resolve_block_sparse_provider.cache_clear()
 
 
 @pytest.mark.parametrize("prefix_blocks,topk", [(0, 1), (2, 0), (2, 1), (2, 3), (2, 5)])
@@ -124,3 +174,43 @@ def test_native_provider_failure_only_recovers_without_accelerator_fault(monkeyp
         output = fastvideo_block_sparse_attn_bshd(query, query, query, block_map, sizes, 2)
         torch.testing.assert_close(output, query, rtol=0, atol=0)
         fallback.assert_called_once()
+
+
+def test_native_provider_failure_logging_releases_tensors(monkeypatch):
+    monkeypatch.setenv("FASTVIDEO_VSA_SM100A", "1")
+    references = []
+
+    # Plain functions, not mocks: mocks record call arguments and would keep q alive.
+    def failing_native(q, *args, **kwargs):
+        references.append(weakref.ref(q))
+        raise RuntimeError("native provider failure")
+
+    native = types.SimpleNamespace(is_supported=lambda *args: True, block_sparse_attn_sm100a=failing_native)
+    provider = types.ModuleType("fastvideo_kernel")
+    setattr(provider, "block_sparse_attn_sm100a", native)
+    index = types.ModuleType("fastvideo_kernel.triton_kernels.index")
+    setattr(index, "map_to_index", lambda block_map: (torch.zeros(1), torch.ones(1)))
+    triton = types.ModuleType("fastvideo_kernel.block_sparse_attn")
+    setattr(triton, "block_sparse_attn", lambda q, *args: (q.clone(), None))
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel", provider)
+    monkeypatch.setitem(
+        sys.modules, "fastvideo_kernel.triton_kernels", types.ModuleType("fastvideo_kernel.triton_kernels")
+    )
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel.triton_kernels.index", index)
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel.block_sparse_attn", triton)
+    monkeypatch.setattr(block_sparse, "logger", init_logger("block-sparse-retention-test"))
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+    sizes = torch.tensor([64, 64], dtype=torch.int32)
+
+    _print_warning_once.cache_clear()
+    try:
+        for _ in range(4):
+            query = torch.randn(1, 128, 2, 8)
+            output = fastvideo_block_sparse_attn_bshd(query, query, query, block_map, sizes, 2)
+            assert output.shape == query.shape
+        del query, output
+        gc.collect()
+        assert len(references) == 4
+        assert all(ref() is None for ref in references)
+    finally:
+        _print_warning_once.cache_clear()

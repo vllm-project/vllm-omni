@@ -20,12 +20,17 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .triton_launch import cuda_pdl_launch_kwargs
+
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
 
 # Hopper+ supports programmatic dependent launch. The kernel waits for its
 # predecessor before any global access and lets its successor launch at once; results are unchanged.
 _USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
+# PTX exp and pointer-select loads are CUDA Triton. HIP rejects the asm, and
+# tl.where on pointers crashes AMD pointer canonicalization.
+_CUDA_TRITON = current_platform.is_cuda() and not current_platform.is_rocm()
 
 
 def _bthd_out(q: torch.Tensor) -> torch.Tensor:
@@ -577,12 +582,20 @@ def _(
 
 
 @triton.jit
-def _exp_ftz(x):
+def _exp_ftz(x, USE_PTX_EXP: tl.constexpr):  # noqa: N803
     # tl.exp(x) lowers to ex2.approx.f32(x * log2e); .ftz only drops the
     # subnormal-result fixup, so results differ only below 2**-126.
-    return tl.inline_asm_elementwise(
-        "ex2.approx.ftz.f32 $0, $1;", "=f,f", [x * 1.4426950408889634], dtype=tl.float32, is_pure=True, pack=1
-    )
+    # The inline asm is PTX, so HIP uses tl.exp.
+    if USE_PTX_EXP:
+        return tl.inline_asm_elementwise(
+            "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            [x * 1.4426950408889634],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    return tl.exp(x)
 
 
 @triton.jit
@@ -629,6 +642,8 @@ def _ring_flash(
     fma_scale: tl.constexpr,
     packed: tl.constexpr,
     USE_PDL: tl.constexpr = False,  # noqa: N803
+    USE_PTX_EXP: tl.constexpr = False,  # noqa: N803
+    SELECT_PTR: tl.constexpr = False,  # noqa: N803
 ):
     """Ring write + attention in one pass, without redundant work.
 
@@ -737,12 +752,15 @@ def _ring_flash(
             token = cols - last_index + newest - tl.where(cols > last_index, ring_capacity, 0)
             in_ring = cols < ring_capacity
             fresh = in_ring & (token >= 0)
-            k_src = tl.where(
-                fresh[None, :],
-                k_row + token[None, :] * ks2 + dims[:, None] * ks3,
-                cache_ptr + base + cols[None, :] * head_dim + dims[:, None],
-            )
-            k = tl.load(k_src, in_ring[None, :], 0)
+            k_fresh_ptr = k_row + token[None, :] * ks2 + dims[:, None] * ks3
+            k_cache_ptr = cache_ptr + base + cols[None, :] * head_dim + dims[:, None]
+            if SELECT_PTR:
+                k_src = tl.where(fresh[None, :], k_fresh_ptr, k_cache_ptr)
+                k = tl.load(k_src, in_ring[None, :], 0)
+            else:
+                k_fresh = tl.load(k_fresh_ptr, fresh[None, :] & in_ring[None, :], 0)
+                k_cache = tl.load(k_cache_ptr, (~fresh)[None, :] & in_ring[None, :], 0)
+                k = tl.where(fresh[None, :], k_fresh, k_cache)
             score = tl.dot(q, k).to(tl.float32)
             if not fma_scale:
                 score = score * scale
@@ -775,16 +793,19 @@ def _ring_flash(
             safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
             rescale = tl.exp(maximum - safe_max)
             if fma_scale:
-                p = _exp_ftz(tl.fma(score, scale, -safe_max[:, None]))
+                p = _exp_ftz(tl.fma(score, scale, -safe_max[:, None]), USE_PTX_EXP)
             else:
-                p = _exp_ftz(score - safe_max[:, None])
+                p = _exp_ftz(score - safe_max[:, None], USE_PTX_EXP)
             denominator = denominator * rescale + tl.sum(p, 1)
-            v_src = tl.where(
-                fresh[:, None],
-                v_row + token[:, None] * vs2 + dims[None, :] * vs3,
-                cache_ptr + v_base + cols[:, None] * head_dim + dims[None, :],
-            )
-            v = tl.load(v_src, in_ring[:, None], 0)
+            v_fresh_ptr = v_row + token[:, None] * vs2 + dims[None, :] * vs3
+            v_cache_ptr = cache_ptr + v_base + cols[:, None] * head_dim + dims[None, :]
+            if SELECT_PTR:
+                v_src = tl.where(fresh[:, None], v_fresh_ptr, v_cache_ptr)
+                v = tl.load(v_src, in_ring[:, None], 0)
+            else:
+                v_fresh = tl.load(v_fresh_ptr, fresh[:, None] & in_ring[:, None], 0)
+                v_cache = tl.load(v_cache_ptr, (~fresh)[:, None] & in_ring[:, None], 0)
+                v = tl.where(fresh[:, None], v_fresh, v_cache)
             acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v)
             maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
@@ -840,9 +861,11 @@ def _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_
         one_warpgroup and d == 64,
         False,
         USE_PDL=_USE_PDL,
-        launch_pdl=_USE_PDL,
+        USE_PTX_EXP=_CUDA_TRITON,
+        SELECT_PTR=_CUDA_TRITON,
         num_warps=nw,
         num_stages=ns,
+        **cuda_pdl_launch_kwargs(_USE_PDL),
     )
     return out
 
@@ -912,9 +935,11 @@ def _launch_flash_packed(
         one_warpgroup and d == 64,
         True,
         USE_PDL=_USE_PDL,
-        launch_pdl=_USE_PDL,
+        USE_PTX_EXP=_CUDA_TRITON,
+        SELECT_PTR=_CUDA_TRITON,
         num_warps=nw,
         num_stages=ns or 2,
+        **cuda_pdl_launch_kwargs(_USE_PDL),
     )
     return out
 
@@ -1006,8 +1031,24 @@ def slot_ring_flash_attention(
     Same state and masking contract; one write+attend launch plus the offset
     advance. FTZ and reduction-layout choices prevent a universal bitwise
     output guarantee. ``skip_empty_tiles`` is accepted for signature
-    compatibility: this kernel always skips wholly masked tiles.
+    compatibility: this kernel always skips wholly masked tiles. Non-CUDA
+    runtimes use the portable ring path to preserve exact output parity.
     """
+    if not _CUDA_TRITON:
+        # HIP cannot use the CUDA pointer-select path. Its separate masked
+        # loads change the reduction layout for larger chunks, so preserve the
+        # established exact-output contract with the portable ring kernels.
+        return slot_ring_attention(
+            q,
+            k,
+            v,
+            cache,
+            end_offset,
+            slot_ids,
+            valid_lengths,
+            context,
+            skip_empty_tiles,
+        )
     b = q.shape[0]
     _check_inputs(q, k, v, cache, (end_offset, slot_ids, valid_lengths), context)
     if end_offset.shape != (cache.shape[1],) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):
@@ -1048,9 +1089,22 @@ def slot_ring_flash_attention_rows(
 ) -> torch.Tensor:
     """``slot_ring_attention_rows`` with the single-pass flash ring kernel.
 
-    One launch per chunk, preserving ring updates and causal masking; see
-    ``_ring_flash`` for the numerical limitations.
+    One launch per chunk on CUDA, preserving ring updates and causal masking;
+    see ``_ring_flash`` for the numerical limitations. Non-CUDA runtimes use
+    the portable ring path to preserve exact output parity.
     """
+    if not _CUDA_TRITON:
+        return slot_ring_attention_rows(
+            q,
+            k,
+            v,
+            cache,
+            starts,
+            slot_ids,
+            valid_lengths,
+            context,
+            skip_empty_tiles,
+        )
     b = q.shape[0]
     _check_inputs(q, k, v, cache, (starts, slot_ids, valid_lengths), context)
     if starts.shape != (b,) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):

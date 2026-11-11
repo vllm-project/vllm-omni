@@ -35,9 +35,8 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
+from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
-from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
@@ -72,6 +71,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.speech_to_text.transcription.serving import (
@@ -81,6 +81,8 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
+from vllm.renderers.online_derenderer import OnlineDerenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -105,7 +107,6 @@ from vllm_omni.entrypoints.duplex.warmup import (
     _warmup_duplex_realtime,
     lookup_duplex_plugin,
     startup_warmup_kind,
-    wait_for_duplex_warmup,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -122,7 +123,6 @@ from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template
 from vllm_omni.entrypoints.openai.diffusion import (
     MAX_UINT32_SEED,
     _generate_with_async_omni,
-    apply_stage_default_sampling_params,
 )
 from vllm_omni.entrypoints.openai.errors import (
     InvalidPresetVoiceReferenceError,
@@ -141,9 +141,13 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _extract_segmentation_instances,
     _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
+    _load_uploaded_image,
+    _parse_json_list_form,
+    _supports_segmentation,
     _update_if_not_none,
 )
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
@@ -157,18 +161,23 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ImageSegmentationResponse,
     ResponseFormat,
+    SegmentationMaskFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
+    VideoDepthResponse,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoListResponse,
     VideoResponse,
+    VideoSegmentationResponse,
 )
 from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionCapacityError,
@@ -178,6 +187,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -189,9 +199,20 @@ from vllm_omni.entrypoints.openai.serving_video import (
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+from vllm_omni.entrypoints.openai.stage_params import (
+    get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
+)
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.openai.video.depth.helpers import (
+    VIDEO_DEPTH_COLORMAPS,
+    VIDEO_DEPTH_MAX_BYTES,
+    extract_video_depth,
+    render_video_depth_response,
+    supports_video_depth,
+)
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
@@ -199,12 +220,21 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _cleanup_video,
     _cleanup_video_references,
     _parse_video_form,
+    _persist_uploaded_reference,
     _run_video_generation_job,
     _status_code_for_video_failure,
     _unpack_video_generation_result,
+    validate_latent_continuation_source,
     video_response_from_request,
 )
+from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
+    VIDEO_SEGMENTATION_MAX_BYTES,
+    extract_video_segmentation,
+    render_video_segmentation_response,
+    supports_video_segmentation,
+)
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 from vllm_omni.entrypoints.serve.profile.protocol import ProfileRequest
 from vllm_omni.entrypoints.serve.profile.utils import _should_enable_profiler_endpoints
@@ -218,7 +248,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -395,6 +425,20 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        provider = getattr(getattr(engine_client, "engine", None), "tracer_provider", None)
+        if provider is not None:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+            from vllm_omni.tracing import TraceContextMiddleware
+
+            # Upstream build_app may already have cached the uninstrumented stack.
+            app.middleware_stack = None
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=provider,
+                exclude_spans=["send", "receive"],
+                excluded_urls="health,healthz,metrics",
+            )
         app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
@@ -411,17 +455,38 @@ async def omni_run_server_worker(
 
             register_routes(app, args.port)
 
+        # OMNI: Mount the weight-transfer admin routes only when the feature
+        # is enabled via weight_transfer_config (mirrors upstream vLLM, which
+        # keeps weight-mutation endpoints behind an explicit opt-in).
+        if getattr(engine_client, "weight_transfer_enabled", False):
+            logger.warning(
+                "SECURITY WARNING: weight transfer endpoints are enabled! "
+                "These mutate model weights and must not be exposed in "
+                "untrusted environments."
+            )
+            app.include_router(weight_transfer_api.router)
+
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        # The inherited routes assume a tokenization handler. Pure diffusion
+        # has none; omit those capabilities instead of dereferencing None.
+        if getattr(app.state, "serving_tokenization", None) is None:
+            remove_route_from_app(app, "/tokenize", {"POST"})
+            remove_route_from_app(app, "/detokenize", {"POST"})
+            remove_route_from_app(app, "/tokenizer_info", {"GET"})
+
         # After initializing the app state, shut down any endpoints that are model specific
         if hasattr(engine_client, "endpoint_restrictions"):
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # Shutdown run requests unless we enabled it directly
+        shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -433,6 +498,21 @@ async def omni_run_server_worker(
             remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
             remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
+        elif os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+            # Migration diagnostic, not a compatibility path. Profiling moved to
+            # ProfilerConfig in vllm-project/vllm#29912 and this variable was
+            # removed in vllm-project/vllm#33536 (vLLM v0.16.0). The read below
+            # only detects a stale value so we can warn; it does not enable
+            # profiling or register the endpoints.
+            logger.warning(
+                "VLLM_TORCH_PROFILER_DIR is set but is ignored: it was removed in "
+                "vLLM v0.16.0 when profiling moved to ProfilerConfig. Profiler "
+                "endpoints are registered from a stage's profiler_config, and no "
+                "stage declares one, so /start_profile and /stop_profile were "
+                'NOT registered. Use --profiler-config \'{"profiler": "torch", '
+                '"torch_profiler_dir": "..."}\' or add a profiler_config block to a '
+                "stage in your deploy YAML. See docs/contributing/profiling.md."
+            )
 
         vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
@@ -470,6 +550,7 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
+                self._asgi = TraceContextMiddleware(inner) if provider is not None else inner
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
@@ -479,7 +560,7 @@ async def omni_run_server_worker(
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 
-                await self._inner(scope, receive, send)
+                await self._asgi(scope, receive, send)
 
         # Startup duplex warmup: real /v1/realtime connections wait on this
         # event. Video-required models (AURA) do this by default — one short
@@ -494,9 +575,9 @@ async def omni_run_server_worker(
         app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
         if warmup_kind is not None:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
+            # Scheduled before serve_http (which may not return until shutdown).
+            # One frontend retries a self-connect; multiple frontends warm
+            # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
         shutdown_task = await serve_http(
@@ -709,6 +790,7 @@ async def _init_duplex_app_state(
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
     state.online_renderer = None
+    state.online_derenderer = None
     for attribute in (
         "openai_serving_chat_batch",
         "openai_serving_completion",
@@ -727,6 +809,7 @@ async def _init_duplex_app_state(
         "openai_streaming_video_output",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
+        "run_serving",
     ):
         setattr(state, attribute, None)
     state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
@@ -802,7 +885,20 @@ def _init_chat_services(
     enable_batch: bool,
 ) -> None:
     """Share chat setup while callers retain capability and endpoint gating."""
-    state.online_renderer = OnlineRenderer(
+    # Serving classes cache system_fingerprint at init. Match upstream
+    # init_generate_state: configure the mode before those constructors run.
+    set_default_fingerprint_mode(
+        getattr(args, "fingerprint_mode", "full"),
+        getattr(args, "fingerprint_value", None),
+    )
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    # Pin CLI fields. getattr keeps test namespaces that predate these flags
+    # on the same disabled defaults the upstream constructors use.
+    trust_request_mm_kwargs = getattr(args, "trust_request_mm_kwargs", False)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
+    reasoning_effort_map = getattr(args, "reasoning_effort_map", None)
+    reasoning_parser = args.structured_outputs_config.reasoning_parser
+    renderer_kwargs = dict(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
         request_logger=request_logger,
@@ -812,10 +908,17 @@ def _init_chat_services(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
+        reasoning_effort_map=reasoning_effort_map,
         log_error_stack=args.log_error_stack,
     )
+    state.online_renderer = OnlineRenderer(
+        **renderer_kwargs,
+        trust_request_mm_kwargs=trust_request_mm_kwargs,
+    )
+    state.online_derenderer = OnlineDerenderer(**renderer_kwargs)
     chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -824,17 +927,19 @@ def _init_chat_services(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
     state.openai_serving_chat = OmniOpenAIServingChat(**chat_kwargs) if enable_chat else None
     state.openai_serving_chat_batch = (
@@ -902,6 +1007,7 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    state.run_serving = ServingRun(engine_client)
 
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
@@ -920,6 +1026,7 @@ async def omni_init_app_state(
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            enable_force_include_usage=args.enable_force_include_usage,
         )
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -950,6 +1057,7 @@ async def omni_init_app_state(
         state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=engine_client,
             model_name=model_name,
+            served_model_names=served_model_names,
             stage_configs=diffusion_stage_configs,
             speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
@@ -989,11 +1097,14 @@ async def omni_init_app_state(
     logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = await _resolve_chat_template(engine_client, args)
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
 
     chat_template_config = ChatTemplateConfig(
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
         trust_request_chat_template=args.trust_request_chat_template,
+        trust_request_mm_kwargs=getattr(args, "trust_request_mm_kwargs", False),
     )
 
     if args.tool_server == "demo":
@@ -1081,11 +1192,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             tool_server=tool_server,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
             enable_log_outputs=args.enable_log_outputs,
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -1100,6 +1214,9 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
         )
         if "generate" in supported_tasks
         else None
@@ -1153,7 +1270,7 @@ async def omni_init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
     state.openai_serving_transcription = (
@@ -1188,10 +1305,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
-            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            enable_log_outputs=getattr(args, "enable_log_outputs", False),
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            default_chat_template_kwargs=default_chat_template_kwargs,
+            disabled_thinking_effort=getattr(args, "anthropic_disabled_thinking_effort", "auto"),
         )
         if "generate" in supported_tasks
         else None
@@ -1201,6 +1322,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             state.online_renderer,
+            online_derenderer=state.online_derenderer,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -1224,6 +1346,22 @@ async def omni_init_app_state(
         )
         is not None,
     )
+
+    has_ming3_chat = (
+        state.openai_serving_chat is not None
+        and getattr(state.openai_serving_chat, "_has_ming3_talker_stage", lambda: False)()
+    )
+    if has_ming3_chat or getattr(state.openai_serving_speech, "_tts_model_type", None) == "ming3_audio_tts":
+        from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets
+
+        await register_model_voice_presets(
+            state.openai_serving_speech,
+            args.model,
+            revision=getattr(args, "revision", None),
+            cache_dir=getattr(args, "download_dir", None),
+        )
+        if has_ming3_chat and state.openai_serving_chat is not None:
+            state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
@@ -1250,7 +1388,12 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
-    state.openai_serving_realtime_robot = None
+    # Policies whose first stage is autoregressive (for example reasoning before
+    # acting) serve OpenPI too; this is None without policy_server_config.
+    state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=engine_client,
+        model_name=model_name,
+    )
     state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
@@ -1298,6 +1441,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 detail="The model does not support Chat Completions API",
             )
         return base_server.create_error_response(message="The model does not support Chat Completions API")
+    if request.model == "auto":
+        request.model = None
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -1438,6 +1583,9 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1465,6 +1613,9 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
@@ -1543,6 +1694,7 @@ async def list_voices(raw_request: Request):
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
             voice_entry = {
+                "id": voice_name,
                 "name": info.get("name", voice_name),
                 "consent": info.get("consent", ""),
                 "created_at": info.get("created_at", 0),
@@ -1665,6 +1817,7 @@ async def upload_voice(
         else:
             return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
+        result["id"] = name.strip().lower()
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
@@ -1802,7 +1955,6 @@ async def realtime_websocket(websocket: WebSocket):
     if use_duplex_realtime and duplex_handler is not None:
         if await _reject_multi_api_duplex(websocket):
             return
-        await wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
         return
 
@@ -1810,6 +1962,13 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.accept()
         await websocket.send_json({"type": "error", "code": "unsupported", "error": "VAD realtime is not enabled"})
         await websocket.close(code=1008)
+        return
+
+    chat = getattr(websocket.app.state, "openai_serving_chat", None)
+    if chat is not None and getattr(chat, "_ming3_speech_service", None) is not None:
+        from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
+
+        await Ming3RealtimeConnection(websocket, chat).handle_connection()
         return
 
     realtime_handler = getattr(websocket.app.state, "openai_realtime_handler", None)
@@ -1825,7 +1984,6 @@ async def duplex_websocket(websocket: WebSocket):
     """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
     if await _reject_multi_api_duplex(websocket):
         return
-    await wait_for_duplex_warmup(websocket)
     handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     if handler is None:
         await websocket.accept()
@@ -1866,21 +2024,54 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 
 async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
-    # Session credentials and replay state are local to each frontend; a shared
-    # listening socket cannot route reconnects back to the session owner.
     count = getattr(websocket.app.state, "api_server_count", None)
     if count is None or (type(count) is int and count == 1):
         return False
+    error = "Duplex sessions require initialized API worker topology."
+    if type(count) is int and count > 1:
+        engine_client = getattr(websocket.app.state, "engine_client", None)
+        config = getattr(engine_client, "duplex_session_config", None)
+        capabilities = getattr(engine_client, "duplex_capabilities", None)
+        if getattr(config, "replica_policy", None) != "least_sessions":
+            error = "Duplex sessions with multiple API workers require replica_policy=least_sessions."
+        elif getattr(capabilities, "supports_session_resume", None) is not False:
+            # Session credentials and replay state are local to each frontend;
+            # the shared socket cannot route reconnects back to their owner.
+            error = "Duplex session resume routing across API workers is not supported."
+        else:
+            return False
     await websocket.accept()
     await websocket.send_json(
         {
             "type": "error",
-            "error": "Duplex sessions require a single API worker with initialized topology.",
+            "error": error,
             "code": "multi_api_duplex_unsupported",
         }
     )
     await websocket.close(code=1008)
     return True
+
+
+@router.post("/v1/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def run_stage(request: RunRequest, raw_request: Request):
+    """Run one pipeline stage and return its encoded result; see `ServingRun`."""
+    serving: ServingRun | None = raw_request.app.state.run_serving
+    if serving is None:
+        return _unsupported_api_response(raw_request, "Run API")
+    request_id = f"run-{random_uuid()}"
+    raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+    try:
+        response = await serving.run(request, request_id=request_id)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        # Includes stage_input payloads that fail to decode.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    return response.model_dump(exclude_none=True)
 
 
 # RL Rollout serving (RFC #3747, P0)
@@ -2019,6 +2210,22 @@ def _build_image_response_metrics(
     return metrics
 
 
+def _image_json_response(response: Any) -> Any:
+    """Serialize an image response with orjson.
+
+    Image responses carry multi-megabyte base64 strings, which the default
+    FastAPI JSON path (``json.dumps``) serializes several times slower. The
+    JSON document is the same; streaming responses pass through unchanged.
+    """
+    if not isinstance(response, ImageGenerationResponse):
+        return response
+    try:
+        import orjson
+    except ImportError:
+        return response
+    return Response(content=orjson.dumps(response.model_dump(mode="json")), media_type="application/json")
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
@@ -2091,6 +2298,9 @@ async def generate_images(
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
+    if request.model == "auto":
+        request.model = None
+
     if request.model is not None and request.model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2111,10 +2321,9 @@ async def generate_images(
                     detail="openai_serving_chat is not initialized for multi-stage image generation.",
                 )
 
-            effective_seed = request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
             extra_body: dict[str, Any] = {
-                "seed": effective_seed,
-                "num_outputs_per_prompt": request.n,
+                **({"seed": request.seed} if request.seed is not None else {}),
+                **({"num_outputs_per_prompt": request.n} if "n" in request.model_fields_set else {}),
             }
             if request.size is not None:
                 width, height = parse_size(request.size)
@@ -2131,6 +2340,11 @@ async def generate_images(
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.layers is not None:
+                # Layered models (e.g. Qwen-Image-Layered) read the requested
+                # layer count from ``extra_body``; the single-stage and
+                # multi-stage edit paths already forward it here.
+                extra_body["layers"] = request.layers
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
@@ -2175,8 +2389,10 @@ async def generate_images(
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-        extra_args = dict(request.extra_params or {})
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine_client))
+        if "n" in request.model_fields_set:
+            gen_params.num_outputs_per_prompt = request.n
+        extra_args = {**gen_params.extra_args, **(request.extra_params or {})}
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:
@@ -2187,6 +2403,12 @@ async def generate_images(
             extra_args["flow_shift"] = request.flow_shift
         if extra_args:
             gen_params.extra_args = extra_args
+        try:
+            # The params were built before extra_args was set, and the inline stage client's clone()
+            # does not re-run __post_init__, so move the schedule onto the typed field here.
+            absorb_attention_schedule_extra_args(gen_params, override=True)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
@@ -2221,13 +2443,12 @@ async def generate_images(
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
         # Whitelisted per-request sampling grid (e.g. QwenImage21Pipeline's sigmas).
         _update_if_not_none(gen_params, "sigmas", (request.model_extra or {}).get("sigmas"))
-        # If seed is not provided, generate a random one to ensure
-        # a proper generator is initialized in the backend.
-        # This fixes issues where using the default global generator
-        # might produce blurry images in some environments.
-        _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
-        )
+        # Image modality on video pipelines (e.g. LingBot T2I) may need num_frames=1.
+        _update_if_not_none(gen_params, "num_frames", (request.model_extra or {}).get("num_frames"))
+        if request.seed is not None:
+            gen_params.seed = request.seed
+        elif gen_params.seed is None:
+            gen_params.seed = random.randint(0, MAX_UINT32_SEED)
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
 
@@ -2260,12 +2481,14 @@ async def generate_images(
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
-        return _build_image_generation_response(
-            images=images,
-            request=request,
-            stage_durations=stage_durations,
-            peak_memory_mb=peak_memory_mb,
-            response_metrics=response_metrics,
+        return _image_json_response(
+            _build_image_generation_response(
+                images=images,
+                request=request,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+                response_metrics=response_metrics,
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2303,8 +2526,8 @@ async def edit_images(
     url: list[str] | None = Form(None),
     url_array: list[str] | None = Form(None, alias="url[]"),
     prompt: str = Form(...),
-    model: str = Form(None),
-    n: int = Form(1),
+    model: str | None = Form(None),
+    n: int | None = Form(None),
     size: str = Form("auto"),
     response_format: str = Form("b64_json"),
     output_format: str | None = Form("png"),
@@ -2342,6 +2565,8 @@ async def edit_images(
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model == "auto":
+        model = None
     if model is not None and model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2407,26 +2632,13 @@ async def edit_images(
             loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
-        # 3 Build sample params
-        gen_params = OmniDiffusionSamplingParams()
-        # 3.0 Init with system default values
-        app_state_args = getattr(raw_request.app.state, "args", None)
-        default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Image edits (img2img) remain gated to classical diffusion stages;
-        # MammothModa2 is rejected at route level by its pipeline's endpoint
-        # restrictions (test_mammoth_moda2_shared_runtime.py).
-        image_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not image_stage_ids:
+        if not any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                 detail="No diffusion stage found in multi-stage pipeline.",
             )
-        image_stage_id = image_stage_ids[0]
-        apply_stage_default_sampling_params(
-            default_sample_param,
-            gen_params,
-            str(image_stage_id),
-        )
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine_client))
+        app_state_args = getattr(raw_request.app.state, "args", None)
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
@@ -2496,7 +2708,10 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, MAX_UINT32_SEED))
+        if seed is not None:
+            gen_params.seed = seed
+        elif gen_params.seed is None:
+            gen_params.seed = random.randint(0, MAX_UINT32_SEED)
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
@@ -2537,10 +2752,9 @@ async def edit_images(
                 _img.save(buf, format="PNG")
                 ref_b64_list.append(base64.b64encode(buf.getvalue()).decode())
 
-            effective_seed = seed if seed is not None else random.randint(0, MAX_UINT32_SEED)
             extra_body: dict[str, Any] = {
-                "seed": effective_seed,
-                "num_outputs_per_prompt": n,
+                **({"seed": seed} if seed is not None else {}),
+                **({"num_outputs_per_prompt": n} if n is not None else {}),
             }
             # size="auto" resolves width/height from input image; forwarding
             # those would override AR-driven `<img_ratio_*>` token selection.
@@ -2633,17 +2847,19 @@ async def edit_images(
             for img in images
         ]
 
-        return ImageGenerationResponse(
-            created=int(time.time()),
-            data=image_data,
-            output_format=output_format,
-            size=_generated_size_str(images, size_str),
-            cot_output=cot_output,
-            metrics=_build_image_response_metrics(
-                response_metrics=response_metrics,
-                stage_durations=stage_durations,
-                peak_memory_mb=peak_memory_mb,
-            ),
+        return _image_json_response(
+            ImageGenerationResponse(
+                created=int(time.time()),
+                data=image_data,
+                output_format=output_format,
+                size=_generated_size_str(images, size_str),
+                cot_output=cot_output,
+                metrics=_build_image_response_metrics(
+                    response_metrics=response_metrics,
+                    stage_durations=stage_durations,
+                    peak_memory_mb=peak_memory_mb,
+                ),
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2659,6 +2875,247 @@ async def edit_images(
     except Exception as e:
         logger.exception(f"Image edit failed: {e}")
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image edit failed: {str(e)}")
+
+
+@router.post(
+    "/v1/images/segmentations",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": ImageSegmentationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def segment_image(
+    raw_request: Request,
+    image: UploadFile | None = File(None),
+    prompt: str = Form(""),
+    boxes: str | None = Form(None),  # JSON [[x0, y0, x1, y1], ...] in pixels
+    box_labels: str | None = Form(None),  # JSON [1 | 0, ...]: positive or negative exemplar
+    score_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_format: SegmentationMaskFormat = Form(SegmentationMaskFormat.PNG),
+    model: str | None = Form(None),
+) -> ImageSegmentationResponse:
+    """Segment every instance of a text and/or exemplar-box concept in one image."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not _supports_segmentation(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support image segmentation.",
+        )
+    if image is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'image'.")
+    box_list = _parse_json_list_form(boxes, "boxes")
+    label_list = _parse_json_list_form(box_labels, "box_labels")
+    if not prompt.strip() and not box_list:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide a text 'prompt', exemplar 'boxes', or both."
+        )
+    try:
+        request_id = f"img_seg-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        pil_image = await _load_uploaded_image(image)
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_image})
+        extra_args: dict[str, Any] = {}
+        for key, value in (
+            ("boxes", box_list),
+            ("box_labels", label_list),
+            ("score_threshold", score_threshold),
+            ("mask_threshold", mask_threshold),
+        ):
+            if value is not None:
+                extra_args[key] = value
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=omni_prompt,
+            request_id=request_id,
+        )
+        width, height = pil_image.size
+        return ImageSegmentationResponse(
+            created=int(time.time()),
+            model=model_name,
+            width=width,
+            height=height,
+            mask_format=mask_format,
+            data=_extract_segmentation_instances(result, mask_format),
+        )
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Image segmentation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image segmentation failed: {e}"
+        ) from e
+
+
+@router.post(
+    "/v1/videos/segmentations",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": VideoSegmentationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def segment_video(
+    raw_request: Request,
+    video: UploadFile | None = File(None),
+    prompt: str = Form(""),
+    prompts: str | None = Form(None),  # JSON ["other concept", ...], tracked alongside ``prompt``
+    mask_video: bool = Form(False),
+    model: str | None = Form(None),
+) -> Response:
+    """Track every instance of one or more text concepts through a video."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not supports_video_segmentation(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support video segmentation.",
+        )
+    if video is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'video'.")
+    extra_prompts = _parse_json_list_form(prompts, "prompts")
+    if not prompt.strip() and not extra_prompts:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide a text 'prompt'.")
+    path = None
+    try:
+        request_id = f"vid_seg-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        suffix = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+        path = await _persist_uploaded_reference(
+            video, field_name="video", suffix=suffix, max_bytes=VIDEO_SEGMENTATION_MAX_BYTES
+        )
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"video": path})
+        extra_args: dict[str, Any] = {"prompts": extra_prompts} if extra_prompts else {}
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=omni_prompt,
+            request_id=request_id,
+        )
+        payload = extract_video_segmentation(result)
+        # Build and serialize off the event loop: a long video's response can be tens of MB.
+        body = await asyncio.to_thread(render_video_segmentation_response, payload, model_name, mask_video)
+        return Response(content=body, media_type="application/json")
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Video segmentation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video segmentation failed: {e}"
+        ) from e
+    finally:
+        if path is not None and os.path.exists(path):
+            os.unlink(path)
+
+
+@router.post(
+    "/v1/videos/depth",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": VideoDepthResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def estimate_video_depth(
+    raw_request: Request,
+    video: UploadFile | None = File(None),
+    input_size: int | None = Form(None),
+    max_res: int | None = Form(None),
+    colormap: str = Form("grayscale"),
+    return_depth: bool = Form(False),
+    model: str | None = Form(None),
+) -> Response:
+    """Estimate temporally consistent depth for every frame of a video."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not supports_video_depth(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support video depth estimation.",
+        )
+    if video is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'video'.")
+    if colormap not in VIDEO_DEPTH_COLORMAPS:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"colormap must be one of {', '.join(VIDEO_DEPTH_COLORMAPS)}, got {colormap!r}.",
+        )
+    path = None
+    try:
+        request_id = f"vid_depth-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        suffix = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+        path = await _persist_uploaded_reference(
+            video, field_name="video", suffix=suffix, max_bytes=VIDEO_DEPTH_MAX_BYTES
+        )
+        extra_args = {
+            key: value for key, value in (("input_size", input_size), ("max_res", max_res)) if value is not None
+        }
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=OmniTextPrompt(prompt="", multi_modal_data={"video": path}),
+            request_id=request_id,
+        )
+        payload = extract_video_depth(result)
+        # Encode off the event loop: a long video's depth video and raw maps can be hundreds of MB.
+        body = await asyncio.to_thread(render_video_depth_response, payload, model_name, colormap, return_depth)
+        return Response(content=body, media_type="application/json")
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Video depth estimation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video depth estimation failed: {e}"
+        ) from e
+    finally:
+        if path is not None and os.path.exists(path):
+            os.unlink(path)
 
 
 @router.post(
@@ -2680,7 +3137,6 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2696,18 +3152,19 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
 
     def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
     try:
+        continue_from = await validate_latent_continuation_source(handler, request)
         ref = video_response_from_request(effective_model_name, request)
+        ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
         task = asyncio.create_task(
             _run_video_generation_job(
@@ -2717,7 +3174,6 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
-                control_path,
                 app_state=raw_request.app.state,
                 latent_edit_input=latent_edit_input,
             )
@@ -2755,7 +3211,6 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -2775,13 +3230,13 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        await validate_latent_continuation_source(handler, request)
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
@@ -2814,7 +3269,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
@@ -3018,7 +3473,19 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        await engine_client.start_profile(stages=stages)
+        # Forward only supplied per-session overrides. AsyncOmni.start_profile
+        # already accepts these; a stages-only body stays a stages-only call.
+        profile_kwargs: dict[str, Any] = {}
+        if request is not None:
+            if request.profile_prefix is not None:
+                profile_kwargs["profile_prefix"] = request.profile_prefix
+            if request.delay_iterations is not None:
+                profile_kwargs["delay_iterations"] = request.delay_iterations
+            if request.max_iterations is not None:
+                profile_kwargs["max_iterations"] = request.max_iterations
+            if request.profiler_kwargs is not None:
+                profile_kwargs["profiler_kwargs"] = request.profiler_kwargs
+        await engine_client.start_profile(stages=stages, **profile_kwargs)
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:

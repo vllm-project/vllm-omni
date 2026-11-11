@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import types
@@ -231,7 +234,9 @@ def _forward_with_fish_kvcache(
     global _FIRST_LONG_HIT_LOGGED, _FIRST_MISS_LOGGED, _FIRST_SMALL_HIT_LOGGED
     global _LONG_HIT_COUNT, _SMALL_HIT_COUNT
 
-    if attn_metadata is not None and not attn_metadata.use_cascade:
+    # vLLM v0.32 removed cascade attention and its metadata field.
+    use_cascade = getattr(attn_metadata, "use_cascade", False)
+    if attn_metadata is not None and not use_cascade:
         num_actual_tokens = attn_metadata.num_actual_tokens
         # vLLM >=0.23.0 lays out the KV cache as
         # (num_blocks, num_kv_heads, block_size, 2*head_size) with K and V
@@ -254,13 +259,14 @@ def _forward_with_fish_kvcache(
             max_query_len=attn_metadata.max_query_len,
             max_seq_len=dispatch_max_seq_len,
             dcp_world_size=impl.dcp_world_size,
-            use_cascade=attn_metadata.use_cascade,
+            use_cascade=use_cascade,
             alibi_slopes=impl.alibi_slopes,
             sliding_window=impl.sliding_window,
             output_scale=output_scale,
             output_block_scale=output_block_scale,
         )
         if can_use:
+            assert dispatch_max_seq_len is not None
             is_long_path = dispatch_max_seq_len > FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN
             if is_long_path:
                 _LONG_HIT_COUNT += 1
@@ -311,7 +317,7 @@ def _forward_with_fish_kvcache(
                 "Fish kvcache attention is required but guard rejected the request: "
                 f"query_shape={tuple(q.shape)} query_dtype={q.dtype} "
                 f"max_query_len={attn_metadata.max_query_len} max_seq_len={dispatch_max_seq_len} "
-                f"dcp_world_size={impl.dcp_world_size} use_cascade={attn_metadata.use_cascade}"
+                f"dcp_world_size={impl.dcp_world_size} use_cascade={use_cascade}"
             )
 
         if not _FIRST_MISS_LOGGED:
@@ -332,7 +338,7 @@ def _forward_with_fish_kvcache(
                 attn_metadata.max_query_len,
                 dispatch_max_seq_len,
                 impl.dcp_world_size,
-                attn_metadata.use_cascade,
+                use_cascade,
             )
 
     return original_forward(

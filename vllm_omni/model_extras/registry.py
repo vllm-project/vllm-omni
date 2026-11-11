@@ -40,6 +40,7 @@ from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as buil
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
 from vllm_omni.model_extras.kandinsky6 import (
     KANDINSKY6_EXTRA_BODY_PARAMS,
     KANDINSKY6_EXTRA_OUTPUT_PARAMS,
@@ -50,6 +51,7 @@ from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
     LTX_EXTRA_OUTPUT_PARAMS,
+    LTX_T2A_EXTRA_BODY_PARAMS,
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
@@ -92,6 +94,8 @@ from vllm_omni.model_extras.ming_image import (
 from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
+from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
+from vllm_omni.model_extras.pan2 import get_pan2_video_generation_defaults
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -249,6 +253,16 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "video_generation_defaults_builder": get_magi2_video_generation_defaults,
         "reference_image_size_resolver": magi2_preserves_reference_image_size,
     },
+    "HyNomasPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
+    },
+    "HyNomasModularPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
+    },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -274,11 +288,17 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     **{
         model_class_name: {
             "reference_image_size_resolver": _always_preserve_reference_image_size,
+            "transformer_config_subfolder_resolver": minimax_h3_transformer_subfolder,
         }
         for model_class_name in (
             "MiniMaxH3Pipeline",
             "MiniMaxH3ModularPipeline",
         )
+    },
+    # PAN 2 scales and center crops the first frame to the requested size itself.
+    "PAN2ModularPipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+        "video_generation_defaults_builder": get_pan2_video_generation_defaults,
     },
     **{
         model_class_name: {
@@ -312,6 +332,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "SanaImageToVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
     },
+    "LTX2TextToAudioPipeline": {
+        "extra_body_params": LTX_T2A_EXTRA_BODY_PARAMS,
+        "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+        "transformer_config_subfolder_resolver": ltx_transformer_config_subfolder,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
@@ -340,6 +365,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "QwenImage21Pipeline": {
         "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
+    },
+    "Flux3Pipeline": {
+        "extra_body_params": frozenset({"flow_shift"}),
+        "image_to_image_prompt_builder": default_image_to_image_prompt,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from threading import Lock
+
 from prometheus_client import Counter, Gauge, Histogram
 
 from vllm_omni.metrics import definitions as defs
@@ -101,6 +103,31 @@ _kv_wait_s_family = Histogram(
     buckets=defs.SECONDS_BUCKETS,
 )
 
+_duplex_families: tuple[Gauge, Counter] | None = None
+_duplex_families_lock = Lock()
+
+
+def _duplex_metric_families() -> tuple[Gauge, Counter]:
+    """Keep legacy deployments' collector registration unchanged."""
+    global _duplex_families
+    with _duplex_families_lock:
+        if _duplex_families is None:
+            reserved = Gauge(
+                defs.DUPLEX_RESERVED_SESSIONS,
+                "Duplex sessions reserved on each stage replica, including opening and closing sessions.",
+                labelnames=list(defs.STAGE_LABELS),
+                # Only the owning frontend publishes each replica. Use live
+                # process aggregation without adding a pid label.
+                multiprocess_mode="livesum",
+            )
+            rejected = Counter(
+                defs.DUPLEX_ADMISSION_REJECTED,
+                "Duplex session admissions rejected by global or replica capacity.",
+                labelnames=list(defs.FAILED_LABELS),
+            )
+            _duplex_families = reserved, rejected
+        return _duplex_families
+
 
 class OmniPrometheusMetrics:
     """Label-bound wrapper around the raw Prometheus metrics.
@@ -190,6 +217,25 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             stage=str(stage),
         ).set(max(n_waiting, 0))
+
+    def set_duplex_reserved_sessions(self, stage: int, replica: int, reserved: int) -> None:
+        if not self._log_stats:
+            return
+        family, _ = _duplex_metric_families()
+        family.labels(
+            model_name=self._model_name,
+            stage=str(stage),
+            replica=str(replica),
+        ).set(max(reserved, 0))
+
+    def inc_duplex_admission_rejected(self, reason: str) -> None:
+        if not self._log_stats:
+            return
+        _, family = _duplex_metric_families()
+        family.labels(
+            model_name=self._model_name,
+            reason=reason if reason in defs.DUPLEX_ADMISSION_REJECT_REASONS else "unknown",
+        ).inc()
 
     def observe_num_inference_steps(self, n_steps: int) -> None:
         if not self._log_stats or n_steps <= 0:

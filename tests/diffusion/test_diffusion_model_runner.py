@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,9 +11,17 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionOutput,
+    VideoOutputTransportConfig,
+)
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import set_forward_context as real_set_forward_context
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -305,6 +314,54 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
     assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
 
 
+class _ScheduleSourcePipeline:
+    """Records the schedule and its source that the runner binds around the batch forward."""
+
+    supports_request_batch = True
+
+    def __init__(self):
+        self.bound = None
+
+    def forward(self, batch):
+        context = get_forward_context()
+        self.bound = (context.attention_schedule, context.attention_schedule_from_request)
+        return [DiffusionOutput(output=prompt) for prompt in batch.prompts]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("explicit", [False, True], ids=["all-inherited", "all-explicit"])
+def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, monkeypatch):
+    # Batch keys keep requests that sent a schedule apart from requests that inherit one, so a batch
+    # has one source; only a request's own ranges are checked against its denoise sequence.
+    ranges = [{"start": 0, "end": 40, "profile": "sparse"}]
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SDPA"))}, default=ranges
+    )
+    runner.pipeline = _ScheduleSourcePipeline()
+    requests = []
+    for req_id in ("a", "b"):
+        request = _make_request()
+        request.request_id = req_id
+        request.sampling_params.attention_schedule = list(ranges) if explicit else None
+        requests.append(request)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
+
+    runner._execute_request_list(
+        requests,
+        od_config=runner.od_config,
+        allow_single_output=False,
+        require_request_batch_support=True,
+        record_name="test_schedule_source",
+        record_output_peak_memory=False,
+    )
+
+    schedule, from_request = runner.pipeline.bound
+    assert schedule == runner.od_config.diffusion_attention_schedule.default
+    assert from_request is explicit
+
+
 def _make_compile_runner(
     model=None,
     *,
@@ -362,14 +419,24 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
-    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    # vllm_omni loggers are reparented onto the vllm logger, which does not
+    # propagate to root, so the fixture's root handler never sees this warning.
+    # Pin this logger itself: an earlier test on the same xdist worker can leave
+    # an ancestor above WARNING, and then logger.warning() emits nothing.
+    target_logger = model_runner_module.logger
+    target_logger.addHandler(caplog.handler)
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.WARNING)
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
     req.sampling_params.num_inference_steps = None
-
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    try:
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
     assert cache_backend.refresh_calls == []
     assert "requires num_inference_steps to be passed explicitly" in caplog.text
@@ -480,16 +547,13 @@ def test_update_states_carries_prepared_layout() -> None:
     request = _make_request()
     prepared_layout = object()
     request.prepared_layout = prepared_layout
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=request.request_id,
-                req=request,
-                diffusion_kv_metadata=None,
-            )
-        ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
 
     states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
@@ -524,9 +588,15 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
-    model = SimpleNamespace(enable_cuda_graph_decode=True)
+@pytest.mark.parametrize(
+    ("decode_graph", "denoise_graph"),
+    [(True, False), (False, True)],
+    ids=["decode-graph", "denoise-graph"],
+)
+def test_compile_transformer_scopes_inductor_cudagraphs_to_graph_layers(monkeypatch, decode_graph, denoise_graph):
+    model = SimpleNamespace(enable_cuda_graph_decode=decode_graph)
     runner = _make_compile_runner(model)
+    runner.od_config.diffusion_use_graph = denoise_graph
     compile_calls = []
 
     def _regionally_compile(target, *args, **kwargs):
@@ -1215,14 +1285,18 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+@pytest.mark.parametrize("early_lora", [False, True])
+def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, early_lora):
+    events = []
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
 
         def load_model(self, **kwargs):
             del kwargs
-            return SimpleNamespace(transformer=torch.nn.Identity())
+            events.append("weights_finalized")
+            return SimpleNamespace(transformer=torch.nn.Identity(), requires_early_lora_init=early_lora)
 
     class _DummyMemoryProfiler:
         consumed_memory = 0
@@ -1263,17 +1337,19 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(
-        model_runner_module,
-        "enable_offload_backend",
-        lambda od_config, pipeline, device: (pipeline, None),
-    )
+
+    def offload(od_config, pipeline, device):
+        events.append("offload")
+        return pipeline, None
+
+    monkeypatch.setattr(model_runner_module, "enable_offload_backend", offload)
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
 
-    DiffusionModelRunner.load_model(runner)
+    DiffusionModelRunner.load_model(runner, initialize_lora=lambda: events.append("lora"))
 
+    assert events == ["weights_finalized", *(["lora"] if early_lora else []), "offload"]
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False

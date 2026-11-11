@@ -498,6 +498,7 @@ class TestPromptUpdateExecution:
             num_outputs_per_prompt=1,
             max_sequence_length=226,
             fps=None,
+            attention_schedule=None,
         )
         req = SimpleNamespace(
             request_id="req",
@@ -907,3 +908,17 @@ class TestPromptUpdateIntegration:
 
         def abort(self, request_id: str) -> None:
             del request_id
+
+
+def test_unpaced_prompt_updates_keep_latest_pending_target(pipeline):
+    state = _make_diffusion_request_state()
+    handler = PromptInteractionHandler.from_pipeline(pipeline)
+    for index, prompt in enumerate(("first", "latest")):
+        handler.enqueue(
+            state, event_id=prompt, received_at=float(index), payload={"prompt": prompt}, transition_chunks=1
+        )
+    session = state.interaction_sessions["prompt"]
+    assert isinstance(session, PromptSession)
+    assert session.pending_event is not None
+    assert session.pending_event.event_id == "latest"
+    assert session.pending_event.prompt == "latest"

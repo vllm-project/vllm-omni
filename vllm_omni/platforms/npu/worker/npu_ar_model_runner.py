@@ -42,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
-from vllm_ascend.worker.model_runner_v1 import graph_capture
+from vllm_ascend.worker.v1.model_runner import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.interfaces import supports_multi_frame_deco
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -131,7 +132,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
@@ -339,9 +343,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return drafts
         return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
 
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        # The parent installs the scheduler's compacted block table and token
+        # counts. Apply the matching worker-side rotation/history eviction before
+        # forward, without compacting or decrementing the logical state again.
+        apply_duplex_window_reanchor(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):

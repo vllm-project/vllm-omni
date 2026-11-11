@@ -49,6 +49,9 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            # talker_mtp sums the residual codebook embeddings and adds
+            # text_step; neither is in the token stream (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -101,6 +104,9 @@ QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            # talker_mtp sums the residual codebook embeddings and adds
+            # text_step; neither is in the token stream (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
     ),
 )

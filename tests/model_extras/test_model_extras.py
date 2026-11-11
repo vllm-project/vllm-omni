@@ -252,6 +252,15 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
         assert get_extra_output_params(pipeline_name) == frozenset()
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_t2a_extra_registry_omits_inapplicable_modality_scale() -> None:
+    params = get_extra_body_params("LTX2TextToAudioPipeline")
+
+    assert "audio_modality_scale" not in params
+    assert "audio_cfg_scale" in params
+
+
 @pytest.mark.parametrize(
     ("model_version", "expected"),
     [("2", False), ("2.3", False), ("2.5", True)],
@@ -449,6 +458,15 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
         is False
     )
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_flux3_extra_registry_declares_contract() -> None:
+    assert get_extra_body_params("Flux3Pipeline") == frozenset({"flow_shift"})
+    assert get_extra_output_params("Flux3Pipeline") == frozenset()
+    assert should_preserve_reference_image_size("Flux3Pipeline", model="org/flux3") is True
+    assert should_init_extra_args_for_non_diffusion_stages("Flux3Pipeline") is False
 
 
 @pytest.mark.core_model

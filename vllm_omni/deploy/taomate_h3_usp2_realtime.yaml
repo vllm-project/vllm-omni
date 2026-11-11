@@ -1,0 +1,65 @@
+# TaoMate-H3 streaming: USP2, tensor parallel 1, FP8 DiT and BF16 LoRA.
+# Launch commands and benchmark context: recipes/TaoLiveAIGC/TaoMate-H3.md.
+# Graph warmup covers prompt lengths 360-470 and can take several minutes;
+# use --stage-init-timeout 1800 --init-timeout 2100. Other lengths capture lazily.
+
+pipeline: taomate_h3
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    # Quantize DiT blocks; excluded projections and the text encoder stay BF16.
+    quantization:
+      transformer:
+        method: fp8_per_channel
+        ignore:
+          - "*patch_proj*"
+          - "*condition_proj*"
+          - "*time_embedder*"
+          - "*token_refiner*"
+          - "*final_layer*"
+          - "*adaln_proj*"
+      text_encoder: null
+    model_class_name: TaoMateH3Pipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 2
+      ulysses_degree: 2
+      ring_degree: 1
+      text_encoder_tp_size: 2
+      vae_patch_parallel_size: 2
+      vae_parallel_mode: tile
+    default_sampling_params:
+      num_inference_steps: 3
+      output_type: np
+      fps: 24
+    model_config:
+      taomate_h3_width: 480
+      taomate_h3_height: 864
+      taomate_h3_seed: 8301
+      taomate_h3_audio_kv_reset_requests: 12
+      # Fixed packed document lengths for prompts up to 512 tokens.
+      taomate_h3_pad_text_tokens: 512
+      taomate_h3_teacher_cuda_graph: true
+      taomate_h3_teacher_graph_text_lengths: "360-470"
+      taomate_h3_text_encoder_cuda_graph: true
+      taomate_h3_adaln_cache: false
+      # Keep the BF16 LoRA delta separate: merging into FP8 loses small updates.
+      taomate_h3_lora_merge: false
+      # Keep checkpoint 256 px tiles; a 480 px override introduces a visible lattice.
+      taomate_h3_vae_decoder_tile_overlap_min: 32
+      taomate_h3_vae_stack_tiling: true
+      taomate_h3_cuda_graph_max_entries: 512
+      # AR-Diffusion owns persistent AV pages and contiguous attention staging.
+      ar_diffusion_kv_config:
+        # Limit extra residency; the complete session budget must still fit.
+        gpu_memory_fraction: 0.02
+        warmup_cudagraph: true

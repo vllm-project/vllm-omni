@@ -168,6 +168,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         self._cudnn_benchmark = (extra or {}).get("codec_cudnn_benchmark", False)
         if not isinstance(self._cudnn_benchmark, bool):
             raise ValueError("codec_cudnn_benchmark must be a boolean")
+        cudnn_fp32_fallback = (extra or {}).get("codec_cudnn_fp32_fallback", True)
+        if not isinstance(cudnn_fp32_fallback, bool):
+            raise ValueError("codec_cudnn_fp32_fallback must be a boolean")
 
         # Calculate total upsampling factor
         self.total_upsample = np.prod(self.config.upsample_rates + self.config.upsampling_ratios)
@@ -224,11 +227,43 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         ):
             use_fused_snake(self.decoder)
 
+        if cudnn_fp32_fallback:
+            self._apply_cudnn_dtype_workaround(vllm_config)
+
         # CUDA Graph support — reuses CUDAGraphDecoderWrapper from Qwen3-TTS
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
         # Captured row counts per graph size; empty keeps one padded decode per batch.
         self._streaming_batch_sizes: dict[int, list[int]] = {}
+
+    def _apply_cudnn_dtype_workaround(self, vllm_config: VllmConfig) -> None:
+        """Promote this decoder on the exact stack reported in issue #8935."""
+        # cuDNN 9.20.0 produces incorrect low-precision Conv1d results for some
+        # Code2Wav window lengths on SM100/SM103 (issue #8935). Apply the
+        # known FP32 workaround before weight loading, Snake caches and graph
+        # capture, including the optional first-frame copy inside the Talker.
+        if (
+            self.code_embedding.weight.dtype not in (torch.bfloat16, torch.float16)
+            or not current_omni_platform.is_cuda()
+            or torch.backends.cudnn.version() != 92000
+        ):
+            return
+        device = torch.device(vllm_config.device_config.device)
+        if device.type != "cuda":
+            return
+        device_id = device.index if device.index is not None else torch.accelerator.current_device_index()
+        capability = current_omni_platform.get_device_capability(device_id)
+        if capability is None or (capability.major, capability.minor) not in ((10, 0), (10, 3)):
+            return
+        self.float()
+        logger.warning_once(
+            "Using float32 for Qwen3-Omni Code2Wav to avoid incorrect cuDNN 9.20.0 "
+            "low-precision Conv1d results on SM%d%d. This increases decoder memory "
+            "use. This fallback applies only to cuDNN 9.20.0. Set "
+            "codec_cudnn_fp32_fallback=false in connector extra to retain the requested dtype.",
+            capability.major,
+            capability.minor,
+        )
 
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
@@ -247,6 +282,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         codec_left_context_frames: int = 0,
         extra_capture_sizes: Iterable[int] = (),
         streaming_batch_sizes: Iterable[int] = (),
+        npu_graph_shapes: Iterable[tuple[int, int]] = (),
     ):
         """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav).
 
@@ -256,7 +292,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         captures multi-row graphs for every bucket up to one streaming window
         (chunk + left context); a streaming batch is then decoded as a few
         length groups (``plan_decode_groups``) instead of one eager call
-        padded to its longest row.
+        padded to its longest row. On NPU only ``npu_graph_shapes`` are
+        captured, exactly and before serving; other shapes run eagerly.
         """
         from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
             CUDAGraphDecoderWrapper,
@@ -264,6 +301,24 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
         if device is None:
             device = next(self.parameters()).device
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.code2wav_graph import (
+                NPUGraphDecoderWrapper,
+                prepare_code2wav_graph_runtime,
+            )
+
+            prepare_code2wav_graph_runtime()
+            shapes = list(npu_graph_shapes)
+            npu_wrapper = NPUGraphDecoderWrapper(self, self.config.num_quantizers)
+            npu_wrapper.warmup(device, shapes)
+            self._cudagraph_wrapper = npu_wrapper
+            self._cudagraph_enabled = True
+            logger.info(
+                "Code2Wav NPUGraph captured %d exact shapes before serving: %s; other shapes run eagerly.",
+                len(shapes),
+                shapes,
+            )
+            return
         if device.type != "cuda":
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
             return
@@ -322,7 +377,25 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             extra_shapes,
         )
 
-    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+    def _graph_attention_mask(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Codec inputs are contiguous, unpadded sequences without a KV
+        # cache. Explicit masks avoid HF packed-sequence detection reading
+        # device values on the host during NPUGraph capture.
+        positions = torch.arange(hidden.shape[1], device=hidden.device)
+        distance = positions[:, None] - positions[None, :]
+        allowed = distance >= 0
+        full_mask = torch.zeros(distance.shape, dtype=hidden.dtype, device=hidden.device)
+        full_mask.masked_fill_(~allowed, torch.finfo(hidden.dtype).min)
+        attention_mask = {"full_attention": full_mask[None, None]}
+        if self.pre_transformer.has_sliding_layers:
+            sliding_mask = torch.zeros_like(full_mask)
+            sliding_mask.masked_fill_(
+                ~(allowed & (distance < self.config.sliding_window)), torch.finfo(hidden.dtype).min
+            )
+            attention_mask["sliding_attention"] = sliding_mask[None, None]
+        return attention_mask
+
+    def forward(self, codes: torch.Tensor, *, graph_safe_mask: bool = False) -> torch.Tensor:
         """
         Convert num_quantizers-layer RVQ codes to audio waveform.
 
@@ -341,7 +414,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        attention_mask = self._graph_attention_mask(hidden) if graph_safe_mask else None
+        hidden = self.pre_transformer(inputs_embeds=hidden, attention_mask=attention_mask).last_hidden_state
         # Shape: [batch, seq_len, hidden_size]
 
         # Algorithm search happens during eager warmup before graph capture.

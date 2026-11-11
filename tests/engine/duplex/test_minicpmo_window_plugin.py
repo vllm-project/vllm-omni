@@ -22,8 +22,7 @@ def _plugin():
     return module.MiniCPMO45DuplexPlugin(lambda *args: None)
 
 
-@pytest.mark.asyncio
-async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
+def _stub_tokenizer(monkeypatch):
     tokenizer = SimpleNamespace(
         all_special_ids=[90],
         unk_token_id=-1,
@@ -32,6 +31,22 @@ async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
         convert_tokens_to_ids=lambda token: {"<|listen|>": 91}.get(token, -1),
     )
     monkeypatch.setattr(module, "_load_tokenizer", lambda config: tokenizer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("extra_body", "mode"), [({}, "basic"), ({"sliding_window_mode": "off"}, "off")])
+async def test_window_defaults_to_basic_and_can_be_disabled(monkeypatch, extra_body, mode):
+    _stub_tokenizer(monkeypatch)
+    config = DuplexSessionConfig(modalities=("text",), extra_body=dict(extra_body))
+    runtime = await _plugin().prepare_runtime_config(config, model_config=None)
+    window = runtime["duplex_window_config"]
+    assert window["sliding_window_mode"] == mode
+    assert (window["basic_window_high_tokens"], window["basic_window_low_tokens"]) == (8000, 6000)
+
+
+@pytest.mark.asyncio
+async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
+    _stub_tokenizer(monkeypatch)
     config = DuplexSessionConfig(
         modalities=("text",),
         extra_body={
@@ -161,9 +176,12 @@ async def test_model_reference_audio_resolution_errors_return_none(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_explicit_reference_audio_uses_media_connector_and_skips_model_default(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("sample_count", [1599, 1600, 96256])
+async def test_explicit_reference_audio_uses_media_connector_and_skips_model_default(
+    monkeypatch, tmp_path: Path, sample_count: int
+):
     ref_path = tmp_path / "reference.wav"
-    sf.write(ref_path, np.full(1600, 0.25, dtype=np.float32), 16_000, subtype="PCM_16")
+    sf.write(ref_path, np.full(sample_count, 0.25, dtype=np.float32), 16_000, subtype="PCM_16")
 
     async def fail_default(_model_config):
         raise AssertionError("the model default must not replace an explicit ref_audio")
@@ -180,6 +198,7 @@ async def test_explicit_reference_audio_uses_media_connector_and_skips_model_def
 
     assert runtime["ref_audio_sample_rate_hz"] == 16_000
     audio = np.frombuffer(base64.b64decode(runtime["ref_audio_data"]), dtype=np.float32)
+    assert audio.shape == (sample_count,)
     np.testing.assert_allclose(audio, 0.25, atol=1e-4)
 
 

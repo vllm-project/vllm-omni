@@ -20,12 +20,18 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    clear_scheduled_denoise_step_on_exit,
+)
+from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -104,6 +110,19 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     )
 
 
+def refresh_cache_for_denoise_schedule(pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None) -> None:
+    """Size an active Cache-DiT context to the schedule forward() resolved for this request.
+
+    The model runner refreshes cache state before forward() starts, when the
+    request's sample solver, flow shift and boundary are not resolved yet. Call
+    this once they are, so each expert's step budget is counted from the exact
+    timesteps diffuse() will route to it.
+    """
+    refresh = getattr(pipeline, "_cache_dit_refresh_for_schedule", None)
+    if refresh is not None:
+        refresh(pipeline, timesteps, boundary_timestep)
+
+
 def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
     gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
@@ -147,6 +166,21 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_boundary_ratio(
+    engine_boundary_ratio: float | None,
+    sampling_params: OmniDiffusionSamplingParams,
+    warn_context: str | None = None,
+) -> float:
+    """Return the effective MoE boundary: engine override, then request, then 0.875."""
+    if engine_boundary_ratio is not None:
+        return engine_boundary_ratio
+    if sampling_params.boundary_ratio is not None:
+        return sampling_params.boundary_ratio
+    if warn_context is not None:
+        logger.warning("boundary_ratio is required for %s generation. using default value 0.875", warn_context)
+    return 0.875
 
 
 def resolve_wan_guidance_scales(
@@ -236,8 +270,14 @@ def create_transformer_from_config(
     prefix: str = "",
     *,
     component: str = "transformer",
+    layer_pp_rank: int | None = None,
+    layer_pp_world: int | None = None,
 ) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
+    """Create WanTransformer3DModel from config dict.
+
+    ``layer_pp_rank`` / ``layer_pp_world`` optionally override Omni's live PP
+    group when slicing DiT blocks (Cell / Noisy PP layer groups ``G``).
+    """
     kwargs: dict = {}
 
     if "patch_size" in config:
@@ -276,6 +316,9 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix
+    if layer_pp_world is not None:
+        kwargs["layer_pp_rank"] = 0 if layer_pp_rank is None else layer_pp_rank
+        kwargs["layer_pp_world"] = layer_pp_world
 
     return WanTransformer3DModel(**kwargs)
 
@@ -403,10 +446,17 @@ class Wan22Pipeline(
     SupportsComponentDiscovery,
     WanLoraLoaderMixin,
 ):
+    # Both CFG branches share latents, timestep and the active expert; UMT5
+    # prompts are zero-padded back to max_sequence_length.
+    supports_cfg_batching = True
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts. The
+    # DMD checkpoint overrides it in __init__ with its fixed three transitions.
+    default_num_inference_steps: int = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -593,6 +643,8 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
+        if self.is_dmd:
+            self.default_num_inference_steps = len(FASTWAN_DMD_TIMESTEPS)
         self._sample_solver = "euler" if self.is_dmd else "unipc"
         self._flow_shift = (
             FASTWAN_DMD_SCHEDULER_SHIFT
@@ -614,6 +666,17 @@ class Wan22Pipeline(
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+        self._denoise_graph_runner = self._build_denoise_graph_runner(od_config)
+
+    def _build_denoise_graph_runner(self, od_config: OmniDiffusionConfig) -> GraphedForward | None:
+        return build_denoise_graph_runner(
+            od_config,
+            self._denoise_graph_forward,
+            "Wan DiT",
+            refusal=None
+            if type(self) is Wan22Pipeline
+            else f"{type(self).__name__} is not validated with denoise graphs",
         )
 
     def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
@@ -661,10 +724,13 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
+        # length; None without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -1148,7 +1214,6 @@ class Wan22Pipeline(
         settings = []
         for request in batch.requests:
             sampling = request.sampling_params
-            boundary = self.boundary_ratio if self.boundary_ratio is not None else sampling.boundary_ratio
             current = {
                 "height, width and num_frames": effective_wan_dimensions(
                     sampling,
@@ -1160,7 +1225,7 @@ class Wan22Pipeline(
                     sampling, default_guidance_scale=1.0 if self.is_dmd else 4.0
                 ),
                 "num_outputs_per_prompt": sampling.num_outputs_per_prompt or 1,
-                "boundary_ratio": 0.875 if boundary is None else boundary,
+                "boundary_ratio": resolve_wan_boundary_ratio(self.boundary_ratio, sampling),
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
@@ -1230,7 +1295,9 @@ class Wan22Pipeline(
             # request-level step counts, including the engine's 1-step warmup.
             num_steps = len(FASTWAN_DMD_TIMESTEPS)
         else:
-            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+            num_steps = (
+                self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+            )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -1247,11 +1314,7 @@ class Wan22Pipeline(
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="T2V")
 
         # validate shapes
         self.check_inputs(
@@ -1337,6 +1400,7 @@ class Wan22Pipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
@@ -1436,6 +1500,7 @@ class Wan22Pipeline(
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
+        release_denoise_graphs_after_denoise(self.od_config, getattr(self, "_denoise_graph_runner", None))
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
@@ -1546,8 +1611,15 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        if getattr(self, "_denoise_graph_runner", None) is not None:
+            # By name: the graph keys on primitive values, and each expert gets its own graph.
+            component = "transformer_2" if current_model is self.transformer_2 else "transformer"
+            return self._denoise_graph_runner(component=component, **kwargs)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def _denoise_graph_forward(self, component: str, **kwargs: Any) -> torch.Tensor:
+        return getattr(self, component)(**kwargs)[0]
 
     def encode_prompt(
         self,

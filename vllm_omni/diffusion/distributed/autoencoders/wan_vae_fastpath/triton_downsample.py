@@ -18,6 +18,8 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from ._utils import on_kernel_device
+
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK = 1024
 # Channels-first rows hold only ``width`` (+1) elements; a smaller block wastes fewer lanes.
@@ -145,7 +147,7 @@ if HAS_TRITON:
 def _supported(x: torch.Tensor) -> bool:
     return (
         HAS_TRITON
-        and x.is_cuda
+        and on_kernel_device(x)
         and x.dtype in _DTYPES
         and x.ndim == 5
         and x.numel() > 0

@@ -18,6 +18,8 @@ from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .triton_launch import cuda_pdl_launch_kwargs
+
 _USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
 
 
@@ -76,8 +78,8 @@ def rms_norm(
             triton.next_power_of_2(N),
             residual is not None,
             USE_PDL=_USE_PDL,
-            launch_pdl=_USE_PDL,
             num_warps=4 if N <= 4096 else 8,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
     if residual is None:
         return out.view(x.shape)
@@ -114,7 +116,14 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     if x2.shape[0]:
         block = 1024
         _silu_and_mul[(x2.shape[0], triton.cdiv(d, block))](
-            x2, out, x2.stride(0), d, block, USE_PDL=_USE_PDL, launch_pdl=_USE_PDL, num_warps=4
+            x2,
+            out,
+            x2.stride(0),
+            d,
+            block,
+            USE_PDL=_USE_PDL,
+            num_warps=4,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
     return out.view(*x.shape[:-1], d)
 
@@ -190,8 +199,8 @@ def qk_norm_rope_(
             eps,
             heads_per_program,
             USE_PDL=_USE_PDL,
-            launch_pdl=_USE_PDL,
             num_warps=4,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
 
 
