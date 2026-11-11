@@ -34,6 +34,7 @@ def test_xcodec_head_metadata_override_is_rocm_only(profile: str) -> None:
         load_deploy_config(get_deploy_config_path(profile)),
         platform="cuda",
     )
-    stages = merge_pipeline_deploy(AUDEX_TTA_PIPELINE, deploy)
 
-    assert "hf_overrides" not in stages[1].yaml_engine_args
+    # merge_pipeline_deploy() re-detects the physical test host and would
+    # reapply the ROCm overlay on AMD CI after this explicit CUDA resolution.
+    assert "hf_overrides" not in deploy.stages[1].engine_extras
