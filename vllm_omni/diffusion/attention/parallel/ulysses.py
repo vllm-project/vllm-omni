@@ -244,24 +244,14 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
         ulysses_a2a_permute: bool = False,
-        ulysses_a2a_backend: str | None = None,
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
-        if ulysses_a2a_backend not in {None, "nccl", "ce"}:
-            raise ValueError("ulysses_a2a_backend must be 'nccl' or 'ce'")
-        if ulysses_a2a_backend == "ce":
-            if current_omni_platform.is_npu():
-                raise ValueError("CE Ulysses requires the CUDA platform")
-            if not _a2a_permute_enabled(True, scatter_idx, gather_idx, sp_group.ulysses_world_size):
-                raise ValueError("CE Ulysses requires a strict 4D head/sequence exchange and ulysses_degree > 1")
-        self._ulysses_a2a_permute = (
-            ulysses_a2a_backend == "ce" if ulysses_a2a_backend is not None else ulysses_a2a_permute
-        )
-        if self._ulysses_a2a_permute:
+        self._ulysses_a2a_permute = ulysses_a2a_permute
+        if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
                 validate_a2a_permute_config,
@@ -269,12 +259,12 @@ class UlyssesParallelAttention:
 
             validate_a2a_permute_config(
                 ulysses_degree=sp_group.ulysses_world_size,
-                ring_degree=getattr(sp_group, "ring_world_size", 1),
-                allgather_degree=getattr(sp_group, "allgather_world_size", 1),
+                ring_degree=sp_group.ring_world_size,
+                allgather_degree=sp_group.allgather_world_size,
                 scatter_idx=scatter_idx,
                 gather_idx=gather_idx,
             )
-            if _a2a_permute_enabled(self._ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
+            if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
                 ensure_a2a_permute_available()
 
     @property

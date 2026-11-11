@@ -12,10 +12,14 @@ from vllm_omni.diffusion.distributed import a2a_permute
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("backend,legacy_flag", [("ce", False), (None, True), (None, False), ("nccl", True)])
-def test_selected_transport_handles_qkv_and_output(monkeypatch, backend, legacy_flag):
-    sp = SimpleNamespace(ulysses_group=SimpleNamespace(group_name="subgroup"), ulysses_world_size=2, ring_world_size=1)
-    use_ce = backend == "ce" or (backend is None and legacy_flag)
+@pytest.mark.parametrize("use_ce", [True, False])
+def test_selected_transport_handles_qkv_and_output(monkeypatch, use_ce):
+    sp = SimpleNamespace(
+        ulysses_group=SimpleNamespace(group_name="subgroup"),
+        ulysses_world_size=2,
+        ring_world_size=1,
+        allgather_world_size=1,
+    )
     initialized: list[bool] = []
     exchanges: list[int] = []
     monkeypatch.setattr(a2a_permute, "ensure_a2a_permute_available", lambda: initialized.append(True))
@@ -41,9 +45,7 @@ def test_selected_transport_handles_qkv_and_output(monkeypatch, backend, legacy_
         return q.new_empty(q.numel() + k.numel() + v.numel())
 
     monkeypatch.setattr(a2a_permute, "ulysses_qkv_ce", exchange_qkv)
-    strategy = ulysses.UlyssesParallelAttention(
-        sp, 2, 1, False, ulysses_a2a_permute=legacy_flag, ulysses_a2a_backend=backend
-    )
+    strategy = ulysses.UlyssesParallelAttention(sp, 2, 1, False, ulysses_a2a_permute=use_ce)
     q = torch.empty(1, 16, 8, 64)
     q, k, v, _, ctx = strategy.pre_attention(q, q, q, None)
     result = strategy.post_attention(q, ctx)
@@ -53,12 +55,10 @@ def test_selected_transport_handles_qkv_and_output(monkeypatch, backend, legacy_
 
 
 @pytest.mark.parametrize("scatter,gather,size", [(1, 2, 2), (2, 1, 1)])
-def test_ce_rejects_unsupported_layout_before_initialization(monkeypatch, scatter, gather, size):
-    sp = SimpleNamespace(ulysses_group=None, ulysses_world_size=size)
+def test_ineligible_layout_does_not_initialize_ce(monkeypatch, scatter, gather, size):
+    sp = SimpleNamespace(ulysses_group=None, ulysses_world_size=size, ring_world_size=1, allgather_world_size=1)
     monkeypatch.setattr(
         a2a_permute, "ensure_a2a_permute_available", lambda: pytest.fail("Unexpected CE initialization")
     )
-    with pytest.raises(ValueError, match="strict 4D"):
-        ulysses.UlyssesParallelAttention(sp, scatter, gather, False, ulysses_a2a_backend="ce")
     strategy = ulysses.UlyssesParallelAttention(sp, scatter, gather, False, ulysses_a2a_permute=True)
     assert not ulysses._a2a_permute_enabled(strategy._ulysses_a2a_permute, scatter, gather, size)

@@ -783,15 +783,6 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--ulysses-a2a-backend",
-            choices=["nccl", "ce"],
-            default=None,
-            help=(
-                "Strict Ulysses all-to-all transport: NCCL or CUDA copy engines (CE). "
-                "CE requires single-node NVLink. Overrides --ulysses-a2a-permute."
-            ),
-        )
-        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",

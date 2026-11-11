@@ -43,7 +43,7 @@ def _worker(rank, init_method, world_size=4):
     initialize_model_parallel(data_parallel_size=1, sequence_parallel_size=world_size, ulysses_degree=world_size)
     try:
         group = get_sp_group()
-        strategy = UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_backend="ce")
+        strategy = UlyssesParallelAttention(group, 2, 1, False, ulysses_a2a_permute=True)
 
         def exchange_qkv(q, k, v):
             return a2a_permute.ulysses_qkv_fwd_group(q, k, v, group.ulysses_group.group_name, world_size)

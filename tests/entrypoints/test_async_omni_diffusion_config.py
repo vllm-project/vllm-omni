@@ -419,16 +419,18 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
-def test_serve_cli_preserves_ulysses_a2a_backend() -> None:
+@pytest.mark.parametrize("enabled", [True, False])
+def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", "--ulysses-a2a-backend", "ce"])
+    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
 
     stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["ulysses_degree"] == 4
-    assert parallel_config["ulysses_a2a_backend"] == "ce"
+    assert parallel_config["ulysses_a2a_permute"] is enabled
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():

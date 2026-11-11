@@ -457,12 +457,8 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
-            backend = parallel_config.ulysses_a2a_backend
-            if backend == "ce" and not current_omni_platform.is_cuda():
-                raise ValueError("CE Ulysses requires the CUDA platform")
-            if backend == "ce" or (
-                backend is None
-                and parallel_config.ulysses_a2a_permute
+            if (
+                parallel_config.ulysses_a2a_permute
                 and parallel_config.ulysses_degree > 1
                 and parallel_config.ulysses_mode == "strict"
             ):

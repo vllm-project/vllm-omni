@@ -231,7 +231,7 @@ In `DiffusionParallelConfig`:
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
-| `ulysses_a2a_backend` | str or None | `None` | CUDA strict Ulysses exchange backend: `nccl` or `ce` (CUDA copy engines over peer-accessible symmetric memory). |
+| `ulysses_a2a_permute` | bool | `False` | Use platform symmetric memory for eligible strict Ulysses exchanges: CUDA copy engines (CE) on CUDA, SHMEM on NPU. When disabled, CUDA uses NCCL. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -240,12 +240,11 @@ In `DiffusionParallelConfig`:
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
-- `ulysses_a2a_backend="ce"` is for one NVLink-connected node with CUDA symmetric-memory support.
+- `ulysses_a2a_permute=True` on CUDA requires one NVLink-connected node with CUDA symmetric-memory support.
 
-The explicit backend takes precedence over the legacy `ulysses_a2a_permute` flag.
-On CUDA, without an explicit backend, `ulysses_a2a_permute=True` selects CE for eligible
-strict layouts and the default selects NCCL. Explicit CE requires `ulysses_degree > 1` and
-`ulysses_mode="strict"`. All ranks of each CE Ulysses subgroup must be on one
+On CUDA, `ulysses_a2a_permute=True` selects CE for eligible strict Ulysses exchanges
+with `ulysses_degree > 1`. When disabled (the default), Ulysses uses NCCL.
+All ranks of each CE Ulysses subgroup must be on one
 host with peer-accessible GPUs; CUDA symmetric-memory rendezvous establishes
 the peer mappings.
 
@@ -254,7 +253,7 @@ Select CE for offline inference with:
 ```python
 parallel_config = DiffusionParallelConfig(
     ulysses_degree=4,
-    ulysses_a2a_backend="ce",
+    ulysses_a2a_permute=True,
 )
 omni = Omni(model="Qwen/Qwen-Image", parallel_config=parallel_config)
 ```
@@ -262,7 +261,7 @@ omni = Omni(model="Qwen/Qwen-Image", parallel_config=parallel_config)
 The same option is available to the serving CLI and to stage deploy configs:
 
 ```bash
-vllm serve Qwen/Qwen-Image --omni --ulysses-degree 4 --ulysses-a2a-backend ce
+vllm serve Qwen/Qwen-Image --omni --ulysses-degree 4 --ulysses-a2a-permute
 ```
 
 CE pushes the original Q/K/V shards together into peer-accessible symmetric

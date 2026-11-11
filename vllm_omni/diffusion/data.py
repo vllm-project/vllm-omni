@@ -297,16 +297,10 @@ class DiffusionParallelConfig:
     ulysses_a2a_permute: bool = False
     """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    CUDA uses CE unless a backend is explicit. NPU retains its eager, pure
-    Ulysses implementation over WORLD in one HCCS domain, using TorchNPU's
-    NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
-    """
-
-    ulysses_a2a_backend: str | None = None
-    """CUDA strict Ulysses transport: ``nccl`` or ``ce`` (copy engines).
-
-    When omitted, ``ulysses_a2a_permute`` selects CE on CUDA if true, NCCL otherwise.
-    CE requires a single NVLink-connected node.
+    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
+    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
+    allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
     cfg_parallel_size: int = 1
@@ -395,11 +389,6 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
-        if self.ulysses_a2a_backend not in {None, "nccl", "ce"}:
-            raise ValueError("ulysses_a2a_backend must be 'nccl' or 'ce'")
-        if self.ulysses_a2a_backend == "ce":
-            if self.ulysses_degree <= 1 or self.ulysses_mode != "strict":
-                raise ValueError("CE Ulysses transport requires ulysses_degree > 1 and ulysses_mode='strict'")
 
         # Validate HSDP configuration
         if self.use_hsdp:
