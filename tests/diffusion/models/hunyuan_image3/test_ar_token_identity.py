@@ -243,6 +243,22 @@ def test_dropping_thought_without_kv_reuse_remains_supported(wrapper):
     assert torch.equal(raw.tokens, legacy.tokens)
 
 
+def test_message_list_with_ar_token_ids_is_rejected(wrapper):
+    generated = wrapper.encode("body</think>", add_special_tokens=False)
+    message_list = [
+        dict(role="user", type="text", content="draw", context_type="str"),
+        dict(role="assistant", type="gen_image", content=_image_info(), context_type="image_info"),
+    ]
+    with pytest.raises(ValueError, match="requires prompt inputs"):
+        wrapper.apply_chat_template(
+            batch_message_list=[message_list],
+            mode="gen_image",
+            sequence_template="instruct",
+            batch_ar_token_ids=[(_prompt_ids(wrapper), generated)],
+            validate_ar_kv_prefix=True,
+        )
+
+
 def test_bridge_copies_original_ids_and_layout_planner_consumes_them(wrapper):
     prompt_ids = _prompt_ids(wrapper)
     generated = [

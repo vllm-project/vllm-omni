@@ -1111,6 +1111,9 @@ class TokenizerWrapper:
         assert bot_task in ["image", "auto", "think", "recaption", "img_ratio"], (
             f"bot_task should be one of ['image', 'auto', 'think', 'recaption', 'img_ratio'], but got {bot_task}."
         )
+        if batch_message_list is not None and batch_ar_token_ids is not None:
+            # Message lists carry text CoT; raw AR IDs only replace prompt-path CoT.
+            raise ValueError("Hunyuan AR token metadata requires prompt inputs, not message lists.")
 
         if batch_message_list is None:
             # Simple text-to-image or text-cot-to-image task
