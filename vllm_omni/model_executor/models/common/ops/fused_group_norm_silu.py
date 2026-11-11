@@ -44,6 +44,13 @@ from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
     welford_group_range,
 )
 
+# Fixed launch configuration for autotune=False: skips per-shape autotune
+# benchmarking (incompatible with CUDA graph capture) at the cost of not
+# picking the shape-optimal config.
+_FIXED_BLOCK_SIZE = 2048
+_FIXED_NUM_WARPS = 8
+_FIXED_NUM_STAGES = 2
+
 
 @triton.autotune(configs=SPLIT_REDUCTION_CONFIGS, key=SPLIT_REDUCTION_KEY, prune_configs_by=SPLIT_REDUCTION_PRUNE)
 @triton.jit
@@ -153,6 +160,7 @@ def fused_group_norm_silu(
     *,
     per_frame: bool = False,
     round_norm_output: bool = False,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """
     Fused GroupNorm + SiLU activation.
@@ -173,6 +181,9 @@ def fused_group_norm_silu(
     - round_norm_output: round the GroupNorm result to the output dtype before
       SiLU, the boundary eager ``F.silu(F.group_norm(x))`` has. Off by default so
       existing callers keep their numerics.
+    - autotune: benchmark launch configurations for new shapes. If disabled,
+      use a fixed launch configuration (autotune benchmarking is incompatible
+      with CUDA graph capture).
     Uses fp32 accumulation for numeric alignment with PyTorch.
     Returns the same shape and eager F.group_norm-compatible dtype.
     Spatial dimensions are flattened during computation and restored afterward;
@@ -239,7 +250,17 @@ def fused_group_norm_silu(
     if split > 1:
         ws = launch_partial_stats(x_flat, rows, C, spatial_size, num_groups, split, split_chunk, frames=frames)
 
-    _group_norm_silu_kernel[(rows * num_groups * split,)](
+    if autotune:
+        kernel = _group_norm_silu_kernel
+        launch_config: dict = {}
+    else:
+        kernel = _group_norm_silu_kernel.fn  # raw JITFunction, no autotuner
+        launch_config = {
+            "BLOCK_SIZE": _FIXED_BLOCK_SIZE,
+            "num_warps": _FIXED_NUM_WARPS,
+            "num_stages": _FIXED_NUM_STAGES,
+        }
+    kernel[(rows * num_groups * split,)](
         x_flat,
         out_flat,
         weight,
@@ -254,6 +275,7 @@ def fused_group_norm_silu(
         ROUND_NORM=round_norm_output,
         SPLIT=split,
         SPLIT_POW2=1 << (split - 1).bit_length(),
+        **launch_config,
     )
 
     return out_flat.reshape(orig_shape)
