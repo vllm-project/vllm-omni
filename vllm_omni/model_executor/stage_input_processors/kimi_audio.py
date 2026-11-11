@@ -46,8 +46,8 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     params = sampling_params_list[0]
     if params.n != 1:
         raise OmniClientError("Kimi-Audio currently requires one completion per request")
-    if not params.detokenize or not params.include_stop_str_in_output:
-        raise OmniClientError("Kimi-Audio requires detokenize=True and include_stop_str_in_output=True")
+    if not params.detokenize or not params.skip_special_tokens:
+        raise OmniClientError("Kimi-Audio requires detokenize=True and skip_special_tokens=True")
     unsupported = [
         name
         for name in (
@@ -92,9 +92,10 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
 
     prepared = KimiAudioPreparedInput.from_wire(info["kimi_audio_input"])
     special = KimiAudioSpecialTokens(**prepared.special_tokens)
-    # Only blanks are returned to the scheduler before completion, then one
-    # msg_end. True text/audio IDs stay in the model's two histories, so the
-    # native tokenizer's different EOS cannot prematurely end either stream.
+    # The scheduler receives visible text IDs or blanks, then one msg_end.
+    # The model never reports its stop IDs from the text stream, and the true
+    # text/audio IDs stay in its two histories, so the native tokenizer's
+    # different EOS cannot prematurely end either stream.
     if set(params.stop_token_ids or ()) != {special.msg_end}:
         raise OmniClientError(f"Kimi-Audio requires stop_token_ids=[{special.msg_end}]; custom stops are not supported")
     if params.eos_token_id == special.kimia_text_blank:
@@ -130,7 +131,7 @@ def kimi_audio_to_decoder(
     """Build stage-1 inputs from completed stage-0 RequestOutputs.
 
     Uses Omni's existing custom_process_input_func signature. The source's
-    cumulative codes.audio is authoritative; scheduler token IDs are blanks.
+    cumulative codes.audio is authoritative; scheduler token IDs carry text.
     Offset and vocabulary size come from the prepared prompt's model config.
     This adapter consumes full requests, not async_chunk deltas.
     """

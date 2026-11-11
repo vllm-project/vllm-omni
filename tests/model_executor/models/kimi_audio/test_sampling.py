@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioSpecialTokens
-from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams, sample_kimi_audio_step
+from vllm_omni.model_executor.models.kimi_audio.sampling import (
+    KimiAudioSample,
+    KimiAudioSamplingParams,
+    sample_kimi_audio_step,
+    scheduler_token_id,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.omni]
 
@@ -96,3 +101,23 @@ def test_stream_end_conditions(special_tokens, output_type, already_finished, au
         assert result.text_token == special_tokens.kimia_text_blank
     if output_type == "text":
         assert result.audio_token == special_tokens.kimia_text_blank
+
+
+@pytest.mark.parametrize(
+    "text_token,text_finished,finished,expected",
+    [
+        (10, False, False, 10),  # Visible text is detokenized natively.
+        (3, False, False, 3),  # A sampled blank stays a blank.
+        (4, True, False, 3),  # The first text EOS is not visible.
+        (3, True, False, 3),  # Forced blanks while audio continues.
+        (12, False, False, 3),  # Audio-vocabulary IDs are not text.
+        (9, False, False, 3),  # A scheduler stop ID must not end the request.
+        (0, False, False, 3),
+        (10, False, True, 0),  # Only the model's own end reports msg_end.
+        (4, True, True, 0),
+    ],
+)
+def test_scheduler_token_reports_visible_text_or_blank(special_tokens, text_token, text_finished, finished, expected):
+    sample = KimiAudioSample(text_token, special_tokens.kimia_text_blank, text_finished, finished)
+    token = scheduler_token_id(sample, special_tokens, text_vocab_size=12, stop_token_ids=(9, special_tokens.msg_end))
+    assert token == expected

@@ -37,9 +37,9 @@ KIMI_AUDIO_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.kimi_audio_to_decoder_async_chunk",
             sampling_constraints={
                 "detokenize": True,
-                # ids.output already excludes EOS and control tokens. Native
-                # detokenization must retain the final visible text token.
-                "include_stop_str_in_output": True,
+                # Scheduler IDs are visible text with blanks in between. The
+                # blank is a special token; native detokenization must skip it.
+                "skip_special_tokens": True,
                 # Checked against the prepared tokenizer vocabulary on admission.
                 "stop_token_ids": [151645],
             },

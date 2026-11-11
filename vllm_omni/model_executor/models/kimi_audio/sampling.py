@@ -7,7 +7,7 @@ overrides. The runner adapter must record the returned tokens in each request's
 own history, including forced blanks and the first text EOS.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from typing import TYPE_CHECKING, Any, Literal
@@ -160,3 +160,25 @@ def sample_kimi_audio_step(
         text_finished if output_type == "text" else audio_token in (special_tokens.msg_end, special_tokens.media_end)
     )
     return KimiAudioSample(text_token, audio_token, text_finished, finished)
+
+
+def scheduler_token_id(
+    sample: KimiAudioSample,
+    special_tokens: KimiAudioSpecialTokens,
+    *,
+    text_vocab_size: int,
+    stop_token_ids: Collection[int],
+) -> int:
+    """Return the ONE ID that vLLM's scheduler and detokenizer see for a step.
+
+    Visible text is reported as-is, so native detokenization produces the
+    response text. Every other step reports the blank, a special token that
+    detokenization skips, and the last step reports msg_end, the stop token.
+    Text IDs that would stop the request are also replaced by the blank: the
+    text stream ends with kimia_text_eos, never with the scheduler's stop IDs.
+    """
+    if sample.finished:
+        return special_tokens.msg_end
+    if sample.text_finished or sample.text_token >= text_vocab_size or sample.text_token in stop_token_ids:
+        return special_tokens.kimia_text_blank
+    return sample.text_token

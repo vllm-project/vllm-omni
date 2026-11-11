@@ -48,9 +48,7 @@ def audio_request(request, prompt_builder):
     prompt = prepare_kimi_audio_inputs(
         [{"role": "user", "message_type": "text", "content": "Hi"}], prompt_builder, output_type="both"
     )
-    params = SamplingParams(
-        include_stop_str_in_output=True, stop_token_ids=[prompt_builder.tokens.msg_end], seed=request.param
-    )
+    params = SamplingParams(stop_token_ids=[prompt_builder.tokens.msg_end], seed=request.param)
     return prepare_kimi_audio_request(prompt, [params]), params
 
 

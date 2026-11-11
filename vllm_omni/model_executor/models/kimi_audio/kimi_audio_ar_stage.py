@@ -15,7 +15,7 @@ from vllm.sequence import IntermediateTensors
 
 from .audio_processing import CHUNK_SAMPLES, SAMPLE_RATE, SAMPLES_PER_TOKEN, KimiAudioWhisperInputs
 from .prompt import KimiAudioEncodedAudio, KimiAudioPreparedInput, KimiAudioSpecialTokens
-from .sampling import KimiAudioSamplingParams, sample_kimi_audio_step
+from .sampling import KimiAudioSamplingParams, sample_kimi_audio_step, scheduler_token_id
 
 if TYPE_CHECKING:
     from transformers import WhisperFeatureExtractor
@@ -253,9 +253,9 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
     requires_request_sample_eligibility = True
     skips_model_sampler_output_token_history = True
     omni_pooler_payload_include_hidden = False
-    # Keep real IDs even when the request finishes on stage 0. Non-async
-    # stage bridging also consumes RequestOutput, so retain audio there too.
-    omni_client_multimodal_output_keys = ("ids.output", "codes.audio", "meta.finished")
+    # Text reaches the client through native detokenization of the scheduler
+    # IDs. Non-async stage bridging consumes RequestOutput, so retain audio.
+    omni_client_multimodal_output_keys = ("codes.audio", "meta.finished")
     # The packed branch states are only needed for current-step logits. They
     # are not downstream conditioning and have width 2H, unlike the H-wide
     # model activations stored by Omni's full-prefix hidden-state cache.
@@ -491,11 +491,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             if state is None:
                 raise ValueError("Missing Kimi-Audio generation state from preprocess")
             special = KimiAudioSpecialTokens(**state["special_tokens"])
-            checkpoint_eos = (
-                getattr(self.config, "eos_token_ids", None) or getattr(self.config, "eos_token_id", None) or []
-            )
-            checkpoint_eos = [checkpoint_eos] if isinstance(checkpoint_eos, int) else checkpoint_eos
-            if special.kimia_text_blank in checkpoint_eos:
+            if special.kimia_text_blank in self._checkpoint_eos_ids():
                 raise ValueError("Kimi-Audio scheduler blank must not be a checkpoint EOS")
             if state["max_tokens"] is None:
                 raise ValueError("Kimi-Audio needs the runner's _omni_max_tokens for final output delivery")
@@ -505,12 +501,15 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         # that snapshot; a later batch gets a new mapping. Per-request lists
         # prevent token-span slicing from confusing batch rows with prefill.
         outputs = {
-            "ids": {"output": [[] for _ in context]},
             "codes": {"audio": [torch.empty(0, dtype=torch.long) for _ in context]},
             "meta": {"finished": [torch.tensor(False) for _ in context]},
         }
         self._sampling_context = (context, outputs)
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=outputs)
+
+    def _checkpoint_eos_ids(self) -> tuple[int, ...]:
+        eos = getattr(self.config, "eos_token_ids", None) or getattr(self.config, "eos_token_id", None) or ()
+        return (eos,) if isinstance(eos, int) else tuple(eos)
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: "SamplingMetadata | None" = None
@@ -540,9 +539,10 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
     def sample(self, logits: torch.Tensor, sampling_metadata: "SamplingMetadata") -> "SamplerOutput":
         """Sample once per eligible request and retain its actual dual-stream IDs.
 
-        Scheduler IDs are blanks followed by msg_end, declared as a stop token
-        at admission. Real text/audio deltas and the end marker go into this
-        step's OmniOutput, including the final pair on stop or length limit.
+        Scheduler IDs are the visible text, blanks elsewhere, then msg_end,
+        declared as a stop token at admission. Native detokenization therefore
+        yields the text. Audio deltas and the end marker go into this step's
+        OmniOutput, including the final code on stop or length limit.
         """
         from vllm.v1.outputs import SamplerOutput
 
@@ -561,6 +561,7 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         if any(max(params.text_top_k, params.audio_top_k) > self.config.vocab_size for params in resolved):
             raise ValueError("Kimi-Audio top_k exceeds the checkpoint vocabulary")
         pending, scheduler_tokens = [], []
+        checkpoint_eos = self._checkpoint_eos_ids()
         for row, ((state, _, special, eligible), params) in enumerate(zip(context, resolved, strict=True)):
             if not eligible:
                 # Partial prefill/recomputation has no accepted output token.
@@ -589,7 +590,16 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
                 params=params,
                 generator=generator,
             )
-            token = special.msg_end if result.finished else special.kimia_text_blank
+            # Official text trimming excludes EOS, the forced post-EOS blanks
+            # and audio-vocabulary IDs. The scheduler's own stop IDs (the
+            # checkpoint EOS and msg_end) must not end the request from the
+            # text stream, so they are reported as blanks, too.
+            token = scheduler_token_id(
+                result,
+                special,
+                text_vocab_size=self.config.kimia_token_offset,
+                stop_token_ids=(*checkpoint_eos, special.msg_end),
+            )
             scheduler_tokens.append(token)
             pending.append((row, state, result, token, generator.get_state() if own_generator else None))
 
@@ -608,11 +618,8 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             )
             state["text_finished"] = result.text_finished
             state["finished"] = result.finished or length_capped
-            # Official text trimming excludes EOS and the forced post-EOS
-            # blanks. Audio stays in the LLM vocabulary here; the downstream
-            # adapter will filter control tokens and remove kimia_token_offset.
-            if not result.text_finished and result.text_token < self.config.kimia_token_offset:
-                outputs["ids"]["output"][row] = [result.text_token]
+            # Audio stays in the LLM vocabulary here; the downstream adapter
+            # will filter control tokens and remove kimia_token_offset.
             if state["output_type"] == "both" and generated > self.config.kimia_mimo_audiodelaytokens:
                 outputs["codes"]["audio"][row] = torch.tensor([result.audio_token], dtype=torch.long)
             outputs["meta"]["finished"][row] = torch.tensor(state["finished"])
