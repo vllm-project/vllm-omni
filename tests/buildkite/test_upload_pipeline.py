@@ -33,6 +33,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+CUDA_READY_YAML = Path(".buildkite/cuda/test-ready.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
@@ -542,7 +543,7 @@ def _iter_steps(doc: dict):
     "changed_file,select_legacy",
     [
         ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", True),
         ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
         ("vllm_omni/clients/duplex.py", False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
@@ -570,6 +571,50 @@ def test_qwen3_perf_pipeline_selection(
     # Compare the dependency-filtered Qwen perf jobs.
     expected_keys = set(legacy_keys) if select_legacy else set()
     assert surviving_keys & legacy_keys == expected_keys
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "selected"),
+    [
+        (["tests/model_executor/models/minicpmo_4_5/test_talker_mrv2_cuda.py"], True),
+        ([".buildkite/amd/test-amd-ready.yml"], True),
+        (["vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py"], False),
+        (
+            [
+                ".buildkite/cuda/test-ready.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/ci_source_file_dependencies.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/scripts/upload_pipeline.py",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+    ],
+)
+def test_cuda_ready_r2_01_collection_count_follows_its_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_files: list[str],
+    selected: bool,
+) -> None:
+    """A change that can move the AMD R2-01 pin must run its CUDA READY check."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    _load_source_file_dependencies.cache_clear()
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=CUDA_READY_YAML)
+    labels = {step.get("label") for step in _iter_steps(rendered)}
+
+    assert ("Simple · ROCm R2-01 Collection Count" in labels) is selected
 
 
 def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:

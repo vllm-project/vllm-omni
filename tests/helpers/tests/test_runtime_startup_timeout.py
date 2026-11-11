@@ -18,6 +18,8 @@ def startup_server(request, tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
     proc = MagicMock(spec=runtime.subprocess.Popen)
     proc.poll.return_value = None
+    # Clock tests do not exercise stderr capture; omit the pipe.
+    proc.stderr = None
     monkeypatch.setattr(runtime.subprocess, "Popen", lambda *args, **kwargs: proc)
     if request.param == "server":
         # Exercise the wait-loop clock without reserving or inspecting real ports.

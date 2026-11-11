@@ -1,5 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
+# Keep MRv1 on other platforms; CUDA selects MRv2 below.
+model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -96,7 +98,7 @@ stages:
     enforce_eager: false
     # Thinker prefix caching stays off here: this profile serves duplex, whose
     # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
-    # turns it on at stage level for CUDA turn serving. Stage-0 n-gram
+    # enables it for CUDA turn serving on both runners. Stage-0 n-gram
     # speculation stays off either way -- the omni prefix cache refuses it next
     # to enable_prefix_caching.
     enable_prefix_caching: false
@@ -174,6 +176,7 @@ stages:
 
 platforms:
   cuda:
+    model_runner: v2
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
@@ -197,6 +200,9 @@ platforms:
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN
       - stage_id: 1
+        # Talker multi-frame decode below runs only on V1; Thinker and Code2Wav
+        # use MRv2.
+        model_runner: v1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
         # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
         # above that bound because physical-preemption replay is unsupported
@@ -226,6 +232,17 @@ platforms:
           stop_token_ids: [1]
 
   npu:
+    # All three stages run MRv2. Same-card A/B (910B3 card 7, 2026-11-10,
+    # HEAD 59a85c105, seed-tts en, warm tiers 32@1/64@4/128@8): mean audio
+    # RTF 0.3181/0.5762/0.8795 (MRv2) vs 0.3199/0.5675/0.8764 (v1) --
+    # -0.6%/+1.5%/+0.4%, within run-to-run noise (a second MRv2 run on the
+    # same card differed by -0.4%/-4.4%/-1.6%). The c8 p99 audio-TTFP tail
+    # (2419.6 ms vs v1 2267.0 ms, +6.7%) likewise overlaps the noise band
+    # (second MRv2 run: 2274.8 ms). Runner-class selection on NPU is made
+    # by vllm-ascend (env VLLM_USE_V2_MODEL_RUNNER overrides, MRv2 by
+    # default); this key is validated but not consulted there -- pin v1
+    # via the env var.
+    model_runner: v2
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is

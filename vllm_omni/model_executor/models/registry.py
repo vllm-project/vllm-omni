@@ -12,6 +12,9 @@ _OMNI_MODELS = {
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
     "SopranoForCausalLM": ("soprano", "soprano_ar", "SopranoForCausalLM"),
     "SopranoDecoderForGeneration": ("soprano", "soprano_decoder", "SopranoDecoderForGeneration"),
+    "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
+    "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),
+    "Lfm3AudioForConditionalGeneration": ("lfm3_audio", "model", "Lfm3AudioForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
