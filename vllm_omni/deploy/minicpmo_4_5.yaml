@@ -1,5 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
+# Keep MRv1 on other platforms; CUDA selects MRv2 below.
+model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -46,14 +48,15 @@ connectors:
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
       cfm_fused_body: true
-      # Enabled in this profile for NPU; set false to disable.
-      # Has no effect on non-NPU backends. Different references share CFM
-      # decode when prepared
-      # prompt/cache/token shapes, dtypes, devices and final flags match.
-      # Requires a FP32 fused Whole-Euler arena, FP32 attention caches and
-      # code2wav_min_batch_size: 1. References still initialize separately.
-      # Does not enable mixed-history or slot-pool batching; singleton and
-      # unsupported configurations retain their existing dispatch.
+      # Enable NPU cross-reference CFM batching for same-shape and ragged
+      # requests, including different token/query, reference prompt and
+      # conformer/CFM attention-history lengths and mixed final-chunk flags.
+      # Requires FP32 fused Whole-Euler, FP32 attention caches, no slot pool
+      # and code2wav_min_batch_size=1; otherwise warn and retain existing dispatch.
+      # Encoder/HiFT run in compatible subgroups; CFM uses per-request masks,
+      # noise offsets and cache trimming. CNN/HiFT cache shapes, dtypes,
+      # devices and the cache-epoch policy still constrain batching.
+      # Enabled in this profile; set false to disable. No effect off NPU.
       cfm_npu_cross_reference_batching: true
       # Small exact encoder batches share one startup arena; larger batches
       # replay in groups, preserving cache lengths without batch padding.
@@ -95,7 +98,7 @@ stages:
     enforce_eager: false
     # Thinker prefix caching stays off here: this profile serves duplex, whose
     # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
-    # turns it on at stage level for CUDA turn serving. Stage-0 n-gram
+    # enables it for CUDA turn serving on both runners. Stage-0 n-gram
     # speculation stays off either way -- the omni prefix cache refuses it next
     # to enable_prefix_caching.
     enable_prefix_caching: false
@@ -173,6 +176,7 @@ stages:
 
 platforms:
   cuda:
+    model_runner: v2
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
@@ -196,6 +200,9 @@ platforms:
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN
       - stage_id: 1
+        # Talker multi-frame decode below runs only on V1; Thinker and Code2Wav
+        # use MRv2.
+        model_runner: v1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
         # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
         # above that bound because physical-preemption replay is unsupported
