@@ -873,7 +873,10 @@ class CosyVoice3Model(
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            self.code2wav = CosyVoice3Code2Wav(
+                self.config,
+                enable_npu_graphs=current_omni_platform.is_npu() and not vllm_config.model_config.enforce_eager,
+            )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.

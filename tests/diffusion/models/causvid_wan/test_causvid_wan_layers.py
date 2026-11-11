@@ -9,6 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+    ARDiffusionCellContext,
+    CellRunSpec,
+    CellTopology,
+)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_DENOISE_STEPS,
     CAUSVID_DEFAULT_SHIFT,
@@ -17,8 +23,6 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -156,7 +160,7 @@ def test_cell_schedule_rejects_unknown_values():
 
 @pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
 def test_cell_schedule_accepts_known_values(name, step_replicas):
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 
     pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
@@ -171,7 +175,23 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_same_step_pipeline_single_chunk_sink_matches_session_policy(persistent):
+    pipeline = _bare_pipeline(step_replicas=3, history=2)
+    request = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "same_step", "num_denoise_steps": 3, "num_chunks": 1}
+        ),
+    )
+    plan, _, _ = pipeline._plan_for(request, same_step_session=persistent)
+    produced = {plan.task(slot, rank) for slot in range(plan.num_slots) for rank in range(plan.world)}
+    assert ((0, 3, 0) in produced) is persistent
+    assert (0, 0, 0) in produced
+
+
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -346,7 +366,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
         request_id="different-shape",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"latent_shape": shape, "num_denoise_steps": 1}),
     )
-    with pipeline.bind_ar_diffusion_cell_context(ctx):
+    with pipeline.bind_ar_diffusion_noisy_kv(ctx.kv):
         with pytest.raises(ValueError, match="does not match preallocated NoisyKV"):
             pipeline.forward(req)
     assert pipeline.block_size == pipeline.max_chunk_tokens == cache.spec.max_chunk_tokens == 16

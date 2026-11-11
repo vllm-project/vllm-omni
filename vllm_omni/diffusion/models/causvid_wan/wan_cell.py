@@ -10,8 +10,8 @@ from typing import Any
 import torch
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.experimental.ar_diffusion.cell_executor import CellAdapter
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 
@@ -45,7 +45,9 @@ class WanCell(CellAdapter):
         self._last_meta: tuple[str, int, int] | None = None
         self._timesteps = [torch.tensor(float(t), dtype=torch.float32) for t in sampler.timesteps]
         self._timestep_clean = torch.zeros((), dtype=torch.float32)
-        transformer.prepare_cell(prompt_embeds)
+        # Conditioning belongs to the request. A batched dispatcher may alternate
+        # requests through this shared transformer on every executor tick.
+        self.transformer.prepare_cell(self.prompt_embeds)
 
     def _init_noise(self, chunk: int) -> torch.Tensor:
         gen = torch.Generator(device=self.device)
@@ -98,6 +100,7 @@ class WanCell(CellAdapter):
             return hidden
         outs: list[dict[str, torch.Tensor]] = []
         tf = self.transformer
+        tf.prepare_cell(self.prompt_embeds)
         for i, (req, cell) in enumerate(tasks):
             chunk, step, block = cell
             self._last_meta = (req, chunk, step)
@@ -157,3 +160,77 @@ class WanCell(CellAdapter):
 
     def unpack_activation(self, payload: dict):
         return payload
+
+
+class WanCellBatch(CellAdapter):
+    """Request dispatcher carrying explicit member/cell metadata per row."""
+
+    _META = "wan_cell_rows"
+
+    def __init__(self, cells: dict[str, WanCell]) -> None:
+        if not cells:
+            raise ValueError("WanCellBatch requires at least one cell")
+        self.cells = cells
+        self._requests = list(cells)
+        self._indices = {req: index for index, req in enumerate(self._requests)}
+        first = next(iter(cells.values()))
+        self.device = first.device
+        schema = first.activation_spec(batch=1, include_hidden=True)
+        if any(cell.activation_spec(batch=1, include_hidden=True) != schema for cell in cells.values()):
+            raise ValueError("incompatible WanCell activation shapes or dtypes")
+
+    def _rows(self, payload):
+        if not isinstance(payload, dict) or self._META not in payload:
+            return {}
+        rows = {}
+        for index, (member, chunk, step, block) in enumerate(payload[self._META].tolist()):
+            req = self._requests[member]
+            rows[(req, chunk, step, block)] = {
+                key: value[index : index + 1] for key, value in payload.items() if key != self._META
+            }
+        return rows
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        if not tasks:
+            return hidden
+        previous = self._rows(hidden)
+        outputs = []
+        for index, (req, cell) in enumerate(tasks):
+            chunk, step, block = cell
+            row_hidden = previous.get((req, chunk, step, block - 1))
+            outputs.append(self.cells[req].forward(((req, cell),), [kv_contexts[index]], hidden=row_hidden))
+        keys = outputs[0].keys()
+        if any(output.keys() != keys for output in outputs):
+            raise RuntimeError("batched Wan cells produced incompatible activation fields")
+        result = {key: torch.cat([output[key] for output in outputs], dim=0) for key in keys}
+        result[self._META] = torch.tensor(
+            [(self._indices[req], *cell) for req, cell in tasks], dtype=torch.int64, device=self.device
+        )
+        return result
+
+    def pack_activation(self, output):
+        return {key: value.contiguous() for key, value in output.items()}
+
+    def unpack_activation(self, payload):
+        return payload
+
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        spec = next(iter(self.cells.values())).activation_spec(batch=batch, include_hidden=include_hidden)
+        return [*spec, (self._META, (batch, 4), torch.int64)]
+
+    def stash_activation(self, payload, *, handles=None, meta=None):
+        del handles
+        if meta is None:
+            raise RuntimeError("WanCellBatch stash_activation needs metadata")
+        rows = self._rows(payload)
+        if not rows:
+            raise RuntimeError("WanCellBatch activation is missing member metadata")
+        # The executor metadata describes only the first task; route rows using
+        # their own chunk/step and apply just its cross-replica step adjustment.
+        first_step = int(next(iter(rows))[2])
+        step_delta = int(meta[2]) - first_step
+        for (req, chunk, step, _block), row in rows.items():
+            self.cells[req].stash_activation(row, meta=(req, chunk, int(step) + step_delta))
+
+    def take_stashed_activation(self, req, chunk, step):
+        return self.cells[req].take_stashed_activation(req, chunk, step)

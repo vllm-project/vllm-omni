@@ -14,6 +14,9 @@ KV allocation. A model adapter owns model-specific controls and conditioning.
 LingBot World v2 is the first single-KV-branch integration. DreamZero uses the
 same runner capability with two logical CFG branches.
 
+See the [KV backend and compute-member contract](ar_diffusion_kv_backends.md)
+for the storage-independent interfaces beneath the existing Session layer.
+
 ## Identities
 
 Four identifiers have distinct lifetimes:

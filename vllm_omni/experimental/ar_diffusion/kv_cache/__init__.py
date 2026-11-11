@@ -12,7 +12,7 @@ request adapter / pool builders) · ``state`` (the model-facing ARDiffusionKVSta
 """
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
-from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVBackend, KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
     ARDiffusionKVCache,
     ARDiffusionRequestAdapter,
@@ -45,6 +45,7 @@ __all__ = [
     "ARDiffusionRequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
+    "KVBackend",
     "KVCacheLifecycle",
     "allocate_kv_pool_with_views",
     "ar_diffusion_paged_attention",

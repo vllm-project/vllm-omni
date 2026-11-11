@@ -2188,11 +2188,17 @@ class LingBotWorldCausalDMDPipeline(
         states: Sequence[StepRequestState] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        del input_batch, kwargs
+        del kwargs
         if states is None or len(states) != 1:
             raise ValueError("LingBot step execution supports a single request, not a batched request.")
         self._require_bound_ar_state()
         state = states[0]
+        members = getattr(input_batch, "execution_batch", None)
+        if members is not None:
+            if members.request_ids != (state.request_id,):
+                raise ValueError("LingBot compute members do not match the scheduled request")
+            if members.kv_views != (self._ar_diffusion_kv_state,):
+                raise ValueError("LingBot compute member is bound to a different KV backend")
         extra = state.extra
         latents = state.latents
         if latents is None:
@@ -2202,13 +2208,16 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError("LingBot step execution requires a current timestep before denoise_step.")
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
+        ar_context = self._ar_block_context(extra["ar_cross_attention"])
+        if members is not None and ar_context is not None:
+            ar_context = replace(ar_context, state=members.kv_views[0])
         return self._dmd_blocks.probe_step(
             current_latents=latents,
             condition=extra["condition"],
             camera=extra["camera"],
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
-            ar=self._ar_block_context(extra["ar_cross_attention"]),
+            ar=ar_context,
             start_frame=int(extra["start_frame"]),
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,

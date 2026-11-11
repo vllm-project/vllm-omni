@@ -4,15 +4,18 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.causvid_wan import async_stream_decode as asd_mod
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import (
     _async_host_copy,
     _start_local,
 )
+from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -70,3 +73,85 @@ def test_local_sidepath_does_not_decode_inside_on_finished():
     assert video is not None
     assert decoder.chunks == 2
     assert video.shape[1] == 3
+
+
+def test_local_cancel_stops_consumer_without_join(monkeypatch):
+    """cancel() must exit the consumer via the stop sentinel (not only bound chunks)."""
+    started: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        started.append(thread)
+        return thread
+
+    monkeypatch.setattr(asd_mod.threading, "Thread", _capture_thread)
+
+    vae = _FakeVae()
+    decoder = _FakeDecoder()
+    job = _start_local(vae=vae, decoder=decoder, session_id="req-cancel")
+    assert job.on_finished is not None
+    consumers = [t for t in started if t.name == "causvid-local-stream-decode"]
+    assert len(consumers) == 1 and consumers[0].is_alive()
+    job.on_finished(0, torch.randn(1, 4, 2, 4, 4))
+    job.cancel()
+    # Second cancel is a no-op.
+    job.cancel()
+    # A missed stop sentinel would leave the consumer blocked past cancel's 5s join.
+    assert not consumers[0].is_alive()
+    assert decoder.chunks <= 1
+
+
+def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch):
+    """Use real admission and KV ownership before injecting a compute failure."""
+    from tests.diffusion.models.causvid_wan.test_cell_batch import _pipeline, _request
+
+    pipeline, ctx, module = _pipeline(monkeypatch)
+    cancelled: list[bool] = []
+    job = SimpleNamespace(cancel=lambda: cancelled.append(True), on_finished=None)
+    monkeypatch.setattr(module, "start_async_stream_decode", lambda **_kwargs: job)
+
+    def boom(**_kwargs):
+        raise RuntimeError("compute boom")
+
+    monkeypatch.setattr(module, "run_cell_pipeline", boom)
+    with pytest.raises(RuntimeError, match="compute boom"):
+        pipeline.forward(_request("stream-fail", stream_decode=True))
+    assert cancelled == [True]
+    assert not ctx.pending and not ctx.inflight and not ctx.kv.cache.pool.keys
+
+
+def test_stream_decode_cancelled_if_wancell_fails(monkeypatch):
+    """Narrow seam: stream start + WanCell build; construction failure cancels the job."""
+    cancelled: list[bool] = []
+    fake_job = SimpleNamespace(on_finished=None, cancel=lambda: cancelled.append(True))
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.start_async_stream_decode",
+        lambda **_kwargs: fake_job,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.WanCell",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("wancell boom")),
+    )
+
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline.vae = None
+    pipeline.transformer = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="wancell boom"):
+        pipeline._start_stream_decode_and_wan_cell(
+            kv_id="kv-admit",
+            n_chunks=1,
+            latent_shape=(1, 4, 1, 1, 1),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            seed=0,
+            prompt_embeds=torch.zeros(1, 1, 1),
+            sampler=SimpleNamespace(),
+            stream_decode=True,
+            finish_rank=0,
+            source_rank=None,
+            pp_rank=0,
+            pp_group=None,
+            timeline_file=None,
+        )
+    assert cancelled == [True]

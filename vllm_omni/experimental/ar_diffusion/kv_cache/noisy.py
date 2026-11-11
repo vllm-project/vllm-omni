@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Noisy KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
+"""Noisy PP versioned KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -12,16 +12,18 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    PRIOR_HANDOFF_SLOT,
     Cell,
     CellPlan,
+    CellSchedule,
     Inflight,
     Ordering,
     RequestKVTransfer,
     union_transfers,
     union_wait_ready,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVBackend, KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerInputs,
@@ -52,8 +54,20 @@ class ARDiffusionNoisyKVSpec:
     block_size: int
     max_chunk_tokens: int
     max_history_chunks: int
+    # Versions per chunk a session keeps across requests: one for the diagonal
+    # orderings (the clean KV of each chunk), one per denoise step plus the
+    # chunk-0 sink for Same-Step, whose consumer reads the version matching its
+    # own step. Defaults to the diagonal case.
+    max_history_versions: int | None = None
+
+    @property
+    def history_versions(self) -> int:
+        """Retained versions per layer one rank may hold at once."""
+        return int(self.max_history_versions or self.max_history_chunks)
 
     def __post_init__(self) -> None:
+        if self.max_history_versions is not None and self.max_history_versions <= 0:
+            raise ValueError(f"max_history_versions must be positive, got {self.max_history_versions}")
         for name in (
             "num_layers",
             "num_kv_heads",
@@ -435,10 +449,11 @@ class NoisyKVTransport:
             torch.cuda.current_stream(self.pool.device).wait_stream(self._comm_stream)
 
     def discard(self, key: VersionKey) -> None:
-        pending = self._pending_recv.pop(key, None)
+        pending = self._pending_recv.get(key)
         if pending is not None:
             handles, payload, nbytes = pending
             _wait_handles(handles)
+            self._pending_recv.pop(key)
             self.bytes_received += nbytes
             del payload
 
@@ -470,6 +485,7 @@ class NoisyKVCache:
         # chunk 0 is deduplicated while inside the recent window. The G/step
         # margins below also cover pipeline overlap and transfers.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
+        per_req = max(per_req, spec.history_versions + 2 + layer_groups, spec.history_versions + step_replicas)
         desired = self.max_batch_size * per_req
         bytes_per_version = (
             2
@@ -511,17 +527,80 @@ class NoisyKVCache:
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
+        # Pool-scoped history survives per-invocation NoisyKVState instances.
+        self._session_structural_keys: dict[str, tuple[object, ...]] = {}
+        self._retained_history: dict[str, set[Cell]] = {}
+        self._active_states: dict[str, NoisyKVState] = {}
+
+    def bind_session_structure(self, kv_id: str, key: tuple[object, ...]) -> None:
+        """Record or check the schedule fingerprint for a persistent session pool key."""
+        existing = self._session_structural_keys.get(kv_id)
+        if existing is None:
+            self._session_structural_keys[kv_id] = key
+            return
+        if existing != key:
+            raise ValueError(
+                f"session {kv_id!r} schedule structural_key mismatch: "
+                f"retained={existing!r} request={key!r}; "
+                "release_noisy_kv and restart, or keep D/S/ordering/H/blocks fixed"
+            )
+
+    def clear_session_structure(self, kv_id: str) -> None:
+        self._session_structural_keys.pop(kv_id, None)
 
 
-class NoisyKVState(KVCacheLifecycle[str]):
-    """Per-request bridge used by the chunk executor."""
+def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
+    """History cells to retain across requests for ``schedule``.
+
+    Keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``. The diagonal
+    orderings read the clean KV of each retained chunk, so one version per chunk
+    is enough; a Same-Step consumer reads the version matching its own denoise
+    step, so every denoise step of the window has to survive. Same-Step
+    additionally keeps absolute chunk-0 clean sink cells for the whole session —
+    later plans still demand ``(0, D, *)`` even after the trailing window has
+    moved past chunk 0.
+    """
+    if num_blocks < 1:
+        return set()
+    t_clean = schedule.num_denoise_steps
+    cells: set[Cell] = set()
+    h = schedule.kv_history_chunks
+    if h >= 1:
+        end = schedule.chunk_end
+        start = max(0, end - h)
+        steps = range(schedule.num_denoise_steps) if schedule.ordering is Ordering.SAME_STEP else (t_clean,)
+        cells |= {(chunk, step, block) for chunk in range(start, end) for step in steps for block in range(num_blocks)}
+    if schedule.ordering is Ordering.SAME_STEP:
+        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+    return cells
+
+
+def prior_history_in_pool(
+    cache: NoisyKVCache,
+    kv_id: str,
+    *,
+    chunk_base: int,
+) -> frozenset[Cell]:
+    """Resident cells for ``kv_id`` with ``chunk < chunk_base`` (outer session supplies base)."""
+    if chunk_base <= 0:
+        return frozenset()
+    return frozenset(
+        (chunk, step, block) for sid, chunk, step, block in cache.pool.keys if sid == kv_id and chunk < chunk_base
+    )
+
+
+class NoisyKVState(KVBackend[tuple[str, Cell], list[NoisyLayerContext]], KVCacheLifecycle[str]):
+    """Per-invocation bridge used by the chunk executor over a shared pool."""
 
     def __init__(self, cache: NoisyKVCache) -> None:
         self.cache = cache
         self._plans: dict[str, CellPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
         self._last_use_global: dict[str, dict[Cell, int]] = {}
-        self._retained: set[VersionKey] = set()
+        self._retain = cache._retained_history
+        self._local_tasks: dict[str, frozenset[Cell]] = {}
+        self._completion_global: dict[str, dict[Cell, int]] = {}
+        self._prepared_tasks: set[tuple[str, Cell]] = set()
         self.bytes_sent = 0
         self.bytes_received = 0
         self.transfers_deduped = 0
@@ -545,93 +624,141 @@ class NoisyKVState(KVCacheLifecycle[str]):
         return self.cache.transport.uses_comm_stream
 
     def bind_rank(self, rank: int, pp_group: Any | None) -> None:
+        if self._plans and rank != self._rank:
+            raise RuntimeError("Cannot change Noisy KV rank while requests are active")
         self._rank = rank
         self._pp_group = pp_group
 
     def wait_sends(self) -> None:
         self.cache.transport.wait_sends()
 
-    def begin_request(self, req: str, plan: CellPlan, *, chunk_tokens: int, t0: int = 0) -> None:
-        if req in self._plans or any(key[0] == req for key in self._retained):
-            raise ValueError(f"Noisy KV owner {req!r} is already active or retains history")
+    def protect(self, req: str, cells: Iterable[Cell]) -> None:
+        """Keep ``cells`` for ``req`` out of last-use eviction and end_request release."""
+        if self.cache._active_states.get(req) is not self:
+            raise ValueError(f"Noisy KV owner {req!r} has no active request in this state")
+        bucket = self._retain.setdefault(req, set())
+        bucket.update(cells)
+
+    def begin_request(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        t0: int = 0,
+        retain: Collection[Cell] | None = None,
+    ) -> None:
         if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
             raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:
             raise ValueError("chunk_tokens exceeds max_chunk_tokens")
+        if req in self.cache._active_states:
+            raise RuntimeError(f"Noisy KV owner {req!r} already has an active request")
+        if not 0 <= self._rank < plan.world:
+            raise ValueError(f"rank {self._rank} out of range for world {plan.world}")
         self._plans[req] = plan
+        self.cache._active_states[req] = self
         self._chunk_tokens[req] = chunk_tokens
+        self._local_tasks[req] = frozenset(
+            task for slot in range(plan.num_slots) if (task := plan.task(slot, self._rank)) is not None
+        )
         mapped = {version: t0 + slot for version, slot in plan.last_use(self._rank).items()}
         self._last_use_global[req] = mapped
+        self._completion_global[req] = {cell: t0 + plan.completion_tick(cell) for cell in self._local_tasks[req]}
+        # An explicit policy replaces the previous call's keep set. Prior
+        # sources remain alive through the plan's last-use table, not retention.
+        if retain is not None:
+            self._retain[req] = set(retain)
+
+    def chunk_tokens(self, req: str) -> int:
+        """Public read for mainline ``SupportsNoisyPPKV`` (admit token-uniformity)."""
+        return self._chunk_tokens[req]
 
     def set_inflight(self, inflight: tuple[Inflight, ...]) -> None:
         self._inflight = inflight
 
     def retain_history(self, req: str, versions: Collection[Cell]) -> None:
-        """Pin resident versions independently of this plan's last-use table.
-
-        The caller selects history according to the model's version policy,
-        before last-use eviction. This does not copy KV or change pool capacity.
-        """
+        """Retain resident versions selected by the model's history policy."""
         if req not in self._plans:
             raise ValueError(f"Noisy KV owner {req!r} has no active request")
-        keys = {_version_key(req, version) for version in versions}
-        missing = keys.difference(self.cache.pool.keys)
+        missing = {_version_key(req, version) for version in versions}.difference(self.cache.pool.keys)
         if missing:
             raise ValueError(f"Cannot retain nonresident Noisy KV versions: {sorted(missing)}")
-        self._retained.update(keys)
-
-    def _release_versions(self, keys: Collection[VersionKey]) -> None:
-        # A pool slot must not be reused while an outbound send or inbound
-        # receive still accesses it. Transport owns the completion mechanism.
-        self.cache.transport.wait_sends()
-        for key in keys:
-            self.cache.transport.discard(key)
-            self.cache.pool.release(key)
+        self.protect(req, versions)
 
     def finish_request(self, owner: str) -> None:
-        """Drop execution metadata and temporary KV, preserving pinned history.
+        """Finish computation and retire temporary KV, preserving selected history."""
+        self.end_request(owner)
 
-        Call only after the request's model computations have finished. As in
-        the legacy session path, retained storage remains pool-owned until an
-        explicit history release. Without pins this matches ``end_request``.
+    def release_history(self, owner: str) -> None:
+        """Release retained storage only after this owner's computation ends."""
+        if owner in self.cache._active_states:
+            raise RuntimeError("Finish the Noisy KV request before releasing its history")
+        self.end_request(owner, retain=())
+        self.cache.clear_session_structure(owner)
+
+    def _is_retained(self, req: str, version: Cell) -> bool:
+        return version in self._retain.get(req, ())
+
+    def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None:
+        """Finish one admitted request.
+
+        ``retain is None`` keeps the existing protect set (normal plan
+        completion). ``retain=()`` clears retained versions for ``req``.
         """
-        req = owner
-        drop = [key for key in self.cache.pool.keys if key[0] == req and key not in self._retained]
-        self._release_versions(drop)
+        active = self.cache._active_states.get(req)
+        if active is not None and active is not self:
+            raise RuntimeError(f"Noisy KV owner {req!r} is active in another state")
+        self.cache.transport.wait_sends()
+        keep_cells = set(retain) if retain is not None else self._retain.get(req, set())
+        keep = {_version_key(req, cell) for cell in keep_cells}
+        drop = [key for key in self.cache.pool.keys if key[0] == req and key not in keep]
+        for key in drop:
+            self.cache.transport.discard(key)
+        for key in drop:
+            self.cache.pool.release(key)
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+        self._local_tasks.pop(req, None)
+        self._completion_global.pop(req, None)
+        self._prepared_tasks.difference_update(tuple(item for item in self._prepared_tasks if item[0] == req))
+        self.cache._active_states.pop(req, None)
+        if keep_cells:
+            self._retain[req] = set(keep_cells)
+        else:
+            self._retain.pop(req, None)
 
-    def release_history(self, owner: str) -> None:
-        """Release retained KV after execution ends; repeated calls are safe."""
-        req = owner
-        if req in self._plans:
+    def release_session(self, session_id: str) -> None:
+        """Drop every pool version and bookkeeping for one finished session."""
+        if session_id in self.cache._active_states:
             raise RuntimeError("Finish the Noisy KV request before releasing its history")
-        keys = [key for key in self._retained if key[0] == req]
-        if not keys:
-            return
-        self._release_versions(keys)
-        self._retained.difference_update(keys)
-
-    def end_request(self, req: str) -> None:
-        """Compatibility cleanup: release both temporary KV and history.
-
-        Cancellation callers must stop model computation before calling this.
-        """
-        self.finish_request(req)
-        self.release_history(req)
+        self.end_request(session_id, retain=())
+        leftover = [key for key in self.cache.pool.keys if key[0] == session_id]
+        for key in leftover:
+            self.cache.transport.discard(key)
+            self.cache.pool.release(key)
+        self._retain.pop(session_id, None)
+        self.cache.clear_session_structure(session_id)
 
     def reset_all(self) -> None:
-        for req in list(self._plans):
-            self.end_request(req)
+        if any(state is not self for state in self.cache._active_states.values()):
+            raise RuntimeError("Cannot reset a Noisy KV cache with requests active in another state")
+        self.cache.transport.wait_sends()
+        for req in list(set(self._plans) | set(self._retain)):
+            self.end_request(req, retain=())
         leftover = list(self.cache.pool.keys)
         for key in leftover:
             self.cache.transport.discard(key)
             self.cache.pool.release(key)
         self._plans.clear()
+        self._local_tasks.clear()
+        self._completion_global.clear()
+        self._prepared_tasks.clear()
         self._chunk_tokens.clear()
         self._last_use_global.clear()
-        self._retained.clear()
+        self._retain.clear()
+        self.cache._session_structural_keys.clear()
         self._inflight = ()
         self._clear_prepare_caches()
 
@@ -694,17 +821,20 @@ class NoisyKVState(KVCacheLifecycle[str]):
         self._write_slots_cache[key] = slots
         return slots
 
-    def prepare(self, tasks: tuple[tuple[str, Cell], ...]) -> list[list[NoisyLayerContext]]:
-        """One ``NoisyLayerContext`` per cell (single block)."""
+    def prepare(self, tasks: Sequence[tuple[str, Cell]]) -> list[list[NoisyLayerContext]]:
+        """Prepare one read/write layer view for each owned cell task."""
+        if len(set(tasks)) != len(tasks):
+            raise ValueError("Noisy KV prepare tasks must be unique")
+        for req, task in tasks:
+            plan = self._plans.get(req)
+            if plan is None:
+                raise ValueError(f"Noisy KV owner {req!r} has no active request")
+            if task not in self._local_tasks.get(req, ()):
+                raise ValueError(f"Noisy KV task {task} is not scheduled locally for owner {req!r}")
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
-        sink = int(
-            any(
-                plan.schedule.ordering is Ordering.SAME_STEP and plan.schedule.chunks > 1
-                for plan in self._plans.values()
-            )
-        )
+        sink = int(any(plan.schedule.same_step_has_sink for plan in self._plans.values()))
         width = (h + 1 + sink) * pool.chunk_blocks
         max_seq_len = (h + 1 + sink) * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
@@ -720,15 +850,14 @@ class NoisyKVState(KVCacheLifecycle[str]):
             plan = self._plans[req]
             srcs = plan.sources(task, self._rank)
             write_key = _version_key(req, task)
-            write_slot = pool.alloc(write_key)
-            write_blocks = pool.block_ids(write_slot)[:num_chunk_blocks]
             blocks: list[int] = []
             for src in srcs:
                 src_key = _version_key(req, src.version)
                 if not pool.has(src_key):
                     raise RuntimeError(f"I5: source {src_key} missing at prepare")
                 blocks.extend(pool.block_ids(pool.slot_of(src_key))[:num_chunk_blocks])
-            blocks.extend(write_blocks)
+            write_slot = pool.alloc(write_key)
+            blocks.extend(pool.block_ids(write_slot)[:num_chunk_blocks])
             if len(blocks) > width:
                 raise RuntimeError(f"block_table width {width} too small for {len(blocks)} blocks")
             # Do not overwrite pinned CPU source while a prior non_blocking H2D is in flight.
@@ -762,11 +891,20 @@ class NoisyKVState(KVCacheLifecycle[str]):
                     )
                 ]
             )
+        self._prepared_tasks.update((req, task) for req, task in tasks)
         self.cache.resident_peak = max(self.cache.resident_peak, self.resident_versions)
         return batch
 
-    def publish(self, tasks: tuple[tuple[str, Cell], ...]) -> None:
-        del tasks
+    def publish(self, tasks: Sequence[tuple[str, Cell]]) -> None:
+        """Confirm writes for tasks prepared by this invocation."""
+        if len(set(tasks)) != len(tasks):
+            raise ValueError("Noisy KV publish tasks must be unique")
+        for req, task in tasks:
+            if (req, task) not in self._prepared_tasks:
+                raise RuntimeError(f"Noisy KV task {task} was not prepared for owner {req!r}")
+            if not self.cache.pool.has(_version_key(req, task)):
+                raise RuntimeError(f"Noisy KV task {task} has no reserved write cell for owner {req!r}")
+        self._prepared_tasks.difference_update((req, task) for req, task in tasks)
 
     def exchange(self, slot: int) -> list[Any]:
         transfers = union_transfers(self._inflight, slot)
@@ -778,13 +916,48 @@ class NoisyKVState(KVCacheLifecycle[str]):
         self.bytes_received = self.cache.transport.bytes_received
         return handles
 
+    def exchange_and_await_prior_handoffs(self, global_slot: int) -> list[Any]:
+        """Exchange prior-history KV for requests whose first cell is ``global_slot``.
+
+        Must run before ``prepare`` of that first cell: the normal per-slot
+        ``exchange`` happens after forward, which is too late for continuation
+        history that is only resident on the owner rank.
+        """
+        transfers: list[RequestKVTransfer] = []
+        wanted: set[VersionKey] = set()
+        for item in self._inflight:
+            if global_slot != item.t0:
+                continue
+            for xfer in item.plan.transfers(PRIOR_HANDOFF_SLOT):
+                transfers.append(RequestKVTransfer(req=item.req, version=xfer.version, src=xfer.src, dst=xfer.dst))
+                if xfer.dst == self._rank:
+                    wanted.add(_version_key(item.req, xfer.version))
+        if not transfers:
+            return []
+        ordered = tuple(sorted(transfers, key=lambda x: (x.src, x.dst, x.req, x.version)))
+        handles = self.cache.transport.exchange(
+            ordered, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
+        )
+        self.bytes_sent = self.cache.transport.bytes_sent
+        self.bytes_received = self.cache.transport.bytes_received
+        for handle in handles:
+            if handle is not None:
+                handle.wait()
+        if self.uses_comm_stream:
+            self.cache.transport.wait_sends()
+        if wanted:
+            self.cache.transport.await_ready(frozenset(wanted))
+            self.bytes_received = self.cache.transport.bytes_received
+        return handles
+
     def evict(self, slot: int) -> None:
         if self.uses_comm_stream:
             self.cache.transport.wait_sends()
         drop: list[VersionKey] = []
         for req, used in self._last_use_global.items():
             for version, last in used.items():
-                if last == slot and _version_key(req, version) not in self._retained:
+                completion = self._completion_global.get(req, {}).get(version, last)
+                if max(last, completion) <= slot and not self._is_retained(req, version):
                     drop.append(_version_key(req, version))
         for key in drop:
             self.cache.transport.discard(key)

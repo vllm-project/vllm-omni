@@ -2,9 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Storage-independent completion and history-release boundary for AR KV."""
 
+from collections.abc import Sequence
 from typing import Protocol, TypeVar
 
 OwnerT = TypeVar("OwnerT", contravariant=True)
+TaskT = TypeVar("TaskT", contravariant=True)
+ViewT = TypeVar("ViewT", covariant=True)
+
+
+class KVBackend(Protocol[TaskT, ViewT]):
+    """Execution boundary shared by chunk-window and Cell backends.
+
+    Tasks and views remain backend-specific: no implicit layout conversion.
+    Prepare returns borrowed read/write views, valid through that forward;
+    callers complete model work before publish, transfers and last-use eviction.
+    Publish confirms successful writes; it does not synchronize GPU computation.
+    Retention policy and finish/release owners are described by KVCacheLifecycle.
+    A failed forward must be retired by backend cleanup, never published.
+    """
+
+    def prepare(self, tasks: Sequence[TaskT]) -> Sequence[ViewT]:
+        """Prepare attention/read-write views corresponding one-to-one to tasks."""
+        ...
+
+    def publish(self, tasks: Sequence[TaskT]) -> None:
+        """Publish successful writes for the tasks, after model computation."""
+        ...
 
 
 class KVCacheLifecycle(Protocol[OwnerT]):
