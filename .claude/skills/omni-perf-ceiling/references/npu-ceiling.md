@@ -18,8 +18,9 @@ accelerator:
 
 - RTF definitions, and the gap between per-request mean and aggregate.
 - Little's law in a closed-loop bench: `aggregate RTF(C) = C / X`.
-- The shared-device bound `X <= N / sum_i g_i(B)`, and the low-concurrency
-  pipeline bound `RTF(1) >= max_i t_i / d + (fill + drain) / d`.
+- Shared capacity accumulates demand per resource and takes the maximum;
+  independent stage durations must not be summed. Serial stage constraints
+  and path gates remain separate (see [bound-models.md](bound-models.md)).
 - The roofline terms: decode bounded by bytes read per step over measured
   bandwidth, compute stages bounded by FLOPs per audio second over measured
   dense throughput.
@@ -27,6 +28,8 @@ accelerator:
   so cell commands in [ceiling-experiments.md](ceiling-experiments.md) are
   unchanged.
 
+Measured peaks calibrate estimates, not strict hardware bounds. Mean RTF
+requires per-request work, and residual attribution requires profiling.
 So the workflow and the report template stay. Only the three measurement
 mechanics below are CUDA-specific.
 

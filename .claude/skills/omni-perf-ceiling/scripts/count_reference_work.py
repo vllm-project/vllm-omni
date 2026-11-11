@@ -4,7 +4,7 @@
 
 """Count per-stage work on a checkpoint's reference (transformers) implementation.
 
-The physical bound needs work counts that belong to the model, not to the
+The calibrated roofline needs reference work counts, separate from the
 serving engine under test: FLOPs, weight bytes streamed per step and KV bytes
 per token. This script builds the model from the checkpoint's own modeling code
 (``trust_remote_code``) on the meta device and counts with ``FlopCounterMode``,

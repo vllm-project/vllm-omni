@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Measure device copy bandwidth, dense matmul throughput and launch latency.
+"""Calibrate device copy bandwidth, dense matmul throughput and launch latency.
+
+These microbenchmarks measure particular shapes and dispatch paths, not hardware
+upper limits or universal launch minima. Faster kernels or other shapes may
+exceed them. Use them for calibrated estimates, never strict physical bounds.
 
 Runs on CUDA GPUs and on Ascend NPUs (``torch_npu``). The reduced-precision
 float32 mode is named ``tf32`` on CUDA and ``hf32`` on Ascend; both appear under
@@ -162,6 +166,13 @@ def main() -> None:
         )
 
     result = {
+        "measurement_kind": "empirical_calibration",
+        "measurement_parameters": {
+            "matmul_n": args.matmul_n,
+            "copy_gib": args.copy_gib,
+            "iters": args.iters,
+            "launch_kernels": args.launch_kernels,
+        },
         "device_type": backend.name,
         "device": backend.device_name(),
         "copy_bandwidth_gbs": copy_bandwidth_gbs(backend, int(args.copy_gib * 2**30), args.iters),

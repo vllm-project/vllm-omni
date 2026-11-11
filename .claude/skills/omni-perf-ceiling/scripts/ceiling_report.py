@@ -22,21 +22,21 @@ Per-stage attribution, in order of preference:
   trimmed to the span between the first and last non-idle sample. Ascend has no
   per-process AI Core counter, so use ``--stage-util`` there.
 
-Optional physical bounds need ``--peaks`` (``measure_peaks.py`` output) and
+Optional calibrated estimates need ``--peaks`` (``measure_peaks.py`` output) and
 work counts, which ``count_reference_work.py`` takes from the checkpoint's
 reference implementation and prints as the flags below. All
 terms are at batch = cell concurrency. ``@STAGE`` joins a term to that stage's
-measured g (``--stage-util`` or ``--pmon``) to report its % of SOL; terms
+measured g (``--stage-util`` or ``--pmon``) to report its estimate/measured ratio; terms
 sharing a NAME add up within each class:
 
 - ``--decode-bound NAME[@STAGE]=WEIGHT_GIB,TOKENS_PER_AUDIO_S[,KV_GIB_PER_SEQ[,GFLOP_PER_TOKEN,DTYPE]]``:
   roofline of an autoregressive stage, reading weights once per step plus each
   sequence's KV cache, against each token's FLOPs.
 - ``--compute-bound NAME[@STAGE]=TFLOP_PER_AUDIO_S,DTYPE[,GIB_PER_AUDIO_S]``:
-  FLOP floor at the measured peak of DTYPE (bf16, fp16, tf32, hf32, fp32), and
+  FLOP estimate at the measured peak of DTYPE (bf16, fp16, tf32, hf32, fp32), and
   optionally the bytes the stage must move.
 - ``--launch-bound NAME[@STAGE]=KERNELS_PER_STEP,STEPS_PER_AUDIO_S,eager|graph``:
-  launch floor from the measured per-kernel latency; STEPS_PER_AUDIO_S is per
+  launch estimate from the measured per-kernel latency; STEPS_PER_AUDIO_S is per
   sequence, so batching divides it.
 
 Per-request terms, ``NAME[@STAGE]=TFLOP,DTYPE[,WEIGHT_GIB[,KERNELS,MODE]]``, where
@@ -48,11 +48,11 @@ STAGE is the first stage the term gates (default 0):
   the per-audio terms (first Talker chunk before Code2Wav). ``@out`` marks the
   last stage's work on the first packet (first Code2Wav chunk).
 
-Each request then satisfies ``RTF_r >= a / d_r + b``. The report prints the
-aggregate RTF floor (``a / mean(d) + b``), the mean RTF floor (per request), and
-the measured ``a`` and ``b`` solved from mean and aggregate RTF. The same terms
-bound first-token latency (terms gating stage 0) and first-packet latency (all
-terms), compared with the bench's mean TTFT and AUDIO_TTFP.
+The legacy ``--*-bound`` flags and JSON ``*_bound`` keys describe calibrated
+estimates, not strict physical bounds. Aggregate RTF uses workload-average
+work counts. Mean RTF is unavailable without per-request work, even at C=1.
+Fixed/fill terms also estimate TTFT and TTFP for the supplied workload.
+Differences from measured values require profiling before attribution.
 
 Audits: ``--kv-capacity STAGE=KV_CACHE_TOKENS,TOKENS_PER_REQUEST[,BLOCK]``
 warns when a stage's KV cache cannot hold C requests; ``--series A,B,...``
@@ -65,7 +65,7 @@ Two readings sit beside the bound and never replace it:
   row priced at a fraction of the measured peak (``F <= 1``). It is a
   projection of one utilization target, not a lower bound.
 - ``--profiled NAME=SECONDS_PER_AUDIO_S``: a profiled duration of the
-  implementation the row names. The implementation floor is
+  implementation the row names. The implementation estimate is
   ``max(roofline, profiled)``; it constrains that implementation only.
 
 Rows of one stage are summed roofline by roofline, so each flag must cover
@@ -362,6 +362,7 @@ def request_terms(raws: list[str], peaks: dict, bw: float, batch: int, adds_work
                 "stage": stage,
                 "kind": "fixed" if adds_work else "fill",
                 "work": max(flops_s, bytes_s / batch) if adds_work else 0.0,
+                "resources": {f"compute:{values[1]}": flops_s, "memory": bytes_s / batch} if adds_work else {},
                 "latency": max(flops_s, bytes_s, launch_s),
             }
         )
@@ -378,9 +379,14 @@ def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int)
     """
     terms: dict[str, dict] = {}
 
-    def row(name: str, stage: str | None, compute: float, memory: float) -> dict:
+    def row(name: str, stage: str | None, compute: float, memory: float, dtype: str | None = None) -> dict:
         entry = terms.setdefault(name, {"stage": None, "device": 0.0, "rows": [], **dict.fromkeys(BOUND_CLASSES, 0.0)})
         entry["stage"] = stage or entry["stage"]
+        resources = entry.setdefault("resources", {})
+        if dtype is not None:
+            key = f"compute:{dtype}"
+            resources[key] = resources.get(key, 0.0) + compute
+        resources["memory"] = resources.get("memory", 0.0) + memory
         entry["rows"].append((compute, memory))
         entry["compute"] += compute
         entry["memory"] += memory
@@ -398,12 +404,12 @@ def stage_terms(specs: dict[str, list[str]], peaks: dict, bw: float, batch: int)
             if len(values) > 4
             else 0.0
         )
-        row(name, stage, flops_s, step_s / batch * tokens_per_s)
+        row(name, stage, flops_s, step_s / batch * tokens_per_s, values[4] if len(values) > 4 else None)
     for raw in specs["compute"]:
         name, stage, values = parse_bound(raw)
         flops_s = float(values[0]) / float(peaks["matmul_tflops"][values[1]])
         bytes_s = float(values[2]) * 2**30 / bw if len(values) > 2 else 0.0
-        row(name, stage, flops_s, bytes_s)
+        row(name, stage, flops_s, bytes_s, values[1])
     for raw in specs["launch"]:
         name, stage, (kernels_per_step, steps_per_audio_s, mode) = parse_bound(raw)
         launch_s = alpha_s(peaks, mode) * float(kernels_per_step) * float(steps_per_audio_s) / batch
@@ -434,12 +440,22 @@ def efficiency_target(raw: str | None) -> dict[str, float] | None:
     return parsed
 
 
-def scaled_device(entry: dict, efficiency: dict[str, float]) -> float:
-    """Row time at a fraction of the measured peak, taken per row before summing."""
-    total = 0.0
-    for compute, memory in entry["rows"]:
-        total += max(compute / efficiency.get("compute", 1.0), memory / efficiency.get("memory", 1.0))
-    return total
+def shared_resources(terms: dict, per_request: list[dict], mean_d: float, efficiency: dict | None = None) -> dict:
+    """Accumulate each resource separately; stages may overlap on a shared device.
+
+    Compute modes are separate constraints: no common-pipe capacity is assumed
+    without a device-specific mapping. Fixed work joins the same resource before
+    taking the maximum. Efficiency scales streaming work only.
+    """
+    totals: dict[str, float] = {}
+    for entry in terms.values():
+        for resource, seconds in entry["resources"].items():
+            fraction = (efficiency or {}).get(resource.split(":")[0], 1.0)
+            totals[resource] = totals.get(resource, 0.0) + seconds / fraction
+    for term in per_request:
+        for resource, seconds in term["resources"].items():
+            totals[resource] = totals.get(resource, 0.0) + seconds / mean_d
+    return totals
 
 
 def physical_bounds(
@@ -450,25 +466,13 @@ def physical_bounds(
     efficiency: dict[str, float] | None = None,
     profiled: dict[str, float] | None = None,
 ) -> dict:
-    """End-to-end RTF, TTFT and TTFP floors for one cell.
+    """Calibrated aggregate RTF and latency estimates (legacy function name).
 
-    Per audio second, each stage's device time is the sum of its rows'
-    rooflines and its serial time in its own process is ``max(device, launch)``.
-    Per request, fixed terms (prefill) add work and latency, fill terms (first
-    chunk before a downstream stage, or before the first packet for ``@out``)
-    add latency only. Each RTF floor has the form ``RTF_r >= a / d_r + b``:
-
-    - shared device: ``a = C * W / N``, ``b = C * sum device(C) / N``
-      (work conservation; aggregate only above C = 1);
-    - stage j throughput: ``a = 0``, ``b = C * serial_j(C)`` (one process runs
-      at most C sequences per step; aggregate only above C = 1);
-    - stage j path: ``a = sum of request latencies gating stages <= j``,
-      ``b = serial_j(1)`` (one request's critical path; a step never runs
-      faster than at batch 1, so it holds per request at any C).
-
-    Aggregate RTF is bounded by the largest ``a / mean(d) + b``, mean RTF by
-    the per-request mean of the largest path floor. TTFT is bounded by the
-    latencies gating stage 0, TTFP by every per-request latency.
+    Shared capacity takes the maximum of separately accumulated memory and
+    per-dtype compute demands. Serial stage rows still sum their rooflines.
+    Fixed work joins its resource before the maximum; fill terms add path
+    latency only. Workload-average inputs cannot justify a mean RTF estimate,
+    even at concurrency one. Empirical peaks are calibration, not hard limits.
     """
     bw = float(peaks["copy_bandwidth_gbs"]) * 1e9
     batch = cell["concurrency"]
@@ -485,34 +489,33 @@ def physical_bounds(
         entry["serial_1"] = single[name]["serial"]
         entry["measured_g"] = measured.get(entry["stage"]) if entry["stage"] is not None else None
         entry["pct_of_sol"] = entry["device"] / entry["measured_g"] if entry["measured_g"] and entry["device"] else None
-    device_total = sum(entry["device"] for entry in terms.values())
-    work_s = sum(t["work"] for t in per_request)
+    mean_d = cell["mean_audio_duration_s"]
+    resource_totals = shared_resources(terms, per_request, mean_d)
+    device_total = max(shared_resources(terms, [], mean_d).values(), default=0.0)
+    cell["shared_resource_s"] = resource_totals
+    cell["bound_kind"] = "calibrated_estimate"
+    cell["mean_bound_unavailable"] = "workload-average inputs do not establish per-request work"
+    cell.pop("rtf_bound_mean", None)
+    cell.pop("pct_of_sol_mean", None)
 
     floors: dict[str, dict] = {}
 
-    def floor(key: str, fixed: float, rate: float, per_request_scope: bool) -> None:
-        floors[key] = {"fixed_s": fixed, "rate": rate, "per_request": per_request_scope or batch == 1}
+    def floor(key: str, fixed: float, rate: float) -> None:
+        floors[key] = {"fixed_s": fixed, "rate": rate, "per_request": False}
 
-    if device_total or work_s:
-        floor("shared device", batch * work_s / num_gpus, batch * device_total / num_gpus, False)
+    if resource_totals:
+        floor("shared device", 0.0, batch * max(resource_totals.values()) / num_gpus)
     for name, entry in terms.items():
         order = stage_order(entry["stage"])
         gate_s = sum(t["latency"] for t in per_request if stage_order(t["stage"]) <= order)
         if batch > 1:
-            floor(f"stage {name} throughput", 0.0, batch * entry["serial"], False)
-        floor(f"stage {name} path", gate_s, entry["serial_1"], True)
+            floor(f"stage {name} throughput", 0.0, batch * entry["serial"])
+        floor(f"stage {name} path", gate_s, entry["serial_1"])
     if per_request:
-        floor("first packet", sum(t["latency"] for t in per_request), 0.0, True)
+        floor("first packet", sum(t["latency"] for t in per_request), 0.0)
 
-    mean_d = cell["mean_audio_duration_s"]
     aggregate = {key: f["fixed_s"] / mean_d + f["rate"] for key, f in floors.items()}
     binding = max(aggregate, key=aggregate.get)
-    per_request_floors = [(f["fixed_s"], f["rate"]) for f in floors.values() if f["per_request"]]
-    durations = cell.get("request_audio_s") or []
-    if per_request_floors and durations:
-        cell["rtf_bound_mean"] = sum(
-            max(fixed / d + rate for fixed, rate in per_request_floors) for d in durations
-        ) / len(durations)
 
     cell["bound_terms"] = terms
     cell["request_terms"] = per_request
@@ -524,8 +527,6 @@ def physical_bounds(
     cell["x_bound"] = batch / aggregate[binding]
     if cell.get("aggregate_rtf"):
         cell["pct_of_sol"] = cell["rtf_bound"] / cell["aggregate_rtf"]
-    if cell.get("rtf_bound_mean"):
-        cell["pct_of_sol_mean"] = cell["rtf_bound_mean"] / cell["mean_audio_rtf"]
 
     ttft_terms = [t for t in per_request if stage_order(t["stage"]) == 0]
     if ttft_terms:
@@ -540,14 +541,14 @@ def physical_bounds(
             cell["ttfp_pct_of_sol"] = cell["ttfp_bound_ms"] / cell["mean_audio_ttfp_ms"]
 
     if efficiency and terms:
-        device_target = sum(scaled_device(entry, efficiency) for entry in terms.values())
+        device_target = max(shared_resources(terms, [], mean_d, efficiency).values(), default=0.0)
         # Fixed and fill terms stay at the full measured peak: the target says
         # how the streaming rows move, and launch time is not a peak fraction.
         cell["efficiency_projection"] = {
             "compute": efficiency.get("compute", 1.0),
             "memory": efficiency.get("memory", 1.0),
             "device_s": device_target,
-            "rtf": (batch * work_s / num_gpus) / mean_d + batch * device_target / num_gpus,
+            "rtf": batch * max(shared_resources(terms, per_request, mean_d, efficiency).values()) / num_gpus,
         }
     for name, seconds in (profiled or {}).items():
         if name not in terms:
@@ -574,12 +575,7 @@ def kv_capacity(raws: list[str]) -> dict[str, int]:
 
 
 def series_warnings(cells: list[dict], series: list[str]) -> list[str]:
-    """Laws a concurrency sweep of one configuration must obey.
-
-    Raising C in a closed loop cannot lower aggregate RTF, audio throughput or
-    first-packet latency beyond noise; a violation means the cells differ in
-    more than C (warm-up, cache state, configuration) or the run thrashed.
-    """
+    """Flag sweep changes for investigation; batching can alter efficiency with C."""
     by_name = {c["name"]: c for c in cells}
     warnings = []
     for raw in series:
@@ -598,7 +594,10 @@ def series_warnings(cells: list[dict], series: list[str]) -> list[str]:
             ):
                 a, b = low.get(key), high.get(key)
                 if a and b and b < 0.95 * a:
-                    warnings.append(f"{pair}: {label} fell from {a:.3f} to {b:.3f}; the cells are not one sweep")
+                    warnings.append(
+                        f"{pair}: {label} fell from {a:.3f} to {b:.3f}; "
+                        "investigate batching, cache state, contention and run comparability"
+                    )
     return warnings
 
 
@@ -617,8 +616,8 @@ def render_latency(cells: list[dict]) -> list[str]:
         return []
     lines = [
         "",
-        "| Cell | C | Mean TTFT (ms) | P50 TTFT | TTFT bound | TTFT % of SOL | Mean TTFP (ms) | P50 TTFP "
-        "| TTFP bound | TTFP % of SOL |",
+        "| Cell | C | Mean TTFT (ms) | P50 TTFT | TTFT estimate | Estimate/measured | Mean TTFP (ms) | P50 TTFP "
+        "| TTFP estimate | Estimate/measured |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in cells:
@@ -634,8 +633,8 @@ def render_latency(cells: list[dict]) -> list[str]:
 def render(cells: list[dict], extra_warnings: list[str]) -> str:
     lines = [
         "| Cell | C | Done/Fail | Mean RTF | P50 | P99 | Aggregate RTF | C/X | Little residual "
-        "| Audio X (s/s) | GPU busy | RTF if no idle | Aggregate RTF bound | % of SOL | Mean RTF bound "
-        "| Mean % of SOL |",
+        "| Audio X (s/s) | GPU busy | RTF if no idle | Aggregate RTF estimate | Estimate/measured | Mean RTF estimate "
+        "| Mean estimate/measured |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in cells:
@@ -646,6 +645,15 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             f"| {fmt(c.get('gpu_busy_share'), 2)} | {fmt(c.get('rtf_floor_no_idle'))} | {fmt(c.get('rtf_bound'))} "
             f"| {fmt_pct(c.get('pct_of_sol'))} | {fmt(c.get('rtf_bound_mean'))} | {fmt_pct(c.get('pct_of_sol_mean'))} |"
         )
+    if any(c.get("bound_kind") for c in cells):
+        lines += [
+            "",
+            "Calibrated estimates, not strict physical bounds or achievable targets. Legacy JSON *_bound keys "
+            "are retained; ratios above 100% can reflect microbenchmark calibration limits.",
+            "Mean RTF estimate unavailable: per-request work counts are required, even at C=1.",
+            "Measured minus estimate/projection is an unattributed gap, not a measured speedup opportunity. "
+            "Kernel, host, transfer and queueing costs require profiling at every concurrency.",
+        ]
     lines += render_latency(cells)
     for c in cells:
         if "measured_fixed_s" in c:
@@ -680,13 +688,15 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             else:
                 lines.append("  X bound unavailable: no positive measured stage time")
         if terms := c.get("bound_terms"):
-            lines.append(f"Physical bound at batch {c['concurrency']} ({c['name']}), seconds per audio-s:")
+            lines.append(
+                f"Calibrated roofline estimate at batch {c['concurrency']} ({c['name']}), seconds per audio-s:"
+            )
             for name, e in terms.items():
                 stage = "" if e["stage"] is None else f" (stage {e['stage']})"
                 measured = (
                     ""
                     if e["measured_g"] is None
-                    else f"; measured g {e['measured_g']:.4f}, {fmt_pct(e['pct_of_sol'])} of SOL"
+                    else f"; measured g {e['measured_g']:.4f}, {fmt_pct(e['pct_of_sol'])} estimate/measured"
                 )
                 lines.append(
                     f"  {name}{stage}: compute {e['compute']:.4f}, memory {e['memory']:.4f}, "
@@ -696,17 +706,19 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
                 if "profiled_s" in e:
                     source = "profiled" if e["profiled_s"] >= e["device"] else "roofline"
                     lines.append(
-                        f"    profiled {e['profiled_s']:.4f}; implementation floor "
+                        f"    profiled {e['profiled_s']:.4f}; implementation estimate "
                         f"{e['implementation_s']:.4f} ({source})"
                     )
             if "g_total" in c:
-                lines.append(f"  measured g_total {c['g_total']:.4f} vs device bound {c['g_bound_total']:.4f}")
+                lines.append(
+                    f"  measured g_total {c['g_total']:.4f} vs shared resource estimate {c['g_bound_total']:.4f}"
+                )
         if proj := c.get("efficiency_projection"):
             lines.append(
                 f"Efficiency projection ({c['name']}, compute {proj['compute']:.2f} of peak, "
                 f"memory {proj['memory']:.2f} of peak): shared-device aggregate RTF {proj['rtf']:.3f} "
-                f"against the bound {c['rtf_bound']:.3f} and measured {fmt(c.get('aggregate_rtf'))}; "
-                f"per-audio device {proj['device_s']:.4f} s vs bound {c['g_bound_total']:.4f} s"
+                f"against the estimate {c['rtf_bound']:.3f} and measured {fmt(c.get('aggregate_rtf'))}; "
+                f"per-audio device {proj['device_s']:.4f} s vs estimate {c['g_bound_total']:.4f} s"
             )
         for t in c.get("request_terms") or []:
             if t["stage"] == OUTPUT_STAGE:
@@ -719,7 +731,8 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             )
         if floors := c.get("bound_floors"):
             lines.append(
-                f"End-to-end floors RTF >= a / d + b ({c['name']}, mean d {c['mean_audio_duration_s']:.2f} s):"
+                f"Calibrated aggregate constraints a / mean(d) + b ({c['name']}, "
+                f"mean d {c['mean_audio_duration_s']:.2f} s):"
             )
             for key, f in floors.items():
                 mark = "  <- binding" if key == c["bound_binding"] else ""
@@ -728,14 +741,14 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             fixed_floor = max(f["fixed_s"] for f in floors.values())
             rate_floor = max(f["rate"] for f in floors.values())
             lines.append(
-                f"  aggregate RTF bound {c['rtf_bound']:.3f} (audio X <= {c['x_bound']:.2f} audio-s/s), "
-                f"measured at {fmt_pct(c.get('pct_of_sol'))} of SOL; "
-                f"mean RTF bound {fmt(c.get('rtf_bound_mean'))}"
+                f"  aggregate RTF estimate {c['rtf_bound']:.3f} (implied audio X {c['x_bound']:.2f} audio-s/s), "
+                f"measured at {fmt_pct(c.get('pct_of_sol'))} estimate/measured; "
+                f"mean RTF estimate {fmt(c.get('rtf_bound_mean'))}"
             )
             if "measured_fixed_s" in c:
                 lines.append(
-                    f"  measured a {c['measured_fixed_s'] * 1000:.0f} ms vs largest floor a "
-                    f"{fixed_floor * 1000:.1f} ms; measured b {c['measured_rate']:.3f} vs largest floor b "
+                    f"  measured a {c['measured_fixed_s'] * 1000:.0f} ms vs largest estimate a "
+                    f"{fixed_floor * 1000:.1f} ms; measured b {c['measured_rate']:.3f} vs largest estimate b "
                     f"{rate_floor:.4f}"
                 )
         terms_by_name = {t["name"]: t for t in c.get("request_terms") or []}
@@ -744,8 +757,8 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
                 continue
             parts = " + ".join(f"{n} {terms_by_name[n]['latency'] * 1000:.1f}" for n in c[f"{key}_terms"])
             lines.append(
-                f"{metric} bound ({c['name']}): {parts} = {c[f'{key}_bound_ms']:.1f} ms; "
-                f"measured mean {fmt(c.get(measured), 1)} ms, {fmt_pct(c.get(f'{key}_pct_of_sol'))} of SOL"
+                f"{metric} estimate ({c['name']}): {parts} = {c[f'{key}_bound_ms']:.1f} ms; "
+                f"measured mean {fmt(c.get(measured), 1)} ms, {fmt_pct(c.get(f'{key}_pct_of_sol'))} estimate/measured"
             )
         for stage, capacity in (c.get("kv_capacity") or {}).items():
             lines.append(f"KV capacity ({c['name']}): stage {stage} holds {capacity} requests at C {c['concurrency']}")
@@ -773,8 +786,9 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
         for metric, key, measured in (("TTFT", "ttft", "mean_ttft_ms"), ("TTFP", "ttfp", "mean_audio_ttfp_ms")):
             if (c.get(f"{key}_pct_of_sol") or 0.0) > 1.05:
                 warnings.append(
-                    f"{c['name']}: {metric} bound {c[f'{key}_bound_ms']:.1f} ms is above measured mean "
-                    f"{c[measured]:.1f} ms; a per-request term overcounts"
+                    f"{c['name']}: {metric} estimate {c[f'{key}_bound_ms']:.1f} ms is above measured mean "
+                    f"{c[measured]:.1f} ms; check work coverage and empirical calibration; "
+                    "this is not a physical impossibility"
                 )
         if c["mean_ttft_ms"] and c["mean_audio_ttfp_ms"] and c["mean_audio_ttfp_ms"] < c["mean_ttft_ms"]:
             warnings.append(
@@ -794,14 +808,14 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
         if c.get("gpu_samples") and not c.get("util_trimmed")
     ]
     warnings += [
-        f"{c['name']}: RTF bound {c['rtf_bound']:.3f} is above measured aggregate RTF {c['aggregate_rtf']:.3f} "
-        f"({c['bound_binding']}); a bound input overcounts"
+        f"{c['name']}: RTF estimate {c['rtf_bound']:.3f} is above measured aggregate RTF {c['aggregate_rtf']:.3f} "
+        f"({c['bound_binding']}); check work coverage and empirical calibration; this is not a physical impossibility"
         for c in cells
         if (c.get("pct_of_sol") or 0.0) > 1.05
     ]
     warnings += [
         f"{c['name']}: only {c['audio_coverage']:.0%} of requests carry stage audio durations; "
-        "the fixed / per-audio split and mean RTF bound use that subset"
+        "the fixed / per-audio split uses that subset"
         for c in cells
         if c.get("audio_coverage", 1.0) < 0.9
     ]
@@ -823,7 +837,8 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
         if proj and c.get("aggregate_rtf") and proj["rtf"] > 1.05 * c["aggregate_rtf"]:
             warnings.append(
                 f"{c['name']}: efficiency projection {proj['rtf']:.3f} is above measured aggregate RTF "
-                f"{c['aggregate_rtf']:.3f}; the cell already beats this utilization target"
+                f"{c['aggregate_rtf']:.3f}; the measured cell is below this counterfactual; "
+                "achieved kernel efficiency is not established"
             )
         for name, e in (c.get("bound_terms") or {}).items():
             if e.get("profiled_s") is not None and e["device"] and e["profiled_s"] < 0.95 * e["device"]:
@@ -893,19 +908,20 @@ def main() -> int:
         "--series",
         action="append",
         default=[],
-        help="NAME,NAME,...: cells of one configuration at rising C; checks the sweep is monotone",
+        help="NAME,NAME,...: cells of one configuration at rising C; flags decreases for investigation, "
+        "not violations of a monotonicity law",
     )
     parser.add_argument(
         "--efficiency-target",
         help="compute=F,memory=F with 0 < F <= 1: project the shared-device floor at that fraction of the "
-        "measured peak. A projection, printed beside the bound, never instead of it",
+        "calibration. A counterfactual, not achieved kernel efficiency",
     )
     parser.add_argument(
         "--profiled",
         action="append",
         default=[],
         help="NAME=SECONDS_PER_AUDIO_S at this cell's batch: a profiled duration of that row's implementation. "
-        "The implementation floor is max(roofline, profiled) and does not enter the bound",
+        "The implementation estimate is max(roofline, profiled) and does not enter the bound",
     )
     parser.add_argument("--num-gpus", type=int, default=1, help="devices shared by all stages")
     parser.add_argument("--json", help="write the ledger to this path")

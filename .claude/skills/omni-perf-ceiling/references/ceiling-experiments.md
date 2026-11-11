@@ -76,7 +76,7 @@ python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py \
   --json $OUT/ledger.json
 ```
 
-Add physical bounds once peaks and per-stage work are known. Work counts come
+Add calibrated estimates once peaks and per-stage work are known. Work counts come
 from the checkpoint's reference implementation, the transformers modeling code
 the checkpoint ships (`trust_remote_code`), not from the vLLM-Omni code path
 under test. `scripts/count_reference_work.py` builds the reference model on the
@@ -144,7 +144,8 @@ Hand counts (`2 * params * tokens`, safetensors prefix sums) are a fallback
 only when no reference implementation can be built; say so in the report.
 
 `@STAGE` is the stage id used by `--stage-util` or `--pmon`; with it the
-report prints each stage's measured `g_i` beside its bound and the % of SOL.
+report prints each stage's measured `g_i` beside its calibrated estimate and
+the estimate/measured ratio.
 Each flag is one row, a group of kernels; the stage's device floor is the sum
 of each row's `max(compute, memory)` (flow model and vocoder are two rows), so
 rows of one stage must not cover the same kernels. Add launch rows when kernel
@@ -157,9 +158,9 @@ log for the graph batch limit):
   --launch-bound code2wav@2=<kernels_per_chunk>,<chunks_per_audio_s>,eager
 ```
 
-The per-request terms give the end-to-end floor
-([bound-models.md](bound-models.md#end-to-end-rtf-fixed-and-per-audio-second-cost)),
-the TTFT bound (terms gating `@0`) and the TTFP bound (all terms); `@out` marks
+The supplied fixed/fill terms give the aggregate end-to-end estimate
+([bound-models.md](bound-models.md#fixed-work-fill-and-aggregate-estimates)),
+the TTFT estimate (terms gating `@0`) and the TTFP estimate (all terms); `@out` marks
 Code2Wav's work on the first chunk, which only the first packet waits for.
 Append `,<kernels>,eager|graph` to a per-request term when the kernel count of
 that path is known.
@@ -204,7 +205,7 @@ measured peaks. It does not cover audio stages.
 
 [mindie-sim](https://github.com/mindie-agent/sim) contributes two readings,
 both printed beside the bound
-([bound-models.md](bound-models.md#target-efficiency-and-profiled-completions)):
+([bound-models.md](bound-models.md#efficiency-targets-and-profiled-measurements)):
 
 ```bash
   --efficiency-target compute=0.8,memory=0.8 \
@@ -214,9 +215,12 @@ both printed beside the bound
 The efficiency target projects the shared-device floor with every streaming
 row at that fraction of the measured peak. The profiled value is one row's
 measured duration; the report prints `max(roofline, profiled)` as that
-implementation's floor and warns when the profile beats the roofline. Its
-event-engine schedule is not used: contention only adds time, so the summed
-roofline is already the device floor.
+implementation's estimate and warns when the profile beats calibration. Its
+event-engine schedule is not used. Shared demand is accumulated per resource
+before taking the maximum; independent stage durations must not be summed.
+An efficiency target does not measure achieved efficiency or attribute the
+residual to host/scheduling. Mean RTF estimates are unavailable without
+per-request work counts. These are empirical estimates, not physical limits.
 
 Count kernels per step from one short nsys capture of the stage, in a run
 that produces no timing numbers:
@@ -289,7 +293,8 @@ importable. `launch_latency_us` holds the per-op cost of tiny kernels issued
 eagerly (`eager`, PyTorch dispatch included) and replayed from a captured
 graph (`graph`); `graph` is null when capture is not available. Launch latency
 depends on the host CPU as well as the device, so measure it on the serving
-host.
+host. These microbenchmarks are calibration, not universal throughput maxima
+or launch minima; other shapes and implementations can beat them.
 
 ## Pitfalls
 
@@ -300,8 +305,9 @@ host.
 - Mixed output modes: a single-file engine and a streaming engine differ in
   work per request.
 - Profilers on: never report profiler-enabled latency or throughput.
-- Reading TTFT or TTFP % of SOL at high C: the bound carries no queueing, so the
-  gap there is admission and waiting; judge latency headroom at C1.
+- Attributing latency residuals without traces: at any C, inefficient kernels,
+  extra work, host, transfer and queueing can contribute. Use C1 as a baseline,
+  then profile the critical path before assigning the gap.
 - Bounds without arithmetic: a bound column that cannot be recomputed from the
   report's substituted formulas is not evidence.
 - Shared hosts: record other processes on the device; GPU utilisation from

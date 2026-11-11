@@ -1,6 +1,6 @@
 ---
 name: omni-perf-ceiling
-description: Estimate the best achievable serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF, TTFT or first-audio latency (AUDIO_TTFP) at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured and physical-bound numbers with a per-stage headroom ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
+description: Estimate idealized serving performance of a vLLM-Omni multi-stage omni model (Qwen3-Omni, MiniCPM-o, and similar thinker/talker/code2wav pipelines) and how much headroom the current implementation leaves. Use when asked for the lowest reachable AUDIO_RTF, TTFT or first-audio latency (AUDIO_TTFP) at a given concurrency, the maximum audio throughput on given hardware, whether a model "still has optimization room", or which stage bounds a target. Produces measured and calibrated roofline estimates with a per-stage gap ledger, on CUDA GPUs or Ascend NPUs. Use `omni-perf-opt` afterwards to implement optimizations.
 ---
 
 # Omni Performance Ceiling
@@ -9,12 +9,14 @@ Answer "how fast can this get, and where is the remaining gap" with two
 numbers per target, not one:
 
 1. **Measured**: the shipped configuration on the target hardware.
-2. **Bound**: a physical floor derived from per-stage work and measured
-   device peaks. Work is counted on the checkpoint's reference (transformers)
-   implementation, so the bound belongs to the model, not to the engine
-   being measured.
+2. **Calibrated estimate**: reference work priced with device microbenchmarks.
+   It is conditional on the workload, precision, cache and serial-path assumptions.
+   It is neither a strict physical bound nor an achievable performance target.
 
-`measured - bound` is the headroom. Report it per stage.
+`measured - estimate` is an unattributed gap, not guaranteed optimization
+headroom. Report it per stage and require profiling before assigning a cause.
+The legacy CLI `--*-bound` and JSON `*_bound` names remain for compatibility;
+`bound_kind=calibrated_estimate` identifies their semantics.
 
 ## First questions
 
@@ -38,33 +40,29 @@ Concurrency 1 is a latency problem; high concurrency is a capacity problem.
 Do not use one model for both. Derivations:
 [references/bound-models.md](references/bound-models.md).
 
-- **Low concurrency**: stages pipeline, so
-  `RTF(1) >= max_i t_i / audio + fill_and_drain / audio`, where `t_i` is the
-  stage's per-request busy time at batch 1. If measured RTF(1) already
-  equals the slowest stage share, scheduling has nothing left; only that
-  stage's single-batch latency can move the number.
-- **High concurrency**: closed-loop load obeys Little's law,
-  `aggregate RTF(C) = C / audio_throughput`. The floor is therefore set by
-  the maximum audio throughput:
-  `audio_throughput <= N_gpu / sum_i g_i(B)`, where `g_i(B)` is GPU-seconds
-  that stage `i` spends per second of audio at batch `B`. Measure `g_i`,
-  bound each `g_i`, add them up. A stage also runs its steps serially in one
-  process, so `audio_throughput <= 1 / max(g_i, l_i)` per stage, where `l_i`
-  is its kernel-launch time per audio second. Small batches and eager
-  fallbacks make that launch term bind before the device does.
+- **Low concurrency**: account for serial stage work and the gates before
+  each stage starts. Stage wall time includes upstream waits, so it does not
+  establish exclusive kernel time or exclude scheduling overhead.
+- **High concurrency**: Little's law relates aggregate RTF to audio throughput
+  while concurrency is held. Accumulate shared demand per resource (memory
+  and each compute dtype), take the maximum, then combine with each stage's
+  serial constraint. Do not sum durations of stages that can overlap via MPS
+  or independent streams. Serial rows inside one stage may still be summed.
 
-Both regimes also pay a fixed cost per request. End-to-end,
-`T_r = a + b * d_r`: `b` is the per-audio-second cost the terms above bound,
-`a` is prefill, first-chunk fill before each downstream stage, host work and,
-under load, queueing. So `aggregate RTF = b + a / mean(d)` and
-`mean RTF = b + a * mean(1/d)`; a mean-RTF target pays more for `a` because
-short utterances weigh more. Report the measured and bound `a` and `b`
-separately: they move with different levers.
+Fixed request work joins the matching resource before the maximum. The
+aggregate shared estimate is `C/N * max_q(D_q + W_q/mean(d))`; D is streaming
+resource demand and W is fixed demand. Different dtype constraints remain
+separate unless a hardware resource mapping proves they share a serial pipe.
 
-First-token and first-packet latency are the head of `a`. TTFT is bounded by
+The fitted `T_r = a + b*d_r` split is descriptive and assumes common a and b.
+Its coefficients do not identify causal fixed/streaming overhead. Workload
+averages do not bound individual requests: the current report leaves mean
+RTF unavailable, even at C1, because it lacks per-request work counts.
+
+First-token and first-packet latency estimates describe the head of `a`. TTFT includes
 the work before the Thinker's first token (encoders, prefill on uncached
 tokens); TTFP adds every hand-off before the first audio packet (Thinker steps
-the Talker needs, the first codec chunk, Code2Wav on that chunk). The floor
+the Talker needs, the first codec chunk, Code2Wav on that chunk). The estimate
 has no queueing term, so judge it at concurrency 1.
 
 ## Workflow
@@ -95,8 +93,8 @@ has no queueing term, so judge it at concurrency 1.
    implied throughput floor. A Little's-law mismatch above 10% means the run
    did not hold concurrency (ramp, failures, or too few prompts); fix that
    before reading anything else. Pass `--series` with the cells of one
-   configuration: throughput, aggregate RTF, TTFT and TTFP must not fall as C
-   rises, and a cell that breaks this is not part of the sweep.
+   configuration. Decreases in throughput, aggregate RTF, TTFT or TTFP
+   are diagnostics to investigate; batching can change efficiency with C.
 
 5. **Attribute device time per stage.** Pick one:
    - one device per stage (`*_3gpu.yaml`): per-device utilisation is the
@@ -108,7 +106,7 @@ has no queueing term, so judge it at concurrency 1.
    Experiment recipes:
    [references/ceiling-experiments.md](references/ceiling-experiments.md).
 
-6. **Compute bounds.** Run `scripts/measure_peaks.py` on the target device for
+6. **Compute calibrated estimates.** Run `scripts/measure_peaks.py` on the target device for
    memory bandwidth, dense matmul throughput and per-kernel launch latency
    (eager and graph replay). Run `scripts/count_reference_work.py` on the
    checkpoint for work counts: it builds the reference transformers model on
@@ -119,7 +117,7 @@ has no queueing term, so judge it at concurrency 1.
    plus KV read per decode step, or bytes moved), and launch (kernels per step
    times steps per audio second, at the stage's eager or graph mode). Split a
    stage into kernel groups with different bound classes, one flag each; the
-   stage floor is `sum over groups of max(compute, memory)` on the device and
+   serial stage estimate is `sum over groups of max(compute, memory)` and
    `max(device, launch)` in its own process; the larger term names the
    stage's bound class.
    Write each term's formula with the numbers substituted so it can be
@@ -128,27 +126,22 @@ has no queueing term, so judge it at concurrency 1.
    adds (Thinker prefill on uncached tokens, encoders) and `--fill-bound` for
    latency before a downstream stage can start (first Thinker step before the
    Talker, the first codec chunk before Code2Wav, and `@out` for Code2Wav on
-   that chunk). The report turns them into aggregate and mean RTF floors of
-   the form `a / d + b`, a TTFT floor (terms gating stage 0) and a TTFP floor
-   (all terms).
+   that chunk). The report produces an aggregate RTF estimate, a TTFT
+   estimate (terms gating stage 0) and a TTFP estimate (all serial gates).
+   Mean RTF estimation requires per-request work and is unavailable.
 
-7. **Correlate measured against bound.** Pass `NAME@STAGE` on the bound
-   flags so `ceiling_report.py` joins each term to that stage's measured
-   `g_i` and reports its % of SOL (bound / measured, at most 100%). A stage
-   far below SOL with a compute or memory bound needs kernel or batching
-   work; a launch-bound stage needs graph coverage or fewer, larger kernels.
-   Measured RTF far above the whole bound, with high GPU idle, is host,
-   scheduling or inter-stage transfer, which the bound does not price.
-   Compare the measured fixed cost `a` and per-audio cost `b` (solved from
-   mean and aggregate RTF) with the largest floor `a` and `b`: a fixed-cost
-   gap points at prefill, first-chunk scheduling, connector waits and
-   queueing; a per-audio gap points at kernels and batching.
-   Optionally pass `--efficiency-target compute=F,memory=F` (each `F` at most 1).
-   It projects the shared-device floor with every streaming row at that
-   fraction of the measured peak, and `--profiled NAME=SECONDS` compares one
-   row's roofline with a profiled duration of that implementation. Both are
-   readings beside the bound: the projection is not a floor, and the profiled
-   floor constrains only the implementation that was profiled.
+7. **Compare measurement and estimate.** Pass `NAME@STAGE` so the report
+   joins the calibration to measured stage busy time. Estimate/measured is a
+   diagnostic ratio; values above 100% can reflect calibration limits.
+   Treat kernel efficiency, extra work, host, transfer and queueing as
+   hypotheses. Use nsys/msprof timelines and kernel counters to identify the
+   critical path. Slow kernels can cause queueing and downstream idle time.
+   The fitted a/b split and an idle percentage cannot establish causality.
+   `--efficiency-target compute=F,memory=F` projects shared resource demand at
+   a hypothetical fraction of calibration. It does not measure achieved
+   efficiency or attribute the residual. `--profiled NAME=SECONDS` compares
+   a supplied implementation duration with its calibrated roofline. Neither
+   comparison is a guarantee of an attainable speedup.
 
 8. **Report.** Fill the template below. Hand the largest gap to
    `omni-perf-opt` as its first candidate.
@@ -158,14 +151,13 @@ has no queueing term, so judge it at concurrency 1.
 - Do not quote a ceiling without the measured cell beside it on the same
   commit and hardware.
 - Historical numbers are context, not evidence for the current revision.
-- Physical bounds are lower limits on time, not predictions. Name the
-  dominant term and the assumptions it hides (perfect batching, no host
-  overhead, peak bandwidth). A target-efficiency projection and a profiled
-  implementation floor are readings beside the bound, and a schedule of
-  shared pipes would be a prediction: contention only adds time, so the sum
-  of the per-row rooflines is already the device floor.
-- Peaks and launch latency come from `measure_peaks.py` on the device in
-  hand, never from memory or a data sheet.
+- Label empirical rooflines as calibrated estimates. Strict hardware bounds
+  require justified resource limits and unavoidable work; this tool does not
+  certify them. Name perfect batching, cache, precision and serial assumptions.
+- Calibrate on the serving device and host with `measure_peaks.py`. A single
+  GEMM shape or PyTorch tiny-op launch cost is not a universal hardware limit.
+- Shared devices use separate resource constraints; summing serial stage
+  durations across independent streams overstates the shared requirement.
 - Work counts (FLOPs, streamed weight bytes, KV bytes) come from the
   checkpoint's reference implementation, never from the vLLM-Omni code path
   being measured: counting the engine's own path folds its waste (padding,
@@ -179,20 +171,16 @@ has no queueing term, so judge it at concurrency 1.
   reported beside it.
   A term that cannot be grounded is written as "not bounded: <reason>",
   never estimated to fill the column.
-- A stage measured below its own bound (% of SOL above 100%) means the work
-  count, the peak or the attribution is wrong. Fix the input before reading
-  the ledger.
-- Bound the RTF the target names. The aggregate floor uses `mean(d)`; the
-  mean floor uses each request's `d` and, above C = 1, only the per-request
-  critical path, so it can sit below the aggregate floor.
-- Per request, a stage streams no faster than at batch 1; a floor that
-  assumes every step is full (`C * serial(C)`) bounds the aggregate only.
-- TTFT and TTFP floors carry no queueing. Quote their % of SOL at C1; above
-  it, name the gap as queueing and scheduling, not kernels.
+- Investigate ratios above 100%: calibration may be exceeded, or work coverage
+  and attribution may differ. Do not declare physical impossibility.
+- Report aggregate and mean RTF separately. Workload-average work supports only
+  aggregate estimates. Mean RTF stays unavailable without per-request counts.
+- TTFT/TTFP estimates omit queueing. At every C their residual may also include
+  inefficient kernels or extra work; profile before assigning host/scheduler cost.
 - Report the regime for each cell. Do not extrapolate a high-concurrency
   RTF from low-concurrency runs, or the reverse.
-- A cell whose throughput is still rising with concurrency is not saturated;
-  its aggregate RTF floor is the next cell's, not this one's.
+- A cell whose throughput is still rising has not established saturation.
+  Keep its estimate tied to its own concurrency and workload.
 - A ceiling belongs to one accelerator. Bounds scale with that device's
   measured peaks, so never carry a CUDA ceiling to Ascend or back.
 
@@ -200,10 +188,12 @@ has no queueing term, so judge it at concurrency 1.
 
 ```markdown
 ## Ceiling summary
-| Cell | Measured | Bound | % of SOL | Binding term |
+| Cell | Measured | Calibrated estimate | Estimate/measured | Binding term |
 |------|----------|-------|----------|--------------|
-| RTF C1 (mean / aggregate) | | | | |
-| RTF C64 (mean / aggregate) | | | | |
+| Aggregate RTF C1 | | | | |
+| Mean RTF C1 | | unavailable: per-request work missing | | |
+| Aggregate RTF C64 | | | | |
+| Mean RTF C64 | | unavailable: per-request work missing | | |
 | Audio throughput C64 (audio-s/s) | | | | |
 | TTFT C1 (ms, mean) | | | | |
 | AUDIO_TTFP C1 (ms, mean) | | | | |
@@ -213,30 +203,30 @@ has no queueing term, so judge it at concurrency 1.
 - Deploy: <yaml> + <overlay>; session mode; output mode
 - Workload: dataset, prompts, warmup, extra body
 
-## Headroom ledger (C<high>)
-| Stage | Time share | g_i (GPU-s per audio-s) | Bound g_i | % of SOL | Bound class | Launch floor | Next lever |
+## Gap ledger (C<high>)
+| Stage | Time share | g_i (GPU-s per audio-s) | Estimated g_i | Estimate/measured | Resource class | Launch estimate | Next lever |
 |-------|-----------|-------------------------|-----------|----------|-------------|--------------|------------|
 | Stage 0 | | | | | | | |
 | Stage 1 | | | | | | | |
 | Stage 2 | | | | | | | |
-| GPU idle / host | | | 0 | | host | | |
+| GPU idle (cause unassigned) | | | | | | | |
 
 ## End-to-end split (T = a + b * d)
-| Cell | Measured a (ms) | Floor a (ms) | Measured b | Floor b | Fixed share of RTF |
+| Cell | Fitted a (ms) | Estimate a (ms) | Fitted b | Estimate b | Fixed share of RTF |
 |------|-----------------|--------------|------------|---------|--------------------|
 | C1 | | | | | |
 | C<high> | | | | | |
 
 ## First-packet path (C1)
-| Term | Gates | Latency floor (ms) | Formula |
+| Term | Gates | Latency estimate (ms) | Formula |
 |------|-------|--------------------|---------|
 | Thinker prefill | stage 0 (TTFT) | | |
 | Thinker steps before Talker | stage 1 | | |
 | First codec chunk | stage 2 | | |
 | Code2Wav first chunk | first packet | | |
-| **TTFP floor** / measured | | | |
+| **TTFP estimate** / measured | | | |
 
-## Bound arithmetic
+## Estimate arithmetic
 [Per stage: each term's formula with numbers substituted, its source
 (measured peak, checkpoint, result JSON, FLOP counter, analytic), and any
 term left "not bounded: <reason>"]
@@ -244,7 +234,9 @@ term left "not bounded: <reason>"]
 ## Checks
 - Little's law: C / audio_throughput vs aggregate RTF
 - Admission: stage capacities and KV capacity >= C; graph fallbacks at C
-- Sweep: throughput, aggregate RTF, TTFT and TTFP monotone in C
+- Sweep: investigate changes in throughput, aggregate RTF, TTFT and TTFP
+- Attribution: trace evidence, or gap remains unattributed
+- Interpretation: calibrated estimates, no guaranteed speedup
 - Quality: <metric> within run-to-run variance, or not measured
 
 ## Not measured
