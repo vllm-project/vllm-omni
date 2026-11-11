@@ -42,7 +42,7 @@ from merge_shard_timings import (  # noqa: E402
     write_merged_profile,
 )
 from runtime_shard import PLUGIN_MODULE, _file_shard_command, _inject_plugin, pack_files, plan_shard_count  # noqa: E402
-from upload_pipeline import _render_test_pipeline  # noqa: E402
+from upload_pipeline import _render_test_pipeline, filter_pipeline_by_source_dependencies  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,6 +55,9 @@ SHARD_ID = "--shard-id=$$BUILDKITE_PARALLEL_JOB"
 def _skip_timing_download(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "1")
     monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
+    # A shard job exports this for its own pytest. Tests that call the plugin
+    # hook, or chdir, must not inherit that relative list.
+    monkeypatch.delenv("VLLM_OMNI_FILE_SHARD_LIST", raising=False)
     monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
     monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
     upload_pipeline_mod._shard_timings_prepared = False
@@ -81,6 +84,30 @@ def _leaves(steps: list) -> list[dict]:
         else:
             leaves.append(step)
     return leaves
+
+
+def test_source_filter_does_not_plan_cuda_shards() -> None:
+    """AMD nightly filtering imports this uploader and must not plan shards."""
+    document = {
+        "steps": [
+            {
+                "label": "Nightly",
+                "commands": ["pytest tests/amd_test.py"],
+                "source_file_dependencies": ["tests/amd_test.py"],
+                "automatic_shard": True,
+            }
+        ]
+    }
+    filtered = filter_pipeline_by_source_dependencies(
+        document,
+        ["tests/amd_test.py"],
+        pipeline_path=Path(".buildkite/amd/test-amd-nightly.yml"),
+    )
+    step = filtered["steps"][0]
+    assert step["label"] == "Nightly"
+    assert step["automatic_shard"] is True
+    assert "parallelism" not in step
+    assert upload_pipeline_mod._shard_timings_prepared is False
 
 
 def test_uploader_keeps_one_simple_test_job_without_timings(monkeypatch: pytest.MonkeyPatch) -> None:

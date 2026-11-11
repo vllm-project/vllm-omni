@@ -91,8 +91,6 @@ from ci_conditions import (
     WEEKLY_LABEL_IF,
     WEEKLY_MAIN_IF,
 )
-from merge_shard_timings import prepare_profile_from_history
-from runtime_shard import apply_automatic_shard, load_shard_timings
 from skip_ci import resolve_ci_context_from_git
 
 if str(ROOT) not in sys.path:
@@ -649,6 +647,10 @@ def _ensure_shard_timings_env() -> None:
         return
     if os.environ.get("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "").strip() in {"1", "true", "yes"}:
         return
+    # Local import: AMD source filtering loads this module and must not require
+    # the shard planner. Only the CUDA uploader reaches a download.
+    from merge_shard_timings import prepare_profile_from_history
+
     output = ROOT / "timings" / "upload-profile.json"
     branch, exclude_branches = _history_selection(_shard_timings_pipeline)
     try:
@@ -668,6 +670,8 @@ def _ensure_shard_timings_env() -> None:
 
 
 def _shard_timings() -> dict[str, float] | None:
+    from runtime_shard import load_shard_timings
+
     _ensure_shard_timings_env()
     raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
     timings = load_shard_timings()
@@ -678,6 +682,8 @@ def _shard_timings() -> dict[str, float] | None:
 
 
 def _plan_automatic_shard(step: dict[str, Any]) -> dict[str, Any]:
+    from runtime_shard import apply_automatic_shard
+
     return apply_automatic_shard(step, timings=_shard_timings(), root=ROOT, log=_log)
 
 
@@ -718,8 +724,10 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
+        # AMD nightly filtering uses this mode. It must not plan CUDA shards or
+        # download timing artifacts; the CUDA uploader does that while rendering.
         if not expand_mirror_hardwares:
-            processed.append(_plan_automatic_shard(leaf))
+            processed.append(leaf)
             continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
