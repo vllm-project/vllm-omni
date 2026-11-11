@@ -27,14 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 import pytest_file_timings  # noqa: E402
 import upload_pipeline as upload_pipeline_mod  # noqa: E402
 from merge_shard_timings import (  # noqa: E402
-    _TEMPORARY_READY_BUILD,
     HISTORY_LOOKUP_BUDGET_SECONDS,
     MAX_CONSECUTIVE_MISSES,
-    build_incomplete_steps,
     build_step_observations,
     list_recent_build_ids,
     merge_build_observations,
-    merge_incomplete_steps,
     merge_step_observations,
     observations_from_download,
     percentile,
@@ -198,35 +195,6 @@ def test_unmeasured_file_stays_weight_zero_and_still_runs(
     assert "temporary estimate" not in "\n".join(step["commands"])
     placed = [name for shard in _read_shard_lists("simple-test") for name in shard]
     assert sorted(placed) == sorted(discovered)
-
-
-def test_killed_session_estimates_selected_files_that_did_not_finish(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    # TEMPORARY: delete with the killed-session estimate.
-    discovered = ["tests/a_test.py", "tests/b_test.py", "tests/c_test.py"]
-    timings = tmp_path / "timings.json"
-    timings.write_text(
-        json.dumps(
-            {
-                "steps": {"Simple Test": {"tests/a_test.py": 1000}},
-                "incomplete_steps": {"Simple Test": {"selected_files": discovered}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(timings))
-    monkeypatch.delenv("MIRROR_HW", raising=False)
-    monkeypatch.setattr(
-        "runtime_shard.discover_test_files", lambda command, root: list(discovered) if "tests/" in command else []
-    )
-
-    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
-    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
-    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
-    assert step["parallelism"] == 3
-    assert [shard for shard in _read_shard_lists("simple-test")] == [[name] for name in discovered]
 
 
 def test_one_over_budget_file_does_not_open_extra_jobs() -> None:
@@ -695,93 +663,6 @@ def test_shard_list_keeps_directory_conftest_and_drops_other_files(tmp_path: Pat
     assert completed.returncode == 0, output
     assert "1 passed" in output
     assert "1 deselected" in output
-
-
-def test_legacy_killed_simple_test_is_incomplete_and_a_finished_job_is_not(tmp_path: Path) -> None:
-    # TEMPORARY: delete with the killed-session estimate.
-    killed = tmp_path / "simple.json"
-    killed.write_text(
-        json.dumps(
-            {
-                "build_id": _TEMPORARY_READY_BUILD[0],
-                "label": "Simple Test",
-                "file_seconds": {"tests/a_test.py": 3},
-            }
-        ),
-        encoding="utf-8",
-    )
-    finished = tmp_path / "engine.json"
-    finished.write_text(
-        json.dumps(
-            {
-                "build_id": _TEMPORARY_READY_BUILD[0],
-                "label": "Engine&Model Executor&Work Test · L4",
-                "file_seconds": {"tests/b_test.py": 3},
-            }
-        ),
-        encoding="utf-8",
-    )
-    recorded = tmp_path / "recorded.json"
-    recorded.write_text(
-        json.dumps(
-            {
-                "label": "Simple Test",
-                "complete": False,
-                "selected_files": ["tests/a_test.py", "tests/c_test.py"],
-                "file_seconds": {"tests/a_test.py": 3},
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert build_incomplete_steps([killed, finished]) == {"Simple Test": {"selected_files": None}}
-    assert build_incomplete_steps([finished]) == {}
-    assert build_incomplete_steps([recorded]) == {
-        "Simple Test": {"selected_files": ["tests/a_test.py", "tests/c_test.py"]}
-    }
-    assert (
-        merge_incomplete_steps(
-            [
-                ({"Simple Test": ({"tests/a_test.py": 3.0}, "l4-k8s")}, {"Simple Test": {"selected_files": None}}),
-                ({"Simple Test": ({"tests/a_test.py": 9.0}, "l4-k8s")}, {}),
-            ]
-        )
-        == {}
-    )
-
-
-def test_timing_plugin_records_completion_and_selected_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # TEMPORARY: delete with the killed-session estimate.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("BUILDKITE_JOB_ID", "job-1")
-    monkeypatch.setenv("BUILDKITE_LABEL", "Simple Test")
-    pytest_file_timings._timings.clear()
-    pytest_file_timings._selected.clear()
-    pytest_file_timings._started.clear()
-    pytest_file_timings._complete = False
-    pytest_file_timings._interrupted = False
-
-    class _Item:
-        nodeid = "tests/a_test.py::test_one"
-
-    try:
-        pytest_file_timings.pytest_collection_modifyitems(None, [_Item(), _Item()])
-        pytest_file_timings.pytest_runtest_logstart("tests/a_test.py::test_one", None)
-        pytest_file_timings.pytest_runtest_logfinish("tests/a_test.py::test_one", None)
-        pytest_file_timings._interrupted = True
-        pytest_file_timings._write()
-        payload = json.loads(next((tmp_path / "timings" / "jobs").glob("*.json")).read_text(encoding="utf-8"))
-        assert payload["complete"] is False
-        assert payload["selected_files"] == ["tests/a_test.py"]
-        pytest_file_timings._interrupted = False
-        pytest_file_timings.pytest_sessionfinish(None, 0)
-        payload = json.loads(next((tmp_path / "timings" / "jobs").glob("*.json")).read_text(encoding="utf-8"))
-        assert payload["complete"] is True
-    finally:
-        pytest_file_timings._timings.clear()
-        pytest_file_timings._selected.clear()
-        pytest_file_timings._started.clear()
-        pytest_file_timings._complete = False
-        pytest_file_timings._interrupted = False
 
 
 def test_simple_test_ignores_durations_recorded_by_another_step(

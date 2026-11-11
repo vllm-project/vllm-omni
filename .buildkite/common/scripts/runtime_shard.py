@@ -102,29 +102,6 @@ def _profile_payload() -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def load_incomplete_steps() -> dict[str, dict[str, Any]]:
-    """TEMPORARY: delete after the CI check.
-
-    Keyed by step label. ``selected_files`` is the marker selection, or None
-    when the killed job's artifact did not record it. Absent labels finished.
-    """
-    payload = _profile_payload()
-    raw = payload.get("incomplete_steps") if isinstance(payload, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    parsed: dict[str, dict[str, Any]] = {}
-    for label, info in raw.items():
-        if not isinstance(info, dict) or "selected_files" not in info:
-            continue
-        selected = info.get("selected_files")
-        if selected is None:
-            parsed[base_label(str(label))] = {"selected_files": None}
-            continue
-        if isinstance(selected, list):
-            parsed[base_label(str(label))] = {"selected_files": [str(item).replace("\\", "/") for item in selected]}
-    return parsed
-
-
 def load_step_queues() -> dict[str, str]:
     """Agent queue recorded for each step label, if the profile has one."""
     payload = _profile_payload()
@@ -240,13 +217,13 @@ def apply_automatic_shard(
     if step_timings is not None and recorded_queue and step_queue and recorded_queue != step_queue:
         log(f"automatic-shard: {label!r} ignores timings recorded on {recorded_queue}")
         step_timings = None
-    planned = _plan_weights(files, step_timings, load_incomplete_steps().get(base_label(label)))
+    planned = _plan_weights(files, step_timings)
     if planned is None:
         reason = "no timings for this step" if timings else "no timing profile"
         log(f"automatic-shard: {label!r} stays 1 job ({reason}; budget {timeout_min} min)")
         step["commands"] = _instrument_commands(commands, instrumentable)
         return step
-    weights, measured, estimated = planned
+    weights, measured = planned
     bins = pack_files(weights, budget_seconds)
     if len(bins) <= 1:
         reason = f"measured {measured}/{len(files)} files fit"
@@ -266,10 +243,9 @@ def apply_automatic_shard(
         else:
             rewritten.append(command)
     step["commands"] = _instrument_commands(rewritten, instrumentable)
-    estimate = f", temporary estimate {estimated} unfinished" if estimated else ""
     log(
         f"automatic-shard: {label!r} -> {len(bins)} jobs "
-        f"(measured {measured}/{len(files)} files{estimate}, budget {timeout_min} min)"
+        f"(measured {measured}/{len(files)} files, budget {timeout_min} min)"
     )
     return step
 
@@ -332,35 +308,17 @@ def _inject_plugin(command: str) -> str:
 def _plan_weights(
     files: list[str],
     timings: dict[str, float] | None,
-    incomplete: dict[str, Any] | None,
-) -> tuple[dict[str, float], int, int] | None:
-    """Weight for every discovered file, plus measured and estimated counts.
+) -> tuple[dict[str, float], int] | None:
+    """Weight for every discovered file, plus the measured count.
 
-    A file with no duration stays at 0. TEMPORARY: when ``incomplete`` is set,
-    selected files that never finished take the mean of the files that did.
-    ``selected_files is None`` means the killed artifact did not record the
-    marker selection, so every unmeasured discovered file is estimated.
-    Delete this estimate with ``incomplete_steps``.
+    A file with no duration stays at 0 and is still placed in a bin.
     """
     measured_list = _measured_weights(files, timings)
     if measured_list is None or timings is None:
         return None
     measured = {name: float(timings[name]) for name in files if name in timings and float(timings[name]) > 0}
     weights = {name: measured.get(name, 0.0) for name in files}
-    estimated = 0
-    if incomplete is not None and measured:
-        selected = incomplete.get("selected_files")
-        if selected is None:
-            pending = [name for name in files if name not in measured]
-        else:
-            chosen = {str(name).replace("\\", "/") for name in selected}
-            pending = [name for name in files if name in chosen and name not in measured]
-        if pending:
-            mean = sum(measured.values()) / len(measured)
-            for name in pending:
-                weights[name] = mean
-            estimated = len(pending)
-    return weights, len(measured), estimated
+    return weights, len(measured)
 
 
 def _shard_slug(label: str) -> str:
