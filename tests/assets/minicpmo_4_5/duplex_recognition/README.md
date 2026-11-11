@@ -39,12 +39,14 @@ Run from the repository root with the normal model cache configured:
 
 ```bash
 pytest -sv tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
-  --run-level core_model -m 'core_model and cuda'
+  --run-level advanced_model -m 'core_model and cuda'
 ```
 
 The ready pipelines schedule the test on CUDA H100/B200 and NPU A2. Both upload
 `tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*`, including
 transcript, events, recognition report, input timeline and generated audio.
+`--run-level advanced_model` loads real weights; `core_model` remains the
+selection mark for ready CI.
 For NPU, replace `cuda` with `npu and A2` in the command above. The recorded
 model comparison below was measured on L20X. This is a strict regression
 threshold, not a claim of cross-hardware token equality.
