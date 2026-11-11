@@ -780,6 +780,8 @@ def resolve_model_class_name(
 
     from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
+    if model_type == "praxis":
+        return "Praxis1Pipeline"
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
@@ -1833,6 +1835,11 @@ class OmniDiffusionConfig:
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
+
+                if model_type == "praxis":
+                    self.model_class_name = "Praxis1Pipeline"
+                    self.update_multimodal_support()
+                    return
 
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
