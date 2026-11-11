@@ -334,6 +334,19 @@ def test_vae_rejects_non_image_configs():
         image_vae.MiniMaxH3ImageVAE(config)
 
 
+@pytest.mark.parametrize("batch_size", [True, False, 0, -1, 33, 1.5, "2", None])
+def test_vae_rejects_invalid_tile_batch_size(batch_size):
+    vae = image_vae.MiniMaxH3ImageVAE(_tiny_vae_config())
+    with pytest.raises(ValueError, match="tile_batch_size"):
+        vae.decode_latent(torch.empty(0), use_cuda_graph=True, tile_batch_size=batch_size)
+
+
+def test_vae_rejects_batched_decode_without_cuda_graphs():
+    vae = image_vae.MiniMaxH3ImageVAE(_tiny_vae_config())
+    with pytest.raises(ValueError, match="requires CUDA graphs"):
+        vae.decode_latent(torch.empty(0), tile_batch_size=2)
+
+
 def _reference_float_resize(pixels: torch.Tensor, width: int, height: int) -> torch.Tensor:
     """The released resize: quantize, PIL LANCZOS, return ``uint8 / 255``."""
     import numpy as np

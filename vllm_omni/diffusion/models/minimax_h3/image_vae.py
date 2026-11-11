@@ -507,14 +507,28 @@ class MiniMaxH3ImageVAE(nn.Module):
                 self._decode_graphs = None
 
     @torch.inference_mode()
-    def decode_latent(self, latent: torch.Tensor, *, group: Any = None, use_cuda_graph: bool = False) -> torch.Tensor:
+    def decode_latent(
+        self,
+        latent: torch.Tensor,
+        *,
+        group: Any = None,
+        use_cuda_graph: bool = False,
+        tile_batch_size: int = 1,
+    ) -> torch.Tensor:
         """Normalized ``[B, C, 1, h, w]`` latents to ``[B, 3, 16h, 16w]`` pixels in [0, 1].
 
         ``group`` spreads the tiles over its ranks (every rank returns the full
         image, decoded from the first rank's latent). ``use_cuda_graph`` replays
         one captured graph per tile shape; the kernels are those of the eager
         single-tile decode, so the output is unchanged.
+
+        ``tile_batch_size > 1`` opts into batched tile kernels. Tile boundaries
+        and blending are unchanged, but floating-point results may differ.
         """
+        if type(tile_batch_size) is not int or not 1 <= tile_batch_size <= 32:
+            raise ValueError("tile_batch_size must be an integer between 1 and 32")
+        if tile_batch_size != 1 and (not use_cuda_graph or self.device.type != "cuda"):
+            raise ValueError("batched tile decode requires CUDA graphs")
         raw = latent.to(device=self.device, dtype=torch.float32)
         raw = raw * self.latents_std.to(raw.device) + self.latents_mean.to(raw.device)
         if _group_world(group)[0] > 1:
@@ -523,8 +537,14 @@ class MiniMaxH3ImageVAE(nn.Module):
         self.prepare_decoder_weights(torch.bfloat16)
         decode_tile = self._decode_tile
         if use_cuda_graph and raw.device.type == "cuda":
-            if getattr(self, "_decode_graphs", None) is None:
-                self._decode_graphs = _TileGraphs(self._decode_tile, autocast_dtype=torch.bfloat16)
+            if self._decode_graphs is None or self._decode_graphs.tile_batch_size != tile_batch_size:
+                self._decode_graphs = (
+                    _TileGraphs(self._decode_tile, autocast_dtype=torch.bfloat16)
+                    if tile_batch_size == 1
+                    else _BatchedTileGraphs(
+                        self._decode_tile, autocast_dtype=torch.bfloat16, tile_batch_size=tile_batch_size
+                    )
+                )
             decode_tile = self._decode_graphs
         with torch.autocast(device_type=raw.device.type, dtype=torch.bfloat16):
             if self.decoder_tiling:
@@ -573,6 +593,7 @@ class _TileGraphs:
     max_shapes = 4
     # Concurrent replica replay can hang on ROCm (gfx950); one replica does not.
     replicas = 1 if torch.version.hip else 6
+    tile_batch_size = 1
 
     def __init__(self, fn, *, autocast_dtype: torch.dtype) -> None:
         self.fn = fn
@@ -634,6 +655,25 @@ class _TileGraphs:
         for *_, stream in entries:
             current.wait_stream(stream)
         return outputs
+
+
+class _BatchedTileGraphs(_TileGraphs):
+    """Opt-in tile batching with independent full-batch and tail graphs."""
+
+    def __init__(self, fn, *, autocast_dtype: torch.dtype, tile_batch_size: int) -> None:
+        super().__init__(fn, autocast_dtype=autocast_dtype)
+        self.tile_batch_size = tile_batch_size
+
+    def map(self, tiles: list[torch.Tensor]) -> list[torch.Tensor]:
+        if not tiles or any(tile.shape != tiles[0].shape for tile in tiles):
+            return super().map(tiles)
+        batches = [
+            torch.cat(tiles[start : start + self.tile_batch_size], dim=0)
+            for start in range(0, len(tiles), self.tile_batch_size)
+        ]
+        full = len(tiles) // self.tile_batch_size
+        outputs = super().map(batches[:full]) + super().map(batches[full:])
+        return [tile for batch in outputs for tile in batch.split(tiles[0].shape[0])]
 
 
 __all__ = ["MINIMAX_H3_IMAGE_VAE_RATIO", "MiniMaxH3ImageVAE"]

@@ -80,6 +80,11 @@ All weights fit on one GPU with large headroom: full residency needs an estimate
 
 **1 GPU, fully resident** — recommended.
 
+For optional VAE tile batching, its numerical compatibility limits and the
+single-GPU comparison workload, see the
+[tile batching guide](../../docs/user_guide/diffusion/minimax_h3_image_vae_tile_batching.md).
+The other profiles on this page remain configuration-only for B300.
+
 ```bash
 vllm serve MiniMaxAI/MiniMax-H3-Image --omni \
   --num-gpus 1 \

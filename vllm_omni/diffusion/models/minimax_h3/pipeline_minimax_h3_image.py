@@ -412,6 +412,11 @@ class MiniMaxH3ImagePipeline(
             and bool(getattr(od_config, "enable_cuda_graph_decode", True))
             and not bool(getattr(od_config, "enforce_eager", False))
         )
+        self._vae_tile_batch_size = additional.get("vae_tile_batch_size", 1)
+        if type(self._vae_tile_batch_size) is not int or not 1 <= self._vae_tile_batch_size <= 32:
+            raise ValueError("vae_tile_batch_size must be an integer between 1 and 32")
+        if self._vae_tile_batch_size != 1 and not self._vae_cuda_graph:
+            raise ValueError("vae_tile_batch_size > 1 requires CUDA graphs")
         tp_size = int(getattr(parallel, "text_encoder_tp_size", 1))
         if not 1 <= tp_size <= dit_world or 64 % tp_size or 8 % tp_size:
             raise ValueError(
@@ -760,7 +765,12 @@ class MiniMaxH3ImagePipeline(
         if parsed["output_type"] == "latent":
             return DiffusionOutput(output=latent)
         check_request_cancellation()
-        pixels = self.vae.decode_latent(latent, group=self._vae_group, use_cuda_graph=self._vae_cuda_graph)
+        pixels = self.vae.decode_latent(
+            latent,
+            group=self._vae_group,
+            use_cuda_graph=self._vae_cuda_graph,
+            tile_batch_size=self._vae_tile_batch_size,
+        )
         # Quantize on the device (the same FP32 arithmetic as on the host) so
         # only uint8 bytes cross to the host.
         pixels = minimax_h3_quantize_image(pixels)
