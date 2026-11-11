@@ -61,7 +61,6 @@ def main(root, suffix, output):
         for index in range(10):
             count = 9 if index == 0 else 12
             frames = {
-                "typed": load(root / f"{backend}-typed{suffix}/tick-{index:03d}.pt"),
                 "stepwise": load(root / f"{backend}-stepwise{suffix}/tick-{index:03d}.pt"),
                 "offline": offline[start : start + count],
             }
@@ -71,21 +70,21 @@ def main(root, suffix, output):
                 paths[mode] = output / f"{backend}-{mode}-{index:03d}.mkv"
                 video(tensor, paths[mode])
             if backend == "taew2_2":
-                frames["full_wan"] = load(root / f"wan-typed{suffix}/tick-{index:03d}.pt")
-                paths["full_wan"] = output / f"wan-typed-{index:03d}.mkv"
-            for other in tuple(key for key in frames if key != "typed"):
-                reference, generated = frames[other], frames["typed"]
+                frames["full_wan"] = load(root / f"wan-stepwise{suffix}/tick-{index:03d}.pt")
+                paths["full_wan"] = output / f"wan-stepwise-{index:03d}.mkv"
+            for other in tuple(key for key in frames if key != "stepwise"):
+                reference, generated = frames[other], frames["stepwise"]
                 mse = (reference - generated).square().mean().item()
-                ssim_raw = run_ffmpeg_similarity("ssim", paths[other], paths["typed"])
-                psnr_raw = run_ffmpeg_similarity("psnr", paths[other], paths["typed"])
-                (output / f"{backend}-typed-vs-{other}-{index:03d}.txt").write_text(ssim_raw + "\n" + psnr_raw)
+                ssim_raw = run_ffmpeg_similarity("ssim", paths[other], paths["stepwise"])
+                psnr_raw = run_ffmpeg_similarity("psnr", paths[other], paths["stepwise"])
+                (output / f"{backend}-stepwise-vs-{other}-{index:03d}.txt").write_text(ssim_raw + "\n" + psnr_raw)
                 # The shared parser only accepts finite numeric PSNR. Identical
                 # RGB videos legitimately produce average:inf in ffmpeg.
                 psnr = math.inf if "average:inf" in psnr_raw else parse_psnr_score(psnr_raw)
                 rows.append(
                     {
                         "backend": backend,
-                        "comparison": f"typed_vs_{other}",
+                        "comparison": f"stepwise_vs_{other}",
                         "tick": index,
                         "float_psnr_db": -10 * math.log10(mse) if mse else "inf",
                         "ffmpeg_psnr_db": psnr if math.isfinite(psnr) else "inf",
@@ -110,8 +109,8 @@ def main(root, suffix, output):
         + "\n"
     )
     for backend in ("wan", "taew2_2"):
-        for mode in ("offline", "stepwise"):
-            subset = [r for r in rows if r["backend"] == backend and r["comparison"] == f"typed_vs_{mode}"]
+        for mode in ("offline",):
+            subset = [r for r in rows if r["backend"] == backend and r["comparison"] == f"stepwise_vs_{mode}"]
             print(
                 backend,
                 mode,

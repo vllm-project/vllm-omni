@@ -1,13 +1,13 @@
 # ABot-World
 
-> Experimental: offline image-conditioned generation and in-process realtime interactive generation
+> Experimental: offline image-conditioned generation and realtime interactive stepwise serving
 
 ## Summary
 
 - Vendor: ACVLab (Amap CV Lab)
 - Model: `acvlab/ABot-World-0-5B-LF`
 - Task: image-conditioned interactive world generation
-- Modes: offline generation, experimental typed Session/Tick, and stepwise chunk output
+- Modes: offline generation and stepwise chunk output, with mid-generation camera keys over `WS /v1/realtime/video`
 - Maintainer: Community
 
 The ABot checkpoint and pipeline integration are Apache-2.0 licensed. The
@@ -35,9 +35,8 @@ FlashAttention paged-KV kernel requires this page size to be a multiple of 16.
 model execution.
 
 Offline whole-clip frame counts must be `9 + 12k`, up to 117 frames. This
-whole-clip safeguard is not a ten-tick limit on typed sessions or stepwise
-rollouts. Both streaming paths decode 9 frames in the opening chunk and 12
-in each subsequent chunk.
+whole-clip safeguard is not a ten-tick limit on stepwise rollouts, which
+decode 9 frames in the opening chunk and 12 in each subsequent chunk.
 
 ## Stepwise generation and decoder selection
 
@@ -70,8 +69,9 @@ to read it from their transformer/VAE configs. Select the tiny decoder with
 `--model-config '{"abot_vae":"taew2_2"}'`.
 `--action-script actions.json` supplies one three-frame action
 list per tick, for example `[[["w"],[],[]],[[],["j"],[]]]` for two ticks.
-Actions must all be known at request start; this is not a mid-rollout control
-transport. Typed sessions below accept incremental events instead.
+Actions must all be known at request start. For mid-rollout control, send
+camera updates over `WS /v1/realtime/video` instead (below); a request uses
+one or the other.
 
 Both decoders own their temporal feature cache per session, following the
 shared AR-Diffusion streaming decoder contract used by LingBot-World. Reset,
@@ -80,24 +80,57 @@ The full decoder's persistent feature budget is separate from paged attention
 KV; admission reserves both. Temporary decoder activations and model weights
 are not included in the per-session persistent-state figure.
 
-## Realtime in-process generation
+## Realtime serving
 
-Each JSONL line describes the prompt and/or three latent-frame camera
-actions (W/A/S/D/I/J/K/L) applied at the next chunk boundary:
+Serve the stepwise topology with the AR-Diffusion deploy config:
 
-```json
-{"event_id":1,"prompt":"A road through a forest","frames":[["j"],[],[]]}
-{"event_id":2,"frames":[["w"],["w"],["w"]]}
-{"event_id":3,"prompt":"The road enters a snowy valley","frames":[[],[],[]]}
+```bash
+vllm serve /path/to/ABot-World-0-5B-LF \
+  --omni \
+  --deploy-config vllm_omni/deploy/abot_world_stepwise.yaml \
+  --port 8000
 ```
 
-Use `ARDiffusionSessionManager` with `ARDiffusionOmniTickConsumer`,
-`ARDiffusionWorkerLifecycle`, and `ABotCameraControlReducer`. Configure
-`ARDiffusionEngine`, one replica, `max_num_seqs=1`, `output_type="pt"`, and the same
-512x832 four-step sampling contract as offline generation. The current control
-plane is an internal Python API; no public server transport is exposed yet.
-`output_type="latent"` intentionally skips video decode and therefore cannot
-be used as evidence of two resident VAE decoding sessions.
+`--deploy-config` is required: the `abot_world` pipeline registers no default
+deploy config, so callers that pass none keep their request-mode topology.
+Clients use the generic WebSocket protocol in
+[`docs/serving/streaming_video_output_api.md`](../../docs/serving/streaming_video_output_api.md).
+`session.start` begins one rollout with the first frame at `image_reference`,
+`width: 832`, `height: 512` and `num_frames: 12k - 3`; each AR block arrives as
+a binary video chunk.
+
+Mid-generation camera keys go in `session.interaction` under
+`event.multi_modal_data.camera` and apply at the next chunk boundary. ABot
+conditions on W/A/S/D/I/J/K/L key actions, not SE3 poses. In `state` mode each
+transition lists the keys held from that point on. Keys stay held across
+chunks until the next update, and a press released before the next boundary
+still produces a one-frame pulse:
+
+```json
+{"type": "session.interaction",
+ "interaction": {"event_id": "turn-left",
+                 "event": {"multi_modal_data": {"camera": {
+                   "mode": "state",
+                   "transitions": [{"actions": ["j"], "client_ts_ms": 1200}]}}}}}
+```
+
+In `script` mode `frames` lists one action list per latent frame. It is
+consumed three frames per chunk and padded with neutral frames once
+exhausted:
+
+```json
+{"type": "session.interaction",
+ "interaction": {"event_id": "dash",
+                 "event": {"multi_modal_data": {"camera": {
+                   "mode": "script",
+                   "frames": [["w"], ["w"], ["w"], ["w", "a"], [], []]}}}}}
+```
+
+An update in one mode replaces the other mode's state. `transition_chunks`
+must be omitted or zero, and a request that carries `camera_action_script`
+rejects live camera updates. Chunk metadata acknowledges updates through
+`started_event_ids`, `active_event_ids` and `completed_event_ids`; an update
+replaced before any chunk used it is reported in `coalesced_event_ids`.
 
 ## Reproduce review evidence
 
@@ -111,7 +144,7 @@ export ABOT_IMAGE=/path/to/image.jpg
 export ABOT_RESULTS=/path/to/new-evidence-directory
 export PYTHONPATH="$PWD"
 for vae in wan taew2_2; do
-  for phase in dual typed stepwise offline; do
+  for phase in stepwise offline; do
     python -m benchmarks.diffusion.abot_review_evidence \
       --model "$ABOT_MODEL" --image "$ABOT_IMAGE" --vae "$vae" \
       --phase "$phase" --ticks 35 --repeats 3 \
@@ -121,18 +154,13 @@ done
 python -m benchmarks.diffusion.abot_compare_quality "$ABOT_RESULTS"
 ```
 
-- `dual`: interleave two live RGB-decoding sessions with different camera
-  controls; compare each of their three chunks exactly against a solo run.
-  Snapshots verify cache budgets, isolation, and independent release.
-- `typed`: 35 consecutive Session/Tick events, with incremental controls and
-  CPU-ready RGB output, using `max_num_seqs=1`.
 - `stepwise`: 35 chunks from one `generate()` call, with the opening input
   prepared once and stateful decoding throughout.
 - `offline`: the matched 117-frame whole-clip control. Quality compares its
-  ten chunks with the first ten chunks from both streaming paths. It is not a
+  ten chunks with the first ten stepwise chunks. It is not a
   claim of 35-tick offline quality equivalence or official-upstream parity.
 
-The three latency phases run one warmup rollout and three measured rollouts.
+Both phases run one warmup rollout and three measured rollouts.
 JSON records retain every tick, configuration, source hashes, memory snapshots,
 and failures. CPU video validation, disk IO, and memory RPCs are outside timing.
 Client wall time includes submission, inference, decode and CPU return, but
@@ -197,6 +225,9 @@ Rerun the paired comparison once a compatible canonical FlashAttention build
 is available; matching a seed alone is not an exact-output oracle.
 
 ### Historical measured validation (2026-09-21)
+
+The typed Session/Tick path measured here has since been removed; its rows
+remain as historical data.
 
 These measurements predate the current-head integration. They are historical
 serving-consistency evidence, not a rerun on the final PR head or a comparison
@@ -272,11 +303,11 @@ by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 ## Current limitations
 
 - Only the `ABot-World-0-5B-LF` causal student checkpoint is supported.
-- The realtime control plane is internal; there is no public server transport yet.
+- Mid-generation updates cover camera keys only; prompt updates are not wired
+  on the stepwise path.
 - AR-Diffusion stages require one replica.
-- Typed mode emits one AR block per tick; stepwise mode emits multiple blocks
-  from one request. `max_num_seqs` must be one in both modes. Multiple resident
-  sessions are interleaved, not executed concurrently.
+- Stepwise mode emits multiple blocks from one request, and `max_num_seqs`
+  must be one.
 - SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization, Cache-DiT, and TeaCache are not supported.
 - No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
 - DiT, clean-context KV commit, and VAE decode are serial; no asynchronous
@@ -289,4 +320,4 @@ by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 - Official implementation: <https://github.com/amap-cvlab/ABot-World>
 - Shared stepwise binding: <https://github.com/vllm-project/vllm-omni/pull/6844>
 - Shared stateful decoder: <https://github.com/vllm-project/vllm-omni/pull/6533>
-- Realtime design: [`docs/design/feature/realtime_ar_diffusion.md`](../../docs/design/feature/realtime_ar_diffusion.md)
+- Streaming video protocol: [`docs/serving/streaming_video_output_api.md`](../../docs/serving/streaming_video_output_api.md)

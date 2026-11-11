@@ -14,9 +14,19 @@ from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
     ABotWorldCausalTransformer3DModel,
 )
 from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
-from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import ABotWorldCausalPipeline, _wan_decode_cache_bytes
+from vllm_omni.diffusion.models.abot_world.interaction import ABotCameraSession
+from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
+    ABotWorldCausalPipeline,
+    _ABotRequestInputs,
+    _wan_decode_cache_bytes,
+)
 from vllm_omni.diffusion.models.abot_world.taew2_2 import TAEW2Decoder
+from vllm_omni.diffusion.models.interface import SupportsInteractionApply
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -238,8 +248,128 @@ def test_decode_failure_releases_partial_session_cache() -> None:
 def test_session_close_releases_decode_state_without_touching_other_session() -> None:
     a = StreamingDecodeState("a", [torch.ones(2)], frames_decoded=3)
     b = StreamingDecodeState("b", [torch.ones(2)], frames_decoded=3)
-    pipeline = SimpleNamespace(_ar_sessions={"a": object(), "b": object()}, _streaming_decode_states={"a": a, "b": b})
+    pipeline = SimpleNamespace(_streaming_decode_states={"a": a, "b": b})
     ABotWorldCausalPipeline.close_ar_diffusion_session(pipeline, "a")
     ABotWorldCausalPipeline.close_ar_diffusion_session(pipeline, "a")
     assert a.nbytes() == 0 and b.nbytes() > 0
-    assert list(pipeline._ar_sessions) == list(pipeline._streaming_decode_states) == ["b"]
+    assert list(pipeline._streaming_decode_states) == ["b"]
+
+
+def test_pipeline_exposes_the_chunk_boundary_interaction_contract() -> None:
+    assert issubclass(ABotWorldCausalPipeline, SupportsInteractionApply)
+
+
+def _bare_pipeline(**attributes) -> ABotWorldCausalPipeline:
+    """A real pipeline instance without checkpoint loading."""
+    pipeline = ABotWorldCausalPipeline.__new__(ABotWorldCausalPipeline)
+    torch.nn.Module.__init__(pipeline)
+    for name, value in attributes.items():
+        setattr(pipeline, name, value)
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    ("chunk_index", "fps", "expected"),
+    [(0, None, (9, 9.0)), (1, None, (12, 12.0)), (1, 16, (12, 16.0))],
+)
+def test_peek_chunk_media_reports_the_opening_and_steady_chunk_lengths(chunk_index, fps, expected) -> None:
+    pipeline = _bare_pipeline(_num_frame_per_block=3, vae_scale_factor_temporal=4)
+    state = StepRequestState(request_id="r", sampling=OmniDiffusionSamplingParams(fps=fps), chunk_index=chunk_index)
+
+    media = pipeline.peek_chunk_media(state)
+
+    assert (media.num_media_frames, media.fps, media.num_latent_frames) == (*expected, 3)
+
+
+_NO_SESSION = object()
+_SCRIPT = (((), (), ()), (("d",), (), ()))
+
+
+def _stepwise_pipeline(seen: list) -> ABotWorldCausalPipeline:
+    pipeline = _bare_pipeline(
+        transformer=_tiny_transformer(),
+        vae_scale_factor_spatial=16,
+        device=torch.device("cpu"),
+    )
+
+    def build_action_tensor(actions, *args):
+        seen.append(actions)
+        return torch.zeros(1)
+
+    pipeline._build_action_tensor = build_action_tensor
+    pipeline._ar_text_caches = lambda *args, **kwargs: []
+    return pipeline
+
+
+def _stepwise_state(*, script=None, live=_NO_SESSION) -> StepRequestState:
+    inputs = _ABotRequestInputs(
+        prompt="p",
+        image=torch.zeros(3, 32, 32),
+        reference_images=None,
+        camera_action_script=script,
+        height=32,
+        width=32,
+        num_frames=33,
+        num_latent_frames=9,
+        num_frame_per_block=3,
+        output_type="pil",
+        max_sequence_length=512,
+        flow_shift=5.0,
+        generator=torch.Generator().manual_seed(0),
+    )
+    state = StepRequestState(
+        request_id="r",
+        sampling=OmniDiffusionSamplingParams(),
+        prompt_embeds=torch.zeros(1, 1, 16),
+        chunk_index=1,
+        total_chunks=3,
+        chunk_num_steps=4,
+        extra={"inputs": inputs, "dtype": torch.float32, "schedule": ((1000, 1.0), (750, 0.75))},
+    )
+    if live is not _NO_SESSION:
+        state.interaction_sessions["camera"] = ABotCameraSession(chunk_actions=live)
+    return state
+
+
+@pytest.mark.parametrize(
+    ("script", "live", "expected"),
+    [
+        (None, _NO_SESSION, None),
+        (None, None, None),
+        (None, (("w",), (), ()), (("w",), (), ())),
+        (_SCRIPT, _NO_SESSION, _SCRIPT[1]),
+        (_SCRIPT, None, _SCRIPT[1]),
+    ],
+)
+def test_next_chunk_takes_live_or_scripted_actions(script, live, expected) -> None:
+    seen: list = []
+    state = _stepwise_state(script=script, live=live)
+
+    _stepwise_pipeline(seen).prepare_next_chunk(state)
+
+    assert seen == [expected]
+    assert state.extra["start_frame"] == 3
+    assert state.latents.shape == (1, 4, 3, 2, 2)
+
+
+def test_next_chunk_rejects_live_actions_for_a_scripted_request() -> None:
+    state = _stepwise_state(script=_SCRIPT, live=(("w",), (), ()))
+    with pytest.raises(ValueError, match="camera_action_script"):
+        _stepwise_pipeline([]).prepare_next_chunk(state)
+
+
+def test_finished_rollout_prepares_no_further_chunk() -> None:
+    seen: list = []
+    state = _stepwise_state()
+    state.chunk_index = state.total_chunks
+
+    _stepwise_pipeline(seen).prepare_next_chunk(state)
+
+    assert seen == [] and state.latents is None
+
+
+def test_request_mode_rejects_ar_diffusion_session_binding() -> None:
+    pipeline = _bare_pipeline(_ar_diffusion_kv_state=object())
+    request = OmniDiffusionRequest(prompt="p", sampling_params=OmniDiffusionSamplingParams(), request_id="r")
+    with pytest.raises(ValueError, match="enable step execution"):
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
