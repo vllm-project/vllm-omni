@@ -49,6 +49,7 @@ from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
+    extract_diffusion_scheduler_wait_ms,
     iter_mm_outputs,
 )
 from vllm_omni.outputs import OmniRequestOutput
@@ -852,6 +853,16 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
+        scheduler_wait_ms = extract_diffusion_scheduler_wait_ms(request_outputs[0]) if request_outputs else None
+        if scheduler_wait_ms is not None:
+            if scheduler_wait_ms > stage_gen_time_ms:
+                logger.warning(
+                    "Stage-%s diffusion scheduler wait %.3f ms exceeds stage generation %.3f ms",
+                    self.stage_id,
+                    scheduler_wait_ms,
+                    stage_gen_time_ms,
+                )
+            stage_gen_time_ms -= scheduler_wait_ms
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
         native_text_metrics = {}
         if request_id:
@@ -897,6 +908,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             stage_gen_time_ms=stage_gen_time_ms,
+            scheduler_queue_wait_ms=scheduler_wait_ms,
             rx_transfer_bytes=0,
             rx_decode_time_ms=0.0,
             rx_in_flight_time_ms=0.0,

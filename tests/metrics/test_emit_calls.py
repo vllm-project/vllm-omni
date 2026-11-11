@@ -8,9 +8,10 @@ Uses behavior and Prometheus exposition to verify production call semantics.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -321,6 +322,193 @@ class TestStageWorkloadMetricScope:
         else:
             obj.prom_metrics.set_peak_memory.assert_not_called()
         obj.mod_metrics.observe_image_ttfp.assert_called_once_with("1", "0", 0.25)
+
+
+class TestStageGenExcludesQueueWait:
+    """Scheduler admission is queue wait, not stage generation, for every stage."""
+
+    _SUBMIT = 10.0
+
+    def _run(
+        self,
+        mocker,
+        stages: list[tuple[float, float | None]],
+        *,
+        stage_type: str = "diffusion",
+        orchestrator_wait_ms: float | None = 1.0,
+        replay_final: bool = False,
+    ) -> tuple[dict[str, float], list[Any], Any]:
+        from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+        from vllm_omni.engine.stage_pool import StagePool, _ReplicaMetrics
+        from vllm_omni.entrypoints.omni_base import OmniBase
+        from vllm_omni.metrics.stats import OrchestratorAggregator
+
+        n_stages = len(stages)
+        pools = []
+        for stage_id in range(n_stages):
+            pool = object.__new__(StagePool)
+            pool.stage_id = stage_id
+            pool.collect_stage_metrics = False
+            pool._output_processor = SimpleNamespace()
+            pool._replica_metrics = {0: _ReplicaMetrics()}
+            pools.append(pool)
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator.collect_stage_metrics = True
+        orchestrator.stage_pools = pools
+        req_state = OrchestratorRequestState(
+            request_id="req-queue",
+            sampling_params_list=[SimpleNamespace(num_inference_steps=4) for _ in stages],
+            final_stage_id=n_stages - 1,
+        )
+        req_state.request_timestamp = self._SUBMIT
+        if orchestrator_wait_ms is not None:
+            req_state.pipeline_timings["queue_wait_ms"] = orchestrator_wait_ms
+        orchestrator.request_states = {"req-queue": req_state}
+        routed: list[Any] = []
+
+        async def record_route(_stage_id, _replica_id, _output, _state, stage_metrics):
+            routed.append(stage_metrics)
+
+        orchestrator._route_output = record_route
+        aggregator = OrchestratorAggregator(
+            num_stages=n_stages,
+            log_stats=False,
+            wall_start_ts=self._SUBMIT,
+            final_stage_id_for_e2e=n_stages - 1,
+        )
+        obj = object.__new__(OmniBase)
+        obj._enable_ar_profiler = False
+        obj.collect_stage_metrics = True
+        obj.request_states = {"req-queue": SimpleNamespace(consumed_metric_message_ids=set())}
+        obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
+        obj.mod_metrics = mocker.Mock()
+        obj._publish_request_gauges = mocker.Mock()
+        obj.engine = SimpleNamespace(
+            get_stage_metadata=lambda stage_id: SimpleNamespace(
+                stage_type=stage_type,
+                final_output=stage_id == n_stages - 1,
+                final_output_type="image" if stage_type == "diffusion" else "text",
+                model_stage=stage_type,
+            )
+        )
+        mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+        mocker.patch(
+            "vllm_omni.entrypoints.omni_base.OmniRequestOutput.from_stage_output",
+            return_value=SimpleNamespace(),
+        )
+
+        final_output = None
+        final_result = None
+        built: list = []
+        for stage_id, (wall_ms, scheduler_wait_ms) in enumerate(stages):
+            raw_metrics: dict[str, float] = {}
+            if scheduler_wait_ms is not None:
+                raw_metrics["scheduler_queue_wait_ms"] = scheduler_wait_ms
+            final_output = SimpleNamespace(
+                request_id="req-queue",
+                finished=True,
+                metrics=raw_metrics,
+                outputs=[],
+                stage_durations={},
+                peak_memory_mb=0.0,
+                final_output_type="image" if stage_type == "diffusion" else "text",
+                images=None,
+            )
+            req_state.stage_submit_ts[stage_id] = self._SUBMIT
+            mocker.patch(
+                "vllm_omni.engine.stage_pool._time.time",
+                return_value=self._SUBMIT + wall_ms / 1000.0,
+            )
+            asyncio.run(orchestrator._handle_processed_outputs(stage_id, 0, [final_output]))
+            stage_metrics = routed[-1]
+            built.append(stage_metrics)
+            final_result = SimpleNamespace(
+                request_id="req-queue",
+                stage_id=stage_id,
+                replica_id=0,
+                stage_submit_ts=self._SUBMIT,
+                metrics=stage_metrics,
+                engine_outputs=final_output,
+            )
+            obj._process_single_result(
+                final_result,
+                stage_id,
+                aggregator,
+                {"req-queue": self._SUBMIT},
+                self._SUBMIT,
+                n_stages - 1,
+            )
+        if replay_final:
+            obj._process_single_result(
+                final_result,
+                n_stages - 1,
+                aggregator,
+                {"req-queue": self._SUBMIT},
+                self._SUBMIT,
+                n_stages - 1,
+            )
+        assert final_output is not None
+        return final_output.stage_durations, built, obj.prom_metrics
+
+    def test_two_stage_diffusion_queue_wait_sums_every_stage(self, mocker) -> None:
+        durations, built, prom = self._run(mocker, [(1000.0, 400.0), (2000.0, 300.0)], replay_final=True)
+
+        assert durations["stage_0_gen_ms"] == pytest.approx(600.0)
+        assert durations["stage_1_gen_ms"] == pytest.approx(1700.0)
+        assert durations["queue_wait_ms"] == pytest.approx(701.0)
+        assert durations["stage_0_gen_ms"] + durations["stage_1_gen_ms"] + durations["queue_wait_ms"] == pytest.approx(
+            3001.0
+        )
+        assert [item.stage_gen_time_ms for item in built] == pytest.approx([600.0, 1700.0])
+        assert [item.stage_stats.total_gen_time_ms for item in built] == pytest.approx([600.0, 1700.0])
+        assert prom.observe_queue_wait.call_count == 1
+        assert prom.observe_queue_wait.call_args.args[0] == pytest.approx(0.701)
+        assert [call.args[2] for call in prom.observe_stage_gen_time.call_args_list] == pytest.approx([0.6, 1.7])
+        assert built[0].diffusion_metrics["scheduler_queue_wait_s"] == pytest.approx(0.4)
+        assert built[1].stage_gen_time_ms == pytest.approx(1700.0)
+        assert built[1].pipeline_timings["queue_wait_ms"] == pytest.approx(701.0)
+
+    def test_three_stage_diffusion_queue_wait_sums_every_stage(self, mocker) -> None:
+        durations, built, prom = self._run(
+            mocker,
+            [(1000.0, 400.0), (2000.0, 300.0), (2500.0, 200.0)],
+        )
+
+        assert durations["stage_0_gen_ms"] == pytest.approx(600.0)
+        assert durations["stage_1_gen_ms"] == pytest.approx(1700.0)
+        assert durations["stage_2_gen_ms"] == pytest.approx(2300.0)
+        assert durations["queue_wait_ms"] == pytest.approx(901.0)
+        assert sum(durations[f"stage_{stage_id}_gen_ms"] for stage_id in range(3)) + durations[
+            "queue_wait_ms"
+        ] == pytest.approx(5501.0)
+        assert [item.stage_stats.total_gen_time_ms for item in built] == pytest.approx([600.0, 1700.0, 2300.0])
+        assert prom.observe_queue_wait.call_args.args[0] == pytest.approx(0.901)
+
+    def test_autoregressive_stage_keeps_generation_and_queue_wait(self, mocker) -> None:
+        durations, built, prom = self._run(mocker, [(1000.0, None)], stage_type="llm")
+
+        assert durations["stage_0_gen_ms"] == pytest.approx(1000.0)
+        assert durations["queue_wait_ms"] == pytest.approx(1.0)
+        assert built[0].stage_stats.total_gen_time_ms == pytest.approx(1000.0)
+        assert prom.observe_queue_wait.call_args.args[0] == pytest.approx(0.001)
+        assert prom.observe_stage_in_queue.call_count == 0
+
+    def test_missing_scheduler_wait_leaves_both_clocks_unchanged(self, mocker) -> None:
+        durations, built, _prom = self._run(mocker, [(1000.0, None)])
+
+        assert durations["stage_0_gen_ms"] == pytest.approx(1000.0)
+        assert durations["queue_wait_ms"] == pytest.approx(1.0)
+        assert built[0].stage_stats.total_gen_time_ms == pytest.approx(1000.0)
+        assert built[0].diffusion_metrics is None or "scheduler_queue_wait_s" not in (built[0].diffusion_metrics or {})
+
+    def test_missing_orchestrator_wait_records_scheduler_wait(self, mocker) -> None:
+        durations, built, prom = self._run(mocker, [(1000.0, 250.0)], orchestrator_wait_ms=None)
+
+        assert durations["stage_0_gen_ms"] == pytest.approx(750.0)
+        assert durations["queue_wait_ms"] == pytest.approx(250.0)
+        assert durations["stage_0_gen_ms"] + durations["queue_wait_ms"] == pytest.approx(1000.0)
+        assert built[0].stage_stats.total_gen_time_ms == pytest.approx(750.0)
+        assert prom.observe_queue_wait.call_args.args[0] == pytest.approx(0.25)
 
 
 class TestStageWaitingAggregation:

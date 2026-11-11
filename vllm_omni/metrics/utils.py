@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
 
@@ -58,6 +58,28 @@ def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float 
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None
     return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def diffusion_output_metrics(engine_output: Any) -> dict[str, Any]:
+    """Return the metrics dict on one engine output, or an empty dict."""
+    raw = getattr(engine_output, "metrics", None)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def extract_diffusion_scheduler_wait_ms(output: Any) -> float | None:
+    """Diffusion scheduler admission on one output, in milliseconds.
+
+    A missing key means the stage did not measure it. A present ``0`` is a
+    real measurement.
+    """
+    wait_ms = diffusion_output_metrics(output).get(metric_defs.SCHEDULER_QUEUE_WAIT_MS)
+    if wait_ms is None:
+        return None
+    return float(wait_ms)
 
 
 def observe_stage_workload_metrics(
@@ -243,17 +265,18 @@ def coerce_positive_int_scalar(value: object) -> int | None:
             if coerced is not None:
                 return coerced
         return None
-    item = getattr(value, "item", None)
+    scalar: Any = value
+    item = getattr(scalar, "item", None)
     if callable(item):
         try:
-            value = item()
+            scalar = item()
         except Exception:
             return None
     try:
-        value = int(value)
+        parsed = int(scalar)
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return parsed if parsed > 0 else None
 
 
 def coerce_positive_float_scalar(value: object) -> float | None:
@@ -271,17 +294,18 @@ def coerce_positive_float_scalar(value: object) -> float | None:
             if coerced is not None:
                 return coerced
         return None
-    item = getattr(value, "item", None)
+    scalar: Any = value
+    item = getattr(scalar, "item", None)
     if callable(item):
         try:
-            value = item()
+            scalar = item()
         except Exception:
             return None
     try:
-        value = float(value)
+        parsed = float(scalar)
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return parsed if parsed > 0 else None
 
 
 def resolve_int_by_sequential_keys(
@@ -509,16 +533,18 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            getter = cast(Callable[[Any], Any], lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n)))
+            result.append((display_name, getter))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+            getter = cast(Callable[[Any], Any], lambda e, n=f.name: getattr(e, n))
+            result.append((f.name, getter))
     return result
 
 

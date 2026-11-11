@@ -3079,7 +3079,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
 @pytest.mark.asyncio
 async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
-    built_metrics = SimpleNamespace(pipeline_timings={})
+    built_metrics = SimpleNamespace(pipeline_timings={}, scheduler_queue_wait_ms=None)
 
     class RecordingPool:
         def __init__(self) -> None:

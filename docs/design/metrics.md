@@ -75,7 +75,7 @@ Image and diffusion metrics use two cooperating collectors. `OmniPrometheusMetri
 
 - `stage_gen_time_s`, `stage_in_queue_s`, image workload, inference-step, and per-stage peak-memory values are emitted from `StageRequestStats` when a stage finishes. `image_pixels` and `image_count_total` are restricted to image outputs; `num_inference_steps` is restricted to diffusion stages.
 - Diffusion engine timings are accumulated per request by `OrchestratorAggregator.accumulate_diffusion_metrics`. Engine-side millisecond values are converted to seconds before `observe_modality_at_finalize(...)` dispatches the per-replica Histogram observations.
-- `request_queue_wait_s` is emitted once at final request completion from `pipeline_timings["queue_wait_ms"]`. A present value of `0` is a valid observation; a missing key produces no sample.
+- `request_queue_wait_s` is emitted once at final request completion from `pipeline_timings["queue_wait_ms"]`. That value is the orchestrator admission hop plus the sum of diffusion `stage_in_queue_s` across finished stages. Do not add `request_queue_wait_s` and `stage_in_queue_s`. `stage_gen_time_s` and `stage_*_gen_ms` exclude that admission wait. A sample is emitted when the orchestrator recorded `queue_wait_ms`, or when any finished diffusion stage reported `scheduler_queue_wait_ms` (that wait is then stored as `queue_wait_ms` even if the orchestrator hop was absent). A present value of `0` is a valid observation. If neither source is present, no sample is emitted.
 - `stage_waiting_requests` is the sum of the latest scheduler snapshots for all live replicas in a stage. AR snapshots arrive through `SchedulerStats`; diffusion snapshots ride normal diffusion output metrics. A dead replica's snapshot is removed. Because this deliberately reuses existing message paths, the gauge can retain its last value while a replica produces no output.
 - `kv_wait_s` measures the AR scheduler interval from entering the KV-transfer-free wait state until extraction acknowledgement. The sample is carried to the Orchestrator through the existing engine output and labeled by connector type. Abort/error/removal paths discard incomplete timers rather than emitting partial waits.
 
@@ -204,10 +204,10 @@ second.
 
 | Metric | Type | Labels | Description |
 | -------- | ------ | -------- | ------------- |
-| `vllm_omni:stage_gen_time_s` | Histogram | `model_name`, `stage`, `stage_type` | Stage submit to finished output; includes in-stage queueing |
-| `vllm_omni:request_queue_wait_s` | Histogram | `model_name` | Orchestration-layer queue wait; a present zero is recorded |
+| `vllm_omni:stage_gen_time_s` | Histogram | `model_name`, `stage`, `stage_type` | Stage submit to finished output, excluding diffusion scheduler admission |
+| `vllm_omni:request_queue_wait_s` | Histogram | `model_name` | Orchestrator admission hop plus the sum of diffusion `stage_in_queue_s`. Do not add the two. A present zero is recorded |
 | `vllm_omni:stage_waiting_requests` | Gauge | `model_name`, `stage` | Sum of the latest waiting snapshots across live replicas in the stage |
-| `vllm_omni:stage_in_queue_s` | Histogram | `model_name`, `stage` | Diffusion scheduler wait from enqueue to initial execution admission |
+| `vllm_omni:stage_in_queue_s` | Histogram | `model_name`, `stage` | Per-stage diffusion scheduler wait from enqueue to initial execution admission. Already included in `request_queue_wait_s` |
 | `vllm_omni:num_inference_steps` | Histogram | `model_name` | Denoising-step distribution for diffusion stages |
 | `vllm_omni:image_count_total` | Counter | `model_name` | Cumulative number of generated image outputs |
 | `vllm_omni:image_pixels` | Histogram | `model_name` | Pixel-count distribution for image outputs |
@@ -381,7 +381,7 @@ The first engine-core output ends prefill even when it carries no token. A gener
 - With `async_chunk`, a downstream stage that receives chunks is submitted together with stage 0, and the request stays in `WAITING_FOR_CHUNK` until the first upstream chunk arrives. Later waits for the next chunk fall inside `vllm_decode_ms`.
 - A stage with `requires_full_payload_input` stays in `WAITING_FOR_INPUT` until the connector delivers the payload.
 
-For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is separate from `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`). That request histogram is the orchestrator admission hop plus the sum of diffusion `vllm_omni:stage_in_queue_s` samples, so those two families must not be added together.
 
 These intervals can overlap with other timings of the same request: the upstream stage's run, the transfer times in `TransferEdgeStats` and `vllm_omni:transfer_tx_s` / `vllm_omni:transfer_rx_s`, and stage-to-stage handoff events. Do not add them together into an end-to-end breakdown of a request unless the intervals are known not to overlap and use the same clock.
 
