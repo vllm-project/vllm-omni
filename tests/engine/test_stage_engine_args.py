@@ -988,3 +988,46 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         assert typed_effective_args == legacy_effective_args, (
             f"{model_type} stage {stage_id} changed effective backend arguments"
         )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "deploy_yaml"),
+    [
+        ("kokoro", "kokoro.yaml"),
+        ("indextts2", "indextts2.yaml"),
+        ("indextts2", "indextts2_low_latency.yaml"),
+        ("yue2", "yue2.yaml"),
+    ],
+)
+def test_skip_tokenizer_init_deploy_configs_do_not_pin_unrelated_hub_tokenizer_offline(
+    model_type: str, deploy_yaml: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stages with skip_tokenizer_init must not hardcode `tokenizer: gpt2`, which
+    forces vLLM's EngineArgs.__post_init__ to resolve `gpt2` from the Hub Cache
+    under HF_HUB_OFFLINE=1 even when `model` is a local directory."""
+    import huggingface_hub.constants
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    pipeline = resolve_pipeline_config(model_type)
+    assert pipeline is not None
+    deploy = load_deploy_config(_DEPLOY_DIR / deploy_yaml)
+    model_dir = _fake_model_root(pipeline, tmp_path)
+
+    def _resolve_test_model_path(model, engine_args):
+        engine_args.pop("model_path_resolver", None)
+        return model
+
+    monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
+    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model=model_dir)
+
+    for legacy_stage in legacy_stages:
+        typed_args = build_engine_args_dict_from_omni_stage_config(
+            omni_config.stage_by_id(legacy_stage.stage_id),
+            model=model_dir,
+        )
+        assert typed_args.get("skip_tokenizer_init") is True
+        assert typed_args.get("tokenizer") is None
+        filtered = {k: v for k, v in typed_args.items() if k in _LLM_BACKEND_FIELDS - _TOPOLOGY_ONLY_ENGINE_ARGS}
+        engine_args = OmniEngineArgs(**filtered)
+        assert engine_args.model == model_dir
+        assert engine_args.tokenizer is None
