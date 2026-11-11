@@ -180,6 +180,12 @@ shows `TeaCache applied with rel_l1_thresh=0.1` at start-up.
   min 0.77); 50 is faster (1.96×) with a lower mean SSIM (0.86).
 - The coefficients were calibrated on the medium checkpoint only; the large
   checkpoint was not measured.
+- For a larger speed-up, use Cache-DiT instead (`--cache-backend cache_dit`).
+  In a separate run on the same GPU (vLLM 0.33.0, `main` at `62876f40` plus
+  #8747, 28 steps, same prompts and seeds), Cache-DiT's default config gave
+  2.36× with mean SSIM 0.85 (min 0.64), against 1.42× and 0.90 (min 0.63) for
+  TeaCache. With CFG, Cache-DiT needs #8747; without it, SD3.5 images come out
+  blurred.
 
 ## XPU
 
