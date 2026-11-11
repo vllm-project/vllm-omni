@@ -77,6 +77,8 @@ class FastPathConfig:
     fuse_norm_cache: bool = False
     # Keep the reference BF16 roundings in the channels-last norm (encoder only).
     exact_bf16_norm: bool = False
+    # Lossless paths and the decoder output projection retain bitwise probes.
+    verify_spatial_padding: bool = True
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
@@ -270,6 +272,15 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 _PROBE_SEED = 0
+# One Gaussian draw is not a bitwise proof. On sm_90 with cuDNN 9.24, implicit
+# spatial padding and an explicit pad are each deterministic, and fp32 matches,
+# but bf16/fp16 still differ by one ulp on a minority of inputs. Seed 0 can
+# match every element (fp16 2x2 with 32 channels, bf16 6x10 with a cached
+# frame) while the next seed does not; that false accept is then reused for
+# every later activation of the shape. Eight fixed seeds caught every such
+# shape exercised by the lossless decoder tests. Trials stay sequential so a
+# probe still holds one input, the reference copy, and two outputs.
+_PROBE_TRIALS = 8
 
 
 def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) -> torch.Tensor:
@@ -284,28 +295,33 @@ def _equal_on_random_operands(
     reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference_input: Callable[[torch.Tensor], torch.Tensor],
 ) -> bool:
-    """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
+    """Compare two convolution formulations on several seeded stand-ins for ``x`` and ``weight``.
 
     Agreement on the real operands proves little: all-zero activations or
-    weights give the same bytes under any kernel. Which kernel cuDNN runs
-    depends only on the verdict key's metadata, never on values, so a match on
-    random data is what makes a verdict reusable for every later input and
-    weight update; it is also the only comparison needed. A private generator
-    leaves the global RNG streams untouched.
+    weights give the same bytes under any kernel. cuDNN picks the kernel from
+    the verdict key's metadata, but two deterministic low-precision kernels
+    can still disagree by an ulp on some inputs, so every one of
+    ``_PROBE_TRIALS`` probes has to match before the verdict is reused for a
+    later input or weight update. A private generator leaves the global RNG
+    streams untouched.
 
     ``reference`` convolves ``reference_input(x)`` (the pre-padded or
-    channels-first copy). The probe input is drawn twice from the same
+    channels-first copy). Each probe input is drawn twice from the same
     generator state, so each formulation's input is freed before the other's
-    is created; callers probe before running the real convolution. The first
-    call for a shape then holds at most one probe input, the reference copy
-    and the two probe outputs, no more than comparing real operands did.
+    is created; callers probe before running the real convolution. Trials are
+    sequential, so the first call for a shape holds at most one probe input,
+    the reference copy and the two probe outputs.
     """
-    generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
-    probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
-    state = generator.get_state()
-    reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
-    generator.set_state(state)
-    return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
+    fan_in_std = weight[0].numel() ** -0.5
+    for seed in range(_PROBE_SEED, _PROBE_SEED + _PROBE_TRIALS):
+        generator = torch.Generator(device=x.device).manual_seed(seed)
+        probe_weight = _random_like(weight, generator, std=fan_in_std)
+        state = generator.get_state()
+        reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
+        generator.set_state(state)
+        if not _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out):
+            return False
+    return True
 
 
 def _conv_with_spatial_padding(
@@ -319,11 +335,12 @@ def _conv_with_spatial_padding(
 
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
-    but is only bit-identical if cuDNN selects the same kernel for both
-    formulations, so the first call for each (conv, shape) compares both on
-    seeded random operands (see :func:`_equal_on_random_operands`) before
-    running the real convolution once with the selected formulation; later
-    calls reuse the verdict until it is evicted.
+    but is only bit-identical when the two formulations agree on every probe in
+    :func:`_equal_on_random_operands`. The first call for each (conv, shape)
+    compares both before running the real convolution once with the selected
+    formulation; later calls reuse the verdict until it is evicted.
+    Internal channels-last decoder convolutions skip this bitwise check under
+    their tolerance-based contract.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
     pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
@@ -336,6 +353,13 @@ def _conv_with_spatial_padding(
 
     def padded(x_padded: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x_padded, weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    cfg = getattr(conv, CFG_ATTR, None)
+    if cfg is not None and cfg.channels_last and not cfg.verify_spatial_padding:
+        # Internal channels-last decoder convolutions already allow rounding
+        # differences. Avoid allocating full-size random inputs and outputs
+        # for an unnecessary bitwise probe while decode caches are live.
+        return candidate(assembled, conv.weight)
 
     verdict = verdicts.get(key)
     if verdict is None:
@@ -463,20 +487,25 @@ def _run_cached_causal_conv(
                 out, cache_list[index] = first_frame
                 return with_bias(out)
 
-        # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
-        # padding, once verified bitwise for this (conv, shape).
+        # Prefer temporal concat with cuDNN spatial padding. Exact paths verify
+        # this formulation for each (conv, shape); channels-last hidden layers
+        # use the tolerance-based policy in _conv_with_spatial_padding.
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
         key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
         if verdicts.get(key, True):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
                 assembled, cache_list[index] = pair
+                # Assembly has consumed the old cache on the current stream.
+                # Keep only its replacement alive during the convolution.
+                del cache, payload
                 out = _conv_with_spatial_padding(conv, assembled, bias, verdicts, key)
                 return with_bias(out)
 
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
+            del cache, payload
             out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
             return with_bias(out)
 
@@ -557,11 +586,16 @@ def _run_norm_act_cached_conv(
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair
+                    del cache, payload
                     fold_bias = return_bias and _may_defer_conv_bias(norm, x)
                     out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
                     if not return_bias:
                         return out
                     return out, _deferred_conv_bias(conv, out) if fold_bias else None
+
+        # A declined fused assembly falls through to the ordinary cache path;
+        # do not retain the old history while that helper replaces its slot.
+        del cache, payload
 
     x = _norm_act(norm, act, x, pending_bias=pending_bias)
     if after_norm is not None:
@@ -607,6 +641,7 @@ def _run_conv_out_channels_last(
     if pair is None:
         return None
     assembled, cache_list[index] = pair
+    del cache, payload
 
     def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()
