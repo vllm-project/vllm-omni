@@ -1676,6 +1676,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     base = resolve_deploy_yaml("vllm_omni/deploy/hunyuan_image3_dit.yaml")
     base_parallel = base["stages"][0]["parallel_config"]
     reliability = Path("tests/dfx/reliability/test_hunyuan_image.py").read_text(encoding="utf-8")
+    reliability_fixtures = Path("tests/dfx/conftest.py").read_text(encoding="utf-8")
     startup = Path("tests/dfx/reliability/test_hunyuan_image_ep_startup.py").read_text(encoding="utf-8")
     accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     step = _find_step("HunyuanImage Expert Parallel Startup", AMD_WEEKLY_PIPELINE)
@@ -1693,6 +1694,10 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit.yaml" in reliability
     assert '"parallel_config.enable_expert_parallel": False' in reliability
     assert 'params["update"]' in reliability
+    assert 'params["stage_init_timeout"] = 1800' in reliability
+    assert 'params["init_timeout"] = 2100' in reliability
+    assert 'stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout")' in reliability_fixtures
+    assert 'init_timeout=runtime_params_by_name[test_name].get("init_timeout")' in reliability_fixtures
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in reliability
     assert "hunyuan_image3_dit.yaml" in startup
     assert "send_health_http_request" in startup

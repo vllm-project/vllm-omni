@@ -308,12 +308,15 @@ def create_reliability_omni_server_params(
 ) -> list[OmniServerParams]:
     unique_params = _create_unique_server_params(configs, stage_configs_dir)
     server_args_by_name = extract_server_args_by_test_name(configs)
+    runtime_params_by_name = {str(cfg.get("test_name")): cfg.get("server_params") or {} for cfg in configs}
     return [
         OmniServerParams(
             model=model,
             stage_config_path=stage_config_path,
             server_args=server_args_by_name.get(test_name),
             use_omni=use_omni,
+            init_timeout=runtime_params_by_name[test_name].get("init_timeout"),
+            stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout"),
         )
         for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args, use_omni in unique_params
     ]
