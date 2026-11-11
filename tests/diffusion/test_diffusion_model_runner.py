@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,9 +11,17 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionOutput,
+    VideoOutputTransportConfig,
+)
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import set_forward_context as real_set_forward_context
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -307,6 +316,54 @@ def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, impor
     assert getattr(request, "kv_computed_tokens", ()) == (imported_tokens or ())
 
 
+class _ScheduleSourcePipeline:
+    """Records the schedule and its source that the runner binds around the batch forward."""
+
+    supports_request_batch = True
+
+    def __init__(self):
+        self.bound = None
+
+    def forward(self, batch):
+        context = get_forward_context()
+        self.bound = (context.attention_schedule, context.attention_schedule_from_request)
+        return [DiffusionOutput(output=prompt) for prompt in batch.prompts]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("explicit", [False, True], ids=["all-inherited", "all-explicit"])
+def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, monkeypatch):
+    # Batch keys keep requests that sent a schedule apart from requests that inherit one, so a batch
+    # has one source; only a request's own ranges are checked against its denoise sequence.
+    ranges = [{"start": 0, "end": 40, "profile": "sparse"}]
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SDPA"))}, default=ranges
+    )
+    runner.pipeline = _ScheduleSourcePipeline()
+    requests = []
+    for req_id in ("a", "b"):
+        request = _make_request()
+        request.request_id = req_id
+        request.sampling_params.attention_schedule = list(ranges) if explicit else None
+        requests.append(request)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
+
+    runner._execute_request_list(
+        requests,
+        od_config=runner.od_config,
+        allow_single_output=False,
+        require_request_batch_support=True,
+        record_name="test_schedule_source",
+        record_output_peak_memory=False,
+    )
+
+    schedule, from_request = runner.pipeline.bound
+    assert schedule == runner.od_config.diffusion_attention_schedule.default
+    assert from_request is explicit
+
+
 def _make_compile_runner(
     model=None,
     *,
@@ -364,14 +421,24 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
-    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    # vllm_omni loggers are reparented onto the vllm logger, which does not
+    # propagate to root, so the fixture's root handler never sees this warning.
+    # Pin this logger itself: an earlier test on the same xdist worker can leave
+    # an ancestor above WARNING, and then logger.warning() emits nothing.
+    target_logger = model_runner_module.logger
+    target_logger.addHandler(caplog.handler)
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.WARNING)
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
     req.sampling_params.num_inference_steps = None
-
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    try:
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
     assert cache_backend.refresh_calls == []
     assert "requires num_inference_steps to be passed explicitly" in caplog.text
@@ -499,6 +566,59 @@ def test_update_states_carries_prepared_layout() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("fail", [False, True])
+def test_step_runner_binds_schedule_around_mixfusion_driver(monkeypatch, fail):
+    """The driver and dense denoise share the same request schedule scope."""
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+    from vllm_omni.diffusion.forward_context import is_forward_context_available
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.vllm_config = None
+    runner.pipeline = _FinalOnlyStepPipeline()
+    request = OmniDiffusionRequest(
+        request_id="scheduled-driver",
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            attention_schedule=[{"start": 0, "end": 1, "profile": "dense"}],
+        ),
+    )
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"dense": AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))},
+    )
+    expected = (AttentionScheduleRange(0, 1, "dense"),)
+    observed = []
+
+    class Driver:
+        def run(self, batch, states, denoise):
+            observed.append(get_forward_context().attention_schedule)
+            assert states[0].attention_schedule == expected
+            if fail:
+                raise RuntimeError("driver failed")
+            return denoise(batch, states=states)
+
+    monkeypatch.setattr(runner.pipeline, "mixfusion_driver", Driver(), raising=False)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
+    output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="driver failed"):
+            runner._execute_stepwise_core(output, record_output_peak_memory=False)
+    else:
+        result = runner._execute_stepwise_core(output, record_output_peak_memory=False)
+        assert result.get_request_output(request.request_id).finished
+    assert observed == [expected]
+    assert not is_forward_context_available()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_update_states_does_not_choose_packing_from_request_flag() -> None:
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     runner.pipeline.supports_mixfusion = True
@@ -596,9 +716,15 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
-    model = SimpleNamespace(enable_cuda_graph_decode=True)
+@pytest.mark.parametrize(
+    ("decode_graph", "denoise_graph"),
+    [(True, False), (False, True)],
+    ids=["decode-graph", "denoise-graph"],
+)
+def test_compile_transformer_scopes_inductor_cudagraphs_to_graph_layers(monkeypatch, decode_graph, denoise_graph):
+    model = SimpleNamespace(enable_cuda_graph_decode=decode_graph)
     runner = _make_compile_runner(model)
+    runner.od_config.diffusion_use_graph = denoise_graph
     compile_calls = []
 
     def _regionally_compile(target, *args, **kwargs):

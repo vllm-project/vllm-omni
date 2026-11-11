@@ -35,6 +35,14 @@ from .omni_duplex_eval_metrics import (
 
 logger = logging.getLogger(__name__)
 
+# Echo the offending reply back once and ask for the score JSON again. This
+# corrects the response format only; the scoring prompt itself (and the pinned
+# rubric it carries) is never reworded. Trace lines record every retry.
+_JUDGE_FORMAT_FOLLOWUP = (
+    "Your reply does not contain the required score fields ({fields}). "
+    "Respond again with only the JSON object that includes these fields."
+)
+
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -52,6 +60,24 @@ def _write(path: Path, value: Any) -> None:
 
 def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
+
+
+def _gt_references(answers: list[object]) -> list[str]:
+    """Mirror the official evaluator's reference handling.
+
+    Drop empty strings (order-preserving, strip-based) then deduplicate while
+    keeping the first occurrence, as ``non_empty_strings`` followed by
+    ``load_reference_texts`` does in OpenBMB/Omni-DuplexEval. Numbering an
+    empty or repeated answer would deviate from the pinned content prompt.
+    """
+    references = []
+    for answer in answers:
+        if answer is None:
+            continue
+        text = str(answer).strip()
+        if text:
+            references.append(text)
+    return list(dict.fromkeys(references))
 
 
 def evaluate_sample(
@@ -73,22 +99,53 @@ def evaluate_sample(
     trace_path = score_path.with_suffix(".judge.jsonl")
     trace_path.write_text("", encoding="utf-8")
 
-    def judge_result(call: Callable[[], str], required: tuple[str, ...]) -> dict[str, Any]:
+    def judge_result(call: Callable[..., str], required: tuple[str, ...]) -> dict[str, Any]:
+        def _trace(payload: dict[str, Any]) -> None:
+            with trace_path.open("a", encoding="utf-8") as trace:
+                trace.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
         try:
             raw_response = call()
         except JudgeResponseError as exc:
-            with trace_path.open("a", encoding="utf-8") as trace:
-                trace.write(
-                    json.dumps(
-                        {"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+            _trace({"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)})
             raise
-        with trace_path.open("a", encoding="utf-8") as trace:
-            trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
-        return parse_judge_json(raw_response, required=required)
+        parse_error: str | None = None
+        parsed: dict[str, Any] | None = None
+        try:
+            parsed = parse_judge_json(raw_response, required=required)
+        except ValueError as exc:
+            parse_error = str(exc)
+        _trace({"raw_response": raw_response, "error": parse_error})
+        if parse_error is None:
+            assert parsed is not None
+            return parsed
+        # The judge can answer in prose instead of the required score JSON, or
+        # with a malformed value in a field that is present; echo the offending
+        # reply back once so only the format is corrected, naming what failed
+        # to parse so the retry can address it.
+        followup = (
+            raw_response,
+            _JUDGE_FORMAT_FOLLOWUP.format(fields=", ".join(required)) + f"\n{parse_error}",
+        )
+        try:
+            retry_response = call(followup=followup)
+        except JudgeResponseError as exc:
+            _trace(
+                {
+                    "raw_response": exc.raw_response,
+                    "finish_reason": exc.finish_reason,
+                    "judge_retry": True,
+                    "error": str(exc),
+                }
+            )
+            raise
+        try:
+            parsed = parse_judge_json(retry_response, required=required)
+        except ValueError as exc:
+            _trace({"raw_response": retry_response, "judge_retry": True, "error": str(exc)})
+            raise
+        _trace({"raw_response": retry_response, "judge_retry": True})
+        return parsed
 
     raw = _read(response_path)
     meta = (
@@ -128,7 +185,9 @@ def evaluate_sample(
                 continue
             frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
             parsed = judge_result(
-                lambda: judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames),
+                lambda **kw: judge.temporal(
+                    build_temporal_prompt(*window, item["sentence"], sample.question_text), frames, **kw
+                ),
                 ("temporal_score", "is_relevant"),
             )
             temporal_rows.append(
@@ -146,10 +205,14 @@ def evaluate_sample(
         content_frames = None
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        content_prompt = build_content_prompt(
+            _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
+        )
         try:
             content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode),
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode=judge_video_mode, **kw
+                ),
                 ("content_score",),
             )
         except Exception as exc:
@@ -157,7 +220,7 @@ def evaluate_sample(
             # whole video is passed through (video_url mode): the judge answers
             # HTTP 400 "Input length (83158) exceeds model's maximum context
             # length (65536)" (#9089).  Degrade that single content call to the
-            # bounded frame-sample path instead of failing the whole run.
+            # frame-sample path instead of failing the whole run.
             if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
                 raise
             logger.warning(
@@ -170,7 +233,9 @@ def evaluate_sample(
                 # Nothing to fall back to: keep the original judge error.
                 raise
             content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode="frame-sample"),
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode="frame-sample", **kw
+                ),
                 ("content_score",),
             )
             content["judge_input_fallback"] = "frame-sample"
@@ -194,7 +259,9 @@ def evaluate_sample(
         if task == "correction" or not times:
             response = separator.join(chunk["text"] for chunk in chunks).strip()
             parsed = judge_result(
-                lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                lambda **kw: judge.chat(
+                    build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                ),
                 ("success_score",),
             )
             event_rows.append({"response_segment": response, **parsed})
@@ -208,7 +275,9 @@ def evaluate_sample(
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
                     parsed = judge_result(
-                        lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                        lambda **kw: judge.chat(
+                            build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                        ),
                         ("success_score",),
                     )
                     event_rows.append({"start_time": start, "response_segment": response, **parsed})
@@ -260,7 +329,12 @@ def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
 
 
 def _content_frame_times(duration: float) -> list[float]:
-    """Sample the full video at approximately one frame every three seconds."""
+    """Sample the full video at approximately one frame every three seconds.
+
+    The count is not capped. The ``video_url`` overflow fallback sends this
+    whole list, so a long clip can exceed the judge context again. That second
+    error is not caught and fails the sample.
+    """
     if duration <= 0:
         return []
     times = []
@@ -268,11 +342,6 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
-    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
-    # coverage while bounding long clips to a safely portable frame count.
-    if len(times) > 16:
-        stride = (len(times) - 1) / 15
-        times = [times[round(i * stride)] for i in range(16)]
     return times
 
 

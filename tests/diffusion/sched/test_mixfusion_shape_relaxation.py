@@ -77,6 +77,40 @@ MIXFUSION = {"extra_args": {"enable_mixfusion": True}}
 PER_PROMPT = {"prompt": "a cat", "additional_information": {"image": "x"}}
 
 
+@pytest.mark.parametrize("scheduler_cls", [_Scheduler, RequestScheduler])
+def test_mixfusion_batch_key_preserves_attention_schedule(monkeypatch, scheduler_cls):
+    """Shape relaxation must retain schedule identity and explicit/inherited intent."""
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    scheduler = _initialized_scheduler(scheduler_cls, monkeypatch, _MixfusionCapablePipeline)
+    service = AttentionScheduleConfig(
+        profiles={"dense": AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))},
+        default=[{"start": 0, "end": 2, "profile": "dense"}],
+    )
+    scheduler.od_config.diffusion_attention_schedule = service
+    keys = []
+    for schedule in (None, list(service.default), []):
+        request = OmniDiffusionRequest(
+            prompt="a cat",
+            request_id="key-test",
+            sampling_params=OmniDiffusionSamplingParams(
+                height=512,
+                width=768,
+                attention_schedule=schedule,
+                extra_args={"enable_mixfusion": True},
+            ),
+        )
+        request.mixfusion_info = MixFusionRequestInfo(1, 1536, 256, 128)
+        keys.append(scheduler._build_sampling_params_key(request))
+    assert keys[0].attention_schedule == keys[1].attention_schedule == service.default
+    assert not keys[0].attention_schedule_explicit
+    assert keys[1].attention_schedule_explicit
+    assert keys[2].attention_schedule == ()
+    assert keys[0] != keys[1] != keys[2]
+
+
 @pytest.mark.parametrize(
     ("scheduler_cls", "pipeline_cls", "prompt", "overrides", "expected"),
     [

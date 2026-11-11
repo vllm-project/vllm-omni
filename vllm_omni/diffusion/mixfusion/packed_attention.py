@@ -33,10 +33,10 @@ def _backend_supports_attention_mask(attn) -> bool:
     Custom attention modules carry no backend and report no mask support
     (mirroring ``Attention._assert_metadata_compatible``).
     """
-    backend = getattr(attn, "attn_backend", None)
+    _, backend, spec = attn.effective_attention()
     if backend is None:
         return False
-    return bool(backend.supports_attention_mask(getattr(attn, "attn_spec", None)))
+    return bool(backend.supports_attention_mask(spec))
 
 
 def _stream_rows(

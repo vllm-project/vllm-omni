@@ -26,6 +26,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanDecoder3d,
 )
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import (
     install_wan_decoder_fast_path,
 )
@@ -210,7 +211,9 @@ def _sharded_worker(
 def test_sharded_fast_path_on_every_rank(autocast: bool, level: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
-    port = str(29610 + int(autocast) + 2 * (level == "fused"))
+    # Ranks of this test share one port. A fixed offset collides with other
+    # files that also listen on 29610 while xdist runs them together.
+    port = str(get_open_port())
     mp.spawn(
         _sharded_worker,
         args=(2, port, autocast, return_dict, level),

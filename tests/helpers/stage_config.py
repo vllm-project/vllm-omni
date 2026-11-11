@@ -268,7 +268,11 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "max_num_batched_tokens": 16384,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                # Thinker owns its card. On a 22 GiB L4 (build 18653, vLLM 0.32.0),
+                # util 0.9 left 0.8 GiB of KV after the 16.78 GiB weights, runner
+                # buffers and the 16384-token prefill peak; one 16384-token request
+                # needs 0.88 GiB.
+                "gpu_memory_utilization": 0.95,
                 "skip_mm_profiling": True,
                 "default_sampling_params": {"max_tokens": 128},
             },
@@ -296,6 +300,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 # ROCm documentation examples request two cards. Share the
                 # Talker's card with Code2Wav and reserve its DiT workspace.
                 "stages": [
+                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
                     {"stage_id": 1, "gpu_memory_utilization": 0.3},
                     {"stage_id": 2, "devices": "1"},
                 ],
@@ -658,8 +663,14 @@ def _materialize_ci_overlay(model_type: str) -> Path:
     if base:
         overlay["base_config"] = str(_DEPLOY_DIR / base)
 
-    with open(out, "w", encoding="utf-8") as f:
-        yaml.safe_dump(overlay, f, sort_keys=False)
+    # Other pytest workers may read this path while regenerating the overlay.
+    fd, tmp_path = tempfile.mkstemp(dir=_CI_GENERATED_DIR, suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(overlay, f, sort_keys=False)
+        os.replace(tmp_path, out)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
     return out
 
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""JoyAI-VL-Interaction -> Qwen3-TTS native all-sync pipelines."""
+"""JoyAI-VL-Interaction -> Qwen3-TTS native pipelines (all-sync, or async-chunk Talker -> Code2Wav)."""
 
 from dataclasses import replace
 
@@ -45,6 +45,7 @@ JOYAI_VL_INTERACTION_PIPELINE = PipelineConfig(
             model_arch="Qwen3TTSTalkerForConditionalGeneration",
             custom_process_input_func=f"{_JOYAI_INPUT_PROCESSOR}.joyai_action_to_tts",
             custom_process_next_stage_input_func=f"{_QWEN3_TTS_INPUT_PROCESSOR}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_QWEN3_TTS_INPUT_PROCESSOR}.talker2code2wav_async_chunk",
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [2150],

@@ -2471,18 +2471,17 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
-@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5, 1.0, 3.0, 5.0])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_transfer_control_delta_is_independent_of_text_guidance(
+def test_transfer_control_increment_is_independent_of_text_guidance(
     make_cosmos3_pipeline, guidance_scale, cfg_normalize
 ) -> None:
     pipeline = make_cosmos3_pipeline()
     cond_no_control = torch.tensor([2.0, 4.0])
     cond_full = torch.tensor([6.0, 10.0])
     uncond_full = torch.tensor([1.0, 3.0])
-    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
-    if guidance_scale != 0.0:
-        expected += 1.5 * (cond_full - cond_no_control)
+    expected = uncond_full + guidance_scale * (cond_full - uncond_full)
+    expected += (1.5 - 1.0) * (cond_full - cond_no_control)
     if cfg_normalize:
         expected = pipeline.cfg_normalize_function(cond_full, expected)
 
@@ -2492,6 +2491,47 @@ def test_transfer_control_delta_is_independent_of_text_guidance(
         cfg_normalize=cfg_normalize,
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("guidance_scale", [0.0, 1e-40, 0.5])
+@pytest.mark.parametrize("text_cfg_below_one", [False, True])
+@pytest.mark.parametrize("delayed_control", [False, True])
+def test_diffuse_transfer_supports_zero_and_small_text_guidance(
+    make_cosmos3_pipeline, sequential_cfg_parallel, guidance_scale, text_cfg_below_one, delayed_control
+) -> None:
+    """Preserve control-only dispatch and allow combined CFG at zero or tiny scales."""
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7] if delayed_control else [7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance_scale,
+        control_guidance=1.5,
+        control_guidance_interval=(0.0, 8.0) if delayed_control else None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    # The stub predicts 102 with text+control, 2 with text only, and 101
+    # with unconditional text+control; its scheduler adds each prediction.
+    expected_calls = [(2, True), (2, False)]
+    expected = 152.0
+    if text_cfg_below_one:
+        expected_calls.append((1, True))
+        expected = 151.0 + guidance_scale
+    if delayed_control:
+        initial_calls = [(2, True), (1, True)] if text_cfg_below_one else [(2, True)]
+        expected_calls = initial_calls + expected_calls
+        expected += 101.0 + guidance_scale if text_cfg_below_one else 102.0
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+    torch.testing.assert_close(result, torch.full_like(latents, expected))
 
 
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2524,7 +2564,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 154.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2675,7 +2715,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 408.0))
 
 
 @pytest.mark.parametrize(
@@ -3719,3 +3759,46 @@ def test_pipeline_init_rejects_model_cpu_offload_under_pp_before_loading(monkeyp
     od_config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="model-level CPU offload"):
         pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+@pytest.mark.parametrize("use_session", [False, True])
+@pytest.mark.parametrize("guidance_scale", [1.0, 3.0])
+@pytest.mark.parametrize("fail_after_first_step", [False, True])
+def test_diffuse_releases_conditioning_after_completion_or_failure(
+    make_cosmos3_pipeline, sequential_cfg_parallel, use_session, guidance_scale, fail_after_first_step
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline._use_session_state = use_session
+    pipeline._memory_manager = SessionStateManager()
+
+    def progress(timesteps):
+        yield timesteps[0]
+        assert pipeline.transformer.cached_kv is not None
+        assert pipeline.transformer.cached_freqs_gen is not None
+        if fail_after_first_step:
+            raise RuntimeError("failure after conditioning was cached")
+        yield timesteps[1]
+
+    pipeline.progress_bar = progress
+    kwargs = dict(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([7, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance_scale,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+        session_id="cache-lifetime",
+    )
+    if fail_after_first_step:
+        with pytest.raises(RuntimeError, match="failure after conditioning"):
+            pipeline.diffuse(**kwargs)
+    else:
+        pipeline.diffuse(**kwargs)
+        # Each branch constructs conditioning only once, reusing it on step two.
+        cold_calls = sum(call["cache_before"] is None for call in pipeline.transformer.calls)
+        assert cold_calls == (2 if guidance_scale > 1 else 1)
+    assert pipeline.transformer.cached_kv is None
+    assert pipeline.transformer.cached_freqs_gen is None
+    assert "cache-lifetime" not in pipeline._memory_manager

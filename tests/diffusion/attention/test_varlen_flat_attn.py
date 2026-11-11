@@ -22,7 +22,11 @@ from vllm_omni.diffusion.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
 )
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.data import AttentionSpec
+from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+from vllm_omni.diffusion.mixfusion.packed_attention import _backend_supports_attention_mask
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -107,6 +111,10 @@ def test_xpu_keeps_the_masked_path_when_a_mask_rides_along(monkeypatch):
 
 class _VarlenBackend:
     @classmethod
+    def supports_attention_mask(cls, spec=None):
+        return False
+
+    @classmethod
     def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         # Mirrors the Flash rule: the quantized kernel rejects cu_seqlens
         # metadata, so only a dequantized policy keeps the varlen path.
@@ -115,6 +123,10 @@ class _VarlenBackend:
 
 class _DenseBackend:
     @classmethod
+    def supports_attention_mask(cls, spec=None):
+        return spec is not None and spec.backend == "TORCH_SDPA"
+
+    @classmethod
     def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         return False
 
@@ -122,6 +134,7 @@ class _DenseBackend:
 def _layer(backend, forward, kv_cache_dtype=None, disable_kv_quant=False):
     layer = Attention.__new__(Attention)
     object.__setattr__(layer, "attn_backend", backend)
+    object.__setattr__(layer, "attention", None)
     object.__setattr__(layer, "forward", forward)
     # Quantization-policy attributes consulted by _effective_kv_cache_dtype.
     object.__setattr__(layer, "_kv_cache_dtype", kv_cache_dtype)
@@ -169,6 +182,41 @@ def test_forward_packed_routes_capability_to_one_varlen_forward():
     assert torch.equal(metadata.extra["cu_seqlens_k"], cu_seqlens)
     assert metadata.extra["max_seqlen_q"] == 8
     assert metadata.extra["max_seqlen_k"] == 8
+
+
+def test_packed_routes_follow_the_scheduled_backend_and_restore_baseline():
+    """The baseline is varlen; a scheduled dense step must receive isolated buckets."""
+    calls = []
+
+    def forward(query, key, value, metadata):
+        calls.append((tuple(query.shape), metadata))
+        return query
+
+    layer = _layer(_VarlenBackend, forward)
+    object.__setattr__(layer, "_schedule_configured", True)
+    object.__setattr__(
+        layer,
+        "_schedule_candidates",
+        {
+            "dense": ScheduleCandidate(_DenseBackend, AttentionSpec(backend="TORCH_SDPA"), None, True),
+        },
+    )
+    query = torch.randn(8, HEADS, HEAD_DIM)
+    cu = torch.tensor([0, 3, 8], dtype=torch.int32)
+    for step, masked in [(0, False), (1, True), (2, False)]:
+        context = ForwardContext(
+            attention_schedule=(AttentionScheduleRange(1, 2, "dense"),),
+            denoise_step_idx=step,
+            total_denoise_steps=3,
+        )
+        with override_forward_context(context):
+            assert _backend_supports_attention_mask(layer) is masked
+            result = layer.forward_packed(query, query, query, cu_seqlens=cu, max_seqlen=5)
+        torch.testing.assert_close(result, query)
+    assert [shape[:2] for shape, _ in calls] == [(1, 8), (1, 3), (1, 5), (1, 8)]
+    assert "cu_seqlens_q" in calls[0][1].extra
+    assert calls[1][1].extra == calls[2][1].extra == {}
+    assert "cu_seqlens_q" in calls[3][1].extra
 
 
 def _segment_mean_flat(query, key, value, cu_seqlens):

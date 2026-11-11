@@ -68,7 +68,12 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
+    DiffusionRequestStatus,
+    DiffusionSchedulerOutput,
+    SchedulerRequestState,
+)
 from vllm_omni.diffusion.utils.pipeline_utils import (
     pipeline_supports,
     resolve_custom_pipeline_cls,
@@ -208,6 +213,7 @@ class _RpcTask:
     deadline: float | None
     unique_reply_rank: int | None
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+    interaction_state: SchedulerRequestState | None = None
 
 
 @dataclass
@@ -781,9 +787,12 @@ class DiffusionEngine:
                 )
 
             self._process_aborts_queue()
-            self._process_rpc_queue()
             try:
-                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                # The runner may already have retired terminal state. Publish
+                # that transition before delivering controls queued during execution.
+                with self._cv:
+                    finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._process_rpc_queue()
                 self._emit_outputs(
                     finished_req_ids,
                     sched_output.scheduled_request_ids,
@@ -793,6 +802,11 @@ class DiffusionEngine:
             except Exception as exc:
                 self._fail_engine(exc)
                 return
+            finally:
+                # Streams/async workers own delivered outputs. Keeping this
+                # local would also retain the previous video during execute_fn
+                # on the next iteration. Do not mutate the shared result.
+                del runner_output
 
             if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
                 # Only exceptional in-flight receives need idle polling. New
@@ -988,10 +1002,15 @@ class DiffusionEngine:
             try:
                 self._run_rpc_task(task)
             finally:
-                if task.method == "submit_interaction" and len(task.args) >= 2:
-                    interaction = task.args[1]
-                    if isinstance(interaction, dict) and isinstance(interaction.get("event_id"), str):
-                        self.track_streaming_interaction(task.args[0], interaction["event_id"], pending=False)
+                if task.method == "submit_interaction":
+                    request_id = task.args[0] if task.args else (task.kwargs or {})["request_id"]
+                    interaction = task.args[1] if len(task.args) >= 2 else (task.kwargs or {}).get("interaction")
+                    if (
+                        isinstance(interaction, dict)
+                        and isinstance(interaction.get("event_id"), str)
+                        and self.scheduler.get_request_state(request_id) is task.interaction_state
+                    ):
+                        self.track_streaming_interaction(request_id, interaction["event_id"], pending=False)
 
             if task.method == "pause_scheduler":
                 # A dequeued pause ends this drain whatever became of it, so
@@ -1013,11 +1032,21 @@ class DiffusionEngine:
                     fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
                 return
 
+        result: object = None
         try:
+            state = task.interaction_state
+            if state is not None and (
+                state.is_finished() or self.scheduler.get_request_state(state.request_id) is not state
+            ):
+                # Accepted controls expire with their request, even if the ID
+                # has since been reused. No worker state remains to update.
+                if not fut.done():
+                    fut.set_result(None)
+                return
             if task.method == "pause_scheduler":
-                result = self._run_pause_barrier(remaining)
+                self._run_pause_barrier(remaining)
             elif task.method == "resume_scheduler":
-                result = self._open_scheduling_gate()
+                self._open_scheduling_gate()
             else:
                 result = self.executor.collective_rpc(
                     method=task.method,
@@ -1679,6 +1708,7 @@ class DiffusionEngine:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling on all diffusion workers.
 
@@ -1687,6 +1717,7 @@ class DiffusionEngine:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         if is_start:
             if profile_prefix is None:
@@ -1696,11 +1727,13 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            kwargs: dict[str, int] = {}
+            kwargs: dict[str, Any] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
             if max_iterations is not None:
                 kwargs["max_iterations"] = max_iterations
+            if profiler_kwargs is not None:
+                kwargs["profiler_kwargs"] = profiler_kwargs
             if kwargs:
                 self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
             else:
@@ -1759,6 +1792,9 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+                # Warm up the base attention only: service ranges are sized for real
+                # requests, not for the fixed short warm-up sequence.
+                attention_schedule=(),
             ),
         )
 
@@ -1867,6 +1903,12 @@ class DiffusionEngine:
             unique_reply_rank=unique_reply_rank,
         )
         with self._cv:
+            if method == "submit_interaction":
+                request_id = args[0] if args else (kwargs or {})["request_id"]
+                task.interaction_state = self.scheduler.get_request_state(request_id)
+                if task.interaction_state is None:
+                    task.future.set_exception(ValueError(f"No active request state for interaction: {request_id!r}"))
+                    return task
             # Feedback changes host-only state and must not wait behind a GPU
             # chunk, otherwise its RPC reply would hold up the control channel.
             if method == "update_streaming_playback":

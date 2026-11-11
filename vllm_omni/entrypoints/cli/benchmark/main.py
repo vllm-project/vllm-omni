@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Top-level ``vllm bench`` command integration for vLLM-Omni.
 
 ``OmniBenchmarkSubcommand`` creates the benchmark command group, discovers
@@ -12,7 +15,7 @@ import argparse
 import typing
 
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 

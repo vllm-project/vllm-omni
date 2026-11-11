@@ -148,10 +148,10 @@ _TIER2_EVENTS = (
     "ItemTruncated",
     "ErrorEvent",
 )
-_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed")
+_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed", "SessionStats")
 _TIER1_COMMANDS = ("UpdateSession", "CreateItem", "CancelResponse", "ClearInput")
 _TIER2_COMMANDS = ("AppendAudio", "Commit")
-_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession")
+_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession", "GetSessionStats")
 
 
 @pytest.mark.parametrize("name", _TIER1_EVENTS)

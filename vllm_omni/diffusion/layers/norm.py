@@ -54,9 +54,11 @@ class LayerNorm(nn.LayerNorm, CustomOp):
 
                 return fast_layernorm(self, x)
             except ImportError as e:
+                # warning_once caches its arguments; pass a string so the cache
+                # does not retain the traceback frame holding ``x``.
                 logger.warning_once(
                     "mindiesd.fast_layernorm import failed, falling back to FP32 layer_norm: %s",
-                    e,
+                    str(e),
                 )
 
         return self.forward_native(x)

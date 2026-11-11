@@ -77,6 +77,12 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
+- `--goodput`
+  Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
+  Supported metrics are `ttft`, `tpot`, `e2el`, and `audio_ttfp`. When multiple objectives are supplied, a
+  request contributes to goodput only when it satisfies every objective, for example
+  `--goodput ttft:500 audio_ttfp:1000`.
+
 - `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
 
@@ -348,6 +354,18 @@ sample metadata records the effective `unit_ms`. Audio pacing uses a cumulative
 monotonic deadline so sending and frame processing do not add a full extra sleep
 to every append. The standalone `generate` command rejects `server_vad` combined
 with `--pace as-fast-as-possible`, which compresses turn and playback timing.
+When audio ends before the video, the runner pads it with silence to cover the
+clip before applying its existing turn-ending behavior. Each sampled frame goes
+into its audio interval `[start, end)`; frames on a boundary belong to the next
+interval. Up to two frames fit in an append. A higher density fails explicitly;
+reduce `--duplex-eval-fps` (or standalone `--fps`) instead of dropping frames.
+To replace standalone responses generated before this correction, use
+`generate --overwrite` or a new response directory.
+With `server_vad`, the full video continues after speech ends: silent audio and
+later frames are still sent before the extra VAD tail silence. Speech can end a
+turn before the clip finishes; later image items update the session context but
+do not themselves trigger another response. Input coverage therefore does not
+guarantee that every post-speech frame contributes to an answer.
 Settling is not an acknowledgement
 that all final input has been processed. Frames use the transport advertised by
 the server: native video frames or bounded image conversation items for Qwen3.
@@ -597,6 +615,9 @@ length because input is paced in real time.
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
 | `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
 | `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
+| `duplex_client_rtf` | same append-send start as `duplex_client_ttfp_ms` | last audio delta, divided by emitted audio duration |
+| `duplex_busy_rtf` | server: union of the turn's stage work spans (RFC #8325) | that union divided by the turn's emitted audio |
+| `duplex_stall_ratio` | server: the turn span minus that union | the stall time divided by the turn's emitted audio |
 
 The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
 prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
@@ -615,6 +636,10 @@ measure the full user-speech-end to first-output latency. Per-response `client_r
 through the last audio packet, divided by emitted audio duration, when an append send was recorded. The server start
 point differs between model plugins, so compare server keys only within one model; client append keys are only
 comparable within one adapter / chunk size.
+`duplex_busy_rtf` and `duplex_stall_ratio` are not substitutes for `duplex_client_rtf`. They come from
+`session.stats` (RFC #8325): OmniInteract and Omni-DuplexEval ask once before close; Seed-TTS asks per turn.
+The keys appear only when serve has `duplex_session.collect_stats: true` and the turn is final; otherwise the
+flatten keys are omitted. Compare them only on a single-host deployment that collected stats.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 
@@ -700,6 +725,7 @@ continues to use client receipt of `response.created` through the last audio pac
 When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
 `response.created`. Created-origin audio is `response_created_to_first_audio_ms` and is not copied into `client_ttfp_ms`.
+`busy_rtf` / `stall_ratio` are the RFC #8325 server-side ratios above, present when `duplex_session.collect_stats` is on.
 Global TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
 token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
@@ -808,25 +834,6 @@ timestamp stays exact even when the clip length is not a multiple of 200 ms. `re
   streaming silence first would charge it for latency no real caller pays.
 - `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own, without a client commit
   or `response.create`. Its 800 ms silence threshold must stay shorter than the one-second tail or the turn never ends.
-
-#### Run the matched nightly workload
-
-The [performance configuration](gh-file:tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json) runs both triggers using the
-first 32 English Seed-TTS entries in fixed order, concurrency 1, temperature 0, and a 256-token output limit. It asks
-the model to read the target text rather than answer or transcribe the accompanying audio. Each trigger runs two
-unmeasured warmup requests before its 32 measured requests. The CUDA nightly job runs this configuration on two H100/B200 GPUs.
-
-Run from the repository environment after reserving two GPUs according to your host's scheduling rules:
-
-```bash
-uv run --no-sync pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
-  --run-level full_model
-```
-
-`BENCHMARK_DIR` selects the result directory (default `tests/dfx/perf/results`). For cached local weights or data, copy the
-JSON and replace `server_params.model` and each `benchmark_params[].dataset_path` with local paths. Preserve sample
-count, order, system prompt, and generation settings across the two cases.
 
 #### Read the reported metrics
 

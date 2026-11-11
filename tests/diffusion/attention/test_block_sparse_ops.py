@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import sys
 import types
+import weakref
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from vllm.logger import _print_warning_once, init_logger
 
+from vllm_omni.diffusion.attention.ops import block_sparse
 from vllm_omni.diffusion.attention.ops.block_sparse import (
     build_prefix_dense_block_map,
     fastvideo_block_sparse_attn_bshd,
@@ -170,3 +174,43 @@ def test_native_provider_failure_only_recovers_without_accelerator_fault(monkeyp
         output = fastvideo_block_sparse_attn_bshd(query, query, query, block_map, sizes, 2)
         torch.testing.assert_close(output, query, rtol=0, atol=0)
         fallback.assert_called_once()
+
+
+def test_native_provider_failure_logging_releases_tensors(monkeypatch):
+    monkeypatch.setenv("FASTVIDEO_VSA_SM100A", "1")
+    references = []
+
+    # Plain functions, not mocks: mocks record call arguments and would keep q alive.
+    def failing_native(q, *args, **kwargs):
+        references.append(weakref.ref(q))
+        raise RuntimeError("native provider failure")
+
+    native = types.SimpleNamespace(is_supported=lambda *args: True, block_sparse_attn_sm100a=failing_native)
+    provider = types.ModuleType("fastvideo_kernel")
+    setattr(provider, "block_sparse_attn_sm100a", native)
+    index = types.ModuleType("fastvideo_kernel.triton_kernels.index")
+    setattr(index, "map_to_index", lambda block_map: (torch.zeros(1), torch.ones(1)))
+    triton = types.ModuleType("fastvideo_kernel.block_sparse_attn")
+    setattr(triton, "block_sparse_attn", lambda q, *args: (q.clone(), None))
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel", provider)
+    monkeypatch.setitem(
+        sys.modules, "fastvideo_kernel.triton_kernels", types.ModuleType("fastvideo_kernel.triton_kernels")
+    )
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel.triton_kernels.index", index)
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel.block_sparse_attn", triton)
+    monkeypatch.setattr(block_sparse, "logger", init_logger("block-sparse-retention-test"))
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+    sizes = torch.tensor([64, 64], dtype=torch.int32)
+
+    _print_warning_once.cache_clear()
+    try:
+        for _ in range(4):
+            query = torch.randn(1, 128, 2, 8)
+            output = fastvideo_block_sparse_attn_bshd(query, query, query, block_map, sizes, 2)
+            assert output.shape == query.shape
+        del query, output
+        gc.collect()
+        assert len(references) == 4
+        assert all(ref() is None for ref in references)
+    finally:
+        _print_warning_once.cache_clear()

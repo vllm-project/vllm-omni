@@ -176,9 +176,12 @@ async def test_model_reference_audio_resolution_errors_return_none(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_explicit_reference_audio_uses_media_connector_and_skips_model_default(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("sample_count", [1599, 1600, 96256])
+async def test_explicit_reference_audio_uses_media_connector_and_skips_model_default(
+    monkeypatch, tmp_path: Path, sample_count: int
+):
     ref_path = tmp_path / "reference.wav"
-    sf.write(ref_path, np.full(1600, 0.25, dtype=np.float32), 16_000, subtype="PCM_16")
+    sf.write(ref_path, np.full(sample_count, 0.25, dtype=np.float32), 16_000, subtype="PCM_16")
 
     async def fail_default(_model_config):
         raise AssertionError("the model default must not replace an explicit ref_audio")
@@ -195,6 +198,7 @@ async def test_explicit_reference_audio_uses_media_connector_and_skips_model_def
 
     assert runtime["ref_audio_sample_rate_hz"] == 16_000
     audio = np.frombuffer(base64.b64decode(runtime["ref_audio_data"]), dtype=np.float32)
+    assert audio.shape == (sample_count,)
     np.testing.assert_allclose(audio, 0.25, atol=1e-4)
 
 

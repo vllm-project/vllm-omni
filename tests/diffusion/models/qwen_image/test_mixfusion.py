@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedRope,
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
+    _reference_qk_norm_rope,
 )
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -372,6 +373,9 @@ class _PackedAttentionStub:
         self.attn_backend = None if varlen else _MaskCapableBackend
         self.attn_spec = None
 
+    def effective_attention(self):
+        return self, self.attn_backend, self.attn_spec
+
     def __call__(self, query, key, value, attn_metadata):
         # Mirror the metadata-keyed dispatch at the top of ``Attention.forward``.
         assert attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None
@@ -412,6 +416,7 @@ def _mixfusion_module(attn: _PackedAttentionStub, rope: _CapturingRope):
         "norm_added_q": lambda t: t,
         "norm_added_k": lambda t: t,
         "qk_norm": True,
+        "reference_precision": False,
         "eps": 1e-6,
         "rope": rope,
         "attn": attn,
@@ -451,10 +456,13 @@ def _forward(module, *, txt_lens, chunks_per_request, txt_padded):
     return image_chunks, text, img_out, txt_out
 
 
-def _assert_common(rope, img_out, txt_out, *, txt_lens, num_chunks, txt_padded):
+def _assert_common(rope, img_out, txt_out, *, txt_lens, num_chunks, txt_padded, reference_precision=False):
     # The eager path casts cos/sin to the activation dtype; FP32 rotary
     # numerics drop Omni-vs-Diffusers PSNR (#7494).
-    assert rope.dtypes and set(rope.dtypes) == {(torch.bfloat16,) * 3}
+    if reference_precision:
+        assert not rope.dtypes  # The reference uses FP32 complex rotation.
+    else:
+        assert rope.dtypes and set(rope.dtypes) == {(torch.bfloat16,) * 3}
     assert img_out.shape == (num_chunks, CHUNK_SIZE, Q_SIZE)
     assert txt_out.shape == (len(txt_lens), txt_padded, Q_SIZE)
     # Text rows beyond a request's real length stay zero-padded.
@@ -493,15 +501,19 @@ def test_packed_attention_packs_mixed_requests_into_one_packed_call():
     _assert_common(rope, img_out, txt_out, txt_lens=txt_lens, num_chunks=sum(chunks), txt_padded=padded)
 
 
-def test_mask_capable_dense_backend_matches_the_varlen_result():
+@pytest.mark.parametrize("reference_precision", [False, True])
+def test_mask_capable_dense_backend_matches_the_varlen_result(reference_precision):
     # Three requests share one image shape but differ in text length: a
     # mask-capable dense backend fuses them into one masked forward.
     txt_lens = [3, 5, 2]
     shapes = {"txt_lens": txt_lens, "chunks_per_request": [2, 2, 2], "txt_padded": 5}
     varlen_module = _mixfusion_module(_PackedAttentionStub(varlen=True), _CapturingRope())
+    object.__setattr__(varlen_module, "reference_precision", reference_precision)
     _, _, varlen_img, varlen_txt = _forward(varlen_module, **shapes)
     attn, rope = _PackedAttentionStub(varlen=False), _CapturingRope()
-    _, _, img_out, txt_out = _forward(_mixfusion_module(attn, rope), **shapes)
+    dense_module = _mixfusion_module(attn, rope)
+    object.__setattr__(dense_module, "reference_precision", reference_precision)
+    _, _, img_out, txt_out = _forward(dense_module, **shapes)
 
     assert attn.packed_calls == []
     assert len(attn.dense_calls) == 1
@@ -519,4 +531,28 @@ def test_mask_capable_dense_backend_matches_the_varlen_result():
     # move the K/V mean far outside these tolerances.
     torch.testing.assert_close(txt_out, varlen_txt, atol=1e-2, rtol=2e-2)
     torch.testing.assert_close(img_out, varlen_img, atol=1e-2, rtol=2e-2)
-    _assert_common(rope, img_out, txt_out, txt_lens=shapes["txt_lens"], num_chunks=6, txt_padded=5)
+    _assert_common(
+        rope,
+        img_out,
+        txt_out,
+        txt_lens=shapes["txt_lens"],
+        num_chunks=6,
+        txt_padded=5,
+        reference_precision=reference_precision,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_reference_rope_per_row_matches_independent_requests(dtype):
+    """Chunk rows retain the reference arithmetic and their own RoPE positions."""
+    gen = torch.Generator().manual_seed(22)
+    q = torch.randn(3, 5, HEADS, HEAD_DIM, generator=gen).to(dtype)
+    k = torch.randn(3, 5, KV_HEADS, HEAD_DIM, generator=gen).to(dtype)
+    freqs = torch.randn(3, 5, ROT_DIM, generator=gen, dtype=torch.complex64)
+    norm = nn.RMSNorm(HEAD_DIM).to(dtype)
+    actual_q, actual_k = _reference_qk_norm_rope(q, k, norm, norm, freqs)
+    expected = [_reference_qk_norm_rope(q[i : i + 1], k[i : i + 1], norm, norm, freqs[i]) for i in range(3)]
+    # CPU complex multiplication can round one FP32 ulp differently for separate rows.
+    tolerance = {"rtol": 2e-6, "atol": 2e-7} if dtype == torch.float32 else {"rtol": 0, "atol": 0}
+    torch.testing.assert_close(actual_q, torch.cat([row[0] for row in expected]), **tolerance)
+    torch.testing.assert_close(actual_k, torch.cat([row[1] for row in expected]), **tolerance)
