@@ -1075,6 +1075,27 @@ def _stage0_vision_runtime():
     return runtime
 
 
+def test_minicpmo_prefill_trace_counts_consumed_units_not_replayed_appends(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex import diagnostics, stage0
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(diagnostics, "trace_start_unit", lambda: 0)
+    monkeypatch.setattr(stage0, "emit_trace", records.append)
+    runtime = _stage0_vision_runtime()
+    runtime.processor._streaming_mel_processor = SimpleNamespace(sample_rate=4)
+    state = stage0._MiniCPMO45Stage0SessionState(session_id="trace-input")
+    kwargs = {"epoch": 2, "seq": 160, "video_frames": ["frame"], "is_speech": True}
+    result = runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), **kwargs)
+    assert result["success"]
+    assert [record["unit_count"] for record in records] == [1, 2]
+    assert [record["video_frames"] for record in records] == [1, 0]
+    assert [record["consumed_audio_samples"] for record in records] == [4, 4]
+    assert all(record["append_identity"] == (2, 160) for record in records)
+    assert all(record["session_id"] == "trace-input" for record in records)
+    runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), **kwargs)
+    assert len(records) == 2  # Cached retry did not consume another frame/audio unit.
+
+
 def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
     from vllm_omni.engine.duplex.contracts import DuplexFence
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt

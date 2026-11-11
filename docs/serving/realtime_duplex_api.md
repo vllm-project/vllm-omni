@@ -2054,6 +2054,44 @@ them out into typed events before they reach a client.
 | `playback.acknowledged` | `playback.acknowledged` (wrapped verbatim under `event`) |
 | `session.resumed`, `session.replaced`, `session.expired`, `session.resync_required`, `session.heartbeat_ack` | passed through unchanged |
 
+## MiniCPM-o 4.5 recognition diagnostics
+
+To investigate incomplete long-video answers, set
+`VLLM_OMNI_MINICPMO_DUPLEX_TRACE_START_UNIT=140` **before starting the server**.
+This internal diagnostic switch is disabled when unset; `0` traces from the
+first unit. The value counts model input units, not seconds or video frames.
+The ready-tier MiniCPM-o Duplex CI job enables it at unit 140 and saves the
+combined output as `results/minicpmo_duplex/server.log` alongside the recognition
+artifacts. Search for `MINICPMO_DUPLEX_TRACE`; the remainder of each line is JSON.
+
+- `prefill_unit` records the frames and audio samples consumed while building
+  each unit, plus append identity and the scheduler's previous terminator.
+  A cached append retry does not produce another input record. This confirms
+  embedding preparation, not completion of the subsequent model forward.
+- `sample` records the session, append identity, unit count, accepted chunk
+  tokens, repetition history, sampling parameters, and turn state before/after
+  the worker commits its sample. `model_logits` contains top-5 and control-token
+  scores at the native sampler entrance; `stage2_logits` contains scores after
+  masking and repetition penalty, before temperature/top-k/top-p. Earlier
+  force-listen processing may already have masked the entrance logits.
+- `reason` distinguishes `chunk_cap`, `chunk_boundary`, `hold_turn_eos`,
+  `accept_turn_eos`, `listen_to_tts_bos`, and an ordinary `sample`.
+  `stage2_token_id` is null when no stage-2 decision was committed. Masked or
+  non-finite scores are JSON null. Deferred speculative draws that were rewound
+  are excluded. Lookahead that merely repeats an accepted terminator is omitted.
+
+For a greedy failure, compare the EOS score with the leading candidates, then
+check whether the worker accepted or rewrote that EOS. Correlate these records
+with the client's `events.jsonl` and `recognition.json` to distinguish model
+decisions from downstream text/audio delivery. These logs do not dump KV caches
+or establish numerical parity with the reference implementation.
+
+Tracing adds top-k work, small device-to-host copies, and log I/O. The deferred
+sampler reuses its existing commit event; normal serving does no diagnostic
+tensor work while the switch is unset. Use tracing for reproduction, and leave
+it off for latency benchmarks. Logs include token IDs and the short decoded
+turn tail, so enable them only for inputs intended for diagnostic capture.
+
 ## Known Limitations
 
 - Several surfaces are capability-gated per model (see *Capability

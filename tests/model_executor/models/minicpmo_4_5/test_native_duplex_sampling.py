@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 duplex sampling: batched rows against a row-by-row reference, the deferred path against both."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex import diagnostics
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
@@ -18,6 +20,113 @@ Model = minicpmo_4_5_omni.MiniCPMO45OmniForConditionalGeneration
 CHUNK_EOS, LISTEN, TTS_PAD, VOCAB = 5, 6, 10, 40
 _NAMES = ("unit", "chunk_eos", "listen", "tts_bos", "turn_eos", "chunk_tts_eos", "tts_pad")
 TOKEN_IDS = {f"{name}_token_id": token for name, token in zip(_NAMES, (1, CHUNK_EOS, LISTEN, 7, 8, 9, TTS_PAD))}
+
+
+@pytest.fixture
+def trace_records(monkeypatch):
+    records = []
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO_DUPLEX_TRACE_START_UNIT", "0")
+    diagnostics.trace_start_unit.cache_clear()
+    # Exercise serialization too: masked logits must be JSON null, not -Infinity.
+    monkeypatch.setattr(diagnostics.logger, "info", lambda _, data: records.append(json.loads(data)))
+    yield records
+    diagnostics.trace_start_unit.cache_clear()
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_diagnostics_preserve_tokens_state_and_rng(monkeypatch, trace_records, deferred, all_greedy):
+    baseline, baseline_states, baseline_md, steps = _setup(2, all_greedy=all_greedy)
+    if not deferred:
+        monkeypatch.setattr(baseline, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
+    with monkeypatch.context() as disabled:
+        disabled.setattr(minicpmo_4_5_omni, "trace_start_unit", lambda: None)
+        expected = _run(baseline, baseline_md, steps)
+    assert trace_records == []
+
+    model, states, md, _ = _setup(2, all_greedy=all_greedy)
+    if not deferred:
+        monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
+    assert _run(model, md, steps) == expected
+    assert {row: vars(s) for row, s in states.items()} == {row: vars(s) for row, s in baseline_states.items()}
+    assert all(torch.equal(md.generators[r].get_state(), baseline_md.generators[r].get_state()) for r in range(6))
+    first = {record["row"]: record for record in trace_records[:6]}
+    assert first[2]["reason"] == "chunk_cap"
+    assert first[3]["reason"] == "chunk_boundary"
+    assert first[2]["stage2_token_id"] is first[3]["stage2_token_id"] is None
+    assert "stage2_logits" not in first[2] and "stage2_logits" not in first[3]
+    assert first[1]["reason"] == "listen_to_tts_bos"
+    assert first[1]["stage2_token_id"] == LISTEN
+    assert first[1]["stage2_logits"]["control_scores"]["chunk_eos_token_id"] is None
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_diagnostics_explain_held_and_no_progress_eos(monkeypatch, trace_records, deferred):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    state.session_id, state.prepared_append_identity, state.audio_chunk_idx = "trace-eos", (2, 160), 160
+    model.max_speak_chars_per_chunk = 0
+    md.output_token_ids[0] = []
+    sample(21)
+    md.output_token_ids[0] = [21]
+    assert sample(TOKEN_IDS["turn_eos_token_id"]) == CHUNK_EOS
+    held = trace_records[-1]
+    assert held["session_id"] == "trace-eos" and held["append_identity"] == [2, 160]
+    assert held["reason"] == "hold_turn_eos"
+    assert held["before"]["turn_end_hold_pending"] is False
+    assert held["after"]["turn_end_hold_pending"] is True
+    assert held["repetition_token_ids"] == [21]
+    assert held["stage2_logits"]["top_ids"][0] == TOKEN_IDS["turn_eos_token_id"]
+    md.output_token_ids[0] = []
+    assert sample(TOKEN_IDS["turn_eos_token_id"]) == TOKEN_IDS["turn_eos_token_id"]
+    accepted = trace_records[-1]
+    assert accepted["reason"] == "accept_turn_eos"
+    assert accepted["before"]["turn_end_hold_pending"] is True
+    assert accepted["after"]["current_turn_ended"] is True
+
+
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_diagnostics_match_across_sync_and_deferred_commit(monkeypatch, trace_records, all_greedy):
+    sync, _, md, steps = _setup(3, all_greedy=all_greedy)
+    monkeypatch.setattr(sync, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
+    _run(sync, md, steps)
+    expected = list(trace_records)
+    trace_records.clear()
+    model, _, md, _ = _setup(3, all_greedy=all_greedy)
+    _run(model, md, steps)
+    assert trace_records == expected
+
+
+def test_diagnostics_filter_rows_and_defer_host_reads(monkeypatch, trace_records):
+    model, states, md, steps = _setup(0, all_greedy=True, max_chars=0)
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO_DUPLEX_TRACE_START_UNIT", "140")
+    diagnostics.trace_start_unit.cache_clear()
+    for row, state in states.items():
+        state.audio_chunk_idx, state.session_id = (140 if row == 5 else 139), f"s{row}"
+    states[5].generated_tokens = [TOKEN_IDS["turn_eos_token_id"]]
+    steps[0][5, TOKEN_IDS["turn_eos_token_id"]] = 3.0
+    with _NoHostReads():
+        model._sample_minicpmo45_native_duplex_stage0(steps[0], md, duplex_rows=list(range(6)))
+    assert trace_records == []
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert len(trace_records) == 1
+    record = trace_records[0]
+    assert record["row"] == 5 and record["session_id"] == "s5"
+    assert record["model_logits"]["control_scores"]["turn_eos_token_id"] == 3.0
+    assert record["stage2_logits"]["control_scores"]["turn_eos_token_id"] == pytest.approx(3.0 / 1.05)
+
+
+def test_disabled_diagnostics_do_not_capture_logits(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO_DUPLEX_TRACE_START_UNIT", raising=False)
+    diagnostics.trace_start_unit.cache_clear()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Disabled diagnostics must not collect tensors or format logs")
+
+    monkeypatch.setattr(diagnostics.SamplingTrace, "capture_logits", forbidden)
+    monkeypatch.setattr(diagnostics, "emit_trace", forbidden)
+    model, _, md, steps = _setup(0)
+    _run(model, md, steps)
+    diagnostics.trace_start_unit.cache_clear()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

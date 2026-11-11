@@ -37,6 +37,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.diagnostics import (
+    SamplingTrace,
+    start_sampling_trace,
+    trace_start_unit,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
@@ -107,6 +112,7 @@ class _MiniCPMO45PendingSamples:
     token_ids: dict[str, int]
     row_sessions: dict[int, str] | None
     row_payloads: dict[int, dict[str, Any]] | None
+    trace: SamplingTrace | None = None
 
 
 def _generator_rewind(generator: torch.Generator) -> Callable[[], None]:
@@ -1237,6 +1243,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         if pending_rows:
             kwargs = {"row_idxs": pending_rows, "token_ids": token_ids, "row_params": row_params}
+            trace = None
+            if trace_start_unit() is not None:
+                trace = start_sampling_trace(
+                    self,
+                    logits,
+                    pending_rows,
+                    self._minicpmo45_duplex_recent_tokens(sampling_metadata, pending_rows),
+                    token_ids,
+                    row_params,
+                    bool(getattr(sampling_metadata, "all_greedy", False)),
+                )
+                kwargs["trace"] = trace
             deferred = self._sample_minicpmo45_native_duplex_rows_deferred(logits, sampling_metadata, **kwargs)
             if deferred is not None:
                 sampled = index_to_device(sampled_ids, logits.device, torch.int32)
@@ -1246,6 +1264,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             for row_idx, sampled in zip(pending_rows, synchronous, strict=True):
                 sampled_ids[row_idx] = sampled
                 self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
+            if trace is not None:
+                trace.emit(self)
 
         return SamplerOutput(
             sampled_token_ids=index_to_device(sampled_ids, logits.device, torch.int32).unsqueeze(-1),
@@ -1367,6 +1387,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_params: list[tuple[float, float, float]],
         sampling_metadata: SamplingMetadata,
         rewinds: dict[int, Callable[[], None]] | None = None,
+        trace: SamplingTrace | None = None,
     ) -> torch.Tensor:
         """Each row's stage-2 token: forbidden ids masked, repetition penalty, then greedy or a candidate draw.
 
@@ -1392,6 +1413,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Distinct (row, col) pairs, so one indexed division equals dividing each once.
             rows_t, cols_t = index_to_device(penalty_rows, device), index_to_device(penalty_cols, device)
             stage2_logits[rows_t, cols_t] = stage2_logits[rows_t, cols_t] / 1.05
+
+        if trace is not None:
+            # Before temperature/top-k/top-p; this is the exact masked and
+            # repetition-penalized tensor consumed by the sampler below.
+            trace.capture_logits("stage2_logits", stage2_logits, rows)
 
         samples: list[torch.Tensor | None] = [None] * len(rows)
         greedy = [local for local, row_idx in enumerate(rows) if all_greedy or float(row_params[row_idx][0]) <= 0]
@@ -1433,6 +1459,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_idxs: list[int],
         token_ids: dict[str, int],
         row_params: list[tuple[float, float, float]],
+        trace: SamplingTrace | None = None,
     ) -> list[int]:
         """Sample duplex rows with at most two host reads: the boundary decisions, then the stage-2 tokens.
 
@@ -1446,23 +1473,34 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         resolved: dict[int, int] = {}
         if 0 <= chunk_eos_id < logits.shape[-1]:
             resolved = dict.fromkeys(self._minicpmo45_duplex_capped_rows(row_idxs, recent, token_ids), chunk_eos_id)
+            if trace is not None:
+                for row_idx in resolved:
+                    trace.decision(row_idx, chunk_eos_id, None, False, False)
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
                 hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
-                resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
+                for row_idx, hit in zip(boundary, hits.tolist(), strict=True):
+                    if hit:
+                        resolved[row_idx] = chunk_eos_id
+                        if trace is not None:
+                            trace.decision(row_idx, chunk_eos_id, None, True, True)
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(
-                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata
+                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, trace=trace
             )
             turn_eos_id = token_ids.get("turn_eos_token_id", -1)
             for row_idx, sampled in zip(stage2_rows, draws.tolist(), strict=True):
                 if sampled == turn_eos_id and self._minicpmo45_hold_unfinished_turn(row_idx):
                     self._minicpmo45_note_held_turn_end(row_idx)
                     resolved[row_idx] = chunk_eos_id
+                    if trace is not None:
+                        trace.decision(row_idx, chunk_eos_id, sampled, False, True)
                     continue
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
+                if trace is not None:
+                    trace.decision(row_idx, resolved[row_idx], sampled, False, True)
         return [int(resolved[row_idx]) for row_idx in row_idxs]
 
     def _sample_minicpmo45_native_duplex_rows_deferred(
@@ -1473,6 +1511,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_idxs: list[int],
         token_ids: dict[str, int],
         row_params: list[tuple[float, float, float]],
+        trace: SamplingTrace | None = None,
     ) -> torch.Tensor | None:
         """``_sample_minicpmo45_native_duplex_rows`` decided on the device without a host sync, or ``None``.
 
@@ -1504,7 +1543,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
             rewinds_into = rewinds if has_chunk_eos else None
             raw = self._minicpmo45_duplex_stage2_draws(
-                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into
+                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into, trace=trace
             )
             token = raw
             listen_id = token_ids.get("listen_token_id", -1)
@@ -1538,6 +1577,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             packed[positions_t, 2] = hit.long()
         host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=device.type == "cuda")
         host.copy_(packed, non_blocking=True)
+        if trace is not None:
+            trace.copy_to_host()
         event = torch.cuda.Event() if device.type == "cuda" else None
         if event is not None:
             event.record()
@@ -1550,6 +1591,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token_ids=token_ids,
             row_sessions=getattr(self, "_minicpmo45_duplex_row_sessions", None),
             row_payloads=getattr(self, "_minicpmo45_duplex_row_payloads", None),
+            trace=trace,
         )
         return final
 
@@ -1590,6 +1632,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     self._record_minicpmo45_duplex_generation_token(row_idx, int(raw))
             for pos, row_idx in enumerate(pending.row_idxs):
                 self._record_minicpmo45_duplex_terminator(row_idx, int(values[pos][0]), pending.token_ids)
+                if pending.trace is not None:
+                    final, raw, hit = values[pos]
+                    pending.trace.decision(row_idx, int(final), int(raw), bool(hit), pending.stage2[pos])
+            if pending.trace is not None:
+                pending.trace.emit(self)
         finally:
             self._minicpmo45_duplex_row_sessions, self._minicpmo45_duplex_row_payloads = saved
 
