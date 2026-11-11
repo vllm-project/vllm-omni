@@ -57,7 +57,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Sequence Parallel](feature/sequence_parallel.md)
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
-- [Noisy KV](feature/noisy_kv.md)
+- [Noisy PP](feature/noisy_pp.md)
 
 #### KV cache and memory management
 

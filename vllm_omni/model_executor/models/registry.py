@@ -23,6 +23,8 @@ _OMNI_MODELS = {
         "thinker",
         "DRVEXOSpeech8BForConditionalGeneration",
     ),
+    "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
+    "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (

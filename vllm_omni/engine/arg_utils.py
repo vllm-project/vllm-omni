@@ -375,6 +375,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     enable_cuda_graph_decode: bool | None = None
@@ -797,12 +798,15 @@ class OrchestratorArgs:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     cache_backend: str = "none"
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -878,6 +882,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_attention_backend",
         "fastvideo_vsa_topk",
         "diffusion_attention_config",
+        "diffusion_attention_schedule",
         "diffusion_compile_granularity",
         "diffusion_compile_dynamic",
         "enable_cuda_graph_decode",
