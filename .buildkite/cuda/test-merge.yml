@@ -192,9 +192,9 @@ steps:
         source_file_dependencies: diffusion_minimax_h3_function
         # Three pytest processes. FL2VA and Ref2VA share one DP2+DLO server
         # (--task-type combined); that process does not tear it down between
-        # the two full waves. The single-partition Ref2VA DP2+DLO boot
-        # (per-partition download, expected_partition, self.transformer)
-        # runs on CUDA Nightly, not in this Merge step. Turbo LoRA (TP2) and
+        # the two full waves. -m advanced_model skips the full_model Ref2VA
+        # partition case in the same file. That case runs in CUDA Nightly
+        # Diffusion X2V · MiniMax H3 Function Test. Turbo LoRA (TP2) and
         # FastH3 LoRA (HSDP/USP) stay separate processes: different layouts,
         # and a DLO teardown can leave a stale resource_tracker /psm_* entry
         # that strands the next collective. A per-process timeout still fails
