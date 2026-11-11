@@ -37,7 +37,7 @@ tts_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_basic_english(omni_server, online_client) -> None:
     """
@@ -58,7 +58,7 @@ def test_basic_english(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_streaming(omni_server, online_client) -> None:
     """

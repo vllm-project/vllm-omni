@@ -22,7 +22,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_chinese_voice_design(omni_server, online_client, run_level) -> None:
     online_client.send_audio_speech_request(
         {
@@ -44,7 +44,7 @@ def test_chinese_voice_design(omni_server, online_client, run_level) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_english_streaming(omni_server, online_client, run_level) -> None:
     online_client.send_audio_speech_request(
         {
@@ -68,7 +68,7 @@ def test_english_streaming(omni_server, online_client, run_level) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_two_concurrent_requests(omni_server, online_client, run_level) -> None:
     online_client.send_audio_speech_request(
         {
@@ -87,7 +87,7 @@ def test_two_concurrent_requests(omni_server, online_client, run_level) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("guidance_scale", [1.0, 4.0])
 def test_reference_cloning_and_direction(omni_server, online_client, run_level, guidance_scale) -> None:
     online_client.send_audio_speech_request(
