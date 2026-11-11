@@ -1167,7 +1167,10 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2452,13 +2455,13 @@ WAN22_2GPU_NODES = (
 )
 
 
-def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+def test_wan22_accuracy_has_one_blocking_comparison_job() -> None:
     two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
     group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
     assert two["agent_pool"] == "mi300_2"
     two_commands = "\n".join(two["commands"])
-    assert two["grade"] == "NonBlocking"
+    assert two["grade"] == "Blocking"
     assert two["timeout_in_minutes"] == 180
     assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
@@ -2508,9 +2511,9 @@ def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
     require_similarity_artifacts(paths)
 
 
-def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuan_image3_lora_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_4"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2531,9 +2534,9 @@ def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanImage3 LoRA Accuracy" not in text
 
 
-def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuanvideo15_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2563,7 +2566,7 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanVideo-1.5 Video Similarity" not in text
 
 
-def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> None:
     timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
     i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert timeline["agent_pool"] == "mi300_2"
@@ -2581,7 +2584,7 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         ),
     )
     for step, marker, path in pairs:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if step is timeline else "NonBlocking")
         assert step["timeout_in_minutes"] == 180
         assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
         commands = "\n".join(step["commands"])
@@ -2924,6 +2927,52 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+_NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
+    ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
+    ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
+    ("Qwen2.5-Omni Documentation Examples", 7, "Qwen2.5-Omni documentation", "QWEN25_OMNI_DOC_ARTIFACT_DIR"),
+    ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
+    ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
+    (
+        "HunyuanVideo-1.5 Video Similarity",
+        6,
+        "HunyuanVideo-1.5 video similarity",
+        "ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR",
+    ),
+    ("MiniMax-H3 Timeline Guide Accuracy", 1, "MiniMax-H3 timeline accuracy", "ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env", _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_promoted_nightly_accuracy_doc_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    pytest_status = 1 if scenario == "pytest-failure" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_status = {"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5)
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-promotion-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 def _assert_nightly_junit_guard(

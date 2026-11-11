@@ -1,5 +1,5 @@
 # AMD MI300 nightly coverage during burn-in, including cold-AITER GPU units.
-# All jobs are non-blocking until the lane has stable runtime evidence.
+# Promote individual jobs after reviewing runtime evidence; keep other jobs non-blocking.
 # Historical build #11646 was red in Function Expansion and Accuracy (one
 # async_chunk similarity mismatch; Seed-TTS WER 0.376480 > 0.35).
 
@@ -114,16 +114,37 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm]
         artifact_paths:
+          - artifacts/rocm-qwen3-omni-accuracy/**/*
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
           - export SEED_TTS_WER_EVAL=1
           # PyTorch ROCm uses the torch.cuda device namespace.
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - |
+            bash <<'RUN_QWEN3_ACCURACY'
+            set -euo pipefail
+            export ROCM_QWEN3_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-accuracy"
+            mkdir -p "$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"
+            timeout --signal=TERM --kill-after=2m 165m pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" --junitxml="$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR/pytest.xml"
+            python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 4 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 4 executed Qwen3-Omni accuracy tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_ACCURACY_ARTIFACT_DIR/pytest.xml"
+            RUN_QWEN3_ACCURACY
           # Native tests run from the image copy under /app/vllm-omni, while
           # Buildkite's artifact hook searches the checkout workspace.
           - |
@@ -137,14 +158,35 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: omni_qwen3_omni_doc
         artifact_paths:
+          - artifacts/rocm-qwen3-omni-doc/**/*
           - qwen3-omni-doc-artifacts/**/*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - |
+            bash <<'RUN_QWEN3_DOC'
+            set -euo pipefail
+            export ROCM_QWEN3_DOC_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-doc"
+            mkdir -p "$$ROCM_QWEN3_DOC_ARTIFACT_DIR"
+            timeout --signal=TERM --kill-after=2m 105m pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" --junitxml="$$ROCM_QWEN3_DOC_ARTIFACT_DIR/pytest.xml"
+            python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 7 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 7 executed Qwen3-Omni documentation tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_DOC_ARTIFACT_DIR/pytest.xml"
+            RUN_QWEN3_DOC
 
       - label: "Qwen3-Omni AITER-on Smoke"
         agent_pool: mi300_2
@@ -230,7 +272,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: omni_qwen2_5_omni_doc
         artifact_paths:
@@ -253,29 +295,33 @@ steps:
               cat "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
-          - >-
-            timeout --signal=TERM --kill-after=2m 105m
-            pytest -s -v -ra
-            tests/examples/online_serving/test_qwen2_5_omni.py
-            -m "full_model and rocm and MI325 and cards_2"
-            --run-level "full_model"
-            --durations=20
-            --junitxml="$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
-            2>&1 | tee "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log"
-          - >-
-            tail -n 100 "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log" >
-            "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest-summary.txt"
           - |
-            python -c 'import sys, xml.etree.ElementTree as ET
+            set +e
+            timeout --signal=TERM --kill-after=2m 105m \
+              pytest -s -v -ra tests/examples/online_serving/test_qwen2_5_omni.py \
+              -m "full_model and rocm and MI325 and cards_2" --run-level "full_model" \
+              --durations=20 --junitxml="$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            tail -n 100 "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log" > "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              python -c 'import sys, xml.etree.ElementTree as ET
             root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            executed = tests - skipped
-            if executed < 1:
-                print(f"Expected Qwen2.5-Omni documentation examples to execute; ran {executed} of {tests}.", file=sys.stderr)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 7 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 7 executed Qwen2.5-Omni documentation tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
                 raise SystemExit(5)
             ' "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
+            fi
+            exit "$$status"
 
   - group: ":speaker: CosyVoice3 MI300 Nightly"
     steps:
@@ -904,7 +950,7 @@ steps:
       - label: "Wan2.2 I2V Accuracy 2 GPU"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_accuracy
         env:
@@ -957,6 +1003,22 @@ steps:
               cp -a tests/e2e/accuracy/wan22_i2v/result/. \
                 "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/result/"
             fi
+            if [[ "$$status" -eq 0 ]]; then
+              python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 3 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 3 executed Wan2.2 I2V accuracy tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/pytest.xml"
+            fi
             exit "$$status"
 
   - group: ":full_moon: HunyuanImage3 LoRA MI300 Nightly"
@@ -964,7 +1026,7 @@ steps:
       - label: "HunyuanImage3 LoRA Accuracy"
         agent_pool: mi300_4
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         env:
@@ -1002,6 +1064,22 @@ steps:
               cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/accuracy/"
             fi
 
+            if [[ "$$status" -eq 0 ]]; then
+              python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 1 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 1 executed HunyuanImage3 LoRA accuracy tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/pytest.xml"
+            fi
             exit "$$status"
 
   - group: ":full_moon: HunyuanVideo-1.5 Accuracy MI300 Nightly"
@@ -1009,7 +1087,7 @@ steps:
       - label: "HunyuanVideo-1.5 Video Similarity"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_hunyuan_video_accuracy
         env:
@@ -1067,6 +1145,22 @@ steps:
               cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/accuracy/"
             fi
 
+            if [[ "$$status" -eq 0 ]]; then
+              python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 6 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 6 executed HunyuanVideo-1.5 video similarity tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/pytest.xml"
+            fi
             exit "$$status"
 
   - group: ":full_moon: MiniMax-H3 Accuracy MI300 Nightly"
@@ -1074,7 +1168,7 @@ steps:
       - label: "MiniMax-H3 Timeline Guide Accuracy"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_minimax_h3_accuracy
         env:
@@ -1111,6 +1205,22 @@ steps:
               cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/accuracy/"
             fi
 
+            if [[ "$$status" -eq 0 ]]; then
+              python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            if root.tag not in {"testsuite", "testsuites"}:
+                raise SystemExit("Unexpected JUnit root")
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            failures = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+            errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+            if tests != 1 or skipped != 0 or failures != 0 or errors != 0:
+                print("Expected exactly 1 executed MiniMax-H3 timeline accuracy tests; "
+                      f"tests={tests}, skipped={skipped}, failures={failures}, errors={errors}", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/pytest.xml"
+            fi
             exit "$$status"
       - label: "MiniMax-H3 I2VA Ref2VA Accuracy"
         agent_pool: mi300_4
