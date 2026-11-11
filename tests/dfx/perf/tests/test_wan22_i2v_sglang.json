@@ -1,0 +1,69 @@
+[
+  {
+    "test_name": "test_sglang_wan22_i2v_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Native SGLang Diffusion, one H100, common online videos client.",
+    "server_params": {
+      "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+      "serve_args": {
+        "backend": "sglang",
+        "num-gpus": 1,
+        "dit-cpu-offload": true,
+        "text-encoder-cpu-offload": true,
+        "warmup-mode": "off",
+        "output-path": "tests/dfx/perf/results/wan-videos",
+        "flow-shift": 5.0
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames81_steps4",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 81,
+          "fps": 16,
+          "seed": 42,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models",
+          "guidance_scale": 5.0,
+          "guidance_scale_2": 5.0,
+          "boundary_ratio": 0.875,
+          "flow_shift": 5.0,
+          "max_sequence_length": 512
+        },
+        "seed": 0,
+        "num_warmups": 2
+      }
+    ],
+    "server_type": "sglang-diffusion"
+  }
+]

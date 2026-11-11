@@ -14,14 +14,17 @@ from typing import Any, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    create_paired_benchmark_pytest_params,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
     get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
+    resolve_pytest_marks,
     run_benchmark,
 )
+from tests.dfx.perf.scripts.sglang_omni_server import SGLANG_SERVER_TYPES, SglangOmniServer, sglang_server_entries
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -49,11 +52,15 @@ _PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
 CONFIG_FILE_PATH = _get_config_file_from_argv()
 if CONFIG_FILE_PATH is None:
     _all_configs = load_benchmark_configs(config_dir=_PERF_TESTS_DIR)
-    BENCHMARK_CONFIGS = [cfg for cfg in _all_configs if not is_diffusion_perf_config(cfg)]
+    BENCHMARK_CONFIGS = [
+        cfg
+        for cfg in _all_configs
+        if not is_diffusion_perf_config(cfg) and cfg.get("server_type", "vllm-omni") == "vllm-omni"
+    ]
     print(
         f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts/generation case(s) from "
-        f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion; "
-        f"use -m to filter, e.g. -m tts)"
+        f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion/other backends; "
+        f"use -m to filter, e.g. -m tts; select SGLang-Omni with --test-config-file)"
     )
 else:
     _loaded = load_benchmark_configs(CONFIG_FILE_PATH)
@@ -67,7 +74,19 @@ else:
 
 DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
-paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
+_server_types = {config.get("server_type", "vllm-omni") for config in BENCHMARK_CONFIGS}
+if len(_server_types) > 1:
+    raise ValueError(f"A benchmark config file must use one server type, got: {sorted(_server_types)}")
+SERVER_TYPE = next(iter(_server_types), "vllm-omni")
+if SERVER_TYPE in SGLANG_SERVER_TYPES:
+    _server_entries = sglang_server_entries(BENCHMARK_CONFIGS)
+    paired_benchmark_params = create_paired_benchmark_pytest_params(
+        _server_entries,
+        {name: get_benchmark_params_for_server(name, server_to_benchmark_mapping) for _, name in _server_entries},
+        {config["test_name"]: resolve_pytest_marks(config.get("mark")) for config in BENCHMARK_CONFIGS},
+    )
+else:
+    paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 
 _omni_server_lock = threading.Lock()
 
@@ -300,6 +319,9 @@ def omni_server_context():
 
 @pytest.fixture
 def omni_server(request, omni_server_context):
+    if SERVER_TYPE in SGLANG_SERVER_TYPES:
+        key = json.dumps(request.param, sort_keys=True)
+        return omni_server_context.acquire(key, lambda: SglangOmniServer(request.param))
     return omni_server_context.acquire(request.param, lambda: _start_omni_server(request.param))
 
 
@@ -633,6 +655,39 @@ def test_performance_benchmark(omni_server, benchmark_params):
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
 
+    provenance = None
+    if SERVER_TYPE in SGLANG_SERVER_TYPES and CONFIG_FILE_PATH:
+        from tests.dfx.perf.scripts.experiment_metadata import (
+            comparison_provenance,
+            configured_num_gpus,
+            resolved_workload,
+        )
+
+        provenance = comparison_provenance(
+            test_config=CONFIG_FILE_PATH,
+            server_config=omni_server.config_path,
+            server_revision=omni_server.server_revision,
+            server_type=SERVER_TYPE,
+        )
+        provenance["num_gpus"] = configured_num_gpus(_config_for_test(test_name) or {})
+        provenance["num_gpus_source"] = "test_config.hardware_marks.num_cards"
+
+    def metadata_for_sweep(
+        num_prompts: int, num_warmups: int, request_rate: float | str, max_concurrency: int | None = None
+    ) -> dict[str, object] | None:
+        if provenance is None:
+            return None
+        return {
+            **provenance,
+            "workload": resolved_workload(
+                params,
+                num_prompts=num_prompts,
+                num_warmups=num_warmups,
+                request_rate=request_rate,
+                max_concurrency=max_concurrency,
+            ),
+        }
+
     def to_list(value, default=None):
         if value is None:
             return [] if default is None else [default]
@@ -655,7 +710,20 @@ def test_performance_benchmark(omni_server, benchmark_params):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
+    if revision := params.get("seed_tts_revision"):
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        # Pass the pinned snapshot to the client while retaining its dataset ID in provenance.
+        root = hf_api().snapshot_download(
+            repo_id=params["dataset_path"],
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=[f"{params['seed_tts_locale']}/**"],
+        )
+        args.extend(["--seed-tts-root", str(root)])
+
     exclude_keys = {
+        "seed_tts_revision",
         "request_rate",
         "baseline",
         "num_prompts",
@@ -715,6 +783,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     # QPS / request-rate sweep
     for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
+        num_warmups = _resolve_num_warmups(params, default=2)
         result = run_benchmark(
             args=args,
             test_name=test_name,
@@ -726,15 +795,17 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
+            num_warmups=num_warmups,
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
+            experiment_metadata=metadata_for_sweep(num_prompt, num_warmups, qps),
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
 
     # concurrency test
     for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
+        num_warmups = _resolve_num_warmups(params, default=max(2, int(concurrency)))
         result = run_benchmark(
             args=args,
             test_name=test_name,
@@ -746,8 +817,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+            num_warmups=num_warmups,
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
+            experiment_metadata=metadata_for_sweep(num_prompt, num_warmups, "inf", concurrency),
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)

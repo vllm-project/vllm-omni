@@ -1,0 +1,59 @@
+[
+  {
+    "test_name": "test_sglang_cosmos3_t2i_tp2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Native SGLang Diffusion TP=2 on two H100 GPUs; matches the Cosmos3 T2I requests in vLLM nightly #18522. The vLLM deployment uses CFG=2, HSDP=2 and VAE patch=2; SGLang uses TP=2, CFG=1, SP=1 without FSDP.",
+    "server_params": {
+      "model": "nvidia/Cosmos3-Nano",
+      "serve_args": {
+        "backend": "sglang",
+        "num-gpus": 2,
+        "tp-size": 2,
+        "sp-degree": 1,
+        "cfg-parallel-size": 1,
+        "use-fsdp-inference": false,
+        "warmup-mode": "off"
+      },
+      "env": {
+        "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1024x1024_steps4",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1024,
+          "height": 1024,
+          "num_inference_steps": 4,
+          "seed": 42,
+          "guidance_scale": 7.0,
+          "flow_shift": 3.0,
+          "guardrails": false,
+          "return_stage_metrics": true
+        },
+        "seed": 0,
+        "num_warmups": 2
+      }
+    ],
+    "server_type": "sglang-diffusion"
+  }
+]

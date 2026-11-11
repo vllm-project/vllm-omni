@@ -1,0 +1,57 @@
+--- a/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
++++ b/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
+@@ -149,6 +149,14 @@
+     for key in _multipart_extra_form_keys(sampling_params_cls):
+         if key in raw_form:
+             extra_from_form[key] = _parse_form_extra_value(raw_form[key])
++
++
++def _image_reference_url(value: str) -> str:
++    """Accept the common videos client's single structured image reference."""
++    reference = json.loads(value)
++    if not isinstance(reference, dict) or not isinstance(reference.get("image_url"), str) or not reference["image_url"]:
++        raise ValueError("image_reference must contain one non-empty image_url")
++    return reference["image_url"]
+
+
+ def _multipart_video_extras(
+@@ -478,6 +486,7 @@
+     enhance_prompt: Optional[bool] = Form(None),
+     input_reference: Optional[UploadFile] = File(None),
+     reference_url: Optional[str] = Form(None),
++    image_reference: Optional[str] = Form(None),
+     video_reference: Optional[UploadFile] = File(None),
+     video_url: Optional[str] = Form(None),
+     video_path: Optional[str] = Form(None),
+@@ -520,9 +529,17 @@
+     request_id = generate_request_id()
+
+     server_args = get_global_server_args()
+-    is_multipart = "multipart/form-data" in content_type
++    is_multipart = any(kind in content_type for kind in ("multipart/form-data", "application/x-www-form-urlencoded"))
+     raw_form: Any = None
+     extra_from_form: Dict[str, Any] = {}
++
++    if is_multipart and image_reference is not None:
++        if input_reference is not None or reference_url is not None:
++            raise HTTPException(status_code=400, detail="Use one image reference field")
++        try:
++            reference_url = _image_reference_url(image_reference)
++        except (ValueError, TypeError) as exc:
++            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+     # Parse model-specific multipart metadata before creating request-owned
+     # directories or saving uploads, so malformed JSON leaves no resources.
+--- a/sglang/multimodal_gen/configs/sample/wan.py
++++ b/sglang/multimodal_gen/configs/sample/wan.py
+@@ -256,6 +256,10 @@
+
+ @dataclass
+ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
++    @classmethod
++    def video_request_extra_fields(cls) -> frozenset[str]:
++        return frozenset({"boundary_ratio"})
++
+     guidance_scale: float = 3.5  # high_noise
+     guidance_scale_2: float = 3.5  # low_noise
+     num_inference_steps: int = 40

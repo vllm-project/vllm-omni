@@ -48,6 +48,68 @@ def test_task_excluded_from_cli_args():
     assert "--dataset-name" in args
 
 
+def test_default_runner_discovery_excludes_sglang():
+    from tests.dfx.perf.scripts import run_benchmark
+
+    assert run_benchmark.SERVER_TYPE == "vllm-omni"
+    assert all(cfg.get("server_type", "vllm-omni") == "vllm-omni" for cfg in run_benchmark.BENCHMARK_CONFIGS)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "model_type"),
+    [("test_qwen3_tts_sglang.json", "tts"), ("test_qwen3_omni_sglang.json", "omni")],
+)
+def test_explicit_sglang_config_uses_shared_marks(monkeypatch, config_name: str, model_type: str):
+    import runpy
+    import sys
+    from pathlib import Path
+
+    config = Path(__file__).with_name(config_name)
+    runner = Path(__file__).parents[1] / "scripts" / "run_benchmark.py"
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(config)])
+    module = runpy.run_path(str(runner))
+    assert module["SERVER_TYPE"] == "sglang-omni"
+    assert len(module["paired_benchmark_params"]) == 1
+    names = {mark.name for mark in module["paired_benchmark_params"][0].marks}
+    assert {"gpu", "cuda", "H100", "cards_2", "full_model", model_type} <= names
+
+
+def test_sglang_uses_common_client_metadata(monkeypatch):
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.dfx.perf.scripts.sglang_omni_server import SglangOmniServer
+
+    monkeypatch.setattr(run_benchmark, "SERVER_TYPE", "sglang-omni")
+    monkeypatch.setattr(run_benchmark, "CONFIG_FILE_PATH", str(Path(__file__).with_name("test_qwen3_omni_sglang.json")))
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H200")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 1}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    run_benchmark.test_performance_benchmark(
+        SglangOmniServer({"model": "test-model", "serve_args": [], "env": {}}),
+        {
+            "test_name": "sglang_smoke",
+            "params": {"dataset_name": "seed-tts", "num_prompts": [1], "max_concurrency": [1], "num_warmups": 0},
+        },
+    )
+    assert len(calls) == 1
+    assert calls[0]["resource_label"] == "H200"
+    assert calls[0]["num_warmups"] == 0
+    assert calls[0]["args"].count("--model") == 1
+    metadata = calls[0]["experiment_metadata"]
+    assert metadata["server_type"] == "sglang-omni"
+    assert metadata["server_revision"] is None
+    assert metadata["workload"]["num_warmups"] == 0
+    assert metadata["workload"]["num_prompts"] == 1
+    assert metadata["workload"]["max_concurrency"] == 1
+    assert metadata["workload"]["request_rate"] == "inf"
+
+
 def test_enabled_false_entry_is_skipped():
     """benchmark_params entry with enabled=false should be skipped."""
     import sys
@@ -450,6 +512,7 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
     shared_test = "test_wan22_i2v_usp2"
     name_a = "832x480_frames81_steps4"
     name_b = "1280x720_frames121_steps4"
+    experiment_metadata = {"schema_version": 1, "workload": {"num_warmups": 2, "seed": None}}
 
     result_a = dfx_conftest.run_benchmark(
         args=["--host", "127.0.0.1", "--port", "8000"],
@@ -472,6 +535,7 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
         random_output_len=1,
         resource_label="H800",
         benchmark_params_name=name_b,
+        experiment_metadata=experiment_metadata,
     )
 
     assert result_a["test_name"] == shared_test
@@ -480,6 +544,8 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
     assert result_b["name"] == name_b
     assert "benchmark_params" not in result_a
     assert "benchmark_params" not in result_b
+    assert "experiment_metadata" not in result_a
+    assert result_b["experiment_metadata"] == experiment_metadata
 
     files = sorted(p.name for p in result_dir.glob("result_*.json"))
     assert len(files) == 2

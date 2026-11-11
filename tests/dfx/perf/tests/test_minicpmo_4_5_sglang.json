@@ -1,0 +1,46 @@
+[
+  {
+    "test_name": "test_sglang_minicpmo_4_5",
+    "server_type": "sglang-omni",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {"cuda": "H100"},
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "serve_args": {"config": "tests/dfx/perf/deploy/sgl_minicpmo_4_5.yaml"},
+      "env": {
+        "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
+        "SGLANG_OMNI_WARMUP_TIMEOUT": "1800"
+      }
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "seed_tts_revision": "8f5e1aa2a35d42f42e940074c1983358b9491f89",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [32],
+        "max_concurrency": [1],
+        "num_warmups": 2,
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "seed_tts_chat_ref_audio_field": "audio.ref_audio",
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "chat_template_kwargs": {"enable_thinking": false, "use_tts_template": true}
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

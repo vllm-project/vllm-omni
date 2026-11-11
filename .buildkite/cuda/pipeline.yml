@@ -3,7 +3,57 @@
 steps:
   - label: ":github: Resolve skip-ci & upload pipeline"
     key: upload-ci-pipeline
+    if: >-
+      (build.env("BACKEND_COMPARISON_ONLY") == null || build.env("BACKEND_COMPARISON_ONLY") == "") &&
+      build.branch != "refs/pull/1994/head" &&
+      (build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test"))
     commands:
       - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml"
     agents:
       queue: "medium_cpu_queue_premerge"
+
+  # Native schedules have no PR labels. An explicit comparison request always
+  # selects this route, including malformed requests that must fail below.
+  - label: ":left_right_arrow: Upload Backend Comparison"
+    key: upload-backend-comparison
+    if: >-
+      (build.env("BACKEND_COMPARISON_ONLY") != null && build.env("BACKEND_COMPARISON_ONLY") != "") ||
+      build.branch == "refs/pull/1994/head" ||
+      (build.branch != "main" && build.pull_request.labels includes "backend-comparison-test")
+    commands:
+      - |
+        set -euo pipefail
+        if [[ -n "$${BACKEND_COMPARISON_ONLY:-}" || "$${BUILDKITE_BRANCH}" == "refs/pull/1994/head" ]]; then
+          case "$${BACKEND_COMPARISON_ONLY:-}/$${BUILDKITE_SOURCE}" in
+            1/schedule|smoke/api) ;;
+            *) echo "Invalid backend comparison mode or build source." >&2; exit 1 ;;
+          esac
+          if [[ "$${BUILDKITE_BRANCH}" != "refs/pull/1994/head" ||
+                "$${BUILDKITE_PIPELINE_SLUG}" != "vllm-omni" ||
+                "$${BUILDKITE_REPO}" != "https://github.com/vllm-project/vllm-omni.git" ]]; then
+            echo "Backend comparison requires the configured pipeline and PR 1994 ref." >&2
+            exit 1
+          fi
+          for flag in NIGHTLY WEEKLY NON_CRITICAL MIRROR_HW; do
+            if [[ -n "$${!flag:-}" ]]; then
+              echo "Backend comparison cannot be combined with $${flag}." >&2
+              exit 1
+            fi
+          done
+          if [[ ! "$${BUILDKITE_COMMIT}" =~ ^[0-9a-f]{40}$$ ]] ||
+             [[ "$$(git rev-parse HEAD)" != "$${BUILDKITE_COMMIT}" ]]; then
+            echo "Backend comparison requires an immutable commit matching the checkout." >&2
+            exit 1
+          fi
+          if [[ "$${BACKEND_COMPARISON_ONLY}" == "smoke" ]]; then
+            smoke_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py "$${BACKEND_COMPARISON_CASES:?Select at least one model}")"
+            printf '%s\n' "$${smoke_steps}" | buildkite-agent pipeline upload
+            exit 0
+          fi
+          weekly_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly)"
+          printf '%s\n' "$${weekly_steps}" | buildkite-agent pipeline upload
+          exit 0
+        fi
+        buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml
+    agents:
+      queue: medium_cpu_queue_premerge

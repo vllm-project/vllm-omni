@@ -1,0 +1,19 @@
+Comparison-image patch for SGLang 0.5.22.
+HunyuanVideo-1.5 declares Diffusers ClassifierFreeGuidance, whose state is
+guider/guider_config.json. Exclude that exact component type from the
+weight-file requirement. Keep checks for custom guiders and learned components.
+
+diff --git a/sglang/multimodal_gen/runtime/utils/hf_diffusers_utils.py b/sglang/multimodal_gen/runtime/utils/hf_diffusers_utils.py
+--- a/sglang/multimodal_gen/runtime/utils/hf_diffusers_utils.py
++++ b/sglang/multimodal_gen/runtime/utils/hf_diffusers_utils.py
+@@ -141,6 +141,10 @@
+         or not _is_diffusers_component_entry(value)
+         or not any(item is not None for item in value)
+     ):
++        return False
++
++    # Diffusers guidance is configuration-only; custom guiders may carry weights.
++    if tuple(value) == ("diffusers", "ClassifierFreeGuidance"):
+         return False
+
+     key_lower = key.lower()
