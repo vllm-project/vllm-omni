@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from concurrent.futures import ThreadPoolExecutor
+from inspect import signature
 from io import BytesIO
 from pathlib import Path
 from threading import Barrier
@@ -11,6 +12,7 @@ import cv2
 import numpy as np
 import pytest
 import vllm
+from packaging.version import Version
 from vllm.multimodal.video import Qwen2VLVideoBackend, VideoBackend
 from vllm.multimodal.video_decoders import opencv
 
@@ -18,6 +20,12 @@ import vllm_omni  # noqa: F401  # Install the compatibility patch through its re
 from vllm_omni.inputs.video import _AFFECTED_VLLM_VERSION, apply_opencv_capture_reuse_patch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+requires_capture_reuse_workaround = pytest.mark.skipif(
+    Version(vllm.__version__).public != _AFFECTED_VLLM_VERSION
+    or "cap" in signature(opencv.OpenCVVideoBackendMixin.get_video_metadata).parameters,
+    reason="Requires vLLM 0.33.0 without the upstream fix; retirement checks remain unconditional.",
+)
 
 
 @pytest.fixture(params=["mp4", "webm", "h264", "trimmed_mp4"])
@@ -72,6 +80,7 @@ def _restore_native(monkeypatch, native_decoder):
     monkeypatch.setattr(opencv.OpenCVVideoBackendMixin, "open_video_capture", classmethod(open_capture))
 
 
+@requires_capture_reuse_workaround
 @pytest.mark.parametrize("loader", [VideoBackend, Qwen2VLVideoBackend])
 @pytest.mark.parametrize("frame_recovery", [False, True])
 def test_video_decode_reuses_capture_without_changing_frames(
@@ -134,7 +143,8 @@ def test_video_workaround_leaves_other_versions_untouched(version, native_decode
     assert opencv.OpenCVVideoBackendMixin.open_video_capture.__func__ is native_decoder[1]
 
 
-def test_video_workaround_is_idempotent_for_local_builds(monkeypatch):
+def test_video_workaround_is_idempotent_for_local_builds(native_decoder, monkeypatch):
+    _restore_native(monkeypatch, native_decoder)
     monkeypatch.setattr(vllm, "__version__", "0.33.0+cu130")
     apply_opencv_capture_reuse_patch()
     decoder = opencv.decode_opencv
@@ -157,6 +167,7 @@ def test_video_workaround_skips_upstream_backports(native_decoder, monkeypatch):
     assert opencv.OpenCVVideoBackendMixin.open_video_capture.__func__ is native_decoder[1]
 
 
+@requires_capture_reuse_workaround
 def test_video_capture_is_isolated_between_threads(video_bytes, monkeypatch):
     expected, metadata = VideoBackend.load_bytes(video_bytes, num_frames=4, backend="opencv")
     original = cv2.VideoCapture
@@ -181,6 +192,7 @@ def test_video_capture_is_isolated_between_threads(video_bytes, monkeypatch):
     assert captures[0] is not captures[1]
 
 
+@requires_capture_reuse_workaround
 def test_video_capture_scope_is_reset_after_failure(video_bytes, monkeypatch):
     original = opencv.OpenCVVideoBackendMixin.get_video_metadata
 
