@@ -13,6 +13,7 @@ from typing import Literal, cast
 
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from vllm.logger import init_logger
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.entrypoints.openai.protocol.capabilities import (
@@ -38,6 +39,7 @@ from vllm_omni.serving_capabilities import OPERATIONS, CapabilityProfile, Operat
 
 ExecutionState = Literal["unpaused", "paused", "unknown"]
 RouteKey = tuple[str, str, str]
+logger = init_logger(__name__)
 
 # Protocol ownership, independent of model names and output-type heuristics.
 _OPERATION_ROUTES: dict[OperationId, tuple[RouteKey, ...]] = {
@@ -375,7 +377,20 @@ class OmniServingCapabilities:
     async def get_capabilities(self) -> OmniCapabilitiesResponse:
         now = datetime.now(timezone.utc)
         geometry = _initialized_image_geometry(self._engine)
-        execution_state = await self._observer() if self._observer is not None else "unknown"
+        execution_state: ExecutionState = "unknown"
+        if self._observer is not None:
+            # Execution observation is optional. A failed observer must not
+            # hide the initialized deployment facts; cancellation still propagates.
+            try:
+                observed = await self._observer()
+                if observed in ("unpaused", "paused", "unknown"):
+                    execution_state = observed
+                else:
+                    logger.warning_once("Invalid execution observation; reporting execution.state=unknown.")
+            except Exception as exc:
+                logger.warning_once(
+                    "Execution observation failed (%s); reporting execution.state=unknown.", type(exc).__name__
+                )
         execution = CapabilityExecution(state=execution_state, scope=self._scope, observed_at=now)
         operations = {}
         for operation_id in OPERATIONS:

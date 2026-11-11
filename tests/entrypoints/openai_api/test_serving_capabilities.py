@@ -121,6 +121,50 @@ def _routes(body):
     return {(route["transport"], route["method"], route["path"]): route["exposure"] for route in body["routes"]}
 
 
+@pytest.mark.parametrize("observation", [ConnectionError("observer unavailable"), None, "invalid", [], True])
+def test_execution_observer_failure_preserves_discovery_and_recovers(observation):
+    engine = _engine()
+    app = _app(engine)
+    service = app.state.omni_serving_capabilities
+    with TestClient(app, raise_server_exceptions=False) as client:
+        healthy = client.get("/v1/omni/capabilities").json()
+        service._observer = AsyncMock(side_effect=[observation, observation, "paused"])
+        for _ in range(2):
+            response = client.get("/v1/omni/capabilities")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["routes"] == healthy["routes"]
+            assert body["stages"] == healthy["stages"]
+            assert body["schema_version"] == healthy["schema_version"] == 1
+            for model, original in zip(body["models"], healthy["models"], strict=True):
+                assert model["id"] == original["id"]
+                assert model["stage_ids"] == original["stage_ids"]
+                for name, operation in model["operations"].items():
+                    execution = operation.pop("execution")
+                    assert execution["state"] == "unknown"
+                    assert execution["scope"] == "deployment"
+                    assert execution["observed_at"] == body["observed_at"]
+                    assert operation == {k: v for k, v in original["operations"][name].items() if k != "execution"}
+        recovered = client.get("/v1/omni/capabilities")
+        assert recovered.status_code == 200
+        assert recovered.json()["models"][0]["operations"]["chat"]["execution"]["state"] == "paused"
+    engine.generate.assert_not_called()
+    engine.wake_up.assert_not_called()
+    engine.check_health.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execution_observer_cancellation_propagates():
+    engine = _engine()
+    service = _app(engine).state.omni_serving_capabilities
+    service._observer = AsyncMock(side_effect=asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError):
+        await service.get_capabilities()
+    engine.generate.assert_not_called()
+    engine.wake_up.assert_not_called()
+    engine.check_health.assert_not_called()
+
+
 def test_image_edit_route_requires_its_actual_diffusion_stage_guard():
     engine = _engine()
     engine.engine.stage_configs = [
