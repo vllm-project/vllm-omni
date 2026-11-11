@@ -816,3 +816,36 @@ def test_archive_limit_reclaims_session_and_allows_fresh_generation(recent_runne
     assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
     np.testing.assert_array_equal(execute(runner, batch()).output["payload"]["video"], expected)
     runner.close_session("s")
+
+@pytest.mark.parametrize("limit", ["history_archive_max_bytes", "history_archive_max_frames"])
+def test_archive_client_error_response_reclaims_runner_session(recent_runner, monkeypatch, limit):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(
+        runner.pipeline.ar_config,
+        history_archive_max_bytes=903 if limit.endswith("bytes") else 1 << 20,
+        history_archive_max_frames=3 if limit.endswith("frames") else 4096,
+    )
+
+    def serialized_forward(self, req, **kwargs):
+        # The base runner converts client exceptions before the AR wrapper sees them.
+        try:
+            return self.pipeline.forward(DiffusionRequestBatch([req]))
+        except OmniClientError as exc:
+            return DiffusionOutput.from_exception(exc)
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", serialized_forward)
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    expected = runner.execute_model(batch().requests[0]).output["payload"]["video"]
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    error = runner.execute_model(batch(index=1).requests[0])
+    assert "archive quota" in error.error
+    assert error.error_status_code == 400
+    assert archive.records == () and archive.payload_bytes == 0
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    actual = runner.execute_model(batch().requests[0]).output["payload"]["video"]
+    np.testing.assert_array_equal(actual, expected)
+    runner.close_session("s")
