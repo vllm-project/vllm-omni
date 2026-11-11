@@ -73,3 +73,23 @@ def test_npu_v2_initializes_stage_output_cache_after_native_kv(monkeypatch, prof
     monkeypatch.setattr(runner, "_init_omni_prefix_cache", omni_init)
     runner.initialize_kv_cache(config, is_profiling=profiling)
     assert calls == ["native", "omni"]
+
+
+@pytest.mark.parametrize("stage", ["llm", "tts"])
+@pytest.mark.parametrize("npu", [False, True])
+def test_minicpmo_factory_returns_npu_state_only_on_npu(monkeypatch, stage, npu):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+    from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: npu)
+    init = Mock(return_value=None)
+    monkeypatch.setattr(OmniModelState, "__init__", init)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = stage
+    config, cache = object(), object()
+    device = torch.device("cpu")
+    state = init_omni_model_state(config, model, cache, device)
+    assert type(state) is (NPUOmniModelState if npu else OmniModelState)
+    init.assert_called_once_with(config, model, cache, device)
