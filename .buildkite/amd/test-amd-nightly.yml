@@ -1791,7 +1791,7 @@ steps:
       - label: "Qwen-Image Diffusers Backend Similarity"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_accuracy
         env:
@@ -1868,7 +1868,7 @@ steps:
       - label: "Qwen3-Omni Duplex Playback"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_qwen3_omni_duplex_playback_function
         artifact_paths:
@@ -1992,7 +1992,7 @@ steps:
       - label: "Wan2.2 Function 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_function
         env:
@@ -2083,7 +2083,7 @@ steps:
       - label: "Wan2.2 Function 2 GPU"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_function
         env:
@@ -2192,7 +2192,7 @@ steps:
       - label: "Qwen-Image Expansion 1 GPU"
         agent_pool: mi300_1
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_function
         env:
@@ -2277,7 +2277,7 @@ steps:
       - label: "Qwen-Image Expansion 2 GPU"
         agent_pool: mi300_2
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_qwen_image_function
         env:
