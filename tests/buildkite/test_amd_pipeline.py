@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -4826,7 +4827,7 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-tiny-diffusion-base/**/*"]
@@ -4858,6 +4859,42 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
         AMD_NIGHTLY_PIPELINE,
     )
     assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["pass", "subtests", "missing", "duplicate", "wrong-node", "skipped", "failure", "error", "subtest-skip"],
+)
+def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenario: str) -> None:
+    step = _find_step("ROCm · Tiny Diffusion Base GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    guard = split(command[command.index("python -c ") :])[2]
+    expected = tmp_path / "expected.txt"
+    expected.write_text("\n".join(_TINY_DIFFUSION_BASE_NODES), encoding="utf-8")
+    root = ET.Element("testsuites")
+    # Pytest 9 counts successful subtests in this total without adding testcase nodes.
+    suite = ET.SubElement(
+        root, "testsuite", tests="80" if scenario == "subtests" else "22", skipped="0", failures="0", errors="0"
+    )
+    for node in _TINY_DIFFUSION_BASE_NODES:
+        module, name = node.split("::", 1)
+        ET.SubElement(suite, "testcase", classname=module.removesuffix(".py").replace("/", "."), name=name)
+    if scenario == "missing":
+        suite.remove(suite[-1])
+    elif scenario == "duplicate":
+        suite[-1].attrib.update(suite[0].attrib)
+    elif scenario == "wrong-node":
+        suite[-1].set("name", "unexpected_test")
+    elif scenario in {"skipped", "failure", "error"}:
+        ET.SubElement(suite[-1], scenario)
+    elif scenario == "subtest-skip":
+        suite.set("skipped", "1")
+    report = tmp_path / "pytest.xml"
+    ET.ElementTree(root).write(report)
+    result = subprocess.run(
+        [sys.executable, "-c", guard, str(report), str(expected)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == (0 if scenario in {"pass", "subtests"} else 5), result.stdout + result.stderr
 
 
 _DISTRIBUTED_BUFFER_READY_LABEL = "ROCm · Distributed Buffer GPU Smokes"
