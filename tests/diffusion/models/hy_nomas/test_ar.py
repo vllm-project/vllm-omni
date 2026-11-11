@@ -695,10 +695,14 @@ def test_recent_total_limits_fail_closed_and_allow_fresh_generation(recent_runne
     runner.close_session("s")
 
 
-@pytest.mark.parametrize("phase", ["allocation", "stage", "peer_stage"])
+@pytest.mark.parametrize("phase", ["allocation", "stage", "archive", "peer_stage"])
 def test_recent_failed_commit_preserves_published_history(recent_runner, monkeypatch, phase):
     runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
     execute(runner, batch())
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    records = archive.records
+    archive_bytes = archive.payload_bytes
     cache = runner._sessions["s"].segmented("cond")
     handles = cache.handles
     masks = runner.pipeline._ar_sessions["s"].history_mask.clone()
@@ -709,6 +713,8 @@ def test_recent_failed_commit_preserves_published_history(recent_runner, monkeyp
 
     if phase == "allocation":
         monkeypatch.setattr(cache, "begin_commit", fail)
+    elif phase == "archive":
+        monkeypatch.setattr(archive, "stage", fail)
     elif phase == "stage":
         original = cache.stage
 
@@ -735,6 +741,78 @@ def test_recent_failed_commit_preserves_published_history(recent_runner, monkeyp
         with pytest.raises(RuntimeError, match="commit failure|another SP rank"):
             runner.pipeline.forward(batch(index=1))
         assert cache.handles == handles and not cache.commit_active
+        assert archive.records is records and archive.payload_bytes == archive_bytes
+        with pytest.raises(RuntimeError, match="no pending"):
+            archive.publish()
         torch.testing.assert_close(runner.pipeline._ar_sessions["s"].history_mask, masks)
         assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    runner.close_session("s")
+
+
+def test_recent_archive_preserves_evicted_rows_and_generation(recent_runner):
+    runner = recent_runner
+    reference = [execute(runner, batch(index=index)).output["payload"]["video"] for index in range(4)]
+    assert runner.pipeline._ar_sessions["s"].history_archive is None
+    runner.reset_session("s")
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    for index, expected in enumerate(reference):
+        output = execute(runner, batch(index=index))
+        np.testing.assert_array_equal(output.output["payload"]["video"], expected)
+    session = runner.pipeline._ar_sessions["s"]
+    archive = session.history_archive
+    assert [record.frame_start for record in archive.records] == [0, 3, 6, 9]
+    assert session.history_frames[0].position > archive.records[0].frame_start
+    for index, record in enumerate(archive.records):
+        assert record.mask.tolist() == [[True] * 6 + [False]]
+        assert record.frame_rows(index * 3 + 2) == slice(2, 3)
+        assert (record.segment, record.text_tokens, record.action_start) == (index + 1, 4, 2)
+        for layer, (key, value) in enumerate(record.layers):
+            assert key.device.type == value.device.type == "cpu"
+            torch.testing.assert_close(key, torch.full((7, 2, 4), index * 3 + layer + 1.0))
+            torch.testing.assert_close(value, -key)
+    assert archive.payload_bytes == 4 * (7 * 2 * 4 * 4 * 2 * 2 + 7)
+    assert output.output["metadata"]["hy_nomas"]["archive_latent_frames"] == 12
+    assert output.output["metadata"]["hy_nomas"]["archive_payload_bytes"] == archive.payload_bytes
+    runner.close_session("s")
+    assert archive.records == () and archive.payload_bytes == 0
+
+
+def test_archive_excludes_transient_conditioning_and_isolates_sessions(recent_runner):
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    state = StepRequestState(request_id="live", sampling=sampling(frames=21), prompt="forest")
+    with runner._bound_ar_session("live", description="test"):
+        runner.pipeline.prepare_encode(state)
+        step_chunk(runner.pipeline, state)
+        step_chunk(runner.pipeline, state)
+        archive = runner.pipeline._session().history_archive
+        assert [record.text_tokens for record in archive.records] == [4, 0]
+        assert [record.layers[0][0].shape[0] for record in archive.records] == [7, 3]
+        assert archive.records[1].mask.tolist() == [[True, True, True]]
+    execute(runner, batch(session="other", seed=19), "other")
+    other = runner.pipeline._ar_sessions["other"].history_archive
+    assert other is not archive and other.frames == 3 and archive.frames == 6
+    runner.reset_session("live")
+    assert archive.records == () and other.frames == 3
+    runner.release_step_requests(["other"])
+    assert other.records == () and not runner.pipeline._ar_sessions
+
+
+@pytest.mark.parametrize("limit", ["history_archive_max_bytes", "history_archive_max_frames"])
+def test_archive_limit_reclaims_session_and_allows_fresh_generation(recent_runner, limit):
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(
+        runner.pipeline.ar_config,
+        history_archive_max_bytes=903 if limit.endswith("bytes") else 1 << 20,
+        history_archive_max_frames=3 if limit.endswith("frames") else 4096,
+    )
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    expected = execute(runner, batch()).output["payload"]["video"]
+    archive = runner.pipeline._ar_sessions["s"].history_archive
+    with pytest.raises(OmniClientError, match="archive quota"):
+        execute(runner, batch(index=1))
+    assert archive.records == () and archive.payload_bytes == 0
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    np.testing.assert_array_equal(execute(runner, batch()).output["payload"]["video"], expected)
     runner.close_session("s")
