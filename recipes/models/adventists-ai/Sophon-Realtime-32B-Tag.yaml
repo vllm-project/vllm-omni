@@ -43,7 +43,7 @@ omni:
           }'
 
 dependencies:
-  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config. Keep the `[trt]` extra: it installs TensorRT for the talker, which the latency below depends on."
+  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config. Keep the `[trt]` extra: it installs TensorRT for the talker; the latency table below was measured with it."
     command: "uv pip install \"sophon-realtime[trt]\""
 
 features: {}
@@ -83,12 +83,15 @@ guide: |
 
   ```bash
   uv venv --python 3.12 && source .venv/bin/activate
-  uv pip install "sophon-realtime[trt]"   # [trt] = TensorRT for the talker; without it the talker is ~3x slower under load
+  uv pip install "sophon-realtime[trt]"   # [trt] = TensorRT for the talker; without it the talker runs in PyTorch and is slower under load
   sophon-realtime serve --port 8000       # downloads the weights (~42 GB) on first run
   ```
 
-  `sophon-realtime serve` starts a CUDA MPS daemon for its GPU by default (`SOPHON_MPS=0` turns it off). First start
-  builds kernels and TensorRT engines (about 8 min on H100); later starts take 4–6 min.
+  `sophon-realtime serve` starts a CUDA MPS daemon for its GPU by default, so the three stages share the GPU
+  concurrently. MPS applies to every CUDA process on that GPU, and the daemon keeps running after the server exits
+  (`serve` prints the command to stop it). On a shared GPU, or with other CUDA workloads on the same device, set
+  `SOPHON_MPS=0`. After the weights are downloaded, the first start builds kernels and TensorRT engines (about 7–8 min
+  on one H100 with sophon-realtime 1.1.2); later starts take about 4–5 min.
 
   ## Zero-shot voice cloning
 
@@ -112,6 +115,9 @@ guide: |
   | 1 | 0.67 s |
   | 8 | 0.61 / 0.76 s |
   | 16 | 0.75 / 1.07 s |
+
+  Measured with TensorRT and CUDA MPS (the repository's one-command scripts) on the v1.0 release, users arriving within
+  10 s; not yet re-measured on sophon-realtime 1.1.2.
 
   ## References
 
