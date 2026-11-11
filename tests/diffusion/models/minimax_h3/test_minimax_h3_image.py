@@ -139,6 +139,48 @@ def test_packed_layout_accepts_audio_free_targets():
         )
 
 
+@pytest.mark.parametrize("ref_grids", [[], [(4, 6)], [(4, 6), (8, 4), (2, 2)]])
+def test_target_slice_matches_packed_update_mask(ref_grids):
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=10,
+        latent_t=1,
+        latent_h=8,
+        latent_w=8,
+        audio_t=0,
+        ref_blocks=[{"kind": "image", "latent_h": h, "latent_w": w} for h, w in ref_grids],
+        seq_len=128,
+    )
+    n_cond = sum(h * w // 4 for h, w in ref_grids)
+    h3i._require_reference_prefix(packed["update_mask"], n_cond)
+    rows = torch.arange(packed["img_pos"].numel())
+    mask = packed["update_mask"].view(-1).bool()
+    assert torch.equal(rows[mask], rows[n_cond:])
+    for wrong in (n_cond + 1, max(n_cond - 1, 0) if n_cond else 1):
+        with pytest.raises(RuntimeError, match="reference rows"):
+            h3i._require_reference_prefix(packed["update_mask"], wrong)
+
+
+def test_euler_target_step_matches_shared_eta0_step():
+    from vllm_omni.diffusion.models.minimax_h3.scheduling_minimax_h3_euler_ancestral import (
+        minimax_h3_euler_eta0_step,
+    )
+
+    generator = torch.Generator().manual_seed(0)
+    n_cond = 3
+    rows = torch.randn(11, 64, generator=generator)
+    velocity = torch.randn(11, 64, generator=generator).to(torch.bfloat16)
+    anchors = rows[:n_cond].clone()
+    sigmas = h3i.minimax_h3_image_run_sigmas(h3i.minimax_h3_image_pdd_grid(_RELEASE_PDD))
+    for sigma_curr, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+        target = rows[n_cond:].clone()
+        expected = minimax_h3_euler_eta0_step(
+            target, target + sigma_curr * velocity[n_cond:].float(), sigma_curr=sigma_curr, sigma_next=sigma_next
+        )
+        h3i._euler_target_step(rows, velocity, n_cond, torch.tensor(sigma_curr - sigma_next))
+        torch.testing.assert_close(rows[n_cond:], expected, rtol=1e-5, atol=1e-5)
+        assert torch.equal(rows[:n_cond], anchors)
+
+
 def test_arch_config_audio_enabled_contract():
     assert MiniMaxH3DiTArchConfig.from_mapping({"audio_enabled": False}).audio_enabled is False
     assert MiniMaxH3DiTArchConfig.from_mapping({}).audio_enabled is True
@@ -259,6 +301,26 @@ def test_vae_round_trip_shapes_and_fp32_statistics(tmp_path):
     pixels = vae.decode_latent(vae.normalize_latent(latent))
     assert pixels.shape == (1, 3, 64, 48)
     assert pixels.dtype == torch.float32 and 0.0 <= pixels.min() and pixels.max() <= 1.0
+
+
+def test_prepare_decoder_weights_keeps_fp32_rope_bases():
+    with torch.device("cpu"):
+        vae = image_vae.MiniMaxH3ImageVAE(_tiny_vae_config())
+    ropes = [m for m in vae.decoder.modules() if isinstance(m, image_vae._RotaryEmbedding2d)]
+    assert ropes
+    expected = [m.inv_freq.clone() for m in ropes]
+
+    vae.prepare_decoder_weights(torch.bfloat16)
+    assert all(p.dtype == torch.bfloat16 for p in vae.decoder.parameters())
+    for m, want in zip(ropes, expected):
+        assert m.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(m.inv_freq, want, rtol=0, atol=0)
+
+    # A second call must not recast the module and drop captured decode graphs.
+    sentinel = object()
+    vae._decode_graphs = sentinel
+    vae.prepare_decoder_weights(torch.bfloat16)
+    assert vae._decode_graphs is sentinel
 
 
 def test_vae_rejects_non_image_configs():

@@ -234,6 +234,27 @@ def minimax_h3_image_presentation(
     return torch.tensor(padded, dtype=torch.long), torch.tensor(tags, dtype=torch.long), text_len
 
 
+def _require_reference_prefix(update_mask: torch.Tensor, n_cond: int) -> None:
+    """The step below slices ``rows[n_cond:]``; that equals the packed
+    ``update_mask`` selection only while the reference rows are a prefix."""
+    mask = update_mask.view(-1).to(torch.bool).cpu()
+    if int(mask.numel()) <= n_cond or mask[:n_cond].any() or not mask[n_cond:].all():
+        raise RuntimeError(
+            f"MiniMax-H3-Image expects {n_cond} reference rows before the target rows, "
+            f"got update_mask with {int((~mask).sum())} condition rows out of {mask.numel()}"
+        )
+
+
+def _euler_target_step(rows: torch.Tensor, velocity: torch.Tensor, n_cond: int, delta: torch.Tensor) -> None:
+    """In-place eta-0 Euler update of the target rows: ``x + (sigma_k - sigma_{k+1}) * v``.
+
+    Algebraically equal to ``minimax_h3_euler_eta0_step`` on ``x0 = x + sigma_k * v``;
+    kept in this form because it is the released sampler's arithmetic.
+    """
+    target = rows[n_cond:]
+    target.copy_(target + delta * velocity[n_cond:].float())
+
+
 def _image_packed_seq_len(used_rows: int) -> int:
     """Used rows (text + target + references) rounded up to 16, plus 16 rows."""
     return ((used_rows + 15) // 16) * 16 + 16
@@ -666,6 +687,7 @@ class MiniMaxH3ImagePipeline(
         branch = MiniMaxH3DenoiseBranch(packed=packed, text_embeddings=hidden, token_tags=tags, device=self.device)
         branch.prepare_rope_table(self.transformer)
         n_cond = int(anchors.shape[0])
+        _require_reference_prefix(packed["update_mask"], n_cond)
         anchors = anchors.to(self.device)
         video_rows = torch.cat((anchors, target_noise.to(self.device)), dim=0)
         audio_rows = torch.empty((0, MINIMAX_H3_AUDIO_ROW_WIDTH), device=self.device, dtype=torch.float32)
@@ -688,14 +710,14 @@ class MiniMaxH3ImagePipeline(
                 # writes only them, so the anchor rows need neither re-copying
                 # nor a zeroed velocity.
                 kwargs["skip_mask_out_condition"] = True
-                with torch.inference_mode():
-                    velocity, _ = self.transformer(pdd_step=step, **kwargs)
-                target = video_rows[n_cond:]
-                target.copy_(target + deltas[step] * velocity[n_cond:].float())
+                velocity, _ = self.transformer(pdd_step=step, **kwargs)
+                _euler_target_step(video_rows, velocity, n_cond, deltas[step])
                 progress_bar.update()
         return video_rows[n_cond:]
 
-    @torch.inference_mode()
+    # no_grad, not inference_mode: the runner selects no_grad for layerwise
+    # offload (DLO), whose hooks read tensor version counters.
+    @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         check_request_cancellation()
         parsed = self._parse_request(request)

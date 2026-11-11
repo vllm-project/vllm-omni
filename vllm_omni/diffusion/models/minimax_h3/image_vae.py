@@ -157,8 +157,15 @@ class _RotaryEmbedding2d(nn.Module):
         super().__init__()
         if dim % 4:
             raise ValueError(f"2D RoPE dim {dim} must be divisible by 4")
-        inv_freq = 1 / theta ** torch.arange(0, 1, 4 / dim, dtype=torch.float32)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim, self.theta = dim, theta
+        self.register_buffer("inv_freq", self._fp32_inv_freq(), persistent=False)
+
+    def _fp32_inv_freq(self, device: torch.device | None = None) -> torch.Tensor:
+        return 1 / self.theta ** torch.arange(0, 1, 4 / self.dim, dtype=torch.float32, device=device)
+
+    def restore_fp32_inv_freq(self) -> None:
+        """Recompute the bases in FP32 after a ``module.to(dtype)`` rounded them."""
+        self.inv_freq = self._fp32_inv_freq(self.inv_freq.device)
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast(ids.device.type, enabled=False):
@@ -483,9 +490,20 @@ class MiniMaxH3ImageVAE(nn.Module):
         return self.decoder(self.post_quant_conv(z.squeeze(2))).unsqueeze(2)
 
     def prepare_decoder_weights(self, dtype: torch.dtype = torch.bfloat16) -> None:
+        """Cast the decoder weights to ``dtype``; the RoPE bases stay FP32 because
+        the angle math runs in FP32 and rounded bases shift every frequency."""
         for module in (self.post_quant_conv, self.decoder):
-            if any(t.is_floating_point() and t.dtype != dtype for t in (*module.parameters(), *module.buffers())):
+            ropes = [m for m in module.modules() if isinstance(m, _RotaryEmbedding2d)]
+            rope_buffers = {id(m.inv_freq) for m in ropes}
+            stale = any(
+                t.is_floating_point() and t.dtype != dtype
+                for t in (*module.parameters(), *module.buffers())
+                if id(t) not in rope_buffers
+            ) or any(m.inv_freq.dtype != torch.float32 for m in ropes)
+            if stale:
                 module.to(dtype)
+                for m in ropes:
+                    m.restore_fp32_inv_freq()
                 self._decode_graphs = None
 
     @torch.inference_mode()
