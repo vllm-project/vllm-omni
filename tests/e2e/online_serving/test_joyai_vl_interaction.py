@@ -20,13 +20,16 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.om
 
 
 async def run_observations(url, model, output_dir, *, expect_streaming=False, instruction_pcm=b""):
+    # Keep the cancellation turn generating after its first transcript delta;
+    # a one-word color reply can finish before the client coroutine resumes.
     config = SessionConfig(
         auto_response=False,
         temperature=0.0,
         instructions=(
             None
             if instruction_pcm
-            else "Describe the color of the current image in one short spoken sentence whenever it changes."
+            else "For every new image, say the color of only the newest image in English. "
+            "If it is green, also count from one to fifty aloud, saying every number without skipping any."
         ),
         extra_body={"tts_language": "English"},
     )
@@ -63,6 +66,19 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
                 )
                 await asyncio.sleep(0)
                 try:
+                    if index == 3 and instruction_pcm:
+                        # Start a fresh query after cancelling the spoken
+                        # counting instruction retained in conversation history.
+                        await client.send(
+                            {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "What color is the newest image?"}],
+                                },
+                            }
+                        )
                     await client.append_audio(
                         instruction_pcm if index in (0, 2) else b"",
                         video_frames=[base64.b64encode(image.getvalue()).decode()],
@@ -153,6 +169,8 @@ def test_committed_observations_produce_speech_cancel_and_release_session(omni_s
             f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
             omni_server.model,
             tmp_path,
+            # The ASR profile uses async_chunk=false: Code2Wav returns a complete
+            # waveform, so only the visual profile requires multiple deltas.
             expect_streaming=not with_asr,
             instruction_pcm=instruction_pcm,
         )
