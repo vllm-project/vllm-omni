@@ -54,6 +54,43 @@ def _render(changed_files: list[str]) -> str:
     )
 
 
+@pytest.mark.parametrize("pytest_exit", [0, 1, 124])
+def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit):
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text())
+    step = next(step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test")
+    # Build 19334 runs the workload under /bin/sh. Exercise that entrypoint,
+    # including tee, without starting a real server or loading model weights.
+    calls_path = tmp_path / "pytest-call.json"
+    executable = tmp_path / "pytest"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['PYTEST_CALLS'], 'w') as output:\n"
+        "    json.dump(sys.argv[1:], output)\n"
+        "print('MINICPMO_DUPLEX_TRACE test')\n"
+        "print('pytest-stderr', file=sys.stderr)\n"
+        "sys.exit(int(os.environ['PYTEST_EXIT']))\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
+    monkeypatch.setenv("PYTEST_EXIT", str(pytest_exit))
+    result = subprocess.run(
+        ["/bin/sh", "-e", "-c", "\n".join(step["commands"])],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == pytest_exit, result.stderr
+    args = json.loads(calls_path.read_text())
+    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
+    assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
+    log = tmp_path / "tests/e2e/online_serving/results/minicpmo_duplex/server.log"
+    assert "MINICPMO_DUPLEX_TRACE test" in log.read_text()
+    assert "pytest-stderr" in log.read_text()
+
+
 def test_bootstrap_if_injected_by_step_key() -> None:
     rendered = _render_bootstrap_pipeline(
         BOOTSTRAP_STEPS_TEMPLATE,
