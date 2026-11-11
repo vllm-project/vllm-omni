@@ -333,13 +333,38 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     return {}
 
 
+def iter_request_outputs(mm_source: object) -> list[Any]:
+    """Return ``mm_source.outputs`` as a list, tolerating a single output object.
+
+    ``RequestOutput.outputs`` is a list of ``CompletionOutput``, but
+    ``PoolingRequestOutput.outputs`` is a single ``PoolingOutput`` (for example
+    the forced-aligner stage behind Qwen3-TTS word timestamps). Iterating the
+    bare attribute therefore raises ``TypeError: 'PoolingOutput' object is not
+    iterable`` and takes the orchestrator down. Normalize both shapes here so
+    every caller can iterate unconditionally.
+
+    Args:
+        mm_source: Duck-typed container with an optional ``outputs`` attribute.
+
+    Returns:
+        The outputs of ``mm_source`` as a list; empty when there are none.
+    """
+    outputs = getattr(mm_source, "outputs", None)
+    if outputs is None:
+        return []
+    if isinstance(outputs, list | tuple):
+        return list(outputs)
+    return [outputs]
+
+
 def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     """Collect all non-empty multimodal_output Mappings from ``mm_source``.
 
     Lookup order:
       1. ``mm_source.multimodal_output`` — top-level attribute / property
-      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
-         entry that carries a non-empty multimodal Mapping
+      2. each ``mm_source.outputs[i].multimodal_output`` — every output entry
+         (``CompletionOutput`` or a lone ``PoolingOutput``) that carries a
+         non-empty multimodal Mapping
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
@@ -356,7 +381,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    for output in iter_request_outputs(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
