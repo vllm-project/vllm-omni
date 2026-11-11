@@ -54,7 +54,9 @@ vllm serve /path/to/praxis-1-droid --omni --served-model-name praxis-1 \
   --deploy-config praxis1-deploy.yaml --stage-init-timeout 1800
 ```
 
-Offline requests pass `robot_obs` and a nonempty `session_id` in
+The
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1-H100.md)
+has a runnable `Omni.generate` example. Offline requests pass `robot_obs` and a nonempty `session_id` in
 `OmniDiffusionSamplingParams.extra_args`; reuse the id for continuation,
 `reset` starts an episode and `end_session` releases it.
 
@@ -142,7 +144,8 @@ kernels. Prompt embeddings are cached per task string.
 
 ## Validation
 
-The port is checked at three levels.
+The port is checked at three levels. Commands are in the
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1-H100.md#verification).
 
 1. **Oracle parity on random weights.** A tiny transformer built by both the
    reference implementation and this port from the same random weights agrees
@@ -160,7 +163,7 @@ The port is checked at three levels.
 3. **Task success in simulation.** The reference repository's MuJoCo task
    suites, driven unchanged against this server over its robot-policy
    WebSocket API, are the qualification that matters. Results are recorded in
-   the recipe that accompanies the checkpoint-gated tests.
+   the recipe.
 
 Weight-free CPU and GPU tests cover the config contract, masks,
 rotary tables, the sampler, weight mapping, observation processing and the
