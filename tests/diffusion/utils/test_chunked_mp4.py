@@ -123,7 +123,9 @@ def test_early_audio_preserves_decoded_media_and_timestamps(encode_audio_first) 
     frames = _frames()
     time = np.arange(8000, dtype=np.float32) / 24000
     audio = np.stack([0.1 * np.sin(2 * np.pi * frequency * time) for frequency in (440, 660)])
-    options = dict(fps=24, audio_sample_rate=24000, video_codec_options={"threads": "1"})
+    # libx264 mbtree lookahead is not bit-stable in AMD CI when AAC work moves
+    # ahead of video encoding. Keep both comparison paths deterministic.
+    options = dict(fps=24, audio_sample_rate=24000, video_codec_options={"threads": "1", "mbtree": "0"})
     baseline = mux_video_audio_bytes(frames, audio, **options)
     result = mux_av_video_audio_bytes(
         (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in frames),

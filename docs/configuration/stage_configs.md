@@ -5,6 +5,8 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+For diffusion sampling, explicit request fields override `--default-sampling-params`, which overrides deploy YAML defaults. CLI values are merged by stage ID, and `extra_args` is merged by key. Invalid CLI JSON fails startup; model-owned sampling constraints still apply.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
