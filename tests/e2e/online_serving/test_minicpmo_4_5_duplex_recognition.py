@@ -19,7 +19,7 @@ from tests.helpers.mark import hardware_test
 pytestmark = [pytest.mark.omni, pytest.mark.core_model]
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkeypatch) -> None:
     manifest = load_manifest()

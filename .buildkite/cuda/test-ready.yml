@@ -242,20 +242,14 @@ steps:
             "
         mirror_hardwares: h100_1
 
-      - label: "Omni · MiniCPM-o 4.5 Duplex Recognition Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_function
+      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
         timeout_in_minutes: 40
         artifact_paths:
           - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
         commands:
-          # Recognition needs real weights even though it runs in the core tier.
-          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py -m "core_model and cuda and H100 and B200 and omni and cards_1" --run-level "advanced_model"
-
-      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
-        timeout_in_minutes: 40
-        commands:
-          - timeout 35m pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py -m 'advanced_model and cuda' --run-level advanced_model
+          # Both concurrency and recognition require real weights.
+          - timeout 35m pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py -m '(core_model or advanced_model) and cuda' --run-level advanced_model
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
