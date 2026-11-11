@@ -41,6 +41,9 @@ EXCLUDED_MODELS = [
     # Requires upstream AR hidden states and token boundaries; covered by
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
+    # Action expert that needs the reasoning stage's KV prefix; covered by
+    # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
+    "Alpamayo2SuperPipeline",
     "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
@@ -52,12 +55,19 @@ EXCLUDED_MODELS = [
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
+    # Physis uses full video model checkpoints and has dedicated contract tests.
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
+    "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
+    # Loads a single upstream model.safetensors + T5Gemma, no diffusers tiny
+    # config; covered by the gated-checkpoint offline/online E2E tests.
+    "StableAudio3Pipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
@@ -86,6 +96,10 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # No common tiny builder for the native Qwen/PixelUMM layout yet; covered by
+    # tests/diffusion/models/hy_nomas and real-checkpoint offline/accuracy/serving E2E.
+    "HyNomasPipeline",
+    "HyNomasModularPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
     "ABotWorldCausalPipeline",
@@ -105,7 +119,7 @@ EXCLUDED_MODELS = [
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
-    # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
+    # Experimental Noisy PP / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
     "Gr00tN1d7Pipeline",
@@ -116,6 +130,23 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
+    # Depth estimation, not generation. Covered by
+    # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
+    # endpoint tests.
+    "VideoDepthAnythingPipeline",
+    # Covered by the dedicated e2e harnesses
+    # tests/e2e/offline_inference/test_flux3.py and
+    # tests/e2e/online_serving/test_flux3.py (FLUX3_MODEL_PATH) instead of the
+    # common tiny-model suite.
+    "Flux3Pipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
+    "PAN2ModularPipeline",
 ]
 
 

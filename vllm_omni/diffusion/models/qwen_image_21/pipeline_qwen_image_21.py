@@ -30,6 +30,11 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 imp
 )
 from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -1514,6 +1519,16 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        # ForwardContext carries one index for this entire transformer forward.
+        # Before allowing mixed steps, check every step-dependent consumer:
+        # Attention treats an unknown index as a skip with an active skip selector,
+        # and W4A8 Linear fallback requires a known index. A representative row's
+        # index could select the wrong precision for the other rows.
+        step_indices = {state.step_index for state in states}
+        if len(step_indices) != 1:
+            raise ValueError(f"Qwen-Image-2.1 requires a common denoise step per forward, got {sorted(step_indices)}.")
+        step_idx = states[0].step_index
+
         if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
             self._release_idle_decode_graphs()
 
@@ -1602,14 +1617,22 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        noise_pred = self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice=latents.size(1),
-        )
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        previous_step = forward_context.denoise_step_idx if forward_context is not None else None
+        try:
+            set_forward_context_denoise_step_idx(step_idx)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                input_batch.do_true_cfg,
+                input_batch.true_cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                input_batch.cfg_normalize,
+                output_slice=latents.size(1),
+            )
+        finally:
+            if forward_context is not None:
+                # Do not reactivate paged KV (or mask an error) while restoring.
+                forward_context.denoise_step_idx = previous_step
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a

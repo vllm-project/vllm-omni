@@ -27,6 +27,16 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+    collect_calibration_specs,
+    propagate_skip_softmax_calibration,
+)
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    parse_attention_schedule,
+    validate_attention_profile_name,
+    validate_attention_schedule,
+)
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -285,7 +295,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+
+    Uses platform symmetric memory on CUDA and NPU. NPU currently requires
+    eager inference and pure Ulysses over WORLD in one HCCS domain, with
+    TorchNPU's NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    """
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
@@ -759,10 +774,12 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
-    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
+    if _looks_like_flux3(model, cfg):
+        return "Flux3Pipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -854,6 +871,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    diffusion_attention_schedule: "AttentionScheduleConfig | None" = None
     fa_deterministic: bool = False
 
     # Running mode
@@ -934,9 +952,12 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float | list[float] = 1.0
     lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
+    lora_application: str = "runtime"
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -962,6 +983,7 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
     # Final-layout Host Weight Runtime policy. The loader only activates this
@@ -1016,6 +1038,15 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # Capture the per-step denoise forward into a device graph (CUDA graph /
+    # XPU graph) and replay it for the following steps. Off by default: it only
+    # pays on a launch-bound denoise step, and pipelines opt in explicitly (see
+    # vllm_omni/diffusion/graph.py for the safety requirements).
+    diffusion_use_graph: bool = False
+    # With diffusion_use_graph: drop the captured denoise graphs after each denoise
+    # loop so their memory pools are free for VAE decode. Every request then
+    # recaptures, trading the reuse across requests for lower peak memory.
+    diffusion_graph_release_after_denoise: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1244,6 +1275,9 @@ class OmniDiffusionConfig:
     def __post_init__(self):
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
+        if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
+
         parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
@@ -1274,6 +1308,13 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_use_graph, bool):
+            raise TypeError(f"diffusion_use_graph must be a bool, got {type(self.diffusion_use_graph)!r}")
+        if not isinstance(self.diffusion_graph_release_after_denoise, bool):
+            raise TypeError(
+                "diffusion_graph_release_after_denoise must be a bool, "
+                f"got {type(self.diffusion_graph_release_after_denoise)!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
@@ -1375,6 +1416,9 @@ class OmniDiffusionConfig:
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
+        # Parsed before the 'full' check, which needs the normalized value: a schedule without
+        # profiles parses to None.
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1391,6 +1435,10 @@ class OmniDiffusionConfig:
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
                     }[offload_strategy]
                 )
+            if self.diffusion_attention_schedule is not None:
+                # The scheduled_attention op and its eager fallback are tested only under
+                # regional compilation.
+                incompatible_features.append("diffusion_attention_schedule profiles")
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1455,10 +1503,30 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
+        if self.lora_application not in ("runtime", "merged"):
+            raise ValueError("lora_application must be 'runtime' or 'merged'")
+        if self.lora_application == "merged":
+            if self.lora_backend != LoRABackend.PEFT:
+                raise ValueError("Merged LoRA requires lora_backend='peft'")
+            if self.quantization_config is not None or self.parallel_config.use_hsdp:
+                raise ValueError("Merged LoRA requires unquantized weights without HSDP")
+            if offload_strategy is not OffloadStrategy.NONE:
+                raise ValueError("Merged LoRA does not support inference weight offloading")
+            if self.is_moe:
+                raise ValueError("Merged LoRA does not support MoE adapters")
+            if (
+                self.weight_transfer_config is not None
+                and self.weight_transfer_config.get("backend") != "omni_lora_ipc"
+            ):
+                raise ValueError("Merged LoRA weight updates require backend='omni_lora_ipc'")
+        elif self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") == "omni_lora_ipc":
+            raise ValueError("omni_lora_ipc requires lora_application='merged'")
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
@@ -1559,13 +1627,12 @@ class OmniDiffusionConfig:
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
         cfg = getattr(self, "diffusion_attention_config", None)
-        if not isinstance(cfg, AttentionConfig):
+        # The baseline plus every schedule profile, so a profile the service default never
+        # references still has its calibration discovered. The loader uses the same helper.
+        baseline = cfg if isinstance(cfg, AttentionConfig) else None
+        specs = collect_calibration_specs(baseline, getattr(self, "diffusion_attention_schedule", None))
+        if not specs:
             return
-        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
-
-        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-            propagate_skip_softmax_calibration,
-        )
 
         propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
@@ -1626,6 +1693,7 @@ class OmniDiffusionConfig:
 
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
+            _looks_like_flux3,
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
@@ -1645,6 +1713,10 @@ class OmniDiffusionConfig:
                 self.model,
                 revision=self.revision,
             )
+            # Mixed Flux3 packages also ship a Diffusers index. Native loading
+            # must resolve variant quantization from the package config below.
+            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+                config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1725,6 +1797,16 @@ class OmniDiffusionConfig:
                         )
                         self.update_multimodal_support()
                         return
+                    # Some native checkpoints (for example the Flux3
+                    # format) intentionally contain only component weights
+                    # and configs. When stage resolution or the caller has
+                    # already selected a registered pipeline, that explicit
+                    # class is sufficient to continue loading without a
+                    # top-level Hugging Face config.
+                    elif self.model_class_name is not None:
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
@@ -1735,12 +1817,26 @@ class OmniDiffusionConfig:
 
                 assert self.model is not None
                 is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
 
                 if is_hidream_o1:
                     self.model_class_name = "HiDreamO1ImagePipeline"
                     self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif is_flux3:
+                    from vllm_omni.diffusion.utils.flux3_package import _resolve_flux3_package_selection
+
+                    self.model_class_name = "Flux3Pipeline"
+                    # Resolve variant metadata before the loader snapshots quantization.
+                    selection = _resolve_flux3_package_selection(self.model, self.additional_config)
+                    if selection.quantization is not None:
+                        raise ValueError(
+                            f"Flux3 quantized variant {selection.quantization!r} is not supported by the "
+                            "BF16 base pipeline"
+                        )
+                    self.set_tf_model_config(TransformerConfig.from_dict(selection.package_config))
                     self.update_multimodal_support()
                 elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
@@ -2415,6 +2511,58 @@ class AttentionConfig:
         return None, None
 
 
+@dataclass
+class AttentionScheduleConfig:
+    """Startup-owned attention profiles and the default integer-step schedule.
+
+    Profiles resolve their own roles, without merging the baseline or its
+    environment fallback. Candidate construction and hardware validation happen
+    later, with the actual model layers available.
+    """
+
+    profiles: dict[str, AttentionConfig] = field(default_factory=dict)
+    default: AttentionSchedule = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profiles, Mapping):
+            raise TypeError("diffusion_attention_schedule.profiles must be a mapping")
+        normalized = {}
+        for name, profile in self.profiles.items():
+            validate_attention_profile_name(name)
+            if not isinstance(profile, (AttentionConfig, Mapping)):
+                raise TypeError(f"attention profile {name!r} must be an AttentionConfig or mapping")
+            normalized[name] = parse_attention_config(copy.deepcopy(profile))
+        self.profiles = normalized
+        default = parse_attention_schedule(self.default)
+        if default is None:
+            raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
+        validate_attention_schedule(default, profiles=self.profiles)
+        self.default = default
+
+
+def parse_attention_schedule_config(
+    value: AttentionScheduleConfig | Mapping[str, Any] | str | None,
+) -> AttentionScheduleConfig | None:
+    """Normalize service config without initializing backends or reading env vars.
+
+    A config without profiles can never select a candidate (its default must then be empty), so it
+    is returned as None: no schedule, and no compile boundary on the attention layers.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if isinstance(value, AttentionScheduleConfig):
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+    elif isinstance(value, Mapping):
+        config = AttentionScheduleConfig(**dict(value))
+    else:
+        raise TypeError(
+            "diffusion_attention_schedule must be an AttentionScheduleConfig, mapping, JSON object, or None"
+        )
+    return config if config.profiles else None
+
+
 def parse_attention_config(
     attention_config: AttentionConfig | Mapping[str, Any] | None = None,
     *,
@@ -2515,23 +2663,36 @@ def build_attention_config(
 def validate_kv_cache_dtype_vs_attention_specs(
     kv_cache_dtype: str | None,
     attention_config: "AttentionConfig | None",
+    schedule: "AttentionScheduleConfig | None" = None,
 ) -> None:
     """Reject a global attention-quant knob combined with per-backend quant specs.
 
     ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
     an explicit ``quant`` spec is the advanced per-backend override. Setting both
     is contradictory intent — fail fast instead of picking one silently. A pure
-    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict. Attention
+    schedule profiles follow the same rule, because a scheduled step keeps the
+    global knob.
     """
-    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+    if kv_cache_dtype in (None, "auto", "float"):
         return
-    specs = [attention_config.default, *attention_config.per_role.values()]
-    for spec in specs:
+    configs = {"diffusion_attention_config": attention_config}
+    if schedule is not None:
+        configs |= {
+            f"diffusion_attention_schedule profile {name!r}": profile for name, profile in schedule.profiles.items()
+        }
+    specs = [
+        (source, spec)
+        for source, source_config in configs.items()
+        if source_config is not None
+        for spec in (source_config.default, *source_config.per_role.values())
+    ]
+    for source, spec in specs:
         if spec is None or spec.quant is None:
             continue
         if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
             raise ValueError(
-                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                f"diffusion_kv_cache_dtype conflicts with a {source} quant spec: "
                 "the unified knob already requests quantized attention. Remove the explicit "
                 "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
             )
