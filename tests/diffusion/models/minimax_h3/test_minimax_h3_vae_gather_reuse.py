@@ -651,3 +651,129 @@ def test_decode_latent_records_the_geometry_decision_and_clears_it_after():
         assert observed["during_hw"] == ((3, 3) if uniform else None)
         assert vae._tile_gather_grid_uniform is False, "decision must not outlive the decode"
         assert vae._tile_gather_expected_hw is None, "expected shape must not outlive the decode"
+
+
+class _ChunkedGatherModel(_FakeCheckpointModel):
+    """Temporal-clip decoder that gathers its tiles the way the checkpoint does.
+
+    ``_adaptive_decode`` mirrors ``klvae.tiled_decode``: the tile grid comes
+    from ``z.shape[-2:]`` alone, this rank decodes its round-robin share, and
+    the shares are gathered -- which is the call the adapter overrides. The
+    streaming entrypoint reaches it per temporal clip without ever entering
+    ``decode_latent``, so this is what a chunked MP4 request really exercises.
+    """
+
+    use_3d_conv = True
+    token_drop = 0
+    tokens_chunk_size = 2
+    token_overlap = 0
+    vae_ratio = 1
+    vae_ratio_t = 1
+    frame_pre_padding = 0
+    frame_overlap = 0
+    isolated_first_frame = False
+    isolated_last_frame = False
+    processor = None
+
+    def __init__(self, collective_calls, sp_size, sp_rank=0):
+        super().__init__()
+        self._calls = collective_calls
+        self._sp_size = sp_size
+        self._sp_rank = sp_rank
+        self.clips = 0
+
+    def split_tiles(self, length, is_decoder=False):
+        """Two equal tiles per axis: a 2x2 equal-shape grid, four tiles."""
+        extent = length // 2
+        return [0, extent], [extent, extent], [0]
+
+    def _decode_temporal_output_frame_plan(self, z, z_head, z_tail, num_chunks, pad_tokens):
+        del z, z_head, z_tail, pad_tokens
+        return num_chunks * 2, 0, num_chunks * 2
+
+    @staticmethod
+    def blend(overlap, part, frame_overlap, dim):  # pragma: no cover - no overlap here
+        del overlap, frame_overlap, dim
+        return part
+
+    def _adaptive_decode(self, clip):
+        self.clips += 1
+        all_tiles = _tiles(4, seed=self.clips)
+        self._calls.append({"peers": _peer_stacks(all_tiles, 4, self._sp_size)})
+        gathered = self._all_gather_tiled_results(_local_tiles(all_tiles, 4, self._sp_rank, self._sp_size), 4)
+        return gathered[0]
+
+
+def _chunked_vae(collective_calls, sp_size=2):
+    vae = _vae(sp_size)
+    vae.model = _ChunkedGatherModel(collective_calls, sp_size)
+    vae._checkpoint_tile_gather = None
+    vae._install_persistent_tile_gather()
+    vae.parallel_size = sp_size
+    vae._pixel_transform = None
+    vae.config_dict = {"latent_channels": 3, "latents_mean": [0.0] * 3, "latents_std": [1.0] * 3}
+    # No process group in these tests: the streaming path then runs the
+    # temporal loop locally, which is the part that reaches the gather.
+    vae.is_distributed_enabled = lambda: False
+    vae._tile_gather_grid_uniform = False
+    vae._tile_gather_expected_hw = None
+    return vae
+
+
+def test_repeated_chunked_decodes_reuse_the_workspace(fake_collective):
+    """Streaming MP4 requests must keep the bounded gather, like decode_latent.
+
+    ``decode_with_chunks`` calls the temporal decoder directly, so without a
+    recorded geometry decision every clip gather of every chunked request
+    would take the checkpoint's per-call-allocating gather and reopen the
+    XCCL registration accumulation this class exists to bound. The sentinel
+    checkpoint gather raises if it is reached, and the landing address must
+    stay the same across requests.
+    """
+    vae = _chunked_vae(fake_collective)
+    latent = torch.zeros(1, 3, 4, 8, 8)
+    frames: list[torch.Tensor] = []
+
+    for _ in range(3):
+        MiniMaxH3VideoVAE.decode_with_chunks(vae, latent, on_chunk=frames.append)
+        assert vae._tile_gather_grid_uniform is False, "decision must not outlive the decode"
+        assert vae._tile_gather_expected_hw is None, "expected shape must not outlive the decode"
+
+    # Two temporal clips per request, all through the equal-shape collective.
+    assert vae.model.clips == 6
+    assert len(fake_collective) == 6
+    assert len({call["buf_ptr"] for call in fake_collective}) == 1, "gather buffer moved between clips"
+    assert vae._tile_gather_stats == {
+        "hits": 5,
+        "allocs": 1,
+        "workspace_bytes": _workspace_bytes(4, 2),
+    }
+    assert [int(chunk.shape[2]) for chunk in frames] == [2] * 6
+
+
+def test_chunked_decode_records_the_geometry_decision_it_shares_with_decode_latent(fake_collective):
+    """The decision is recorded from the grid geometry before any clip runs,
+    and an unequal grid routes every rank to the checkpoint gather together --
+    the same protocol choice ``decode_latent`` makes, not a chunked variant."""
+    vae = _chunked_vae(fake_collective)
+    observed = {}
+    decode_clip = vae.model._adaptive_decode
+
+    def _adaptive_decode(clip):
+        observed["uniform"] = vae._tile_gather_grid_uniform
+        observed["hw"] = vae._tile_gather_expected_hw
+        return decode_clip(clip)
+
+    vae.model._adaptive_decode = _adaptive_decode
+    MiniMaxH3VideoVAE.decode_with_chunks(vae, torch.zeros(1, 3, 4, 8, 8), on_chunk=lambda _f: None)
+    assert observed == {"uniform": True, "hw": (4, 4)}
+
+    # An unequal grid: geometry records no decision, so the clip gathers take
+    # the checkpoint's variable-shape gather on every rank alike.
+    entries: list[tuple] = []
+    vae.model.split_tiles = lambda length, is_decoder=False: ([0, length // 2], [length // 2, length // 2 - 1], [0])
+    _install_checkpoint_gather(vae, 0, 2, entries)
+    vae.model._adaptive_decode = _adaptive_decode
+    MiniMaxH3VideoVAE.decode_with_chunks(vae, torch.zeros(1, 3, 4, 8, 8), on_chunk=lambda _f: None)
+    assert observed == {"uniform": False, "hw": None}
+    assert len(entries) == 2, "every clip gather must take the checkpoint path"

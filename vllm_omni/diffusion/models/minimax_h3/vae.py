@@ -897,6 +897,35 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return self._decoder_tile_grid_hw(latent) is not None
 
     @contextmanager
+    def _tile_gather_protocol(self, latent: torch.Tensor) -> Iterator[None]:
+        """Record this decode's gather protocol, from the grid geometry alone.
+
+        Both decode entrypoints (``decode_latent`` and ``decode_with_chunks``)
+        enter this before dispatching a tile, so the chunked path reuses the
+        bounded workspace instead of falling back to the checkpoint's
+        per-call-allocating gather. The checkpoint's ``tiled_decode`` derives
+        its grid from ``z.shape[-2:]`` only, so every temporal clip of this
+        latent shares the decision recorded here, and the decision is a pure
+        function of the latent shape: every rank records the same value and
+        the gather never chooses a collective from rank-local tile shapes.
+        The decision belongs to this decode's grid only -- it is cleared on
+        the way out, and a gather with no recorded decision (the encoder-side
+        gathers) takes the checkpoint path on every rank alike.
+        """
+
+        if getattr(self, "_checkpoint_tile_gather", None) is None:
+            yield
+            return
+        expected_hw = self._decoder_tile_grid_hw(latent)
+        self._tile_gather_grid_uniform = expected_hw is not None
+        self._tile_gather_expected_hw = expected_hw
+        try:
+            yield
+        finally:
+            self._tile_gather_grid_uniform = False
+            self._tile_gather_expected_hw = None
+
+    @contextmanager
     def _rank_local_tiling(self) -> Iterator[None]:
         state = self._native_parallel_state()
         saved_state = dict(state)
@@ -1222,20 +1251,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # is dispatched. It comes from the grid geometry alone, so every rank
         # records the same value and the gather never has to choose a
         # collective from rank-local tile shapes.
-        record_protocol = getattr(self, "_checkpoint_tile_gather", None) is not None
-        if record_protocol:
-            expected_hw = self._decoder_tile_grid_hw(latent)
-            self._tile_gather_grid_uniform = expected_hw is not None
-            self._tile_gather_expected_hw = expected_hw
-        try:
-            with self._decode_tiling_context(latent):
-                decoded = self.model.decode_base(self._denormalize_latent(latent))
-        finally:
-            if record_protocol:
-                # The decision belongs to this decode's grid only; a gather
-                # with no recorded decision takes the checkpoint path.
-                self._tile_gather_grid_uniform = False
-                self._tile_gather_expected_hw = None
+        with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
@@ -1300,8 +1317,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # Native H3 tiling performs its own collectives for every temporal clip,
         # so this path needs the same too-few-tiles fallback as the complete
         # decode: without it a shape that leaves some ranks tileless hangs the
-        # gather instead of decoding rank-locally.
-        with self._decode_tiling_context(z):
+        # gather instead of decoding rank-locally. It needs the same recorded
+        # gather protocol too -- the clips go through ``_adaptive_decode``
+        # without entering ``decode_latent``, and with no decision recorded
+        # every tile gather of a streaming request would take the
+        # per-call-allocating checkpoint gather.
+        with self._tile_gather_protocol(z), self._decode_tiling_context(z):
             decode_h3_chunks(self, z, on_chunk, group=group)
 
     def _revert_decoded(self, decoded: torch.Tensor) -> torch.Tensor:
