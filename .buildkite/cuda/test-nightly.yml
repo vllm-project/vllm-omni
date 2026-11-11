@@ -412,9 +412,11 @@ steps:
             -m "full_model and diffusion and H100 and B200 and cards_1"
             --run-level "full_model"
 
-      # full_model only. The same file's advanced_model waves stay on Merge.
-      # --run-level does not collect tests. This stays 2-card DP2+DLO;
-      # the 4-GPU USP+HSDP accuracy/perf jobs do not cover it.
+      # The partition case is full_model only (not advanced_model). The same
+      # file's advanced_model waves stay on Merge. --run-level does not
+      # collect or select tests. Do not normalize -m to Merge's advanced_model
+      # expression or this step will collect zero items. This stays 2-card
+      # DP2+DLO; the 4-GPU USP+HSDP accuracy/perf jobs do not cover it.
       - label: ":full_moon: Diffusion X2V · MiniMax H3 Function Test"
         source_file_dependencies: diffusion_minimax_h3_function
         timeout_in_minutes: 90
