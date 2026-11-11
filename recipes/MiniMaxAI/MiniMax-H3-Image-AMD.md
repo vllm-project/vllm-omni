@@ -168,7 +168,6 @@ docker run -d --name minimax-h3-image-amd \
   --host 127.0.0.1 --port 8001 \
   --num-gpus 4 --usp 4 --ring 1 --text-encoder-tp-size 4 \
   --diffusion-attention-backend FLASH_ATTN \
-  --no-enable-cuda-graph-decode \
   --additional-config '{"text_encoder_cudnn_sdp":false}'
 
 docker logs --tail 100 minimax-h3-image-amd
@@ -181,10 +180,12 @@ Important settings for this profile:
 - `VLLM_ROCM_USE_SKINNY_GEMM=0` avoids an incompatible precompiled skinny
   GEMM selected by the small DiT conditioning projections. The same shape
   passed through the supported AITER/PyTorch dispatch with this setting.
-- `--no-enable-cuda-graph-decode` disables VAE graph replay. A first image
-  succeeded with graphs enabled, but a following request stalled. The
-  graph-disabled profile passed consecutive-image tests and the full
-  benchmark. Distributed VAE tile decoding remains enabled.
+- VAE tile decode uses CUDA graphs. On ROCm the pipeline replays a single
+  graph replica: concurrent replay of several replicas could leave a request
+  in VAE decode at 100% GPU utilization. With one replica, 4 × MI350X served
+  84 of 84 requests (about 60 at 4K, including concurrent clients), with
+  outputs bit-identical to eager decode and faster than eager (0.78 s vs
+  0.87 s at 2048², 3.09 s vs 3.36 s at 4736 × 3552).
 - `text_encoder_cudnn_sdp=false` records the selected encoder reproducibility
   policy. This is separate from the kernel compatibility fixes.
 - Precision is BF16, without quantization or offload. The image pipeline
@@ -192,15 +193,12 @@ Important settings for this profile:
 
 ### Per-architecture settings and other layouts
 
-- VAE graph replay can hang on both `gfx950` and `gfx942`; keep
-  `--no-enable-cuda-graph-decode` on all AMD GPUs. With graphs enabled, a
-  request can remain in VAE decode with the GPU at 100% utilization and never
-  complete. On MI350X this happened within the first three requests. On MI325X
-  (`gfx942`) the measurements below ran with graphs enabled and never stalled,
-  but the recipe-site command (Ulysses 4, encoder TP 4) stalled on its fifth
-  request; with the flag, the same command completed 16 of 16. Eager decode is
-  slower: at 4736 × 3552 on one GPU, decode took 1.0 s with graphs on MI325X
-  and 4.9 s eager on MI350X.
+- `--no-enable-cuda-graph-decode` is not needed on AMD GPUs. Earlier
+  revisions replayed several VAE graph replicas, which could hang on both
+  `gfx950` and `gfx942`; the pipeline now uses one replica on ROCm. Keep the
+  flag only as a fallback if a request stays in VAE decode; eager decode is
+  slower (at 4736 × 3552 on one GPU, 1.0 s with graphs on MI325X and 4.9 s
+  eager on MI350X).
 - For other GPU counts, set `--num-gpus N --usp N --ring 1` (Ulysses; the 56
   attention heads allow N = 2, 4 or 8) or `--num-gpus N
   --tensor-parallel-size N` (TP). Ulysses had the lowest measured latency
@@ -293,8 +291,8 @@ resolved offline from the local Hugging Face cache.
 
 | GPU | Runtime | Extra server flags |
 | --- | --- | --- |
-| MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on; for serving, add `--no-enable-cuda-graph-decode`, see above) |
-| MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with this checkout installed | `--no-enable-cuda-graph-decode` |
+| MI325X (`gfx942`) | `rocm/vllm-omni:90eeebbd173c2c3cceac75fe299fb98e06813500` | none (VAE graph decode on) |
+| MI350X (`gfx950`) | `vllm/vllm-openai-rocm:v0.33.0` with this checkout installed | `--no-enable-cuda-graph-decode` (measured before the single-replica fix; no longer needed) |
 
 Both used vLLM `0.33.0+rocm100`, PyTorch `2.13.0+rocm10.0.0`, Transformers
 5.19.0 and Diffusers 0.40.0, with `--diffusion-attention-backend FLASH_ATTN`
