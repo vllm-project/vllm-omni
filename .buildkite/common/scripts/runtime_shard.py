@@ -38,7 +38,8 @@ PYTHONPATH_EXPORT = f'export PYTHONPATH="{SCRIPTS_DIR}$${{PYTHONPATH:+:$$PYTHONP
 ARTIFACT_PATHS = ["timings/jobs/*.json"]
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _SHELL_EXPAND_ARG = re.compile(r"^(?:--(?:num-shards|shard-id)=)?\${1,2}[A-Za-z_][A-Za-z0-9_]*$")
-_SHARD_FILE_ARG = '"$${_shard_files[@]}"'
+# Buildkite runs commands with /bin/sh (dash on the CI image): no mapfile or arrays.
+_SHARD_FILE_ARG = '"$$@"'
 FILE_SHARD_ROOT = Path("timings/file-shards")
 _VALUE_OPTIONS = {
     "-m",
@@ -403,8 +404,11 @@ def _file_shard_command(command: str, slug: str) -> str:
             "set -eu",
             f'shard_list="{FILE_SHARD_ROOT.as_posix()}/{slug}/$${{BUILDKITE_PARALLEL_JOB:-0}}.txt"',
             'buildkite-agent artifact download "$$shard_list" .',
-            'mapfile -t _shard_files < "$$shard_list"',
-            'test "$${#_shard_files[@]}" -gt 0',
+            'test -s "$$shard_list"',
+            # Paths hold no whitespace or glob characters; -f keeps them literal.
+            "set -f",
+            'set -- $$(cat "$$shard_list")',
+            "set +f",
             pytest_line,
         )
     )

@@ -608,6 +608,9 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     assert SHARD_ID not in rendered
     assert "'$" not in rendered
     assert PLUGIN_MODULE in rendered
+    # Buildkite runs commands with /bin/sh. dash has no mapfile and no arrays.
+    assert "mapfile" not in rendered
+    assert "[@]" not in rendered
     expanded = rendered.replace("$$", "$").replace("pytest ", f"{interpreter} {dumper_arg} ", 1)
     if sys.platform == "win32" and "system32" in bash.lower():
         expanded = expanded.replace("$", r"\$")
