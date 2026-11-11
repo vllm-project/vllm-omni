@@ -157,6 +157,83 @@ async def test_moss_empty_stream_is_an_error(sse, payload):
                 await anext(chunks)
 
 
+def _burst_serving():
+    serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    serving._tts_model_type = "moss_tts"
+    serving.engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
+    )
+    serving._adapter = MossTTSAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+    return serving
+
+
+@pytest.mark.asyncio
+async def test_initial_burst_buffering_off_by_default(monkeypatch):
+    """Default (VLLM_OMNI_SPEECH_INITIAL_BURST unset -> 1): chunks stream
+    straight through — the consumer's first pull returns after ONE chunk
+    was generated."""
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_INITIAL_BURST", raising=False)
+    serving = _burst_serving()
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(3):
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), "burst-off", response_format="pcm")
+    first = await anext(chunks)
+    assert state["generated"] == 1, "pass-through: the first pull must return immediately after one chunk"
+    assert len(first) == 640
+    rest = [c async for c in chunks]
+    assert [len(c) for c in rest] == [640, 640]
+
+
+@pytest.mark.asyncio
+async def test_initial_burst_buffering_holds_until_full(monkeypatch):
+    """burst=N holds the first N-1 chunks and releases them together with
+    chunk N: after the consumer's FIRST pull, all N chunks must already have
+    been generated (the playback clock starts with N chunks of reserve)."""
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
+    serving = _burst_serving()
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(3):
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), "burst-on", response_format="pcm")
+    first = await anext(chunks)
+    assert state["generated"] == 3, (
+        f"burst=3: all three chunks must be generated before the first release, got {state['generated']}"
+    )
+    assert len(first) == 640
+    rest = [c async for c in chunks]
+    assert [len(c) for c in rest] == [640, 640]
+
+
+@pytest.mark.asyncio
+async def test_initial_burst_holds_wav_header_with_the_release(monkeypatch):
+    """With burst>1 the WAV header must NOT go out alone: header + the
+    whole reserve arrive together on the release pull."""
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "2")
+    serving = _burst_serving()
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(2):
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), "burst-wav", response_format="wav")
+    output = [c async for c in chunks]
+    # header + 2 held chunks, in order: header arrives WITH the release
+    assert len(output) == 3
+    assert output[0].startswith(b"RIFF")
+    assert output[1] != b"" and output[2] != b""
+
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):

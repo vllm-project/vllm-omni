@@ -1850,6 +1850,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         emitted_samples = 0
         total_audio_s: float | None = None
         sample_rate_val = 24000
+        # Initial burst buffering: hold the first (N-1) audio chunks and emit
+        # them together with chunk N, so the client's playback clock starts
+        # with N chunks of reserve and absorbs the per-arrival prefill-tail
+        # block (~100-500ms) that a shared GPU serializes ahead of decode —
+        # without the reserve, in-flight streams underrun on every mixed
+        # step. Default 1 = off; N>=2 enables. Opt-in for deployments where
+        # the first-packet reserve matters more than the earliest possible
+        # first byte.
+        burst_n = max(1, int(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1")))
+        burst_buf: list[bytes] = []
+        burst_released = burst_n <= 1
         first_chunk = True
         first_audio_chunk_s: float | None = None
         first_audio_packet_ts: float | None = None
@@ -1991,6 +2002,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     record_audio_chunk(audio_bytes, chunk_np, res)
                     if audio_format is not None and not audio_format and audio_bytes:
                         audio_format.update(_encoded_audio_format(audio_response, output_sample_rate, chunk_np))
+                    if not burst_released:
+                        # Hold the WAV header with the burst: the client
+                        # connection stays silent until the reserve releases,
+                        # so header + N chunks arrive together.
+                        burst_buf.append(audio_bytes)
+                        if len(burst_buf) >= burst_n:
+                            if wav_header is not None:
+                                yield wav_header
+                            for held in burst_buf:
+                                if include_sample_rate:
+                                    yield held, output_sample_rate
+                                else:
+                                    yield held
+                            burst_buf.clear()
+                            burst_released = True
+                        continue
                     if wav_header is not None:
                         yield wav_header
                     if include_sample_rate:
