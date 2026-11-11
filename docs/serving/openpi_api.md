@@ -108,7 +108,9 @@ reset
 
 If `endpoint` is omitted, the server treats the message as `infer`. Each
 inference message produces one action response after the engine request
-completes; action tokens or intermediate tensors are not streamed.
+completes; action tokens or intermediate tensors are not streamed. Wait for
+each reply before sending another request; pipelining closes the socket with
+code 1008.
 
 NumPy arrays use the marker format implemented by `openpi-client`. The server
 also accepts the legacy vLLM NumPy marker representation on input. JSON text
@@ -135,13 +137,16 @@ frames are not observation messages.
 
 ## Limits and Errors
 
-- Maximum inbound payload size is 64 MiB.
+- Maximum inbound payload size is 64 MiB. For robot-policy servers, the
+  WebSocket transport defaults to the same limit so camera-history messages
+  above 16 MiB reach the handler. Explicit server transport limits are preserved.
 - The server closes an idle connection after 30 seconds.
 - Invalid binary input returns a MessagePack
   `{"type":"error","message":"Invalid request payload"}` response.
 - Inference failures return a generic `Internal inference error` without
   exposing an internal traceback.
 - Unsupported NumPy object, structured, and complex dtypes are rejected.
+- Decoding runs off the event loop, with bounded container lengths and total elements.
 - A configured `openpi_prompt_builder` that cannot be imported fails server
   startup with an error naming the setting.
 
@@ -149,3 +154,11 @@ Observation keys, camera layout, state tensors, and action shapes are defined
 by the loaded policy rather than by this transport. Read the handshake before
 constructing observations. See the [DreamZero example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/dreamzero)
 for a complete OpenPI client and DROID simulation loop.
+
+For deployments declaring `needs_session_id: true`, each inference must carry a
+nonempty string `session_id`. The server namespaces client IDs by WebSocket
+connection. Reset and disconnect release that connection's owned worker sessions
+when the policy declares `supports_close_session`; other adapters use their
+existing session-drop hook. Reconnect with a fresh episode rather than resuming
+state from another socket. Policies using worker-owned sessions require one
+stage and one replica until replica affinity is supported.
