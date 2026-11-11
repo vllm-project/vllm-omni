@@ -23,6 +23,7 @@ from upload_pipeline import (  # noqa: E402
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
     _load_bootstrap_steps,
+    _load_mirror_hardwares,
     _load_source_file_dependencies,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
@@ -32,6 +33,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+CUDA_READY_YAML = Path(".buildkite/cuda/test-ready.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
@@ -171,6 +173,7 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
     assert step["retry"] == {
+        "manual": {"permit_on_passed": True},
         "automatic": [
             {"exit_status": -1, "limit": 1},
             {"exit_status": 128, "limit": 1},
@@ -191,6 +194,35 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     ]
 
 
+def test_every_hardware_preset_uses_shared_retry() -> None:
+    presets = _load_mirror_hardwares()
+    assert presets
+    for preset in presets.values():
+        assert preset["retry"]["manual"] == {"permit_on_passed": True}
+        assert preset["retry"]["automatic"] == [
+            {"exit_status": -1, "limit": 1},
+            {"exit_status": 128, "limit": 1},
+            {"signal_reason": "agent_stop", "limit": 1},
+            {"signal_reason": "agent_refused", "limit": 1},
+        ]
+
+
+def test_cpu_step_does_not_gain_hardware_retry() -> None:
+    rendered = _render_test_pipeline(
+        {
+            "steps": [
+                {
+                    "label": "CPU report",
+                    "commands": ["echo ok"],
+                    "agents": {"queue": "medium_cpu_queue_premerge"},
+                },
+            ],
+        },
+        changed_files=None,
+    )
+    assert "retry" not in rendered["steps"][0]
+
+
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
     step = _expand_mirror_hardwares(
         {
@@ -200,6 +232,7 @@ def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
         },
     )
     assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
+    assert "manual" not in step["retry"]
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
@@ -501,10 +534,6 @@ def _iter_steps(doc: dict):
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
         (
-            Path(".buildkite/cuda/test-weekly.yml"),
-            {"weekly-omni-performance-vllm-text", "weekly-omni-performance-multi-replicas"},
-        ),
-        (
             Path(".buildkite/npu/test-npu-nightly.yml"),
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
         ),
@@ -514,14 +543,12 @@ def _iter_steps(doc: dict):
     "changed_file,select_legacy",
     [
         ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", True),
         ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
         ("vllm_omni/clients/duplex.py", False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
         ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
         ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True),
         ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
         ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
         ("tests/dfx/perf/scripts/run_benchmark.py", True),
@@ -541,10 +568,53 @@ def test_qwen3_perf_pipeline_selection(
     rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=pipeline_path)
     surviving_keys = {step["key"] for step in _iter_steps(rendered) if isinstance(step.get("key"), str)}
 
-    # Compare the dependency-filtered Qwen perf jobs. The weekly random job has
-    # no source dependencies and remains unconditional under source filtering.
+    # Compare the dependency-filtered Qwen perf jobs.
     expected_keys = set(legacy_keys) if select_legacy else set()
     assert surviving_keys & legacy_keys == expected_keys
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "selected"),
+    [
+        (["tests/model_executor/models/minicpmo_4_5/test_talker_mrv2_cuda.py"], True),
+        ([".buildkite/amd/test-amd-ready.yml"], True),
+        (["vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py"], False),
+        (
+            [
+                ".buildkite/cuda/test-ready.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/ci_source_file_dependencies.yml",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+        (
+            [
+                ".buildkite/common/scripts/upload_pipeline.py",
+                "vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py",
+            ],
+            True,
+        ),
+    ],
+)
+def test_cuda_ready_r2_01_collection_count_follows_its_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_files: list[str],
+    selected: bool,
+) -> None:
+    """A change that can move the AMD R2-01 pin must run its CUDA READY check."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    _load_source_file_dependencies.cache_clear()
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=CUDA_READY_YAML)
+    labels = {step.get("label") for step in _iter_steps(rendered)}
+
+    assert ("Simple · ROCm R2-01 Collection Count" in labels) is selected
 
 
 def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
