@@ -279,8 +279,9 @@ def _flashinfer_autotune_cache_path(od_config: OmniDiffusionConfig, rank: int) -
     """Per-rank FlashInfer autotune cache file for this diffusion stage.
 
     The key covers what changes the GEMM shapes and kernels a rank runs: the model, its quantization, the dtype and
-    the parallel layout. FlashInfer itself records the GPU and library versions in the file and does not reuse a
-    file written under a different environment.
+    the parallel layout. FlashInfer itself records the GPU and library versions in the file and rejects a file
+    written under a different environment; ``_load_flashinfer_autotune_cache`` then moves this worker to an
+    environment-specific sibling path, because FlashInfer also refuses to overwrite the other environment's file.
     """
     import hashlib
 
@@ -298,6 +299,39 @@ def _flashinfer_autotune_cache_path(od_config: OmniDiffusionConfig, rank: int) -
     )
     key = hashlib.sha256(key_src.encode()).hexdigest()[:16]
     return os.path.join(envs.VLLM_CACHE_ROOT, "flashinfer_autotune", "diffusion", key, f"rank{rank}.json")
+
+
+def _flashinfer_autotune_env_tag() -> str:
+    """Short fingerprint of the GPU and library versions a tuned tactic is only valid for.
+
+    FlashInfer's own metadata is used when it can be read, so the tag changes exactly when FlashInfer
+    would reject the cache file; otherwise the library version, the CUDA version and the device name
+    stand in for it.
+    """
+    import hashlib
+
+    try:
+        from flashinfer.autotuner.autotuner import _collect_metadata
+
+        fingerprint = _stable_config_repr(dict(_collect_metadata()))
+    except Exception:
+        import flashinfer
+        from vllm.platforms import current_platform
+
+        fingerprint = _stable_config_repr(
+            (
+                getattr(flashinfer, "__version__", "unknown"),
+                getattr(torch.version, "cuda", None),
+                current_platform.get_device_name(),
+            )
+        )
+    return hashlib.sha256(fingerprint.encode()).hexdigest()[:8]
+
+
+def _flashinfer_autotune_env_cache_path(cache_path: str) -> str:
+    """Sibling of ``cache_path`` for this GPU / library environment."""
+    base, ext = os.path.splitext(cache_path)
+    return f"{base}.env-{_flashinfer_autotune_env_tag()}{ext}"
 
 
 def _device_capability_at_least(capability: int) -> bool:
@@ -333,16 +367,36 @@ def _flashinfer_autotune_wanted(od_config: Any) -> bool:
     return True
 
 
-def _flashinfer_tune_signature(sampling_params: Any) -> tuple[Any, ...]:
-    """What sets a request's GEMM row counts: output geometry, outputs per prompt and whether CFG batches."""
-    cfg = any((getattr(sampling_params, name, None) or 0) > 1 for name in ("guidance_scale", "true_cfg_scale"))
-    return (
-        *(
-            getattr(sampling_params, name, None)
-            for name in ("height", "width", "num_frames", "resolution", "num_outputs_per_prompt")
-        ),
-        cfg,
-    )
+def _flashinfer_tune_signature(request: Any) -> str:
+    """Text for the shapes a request makes the forward run.
+
+    The scheduler's batch-compatibility key already collects everything that has to be homogeneous for
+    requests to share a forward -- output geometry, outputs per prompt, CFG, LoRA and the pipeline's own
+    condition key (Qwen-Image's reference-image sizes, Wan's image condition) -- which is also what sets
+    the GEMM shapes that forward runs.
+
+    Prompt-dependent rows are not part of it: text embeddings are padded to the longest prompt of the
+    batch, so no single request's admission data predicts them. GEMMs on those rows keep FlashInfer's
+    heuristic tactic (a cache miss falls back, it does not fail).
+    """
+    try:
+        from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+
+        key: Any = build_request_batch_sampling_params_key(request)
+    except Exception:
+        # Request shapes the key builder does not accept (older callers, test stubs): fall back to the
+        # geometry and condition identity that are always readable.
+        sampling_params = getattr(request, "sampling_params", request)
+        cfg = any((getattr(sampling_params, name, None) or 0) > 1 for name in ("guidance_scale", "true_cfg_scale"))
+        key = (
+            *(
+                getattr(sampling_params, name, None)
+                for name in ("height", "width", "num_frames", "resolution", "num_outputs_per_prompt")
+            ),
+            cfg,
+            getattr(request, "batch_compatibility_key", None),
+        )
+    return _stable_config_repr(key)
 
 
 def _get_mem_allocator_instance() -> Any:
@@ -586,7 +640,7 @@ class DiffusionWorker:
 
     def _flashinfer_autotune_context(
         self,
-        sampling_params: list[Any] | None = None,
+        requests: list[Any] | None = None,
         *,
         request_ids: list[str] | None = None,
         new_request_ids: list[str] | None = None,
@@ -601,9 +655,9 @@ class DiffusionWorker:
         online per-token FP8 uses CUTLASS) on the library's heuristic tactic. Tune mode profiles
         only cache misses, but it also adds milliseconds of host time to every FlashInfer call even
         on cache hits, so it is entered only for the first forward of each new batch composition
-        (the sorted per-request shape signatures, so a batch of two ``S`` requests differs from one;
-        with step execution: every step of the requests in that batch until they finish, since
-        prefill and decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
+        (the sorted per-request signatures of ``_flashinfer_tune_signature``, so a batch of two ``S``
+        requests differs from one; with step execution: every step of the requests in that batch
+        until they finish, since prefill and decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
         The per-rank cache file is loaded once and rewritten when new tactics were profiled.
         Graph-captured paths are safe: their eager warm-up runs before capture, so capture only
         sees cache hits.
@@ -617,28 +671,37 @@ class DiffusionWorker:
         cache_path = self.__dict__.get("_flashinfer_autotune_cache_file") or _flashinfer_autotune_cache_path(
             od_config, self.rank
         )
-        self._load_flashinfer_autotune_cache(cache_path)
-        seen: set[tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        cache_path = self._load_flashinfer_autotune_cache(cache_path)
+        seen: set[tuple[str, ...]] = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        pending: dict[tuple[str, ...], set[str]] = self.__dict__.setdefault("_flashinfer_pending_signatures", {})
         tuning_ids: set[str] = self.__dict__.setdefault("_flashinfer_tuning_request_ids", set())
-        step_signatures: dict[str, tuple[Any, ...]] = self.__dict__.setdefault("_flashinfer_step_signatures", {})
-        signatures = [_flashinfer_tune_signature(sp) for sp in sampling_params or []]
+        step_signatures: dict[str, str] = self.__dict__.setdefault("_flashinfer_step_signatures", {})
+        signatures = [_flashinfer_tune_signature(request) for request in requests or []]
         if request_ids is not None:
             # Step mode: the forward batches every scheduled request, not only the newly admitted ones.
             step_signatures.update(zip(new_request_ids or [], signatures))
             signatures = [step_signatures[rid] for rid in request_ids if rid in step_signatures]
         # GEMM row counts follow the whole batch (requests x outputs per prompt x CFG), so the batch
         # composition is the key: [S] and [S, S] are different shapes.
-        batch_signature = tuple(sorted(signatures, key=repr))
-        new_batch = bool(batch_signature) and batch_signature not in seen
-        seen.add(batch_signature)
-        if new_batch and request_ids:
+        batch_signature = tuple(sorted(signatures))
+        # A composition counts as tuned only once a forward of it ran to the end, so a request that
+        # fails or is cancelled part way through does not mark the shapes it never reached.
+        new_batch = bool(batch_signature) and batch_signature not in seen and batch_signature not in pending
+        if new_batch and request_ids is not None:
+            pending[batch_signature] = set(request_ids)
             tuning_ids.update(request_ids)
         tune = new_batch or bool(request_ids and tuning_ids.intersection(request_ids))
         if not tune:
             return nullcontext()
-        return self._flashinfer_autotune_session(cache_path)
+        # Step mode commits when the requests finish; a one-shot forward commits when it returns.
+        return self._flashinfer_autotune_session(cache_path, None if request_ids is not None else batch_signature)
 
-    def _finish_flashinfer_tuning(self, request_ids: list[str]) -> None:
+    def _finish_flashinfer_tuning(self, request_ids: list[str], *, completed: bool) -> None:
+        """Retire the tuning state of requests that left the step batch.
+
+        ``completed`` requests commit the compositions they were tuning; cancelled or failed ones drop
+        them, so a retry of the same shape tunes the steps the dropped request never reached.
+        """
         tuning_ids = self.__dict__.get("_flashinfer_tuning_request_ids")
         if tuning_ids:
             tuning_ids.difference_update(request_ids)
@@ -646,24 +709,55 @@ class DiffusionWorker:
         if step_signatures:
             for request_id in request_ids:
                 step_signatures.pop(request_id, None)
-
-    def _load_flashinfer_autotune_cache(self, cache_path: str) -> None:
-        if getattr(self, "_flashinfer_autotune_loaded", None) == cache_path:
+        pending = self.__dict__.get("_flashinfer_pending_signatures")
+        if not pending:
             return
+        seen = self.__dict__.setdefault("_flashinfer_tuned_signatures", set())
+        for signature, waiting in list(pending.items()):
+            if not waiting.intersection(request_ids):
+                continue
+            if not completed:
+                del pending[signature]
+                continue
+            waiting.difference_update(request_ids)
+            if not waiting:
+                del pending[signature]
+                seen.add(signature)
+
+    def _load_flashinfer_autotune_cache(self, cache_path: str) -> str:
+        """Load this rank's tactic cache once; returns the file the worker should write back to."""
+        loaded = self.__dict__.get("_flashinfer_autotune_loaded")
+        if loaded is not None and loaded[0] == cache_path:
+            return loaded[1]
         from flashinfer.autotuner import AutoTuner
 
-        if os.path.exists(cache_path):
-            AutoTuner.get().load_configs(cache_path)
-        self._flashinfer_autotune_loaded = cache_path
-        logger.info("Worker %d: FlashInfer autotune enabled, cache %s", self.rank, cache_path)
+        save_path = cache_path
+        if os.path.exists(cache_path) and AutoTuner.get().load_configs(cache_path) is False:
+            # The file was tuned under other GPU or library versions, so FlashInfer neither loads it
+            # nor overwrites it. Give this environment its own file instead of re-tuning every start.
+            save_path = _flashinfer_autotune_env_cache_path(cache_path)
+            if os.path.exists(save_path):
+                AutoTuner.get().load_configs(save_path)
+            logger.info(
+                "Worker %d: FlashInfer rejected the autotune cache %s (different environment); using %s",
+                self.rank,
+                cache_path,
+                save_path,
+            )
+        self._flashinfer_autotune_loaded = (cache_path, save_path)
+        logger.info("Worker %d: FlashInfer autotune enabled, cache %s", self.rank, save_path)
+        return save_path
 
     @contextmanager
-    def _flashinfer_autotune_session(self, cache_path: str) -> Iterator[None]:
+    def _flashinfer_autotune_session(self, cache_path: str, commit: tuple[str, ...] | None = None) -> Iterator[None]:
         from flashinfer.autotuner import AutoTuner, autotune
 
         tuner = AutoTuner.get()
         with autotune(tune_mode=True):
             yield
+        # The forward returned, so this composition is covered; a raising forward leaves it uncovered.
+        if commit is not None:
+            self.__dict__.setdefault("_flashinfer_tuned_signatures", set()).add(commit)
         # Only shapes that missed the cache were profiled; persist them for the next start.
         if getattr(tuner, "_dirty", False):
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -1053,7 +1147,7 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
-        with ctx, self._flashinfer_autotune_context([request.sampling_params]):
+        with ctx, self._flashinfer_autotune_context([request]):
             kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
@@ -1086,8 +1180,8 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
-        batch_params = [new_req.req.sampling_params for new_req in scheduler_output.scheduled_new_reqs]
-        with ctx, self._flashinfer_autotune_context(batch_params):
+        batch_requests = [new_req.req for new_req in scheduler_output.scheduled_new_reqs]
+        with ctx, self._flashinfer_autotune_context(batch_requests):
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
@@ -1102,7 +1196,7 @@ class DiffusionWorker:
         try:
             new_reqs = scheduler_output.scheduled_new_reqs
             tune_ctx = self._flashinfer_autotune_context(
-                [new_req.req.sampling_params for new_req in new_reqs],
+                [new_req.req for new_req in new_reqs],
                 request_ids=list(scheduler_output.scheduled_request_ids),
                 new_request_ids=[new_req.req.request_id for new_req in new_reqs],
             )
@@ -1112,7 +1206,7 @@ class DiffusionWorker:
             # The engine terminates every scheduled request when execution raises.
             for request_id in scheduler_output.scheduled_request_ids:
                 self._step_lora_state.pop(request_id, None)
-            self._finish_flashinfer_tuning(list(scheduler_output.scheduled_request_ids))
+            self._finish_flashinfer_tuning(list(scheduler_output.scheduled_request_ids), completed=False)
             raise
         # The runner owns model state; retire the worker's metadata before idle.
         finished_ids = []
@@ -1121,7 +1215,7 @@ class DiffusionWorker:
             if request_output is not None and request_output.finished:
                 self._step_lora_state.pop(request_id, None)
                 finished_ids.append(request_id)
-        self._finish_flashinfer_tuning(finished_ids)
+        self._finish_flashinfer_tuning(finished_ids, completed=True)
         if profiler:
             profiler.step()
         return output
@@ -1132,7 +1226,8 @@ class DiffusionWorker:
         self.model_runner.release_step_requests(request_ids)
         for request_id in request_ids:
             self._step_lora_state.pop(request_id, None)
-        self._finish_flashinfer_tuning(request_ids)
+        # Reached on abort and on the error path, so these requests did not complete their shapes.
+        self._finish_flashinfer_tuning(request_ids, completed=False)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.

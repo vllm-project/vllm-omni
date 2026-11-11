@@ -109,18 +109,29 @@ vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune     # force
 On one B200, Wan2.2-T2V-A14B MXFP8 (832x480, 81 frames, 40 steps) went from
 112 s to 95 s per request with identical output.
 
-The first forward of each new batch (the shapes of the requests it batches:
-output size, frame count, outputs per prompt and CFG on or off, so two
-requests of one shape count as a new batch after a single one) runs under
-FlashInfer's autotune context, which profiles the GEMM shapes it has not seen;
-with step execution that covers every step of the requests in that batch,
-since prefill and decode differ. That forward is slower, so send a warm-up
-request at the measured shape and batch size before timing. Later requests
+The first forward of each new batch runs under FlashInfer's autotune context,
+which profiles the GEMM shapes it has not seen; with step execution that covers
+every step of the requests in that batch, since prefill and decode differ. That
+forward is slower, so send a warm-up request at the measured shape and batch
+size before timing. A batch is identified by the scheduler's
+batch-compatibility key of each request it batches -- output size, frame count,
+outputs per prompt, CFG, LoRA and the pipeline's own condition key (for example
+Qwen-Image-2.1's reference-image sizes) -- so two requests of one shape count
+as a new batch after a single one, and a new reference-image geometry is tuned
+again. Rows that depend on the prompt text are not covered: text embeddings are
+padded to the longest prompt in the batch, so no request predicts them at
+admission, and those GEMMs keep FlashInfer's heuristic tactic. A request that
+fails or is cancelled part way through leaves its batch untuned, so a retry
+tunes the steps it never reached. Later requests
 run in FlashInfer's normal mode and use the tuned tactics: tune mode is not kept
 on, because it adds host time to every FlashInfer call even when the tactic is
 cached. Tactics are cached per rank under
 `$VLLM_CACHE_ROOT/flashinfer_autotune/diffusion/<key>/rank<N>.json`, keyed on the
 model, quantization, dtype and parallel layout, and are reused after a restart.
+A tactic is only valid for the GPU and library versions it was tuned on;
+FlashInfer rejects such a file and will not overwrite it, so the worker then
+writes `rank<N>.env-<fingerprint>.json` next to it instead of re-tuning on every
+start.
 Captured CUDA graphs are compatible: their eager warm-up runs before capture, so
 the capture only sees cached tactics. The flag is a no-op off CUDA or without
 FlashInfer.

@@ -20,12 +20,13 @@ class _FakeTuner:
     def __init__(self):
         self.is_tuning_mode = False
         self._dirty = False
+        self.reject_paths: set[str] = set()  # files FlashInfer refuses (tuned in another environment)
         self.loaded: list[str] = []
         self.saved: list[str] = []
 
     def load_configs(self, path):
         self.loaded.append(path)
-        return True
+        return path not in self.reject_paths
 
     def save_configs(self, path):
         self.saved.append(path)
@@ -154,10 +155,10 @@ def test_step_requests_stay_in_tune_mode_until_finished(mocker, fake_flashinfer,
     monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
     worker = _make_worker(_od_config(True), lambda req, **kw: "out")
 
-    def step(new=(), ids=()):
-        new_reqs = [SimpleNamespace(req=SimpleNamespace(request_id=i, sampling_params=_params())) for i in new]
+    def step(new=(), ids=(), **shape):
+        new_reqs = [SimpleNamespace(req=SimpleNamespace(request_id=i, sampling_params=_params(**shape))) for i in new]
         with worker._flashinfer_autotune_context(
-            [r.req.sampling_params for r in new_reqs],
+            [r.req for r in new_reqs],
             request_ids=list(ids),
             new_request_ids=list(new),
         ):
@@ -166,14 +167,42 @@ def test_step_requests_stay_in_tune_mode_until_finished(mocker, fake_flashinfer,
     assert step(new=["a"], ids=["a"]) is True  # prefill of a new shape
     assert step(ids=["a"]) is True  # decode steps of the same request have other row counts
     assert step(new=["b"], ids=["a", "b"]) is True  # [S, S] is a new batch: twice the GEMM rows
-    worker._finish_flashinfer_tuning(["a"])
+    worker._finish_flashinfer_tuning(["a"], completed=True)
     assert step(ids=["b"]) is True  # "b" keeps tuning its decode steps until it finishes
-    worker._finish_flashinfer_tuning(["b"])
+    worker._finish_flashinfer_tuning(["b"], completed=True)
     assert step(new=["c"], ids=["c"]) is False  # repeat of the [S] batch
     assert step(ids=["c"]) is False
     assert step(new=["d"], ids=["c", "d"]) is False  # repeat of the [S, S] batch
-    worker._finish_flashinfer_tuning(["c", "d"])
+    worker._finish_flashinfer_tuning(["c", "d"], completed=True)
     assert worker._flashinfer_step_signatures == {}  # finished requests are forgotten
+
+
+def test_cancelled_request_leaves_its_shape_untuned(mocker, fake_flashinfer, tmp_path, monkeypatch):
+    _cuda(mocker)
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    worker = _make_worker(_od_config(True), lambda req, **kw: "out")
+
+    def step(new=(), ids=()):
+        new_reqs = [SimpleNamespace(req=SimpleNamespace(request_id=i, sampling_params=_params())) for i in new]
+        with worker._flashinfer_autotune_context(
+            [r.req for r in new_reqs], request_ids=list(ids), new_request_ids=list(new)
+        ):
+            return fake_flashinfer.is_tuning_mode
+
+    assert step(new=["a"], ids=["a"]) is True  # prefill of a new shape
+    worker._finish_flashinfer_tuning(["a"], completed=False)  # cancelled before its decode steps
+    # The shape never finished a forward, so the retry must still tune the steps "a" never reached.
+    assert step(new=["b"], ids=["b"]) is True
+    worker._finish_flashinfer_tuning(["b"], completed=True)
+    assert step(new=["c"], ids=["c"]) is False  # now covered
+
+    # Same for a raising forward: release_step_requests is the abort/error path.
+    worker.model_runner = SimpleNamespace(release_step_requests=lambda ids: None)
+    worker._step_lora_state = {}
+    assert step(new=["d"], ids=["d"]) is False  # composition already tuned by "b"
+    assert step(new=["e"], ids=["d", "e"]) is True  # new composition [S, S]
+    worker.release_step_requests(["d", "e"])
+    assert step(new=["f", "g"], ids=["f", "g"]) is True  # [S, S] is untuned again
 
 
 def test_batch_size_is_part_of_the_tuned_shape(mocker, fake_flashinfer, tmp_path, monkeypatch):
@@ -300,3 +329,86 @@ def test_decision_is_made_once_per_worker(mocker, fake_flashinfer):
         worker.execute_model(_request(**shape), worker.od_config)
 
     assert capability.call_count == 1
+
+
+def _real_request(request_id="r0", *, condition=(), height=1328, width=1328):
+    """A real request so the signature goes through the scheduler's batch-compatibility key."""
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "a cat"},
+        sampling_params=OmniDiffusionSamplingParams(height=height, width=width, true_cfg_scale=4.0),
+        request_id=request_id,
+    )
+    # What Qwen-Image-2.1's preprocessor records: the reference-image sizes that set the prefix rows.
+    request.batch_compatibility_key = ("qwen_image_21", tuple(condition))
+    return request
+
+
+def test_condition_geometry_is_part_of_the_tuned_shape(mocker, fake_flashinfer, tmp_path, monkeypatch):
+    _cuda(mocker)
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    seen = []
+    worker = _make_worker(_od_config(True), lambda req, **kw: seen.append(fake_flashinfer.is_tuning_mode) or "out")
+
+    # Same output geometry throughout; only the reference-image prefix changes.
+    for condition in ((), (), ((512, 512),), ((512, 512),), ((1024, 1024), (512, 512)), ((512, 512),)):
+        assert worker.execute_model(_real_request(condition=condition), worker.od_config) == "out"
+
+    assert seen == [True, False, True, False, True, False]
+
+
+def test_prompt_only_differences_share_a_signature(mocker, fake_flashinfer, tmp_path, monkeypatch):
+    """Text rows are padded to the longest prompt of the batch, so they are not in the signature."""
+    _cuda(mocker)
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    first = _real_request()
+    second = _real_request("r1")
+    second.prompt = {"prompt": "a very long prompt " * 20}
+
+    assert dw._flashinfer_tune_signature(first) == dw._flashinfer_tune_signature(second)
+
+
+def test_rejected_cache_file_moves_this_environment_to_its_own_path(mocker, fake_flashinfer, tmp_path, monkeypatch):
+    _cuda(mocker)
+    monkeypatch.setattr("vllm.envs.VLLM_CACHE_ROOT", str(tmp_path))
+    mocker.patch.object(dw, "_flashinfer_autotune_env_tag", return_value="deadbeef")
+
+    def runner(req, **kwargs):
+        fake_flashinfer._dirty = fake_flashinfer.is_tuning_mode
+        return "out"
+
+    worker = _make_worker(_od_config(True), runner)
+    path = dw._flashinfer_autotune_cache_path(worker.od_config, 0)
+    os.makedirs(os.path.dirname(path))
+    open(path, "w").close()
+    # FlashInfer refuses a file tuned under other GPU / library versions, and refuses to overwrite it.
+    fake_flashinfer.reject_paths.add(path)
+    env_path = dw._flashinfer_autotune_env_cache_path(path)
+
+    worker.execute_model(_request(), worker.od_config)
+
+    # Saving to the rejected file would be skipped by FlashInfer, so the fresh tactics go next to it.
+    assert fake_flashinfer.loaded == [path] and fake_flashinfer.saved == [env_path]
+    assert env_path == path.replace(".json", ".env-deadbeef.json")
+
+    # The next worker loads that file instead of tuning again.
+    open(env_path, "w").close()
+    fake_flashinfer.loaded.clear()
+    other = _make_worker(_od_config(True), runner, rank=0)
+    other.execute_model(_request(), other.od_config)
+
+    assert fake_flashinfer.loaded == [path, env_path]
+
+
+def test_signature_uses_the_scheduler_batch_key():
+    """Fields that only the scheduler key knows about must reach the signature."""
+    base = _real_request()
+    longer_text = _real_request()
+    longer_text.sampling_params.max_sequence_length = 512
+    cfg_off = _real_request()
+    cfg_off.sampling_params.true_cfg_scale = 1.0
+
+    assert dw._flashinfer_tune_signature(base) != dw._flashinfer_tune_signature(longer_text)
+    assert dw._flashinfer_tune_signature(base) != dw._flashinfer_tune_signature(cfg_off)
