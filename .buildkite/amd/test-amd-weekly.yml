@@ -280,6 +280,9 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 90
         source_file_dependencies: reliability_invalid_param_h100
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
           - artifacts/rocm-invalid-parameters-single/**/*
         commands:
@@ -410,6 +413,9 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 120
         source_file_dependencies: reliability_invalid_param_l4
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
           - artifacts/rocm-invalid-parameters-audio/**/*
         commands:
