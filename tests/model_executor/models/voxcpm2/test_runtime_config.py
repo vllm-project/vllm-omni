@@ -2,28 +2,82 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 
-from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig, reject_outer_full_cudagraph
-from vllm_omni.platforms import current_omni_platform
+import vllm_omni
+from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.model_executor.models.voxcpm2.runtime_config import (
+    _VoxCPM2RuntimeConfig,
+    reject_outer_full_cudagraph,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("uses_v2", [False, True])
-def test_runner_specific_audio_defaults(uses_v2):
+class _FakeOmniPlatform:
+    """Deterministic platform stand-in so cadence defaults are assertable on any runner.
+
+    Also counts ``is_cuda()`` calls so the tests can assert the fake was
+    actually consulted: from_vllm_config resolves the platform at call time
+    today, and these guards fail loudly if it ever switches to a module-level
+    import that would silently bypass the faked platform.
+    """
+
+    def __init__(self, is_cuda: bool) -> None:
+        self._is_cuda = is_cuda
+        self.is_cuda_calls = 0
+
+    def is_cuda(self) -> bool:
+        self.is_cuda_calls += 1
+        return self._is_cuda
+
+
+@pytest.mark.parametrize(
+    ("uses_v2", "is_cuda", "expected"),
+    [
+        (False, False, (2, 1)),
+        (False, True, (2, 1)),
+        (True, False, (2, 1)),
+        (True, True, (1, 3)),
+    ],
+)
+def test_runner_specific_audio_defaults(monkeypatch, uses_v2, is_cuda, expected):
+    # Incremental VAE is a CUDA-only per-patch feature: CUDA v2 gets the MRV2
+    # audio profile (1/3); every other combination keeps the v1 cadence (2/1).
+    # The base deploy yaml no longer pins the audio cadence keys, so the
+    # (2, 1) dataclass defaults ARE the shipped v1 behavior — changing them
+    # silently changes every deployment that does not pin the keys itself.
+    import vllm_omni.platforms as platforms_mod
+
+    # Patch the backing global, not the lazy attribute: assigning
+    # current_omni_platform writes a real module attribute that permanently
+    # shadows the lazy __getattr__ after monkeypatch restores it.
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delitem(vars(platforms_mod), "current_omni_platform", raising=False)
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
     )
-    # Incremental VAE is the CUDA v2 default only. ROCm keeps the v1 profile.
-    incremental = uses_v2 and current_omni_platform.is_cuda()
-    assert config.enable_incremental_vae is incremental
-    assert config.vae_decode_every == (1 if incremental else 3)
-    assert config.audio_emit_every == (3 if incremental else 1)
+    assert config.enable_incremental_vae is (uses_v2 and is_cuda)
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
+    if uses_v2:
+        # The v2 cadence depends on the platform read at call time; assert the
+        # fake was consulted so a module-level import can't silently bypass it.
+        assert fake_platform.is_cuda_calls >= 1
+    else:
+        # The v1 cadence must stay platform-independent: from_vllm_config
+        # should not consult the platform on the legacy path at all.
+        assert fake_platform.is_cuda_calls == 0
 
 
 def test_mrv2_explicit_legacy_audio_override():
@@ -38,6 +92,65 @@ def test_mrv2_explicit_legacy_audio_override():
     assert not config.enable_incremental_vae
     assert config.vae_decode_every == 3
     assert config.audio_emit_every == 1
+
+
+def _runtime_config_from_deploy_yaml(yaml_path: Path, use_v2_model_runner: bool) -> _VoxCPM2RuntimeConfig:
+    merged = resolve_deploy_yaml(yaml_path)
+    runtime_dict = next(
+        stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+        for stage in merged["stages"]
+        if "voxcpm2_runtime_config" in stage.get("engine_extras", {}).get("hf_overrides", {})
+    )
+    return _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner, voxcpm2_runtime_config=runtime_dict)
+        )
+    )
+
+
+def test_deploy_yaml_resolves_effective_audio_defaults():
+    # The base yaml does not pin the audio cadence keys; the dataclass
+    # defaults decide for v1 and the shipped MRV2 overlay re-pins them for v2.
+    deploy_dir = Path(vllm_omni.__file__).resolve().parent / "deploy"
+    v1 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2.yaml", use_v2_model_runner=False)
+    assert v1.vae_decode_every == 2
+    assert v1.audio_emit_every == 1
+
+    v2 = _runtime_config_from_deploy_yaml(deploy_dir / "voxcpm2_mrv2.yaml", use_v2_model_runner=True)
+    assert v2.vae_decode_every == 1
+    assert v2.audio_emit_every == 3
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "expected"),
+    [
+        (False, (2, 1)),  # non-CUDA v2 keeps the v1 cadence (incremental VAE is CUDA-only)
+        (True, (1, 3)),  # CUDA v2 must not inherit v1 cadence values from the base yaml
+    ],
+)
+def test_v2_overlay_on_base_yaml_uses_runner_defaults(monkeypatch, tmp_path, is_cuda, expected):
+    # A thin overlay built on the base yaml (base_config + model_runner: v2,
+    # no explicit cadence keys) must resolve the audio cadence through
+    # runtime_config.py per platform, not inherit stale base-yaml pins.
+    import vllm_omni.platforms as platforms_mod
+
+    # An earlier test in the same process may have resolved the real platform
+    # into a module attribute (a direct assignment); delete that residue so
+    # the from-import falls back to the lazy __getattr__ and consults the
+    # fake below. Without this, the real CUDA platform answers and the fake
+    # records zero is_cuda() calls (buildkite 18587).
+    monkeypatch.delitem(vars(platforms_mod), "current_omni_platform", raising=False)
+    fake_platform = _FakeOmniPlatform(is_cuda)
+    monkeypatch.setattr(platforms_mod, "_current_omni_platform", fake_platform)
+    deploy_yaml = Path(vllm_omni.__file__).resolve().parent / "deploy" / "voxcpm2.yaml"
+    overlay = tmp_path / "voxcpm2_v2_overlay.yaml"
+    overlay.write_text(f"base_config: {deploy_yaml}\nmodel_runner: v2\n")
+
+    config = _runtime_config_from_deploy_yaml(overlay, use_v2_model_runner=True)
+    assert (config.vae_decode_every, config.audio_emit_every) == expected
+    # Same call-time guard as the defaults test: the fake platform must be
+    # the one from_vllm_config consults.
+    assert fake_platform.is_cuda_calls >= 1
 
 
 @dataclass

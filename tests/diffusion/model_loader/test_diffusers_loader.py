@@ -285,11 +285,16 @@ def test_maybe_fuse_distilled_lora_skips_when_lora_path_unset():
     assert getattr(model, "lora_is_fused", False) is False
 
 
-def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
+@pytest.mark.parametrize(
+    ("lora_scale", "should_warn"),
+    [(1.0, False), ([1.0, 1.5], True)],
+)
+def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, should_warn, mocker):
+    warning = mocker.patch.object(loader_module.logger, "warning")
     cfg = SimpleNamespace(
         lora_backend=LoRABackend.DISTILL,
         lora_path="/path/to/lora.safetensors",
-        lora_scale=1.0,
+        lora_scale=lora_scale,
         dtype=torch.bfloat16,
         quantization_config=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -304,6 +309,10 @@ def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
 
     model.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
     assert getattr(model, "lora_is_fused", False) is True
+    if should_warn:
+        warning.assert_called_once_with("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+    else:
+        warning.assert_not_called()
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -667,6 +676,113 @@ def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypa
         "transformer.audio_proj_in.weight",
         "transformer.transformer_blocks.0.audio_ff.weight",
     ]
+
+
+def test_safetensors_directory_source_selects_model_file_from_package_root(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Exact allow patterns keep root package components isolated."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    selected_file = tmp_path / "model.safetensors"
+    sibling_file = tmp_path / "ae.safetensors"
+    selected_file.write_bytes(b"")
+    sibling_file.write_bytes(b"")
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[selected_file.name, "*.safetensors"],
+    )
+    weight = torch.zeros(1)
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    hub_download = MagicMock()
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(selected_file)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
+    hub_download.assert_not_called()
+
+
+def test_remote_source_without_index_skips_empty_index_download(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A remote exact-file source must not request an empty index filename."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="org/model",
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[checkpoint.name],
+    )
+    weight = torch.zeros(1)
+    index_resolver = MagicMock()
+    hub_download = MagicMock(return_value=str(tmp_path))
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    monkeypatch.setattr(loader_mod, "maybe_download_from_modelscope", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loader, "_resolve_weight_index", index_resolver)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+    hub_download.assert_called_once()
+    index_resolver.assert_not_called()
+
+
+def test_safetensors_directory_source_uses_its_single_checkpoint(tmp_path, mocker):
+    """A component directory with one checkpoint loads that checkpoint."""
+    component_dir = tmp_path / "dit"
+    component_dir.mkdir()
+    checkpoint = component_dir / "component.safetensors"
+    checkpoint.write_bytes(b"")
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(component_dir),
+        subfolder="",
+        revision=None,
+        fall_back_to_pt=True,
+    )
+    safetensors_iterator = mocker.patch(
+        "vllm_omni.diffusion.model_loader.diffusers_loader.safetensors_weights_iterator",
+        return_value=iter([("weight", torch.zeros(1))]),
+    )
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", torch.zeros(1))]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(checkpoint)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
 
 
 def test_stream_online_quant_weights_offloads_layers_after_processing():
@@ -1370,6 +1486,18 @@ def test_dlo_allgather_allows_unquantized_host_fallback():
     model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
 
     assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
+def test_dlo_allgather_rejects_configurable_online_fp8_blocks():
+    from vllm_omni.quantization.fp8_config import OnlineBlockFp8LinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(OnlineBlockFp8LinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == (
+        "OnlineBlockFp8LinearMethod",
+    )
 
 
 def test_dlo_load_model_keeps_host_fallback_on_cpu_through_post_load_sweep(monkeypatch, mocker):
@@ -2181,6 +2309,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 

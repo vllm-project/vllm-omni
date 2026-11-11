@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from unittest.mock import Mock, create_autospec, patch
 
 import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen3_omni.talker_sampler import Qwen3OmniTalkerSampler
 
@@ -23,7 +25,9 @@ class _BaseSampler:
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         pass
 
-    def _sample_random(self, logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler):
+    def _sample_random(
+        self, logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, has_topp_only_rows, use_fused_sampler
+    ):
         self.upstream_rows.append(int(logits.shape[0]))
         return logits.argmax(dim=-1), logits
 
@@ -38,8 +42,32 @@ class _BaseSampler:
             None,
             None,
             False,
+            False,
         )
         return sampled
+
+
+def test_custom_sampler_registers_native_masking_kernels(monkeypatch):
+    """Seeded Talker sampling uses native masking even with FlashInfer available."""
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "current_platform",
+        SimpleNamespace(is_cpu=lambda: False, is_cuda_alike=lambda: True),
+    )
+    registry = JitWarmupRegistry(SimpleNamespace())
+    with registry.activate():
+        Qwen3OmniTalkerSampler(_BaseSampler())
+
+    assert set(registry._registrations) == {
+        topk_topp_sampler._topk_topp,
+        topk_topp_sampler._topp_split_stats,
+        topk_topp_sampler._topp_split_step,
+        topk_topp_sampler._topp_split_mask,
+    }
+    assert len(registry) == 4
 
 
 def _sampler(requests: dict[int, SamplingParams]) -> tuple[Qwen3OmniTalkerSampler, _BaseSampler]:
@@ -53,7 +81,7 @@ def _sampler(requests: dict[int, SamplingParams]) -> tuple[Qwen3OmniTalkerSample
 def _step(sampler: Qwen3OmniTalkerSampler, slots: list[int], logits: torch.Tensor) -> torch.Tensor:
     mapping = torch.tensor(slots, dtype=torch.int64)
     sampled, _ = sampler.base_sampler._sample_random(
-        logits.clone(), mapping, np.array(slots), torch.zeros(len(slots), dtype=torch.int64), None, None, False
+        logits.clone(), mapping, np.array(slots), torch.zeros(len(slots), dtype=torch.int64), None, None, False, False
     )
     return sampled
 
@@ -128,3 +156,52 @@ def test_unseeded_step_stays_on_upstream_sampler():
     sampled = _step(sampler, [0, 1], logits)
     assert torch.equal(sampled, logits.argmax(dim=-1))
     assert base.upstream_rows == [2]
+
+
+@pytest.mark.parametrize("has_topp_only_rows", [False, True])
+@pytest.mark.parametrize("seeded_rows", [0, 1, 2])
+def test_target_sampler_dispatch_preserves_top_p_only_rows(has_topp_only_rows, seeded_rows):
+    """Exercise the target runtime dispatcher, rather than an older hook stub."""
+    base = Mock(spec=Sampler)
+    logits = torch.zeros(2, _VOCAB)
+    mapping = torch.arange(2, dtype=torch.int64)
+    slots = np.arange(2)
+    pos = torch.zeros(2, dtype=torch.int64)
+    base._sample_random = create_autospec(
+        Sampler._sample_random.__get__(base, Sampler),
+        side_effect=lambda rows, *args: (rows.argmax(dim=-1), rows),
+    )
+    original = base._sample_random
+    base.apply_sampling_params.side_effect = lambda logits, *args, **kwargs: logits
+    base.sampling_states = Mock()
+    base.sampling_states.get_top_k_top_p.return_value = (None, None, has_topp_only_rows)
+    base.sampling_states.any_greedy.return_value = False
+    base.sampling_states.any_explicit_seed.return_value = False
+    base.use_flashinfer = False
+    base.use_xpu_sampler = False
+    base.penalties_state = Mock(device=torch.device("cpu"))
+    sampler = Qwen3OmniTalkerSampler(base)
+    for row in range(seeded_rows):
+        sampler.add_request(row, SamplingParams(temperature=0.9, seed=row))
+    with patch(
+        "vllm_omni.model_executor.models.qwen3_omni.talker_sampler.apply_top_k_top_p", return_value=logits
+    ) as mask:
+        sampled, processed = Sampler.sample(base, logits, mapping, mapping, slots, pos, mapping, mapping, slots)
+
+    assert sampled.shape == (2,)
+    assert processed is logits
+    if seeded_rows:
+        mask.assert_called_once_with(logits, None, None, has_topp_only_rows=has_topp_only_rows)
+    else:
+        mask.assert_not_called()
+    if seeded_rows == 0:
+        original.assert_called_once_with(logits, mapping, slots, pos, None, None, has_topp_only_rows, False)
+    elif seeded_rows == 1:
+        original.assert_called_once()
+        # The other row was already masked, so its upstream call must not mask again.
+        assert original.call_args.args[-4:] == (None, None, False, False)
+        assert original.call_args.args[0].shape == (1, _VOCAB)
+        assert original.call_args.args[1].tolist() == [1]
+        assert sampled[1] == 0
+    else:
+        original.assert_not_called()

@@ -41,6 +41,9 @@ EXCLUDED_MODELS = [
     # Requires upstream AR hidden states and token boundaries; covered by
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
+    # Action expert that needs the reasoning stage's KV prefix; covered by
+    # tests/diffusion/models/alpamayo2_super and the full-model E2E test.
+    "Alpamayo2SuperPipeline",
     "WanPipeline",
     # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
     "SeedVR2Pipeline",
@@ -93,6 +96,10 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # No common tiny builder for the native Qwen/PixelUMM layout yet; covered by
+    # tests/diffusion/models/hy_nomas and real-checkpoint offline/accuracy/serving E2E.
+    "HyNomasPipeline",
+    "HyNomasModularPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
     "ABotWorldCausalPipeline",
@@ -112,7 +119,7 @@ EXCLUDED_MODELS = [
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
-    # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
+    # Experimental Noisy PP / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
     "Gr00tN1d7Pipeline",
@@ -132,6 +139,14 @@ EXCLUDED_MODELS = [
     # tests/diffusion/models/video_depth_anything and the /v1/videos/depth
     # endpoint tests.
     "VideoDepthAnythingPipeline",
+    # Covered by the dedicated e2e harnesses
+    # tests/e2e/offline_inference/test_flux3.py and
+    # tests/e2e/online_serving/test_flux3.py (FLUX3_MODEL_PATH) instead of the
+    # common tiny-model suite.
+    "Flux3Pipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
+    "PAN2ModularPipeline",
 ]
 
 

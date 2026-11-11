@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import json
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -1571,19 +1572,17 @@ class TestDeployConfigLoading:
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
-    def test_minicpmo_talker_multi_frame_is_npu_scoped(self, platform: str):
-        """Stage 1's K-frame decode needs the NPU worker to inject constant
-        continue drafts, so the deploy block that arms it must not sit in the
-        platform-shared stage.
+    def test_minicpmo_talker_multi_frame_is_platform_scoped(self, platform: str):
+        """Both platforms arm stage 1's K-frame decode in their own block.
 
-        On NPU the ``speculative_config`` is a fingerprint: the worker replays
-        the decode graph and vLLM's n-gram proposer is never consulted. On CUDA
-        the same block hands the Talker to the real proposer plus the rejection
-        sampler, which asserts on its codec ids (device-side assert out of
-        ``get_token_bin_counts_and_mask``).
+        The deploy block sits under each platform's stage 1, not in the
+        platform-shared stage, because the two use it differently: NPU replays
+        the decode graph and never consults vLLM's n-gram proposer, while CUDA
+        books the span and overrides the drafts from the runner. Both need the
+        synchronous runner contract, hence ``async_scheduling: false``.
 
-        This base profile also leaves stage-0 prefix caching off on CUDA; the
-        CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
+        This base profile also leaves stage-0 prefix caching off on CUDA; so does
+        the turn profile (see test_thinker_prefix_cache_defaults).
         """
         deploy = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
@@ -1612,16 +1611,22 @@ class TestDeployConfigLoading:
             assert stages[1].yaml_engine_args["async_scheduling"] is False
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
         else:
-            assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
-            # Without the block the head is the full codec vocabulary, so the
-            # codec EOS is the only stop id -- the marker would end a request
-            # on an ordinary codec id.
-            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+            # CUDA arms the same block: the runner injects the constant
+            # continue drafts, so the deploy stop id is the two-wide
+            # continue/stop marker and the head stays collapsed.
+            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
             # Either absent (falls back to the top-level false) or explicitly
             # false; the regression this guards against is true.
             assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
-            assert "speculative_config" not in stages[1].yaml_engine_args
-            assert stages[1].yaml_engine_args["async_scheduling"] is True
+            assert stages[1].yaml_engine_args["speculative_config"] == {
+                "method": "ngram",
+                "num_speculative_tokens": 7,
+                "prompt_lookup_min": 1,
+                "prompt_lookup_max": 1,
+            }
+            # K-step books its span with the synchronous runner contract.
+            assert stages[1].yaml_engine_args["async_scheduling"] is False
             # Base concurrency stays 16; only the NPU overlay lowers it to 8,
             # so a CUDA deployment keeps the pipeline default.
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
@@ -1698,7 +1703,10 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         assert isinstance(pipeline, PipelineConfig)
         deploy = _apply_platform_overrides(
@@ -1706,10 +1714,14 @@ stages:
             platform=platform,
         )
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expect_v2 = platform == "cuda"
+        expect_v2 = platform in {"cuda", "npu"}
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            expect_v2,
+            expect_v2,
+            expect_v2,
+        ]
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 
         duplex = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
@@ -2096,9 +2108,17 @@ stages:
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
-            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
-            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
-            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
+            *(
+                (yaml_name, platform, False)
+                for yaml_name in (
+                    "minicpmo_4_5_turn.yaml",
+                    "minicpmo_4_5_turn_mrv2.yaml",
+                    "minicpmo_4_5_turn_mrv2_h200.yaml",
+                )
+                for platform in ("npu", "rocm", "xpu", "musa")
+            ),
+            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", True),
+            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", True),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
@@ -2126,6 +2146,32 @@ stages:
         assert pipeline is not None
         stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
         assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
+
+    @pytest.mark.parametrize("runner", ["v1", "v2"])
+    @pytest.mark.parametrize("disable_prefix_cache", [False, True])
+    def test_minicpmo_turn_cuda_prefix_cache_can_be_disabled(self, monkeypatch, tmp_path, runner, disable_prefix_cache):
+        """Both runners inherit the enabled cache; an explicit overlay can opt out."""
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
+        stage0 = (
+            "\n    stages:\n      - stage_id: 0\n        enable_prefix_caching: false" if disable_prefix_cache else ""
+        )
+        overlay = tmp_path / "turn.yaml"
+        overlay.write_text(
+            f"base_config: {get_deploy_config_path('minicpmo_4_5_turn.yaml')}\n"
+            f"platforms:\n  cuda:\n    model_runner: {runner}{stage0}\n",
+            encoding="utf-8",
+        )
+        deploy = _apply_platform_overrides(load_deploy_config(overlay), platform="cuda")
+        stages = merge_pipeline_deploy(resolve_pipeline_config(deploy.pipeline), deploy)
+        # The inherited CUDA Talker entry keeps V1 for multi-frame decode.
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            runner == "v2",
+            False,
+            runner == "v2",
+        ]
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (not disable_prefix_cache)
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
@@ -3235,24 +3281,32 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
     @pytest.mark.parametrize(
-        "filename,pipeline_key",
+        "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
         [
-            ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
-            ("moss_tts_local.yaml", "moss_tts_local"),
+            ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
+            ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            # The CUDA Talker keeps V1 for multi-frame decode.
+            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", (1,)),
+            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", (1,)),
+            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", (0, 1, 2)),
+            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_recommended_native_runner_platform_defaults(self, platform, filename, pipeline_key):
+    def test_recommended_native_runner_platform_defaults(
+        self, platform, filename, pipeline_key, cuda_default_runner, cuda_v1_stages
+    ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        expect_v2 = platform == "cuda"
-        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+        assert deploy.model_runner == (cuda_default_runner if platform == "cuda" else "v1")
 
         # The selection must reach the live worker-dispatch consumer, not just
         # the transport-level DeployConfig field.
         pipeline = resolve_pipeline_config(pipeline_key)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * len(stages)
+        expected = [platform == "cuda" and stage.stage_id not in cuda_v1_stages for stage in stages]
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == expected
+        expect_v2 = all(expected)
 
         if expect_v2 and pipeline.stages and deploy.async_chunk:
             # v2 only engages the native plane on stages declaring support.
@@ -4259,3 +4313,14 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["generic-diffusion", "registered-pipeline"])
+def test_invalid_cli_sampling_json_fails_startup(registered: bool) -> None:
+    with pytest.raises(json.JSONDecodeError):
+        if registered:
+            VllmOmniConfig.from_pipeline_config(
+                OMNI_PIPELINES["moss_image"], cli_overrides={"default_sampling_params": "{"}
+            )
+        else:
+            StageConfigFactory._normalize_default_diffusion({"default_sampling_params": "{"})
