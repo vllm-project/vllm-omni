@@ -415,6 +415,25 @@ def test_talker2code2wav_async_chunk_honors_per_request_initial_codec_chunk_fram
     assert payload.meta.left_context_size == 0
 
 
+def test_talker2code2wav_async_chunk_rejects_negative_configured_initial_chunk_frames():
+    transfer_manager = _transfer_manager(chunk_frames=4)
+    transfer_manager.connector.config["extra"]["initial_codec_chunk_frames"] = -1
+    request = SimpleNamespace(
+        external_req_id="rid-ic-neg",
+        output_token_ids=[1],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    with pytest.raises(ValueError, match="initial_codec_chunk_frames=-1"):
+        talker2code2wav_async_chunk(
+            transfer_manager=transfer_manager,
+            multimodal_output=None,
+            request=request,
+            is_finished=False,
+        )
+
+
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
     transfer_manager = _transfer_manager()
     request = SimpleNamespace(

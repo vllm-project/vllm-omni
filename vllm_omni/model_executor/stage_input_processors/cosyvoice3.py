@@ -141,7 +141,7 @@ def talker2code2wav_async_chunk(
 
         initial_token_hop_len = initial_chunk_size if initial_chunk_size > 0 else chunk_size
         if initial_chunk_size > chunk_size:
-            logger.warning(
+            logger.warning_once(
                 "initial_codec_chunk_frames=%d > codec_chunk_frames=%d, clamping to codec_chunk_frames.",
                 initial_chunk_size,
                 chunk_size,
