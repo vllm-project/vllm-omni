@@ -56,8 +56,9 @@ Offline requests pass `robot_obs` and a nonempty `session_id` in
 `OmniDiffusionSamplingParams.extra_args`; reuse the id for continuation,
 `reset` starts an episode and `end_session` releases it.
 
-Closed-loop clients use [OpenPI](../serving/openpi_api.md) at
-`/v1/realtime/robot/openpi`, which drives the same worker sessions.
+Closed-loop clients use the [Positronic API](../serving/positronic_api.md) at
+`/api/v1/session[/<model_id>]` or [OpenPI](../serving/openpi_api.md) at
+`/v1/realtime/robot/openpi`. Both drive the same worker sessions.
 
 ### Observations and commands
 
@@ -106,7 +107,7 @@ Set these under `model_config` in a copy of the deployment:
 | `max_num_steps` | 16; worker-enforced cap on every API |
 | `max_sessions`, `max_context_chunks`, `exec_horizon` | 4 sessions, 1 context chunk (0 to 3), 24-row horizon (1 to 24); `context_mode=stateless` disables history |
 | `control_mode` | `droid_impedance` or `none` |
-| `session_idle_timeout` | 300 s for offline and OpenPI sessions; a transport that reserves a session keeps it alive |
+| `session_idle_timeout` | 300 s for offline and OpenPI sessions; live Positronic sockets keep their reservation |
 | `warmup` | true; runs valid observations at the configured context depths before the server is ready |
 | `text_cache_max_entries`, `text_cache_max_bytes` | 128 entries, 64 MiB; zero disables the prompt-embedding cache |
 
@@ -114,6 +115,25 @@ Failed inference discards the episode. The worker requires one GPU, bfloat16
 and `max_num_seqs: 1`, and rejects parallelism, quantization, CPU offload,
 sleep mode, LoRA and step execution at startup. Cache acceleration is not
 applied: the pipeline owns its Euler loop.
+
+## Positronic session settings
+
+Query values are JSON literals and inherit the deployment defaults:
+
+| Query | Accepted values |
+| --- | --- |
+| `num_steps` | integer 1 to `max_num_steps` |
+| `cfg_scale`, `cfg_video_scale`, `t_shift` | finite nonnegative scales; positive shift |
+| `max_context_chunks`, `exec_horizon` | integer 0 to 3; integer 1 to 24 or null |
+| `context_mode`, `control_mode` | `observed`/`stateless`; `none`/`droid_impedance` |
+| `declare_stop_on_fault` | Boolean; default true |
+
+Zero context, stateless mode or a horizon below 24 forces cold starts while
+advancing the seed. Fixed settings are `carry_mode=clean`, `solver=euler`,
+`cfg_batched=false`, `smoothing=null`, `compile=false`,
+`record_denoised=false`, `skip_video_decoder=true`, `prompt_style=caption`,
+`pad_start=false`, `stride=1`; `action_steps` must be null or equal to
+`num_steps`, and supplied `history_frames`/`stack_keys` must match the rig.
 
 ## Attention and kernels
 
