@@ -55,6 +55,11 @@ attention backend, retained set, RoPE positions, or sampling RNG.
 4. Use the existing SP error agreement before GPU publication.
 5. Commit GPU retention, then publish the prepared archive tuple.
 
+The request-mode runner also releases the session when the base runner returns
+an error-bearing `DiffusionOutput`: client errors can be serialized rather than
+raised through the session context. The original error/status is preserved;
+subsequent use of the same session ID starts with fresh state.
+
 Archive copies are blocking and once per layer/chunk. This adds D2H work;
 no speedup is claimed. An archive copy/quota failure participates in the
 existing rank error check. Local or peer failure discards pending CPU/GPU
