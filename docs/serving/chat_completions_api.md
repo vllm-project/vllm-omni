@@ -32,6 +32,32 @@ Use `stream: true` for Server-Sent Events. Input media syntax, supported output
     Each server hosts one model. Query `GET /v1/models` for its served model
     name when your client requires the `model` field.
 
+## Streaming Audio
+
+For models that support audio output, request `"stream": true`, include
+`"audio"` in `modalities`, and set `"audio": {"format": "wav"}` to receive
+streaming WAV audio. Audio events have `modality: "audio"`; each choice's
+`delta.content` contains base64-encoded audio bytes.
+
+For each `choice.index`, the first nonempty audio chunk contains a WAV header
+followed by PCM16 samples. Later chunks for that choice contain only PCM16
+samples. Empty chunks do not consume the header, and each new request starts
+a new audio stream.
+
+Audio preserves the model's mono or stereo channel layout. Each choice's
+`audio_metadata` reports `channels`, `sample_rate_hz`, and `frame_count` (samples
+per channel). The WAV header matches this metadata; stereo PCM16 samples are
+interleaved in frame order.
+
+Base64-decode each audio chunk and append its bytes, in arrival order, to one
+WAV file per choice in the request. Do not save each chunk as a separate WAV
+file: chunks after the first do not have a header. The
+[multimodal Chat client](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py)
+demonstrates this pattern.
+
+With `audio.format` set to `"pcm"` or `"pcm16"`, all chunks contain raw PCM16
+without a WAV header. A non-streaming WAV response contains a complete WAV file.
+
 ## vLLM Extension Parameters
 
 Send standard and vLLM-specific Chat parameters as top-level fields in a
