@@ -39,6 +39,24 @@ def pipeline_setup(monkeypatch):
     return model_config, language_model_class
 
 
+def test_pipeline_profiles_the_resumable_denoise_entry_points(pipeline_setup, monkeypatch):
+    monkeypatch.setattr(pipeline_module.SenseNovaU1Pipeline, "_denoise_one", lambda self: "request")
+    monkeypatch.setattr(pipeline_module.SenseNovaU1Pipeline, "denoise_step", lambda self: "step")
+    od_config = SimpleNamespace(
+        model="sensenova-test-model",
+        dtype=torch.bfloat16,
+        quantization_config=None,
+        revision=None,
+        enable_diffusion_pipeline_profiler=True,
+    )
+    pipeline = pipeline_module.SenseNovaU1Pipeline(od_config=od_config)
+
+    assert pipeline._denoise_one() == "request"
+    assert pipeline.denoise_step() == "step"
+    assert pipeline.stage_durations["SenseNovaU1Pipeline._denoise_one"] >= 0
+    assert pipeline.stage_durations["SenseNovaU1Pipeline.diffuse"] >= 0
+
+
 @pytest.mark.parametrize(
     ("quantization", "lora_backend", "lora_path"),
     [

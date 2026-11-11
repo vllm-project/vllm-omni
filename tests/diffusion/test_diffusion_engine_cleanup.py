@@ -43,6 +43,7 @@ def _make_engine() -> DiffusionEngine:
     engine.executor = SimpleNamespace(
         collective_rpc=Mock(),
         drop_output=Mock(),
+        release_step_requests=Mock(),
         shutdown=Mock(),
         wait_output_ready=Mock(),
     )
@@ -659,7 +660,7 @@ def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine
     engine = _make_engine()
     engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
     cleanup = Mock()
-    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
+    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup, release_step_requests=Mock())
     return engine, cleanup
 
 
@@ -690,6 +691,7 @@ def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
 
 def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
     engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
     engine.scheduler.add_request(_make_request("req-0"))
     engine.scheduler.finish_requests("req-0", DiffusionRequestStatus.FINISHED_COMPLETED)
 
@@ -697,6 +699,22 @@ def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
     engine._abort_requests(["req-idle"])
 
     cleanup.assert_not_called()
+    engine.executor.release_step_requests.assert_not_called()
+
+
+def test_step_abort_state_cleanup_failure_fails_the_engine() -> None:
+    engine = _make_engine()
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    request_id = engine.scheduler.add_request(_make_request("abort-cleanup-failure"))
+    error = RuntimeError("step retirement failed on a Worker")
+    engine.executor.release_step_requests.side_effect = error
+    engine._fail_engine = Mock()
+
+    with pytest.raises(RuntimeError, match="step retirement failed"):
+        engine._abort_requests([request_id])
+
+    engine.executor.release_step_requests.assert_called_once_with([request_id])
+    engine._fail_engine.assert_called_once_with(error)
 
 
 def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:

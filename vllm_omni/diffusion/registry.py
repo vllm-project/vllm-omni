@@ -883,6 +883,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
     "Flux3Pipeline": "get_flux3_pre_process_func",
     "PAN2ModularPipeline": "get_pan2_pre_process_func",
