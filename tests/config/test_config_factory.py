@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import json
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -4331,3 +4332,14 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["generic-diffusion", "registered-pipeline"])
+def test_invalid_cli_sampling_json_fails_startup(registered: bool) -> None:
+    with pytest.raises(json.JSONDecodeError):
+        if registered:
+            VllmOmniConfig.from_pipeline_config(
+                OMNI_PIPELINES["moss_image"], cli_overrides={"default_sampling_params": "{"}
+            )
+        else:
+            StageConfigFactory._normalize_default_diffusion({"default_sampling_params": "{"})
