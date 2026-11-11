@@ -94,6 +94,7 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
+from vllm_omni.model_extras.pan2 import get_pan2_video_generation_defaults
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -292,6 +293,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "MiniMaxH3ModularPipeline",
         )
     },
+    # PAN 2 scales and center crops the first frame to the requested size itself.
+    "PAN2ModularPipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+        "video_generation_defaults_builder": get_pan2_video_generation_defaults,
+    },
     **{
         model_class_name: {
             "extra_body_params": LTX_EXTRA_BODY_PARAMS,
@@ -357,6 +363,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "QwenImage21Pipeline": {
         "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
+    },
+    "Flux3Pipeline": {
+        "extra_body_params": frozenset({"flow_shift"}),
+        "image_to_image_prompt_builder": default_image_to_image_prompt,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
