@@ -323,10 +323,10 @@ steps:
         - |
           timeout --signal=TERM --kill-after=1m 30m bash <<'PAUSE_KEEP_READY'
           set -euo pipefail
-          # Cold AITER JIT can consume the default 600-second DLO wave budget
-          # before the first execute_model returns. Keep AITER enabled while
-          # leaving the 30-minute command as the outer bound.
-          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900
+          # Cold AITER JIT has exceeded 900 seconds before the first
+          # execute_model returns. Keep AITER enabled, give the compile a
+          # 20-minute wave budget, and retain the 30-minute outer fail-close.
+          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200
           nodes=(
             "tests/diffusion/distributed/test_pause_keep_two_ranks.py::test_keep_pause_two_ranks_ack_and_rank_failure"
           )
