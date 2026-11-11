@@ -110,11 +110,11 @@ def get_text_to_audio_query(
         text = "Hello, this is a test of Step Audio 2 text to speech synthesis."
 
     prompt = (
-        "<|im_start|>system\n"
-        "请逐字朗读用户提供的文本，不要改写或补充。<|im_end|>\n"
-        "<|im_start|>user\n"
-        f"{text}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "<|BOT|>system\n"
+        "请逐字朗读用户提供的文本，不要改写或补充。<|EOT|>"
+        "<|BOT|>human\n"
+        f"{text}<|EOT|>"
+        "<|BOT|>assistant\n"
         "<tts_start>"
     )
 
@@ -151,14 +151,7 @@ def get_audio_to_audio_query(
     if question is None:
         question = "请仔细聆听这段语音，然后复述其内容。"
 
-    prompt = (
-        "<|im_start|>system\n"
-        f"{question}<|im_end|>\n"
-        "<|im_start|>user\n"
-        "<audio_patch><|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<tts_start>"
-    )
+    prompt = f"<|BOT|>system\n{question}<|EOT|><|BOT|>human\n<audio_patch><|EOT|><|BOT|>assistant\n<tts_start>"
 
     # Load source audio
     if audio_path:
