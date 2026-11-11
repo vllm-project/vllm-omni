@@ -842,6 +842,27 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_tts_base_expansion.py
     - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
     - tests/e2e/online_serving/test_qwen3_tts_customvoice_expansion.py
+    - tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
+    - vllm_omni/model_executor/stage_input_processors/forced_aligner.py
+    - vllm_omni/utils/forced_aligner.py
+
+  tts_audex_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_audex_s2t.py
+    - tests/e2e/offline_inference/test_audex_tta.py
+    - tests/e2e/offline_inference/test_audex_tts.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/audex_thinker_only.yaml
+    - vllm_omni/deploy/audex_tta.yaml
+    - vllm_omni/deploy/audex_tts.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/openai/tts_adapters/audex.py
+    - vllm_omni/entrypoints/openai/tts_adapters/audex_tta.py
+    - vllm_omni/model_executor/models/audex/
+    - vllm_omni/model_executor/stage_input_processors/audex.py
 
   tts_moss_tts_expansion:
     - tests/e2e/offline_inference/test_moss_tts_expansion.py
@@ -858,6 +879,7 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/moss_tts.py
 
   tts_cosyvoice3_function:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *cosyvoice3
     - tests/assets/cosyvoice3/
     - tests/e2e/offline_inference/test_cosyvoice3_expansion.py
