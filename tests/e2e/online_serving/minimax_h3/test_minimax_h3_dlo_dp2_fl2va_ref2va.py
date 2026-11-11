@@ -14,9 +14,9 @@ and finalizes it when a different value appears. This module must not add
 another server param. DLO teardown can leave a stale ``resource_tracker``
 ``/psm_*`` entry in the parent and strand the next collective. Turbo LoRA
 (TP2) and FastH3 LoRA (HSDP/USP) stay in their own pytest processes for that
-reason and because those layouts are not this DP2 server. The Ref2VA
-partition's own transformer is covered by
-``test_minimax_h3_ref2va_partition.py``, also its own process.
+reason and because those layouts are not this DP2 server. CUDA Nightly
+runs ``test_minimax_h3_ref2va_partition.py`` for the Ref2VA partition's
+own transformer.
 """
 
 from __future__ import annotations

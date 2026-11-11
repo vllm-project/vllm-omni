@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Light single-partition Ref2VA boot for the Merge DP2 job.
+"""Light single-partition Ref2VA boot for CUDA Nightly.
 
-The combined DP2+DLO server loads Ref2VA as ``transformers_ref``. This
-process boots ``--task-type ref2va`` so a live GPU server still takes the
-per-partition download, checks ``expected_partition == "ref2va"``, and
-denoises on ``self.transformer``.
+Merge runs FL2VA and Ref2VA on one ``--task-type combined`` DP2+DLO server,
+where Ref2VA denoises through ``transformers_ref``. This process boots
+``--task-type ref2va`` so a live CUDA GPU still takes the per-partition
+download, checks ``expected_partition == "ref2va"``, and denoises on
+``self.transformer``. It is a CUDA Nightly step, not part of the Merge job.
 
 ``--enforce-eager`` skips inductor compile. The wave is two concurrent
 512x288 one-step clips: one step is a supported full-range schedule, 4s is
 the duration floor, and DP AllGather still needs a homogeneous pair. The
-full 1344x768 four-step FL2VA and Ref2VA waves stay on the combined server.
-This file is its own pytest process so a DLO teardown cannot strand Turbo
-or FastH3.
+full 1344x768 four-step waves stay on the Merge combined server.
 """
 
 from __future__ import annotations
