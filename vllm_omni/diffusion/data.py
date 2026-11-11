@@ -311,11 +311,16 @@ class DiffusionParallelConfig:
     text_encoder_tp_size: int = 1
     """Number of ranks used to tensor-parallel shard the diffusion text encoder.
 
-    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
-    which keeps the encoder fully resident on the DiT main rank (historical
-    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
-    ranks and run the encode with distributed collectives over the encoder
-    process group.
+    Defaults to 1, which keeps a full encoder copy (historical behavior).
+    Values > 1 shard the encoder and run the encode with collectives over the
+    encoder process group:
+
+    - MiniMax-H3 shards its Qwen3-VL encoder across the first
+      ``text_encoder_tp_size`` DiT ranks.
+    - Pipelines using ``maybe_shard_text_encoder`` (Qwen-Image family, incl. Qwen-Image-2.1) shard a
+      Hugging Face encoder with its ``base_model_tp_plan``; groups tile each
+      data-parallel replica, so the size must divide the replica's rank count
+      (world size / data_parallel_size).
     """
 
     vae_parallel_mode: str = "tile"
@@ -868,6 +873,11 @@ class OmniDiffusionConfig:
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     diffusion_attention_schedule: "AttentionScheduleConfig | None" = None
     fa_deterministic: bool = False
+    # Run the positive and negative CFG branches as one batched denoiser call
+    # when CFG is not split across ranks. Only pipelines that declare
+    # ``supports_cfg_batching`` use it; it halves the denoiser calls per step.
+    # Off by default: opt in with ``--enable-cfg-batching``.
+    enable_cfg_batching: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

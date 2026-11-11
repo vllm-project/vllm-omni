@@ -72,6 +72,17 @@ from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
 
+
+def _request_key(info: Any, index: int) -> str:
+    """Stable request key across V1 and MRv2 buffer layouts."""
+    identifier = None
+    if isinstance(info, dict):
+        identifier = info.get("req_id")
+        if identifier is None:
+            identifier = info.get("request_id")
+    return str(identifier) if identifier is not None else str(index)
+
+
 # Codec-sampling fallbacks the multi-frame path reads directly. The deploy YAML
 # and the checkpoint's tts_config override them per request; these match what
 # the single-frame path falls back to.
@@ -771,6 +782,12 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
         )
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
+        # K-step passes two-wide continue/stop control rows to the sampler.
+        # Codec sampling (penalties, EOS, history) already happened inside the
+        # model's per-frame output loop, so the codec-vocab penalties must not
+        # index into these rows -- V1 does the same via min-tokens neutralization.
+        if logits.shape[-1] <= 2:
+            return logits
         if np.any(self.use_window[ctx.idx_mapping_np]):
             # One logits row per request means no draft rows: every window ends at total_len.
             drafts = logits.shape[0] != len(ctx.idx_mapping_np)
@@ -868,7 +885,136 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         for req_id in finished_req_ids:
             self._v1_generators.pop(req_id, None)
 
+    def _control_rows_output(
+        self, sampled: torch.Tensor, input_batch: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fold a K-frame control step into one row per request.
+
+        ``sampler_output.sampled_token_ids`` is read as one row per request
+        (``num_sampled_tokens = ...shape[0]``, gpu_model_runner.py:3475) and,
+        once the row is wider than one id, the engine keeps every entry that is
+        not ``PLACEHOLDER_TOKEN_ID`` and is below ``vocab_size``
+        (rejection_sampler.py:313). A K-frame step therefore reports K columns
+        padded with ``-1``; frame 0 alone would let a stop bit raised on a later
+        frame never reach ``check_stop`` and the request would run to
+        ``max_tokens``.
+        """
+        n = int(input_batch.num_reqs)
+        num_rows = int(sampled.shape[0])
+        if n <= 0 or num_rows < n:
+            raise RuntimeError(
+                f"MiniCPM-o K-step sampler: {num_rows} control rows cannot cover {n} requests; the K-step layout moved"
+            )
+        mapping = getattr(input_batch, "expanded_idx_mapping", None)
+        counts = self._control_rows_per_request(mapping, n, num_rows)
+        if num_rows % n == 0 and (counts is None or min(counts) == max(counts)):
+            frames = num_rows // n
+            # ``merge_frame_outputs`` stacks one request's frames into consecutive
+            # rows (minicpmo_4_5_omni_tts.py:2740), the same request-major layout
+            # ``logits_indices`` reads, so a plain reshape recovers the frames
+            # without a device read.
+            rows = sampled.reshape(n, frames)
+            active = None
+        else:
+            # Uneven step: a request still in chunked prefill contributes rows
+            # that were never sampled, so the frames cannot be reshaped. Scatter
+            # by ``expanded_idx_mapping`` and drop the prefill request's frames
+            # the way the runner does (its token is discarded).
+            rows, active = self._control_rows_uneven(sampled, input_batch, n, counts)
+        stop = rows == 1
+        # Keep every frame up to and including the first stop bit. The engine
+        # finishes a request on its last adopted id only (``check_stop`` reads
+        # ``output_token_ids[-1]``, vllm/v1/core/sched/utils.py:105), so trailing
+        # continue rows would hide a stop raised mid-step.
+        before_stop = stop.long().cumsum(dim=1) - stop.long()
+        keep = before_stop == 0
+        if active is not None:
+            keep = keep & active.unsqueeze(1)
+        padded = torch.where(keep, rows, torch.full_like(rows, -1))
+        num_sampled = keep.sum(dim=1, dtype=torch.int32)
+        # The step adopts every frame it ran, so no row is a rejection.
+        num_rejected = torch.zeros_like(num_sampled)
+        return padded, num_sampled, num_rejected
+
+    @staticmethod
+    def _control_rows_per_request(mapping: Any, n: int, num_rows: int) -> list[int] | None:
+        """Rows per request from ``expanded_idx_mapping`` (host read, rare path).
+
+        Returns ``None`` when the batch carries no mapping, which means the
+        layout is the uniform request-major one merge_frame_outputs produced.
+        """
+        if mapping is None:
+            return None
+        values = mapping.detach().to(device="cpu").reshape(-1).tolist()
+        if len(values) != num_rows:
+            return None
+        counts = [0] * n
+        for value in values:
+            index = int(value)
+            if index < 0 or index >= n:
+                return None
+            counts[index] += 1
+        return counts
+
+    def _control_rows_uneven(
+        self,
+        sampled: torch.Tensor,
+        input_batch: Any,
+        n: int,
+        counts: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter an uneven control step into one padded row per request."""
+        mapping = input_batch.expanded_idx_mapping.detach().to(device="cpu").reshape(-1).tolist()
+        if counts is None:
+            counts = [0] * n
+            for value in mapping:
+                counts[int(value)] += 1
+        frames = max(1, max(counts))
+        values = sampled.detach().to(device="cpu").reshape(-1).tolist()
+        slots = getattr(input_batch, "idx_mapping", None)
+        slot_of_request = slots.detach().to(device="cpu").reshape(-1).tolist() if slots is not None else list(range(n))
+        num_computed = getattr(input_batch, "num_computed_prefill_tokens_np", None)
+        num_scheduled = getattr(input_batch, "num_scheduled_tokens", None)
+        prefill_host = getattr(input_batch, "prefill_len_np", None)
+        if num_computed is not None and num_scheduled is not None and prefill_host is not None:
+            computed = [int(num_computed[r]) + int(num_scheduled[r]) for r in range(n)]
+        else:
+            computed = input_batch.seq_lens.detach().to(device="cpu").reshape(-1).tolist()[:n]
+        if prefill_host is None:
+            prefill_host = self.req_states.prefill_len.gpu.detach().to(device="cpu").reshape(-1).tolist()
+        active = []
+        for row in range(n):
+            slot = int(slot_of_request[row]) if row < len(slot_of_request) else row
+            prompt_len = int(prefill_host[slot]) if slot < len(prefill_host) else 0
+            # seq_len below the prompt length means the request is still in
+            # chunked prefill: the runner discards whatever it sampled.
+            active.append(int(computed[row]) >= prompt_len)
+        filled = [[-1] * frames for _ in range(n)]
+        cursor = [0] * n
+        for row, request in enumerate(mapping):
+            slot = int(request)
+            filled[slot][cursor[slot]] = int(values[row])
+            cursor[slot] += 1
+        rows = torch.tensor(filled, dtype=sampled.dtype, device=sampled.device)
+        active_mask = torch.tensor(active, dtype=torch.bool, device=sampled.device)
+        return rows, active_mask
+
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        if logits.shape[-1] <= 2:
+            # K-step control rows are two-wide; sampling already ran per frame,
+            # so take the set bit and skip the codec-vocab pipeline.
+            sampled = logits.argmax(dim=-1)
+            sampled, num_sampled, num_rejected = self._control_rows_output(sampled, input_batch)
+            output_kwargs: dict[str, Any] = {
+                "sampled_token_ids": sampled,
+                "logprobs_tensors": None,
+                "num_nans": None,
+                "num_sampled": num_sampled,
+                "num_rejected": num_rejected,
+            }
+            if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
+                output_kwargs["sampling_mask_tensors"] = None
+            return Mrv2SamplerOutput(**output_kwargs)
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
         masked = getattr(self.talker, "_mrv2_masked_eos", None)
         self.talker._mrv2_masked_eos = None
@@ -1223,26 +1369,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         parsers is what keeps the runner and the scheduler from disagreeing: a
         mismatch either arms the loop with no drafts to consume, or leaves it
         off while the scheduler reserves K positions per request.
-
-        Model Runner V2 is rejected outright: its decode preprocess is an
-        identity (the runner embeds its own gathered ids), so the K-step
-        re-embed lives in the V1 batched path only. Arming the loop anyway
-        would condition every row on a placeholder continue id and quietly
-        degrade the codec stream.
         """
         model_cfg = getattr(vllm_config, "model_config", None)
         frames = talker_kstep_frames(
             getattr(model_cfg, "model_stage", None),
             getattr(vllm_config, "speculative_config", None),
         )
-        if frames > 0 and bool(getattr(model_cfg, "use_v2_model_runner", False)):
-            raise ValueError(
-                "Talker multi-frame decode is not supported with Model Runner V2: "
-                "its decode preprocess embeds the ids the runner gathered (under speculative "
-                "decoding, the placeholder continue ids) instead of the real previous codec frame, "
-                "and the owned id snapshot the codec payload is built from lives in the V1 batched "
-                "decode path. Turn off multi-frame decode (num_speculative_tokens) or Model Runner V2."
-            )
         if frames > 0:
             logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
@@ -1518,8 +1650,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
-        request_id = info_dict.get("request_id")
-        request_id = str(info_dict.get("req_id", "0") if request_id is None else request_id)
+        # Single key helper for every per-request mapping in this file
+        # (audio states, condition states, codec device-state rows): MRv2
+        # buffers always carry ``req_id`` (engine id), V1 buffers carry
+        # ``request_id``; both resolve to the same engine-side id per runner.
+        request_id = _request_key(info_dict, 0)
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
@@ -1750,7 +1885,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         prefill_embeds: list[tuple[int, torch.Tensor]] = []
         k_last_rows: list[tuple[int, int]] = []
         for row, info in enumerate(req_infos):
-            request_id = str(info.get("request_id", "0"))
+            request_id = _request_key(info, row)
             state = info.get("audio_state")
             if info.get("_omni_is_prefill", False) or not isinstance(state, dict):
                 # A row without Talker state builds its condition like a prefill.
@@ -1832,8 +1967,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     # counts and penalty histories stay on the device. MRv2 derives these
     # directly from runner state rather than the model-owned V1 codec slots.
 
-    #: Decode rows need no per-row preprocess beyond the runner's embedding.
-    mrv2_decode_preprocess_is_identity = True
+    @property
+    def mrv2_decode_preprocess_is_identity(self) -> bool:
+        """K<=1 decode rows need no model-side preprocess.
+
+        With one frame per step the runner's ``embed_input_ids`` already wrote
+        the real codec token, and ``preprocess_decode_batch_mrv2`` early-returns
+        the inputs unchanged, so the runner can skip decode rows entirely (no
+        per-row info build, no batched call). K>1 rows carry K-step placeholder
+        codes that must be re-embedded from the previous real codec frame, so
+        they are not identity.
+        """
+        return int(getattr(self, "_k_step_frames", 0) or 0) <= 1
 
     @property
     def logits_vocab_size(self) -> int:
@@ -1846,24 +1991,79 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         input_embeds: torch.Tensor,
         req_infos: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-        """Decode rows are ``emb_code`` of their input id, already in ``input_embeds``."""
+        """Re-embed K-step placeholder rows with the previous real codec frame."""
         num_rows = len(req_infos)
         empty = input_embeds.new_empty((num_rows, 0))
-        return input_ids, input_embeds, empty, empty, [{} for _ in range(num_rows)]
+        updates: list[dict[str, Any]] = [{} for _ in range(num_rows)]
+        if int(getattr(self, "_k_step_frames", 0) or 0) <= 1:
+            # Single-frame MRv2: the runner already embedded last_sampled_tokens.
+            return input_ids, input_embeds, empty, empty, updates
+
+        weight = self.emb_code[0].weight
+        codes = input_ids.reshape(-1).to(device=weight.device, dtype=torch.long).clone()
+        empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
+        request_states = self._request_audio_states
+        scalar_rows: list[tuple[int, int]] = []
+        for row, info in enumerate(req_infos):
+            state = info.get("audio_state")
+            stored = request_states.get(_request_key(info, row))
+            if isinstance(stored, dict):
+                state = stored
+            if not isinstance(state, dict) or state.get("finished"):
+                updates[row] = {"codes": {"audio": empty_codes}}
+                continue
+            device_last = state.get("_kstep_last_code")
+            if isinstance(device_last, torch.Tensor):
+                codes[row : row + 1].copy_(device_last)
+            else:
+                last = state.get("last_code")
+                if isinstance(last, int) and last >= 0:
+                    scalar_rows.append((row, last))
+            updates[row] = {"codes": {"audio": empty_codes}}
+        if scalar_rows:
+            codes.index_copy_(
+                0,
+                index_to_device([row for row, _ in scalar_rows], codes.device),
+                torch.tensor([code for _, code in scalar_rows], dtype=torch.long, device=weight.device),
+            )
+        embeds = self.emb_code[0](codes)
+        return input_ids, embeds, empty, empty, updates
 
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any]:
         talker_sampler = _install_mrv2_talker_sampler(sampler, self)
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         if spec_config is None:
             return talker_sampler, None
-        if not self._mrv2_turn_drafts():
-            # Any draft method, not only drafters that read Talker layers.
+        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+        if self._mrv2_turn_drafts():
+            # DSpark turn-session draft verification: verification reuses the
+            # stock sampler, whose penalty stage is the codec window.
+            return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
+        if self._k_step_frames > 0:
+            if session_mode == "duplex":
+                # Duplex with a stage-1 speculative_config is how the K-step count
+                # reaches the Talker (K > 0): the frame loop drives draft booking
+                # through the runner's _propose_draft_tokens and the per-frame
+                # boundary samplers, so no draft speculator is installed here and
+                # this combination must not raise.
+                return talker_sampler, None
+            # A turn session cannot book the K-step frame loop's drafts (the
+            # booking lives in the duplex runner), so its draft codes would be
+            # sampled without verification -- fail closed like any other draft
+            # method.
             raise NotImplementedError(
-                "MiniCPM-o 4.5 Talker on model_runner: v2 verifies draft codes in turn sessions only; "
-                "remove the stage-1 speculative_config for duplex"
+                "MiniCPM-o 4.5 Talker (model_runner: v2) K-step frames require "
+                "session_mode: duplex; remove the stage-1 speculative_config "
+                "from turn sessions"
             )
-        # Verification reuses the stock sampler, whose penalty stage is the codec window.
-        return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
+        # Any other stage-1 draft method would verify draft rows without the
+        # Talker's codec-window penalty and forced EOS (the same hazard
+        # _check_v1_draft_method guards for the V1 runner): fail closed.
+        raise NotImplementedError(
+            "MiniCPM-o 4.5 Talker (model_runner: v2) verifies draft codes in "
+            "turn sessions only; remove the stage-1 speculative_config for "
+            "duplex sessions without the K-step frame loop"
+        )
 
     def _mrv2_turn_drafts(self) -> bool:
         """Whether this Talker can verify draft codes: turn sessions without the K-step loop.
@@ -2211,7 +2411,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         states = []
         request_ids = []
         for index, info in enumerate(infos):
-            request_id = str(info.get("request_id", index))
+            request_id = _request_key(info, index)
             state = self._request_audio_states.get(request_id)
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
@@ -2455,6 +2655,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             old_codes = state.get("codes")
             if not isinstance(old_codes, torch.Tensor):
                 old_codes = hidden.new_empty((0,), dtype=torch.long)
+            elif old_codes.device != delta.device:
+                # The prefill handoff seeds ``codes`` on the host, while the
+                # fused CUDA graph emits ``delta`` on the device. Align them
+                # before concatenating (build 19180 Stage-1 fatal error).
+                old_codes = old_codes.to(delta.device)
             # Full-width mirror; only the host-side ``_request_codec_history``
             # (flushed one step later) is exact, and it is the one readers use.
             state["codes"] = torch.cat((old_codes.reshape(-1), delta.reshape(-1)))
@@ -2552,7 +2757,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
                 continue
-            request_id = str(info.get("request_id", index))
+            request_id = _request_key(info, index)
             state = request_states.get(request_id)
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
@@ -2594,7 +2799,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(flag_false)
                 continue
-            request_id = str(info.get("request_id", index))
+            request_id = _request_key(info, index)
             state = request_states.get(request_id)
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
@@ -2674,6 +2879,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             assert head_logits_all is not None
             projection_index = projection_indices[index]
             frame_logits = head_logits_all[projection_index : projection_index + 1]
+            # min_tokens is enforced per frame by the boundary samplers below
+            # (same semantics as the single-frame path's ``mask_eos_rows``):
+            # while ``step < min_tokens`` the stop ids are censored, and on the
+            # first frame past the floor the model decides again on its own.
+            # There is deliberately no cross-frame stop latch here.
             if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -3369,7 +3579,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if not bool(emit):
                 continue
             codes = state.get("codes")
-            if isinstance(codes, torch.Tensor):
+            if not isinstance(codes, torch.Tensor):
+                # First committed frame of a request whose state arrived without a
+                # history tensor (MRv2 never seeds ``codes`` at prefill). Seeding
+                # here is what makes the penalty window grow at all: the old
+                # extend-only form skipped the update forever, so every frame was
+                # sampled with an empty window and some texts never stopped.
+                seed = None
+                if isinstance(info, dict):
+                    accumulated = (info.get("audio_codes") or {}).get("accumulated")
+                    if isinstance(accumulated, torch.Tensor):
+                        seed = accumulated.to(dtype=torch.long).reshape(-1)
+                if seed is not None and seed.numel() > 0:
+                    codes = torch.cat([seed[-(HISTORY_WINDOW - 1) :], seed.new_tensor([sampled_id])])
+                else:
+                    codes = torch.tensor([sampled_id], dtype=torch.long)
+                state["codes"] = codes
+            else:
                 state["codes"] = torch.cat([codes[-(HISTORY_WINDOW - 1) :], codes.new_tensor([sampled_id])])
             # K-step: the rows vLLM schedules for the next step carry
             # placeholder continue ids, so the real previous codec id is kept
@@ -3477,7 +3703,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
             if not isinstance(info, dict):
                 continue
-            request_id = str(info.get("request_id", index))
+            request_id = _request_key(info, index)
             state = self._request_audio_states.get(request_id)
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
@@ -3557,7 +3783,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     getattr(getattr(self, "vllm_config", None), "scheduler_config", None), "max_num_seqs", 4096
                 )
                 codec_state = self._device_codec_state = CodecState(device, self._num_audio_tokens, capacity=capacity)
-            rows = [(str(infos[index].get("request_id", index)), state, code) for index, state, code in gpu_rows]
+            # Key codec device-state rows through the shared helper so the row
+            # identity matches the engine-side id used by the release path
+            # (``on_requests_finished``). MRv2 buffers carry ``req_id`` only;
+            # keying on ``request_id`` would silently fall back to the batch
+            # row index, which is reused whenever a slot is recycled and would
+            # never be released (the release path receives engine ids).
+            rows = [(_request_key(infos[index], index), state, code) for index, state, code in gpu_rows]
             if (
                 len(gpu_groups) == len(gpu_rows)
                 and all(group is gpu_groups[0][0] for group, _ in gpu_groups)
