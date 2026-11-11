@@ -20,7 +20,6 @@ from vllm.logger import init_logger
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 if TYPE_CHECKING:
@@ -247,84 +246,3 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
             "NPU Model Runner V2 loaded %s with Ascend attention metadata.",
             type(self.model).__name__,
         )
-
-
-class NPUOmniGenerationModelRunner(OmniGenerationModelRunner, NPUModelRunner):
-    """Attention-free Omni generation stages on Ascend Model Runner V2.
-
-    Omni's load and capture wrappers are first in the MRO and use cooperative
-    super() calls, which continue into Ascend's runner. Input preparation,
-    dummy batches, forward context, and KV initialization explicitly use the
-    Ascend implementations below. Code2Wav is the supported generation stage;
-    it has no paged KV or slot mapping.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        _default_ascend_decode_graph_flag()
-        _install_pcp_partition_stub()
-        super().__init__(*args, **kwargs)
-
-    def _close_omni_aux_output(self) -> None:
-        """V1 auxiliary output streams are not used by this V2 runner."""
-
-    def prepare_inputs(
-        self,
-        scheduler_output: Any,
-        batch_req_state: Any,
-        batch_desc: Any,
-        num_active_loras: int = 0,
-    ) -> Any:
-        return NPUModelRunner.prepare_inputs(
-            self,
-            scheduler_output,
-            batch_req_state,
-            batch_desc,
-            num_active_loras,
-        )
-
-    def _make_dummy_input_batch(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        *,
-        max_query_len: int | None,
-        is_padding: bool,
-    ) -> Any:
-        del is_padding
-        from vllm_ascend.worker.v2.input_batch import AscendInputBatch
-
-        return AscendInputBatch.make_dummy(
-            num_reqs,
-            num_tokens,
-            self.input_buffers,
-            max_query_len=max_query_len,
-        )
-
-    def _forward_context(self, attn_metadata: Any, vllm_config: Any, **kwargs: Any):
-        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-
-        if "cudagraph_runtime_mode" in kwargs:
-            kwargs["aclgraph_runtime_mode"] = kwargs.pop("cudagraph_runtime_mode")
-        slot_mapping = kwargs.pop("slot_mapping", None)
-        if slot_mapping is not None:
-            raise NotImplementedError(
-                "NPU Omni generation stages do not support slot_mapping; use this runner only for "
-                "attention-free stages such as Code2Wav."
-            )
-        kwargs.pop("is_padding", None)
-        kwargs.setdefault("model_instance", getattr(self, "model", None))
-        return set_ascend_forward_context(attn_metadata, vllm_config, **kwargs)
-
-    def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
-        import vllm.v1.worker.gpu.model_runner as model_runner
-
-        original = model_runner.maybe_create_adaptive_verification_manager
-
-        def _compatible(*call_args: Any, **call_kwargs: Any) -> Any:
-            return _call_without_unknown_kwargs(original, *call_args, **call_kwargs)
-
-        model_runner.maybe_create_adaptive_verification_manager = _compatible
-        try:
-            NPUModelRunner.initialize_kv_cache(self, kv_cache_config, *args, **kwargs)
-        finally:
-            model_runner.maybe_create_adaptive_verification_manager = original

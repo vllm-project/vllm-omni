@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import replace
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -121,9 +121,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     # the vllm-ascend build this image ships never sets it -- the static-shape
     # capture path would raise AttributeError without a default here.
     enable_hamming_sparse: bool = False
-    execute_model_state: ExecuteModelState | None = None
-    kv_extracted_req_ids: list[str] | None = None
-    sampling_done_event: Any | None = None
 
     def __init__(self, *args, **kwargs):
         from vllm_omni.platforms.npu.attention import static_shape_decode
@@ -173,13 +170,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         dispatcher = getattr(self, "cudagraph_dispatcher", None)
         dispatcher_saved = getattr(dispatcher, "uniform_decode_query_len", None)
         self.uniform_decode_query_len = 1
-        if dispatcher is not None and dispatcher_saved is not None:
+        if dispatcher_saved is not None:
             dispatcher.uniform_decode_query_len = 1
         try:
             yield
         finally:
             self.uniform_decode_query_len = saved
-            if dispatcher is not None and dispatcher_saved is not None:
+            if dispatcher_saved is not None:
                 dispatcher.uniform_decode_query_len = dispatcher_saved
 
     def _check_and_update_cudagraph_mode(self, *args, **kwargs):
@@ -1064,7 +1061,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.kv_extracted_req_ids = None
         combined_hidden_states = None
         combined_multimodal_outputs = None
-        mm_cpu: dict[str, Any] | None = None
+        mm_cpu = None
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1420,8 +1417,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # Non-async-chunk ships the full payload to the next stage via
             # inter_stage_outputs (the NPU runner has no separate full-payload
             # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
-            pooler_inter = cast(list[dict[str, object] | None] | None, pooler_output)
-            pooler_client = cast(list[dict[str, object] | None] | None, pooler_output)
+            pooler_inter, pooler_client = pooler_output, pooler_output
 
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
         if pooler_inter and self._should_accumulate_full_payload_output():

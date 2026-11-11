@@ -9,7 +9,6 @@ import time
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import replace
-from typing import cast
 
 import numpy as np
 import torch
@@ -117,8 +116,6 @@ class _AsyncNPUGenerationOutput(AsyncModelRunnerOutput):
 
 class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
     """Generation model runner for vLLM-omni on NPU (non-autoregressive)."""
-
-    execute_model_state: ExecuteModelState | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -623,8 +620,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         else:
             # See npu_ar_model_runner: non-async-chunk ships the full payload to the next
             # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
-            inter_stage_outputs = cast(list[dict[str, object] | None] | None, per_req_payloads)
-            multimodal_outputs = cast(list[dict[str, object] | None] | None, per_req_payloads)
+            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
@@ -642,7 +638,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=None,
-            multimodal_outputs=cast(list[dict[str, object]] | None, multimodal_outputs),
+            multimodal_outputs=multimodal_outputs,
             inter_stage_outputs=inter_stage_outputs,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},

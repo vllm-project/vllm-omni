@@ -85,23 +85,27 @@ def test_generation_worker_selects_stage_runner(monkeypatch, use_v2):
 def test_npu_generation_runner_mro_preserves_ascend_backend_methods():
     from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
-    from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniGenerationModelRunner
+    from vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 import NPUGenerationModelRunnerV2
+    from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniV2RunnerMixin
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-    mro = NPUOmniGenerationModelRunner.__mro__
+    mro = NPUGenerationModelRunnerV2.__mro__
     assert mro.index(NPUModelRunner) > mro.index(OmniGPUModelRunner)
-    assert NPUOmniGenerationModelRunner.load_model is OmniGPUModelRunner.load_model
-    assert NPUOmniGenerationModelRunner.capture_model is OmniGPUModelRunner.capture_model
-    assert NPUOmniGenerationModelRunner._dummy_run is NPUModelRunner._dummy_run
-    assert NPUOmniGenerationModelRunner.initialize_kv_cache.__qualname__.startswith("NPUOmniGenerationModelRunner.")
+    assert NPUGenerationModelRunnerV2.load_model is OmniGPUModelRunner.load_model
+    assert NPUGenerationModelRunnerV2.capture_model is OmniGPUModelRunner.capture_model
+    assert NPUGenerationModelRunnerV2._dummy_run is NPUModelRunner._dummy_run
+    assert NPUGenerationModelRunnerV2.prepare_inputs is NPUOmniV2RunnerMixin.prepare_inputs
+    assert NPUGenerationModelRunnerV2._make_dummy_input_batch is NPUOmniV2RunnerMixin._make_dummy_input_batch
+    assert NPUGenerationModelRunnerV2.initialize_kv_cache is NPUOmniV2RunnerMixin.initialize_kv_cache
+    assert NPUGenerationModelRunnerV2._forward_context.__qualname__.startswith("NPUGenerationModelRunnerV2.")
 
 
 def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch):
     from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
-    from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniGenerationModelRunner
+    from vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 import NPUGenerationModelRunnerV2
 
-    runner = object.__new__(NPUOmniGenerationModelRunner)
+    runner = object.__new__(NPUGenerationModelRunnerV2)
     assert callable(runner._close_omni_aux_output)
     runner.input_buffers = object()
     made: dict[str, Any] = {}
@@ -111,7 +115,7 @@ def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch
         staticmethod(lambda *args, **kwargs: made.update(args=args, kwargs=kwargs) or "ascend-batch"),
     )
     assert (
-        NPUOmniGenerationModelRunner._make_dummy_input_batch(runner, 2, 7, max_query_len=4, is_padding=True)
+        NPUGenerationModelRunnerV2._make_dummy_input_batch(runner, 2, 7, max_query_len=4, is_padding=True)
         == "ascend-batch"
     )
     assert made["args"][:3] == (2, 7, runner.input_buffers)
@@ -128,7 +132,7 @@ def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch
 
     monkeypatch.setattr(forward_context_module, "set_ascend_forward_context", fake_context)
     runner.model = "model-instance"
-    result = NPUOmniGenerationModelRunner._forward_context(
+    result = NPUGenerationModelRunnerV2._forward_context(
         runner,
         None,
         "config",
@@ -144,7 +148,7 @@ def test_npu_generation_runner_uses_ascend_input_and_forward_context(monkeypatch
         "model_instance": "model-instance",
     }
     with pytest.raises(NotImplementedError, match="slot_mapping"):
-        NPUOmniGenerationModelRunner._forward_context(
+        NPUGenerationModelRunnerV2._forward_context(
             runner,
             None,
             "config",

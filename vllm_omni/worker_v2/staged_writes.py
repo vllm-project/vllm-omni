@@ -192,6 +192,7 @@ def install() -> None:
         # Upstream stores pending values in array.array; Omni's deferred writer
         # batches NumPy arrays and Python lists together, so normalize its buffer.
         self._staged_write_contents = []
+        # Keep the upstream _staged_chunks() field available; Omni's patched writes use contents directly.
         self._staged_write_chunks = []
         self._np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         self._staged_len = 0

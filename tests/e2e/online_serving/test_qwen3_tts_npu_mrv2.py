@@ -7,6 +7,7 @@ import time
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from packaging.version import Version
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -123,7 +124,7 @@ def test_qwen3_tts_npu_mrv2_stream_abort_and_long_input(omni_server, openai_clie
     from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
 
     tokenizer_kwargs = {"trust_remote_code": True, "use_fast": True}
-    if transformers.__version__ < "5":
+    if Version(transformers.__version__) < Version("5"):
         tokenizer_kwargs["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(MODEL, **tokenizer_kwargs)
     talker_prompt_tokens = len(tokenizer(build_assistant_text(long_text), padding=False)["input_ids"])
