@@ -1096,7 +1096,8 @@ class TokenizerWrapper:
         batch_gen_image_info: list[ImageInfo] | None = None,
         batch_cond_image_info: list[JointImageInfo] | list[list[JointImageInfo]] | None = None,
         batch_system_prompt: list[str] | None = None,
-        batch_cot_text: list[str] | None = None,
+        # Raw AR token rows replace text entries when batch_ar_token_ids is set.
+        batch_cot_text: list[str | list[int] | None] | None = None,
         max_length: int | None = None,
         bot_task: str = "auto",  # auto/image/think/recaption/img_ratio
         image_base_size: int = 1024,
@@ -1220,6 +1221,15 @@ class TokenizerWrapper:
                     boundary + 1,
                     min(len(source_ids), int(output.gen_timestep_scatter_index[i][0])),
                 )
-                if output.tokens[i, :prefix_len].tolist() != source_ids[:prefix_len]:
-                    raise ValueError("Hunyuan AR KV prefix token IDs do not match the DiT layout.")
+                layout_ids = output.tokens[i, :prefix_len].tolist()
+                if layout_ids != source_ids[:prefix_len]:
+                    mismatch = next(
+                        (pos for pos, (a, b) in enumerate(zip(layout_ids, source_ids)) if a != b),
+                        min(len(layout_ids), len(source_ids)),
+                    )
+                    raise ValueError(
+                        "Hunyuan AR KV prefix token IDs do not match the DiT layout: "
+                        f"first mismatch at {mismatch}, checked prefix {prefix_len}, "
+                        f"AR sequence length {len(source_ids)}."
+                    )
         return dict(output=output, sections=sections)
