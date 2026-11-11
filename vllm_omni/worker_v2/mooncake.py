@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -62,11 +62,11 @@ class MooncakeOutputRewrite:
         for entry in self.rows:
             if output.request_errors and entry.req_id in output.request_errors:
                 continue
-            payloads = [
-                channel[entry.row]
-                for channel in channels
-                if channel and entry.row < len(channel) and channel[entry.row]
-            ]
+            payloads: list[dict[str, Any]] = []
+            for channel in channels:
+                payload = channel[entry.row] if channel and entry.row < len(channel) else None
+                if isinstance(payload, dict) and payload:
+                    payloads.append(payload)
             source = next((payload for payload in payloads if all(key in payload for key in keys.values())), None)
             try:
                 if source is None:

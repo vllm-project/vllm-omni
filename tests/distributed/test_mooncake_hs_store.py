@@ -18,8 +18,9 @@ from typing import Protocol
 import pytest
 import torch
 
+from vllm_omni.distributed.kv_transfer.mooncake import connector as connector_module
 from vllm_omni.distributed.kv_transfer.mooncake.config import MooncakeConfig
-from vllm_omni.distributed.kv_transfer.mooncake.connector import Attempt, OmniMooncakeStoreConnector
+from vllm_omni.distributed.kv_transfer.mooncake.connector import Attempt, OmniMooncakeStoreConnector, PendingSave
 from vllm_omni.distributed.kv_transfer.mooncake.hs import decode_hs, hs_key
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -27,6 +28,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class NativeStore(Protocol):
     def get(self, key: str) -> bytes | None: ...
+
+    def get_batch(self, keys: list[str]) -> list[bytes]: ...
 
     def put(self, key: str, payload: bytes) -> int: ...
 
@@ -75,11 +78,14 @@ def native_connector(native_store):
     store, namespace, keys = native_store
     connector = OmniMooncakeStoreConnector.__new__(OmniMooncakeStoreConnector)
     connector._closed = True
+    connector._lock = threading.RLock()
+    connector._reserved_bytes = 0
     connector.namespace = namespace
     connector.block_size = 4
     connector.hidden_size = 8
     connector.hidden_layer = 24
     connector.hs_dtype = torch.bfloat16
+    connector._row_bytes = 2 * 8 * 2
     connector.settings = MooncakeConfig(
         config_file=os.environ["MOONCAKE_CONFIG_PATH"],
         namespace=namespace,
@@ -109,7 +115,7 @@ def test_native_hs_save_read_is_exact(native_connector):
     # does not claim to exercise attention-KV copying.
     assert store.put(kv_key, b"test-kv-commit") == 0
     expected = tensors()
-    connector._save_hs(attempt, [(0, 4, expected)])
+    connector._save_hs(PendingSave(attempt, [(0, 4, expected)], 0))
     payload = store.get(key)
     assert store.get(key + ":ready") == hashlib.sha256(payload).digest()
     actual = connector._read_hs(attempt, 4)
@@ -126,7 +132,7 @@ def test_native_missing_and_evicted_hs_fail_before_assembly(native_connector):
     with pytest.raises(ValueError, match="missing HS"):
         connector._read_hs(attempt, 4)
     assert store.put(kv_key, b"test-kv-commit") == 0
-    connector._save_hs(attempt, [(0, 4, tensors())])
+    connector._save_hs(PendingSave(attempt, [(0, 4, tensors())], 0))
     assert store.batch_is_exist([key, key + ":ready"]) == [1, 1]
     assert store.remove(key, force=True) == 0
     with pytest.raises(ValueError, match="missing HS"):
@@ -147,7 +153,7 @@ def test_native_hs_without_completion_is_not_readable(native_connector):
     connector, attempt, key, kv_key = native_connector
     store = connector.connector_worker.store
     assert store.put(kv_key, b"test-kv-commit") == 0
-    connector._save_hs(attempt, [(0, 4, tensors())])
+    connector._save_hs(PendingSave(attempt, [(0, 4, tensors())], 0))
     assert store.remove(key + ":ready", force=True) == 0
     with pytest.raises(ValueError, match="completion record"):
         connector._read_hs(attempt, 4)
@@ -157,10 +163,10 @@ def test_native_refill_replaces_stale_completion_after_eviction(native_connector
     connector, attempt, key, kv_key = native_connector
     store = connector.connector_worker.store
     assert store.put(kv_key, b"test-kv-commit") == 0
-    connector._save_hs(attempt, [(0, 4, tensors())])
+    connector._save_hs(PendingSave(attempt, [(0, 4, tensors())], 0))
     assert store.remove(key, force=True) == 0
     replacement = tensors(10)
-    connector._save_hs(attempt, [(0, 4, replacement)])
+    connector._save_hs(PendingSave(attempt, [(0, 4, replacement)], 0))
     restored = connector._read_hs(attempt, 4)
     assert all(torch.equal(restored[name], replacement[name]) for name in replacement)
 
@@ -174,7 +180,7 @@ def test_native_concurrent_duplicate_writes_publish_one_complete_winner(native_c
 
     def write(index):
         barrier.wait(timeout=10)
-        connector._save_hs(attempt, [(0, 4, alternatives[index])])
+        connector._save_hs(PendingSave(attempt, [(0, 4, alternatives[index])], 0))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(write, index) for index in range(2)]
@@ -186,7 +192,28 @@ def test_native_concurrent_duplicate_writes_publish_one_complete_winner(native_c
     assert any(all(torch.equal(actual[name], candidate[name]) for name in actual) for candidate in alternatives)
     # A later duplicate must leave both the existing object and its commit
     # record usable. M1 relies on the pinned Store's immutable-key behavior.
-    connector._save_hs(attempt, [(0, 4, tensors(20))])
+    connector._save_hs(PendingSave(attempt, [(0, 4, tensors(20))], 0))
     assert store.get(key) == payload
     restored = connector._read_hs(attempt, 4)
     assert all(torch.equal(restored[name], actual[name]) for name in actual)
+
+
+def test_native_batched_read_spans_batches_and_rejects_a_gap(native_store, native_connector, monkeypatch):
+    store, namespace, cleanup = native_store
+    connector, attempt, _, _ = native_connector
+    attempt.hashes = [b"prefix-0", b"prefix-1", b"prefix-2"]
+    expected = [tensors(10 * index) for index in range(3)]
+    for block_hash in attempt.hashes:
+        key = hs_key(namespace, block_hash)
+        kv_key = connector.connector_worker.token_dbs[0].key_for(block_hash)
+        cleanup.extend([key, key + ":ready", kv_key])
+        assert store.put(kv_key, b"test-kv-commit") == 0
+    connector._save_hs(PendingSave(attempt, [(4 * i, 4 * i + 4, expected[i]) for i in range(3)], 0))
+    # Two blocks per get_batch call, so this prefix needs two Store calls.
+    monkeypatch.setattr(connector_module, "_READ_BATCH_BYTES", 2 * connector.block_size * connector._row_bytes)
+    restored = connector._read_hs(attempt, 12)
+    for name in ("embedding", "hidden"):
+        assert torch.equal(restored[name], torch.cat([block[name] for block in expected]))
+    assert store.remove(hs_key(namespace, attempt.hashes[1]), force=True) == 0
+    with pytest.raises(ValueError, match="missing HS"):
+        connector._read_hs(attempt, 12)

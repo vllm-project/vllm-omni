@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from dataclasses import dataclass, field, replace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -47,11 +47,54 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 from .config import MooncakeConfig
-from .hs import HSBlockSpec, RequestHS, decode_hs, encode_hs, hs_key, prefix_digest
+from .hs import CaptureTensors, HSBlockSpec, RequestHS, decode_hs, encode_hs, hs_key, prefix_digest
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 logger = init_logger(__name__)
 _INIT_LOCK = threading.Lock()
 _HS_HEADER_ALLOWANCE = 16392
+# One Store round trip fetches the HS objects and completion records of up to
+# this many payload bytes, far below the client's default 4 GiB buffer.
+_READ_BATCH_BYTES = 16 * 1024 * 1024
+_KV_POLL_SECONDS = 0.005
+# The load path and library version do not change cached values;
+# model_revision identifies the weights.
+_UNSTABLE_CONFIG_KEYS = frozenset({"_name_or_path", "transformers_version"})
+
+
+def _stable_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _stable_config(item) for key, item in value.items() if key not in _UNSTABLE_CONFIG_KEYS}
+    if isinstance(value, list):
+        return [_stable_config(item) for item in value]
+    return value
+
+
+def cache_namespace(
+    settings: MooncakeConfig,
+    hf_config: PretrainedConfig,
+    hidden_layer: int,
+    dtype: torch.dtype,
+    kv_spec: FullAttentionSpec,
+) -> str:
+    """Digest every setting that can change stored KV or HS values."""
+    identity = {
+        "namespace": settings.namespace,
+        "revision": settings.model_revision,
+        "stage": "thinker",
+        "format": 1,
+        "layer": hidden_layer,
+        "config": _stable_config(hf_config.to_dict()),
+        "dtype": str(dtype),
+        "kv_spec": repr(kv_spec),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _lookup_queue_drained() -> None:
+    """Marker job: it runs only after every lookup queued before it has finished."""
 
 
 class JointStoreWorker(MooncakeStoreWorker):
@@ -122,6 +165,15 @@ class PendingRead:
     block_ids: frozenset[int] = frozenset()
 
 
+@dataclass
+class PendingSave:
+    """Complete prompt blocks queued for saving, with their staging budget."""
+
+    attempt: Attempt
+    blocks: list[tuple[int, int, CaptureTensors]]
+    reserved_bytes: int
+
+
 class JointMetadata(MooncakeStoreConnectorMetadata):
     """Native KV transfer metadata plus Omni request-attempt ownership."""
 
@@ -147,13 +199,16 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
     ) -> None:
         self._closed = False
         self._lock = threading.RLock()
-        self._executor: ThreadPoolExecutor | None = None
+        self._read_executor: ThreadPoolExecutor | None = None
+        self._save_executor: ThreadPoolExecutor | None = None
         self._attempts: dict[str, Attempt] = {}
         self._delivered_until: dict[str, int] = {}
         self._reads: dict[str, PendingRead] = {}
-        self._saves: dict[Future[None], int] = {}
+        self._saves: dict[Future[None], PendingSave] = {}
         self._reserved_bytes = 0
         self._scheduler_attempts: dict[str, str] = {}
+        self._lookup_started: dict[str, float] = {}
+        self._lookup_probe: Future[None] | None = None
         self._bypass: set[str] = set()
         self._retired: set[str] = set()
         self._cancelled: set[str] = set()
@@ -170,20 +225,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = spec.block_size
         self._row_bytes = 2 * self.hidden_size * torch.empty((), dtype=self.hs_dtype).element_size()
-        identity = {
-            "namespace": self.settings.namespace,
-            "revision": self.settings.model_revision,
-            "stage": "thinker",
-            "format": 1,
-            "layer": self.hidden_layer,
-            "config": model.hf_config.to_dict(),
-            "dtype": str(self.hs_dtype),
-            "kv_spec": repr(spec),
-        }
-        self.namespace = hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+        self.namespace = cache_namespace(self.settings, model.hf_config, self.hidden_layer, self.hs_dtype, spec)
         # Isolate native KV as well as HS across incompatible checkpoints.
+        # Asynchronous lookup keeps a slow Store off the scheduling path.
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
-        extra.update(cache_prefix=self.namespace, load_async=True, save_decode_cache=False)
+        extra.update(cache_prefix=self.namespace, load_async=True, lookup_async=True, save_decode_cache=False)
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._capacity_only = False
@@ -209,7 +255,10 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                         os.environ.pop("MOONCAKE_CONFIG_PATH", None)
                     else:
                         os.environ["MOONCAKE_CONFIG_PATH"] = previous
-            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni-mooncake-hs")
+            # Loads have running deadlines; a save waiting for its native KV
+            # object must never hold the worker a load needs.
+            self._read_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni-mooncake-hs-read")
+            self._save_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni-mooncake-hs-save")
 
     @staticmethod
     def _validate_supported(config: VllmConfig, kv_config: KVCacheConfig | None) -> None:
@@ -248,10 +297,50 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
-        if request.request_id in self._bypass:
-            self.connector_scheduler.load_specs.pop(request.request_id, None)
+        req_id = request.request_id
+        if req_id in self._bypass or self._lookup_stalled():
+            self._end_lookup(req_id)
             return 0, False
-        return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        started = self._lookup_started.setdefault(req_id, time.monotonic())
+        matched, load_async = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        if matched is not None:
+            self._lookup_started.pop(req_id, None)
+            return matched, load_async
+        if time.monotonic() - started < self.settings.load_timeout_seconds:
+            return None, False
+        logger.warning(
+            "Mooncake prefix lookup for %s exceeded %.1f s; computing the request without the cache",
+            req_id,
+            self.settings.load_timeout_seconds,
+        )
+        # The pinned client sends lookups one at a time over one socket, so a
+        # stalled reply delays every later lookup. Treat new requests as
+        # misses until the work queued before this marker has finished.
+        self._lookup_probe = self.connector_scheduler.client.executor.submit(_lookup_queue_drained)
+        self._bypass.add(req_id)
+        self._end_lookup(req_id)
+        return 0, False
+
+    def _lookup_stalled(self) -> bool:
+        if self._lookup_probe is not None and self._lookup_probe.done():
+            self._lookup_probe = None
+        return self._lookup_probe is not None
+
+    def _end_lookup(self, req_id: str) -> None:
+        assert self.connector_scheduler is not None
+        # Cancels a queued lookup; a running one finishes unobserved.
+        self.connector_scheduler.client.discard(req_id)
+        self.connector_scheduler.load_specs.pop(req_id, None)
+        self._lookup_started.pop(req_id, None)
+
+    def reset_cache(self) -> bool | None:
+        if self.role != KVConnectorRole.SCHEDULER:
+            return None
+        # The pinned reset drains native KV writes and then removes every
+        # object in the Store. HS writes are outside that barrier, so an old
+        # save could repopulate the cache, and other namespaces would be lost.
+        logger.warning("Mooncake KV/HS does not support online connector reset; use a new namespace instead")
+        return False
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         super().update_connector_output(connector_output)
@@ -274,6 +363,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         retired = set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ())
         for req_id in retired:
             self._scheduler_attempts.pop(req_id, None)
+            self._lookup_started.pop(req_id, None)
             self._bypass.discard(req_id)
         native = cast(MooncakeStoreConnectorMetadata, super().build_connector_meta(scheduler_output))
         req_ids = {req.req_id for req in native.requests} | set(scheduler_output.num_scheduled_tokens)
@@ -349,21 +439,31 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         )
 
     def _read_hs(self, attempt: Attempt, tokens: int) -> dict[str, torch.Tensor]:
-        blocks = []
         assert self.connector_worker is not None
         store = self.connector_worker.store
-        for index, block_hash in enumerate(attempt.hashes[: tokens // self.block_size]):
+        hashes = attempt.hashes[: tokens // self.block_size]
+        if not hashes or len(hashes) * self.block_size != tokens:
+            raise ValueError("incomplete HS prefix")
+        blocks = []
+        per_batch = max(1, _READ_BATCH_BYTES // (self.block_size * self._row_bytes))
+        for first in range(0, len(hashes), per_batch):
             if attempt.cancelled:
                 raise ValueError("cancelled HS load")
-            key = hs_key(self.namespace, block_hash)
-            payload = store.get(key)
-            if not isinstance(payload, bytes) or not payload:
-                raise ValueError("missing HS object")
-            if store.get(key + ":ready") != hashlib.sha256(payload).digest():
-                raise ValueError("HS object has no matching completion record")
-            blocks.append(decode_hs(payload, self._spec(block_hash, index)))
-        if len(blocks) * self.block_size != tokens:
-            raise ValueError("incomplete HS prefix")
+            batch = hashes[first : first + per_batch]
+            keys = [hs_key(self.namespace, block_hash) for block_hash in batch]
+            values = store.get_batch([name for key in keys for name in (key, key + ":ready")])
+            # A missing key yields empty bytes; a failed batch can return a
+            # single entry instead of one value per key.
+            if len(values) != 2 * len(keys):
+                raise ValueError("HS batch read failed")
+            for offset, block_hash in enumerate(batch):
+                payload, ready = values[2 * offset], values[2 * offset + 1]
+                if not isinstance(payload, bytes) or not payload:
+                    raise ValueError("missing HS object")
+                if ready != hashlib.sha256(payload).digest():
+                    raise ValueError("HS object has no matching completion record")
+                blocks.append(decode_hs(payload, self._spec(block_hash, first + offset)))
+            del values
         return {name: torch.cat([block[name] for block in blocks]) for name in ("embedding", "hidden")}
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
@@ -379,16 +479,18 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 reserve = 3 * tokens * self._row_bytes + _HS_HEADER_ALLOWANCE
                 pending = PendingRead(attempt, reserve, time.monotonic() + self.settings.load_timeout_seconds)
                 pending.block_ids = frozenset(req.block_ids[0][: tokens // self.block_size])
+                # Saves have separate slots and workers, so they cannot
+                # prevent a load from being admitted or started.
                 if (
-                    len(self._reads) + len(self._saves) >= self.settings.max_pending_transfers
+                    len(self._reads) >= self.settings.max_pending_transfers
                     or self._memory_used() + reserve > self.settings.max_hs_bytes
                 ):
                     pending.failed = True
                     pending.reserved_bytes = 0
                 else:
                     self._reserved_bytes += reserve
-                    assert self._executor is not None
-                    pending.future = self._executor.submit(self._read_hs, attempt, tokens)
+                    assert self._read_executor is not None
+                    pending.future = self._read_executor.submit(self._read_hs, attempt, tokens)
                 self._reads[attempt.token] = pending
         # Even an HS admission failure drains the native KV operation before
         # allowing the scheduler to free its destination blocks.
@@ -419,7 +521,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     pending.failed = True
                 hs_done = pending.future is None or pending.future.done()
                 tensors = None
-                if not pending.failed and pending.future is not None and hs_done:
+                if not pending.failed and not attempt.cancelled and pending.future is not None and hs_done:
                     try:
                         tensors = pending.future.result()
                     except (ValueError, RuntimeError, OSError) as exc:
@@ -428,10 +530,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 if pending.failed and not pending.failure_reported and not attempt.cancelled:
                     failed.add(attempt.req_id)
                     pending.failure_reported = True
-                if pending.failed and pending.kv_done and not pending.completion_reported:
-                    # HS reads touch CPU buffers only. A timed-out read may
-                    # drain in the background while this request recomputes;
-                    # keep its reservation until the future really finishes.
+                if (pending.failed or attempt.cancelled) and pending.kv_done and not pending.completion_reported:
+                    # Once the native copy drains, the scheduler may recycle
+                    # the destination GPU blocks. HS reads touch CPU buffers
+                    # only: a failed or cancelled read may still be running,
+                    # so its reservation stays until the future finishes.
                     current = self._attempts.get(attempt.req_id)
                     if current is None or current.token == token:
                         finished.add(attempt.req_id)
@@ -447,13 +550,13 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 if not pending.completion_reported and (current is None or current.token == token):
                     finished.add(attempt.req_id)
                 del self._reads[token]
-            for future, reserve in list(self._saves.items()):
+            for future, save in list(self._saves.items()):
                 if future.done():
                     try:
                         future.result()
                     except (ValueError, RuntimeError, OSError) as exc:
                         logger.warning("Mooncake HS save skipped: %s", exc)
-                    self._reserved_bytes -= reserve
+                    self._release_staging(save)
                     del self._saves[future]
         return KVConnectorTransferResults(finished_sending=set(), finished_recving=finished, failed_recving=failed)
 
@@ -462,41 +565,73 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         # to whole-attempt failure so HS state and retry bypass stay coherent.
         return set()
 
-    def _save_hs(self, attempt: Attempt, blocks: list[tuple[int, int, dict[str, torch.Tensor]]]) -> None:
+    def _release_staging(self, save: PendingSave) -> None:
+        with self._lock:
+            self._reserved_bytes -= save.reserved_bytes
+            save.reserved_bytes = 0
+
+    def _write_hs_block(
+        self, store: Any, attempt: Attempt, block: tuple[int, int, CaptureTensors]
+    ) -> tuple[str, str, bytes] | None:
+        """Write one HS object; return its KV key, completion key and digest."""
         assert self.connector_worker is not None
+        start, _, tensors = block
+        index = start // self.block_size
+        block_hash = attempt.hashes[index]
+        key = hs_key(self.namespace, block_hash)
+        spec = self._spec(block_hash, index)
+        if store.put(key, encode_hs(spec, tensors)) != 0:
+            return None
+        # put(existing_key) is immutable in the pinned Store. Read the actual
+        # winner so concurrent duplicate writers publish its digest.
+        actual = store.get(key)
+        if not isinstance(actual, bytes) or not actual:
+            return None
+        decode_hs(actual, spec)
+        kv_key = self.connector_worker.token_dbs[0].key_for(block_hash)
+        return kv_key, key + ":ready", hashlib.sha256(actual).digest()
+
+    def _save_hs(self, save: PendingSave) -> None:
+        """Write HS objects, then publish each completion record after its KV.
+
+        Tensors and their staging reservation are released before waiting for
+        native KV objects, so a slow KV write holds only this save worker.
+        """
+        assert self.connector_worker is not None
+        attempt = save.attempt
         store = self.connector_worker.store
         deadline = time.monotonic() + self.settings.load_timeout_seconds
-        for start, _, tensors in blocks:
-            if attempt.cancelled:
-                return
-            index = start // self.block_size
-            block_hash = attempt.hashes[index]
-            key = hs_key(self.namespace, block_hash)
-            payload = encode_hs(self._spec(block_hash, index), tensors)
-            if store.put(key, payload) != 0:
-                return
-            del payload
-            # put(existing_key) is immutable in the pinned Store. Read the
-            # actual winner so concurrent duplicate writers publish its digest.
-            actual = store.get(key)
-            if not isinstance(actual, bytes) or not actual:
-                return
-            decode_hs(actual, self._spec(block_hash, index))
-            kv_key = self.connector_worker.token_dbs[0].key_for(block_hash)
-            while store.is_exist(kv_key) != 1:
-                if attempt.cancelled or time.monotonic() >= deadline:
+        commits: dict[str, tuple[str, bytes]] = {}
+        try:
+            # Indexing leaves no tensor reference in this frame for the KV wait.
+            for position in range(len(save.blocks)):
+                if attempt.cancelled:
                     return
-                time.sleep(0.005)
-            if not attempt.cancelled:
-                digest = hashlib.sha256(actual).digest()
-                ready_key = key + ":ready"
-                previous = store.get(ready_key)
-                # HS can be evicted independently of its completion record.
-                # A refilled object needs a new record; immutable put alone
-                # would preserve the old digest and poison every later hit.
-                if previous and previous != digest:
-                    store.remove(ready_key, force=True)
-                store.put(ready_key, digest)
+                written = self._write_hs_block(store, attempt, save.blocks[position])
+                if written is None:
+                    break
+                kv_key, ready_key, digest = written
+                commits[kv_key] = (ready_key, digest)
+        finally:
+            save.blocks.clear()
+            self._release_staging(save)
+        while commits and not attempt.cancelled and time.monotonic() < deadline:
+            kv_keys = list(commits)
+            for kv_key, exists in zip(kv_keys, store.batch_is_exist(kv_keys)):
+                if exists == 1 and not attempt.cancelled:
+                    self._publish_ready(store, *commits.pop(kv_key))
+            if commits:
+                time.sleep(_KV_POLL_SECONDS)
+
+    @staticmethod
+    def _publish_ready(store: Any, ready_key: str, digest: bytes) -> None:
+        previous = store.get(ready_key)
+        # HS can be evicted independently of its completion record. A refilled
+        # object needs a new record; immutable put alone would preserve the
+        # old digest and poison every later hit.
+        if previous and previous != digest:
+            store.remove(ready_key, force=True)
+        store.put(ready_key, digest)
 
     def capture_step(
         self, req_id: str, attempt_id: str, start_token: int, prompt_len: int, tensors: dict[str, torch.Tensor]
@@ -520,13 +655,13 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             )
             if (
                 blocks
-                and len(self._reads) + len(self._saves) < self.settings.max_pending_transfers
+                and len(self._saves) < self.settings.max_pending_transfers
                 and self._memory_used() + reserve <= self.settings.max_hs_bytes
             ):
                 self._reserved_bytes += reserve
-                assert self._executor is not None
-                future = self._executor.submit(self._save_hs, attempt, blocks)
-                self._saves[future] = reserve
+                save = PendingSave(attempt, blocks, reserve)
+                assert self._save_executor is not None
+                self._saves[self._save_executor.submit(self._save_hs, save)] = save
             # Preemption rebuilds KV/HS, but the downstream accumulator still
             # owns already published rows. Keep its watermark across attempts.
             end = start_token + tensors["embedding"].shape[0]
@@ -545,10 +680,12 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             return
         self._closed = True
         with self._lock:
-            for attempt in self._attempts.values():
+            # Saves of normally finished requests may still wait for KV.
+            for attempt in [*self._attempts.values(), *(save.attempt for save in self._saves.values())]:
                 attempt.cancelled = True
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+        for executor in (self._read_executor, self._save_executor):
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
         super().shutdown()
         with self._lock:
             self._attempts.clear()

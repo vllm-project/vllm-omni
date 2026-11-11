@@ -126,6 +126,10 @@ M0 validated waiting and recovery with a sequential Thinker-only probe. Those
 results do not establish full text/audio serving correctness or performance
 for this backend. Full-pipeline GPU acceptance, duplex evaluation, and
 performance measurements must be recorded separately before claiming support.
+M1 is a Mooncake-only external cache: local Thinker prefix caching is disabled,
+so the two caches do not cooperate. The
+[design document](../design/feature/mooncake_kv_hs_cache.md) describes the
+request lifecycle and the deferred two-level mode.
 
 The adapter targets vLLM `0.33.0` at source revision
 `4ba787ec9959e566d3b587a796dff07673324da5` and Mooncake `0.3.12.post1`.
@@ -159,18 +163,25 @@ stages:
 Use a reachable Mooncake master and install the Mooncake package matching the
 selected vLLM/CUDA environment. `namespace` separates cache populations;
 `model_revision` must identify the exact checkpoint actually loaded, including
-when loading a local directory. Change the namespace for an incompatible cache
-deployment. Never reuse a checkpoint identifier for different weights.
+when loading a local directory. The load path and transformers version are not
+part of the cache identity, so replicas that load the same revision from
+different directories share entries. Change the namespace for an incompatible
+cache deployment. Never reuse a checkpoint identifier for different weights.
 
 `max_hs_bytes` bounds temporary HS data, independently of Mooncake's configured
-store capacity. `max_pending_transfers` bounds queued HS transfers, and
-`load_timeout_seconds` sets the HS load deadline. Account for GPU KV, temporary
-worker buffers, and Mooncake KV/HS/metadata storage separately.
+store capacity. `max_pending_transfers` bounds queued HS reads and, separately,
+queued HS writes. Reads and writes also use separate worker threads, so a write
+waiting for its KV object cannot delay a load. `load_timeout_seconds` bounds
+each prefix lookup and each HS load. Lookups run asynchronously; one that
+exceeds the deadline is treated as a miss, and later requests skip lookup until
+the stalled reply returns. Account for GPU KV, temporary worker buffers, and
+Mooncake KV/HS/metadata storage separately.
 The output tensors handed to Talker are accounted separately from transfer
-staging. A timed-out HS read can drain in the background while its request
-recomputes, retaining its staging reservation until it finishes. Native KV
-copies must finish before their destination GPU blocks can be recycled;
-the HS deadline cannot forcibly interrupt a native KV copy.
+staging. A timed-out or cancelled HS read can drain in the background,
+retaining its staging reservation until it finishes. Native KV copies must
+finish before their destination GPU blocks can be recycled, and the HS
+deadline cannot interrupt them. A cancelled request's blocks are released as
+soon as its native copy finishes, without waiting for its HS read.
 
 The configuration bridge selects `OmniMooncakeStoreConnector` through vLLM's
 connector extension mechanism and explicitly sets
@@ -179,6 +190,11 @@ terminates the request; it does not provide recomputation. Selecting Mooncake
 together with LMCache, a separate `kv_transfer_config`, local Thinker prefix
 caching, or a producer-only/consumer-only role is rejected. Keep Talker prefix
 caching disabled when comparing Thinker cache behavior.
+
+Online connector reset, `reset_prefix_cache(reset_connector=True)`, returns
+`False`. The pinned reset removes every object in the Store, including other
+namespaces, and does not wait for HS writes. Use a new namespace to start from
+an empty cache.
 
 ### Correctness contract
 
@@ -191,9 +207,10 @@ caching disabled when comparing Thinker cache behavior.
   for that request's recovery. Other requests still use the cache normally.
 - Cache writes include only complete prompt blocks. Failed or skipped writes
   must not change the current response or publish an incomplete reusable entry.
-- Cancellation and preemption invalidate the load attempt. Buffer memory cannot
-  be released while a transfer still accesses it, and a late completion must
-  never publish output for a cancelled attempt.
+- Cancellation and preemption invalidate the load attempt. GPU blocks are
+  released once the native KV copy finishes; CPU buffers stay reserved while
+  an HS read still accesses them. A late completion must never publish output
+  for a cancelled attempt.
 
 Validation must cover first writes, confirmed full/partial hits, block-boundary
 and chunked-prefill cases, corrupted/missing objects, failure recovery, and
