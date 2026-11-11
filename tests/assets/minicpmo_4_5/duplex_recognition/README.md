@@ -42,7 +42,7 @@ pytest -sv tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
   --run-level advanced_model -m 'core_model and cuda'
 ```
 
-The CUDA ready `Omni · MiniCPM-o 4.5 MRv2 Duplex Test` job runs this test and uploads
+The CUDA ready `Omni · MiniCPM-o 4.5 Duplex Test` job runs this test and uploads
 `tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*`, including
 transcript, events, recognition report, input timeline and generated audio.
 `--run-level advanced_model` loads real weights; `core_model` remains the

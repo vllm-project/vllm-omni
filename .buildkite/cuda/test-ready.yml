@@ -232,24 +232,23 @@ steps:
             "
         mirror_hardwares: h100_1
 
-      # The live client waits for a learned turn terminator; use real weights.
+      # CUDA defaults to MRv2. Keep protocol, client, concurrency and accuracy
+      # coverage in one job; each selected case still requires real weights.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
-        commands:
-          - |
-            timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: h100_1
-
-      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
-        timeout_in_minutes: 40
+        timeout_in_minutes: 60
         artifact_paths:
           - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
+          - tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
         commands:
-          # Both concurrency and recognition require real weights.
-          - timeout 35m pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py -m '(core_model or advanced_model) and cuda' --run-level advanced_model
+          - >-
+            timeout 55m pytest -s -v
+            tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_websocket_protocol_smoke
+            tests/e2e/online_serving/test_duplex_client_live.py
+            tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py
+            tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py
+            -m '(core_model or advanced_model) and cuda' --run-level advanced_model
+            --junitxml=tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
