@@ -28,9 +28,26 @@ _ROOT = Path(__file__).resolve().parents[3]
 
 def _source_class(path: str, name: str, method: str, bases: tuple[str, ...] = ()) -> ast.ClassDef:
     tree = ast.parse((_ROOT / path).read_text(encoding="utf-8"))
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
-    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == method]
-    assert len(cls.body) == 1
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+
+    def find_method(cls: ast.ClassDef, seen: set[str]) -> ast.FunctionDef | None:
+        for node in cls.body:
+            if isinstance(node, ast.FunctionDef) and node.name == method:
+                return node
+        # The method may be shared through a mixin declared in the same file.
+        for base in cls.bases:
+            if isinstance(base, ast.Name) and base.id in classes and base.id not in seen:
+                seen.add(base.id)
+                inherited = find_method(classes[base.id], seen)
+                if inherited is not None:
+                    return inherited
+        return None
+
+    cls = classes.get(name)
+    assert cls is not None, f"{name} not found in {path}"
+    resolved = find_method(cls, {name})
+    assert resolved is not None, f"{name} does not define or inherit {method} from an in-module base in {path}"
+    cls.body = [resolved]
     cls.bases = [ast.Name(id=base, ctx=ast.Load()) for base in bases]
     cls.decorator_list = []
     return cls
