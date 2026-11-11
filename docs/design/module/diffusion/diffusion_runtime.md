@@ -533,3 +533,11 @@ at idle through the engine, executor, worker, and runner using two CPU regressio
 - [Async diffusion output](../../feature/async_diffusion_output.md)
 - [Engine orchestration](../engine_orchestration.md)
 - [Stage runtime](../stage_runtime.md)
+
+### NPU worker finalization
+
+NPU runtime finalization can continue after the worker reports application
+shutdown. The multiprocess executor allows a shared 60-second graceful join
+window on NPU, retaining the 15-second window on other platforms and the
+existing bounded terminate/kill escalation. Exit-code logging distinguishes
+natural process exit from a completed application cleanup message.

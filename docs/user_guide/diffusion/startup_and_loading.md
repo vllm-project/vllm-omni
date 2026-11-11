@@ -58,3 +58,7 @@ configurations.
 | --- | ---: | ---: | ---: |
 | **Qwen/Qwen-Image** (53.7 GiB) | 168 s | 27 s | **6.2x** |
 | **Wan-AI/Wan2.2-I2V-A14B-Diffusers** (64.5 GiB) | 283 s | 56 s | **5.1x** |
+
+For MiniMax-H3-Image on Ascend, see the
+[NPU serving and VAE graph options](minimax_h3_image_npu.md), including host-master
+AdaLN staging for memory-constrained resident sequence parallelism.

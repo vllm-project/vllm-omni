@@ -830,8 +830,8 @@ class MiniMaxH3DiTModel(nn.Module):
         if type(offload_adaln) is not bool:
             raise ValueError("minimax_h3_adaln_offload must be a boolean")
         if offload_adaln:
-            if not current_omni_platform.is_cuda():
-                raise ValueError("MiniMax H3 AdaLN offload requires CUDA")
+            if not (current_omni_platform.is_cuda() or current_omni_platform.is_npu()):
+                raise ValueError("MiniMax H3 AdaLN offload requires CUDA or NPU")
             if quant_config is not None:
                 raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
             if conflicting_offload:

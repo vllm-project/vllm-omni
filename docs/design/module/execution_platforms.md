@@ -70,3 +70,12 @@ from the common or upstream implementation.
 
 Validate common import paths without the target accelerator and run focused
 tests in a fresh `uv` environment on every affected device platform.
+
+## MiniMax H3 image NPU adapter
+
+The NPU model-patch hook owns opt-in image VAE graph replay, independent decoder
+streams, and approximate encoder/decoder tile batching. Other platforms and
+pipelines retain their existing behavior. Graph buffers belong to the VAE
+instance, and weight relocation invalidates its captures. User configuration
+and precision limits are documented in the
+[Ascend image guide](../../user_guide/diffusion/minimax_h3_image_npu.md).
