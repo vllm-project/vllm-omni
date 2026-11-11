@@ -6,7 +6,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -62,6 +62,8 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_placeholder_token_ids
+from vllm_omni.model_executor.models.qwen3_omni.talker_sampler import mrv2_talker_sampler
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
@@ -104,6 +106,12 @@ TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+
 logger = init_logger(__name__)
 
 # The encoder CUDA graph protocol, forwarded from the thinker to the stage
@@ -111,10 +119,13 @@ logger = init_logger(__name__)
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
+    "encoder_cudagraph_group_eligible",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",
@@ -184,6 +195,17 @@ class Qwen3OmniMoeForConditionalGeneration(
     # Postprocess only stores the last hidden for the deferred decode MTP.
     eager_frames_need_postprocess = False
 
+    def create_omni_model_state(
+        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
+    ) -> "OmniModelState":
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        if current_omni_platform.is_npu() and self.model_stage in ("thinker", "talker"):
+            from vllm_omni.platforms.npu.models.qwen3_omni_model_state import NPUQwen3OmniModelState
+
+            return NPUQwen3OmniModelState(vllm_config, self, encoder_cache, device)
+        return OmniModelState(vllm_config, self, encoder_cache, device)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
@@ -241,6 +263,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Speculative sampling can change the token width between steps.
             # Keep the existing capture-stream handoff for the entire request.
             self.publishes_sampled_embeddings = self.is_staged_run and vllm_config.speculative_config is None
+            # MRv2: every Thinker output row is on the token axis before
+            # sampling, so prefix-cache hits can be merged from cached rows.
+            self.supports_mrv2_prefix_cache_outputs = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -306,6 +331,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             # next text step (see ``talker_mtp``).
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
+            # Codebook 0 uses V1's per-request CUDA generator (see
+            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
+            # which is also what V1 captures: replay advances Philox, so each
+            # step gets a fresh stream. An external uniform buffer is a different
+            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
+            # Seed-TTS word error by about 0.4 percentage points.
+            self.mtp_sample_uniforms = False
+            self.mrv2_custom_sampler = mrv2_talker_sampler
+            self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
+            self.mtp_sample_vocab_size = self._codec_codebook_size
+            self.talker_mtp_accepts_per_row_generators = True
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
             # Decode each stream's first frame here (see talker_first_audio_enabled).
@@ -1048,6 +1084,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        sample_uniforms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        generators: Any = None,
         **kwargs: Any,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
@@ -1060,8 +1099,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
+        # One decode row per request. A longer span still samples inside the
+        # predictor; the static uniform buffer is shaped for a single step.
+        sampling_noise = sample_uniforms if input_ids.shape[-1] == 1 else None
         code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-            input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
+            input_ids,
+            inputs_embeds,
+            last_talker_hidden=last_talker_hidden,
+            sample_uniforms=sampling_noise,
+            generator=None if sampling_noise is not None else generator,
+            generators=None if sampling_noise is not None else generators,
         )
         # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
         # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]
@@ -1121,10 +1168,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequence_embeds = to_device_nonblocking(embed["prefill"], talker_device).to(
             torch.bfloat16
         )  # Tensor [P,H]
-        thinker_hidden_states = to_device_nonblocking(hs["output"], talker_device).to(torch.bfloat16)  # Tensor [K,H]
         # Token ids stay on CPU too: prefill parsing reads them on the host.
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
+        if meta.get("prefill_holds_accept_hidden") and thinker_chatml_ids_cpu is not None:
+            # Async chunk 0 sent one merged prefill tensor whose placeholder
+            # rows already hold the accept-layer hidden state.
+            thinker_hidden_states = thinker_sequence_embeds[: thinker_chatml_ids_cpu.shape[-1]]
+        else:
+            hidden_output = hs.get("output")
+            thinker_hidden_states = None
+            if hidden_output is not None:
+                thinker_hidden_states = to_device_nonblocking(hidden_output, talker_device).to(torch.bfloat16)  # [K,H]
         thinker_sequences = (
             None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
@@ -1270,10 +1325,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         result_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
         im_start_indexes = torch.nonzero(parse_ids[0] == self.config.im_start_token_id).flatten().tolist()
         im_start_indexes.append(target_len)
+        # Same placeholder set as the merged chunk-0 prefill (talker_rows.py).
+        audio_token_id, image_token_id, video_token_id = talker_placeholder_token_ids(self.thinker_config)
         multimodal_mask = (
-            (result_ids == self.thinker_config.audio_token_id) |
-            (result_ids == self.thinker_config.image_token_id) |
-            (result_ids == self.thinker_config.video_token_id)
+            (result_ids == audio_token_id) |
+            (result_ids == image_token_id) |
+            (result_ids == video_token_id)
         )  # [t] # fmt: skip
         role_tokens = parse_ids[0].tolist()
 
@@ -1351,7 +1408,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )
-        start_index = meta.get("num_processed_tokens", 0)
+        if meta.get("resumable", False):
+            start_index = meta.get("num_processed_tokens", 0)
+        else:
+            # Decode rows start at the first text token the prefill did not
+            # consume, one per generated frame, and rows that arrived during a
+            # chunked prefill are cached first. The row for this position is
+            # therefore the number of frames before it, not the text index.
+            start_index = payload["_omni_num_computed_tokens"] - payload["_omni_prompt_len"]
+            if start_index < 0:
+                raise ValueError(f"Talker decode requires a non-negative generation offset, got {start_index}")
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = to_device_nonblocking(cached_thinker_decode_embeds, device)
@@ -1417,10 +1483,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         last_talker_hidden = None
         text_step = None
+        if self.vllm_config.model_config.async_chunk:
+            text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
         try:
-            if self.vllm_config.model_config.async_chunk:
-                text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
-            else:
+            if not self.vllm_config.model_config.async_chunk:
                 q_tail = hs.get("trailing_text", None)
                 if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                     use_vec = q_tail[0:1, :]
@@ -1724,6 +1790,27 @@ class Qwen3OmniMoeForConditionalGeneration(
             codec_left_context_frames=left_frames,
             extra_capture_sizes=self._get_codec_ramp_windows() if streaming else (),
             streaming_batch_sizes=[int(b) for b in batch_sizes] if streaming else (),
+            npu_graph_shapes=self._plan_npu_code2wav_graph_shapes(streaming) if current_omni_platform.is_npu() else (),
+        )
+
+    def _plan_npu_code2wav_graph_shapes(self, streaming: bool) -> list[tuple[int, int]]:
+        """Exact decode windows the Code2Wav stage sees, matching the talker chunker."""
+        from vllm_omni.platforms.npu.models.code2wav_graph import plan_code2wav_graph_shapes
+
+        max_batch_size = int(self.vllm_config.scheduler_config.max_num_seqs)
+        if not streaming:
+            # Non-streaming chunked_decode: first chunk, then chunk + left context.
+            return plan_code2wav_graph_shapes(steady_window=325, start_windows=[300], max_batch_size=max_batch_size)
+        extra = self._get_codec_connector_extra()
+        chunk = int(extra.get("codec_chunk_frames", 25) or 25)
+        left = int(extra.get("codec_left_context_frames", 25) or 0)
+        initial = int(extra.get("initial_codec_chunk_frames") or 0)
+        schedule = parse_chunk_ramp(dict(extra), steady=chunk) or ([initial, chunk] if initial > 0 else [chunk])
+        return plan_code2wav_graph_shapes(
+            steady_window=chunk + left,
+            start_windows=ramp_decode_windows(schedule, left),
+            batch_sizes=[int(b) for b in extra.get("codec_graph_batch_sizes") or ()],
+            max_batch_size=max_batch_size,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1764,6 +1851,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 self.code2wav.precompute_snake_caches()
                 self._maybe_enable_code2wav_cudagraph()
             except Exception:
+                if current_omni_platform.is_npu():
+                    # A failed NPUGraph capture can leave torch-npu allocator
+                    # state invalid, so eager fallback in this process is unsafe.
+                    raise
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
                     exc_info=True,

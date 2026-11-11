@@ -20,8 +20,44 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker.moe_prefill_warmup import warm_up_moe_prefill_kernels
+from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 
 logger = init_logger(__name__)
+
+
+def _is_mammoth_moda2_vllm_config(vllm_config) -> bool:
+    """True when this stage loads a MammothModa2 AR / multimodal checkpoint.
+
+    AR stages do not yet have a per-model ``model_runner_cls`` registry like
+    diffusion, so Mammoth specialty capture is selected by checkpoint metadata
+    here. Prefer ``model_type`` / ``architectures`` over path heuristics.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str) and model_type.startswith("mammoth_moda2"):
+        return True
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any("MammothModa2" in str(arch) for arch in architectures)
+
+
+def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
+    """Pick the AR runner class for this stage.
+
+    MammothModa2 MoE specialty capture/replay lives on
+    ``MammothGPUARModelRunner`` so shared ``OmniGPUModelRunner`` stays a thin
+    hook. Custom ``model_runner_cls`` overrides and V2 runners are left alone.
+    Specialty/flag mismatches are checked after ``load_model`` (the flag is
+    set during Mammoth model ``__init__``), not here at ``init_device``.
+    """
+    if runner_cls is not GPUARModelRunner or not _is_mammoth_moda2_vllm_config(vllm_config):
+        return runner_cls
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import (
+        MammothGPUARModelRunner,
+    )
+
+    return MammothGPUARModelRunner
 
 
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
@@ -132,13 +168,22 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
-            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            runner_cls = resolve_gpu_ar_model_runner_cls(self.vllm_config, self.model_runner_cls)
+            self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
-    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
+    def compile_or_warm_up_model(self):
+        # Runs before the upstream warmup so the prefill fused-MoE configs and
+        # the seeded-sampling Triton kernel are compiled before vLLM activates
+        # its JIT monitor (#9069).
+        warm_up_moe_prefill_kernels(self)
+        register_top_k_top_p_warmup(self)
+        return super().compile_or_warm_up_model()
+
+    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         """
         Explicitly handle sleep commands.
         Calls the implementation in the base class OmniGPUWorkerBase.
@@ -148,7 +193,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             task = OmniSleepTask(**task)
         return super().handle_sleep_task(task)
 
-    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK | None:
         """
         Explicitly handle wake-up commands.
         Calls the implementation in the base class OmniGPUWorkerBase.

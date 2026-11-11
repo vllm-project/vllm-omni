@@ -70,7 +70,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import validate_tts_request
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditioning_cache_salt, validate_tts_request
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
@@ -361,6 +361,19 @@ class _SpeechStreamingResponse(StreamingResponse):
             # Close it explicitly, even inside Starlette's cancelled scope.
             with anyio.CancelScope(shield=True):
                 await cast(Any, self.body_iterator).aclose()
+
+
+def _ensure_cache_salt(adapter, request, prompt: dict, tts_params: dict | None) -> None:
+    # Placeholder-token prompts collide in the prefix cache across different
+    # inputs unless salted; diffusion pipelines never reach here. Base
+    # identity is whatever build() already set, else the derived default.
+    # Compose with a caller salt rather than replace, so narrowing by
+    # tenant/session doesn't lose voice/input isolation.
+    if not isinstance(adapter, ARTTSAdapter):
+        return
+    derived = prompt.get("cache_salt") or conditioning_cache_salt(request, tts_params)
+    client_salt = request.cache_salt
+    prompt["cache_salt"] = f"{client_salt}:{derived}" if client_salt else derived
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -2290,6 +2303,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             output_policy = prepared.output_policy
+            _ensure_cache_salt(adapter, request, prompt, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2309,6 +2323,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             tts_params = {}
             prompt = {"prompt": request.input}
+            if request.cache_salt is not None:
+                # No adapter identity to compose with; forward as-is,
+                # matching serving_chat.py's cache_salt passthrough.
+                prompt["cache_salt"] = request.cache_salt
             output_policy = OutputPolicy()
 
         if model_type is None:
@@ -2382,6 +2400,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
             arrival_time=arrival_time,
+            watermarking=request.watermarking,
         )
         # Only the non-streaming path consumes output policies (in
         # `_generate_audio_bytes`); streaming never reads them. Store late —
@@ -2727,6 +2746,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
+                watermarking=request.watermarking,
             )
 
             final_output: OmniRequestOutput | None = None
@@ -3105,6 +3125,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
             non_streaming_mode=_pick("non_streaming_mode"),
+            watermarking=_pick("watermarking"),
         )
 
     async def create_speech_batch(

@@ -24,9 +24,9 @@ from typing import Any
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.buffer_utils as buffer_utils
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
-from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput

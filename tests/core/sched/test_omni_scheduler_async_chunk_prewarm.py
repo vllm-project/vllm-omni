@@ -14,7 +14,9 @@ from collections import defaultdict
 import msgspec
 import pytest
 import torch
+from vllm.outputs import RequestError
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_generation_scheduler as gen_sched_mod
@@ -89,6 +91,7 @@ def _make_scheduler(scheduler_cls):
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler._pending_request_prewarms = {}
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 
@@ -252,8 +255,39 @@ def test_scheduler_output_defaults_to_no_prewarms() -> None:
 
 
 def _finish_via_error_outputs(scheduler, request_id: str) -> None:
-    scheduler.grammar_compile_error_reqs = {request_id}
+    scheduler.grammar_compile_error_reqs = {
+        request_id: RequestError(
+            code="validation_error",
+            message="Invalid structured outputs: fixture",
+        )
+    }
     scheduler._finish_error_requests(defaultdict(list))
+
+
+@_SCHEDULERS
+@pytest.mark.parametrize("grammar_errors", [set(), {"req-error"}, ["req-error"]])
+def test_error_requests_reject_unexpected_grammar_container(scheduler_cls, grammar_errors) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    scheduler.grammar_compile_error_reqs = grammar_errors
+    scheduler.encoder_cache_mismatch_reqs = {"encoder-error"}
+    outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+    with pytest.raises(TypeError, match="grammar_compile_error_reqs must be a dict"):
+        scheduler._finish_error_requests(outputs)
+    assert scheduler.grammar_compile_error_reqs is grammar_errors
+    assert scheduler.encoder_cache_mismatch_reqs == {"encoder-error"}
+    assert not outputs
+
+
+@_SCHEDULERS
+def test_error_requests_allow_absent_grammar_state(scheduler_cls) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    scheduler._finish_error_requests(defaultdict(list))
+
+
+def _finish_via_encoder_cache_mismatch(scheduler, request_id: str) -> None:
+    scheduler.encoder_cache_mismatch_reqs = {request_id}
+    scheduler._finish_error_requests(defaultdict(list))
+    assert scheduler.encoder_cache_mismatch_reqs == set()
 
 
 @_SCHEDULERS
@@ -264,6 +298,7 @@ def _finish_via_error_outputs(scheduler, request_id: str) -> None:
         pytest.param(lambda s, rid: s.finish_requests(rid, RequestStatus.FINISHED_ABORTED), id="abort-single-id"),
         pytest.param(lambda s, rid: s._finish_input_timeout_requests({rid}), id="input-timeout"),
         pytest.param(_finish_via_error_outputs, id="error-outputs"),
+        pytest.param(_finish_via_encoder_cache_mismatch, id="encoder-cache-mismatch"),
     ],
 )
 def test_finish_paths_discard_undrained_prewarm(scheduler_cls, base_scheduler, finish) -> None:

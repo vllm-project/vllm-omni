@@ -8,6 +8,7 @@ owners:
   - "@fake0fan"
   - "@Sy0307"
   - "@Gaohan123"
+  - "@ZhengWG"
 primary_code_paths:
   - vllm_omni/core/**
   - vllm_omni/worker/**
@@ -30,6 +31,41 @@ last_reviewed: 2026-07-16
 
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
+
+After applying sampled output, the AR scheduler publishes only completed KV
+blocks to upstream prefix caching, including on its plain-decode path. Async
+placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
+as the materialized frontier. Stale output and requests that were not running
+before the update do not publish blocks. Publication precedes stop cleanup so
+the last completed blocks remain reusable after a request finishes.
+
+For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+with vLLM versions that build the ranges inline.
+
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
+## Qwen3-Omni Talker sampling
+
+The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
+including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
+top-k/top-p masking before drawing from their request-local V1 generators.
+Unseeded and greedy rows keep upstream sampling. When mixed rows have already
+been masked, their upstream call disables repeated masking and fused sampling.
+
+Custom samplers register their selected JIT kernels while the runner's startup
+registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+masking even when unseeded sampling selects FlashInfer, so it registers those
+native kernels explicitly. AR workers also warm the existing fused-MoE prefill
+batch sizes on both runner implementations before CUDA graph capture and JIT
+monitoring. These startup passes leave EPLB load recording disabled.
 
 ## Full-payload input scheduling
 
@@ -86,6 +122,41 @@ scheduler metadata before the next execution can reuse them. Background
 construction snapshots those inputs. Both paths reuse the request IDs already
 copied by upstream bookkeeping; connector collection stays on the main thread
 because it can run a tensor-parallel collective.
+
+## GPU memory accounting and output snapshots
+
+Workers size the KV cache from model weights, persistent runner buffers
+allocated before profiling starts (torch allocations beyond the weights at
+that point), the profiling-window peak increase and non-torch memory, then
+reserve CUDA graph and auxiliary graph memory separately. Upstream
+profiling's `non_kv_cache_memory` is not used, because it also counts memory
+the caching allocator reserves without allocating, such as graph pools
+captured at model load; co-located stage budgets are tuned without it.
+
+MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
+group in each ring slot. The slot waits for its previous device-to-host copy
+event before reuse or growth. Shorter outputs publish and copy only the live
+prefix. Retained GPU storage is bounded by each slot's largest payload rather
+than accumulating a buffer for every prefill length; published CPU outputs
+own their storage independently of subsequent slot reuse.
+
+## Request-local model errors
+
+MRV2 model states can return an owned, step-local failure mask from
+`get_request_errors()`. `OmniAsyncOutput` copies it alongside the other output
+tensors and resolves request IDs after the copy completes. Before handing
+outputs to the native data plane, it removes failed rows' tokens and audio
+payloads. The scheduler then marks only those requests `FINISHED_ERROR`, frees
+their state through the normal completion path, and propagates `FinishReason.ERROR`
+to the API. Healthy rows continue. Numerical failure must not be represented as
+an ordinary EOS or a successful, truncated audio response.
+
+Ming3's `create_omni_model_state` hook selects its model-owned state before
+generic hybrid dispatch, preserving its flow and AudioVAE lifecycle.
+Ming3 defaults to one MRV2 stage containing the backbone, flow head and
+AudioVAE, without an inter-stage connector. The VAE cursor stays on device and advances under
+the same emission-or-flush mask as the decoder's KV length. Invalid rows
+leave both unchanged; CUDA graph padding rows expose no cached tokens.
 
 ## Safe-change guide
 
