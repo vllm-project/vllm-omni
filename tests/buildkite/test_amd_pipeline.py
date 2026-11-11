@@ -1528,6 +1528,28 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
 
 
+def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
+    group = _find_group("Reliability Test", AMD_WEEKLY_PIPELINE)
+    affected_labels = {
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+    }
+    expected_env = {
+        "VLLM_ROCM_USE_AITER": "0",
+        "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+    }
+
+    invalid_parameter_steps = {step["label"]: step for step in group["steps"] if "Invalid parameters" in step["label"]}
+    assert affected_labels < invalid_parameter_steps.keys()
+    for label, step in invalid_parameter_steps.items():
+        if label in affected_labels:
+            assert step["env"] == expected_env
+        else:
+            env = step.get("env", {})
+            assert "VLLM_ROCM_USE_AITER" not in env
+            assert "DIFFUSION_ATTENTION_BACKEND" not in env
+
+
 @pytest.mark.parametrize(
     "case",
     ("pass", "unexpected-skip", "zero-tests", "pytest-failure", "timeout"),
@@ -4614,7 +4636,7 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 40
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
-    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900" in command
+    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200" in command
     assert "VLLM_ROCM_USE_AITER=0" not in command
     assert _marker_expressions(step) == [
         _PAUSE_KEEP_READY_MARKER,

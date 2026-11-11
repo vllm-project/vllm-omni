@@ -1371,6 +1371,9 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
     )
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_cnn_cache"].shape[2] == 4
     # ``(n_t, depth, 2, rows, heads, frames, head_dim)``: the K/V halves keep
     # their own axis and the two CFG rows of each request land on the row axis.
@@ -1437,6 +1440,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert states[0] is states[1]
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_att_cache"].dtype == torch.bfloat16
     restored = adapter._split_flow_cache(stacked, 2)
     for original, round_tripped in zip(states, restored, strict=True):
@@ -2154,6 +2160,10 @@ def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():
     assert torch.count_nonzero(att[..., mel_frames : mel_frames + pad_frames, :]) == 0
     # This tail becomes the next chunk's CNN left context.
     assert torch.count_nonzero(cnn[..., -pad_frames:]) == 0
+    # Per-request history must preserve the same masked padding for later chunks.
+    with torch.no_grad():
+        _, _, rows = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=[att[..., :0, :]])
+    assert torch.equal(rows[0], att)
 
 
 def test_padding_does_not_change_the_valid_frames():
@@ -2535,3 +2545,26 @@ def test_estimator_step_preserves_precomputed_time_embedding(monkeypatch):
         time_embedding=supplied,
     )
     assert seen[0] is supplied
+
+
+def test_eager_per_request_history_matches_stacked_history():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    mu = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4)
+    speakers, cond = torch.ones(2, 1), torch.zeros_like(mu)
+    _, cnn, previous = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+    # ``previous`` is the split K/V stack ``(n_t, depth, 2, 2B, H, L, d)``:
+    # the CFG-stacked batch is dim 3, so a request row pairs the row-th and
+    # (2 + row)-th CFG entries along that axis.
+    rows = [torch.cat((previous[:, :, :, row : row + 1], previous[:, :, :, 2 + row : 3 + row]), dim=3) for row in range(2)]
+    expected, expected_cnn, expected_att = adapter._decode_cfm(mu, speakers, cond, cnn_cache=cnn, att_cache=previous)
+    actual, actual_cnn, actual_rows = adapter._decode_cfm(
+        mu, speakers, cond, cnn_cache=cnn, att_cache=rows, att_keep=(2, 2)
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_cnn, expected_cnn)
+    trimmed = torch.cat((expected_att[..., :2, :], expected_att[..., -2:, :]), dim=-2)
+    assert torch.equal(adapter._stack_estimator_att(actual_rows), trimmed)
+    # New row caches are independently owned; updating one cannot corrupt a peer.
+    peer = actual_rows[1].clone()
+    actual_rows[0].zero_()
+    assert torch.equal(actual_rows[1], peer)
