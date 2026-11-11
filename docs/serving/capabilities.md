@@ -3,6 +3,8 @@
 `GET /v1/omni/capabilities` describes the model and endpoints of a running
 vLLM-Omni deployment. Clients can select a compatible request before submitting
 generation. The endpoint uses the server's usual API-key authentication.
+The discovery endpoint is read-only. The accompanying image-edit changes
+described below affect how existing generation requests are handled.
 
 ```bash
 curl -H "Authorization: Bearer $VLLM_API_KEY" \
@@ -114,6 +116,20 @@ the speech endpoint's wire fields remain `ref_audio`, `ref_text`, and
 
 ### Images and native masks
 
+The image-edit request behavior includes the following changes:
+
+| Input | Behavior and compatibility |
+| --- | --- |
+| `mask_image` and `reference_image` form values | Multipart strings now bind as form fields and reach the handler, including data URIs and HTTP(S) URLs. Uploads remain supported. |
+| Remote `image`, `url`, `mask_image`, and `reference_image` inputs | vLLM's `MediaConnector` enforces configured `--allowed-media-domains`. An unset or empty list preserves unrestricted domains; HTTP redirects are rejected. Deployments using a nonempty allow-list must include their input hosts. |
+| Native mask and separate reference fields | HTTP 400 when the multi-stage route cannot forward them or a model explicitly declares them unsupported. The rejection identifies fields the selected path cannot consume. |
+| Mask canvas | HTTP 400 when a declared mask contract's source-count limit or same-size requirement is violated, before generation. For Klein this requires one source image with the same dimensions as the mask. |
+
+These checks preserve the source and mask pixels during loading. Model-specific
+conversion remains with the model, and optional RGB normalization continues to
+apply only to ordinary and reference images. A valid configured public model
+alias is accepted; an incorrect model name is rejected before generation.
+
 Image counts distinguish single-source editing from multiple reference images
 within `image_to_image`; they do not create additional operation IDs. Z-Image
 has a real single-image editing path. Klein permits up to four ordinary image
@@ -207,6 +223,12 @@ unknown execution here. `observed_at` identifies when the observation was made.
 An unpaused gate does not promise sufficient GPU memory, a healthy worker, or
 successful generation; normal request errors remain authoritative.
 
+If the optional execution observer raises an ordinary exception or returns an
+invalid state, discovery still returns HTTP 200 with `execution.state: unknown`.
+Model declarations, routes, stages, and input constraints remain available.
+The server logs a deduplicated diagnostic; cancellation continues to propagate.
+A later query can report a valid observation without restarting the server.
+
 The query reads initialized declarations, route policy, local replica metadata,
 and the local execution condition. It does not reload configuration, resolve a checkpoint, download
 files, perform health RPCs, wake workers, or run generation.
@@ -257,6 +279,15 @@ must not call `load_capabilities()`, tokenizers, filesystem readers or RPCs.
 The serving projection applies the actual route's restrictions once at app
 initialization. Optional runtime geometry uses `ServingPostProcess` and
 `RuntimeServingMetadata`; a pipeline without these retains unknown geometry.
+
+`entrypoints/openai/serving_policy.py` owns handler selection and the deployment
+conditions shared by discovery and the HTTP/WebSocket guards. Callers retain
+their original rejection status, message, and ordering. In particular, an
+asynchronous video job can be accepted and then fail its video-stage check
+during execution; discovery does not move that check into task submission.
+Unrecognized extension routes remain unknown. Startup reads initialized
+application state and diffusion configuration directly, without constructing
+an HTTP request.
 
 Adding a supported model requires updating its declaration and the relevant
 positive and negative regression cases. Registry coverage tests ensure aliases
