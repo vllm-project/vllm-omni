@@ -1132,17 +1132,20 @@ class AttSlotPool:
     def __init__(self, arena: WholeEulerExecutionArena, *, slots: int, frames: int, suffix: int) -> None:
         """Slots shaped like ``arena``'s attention cache rows."""
         self.n_timesteps, self.depth = arena.n_timesteps, arena.depth
-        self.heads, self.width = arena.heads, arena.att_width
+        self.heads, self.head_dim = arena.heads, arena.head_dim
         self.slots, self.frames, self.suffix = int(slots), int(frames), int(suffix)
         self.device, self.dtype = arena.device, arena.att_cache_dtype
-        shape = (self.n_timesteps, self.depth, self.slots, 2, self.heads, self.frames, self.width)
+        # ``(n_t, depth, 2, 2 * slots, heads, frames, head_dim)``: the split
+        # K/V layout of the arena storage, one slot per request holding its
+        # CFG pair on the two physical rows ``2 * slot`` and ``2 * slot + 1``.
+        shape = (self.n_timesteps, self.depth, 2, 2 * self.slots, self.heads, self.frames, self.head_dim)
         self.storage = torch.zeros(shape, device=self.device, dtype=self.dtype)
         # Lowest slot first, so a lightly loaded pool keeps touching the same pages.
         self._free = list(range(self.slots - 1, -1, -1))
 
     def rows(self) -> torch.Tensor:
-        """``(n_t, depth, 2 * slots, heads, frames, width)``: one row per request CFG half."""
-        return self.storage.flatten(2, 3)
+        """``(n_t, depth, 2, 2 * slots, heads, frames, head_dim)``: split K/V, one row per request CFG half."""
+        return self.storage
 
     @property
     def free_slots(self) -> int:
@@ -1157,20 +1160,25 @@ class AttSlotPool:
 
     def adopt(self, cache: torch.Tensor) -> "ResidentAttCache | None":
         """A slot holding the logical cache; ``None`` when the pool is full."""
-        frames = int(cache.shape[4])
+        if cache.ndim != 7:
+            raise ValueError(f"expected a (n_t, depth, 2, 2, H, L, D) split K/V cache, got {tuple(cache.shape)}")
+        frames = int(cache.shape[5])
         if not self._free or not self.fits(frames):
             return None
         slot = self._free.pop()
         streaming = frames - self.suffix
-        _copy_frame_segments(self.storage[:, :, slot], cache, [(streaming, self.suffix), (0, streaming)])
+        _copy_frame_segments(
+            self.storage[:, :, :, 2 * slot : 2 * slot + 2], cache, [(streaming, self.suffix), (0, streaming)]
+        )
         return ResidentAttCache(self, slot, list(range(self.suffix, self.suffix + streaming)))
 
 
 class ResidentAttCache:
     """A request's estimator attention cache resident in an ``AttSlotPool`` slot.
 
-    Stands in for the logical ``(n_t, depth, 2, heads, L, width)`` tensor. The slot returns
-    to the pool when the handle is collected; work queued on it before then runs first (one stream).
+    Stands in for the logical ``(n_t, depth, 2, 2, heads, L, head_dim)`` tensor -- the
+    request's CFG pair on the split K/V layout. The slot returns to the pool when the
+    handle is collected; work queued on it before then runs first (one stream).
     """
 
     __slots__ = ("pool", "slot", "layout", "__weakref__")
@@ -1184,7 +1192,9 @@ class ResidentAttCache:
     @property
     def shape(self) -> torch.Size:
         pool = self.pool
-        return torch.Size((pool.n_timesteps, pool.depth, 2, pool.heads, len(self.layout) + pool.suffix, pool.width))
+        return torch.Size(
+            (pool.n_timesteps, pool.depth, 2, 2, pool.heads, len(self.layout) + pool.suffix, pool.head_dim)
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1201,7 +1211,7 @@ class ResidentAttCache:
     def materialize(self) -> torch.Tensor:
         """The logical cache as a tensor of its own."""
         index = index_to_device(self.physical_frames(), self.pool.device)
-        return self.pool.storage[:, :, self.slot].index_select(4, index)
+        return self.pool.storage[:, :, :, 2 * self.slot : 2 * self.slot + 2].index_select(5, index)
 
 
 def _materialize_att_rows(rows: list) -> list[torch.Tensor]:

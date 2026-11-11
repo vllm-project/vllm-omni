@@ -138,6 +138,7 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         top_p,
         K: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
         KP: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        CAND: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
     ):
         """Single-block fused top-k + top-p mask over one B=1 logits row.
 
@@ -159,13 +160,24 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         padding candidates carry zero prob and sort before every finite value,
         so both paths always remove them.
 
+        The eager top-k drops only logits strictly below the kth value, so
+        the candidate row is wider than ``K``: the host loads ``CAND >= K``
+        candidates and the kernel keeps every one at or above ``vals[K - 1]``
+        -- ties included -- instead of truncating the tied tail. Reading the
+        boundary value needs no host round-trip (``K - 1 < CAND`` always, and
+        this kernel runs inside graph capture): a one-hot selection reduced
+        with ``tl.max`` extracts it.
+
         ``out`` arrives pre-filled with ``-inf`` from the caller and the kernel
         only scatters the kept candidates: filling and scattering from the same
         program let two lanes order their writes to one address arbitrarily.
         """
         offs = tl.arange(0, KP)
-        cand = offs < K
+        cand = offs < CAND
         v = tl.load(vals_ptr + offs, mask=cand, other=float("-inf"))
+        # Tie-inclusive kth threshold, matching the eager ``masked_fill_``.
+        kth = tl.max(tl.where(offs == K - 1, v, float("-inf")), axis=0)
+        cand = cand & (v >= kth)
         mx = tl.max(v, axis=0)
         e = tl.where(cand, tl.exp(v - mx), 0.0)
         q = e / tl.sum(e, axis=0)
@@ -722,6 +734,18 @@ def _topk_topp_fused(
     order (``torch.topk``'s) nor the eager one (``torch.sort``'s) is
     specified. The caller's softmax + ``torch.multinomial`` input is
     therefore unchanged in shape, dtype and RNG stream.
+
+    The eager top-k keeps every logit at or above the kth value -- ties
+    included -- so the candidate set is wider than ``keep``: up to
+    ``_TAIL_MAX_CANDIDATES`` candidates are loaded and the kernel re-derives
+    the kth value in-register (it runs inside graph capture, so no host-side
+    data-dependent branch is possible) and keeps the whole tie group. A tie
+    group larger than ``_TAIL_MAX_CANDIDATES`` cannot widen further on the
+    host; the kernel then keeps the candidates that fit the capacity. The
+    dropped members are indistinguishable from the kept ones in logit value,
+    and a >64-wide group of *identical finite* logits does not occur in
+    practice, while a tied ``-inf`` tail carries zero probability mass and
+    does not change the normalized distribution the sampler sees.
     """
     global _TAIL_FUSION_OK
     if not _TAIL_FUSION_OK or logits.device.type != "npu":
@@ -738,9 +762,13 @@ def _topk_topp_fused(
     # shapes. An abort cannot be caught below, so defer that case to eager.
     if keep < 2:
         return None
-    vals, idx = torch.topk(logits, keep, dim=-1)
+    vocab = int(logits.shape[-1])
+    # cand_n >= keep always here, so the kernel's kth read (position K - 1)
+    # stays inside the loaded set.
+    cand_n = min(vocab, _TAIL_MAX_CANDIDATES)
+    vals, idx = torch.topk(logits, cand_n, dim=-1)
     out = torch.full_like(logits, float("-inf"))
-    kp = 1 << (keep - 1).bit_length()
+    kp = 1 << (cand_n - 1).bit_length()
     try:
         _topk_topp_mask_kernel[(1,)](
             vals,
@@ -749,6 +777,7 @@ def _topk_topp_fused(
             float(top_p),
             K=keep,
             KP=kp,
+            CAND=cand_n,
             num_warps=8,
         )
     except Exception as exc:

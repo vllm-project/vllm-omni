@@ -1144,15 +1144,22 @@ class BatchedToken2Wav(nn.Module):
                 if att_cache is None
                 else old_att
             )
-            return self._cfm_graph_wrapper.replay(
+            # The wrapper's graph_fn is upstream ``blocks_forward_chunk``,
+            # which walks the layers on packed ``[K | V]`` caches: pack the
+            # split input cache, hand over a packed shadow of the output
+            # buffer and fold the packed result back -- the same exchange the
+            # eager branch and the Whole-Euler bridge below perform.
+            result, _, packed_att = self._cfm_graph_wrapper.replay(
                 estimator_input,
                 time_embedding,
                 graph_cnn,
-                graph_att,
+                _pack_att_cache(graph_att),
                 cnn_out,
-                att_out,
+                _packed_att_buffer(att_out),
                 attn_mask,
             )
+            _unpack_att_cache(packed_att, att_out)
+            return result, cnn_out, att_out
         if valid_lengths is not None:
             if not hasattr(estimator, "in_proj"):
                 raise RuntimeError('MiniCPMO45Code2WavBatchError {"reason":"ragged_kernel_unavailable"}')

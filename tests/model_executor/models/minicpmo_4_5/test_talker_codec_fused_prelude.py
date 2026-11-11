@@ -375,6 +375,13 @@ def _tied_logits(name: str) -> torch.Tensor:
     elif name == "partial_tie":
         logits[0, :10] = 1.0
         logits[0, 10:25] = torch.linspace(0.5, 0.1, 15, device=_device())
+    elif name == "more_than_k_tied":
+        # The highest value ties across more entries than top_k: the eager
+        # threshold keeps them all, so the fused candidate row must reach
+        # past K to hold the whole tie group (30 ties with top_k=25 used to
+        # keep 22 members against the eager 26).
+        logits[0, :30] = 0.0
+        logits[0, 30:64] = torch.linspace(-0.5, -5.0, 34, device=_device())
     else:  # pragma: no cover - guards the caller below
         raise AssertionError(name)
     return logits
@@ -408,3 +415,24 @@ def test_fused_tail_keeps_a_valid_distribution_on_tied_logits(name, top_p):
     assert torch.equal(torch.sort(fused[kept]).values, torch.sort(eager[kept_eager]).values), (
         f"{name}/{top_p}: kept logits differ"
     )
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_keeps_threshold_ties_above_k():
+    """A tie group wider than ``top_k`` must be kept whole.
+
+    The eager top-k drops only logits strictly below the kth value, so with 30
+    tied highest values and ``top_k=25`` the eager support holds all 30 ties
+    and top-p trims it to 26 members; the fused kernel used to truncate the
+    candidate row at K and keep 22.
+    """
+    logits = _tied_logits("more_than_k_tied")
+    fused = tcs._topk_topp_fused(logits.clone(), 25, 0.85)
+    assert fused is not None
+    eager = _eager_top_k_top_p(logits, 25, 0.85)
+    kept, kept_eager = torch.isfinite(fused), torch.isfinite(eager)
+    assert int(kept.sum()) == int(kept_eager.sum()) == 26
+    assert torch.equal(torch.sort(fused[kept]).values, torch.sort(eager[kept_eager]).values)
+    probs = torch.softmax(fused, dim=-1)
+    assert not bool(torch.isnan(probs).any())
+    assert torch.allclose(probs.sum(-1), torch.ones(1, device=probs.device), atol=1e-5)

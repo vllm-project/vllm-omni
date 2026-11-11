@@ -21,6 +21,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     relpos_encode_token_budget,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    AttSlotPool,
+    WholeEulerExecutionArena,
     _pack_att_cache,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
@@ -1176,10 +1178,127 @@ def test_cfm_graph_receives_bfloat16_cache_in_compute_dtype():
         speakers=torch.ones((2, 1)),
         cond=torch.zeros((2, 1, 2)),
         cnn_cache=torch.zeros((1, 2, 2, 1)),
-        att_cache=torch.zeros((1, 2, 1, 1, 2), dtype=torch.bfloat16),
+        att_cache=torch.zeros((1, 2, 2, 1, 2, 1), dtype=torch.bfloat16),
     )
 
     assert seen_dtypes == [torch.float32]
+
+
+def test_estimator_step_bridges_the_split_cache_into_the_single_step_graph():
+    """The single-step graph wrapper must see upstream packed ``[K | V]`` caches, both entry modes.
+
+    The wrapper's graph_fn is upstream ``blocks_forward_chunk``, which walks the
+    layers on packed caches: the split input cache must be packed on the way in
+    and the packed output folded back into the split buffer on the way out --
+    the same exchange the eager branch and the Whole-Euler bridge perform.
+    """
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    estimator = adapter.flow.decoder.estimator
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    class RecordingGraph:
+        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out, attn_mask=None):
+            del time_embedding, cnn_cache, attn_mask
+            seen.append((att_cache, att_out))
+            # Mark the packed output halves apart, so the fold-back into the
+            # split buffer is proven direction by direction.
+            width = att_out.shape[-1] // 2
+            att_out[..., :width] = 1.0
+            att_out[..., width:] = -1.0
+            cnn_out.fill_(0.0)
+            return estimator_input[:, :1], cnn_out, att_out
+
+    adapter._cfm_graph_wrapper = RecordingGraph()
+    kwargs = dict(
+        x=torch.ones((2, 1, 2)),
+        mu=torch.ones((2, 1, 2)),
+        time=torch.zeros(2),
+        speakers=torch.ones((2, 1)),
+        cond=torch.zeros((2, 1, 2)),
+    )
+
+    # Cold start: no history, so the wrapper gets a packed 0-frame cache and
+    # the split buffer comes back filled from the packed output.
+    _, _, cold_att = adapter._estimator_step(estimator, cnn_cache=None, att_cache=None, **kwargs)
+    cold_in, cold_out = seen[-1]
+    assert cold_in.ndim == 5 and int(cold_in.shape[-2]) == 0
+    assert cold_out.ndim == 5 and int(cold_out.shape[-1]) == 2 * int(cold_att.shape[-1])
+    assert cold_att.ndim == 6 and int(cold_att.shape[1]) == 2
+    assert torch.equal(cold_att[:, 0], torch.ones_like(cold_att[:, 0]))
+    assert torch.equal(cold_att[:, 1], -torch.ones_like(cold_att[:, 1]))
+
+    # Continuation: the split 6-D cache is handed over packed, and the split
+    # buffer returns refilled.
+    att_cache = torch.arange(12, dtype=torch.float32).reshape(1, 2, 2, 1, 3, 1)
+    _, _, cont_att = adapter._estimator_step(estimator, cnn_cache=None, att_cache=att_cache, **kwargs)
+    cont_in, cont_out = seen[-1]
+    assert cont_in.ndim == 5
+    assert torch.equal(cont_in, torch.cat((att_cache[:, 0], att_cache[:, 1]), dim=-1))
+    assert cont_out.shape[-1] == 2 * int(cont_att.shape[-1])
+    assert cont_att.shape == (1, 2, 2, 1, 5, 1)
+    assert torch.equal(cont_att[:, 0], torch.ones_like(cont_att[:, 0]))
+    assert torch.equal(cont_att[:, 1], -torch.ones_like(cont_att[:, 1]))
+
+
+def test_att_slot_pool_round_trips_the_split_kv_layout():
+    """Adoption, replay and materialization must agree on the split K/V slot layout.
+
+    The pool mirrors the arena layout -- ``(n_t, depth, 2, 2 * slots, heads,
+    frames, head_dim)`` with one request's CFG pair on rows ``2 * slot`` and
+    ``2 * slot + 1`` -- and this walks the exchange ``_replay_slots``
+    performs: adopt a request's split cache, let the graph write new frames
+    into the slot's free frames, trim the layout, and materialize the
+    logical cache back out.
+    """
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    arena = WholeEulerExecutionArena(adapter.flow.decoder.estimator, device=torch.device("cpu"), dtype=torch.float32)
+    n_t, depth, heads, head_dim, suffix = (
+        arena.n_timesteps,
+        arena.depth,
+        arena.heads,
+        arena.head_dim,
+        2,
+    )
+    pool = AttSlotPool(arena, slots=2, frames=8, suffix=suffix)
+    assert pool.rows().shape == (n_t, depth, 2, 4, heads, 8, head_dim)
+
+    # A request's cache after a chunk: streaming frames, then the suffix.
+    streaming = 3
+    frames = suffix + streaming
+    cache = torch.arange(n_t * depth * 2 * 2 * heads * frames * head_dim, dtype=torch.float32).reshape(
+        n_t, depth, 2, 2, heads, frames, head_dim
+    )
+    handle = pool.adopt(cache)
+    assert handle is not None
+    assert handle.shape == (n_t, depth, 2, 2, heads, frames, head_dim)
+    assert 0 <= 2 * handle.slot and 2 * handle.slot + 1 < 2 * pool.slots
+
+    # Adoption round-trips: materializing the handle returns the input.
+    assert torch.equal(handle.materialize(), cache)
+
+    # The physical slot holds the suffix frames first, then the streaming
+    # frames, in the order adopt() scatters them.
+    slot = pool.storage[:, :, :, 2 * handle.slot : 2 * handle.slot + 2]
+    assert torch.equal(slot[..., :suffix, :], cache[..., streaming:, :])
+    assert torch.equal(slot[..., suffix : suffix + streaming, :], cache[..., :streaming, :])
+
+    # Replay: the graph writes the chunk's new frames into the slot's free
+    # frames (suffix 0..1 and layout 2..4 are taken; 5..7 are free), on the
+    # slot's two CFG rows; the trim then keeps a streaming prefix, exactly
+    # as `_replay_slots` does.
+    new_frames = [5, 6]
+    written = torch.full((n_t, depth, 2, 2, heads, len(new_frames), head_dim), 7.0)
+    pool.storage[:, :, :, 2 * handle.slot : 2 * handle.slot + 2, :, new_frames, :] = written
+    handle.layout = [5, 6, 2]
+    out = handle.materialize()
+    assert out.shape[-2] == 3 + suffix
+    assert torch.equal(out[..., :2, :], written)
+    assert torch.equal(out[..., 2:3, :], cache[..., 0:1, :])
+    assert torch.equal(out[..., 3:, :], cache[..., streaming:, :])
+
+    # A cache on any other layout fails loudly instead of aliasing wrong axes.
+    with pytest.raises(ValueError):
+        pool.adopt(torch.zeros(n_t, depth, 2, 2, heads, frames + 2 * head_dim))
 
 
 def test_npu_sdpa_context_uses_platform_patch(monkeypatch):
