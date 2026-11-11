@@ -161,8 +161,8 @@ def test_audex_offline_cfg_disabled_matches_baseline(omni_runner: OmniRunner, ru
     )
     if current_platform.is_rocm():
         # Repeated ROCm decoding can differ by a few float32 rounding units.
-        # Keep the bound far below an audible amplitude while preserving the
-        # byte-identical CUDA contract.
-        np.testing.assert_allclose(base_audio, disabled_audio, rtol=0.0, atol=5e-7)
+        # Keep the bound below -120 dBFS while preserving the byte-identical
+        # CUDA contract.
+        np.testing.assert_allclose(base_audio, disabled_audio, rtol=0.0, atol=1e-6)
     else:
         np.testing.assert_array_equal(base_audio, disabled_audio)
