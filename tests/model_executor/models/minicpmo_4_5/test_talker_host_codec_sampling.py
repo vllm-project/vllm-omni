@@ -60,8 +60,11 @@ def test_host_sampler_emits_first_frame_and_honors_max_tokens() -> None:
     assert host_id != _EOS_ID
 
     # max_tokens=3: frames 0 and 1 emit, frame 2 reaches the limit.
-    for step in (1, 2):
-        host_id, finished, emit = _sample(talker, request_id="req-1", step=step, state=state)
+    host_id, finished, emit = _sample(talker, request_id="req-1", step=1, state=state)
+    assert emit and not finished
+    assert host_id != _EOS_ID
+
+    host_id, finished, emit = _sample(talker, request_id="req-1", step=2, state=state)
     assert not emit
     assert finished
 
@@ -92,6 +95,10 @@ def test_host_sampler_state_released_on_cleanup() -> None:
     talker = _make_talker()
     _sample(talker, request_id="req-2", step=0, state={"codec_temperature": 0.0})
     assert "req-2" in talker._request_host_codec_states
+
+    # The generator lives in the per-request state, so no dead carrier dict
+    # is left behind for the cleanup hook to pop.
+    assert not hasattr(talker, "_request_host_codec_generators")
 
     talker._deferred_cleanup_ids = {"req-2"}
     talker._flush_deferred_cleanup()

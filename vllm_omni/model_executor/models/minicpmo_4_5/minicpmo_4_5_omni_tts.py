@@ -3468,13 +3468,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_host_codec_states = states
         hstate = states.get(request_id)
         if hstate is None:
-            # A carried generator (a duplex condition reset) keeps advancing
-            # the request's draw stream; a fresh request seeds its own.
-            carried = getattr(self, "_request_host_codec_generators", None)
-            generator = carried.pop(request_id, None) if isinstance(carried, dict) else None
-            if generator is None:
-                seed = _codec_int_param(request_state, "codec_seed", self._codec_seed)
-                generator = random.Random(int(seed))
+            # A fresh request seeds its own draw stream; hstate carries the
+            # generator for the rest of the request's lifetime.
+            seed = _codec_int_param(request_state, "codec_seed", self._codec_seed)
+            generator = random.Random(int(seed))
             window: list[int] = []
             if isinstance(history, torch.Tensor) and history.numel() > 0:
                 window = [int(t) for t in history.detach().to(torch.long).reshape(-1).cpu().tolist()]
@@ -3729,9 +3726,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             host_codec_states = getattr(self, "_request_host_codec_states", None)
             if isinstance(host_codec_states, dict):
                 host_codec_states.pop(request_id, None)
-            host_codec_generators = getattr(self, "_request_host_codec_generators", None)
-            if isinstance(host_codec_generators, dict):
-                host_codec_generators.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
             getattr(self, "_cuda_kstep_request_bank", {}).pop(request_id, None)
             bindings = getattr(self, "_cuda_kstep_rng_bindings", {})
