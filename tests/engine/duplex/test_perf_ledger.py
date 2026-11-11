@@ -300,18 +300,3 @@ def test_with_perf_chunk_copies_the_envelope_and_skips_prompts_without_one() -> 
     assert "perf_chunk" not in duplex
     plain = {"prompt_token_ids": [1]}
     assert with_perf_chunk(plain, (0, 3)) is plain
-
-
-def test_ephemeral_perf_envelope_preserves_existing_buffer_without_mutation() -> None:
-    buffer = {"keep": [1, 2]}
-    prompt = {"prompt_token_ids": [3], "model_intermediate_buffer": buffer}
-    stamped = with_perf_chunk(prompt, (1, 4), create_envelope=True)
-    assert stamped["prompt_token_ids"] is prompt["prompt_token_ids"]
-    assert stamped["model_intermediate_buffer"] == {"keep": [1, 2], "duplex": {"perf_chunk": [1, 4]}}
-    assert buffer == {"keep": [1, 2]}
-
-
-@pytest.mark.parametrize("buffer", [[], "opaque", {"duplex": None}, {"duplex": []}])
-def test_ephemeral_perf_envelope_does_not_replace_an_incompatible_buffer(buffer) -> None:
-    prompt = {"prompt_token_ids": [3], "model_intermediate_buffer": buffer}
-    assert with_perf_chunk(prompt, (1, 4), create_envelope=True) is prompt

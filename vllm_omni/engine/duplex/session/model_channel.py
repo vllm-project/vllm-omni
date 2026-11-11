@@ -616,7 +616,7 @@ class ModelChannel:
                             turn_seq=reservation.update.turn_seq,
                             submitted_ns=accepted_ns,
                         )
-                        prompt = with_perf_chunk(prompt, perf_chunk, create_envelope=not resumable)
+                        prompt = with_perf_chunk(prompt, perf_chunk)
                     runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
                     submission = DuplexStageSubmission(
                         context=request_context,

@@ -351,21 +351,13 @@ def _chunk_document(chunk: ChunkPerfRecord, origin: int, *, final: bool) -> dict
     }
 
 
-def with_perf_chunk(
-    prompt: dict[str, object], chunk: tuple[int, int], *, create_envelope: bool = False
-) -> dict[str, object]:
+def with_perf_chunk(prompt: dict[str, object], chunk: tuple[int, int]) -> dict[str, object]:
     """Return ``prompt`` with ``duplex.perf_chunk`` set, so stage schedulers time its steps.
 
-    Non-resumable turn requests can opt in to a new envelope: downstream
-    prewarm copies the fixed identity for that request. Resumable requests
-    keep their existing envelope and update/connector propagation contract.
+    Prompts without a duplex envelope are returned unchanged; their chunks get no spans.
     """
     buffer = prompt.get("model_intermediate_buffer")
-    if create_envelope and buffer is None:
-        buffer = {}
     duplex = buffer.get("duplex") if isinstance(buffer, Mapping) else None
-    if create_envelope and isinstance(buffer, Mapping) and "duplex" not in buffer:
-        duplex = {}
     if not isinstance(buffer, Mapping) or not isinstance(duplex, Mapping):
         return prompt
     return {

@@ -17,7 +17,6 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
-from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.model_executor.models.qwen3_omni.duplex.context_budget import CONTEXT_OMITTED, CONTEXT_SOURCES
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
@@ -121,25 +120,6 @@ def _history(turns):
         messages.extend([{"role": "user", "content": f"question {i}"}, {"role": "assistant", "content": f"answer {i}"}])
     messages.append({"role": "user", "content": "current question"})
     return [dict(message, _src=i) for i, message in enumerate(messages)]
-
-
-@pytest.mark.parametrize("audio_enabled", [False, True])
-def test_ephemeral_perf_metadata_preserves_real_processor_tokens_and_media(processor, audio_enabled):
-    payload = {"type": "conversation"}
-    messages = [{"role": "user", "content": "A synthetic greeting.", "_src": 0}]
-    if audio_enabled:
-        audio = (0.1 * np.sin(np.arange(16001) * 0.1)).astype("<f4")
-        payload = {"audio": base64.b64encode(audio.tobytes()).decode()}
-        messages.append({"role": "user", "audio_payload": payload, "_src": 1})
-    prompt = _plan(_plugin(processor), messages, payload=payload).prompt
-    stamped = with_perf_chunk(prompt, (2, 9), create_envelope=True)
-    assert stamped["prompt"] == prompt["prompt"]
-    assert stamped["multi_modal_data"] is prompt["multi_modal_data"]
-    assert "model_intermediate_buffer" not in prompt
-    plain_result, stamped_result = _expanded(processor, prompt), _expanded(processor, stamped)
-    assert plain_result.keys() == stamped_result.keys()
-    for key in plain_result:
-        np.testing.assert_array_equal(plain_result[key], stamped_result[key])
 
 
 def test_default_legacy_and_budget_produce_identical_fitting_prompt(processor):
