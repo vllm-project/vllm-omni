@@ -68,7 +68,7 @@ case "$QUERY_TYPE" in
   text_to_audio)
     system_content='[{"type": "text", "text": "You are a text-to-speech assistant. Read the text aloud exactly as provided."}]'
     user_content='[
-      {"type": "text", "text": "Hello, this is a test of Step Audio 2 text to speech synthesis.<tts_start>"}
+      {"type": "text", "text": "Hello, this is a test of Step Audio 2 text to speech synthesis."}
     ]'
     thinker_sampling_params='{
       "temperature": 0.7,
@@ -84,7 +84,7 @@ case "$QUERY_TYPE" in
     system_content='[{"type": "text", "text": "You are an audio processing assistant. Listen and repeat the audio content."}]'
     user_content='[
       {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
-      {"type": "text", "text": "Please listen to this audio and repeat its content.<tts_start>"}
+      {"type": "text", "text": "Please listen to this audio and repeat its content."}
     ]'
     thinker_sampling_params='{
       "temperature": 0.7,
@@ -97,6 +97,14 @@ case "$QUERY_TYPE" in
     }'
     ;;
 esac
+
+# Continue the assistant's speech prefix, matching the Python client.
+assistant_message=''
+generation_options=''
+if [[ "$QUERY_TYPE" != "audio_to_text" ]]; then
+  assistant_message=', {"role": "assistant", "content": "<tts_start>"}'
+  generation_options='"continue_final_message": true, "add_generation_prompt": false,'
+fi
 
 sampling_params_list='[
   '"$thinker_sampling_params"',
@@ -115,6 +123,7 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
   "model": "stepfun-ai/Step-Audio-2-mini",
   "modalities": $MODALITIES,
   "sampling_params_list": $sampling_params_list,
+  $generation_options
   "messages": [
     {
       "role": "system",
@@ -123,7 +132,7 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
     {
       "role": "user",
       "content": $user_content
-    }
+    }$assistant_message
   ]
 }
 EOF
