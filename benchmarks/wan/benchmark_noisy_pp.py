@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import socket
 import statistics
 import time
@@ -17,6 +16,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+
+from benchmarks.wan.source_snapshot import record_source_snapshot
 
 
 def main():
@@ -70,20 +71,7 @@ def main():
     # snapshot in --out must fail the whole job here instead of rank 0
     # alone, which would leave the other ranks hanging in
     # init_distributed_environment until torchrun's timeout.
-    for file in snapshot_files:
-        relative = file.relative_to(root)
-        dst = args.out / "source_snapshot" / relative
-        if dst.exists() and dst.read_bytes() != file.read_bytes():
-            p.error(f"result directory contains different source: {relative}")
-    if rank == 0:
-        manifest = {}
-        for file in snapshot_files:
-            relative = file.relative_to(root)
-            dst = args.out / "source_snapshot" / relative
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file, dst)
-            manifest[str(relative)] = hashlib.sha256(file.read_bytes()).hexdigest()
-        (args.out / "source_snapshot/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    record_source_snapshot(p, root, args.out, snapshot_files, rank)
     torch.set_num_threads(8)
     from vllm_omni.platforms import current_omni_platform
 

@@ -23,14 +23,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_noisy_kv_cache_accepts_benchmark_kwargs():
-    """Call-site guard for the GPU-only rename blind spot in the benchmark.
+    """CPU stand-in for ``NoisyKVCache`` parameters the GPU benchmark passes.
 
-    ``NoisyKVCache`` is constructed only inside the GPU benchmark job, so a
-    kwarg rename on main would otherwise surface only there. Build it with
-    the exact kwargs ``benchmark_noisy_pp`` passes, on CPU with a tiny spec,
-    so the next rename fails here first. The schedule-side ``step_replicas``
-    read is exercised on the real admit path by
-    ``test_hybrid_adapter_satisfies_executor_protocol``.
+    The keyword arguments below are a local copy of that call, not values read
+    from ``benchmark_noisy_pp``. This fails when ``NoisyKVCache`` rejects one
+    of these parameters. It stays green when only the benchmark call site
+    changes. ``test_hybrid_adapter_satisfies_executor_protocol`` covers the
+    schedule-side ``step_replicas`` read on the admit path.
     """
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache
 
