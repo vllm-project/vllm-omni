@@ -57,20 +57,7 @@ vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va --kv-isolate
 | Only `--kv-isolate` | Isolation, one-time capture, Host INT8 and asynchronous prefetch |
 | Both flags | Same as isolation alone; the entire offload configuration is ignored |
 
-This option defaults to off and does not use an environment-variable switch.
-The initial implementation supports single-request full-loop inference with
-local attention or pure Ulysses, using Flash, SDPA or RainFusion. It rejects
-VDN-H3, ControlNet, latent editing, step execution, Ring/AllGather, scheduler-paged
-KV, attention schedules, multi-request packed inference and additional semantic
-masks. RainFusion can sparsify dynamic queries. Reference queries execute
-reference-only dense attention. Cache-DiT history is invalidated at reference-version or layout
-boundaries; enabling isolation does not add a hit-priority refresh policy.
-
-**Isolation changes the learned model computation and can change prompt
-following, reference fidelity and shot timing. It is not a lossless optimization.**
-Evaluate output quality before deployment; this option does not establish that
-training or distillation is unnecessary. It is separate from cross-request
-prefix caching and does not establish support for other bidirectional models.
+This option defaults to off and does not use an environment-variable switch. **Isolation changes the learned model computation. It is not a lossless optimization.**
 
 #### Diffusion KV Prefix Caching
 
