@@ -52,6 +52,7 @@ from .abot_world_transformer import (
     ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,
 )
+from .actions import PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
 from .interaction import ABotCameraSession
 from .taew2_2 import TAEW2Decoder
 
@@ -74,7 +75,7 @@ _PAGED_KV_BLOCK_ALIGNMENT = 16
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
-_PREPROCESSED_ACTION_SCRIPT_KEY = "_abot_camera_action_script"
+_PREPROCESSED_ACTION_SCRIPT_KEY = PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
 _ACTION_CONTROL_DIM = 32
 
 
@@ -1446,16 +1447,10 @@ class ABotWorldCausalPipeline(
         total_steps = (inputs.num_latent_frames // block_frames) * len(ABOT_DMD_TIMESTEPS)
         generated_blocks: list[torch.Tensor] = []
 
+        block_action = self._build_action_tensor(None, block_frames, inputs.height, inputs.width, dtype)
+
         with self.progress_bar(total=total_steps) as progress_bar:
             for local_start in range(0, inputs.num_latent_frames, block_frames):
-                block_action = self._build_action_tensor(
-                    None,
-                    block_frames,
-                    inputs.height,
-                    inputs.width,
-                    dtype,
-                )
-
                 noise = randn_tensor(
                     (1, out_channels, block_frames, latent_h, latent_w),
                     generator=inputs.generator,

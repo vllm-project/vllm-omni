@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 _ACTION_ORDER = ("w", "a", "s", "d", "i", "j", "k", "l")
+CAMERA_ACTION_SCRIPT_KEY = "camera_action_script"
+PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY = "_abot_camera_action_script"
 _VALID_ACTIONS = frozenset(_ACTION_ORDER)
 
 

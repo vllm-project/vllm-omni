@@ -212,6 +212,20 @@ def test_live_updates_are_rejected_for_a_scripted_request() -> None:
         handler.validate_payload(state, event_id="e", payload=_hold("w"), transition_chunks=None)
 
 
+@pytest.mark.parametrize("key", ["camera_action_script", "_abot_camera_action_script"])
+def test_live_updates_are_rejected_before_a_scripted_request_is_prepared(key) -> None:
+    handler = ABotCameraInteractionHandler()
+    state = StepRequestState(
+        request_id="r",
+        sampling=OmniDiffusionSamplingParams(extra_args={key: [[["w"], [], []]]}),
+    )
+    with pytest.raises(ValueError, match="camera_action_script"):
+        handler.validate_payload(state, event_id="e", payload=_hold("w"), transition_chunks=None)
+    with pytest.raises(ValueError, match="camera_action_script"):
+        handler.enqueue(state, event_id="e", received_at=1.0, payload=_hold("w"), transition_chunks=None)
+    assert "camera" not in state.interaction_sessions
+
+
 def test_pending_updates_are_bounded() -> None:
     handler = ABotCameraInteractionHandler()
     state = _state()

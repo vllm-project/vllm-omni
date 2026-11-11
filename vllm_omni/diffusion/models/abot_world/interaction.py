@@ -14,7 +14,12 @@ from vllm_omni.diffusion.interaction.types import (
     InteractionPayload,
     InteractionSession,
 )
-from vllm_omni.diffusion.models.abot_world.actions import ABotCameraUpdate, parse_abot_camera_update
+from vllm_omni.diffusion.models.abot_world.actions import (
+    CAMERA_ACTION_SCRIPT_KEY,
+    PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY,
+    ABotCameraUpdate,
+    parse_abot_camera_update,
+)
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 ActionFrames = tuple[tuple[str, ...], ...]
@@ -115,7 +120,7 @@ class ABotCameraInteractionHandler(InteractionHandler):
             raise ValueError("event_id must be nonempty.")
         if transition_chunks not in (None, 0):
             raise ValueError("ABot applies camera updates at one chunk boundary; transition_chunks must be 0.")
-        if getattr(state.extra.get("inputs"), "camera_action_script", None) is not None:
+        if _request_is_scripted(state):
             raise ValueError("Cannot use mid-generation camera interaction together with camera_action_script.")
         update = parse_abot_camera_update(payload)
         session = state.interaction_sessions.get(self.modality)
@@ -130,6 +135,20 @@ class ABotCameraInteractionHandler(InteractionHandler):
         if not isinstance(session, ABotCameraSession):
             raise TypeError("ABot camera interaction session has an unexpected type.")
         return session
+
+
+def _request_is_scripted(state: StepRequestState) -> bool:
+    """Whether the request carries ``camera_action_script``.
+
+    The sampling arguments exist from request creation; the parsed inputs only
+    after ``prepare_encode``.
+    """
+    if getattr(state.extra.get("inputs"), "camera_action_script", None) is not None:
+        return True
+    extra_args = getattr(state.sampling, "extra_args", None) or {}
+    return any(
+        extra_args.get(key) is not None for key in (CAMERA_ACTION_SCRIPT_KEY, PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY)
+    )
 
 
 def _advance(
