@@ -52,7 +52,7 @@ from .abot_world_transformer import (
     ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,
 )
-from .actions import PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
+from .actions import CAMERA_ACTION_SCRIPT_KEY, PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
 from .interaction import ABotCameraSession
 from .taew2_2 import TAEW2Decoder
 
@@ -75,7 +75,6 @@ _PAGED_KV_BLOCK_ALIGNMENT = 16
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
-_PREPROCESSED_ACTION_SCRIPT_KEY = PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY
 _ACTION_CONTROL_DIM = 32
 
 
@@ -388,7 +387,7 @@ def get_abot_world_pre_process_func(
                     raise ValueError("Each reference image must be a PIL image, tensor, or file path.")
 
         extra_args = dict(getattr(request.sampling_params, "extra_args", None) or {})
-        camera_action_script = extra_args.get("camera_action_script")
+        camera_action_script = extra_args.get(CAMERA_ACTION_SCRIPT_KEY)
         if camera_action_script is not None:
             from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
 
@@ -400,7 +399,7 @@ def get_abot_world_pre_process_func(
             updated_mmd["reference_images"] = tuple(resolved_refs)
         updated_prompt["multi_modal_data"] = updated_mmd
         request.prompt = updated_prompt
-        extra_args[_PREPROCESSED_ACTION_SCRIPT_KEY] = camera_action_script
+        extra_args[PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY] = camera_action_script
         request.sampling_params.extra_args = extra_args
         return request
 
@@ -840,7 +839,7 @@ class ABotWorldCausalPipeline(
             )
 
         extra_args = getattr(sampling, "extra_args", None) or {}
-        camera_action_script = extra_args.get(_PREPROCESSED_ACTION_SCRIPT_KEY)
+        camera_action_script = extra_args.get(PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY)
         flow_shift = _positive_finite_flow_shift(extra_args.get("flow_shift", 5.0))
 
         height = getattr(sampling, "height", None) or _DEFAULT_HEIGHT
