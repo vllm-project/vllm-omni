@@ -1664,6 +1664,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """
         if int(sampled) in self._minicpmo45_duplex_control_ids():
             return
+        state.turn_end_hold_pending = False
         token_ids = getattr(state, "open_turn_token_ids", None)
         if not isinstance(token_ids, list):
             token_ids = []
@@ -1676,18 +1677,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def _minicpmo45_clear_open_turn_tail(self, state: Any) -> None:
         state.open_turn_tail = ""
         state.open_turn_token_ids = []
+        state.turn_end_hold_pending = False
 
     def _minicpmo45_hold_unfinished_turn(self, row_idx: int) -> bool:
         """Keep an open turn when ``<|turn_eos|>`` arrives before the sentence ends.
 
         The text is the turn tail recorded with earlier text tokens, not the
-        current chunk. After a hold rewrites ``<|turn_eos|>`` to ``<|chunk_eos|>``,
-        the next chunk is empty; the same unfinished tail must still hold.
+        current chunk. A hold rewrites ``<|turn_eos|>`` to ``<|chunk_eos|>`` for
+        one continuation attempt. Another EOS without new text ends the turn.
         A turn already ended, a tail that already ends a sentence, an empty
         tail, or a turn held ``MAX_HELD_UNFINISHED_TURN_ENDS`` times is left alone.
         """
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None or getattr(state, "current_turn_ended", True):
+            return False
+        if getattr(state, "turn_end_hold_pending", False):
             return False
         if int(getattr(state, "held_turn_ends", 0) or 0) >= MiniCPMO45DuplexPolicy.MAX_HELD_UNFINISHED_TURN_ENDS:
             return False
@@ -1701,6 +1705,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if state is None:
             return
         state.held_turn_ends = int(getattr(state, "held_turn_ends", 0) or 0) + 1
+        state.turn_end_hold_pending = True
 
     def _finalize_minicpmo45_native_duplex_sample(
         self,

@@ -822,11 +822,23 @@ embeddings even when they do not add a pooled token.
 
 MiniCPM-o native duplex does not apply a character cap unless
 `max_speak_chars_per_chunk` is set to a positive value. The default is 0,
-so a chunk closes only at the official 20-token budget. A decoded prefix
+so the default length limit is the official 20-token budget; sampled chunk
+terminators can still close a chunk earlier. A decoded prefix
 ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
 cap is set. That cap keeps the token that crosses the target, then closes
 the chunk before another draw. Hard token and request caps retain priority;
 explicit `force_listen` bypasses only the soft character target.
+
+MiniCPM-o also applies a bounded continuation policy that differs from official
+`streaming_generate`: when an open turn has text without sentence-ending
+punctuation, a sampled `<|turn_eos|>` is replaced with `<|chunk_eos|>` to give
+the next chunk a chance to finish the sentence. If no new text token arrives
+before the next `<|turn_eos|>`, that turn end is accepted. Control tokens do
+not count as text progress. New text permits another continuation attempt,
+up to 16 held turn ends per turn. Sentence-ending punctuation releases the
+hold immediately. An accepted turn end or explicit force-listen clears the
+continuation state. Stage 0 and the Talker handoff share the sentence-end
+predicate; the Talker still receives an accepted `<|turn_eos|>` unchanged.
 
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change

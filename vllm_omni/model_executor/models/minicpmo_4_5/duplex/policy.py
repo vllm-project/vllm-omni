@@ -96,7 +96,8 @@ class MiniCPMO45DuplexPolicy:
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
-    # Official streaming_generate closes a chunk at this token budget only.
+    # Official streaming_generate uses this token budget as its length limit;
+    # sampled terminators can close the chunk earlier.
     # A 28-character cap fired earlier (16 tokens into "……数字") and the next
     # unit then sampled <|turn_eos|>, so the number never followed. 0 disables
     # the character cap; a positive max_speak_chars_per_chunk still opts in.
@@ -108,8 +109,8 @@ class MiniCPMO45DuplexPolicy:
     CLOSING_PUNCTUATION = "\"'”’」』）)】"
     TURN_TEXT_TAIL_CHARS = 16
     # Issue 9828 samples <|turn_eos|> after 「正」. One more chunk is about 20
-    # tokens; 16 holds lets that sentence finish if the model retries the turn
-    # end between words, then the next <|turn_eos|> is accepted.
+    # tokens. Retry only while text advances, up to 16 holds per turn; another
+    # <|turn_eos|> without new text is accepted immediately.
     MAX_HELD_UNFINISHED_TURN_ENDS = 16
 
     @staticmethod

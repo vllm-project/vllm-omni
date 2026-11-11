@@ -10,6 +10,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -290,8 +291,7 @@ class _SentenceTokenizer(_CharTokenizer):
 def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferred):
     """Issue 9828: <|turn_eos|> after 「正」 must not end the turn.
 
-    The second sample is the empty chunk after the hold. The turn tail is
-    still unfinished, so that <|turn_eos|> is held too.
+    Further text in the next chunk permits another hold until the sentence ends.
     """
     model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=True)
     model.max_speak_chars_per_chunk = 0
@@ -308,8 +308,10 @@ def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferre
     assert state.generated_tokens == [21]
     assert state.open_turn_tail.endswith("正")
 
-    # The next segment drops the chunk terminator, so its accepted text is empty.
+    # The next segment drops the chunk terminator and resumes with new text.
     md.output_token_ids[0] = []
+    assert sample(23) == 23
+    md.output_token_ids[0] = [23]
     assert sample(turn_eos) == CHUNK_EOS
     assert state.current_turn_ended is False
     assert state.held_turn_ends == 2
@@ -320,6 +322,59 @@ def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferre
     assert state.current_turn_ended is True
     assert state.held_turn_ends == 0
     assert state.open_turn_tail == ""
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("control_token", [None, TOKEN_IDS["tts_bos_token_id"]])
+def test_turn_eos_without_text_progress_ends_the_turn(monkeypatch, deferred, control_token):
+    """An unpunctuated answer gets one continuation attempt, not 16 empty chunks."""
+    model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    state = _MiniCPMO45Stage0SessionState(session_id="no-progress", current_turn_ended=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model.max_speak_chars_per_chunk = 0
+    turn_eos = TOKEN_IDS["turn_eos_token_id"]
+    md.output_token_ids[0] = []
+    assert sample(21) == 21  # No sentence-ending punctuation.
+    md.output_token_ids[0] = [21]
+    assert sample(turn_eos) == CHUNK_EOS
+
+    md.output_token_ids[0] = []
+    if control_token is not None:
+        assert sample(control_token) == control_token
+        md.output_token_ids[0] = [control_token]
+    assert sample(turn_eos) == turn_eos
+    assert state.current_turn_ended is True
+    assert state.held_turn_ends == 0
+    assert state.open_turn_tail == ""
+
+    # A later answer gets its own continuation attempt.
+    md.output_token_ids[0] = []
+    assert sample(21) == 21
+    md.output_token_ids[0] = [21]
+    assert sample(turn_eos) == CHUNK_EOS
+    assert state.current_turn_ended is False
+    assert state.held_turn_ends == 1
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_turn_end_hold_cap_survives_text_progress(monkeypatch, deferred):
+    """Progress permits retries but cannot reset the total per-turn hold limit."""
+    model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    state = _MiniCPMO45Stage0SessionState(session_id="hold-cap", current_turn_ended=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model.max_speak_chars_per_chunk = 0
+    turn_eos = TOKEN_IDS["turn_eos_token_id"]
+    for _ in range(MiniCPMO45DuplexPolicy.MAX_HELD_UNFINISHED_TURN_ENDS):
+        md.output_token_ids[0] = []
+        assert sample(21) == 21
+        md.output_token_ids[0] = [21]
+        assert sample(turn_eos) == CHUNK_EOS
+        assert state.current_turn_ended is False
+    md.output_token_ids[0] = []
+    assert sample(21) == 21
+    md.output_token_ids[0] = [21]
+    assert sample(turn_eos) == turn_eos
+    assert state.current_turn_ended is True
 
 
 def test_deferred_sentence_ender_is_committed_before_the_next_turn_eos(monkeypatch):
