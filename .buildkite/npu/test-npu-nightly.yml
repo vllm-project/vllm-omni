@@ -405,6 +405,38 @@ steps:
             pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_ref2va_rainfusion_npu.py -m "full_model and npu and A3 and diffusion and cards_4" --run-level full_model 2>&1 | python3 -u tests/e2e/online_serving/minimax_h3/rainfusion_trace.py
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -k test_minimax_h3_ref2va_rainfusion_laser_4npu_a3 -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json --run-level full_model
             '
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 Ref2VA Lossless Perf Test · A5"
+        key: nightly-diffusion-x2v-minimax-h3-ref2va-a5
+        source_file_dependencies:
+          - diffusion_minimax_h3_perf
+          - diffusion_offloader
+        timeout_in_minutes: 180
+        mirror_hardwares: a5_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+          VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "4000"
+          BENCHMARK_DIR: tests/dfx/perf/results
+        artifact_paths:
+          - "tests/dfx/perf/results/result_test_minimax_h3_ref2va_dlo_4npu_a5_*.json"
+        commands:
+          - |
+            set -e
+            if [ -z "$${VLLM_TEST_MINIMAX_H3_REF2VA_MODEL:-}" ] &&
+               [ -n "$${VLLM_TEST_MINIMAX_H3_MODEL:-}" ] &&
+               [ -d "$$VLLM_TEST_MINIMAX_H3_MODEL/Ref2VA" ]; then
+              export VLLM_TEST_MINIMAX_H3_REF2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/Ref2VA"
+            fi
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+              -k test_minimax_h3_ref2va_dlo_4npu_a5 \
+              -m "full_model and npu and A5 and diffusion and cards_4" --run-level full_model \
+              --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            if ! compgen -G "$$BENCHMARK_DIR/result_test_minimax_h3_ref2va_dlo_4npu_a5_*.json" >/dev/null; then
+              echo "MiniMax-H3 Ref2VA A5 benchmark did not produce a result JSON" >&2
+              exit 1
+            fi
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
         key: nightly-diffusion-x2v-timeline-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_accuracy
