@@ -171,7 +171,11 @@ export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+With TensorRT and batched flow enabled, a stage configured for multiple requests builds and caches one dual-profile estimator engine. Profile 0 preserves the legacy single-request CFG batch 2 path up to the full 3000-frame estimator limit. Profile 1 covers CFG batches from 4 up to twice the smaller of the configured stage-1 `max_num_seqs` and eight, with a 1024-frame limit to bound TensorRT activation memory. Groups outside these bounds run as serial CFG2 pairs through profile 0 within its 3000-frame limit. The engine cache key includes the TensorRT/GPU, batch-profile version, and batched-frame limit, so the build cost is not paid on every launch. If the dual-profile engine cannot be built at all, vLLM-Omni keeps the Torch estimator rather than installing a partial TensorRT path.
+
+This option enables TensorRT execution for batched CFG inputs; it does not guarantee an end-to-end throughput improvement. Actual batch sizes depend on the streaming groups: requests with different reference token or feature shapes are grouped separately, so mixed-reference workloads may expose little batching opportunity.
+
+Batching preserves output lengths and streaming cache alignment, but the different GEMM/TensorRT tactic shapes can produce small numerical differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### Ascend Stage-1 graph regions
 
