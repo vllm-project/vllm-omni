@@ -36,10 +36,17 @@ class _BatchRecordingPolicy:
         self.language_key = LANGUAGE_KEY
         self.calls: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
         self.fail_batched = False
+        self.draw_noise = False
+        self.noise: list[list[torch.Tensor]] = []
         self.reset_calls = 0
 
     def get_action(self, obs: dict[str, Any], options: dict[str, Any] | None = None):
         self.calls.append((obs, options))
+        if self.draw_noise:
+            # Like the action head, draw each sample's noise before anything can fail.
+            generator = (options or {}).get("generator")
+            generators = generator if isinstance(generator, list) else [generator]
+            self.noise.append([torch.randn(1, generator=g) for g in generators])
         state = obs["state"]["joint"]
         if self.fail_batched and state.shape[0] > 1:
             raise RuntimeError("batched call failed")
@@ -174,6 +181,39 @@ def test_failed_batched_call_falls_back_and_only_the_bad_request_errors(pipeline
     assert _arm(outputs[0]) == 1.0
     assert "GR00T policy inference failed: NaN state" in outputs[1].error
     assert [obs["state"]["joint"].shape[0] for obs, _ in pipeline.policy.calls] == [2, 1, 1]
+
+
+@pytest.mark.parametrize("bad_value", [None, 0.5])
+def test_nested_value_without_a_batch_axis_fails_alone(pipeline, bad_value):
+    bad = _robot_obs(2.0)
+    bad["state"]["joint"] = bad_value
+    wave = DiffusionRequestBatch(
+        requests=[_request("ok-1", _robot_obs(1.0)), _request("bad", bad), _request("ok-2", _robot_obs(3.0))]
+    )
+
+    outputs = pipeline.forward(wave)
+
+    assert _arm(outputs[0]) == 1.0
+    assert "GR00T policy inference failed" in outputs[1].error
+    assert _arm(outputs[2]) == 3.0
+    assert len(pipeline.policy.calls) == 3
+
+
+def test_retry_after_a_failed_batch_draws_each_requests_solo_noise(pipeline):
+    pipeline.policy.fail_batched = True
+    pipeline.policy.draw_noise = True
+    seeds = (11, 22)
+    wave = DiffusionRequestBatch(requests=[_request("a", _robot_obs(1.0)), _request("b", _robot_obs(2.0))])
+    for request, seed in zip(wave.requests, seeds):
+        request.sampling_params.generator = torch.Generator().manual_seed(seed)
+
+    outputs = pipeline.forward(wave)
+
+    assert [_arm(output) for output in outputs] == [1.0, 2.0]
+    batched, *retries = pipeline.policy.noise
+    assert len(batched) == 2
+    for (drawn,), seed in zip(retries, seeds):
+        assert torch.equal(drawn, torch.randn(1, generator=torch.Generator().manual_seed(seed)))
 
 
 def test_reset_from_any_request_resets_the_shared_policy_once_per_request(pipeline):

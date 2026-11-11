@@ -184,6 +184,9 @@ class Gr00tN1d7Pipeline(nn.Module):
         merged = _merge_observations(observations)
         if merged is not None:
             options = {"generator": generators} if any(g is not None for g in generators) else None
+            # The batched call draws each request's noise from its generator before it can
+            # fail, so keep the states to give a retried request the noise it draws alone.
+            generator_states = [g.get_state() if g is not None else None for g in generators]
             try:
                 result = self.policy.get_action(merged, options)
                 actions = result[0] if isinstance(result, tuple) else result
@@ -198,6 +201,9 @@ class Gr00tN1d7Pipeline(nn.Module):
                     len(pending),
                     exc_info=True,
                 )
+                for generator, state in zip(generators, generator_states):
+                    if generator is not None and state is not None:
+                        generator.set_state(state)
             else:
                 return [DiffusionOutput(output={"actions": actions_i}) for actions_i in per_request]
         else:
@@ -255,15 +261,17 @@ def _merge_observations(observations: list[dict[str, Any]]) -> dict[str, Any] | 
     first = observations[0]
     if not isinstance(first.get("video"), Mapping) or not first["video"]:
         return None
-    for obs in observations:
-        if set(obs) != set(first):
-            return None
-        for modality in first:
-            if not isinstance(obs[modality], Mapping) or set(obs[modality]) != set(first[modality]):
-                return None
-            if any(len(value) != 1 for value in obs[modality].values()):
-                return None
     try:
+        for obs in observations:
+            if set(obs) != set(first):
+                return None
+            for modality in first:
+                if not isinstance(obs[modality], Mapping) or set(obs[modality]) != set(first[modality]):
+                    return None
+                # A value without a length (None, a scalar) raises TypeError here, so the
+                # wave falls back to one call per request and only that request errors.
+                if any(len(value) != 1 for value in obs[modality].values()):
+                    return None
         merged: dict[str, Any] = {}
         for modality, keys in first.items():
             if modality == "language":
