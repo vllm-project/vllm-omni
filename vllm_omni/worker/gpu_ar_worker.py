@@ -26,6 +26,40 @@ from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 logger = init_logger(__name__)
 
 
+def _is_mammoth_moda2_vllm_config(vllm_config) -> bool:
+    """True when this stage loads a MammothModa2 AR / multimodal checkpoint.
+
+    AR stages do not yet have a per-model ``model_runner_cls`` registry like
+    diffusion, so Mammoth specialty capture is selected by checkpoint metadata
+    here. Prefer ``model_type`` / ``architectures`` over path heuristics.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str) and model_type.startswith("mammoth_moda2"):
+        return True
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any("MammothModa2" in str(arch) for arch in architectures)
+
+
+def resolve_gpu_ar_model_runner_cls(vllm_config, runner_cls):
+    """Pick the AR runner class for this stage.
+
+    MammothModa2 MoE specialty capture/replay lives on
+    ``MammothGPUARModelRunner`` so shared ``OmniGPUModelRunner`` stays a thin
+    hook. Custom ``model_runner_cls`` overrides and V2 runners are left alone.
+    Specialty/flag mismatches are checked after ``load_model`` (the flag is
+    set during Mammoth model ``__init__``), not here at ``init_device``.
+    """
+    if runner_cls is not GPUARModelRunner or not _is_mammoth_moda2_vllm_config(vllm_config):
+        return runner_cls
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import (
+        MammothGPUARModelRunner,
+    )
+
+    return MammothGPUARModelRunner
+
+
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU worker for autoregressive omni model stages.
 
@@ -134,7 +168,8 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
-            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            runner_cls = resolve_gpu_ar_model_runner_cls(self.vllm_config, self.model_runner_cls)
+            self.model_runner = runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
