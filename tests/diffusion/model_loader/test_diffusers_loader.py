@@ -358,15 +358,14 @@ def test_maybe_fuse_distilled_lora_rejects_online_int8_weights(mock_tp_group, mo
         },
         str(lora_path),
     )
-    cfg = SimpleNamespace(
-        lora_backend="distill",
+    od_config = OmniDiffusionConfig(
+        model="",
+        dtype=torch.bfloat16,
+        lora_backend=LoRABackend.DISTILL,
         lora_path=str(lora_path),
         lora_scale=1.0,
-        dtype=torch.bfloat16,
-        quantization_config=None,
-        parallel_config=SimpleNamespace(use_hsdp=False),
     )
-    loader = DiffusersPipelineLoader(LoadConfig(), cfg)
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     model = _Pipeline()
     weight_before = proj.weight.detach().clone()
 
