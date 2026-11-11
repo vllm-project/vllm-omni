@@ -135,6 +135,26 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, devic
     assert token2wav.trt_spk_calls == 0
 
 
+@pytest.mark.parametrize(
+    "flow,reason",
+    [
+        pytest.param(torch.nn.Identity(), "flow has no parameters", id="parameterless"),
+        pytest.param(torch.nn.Linear(1, 1, device="cpu"), "flow is on CPU", id="cpu"),
+    ],
+)
+def test_device_speaker_fallback_without_accelerator(tmp_path, monkeypatch, mocker, flow, reason):
+    monkeypatch.setattr(_FakeToken2Wav, "flow", property(lambda self: flow))
+    warning = mocker.patch.object(code2wav_module.logger, "warning")
+
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": True})
+
+    assert token2wav.device_spk_calls == 0
+    assert token2wav.trt_spk_calls == 0
+    warning.assert_called_once_with(
+        "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime", reason
+    )
+
+
 @pytest.mark.parametrize("value", ["maybe", "yes", 2, 1.5, []])
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, device_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):

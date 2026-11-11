@@ -1905,6 +1905,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
+            else:
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
+                )
         else:
             logger.info(
                 "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
