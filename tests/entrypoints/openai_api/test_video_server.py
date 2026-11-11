@@ -1225,6 +1225,37 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     assert input_image.size == (40, 24)
 
 
+def test_i2v_video_generation_rejects_oversized_image_url(test_client, monkeypatch):
+    async_client = httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        return async_client(
+            *args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-length": "5"},
+                    content=b"12345",
+                )
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(video_api_utils, "MAX_IMAGE_INPUT_BYTES", 4)
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "reject oversized reference",
+            "image_reference": json.dumps({"image_url": "https://example.com/large.png"}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "exceeds" in response.json()["detail"]
+
+
 def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker: MockerFixture, monkeypatch):
     requested_paths = []
     async_client = httpx.AsyncClient
