@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """CFG companion request tracker for the Omni orchestrator.
 
 Encapsulates all bookkeeping for Classifier-Free Guidance companion
@@ -8,21 +11,35 @@ deferred forwarding, and cleanup).
 from __future__ import annotations
 
 import logging
-from typing import Any
+import math
+import time
+from collections.abc import Callable
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class _PendingParent(TypedDict):
+    engine_outputs: Any
+    stage_id: int
+    deferred_at: float
 
 
 class CfgCompanionTracker:
     """Manages CFG companion request lifecycle in the orchestrator scheduling loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
         self._companion_map: dict[str, dict[str, str]] = {}  # parent -> {role: companion_id}
         self._companion_ids: set[str] = set()
         self._companion_to_parent: dict[str, str] = {}  # companion -> parent
         self._done: dict[str, set[str]] = {}  # parent -> completed companion ids
-        self._pending_parents: dict[str, dict[str, Any]] = {}  # parent -> deferred result
+        self._pending_parents: dict[str, _PendingParent] = {}  # parent -> deferred result
         self._companion_outputs: dict[str, Any] = {}  # companion_id -> engine output
+        self._terminal_parents: set[str] = set()
+        self._terminal_request_ids: set[str] = set()
+        self._terminal_request_ids_by_parent: dict[str, set[str]] = {}
+        self._terminal_parent_by_request_id: dict[str, str] = {}
 
     def is_companion(self, req_id: str) -> bool:
         return req_id in self._companion_ids
@@ -47,11 +64,14 @@ class CfgCompanionTracker:
         self._companion_map.setdefault(parent_id, {})
         self._done.setdefault(parent_id, set())
 
-    def register_companion(self, parent_id: str, role: str, companion_id: str) -> None:
+    def register_companion(self, parent_id: str, role: str, companion_id: str) -> bool:
+        if parent_id in self._terminal_parents:
+            return False
         self.register_parent(parent_id)
         self._companion_map[parent_id][role] = companion_id
         self._companion_ids.add(companion_id)
         self._companion_to_parent[companion_id] = parent_id
+        return True
 
     def set_companion_output(self, companion_id: str, output: Any) -> None:
         """Stash companion engine output for the parent to bundle at forward time."""
@@ -79,6 +99,43 @@ class CfgCompanionTracker:
             return False
         return companion_id in self._done.get(parent_id, set())
 
+    def claim_terminal(self, parent_id: str) -> bool:
+        """Claim the parent-level terminal transition once.
+
+        Failure and cancellation paths call this before their first ``await``.
+        A later error, timeout, or cleanup event therefore cannot emit another
+        parent result while the original transition is still being cleaned up.
+        """
+        if parent_id in self._terminal_parents:
+            return False
+        self._terminal_parents.add(parent_id)
+        terminal_request_ids = {parent_id, *self._companion_map.get(parent_id, {}).values()}
+        self._terminal_request_ids.update(terminal_request_ids)
+        self._terminal_request_ids_by_parent[parent_id] = terminal_request_ids
+        for request_id in terminal_request_ids:
+            self._terminal_parent_by_request_id[request_id] = parent_id
+        return True
+
+    def is_terminal(self, parent_id: str) -> bool:
+        """Return whether a parent-level terminal transition was claimed."""
+        return parent_id in self._terminal_parents
+
+    def is_request_terminal(self, request_id: str) -> bool:
+        """Return whether a parent or one of its companions is terminal."""
+        return request_id in self._terminal_request_ids
+
+    def get_terminal_parent(self, request_id: str) -> str | None:
+        """Return the terminal parent owning a request id, if any."""
+        return self._terminal_parent_by_request_id.get(request_id)
+
+    def finalize_terminal(self, parent_id: str) -> None:
+        """Release the terminal claim after request cleanup has completed."""
+        self._terminal_parents.discard(parent_id)
+        for request_id in self._terminal_request_ids_by_parent.pop(parent_id, {parent_id}):
+            self._terminal_request_ids.discard(request_id)
+            if self._terminal_parent_by_request_id.get(request_id) == parent_id:
+                self._terminal_parent_by_request_id.pop(request_id, None)
+
     def on_companion_completed(self, companion_id: str) -> str | None:
         """Mark done. Returns parent_id only if parent is pending and all companions finished."""
         parent_id = self._companion_to_parent.get(companion_id)
@@ -98,19 +155,52 @@ class CfgCompanionTracker:
         """Hold parent result while waiting for companions to finish.
 
         Deferred parents are released when their companions' processed outputs
-        arrive, and failed by the orchestrator when a companion errors or is
-        aborted. TODO: a deadline for deferred parents and detection of a
-        companion replica dying silently (no error output, no abort) still
-        need a liveness owner in the orchestrator loop.
+        arrive. The first deferral records the monotonic start time; repeated
+        deferrals replace the payload without extending the deadline. The
+        orchestrator owns timeout and failure reporting.
         """
-        self._pending_parents[parent_id] = {
-            "engine_outputs": engine_outputs,
-            "stage_id": stage_id,
-        }
+        pending = self._pending_parents.get(parent_id)
+        if pending is None:
+            self._pending_parents[parent_id] = {
+                "engine_outputs": engine_outputs,
+                "stage_id": stage_id,
+                "deferred_at": self._clock(),
+            }
+        else:
+            # A re-deferral updates the payload but preserves the original
+            # deadline so repeated partial outputs cannot extend the wait.
+            pending["engine_outputs"] = engine_outputs
+            pending["stage_id"] = stage_id
         logger.debug("Parent %s deferred, waiting for CFG companions", parent_id)
 
-    def pop_pending_parent(self, parent_id: str) -> dict[str, Any] | None:
+    def pop_pending_parent(self, parent_id: str) -> _PendingParent | None:
         return self._pending_parents.pop(parent_id, None)
+
+    def poll_expired(
+        self,
+        timeout_s: float,
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, _PendingParent]]:
+        """Claim and remove parents whose companion wait reached ``timeout_s``.
+
+        ``now`` is injectable for deterministic tests. Expiry is inclusive, and
+        a parent whose companions are already all done is left for the normal
+        completion path to flush.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
+        current = self._clock() if now is None else now
+        expired: list[tuple[str, _PendingParent]] = []
+        for parent_id, pending in list(self._pending_parents.items()):
+            if self.all_companions_done(parent_id) or current - pending["deferred_at"] < timeout_s:
+                continue
+            if not self.claim_terminal(parent_id):
+                continue
+            claimed = self._pending_parents.pop(parent_id, None)
+            if claimed is not None:
+                expired.append((parent_id, claimed))
+        return expired
 
     def cleanup_parent(self, parent_id: str) -> list[str]:
         companion_ids = list(self._companion_map.pop(parent_id, {}).values())
@@ -136,6 +226,7 @@ class CfgCompanionTracker:
 
         for parent_id in parents_to_cleanup:
             companion_ids = self.cleanup_parent(parent_id)
+            self.finalize_terminal(parent_id)
             for companion_id in companion_ids:
                 if companion_id not in seen:
                     seen.add(companion_id)
