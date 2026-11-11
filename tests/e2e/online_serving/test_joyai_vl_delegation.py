@@ -16,13 +16,12 @@ import json
 import pytest
 from PIL import Image
 
+from tests.e2e.online_serving.helpers.joyai_vl_interaction import joyai_server_params
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import delegation_tool_definition
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.omni]
 
 #: The answer the application fabricates for the delegated question.
 DELEGATED_ANSWER = "the code is ZB-4471"
@@ -256,15 +255,7 @@ async def run_delegation(url, model, output_dir):
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
-    [
-        OmniServerParams(
-            model="jdopensource/JoyAI-VL-Interaction-Preview",
-            stage_config_path=modify_stage_config(
-                get_deploy_config_path("joyai_vl_interaction.yaml"),
-                updates={"session_mode": "duplex", "async_chunk": True},
-            ),
-        )
-    ],
+    [joyai_server_params()],
     indirect=True,
 )
 def test_delegated_question_round_trips_into_speech(omni_server, tmp_path):
