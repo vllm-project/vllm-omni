@@ -55,6 +55,7 @@ steps:
         mirror_hardwares: a2b3_npu_4
         timeout_in_minutes: 15
         source_file_dependencies:
+          - "docker/Dockerfile.npu.ci"
           - "vllm_omni/diffusion/attention/parallel/"
           - "vllm_omni/diffusion/distributed/"
           - "tests/diffusion/distributed/test_ulysses_symmetric_memory_npu.py"

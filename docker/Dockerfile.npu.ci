@@ -6,6 +6,9 @@ ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
+ARG VLLM_ASCEND_DEVICE_SUFFIX
+# Includes the CANN 9.2.1 Runtime symbol-loading fix (cann/shmem !966).
+ARG CANN_SHMEM_COMMIT=f6df6ba3fa962484b2629e7e8ad7e6e15e3190b6
 ARG APP_DIR=/vllm-workspace/vllm-omni
 WORKDIR ${APP_DIR}
 
@@ -13,7 +16,9 @@ RUN sed -i "s@^\(deb.*\)https\?://[a-z0-9.-]*\.ubuntu\.com@\1http://cache-servic
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        cmake \
         ffmpeg \
+        git \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -22,12 +27,30 @@ RUN apt-get update && \
         libxext6 \
         libxrender1 \
         libxcb1 \
+        make \
         espeak-ng && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
 # Avoid glibc heap corruption at Python shutdown with the NPU runtime.
 ENV LD_PRELOAD=libjemalloc.so.2
+
+# The A2 Ulysses lane needs the native runtime, not its Python extension.
+# Keep bootstrap plugins beside libshmem.so and make the installation visible
+# to both TorchNPU's allocator and the Python transport in fresh processes.
+RUN if [ -z "${VLLM_ASCEND_DEVICE_SUFFIX}" ]; then \
+      source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+      git clone --no-checkout --filter=blob:none https://gitcode.com/cann/shmem.git /tmp/cann-shmem && \
+      git -C /tmp/cann-shmem checkout --detach "${CANN_SHMEM_COMMIT}" && \
+      cd /tmp/cann-shmem && \
+      CMAKE_BUILD_PARALLEL_LEVEL=8 bash scripts/build.sh && \
+      mkdir -p /opt/cann-shmem && \
+      cp -a install/shmem/lib /opt/cann-shmem/lib && \
+      echo /opt/cann-shmem/lib > /etc/ld.so.conf.d/cann-shmem.conf && \
+      ldconfig && \
+      python3 -c 'import ctypes; ctypes.CDLL("libshmem.so").aclshmemx_barrier_all_on_stream' && \
+      cd / && rm -rf /tmp/cann-shmem; \
+    fi
 
 RUN python3 -m pip install -U pip && \
     python3 -m pip install -v \
