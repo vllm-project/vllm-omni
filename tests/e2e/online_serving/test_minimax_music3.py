@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online tests for MiniMax Music 3 text-to-music.
 
 This is a music model on the speech endpoint, so the request shape differs
@@ -60,7 +60,7 @@ tts_server_params = [
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_music_001(omni_server, openai_client) -> None:
     """Baseline: lyrics plus caption in, one ten-second song out.
@@ -86,7 +86,7 @@ def test_text_to_music_001(omni_server, openai_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_music_multi_window_002(omni_server, openai_client) -> None:
     """A song long enough to span several acoustic windows.

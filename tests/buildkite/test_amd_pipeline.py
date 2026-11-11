@@ -2397,6 +2397,30 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
                 "tests/e2e/online_serving/test_kokoro.py",
             ),
         },
+        "MOSS-TTS v1.5 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 1,
+            "artifact_name": "rocm-moss-tts-v15-weekly",
+            "dependency": "tts_moss_v15_weekly",
+            "files": ("tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",),
+        },
+        "MiniMax Music3 · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 330,
+            "count": 2,
+            "artifact_name": "rocm-minimax-music3-weekly",
+            "dependency": "tts_minimax_music3_weekly",
+            "files": ("tests/e2e/online_serving/test_minimax_music3.py",),
+        },
+        "YuE2 online · 1-GPU": {
+            "timeout": 480,
+            "test_timeout": 450,
+            "count": 6,
+            "artifact_name": "rocm-yue2-weekly",
+            "dependency": "tts_yue2_weekly",
+            "files": ("tests/e2e/online_serving/test_yue2.py",),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2494,6 +2518,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_gepard_tts.py": 11,
         "tests/e2e/offline_inference/test_kokoro.py": 2,
         "tests/e2e/online_serving/test_kokoro.py": 5,
+        "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py": 1,
+        "tests/e2e/online_serving/test_minimax_music3.py": 2,
+        "tests/e2e/online_serving/test_yue2.py": 3,
     }
     for path, expected_count in marker_counts.items():
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
