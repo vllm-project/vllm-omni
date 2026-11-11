@@ -353,10 +353,6 @@ _STEP_AUDIO_ROWS = "minimax_h3_audio_rows"
 _STEP_MODEL_ROWS = "minimax_h3_model_rows"
 _STEP_SAMPLER = "minimax_h3_sampler"
 _STEP_SAMPLING_STATE = "minimax_h3_sampling_state"
-_STEP_SIGMAS_VIDEO = "minimax_h3_sigmas_video"
-_STEP_SIGMAS_AUDIO = "minimax_h3_sigmas_audio"
-_STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
-_STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
 _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
 _STEP_VIDEO_EDIT = "minimax_h3_video_edit"
@@ -4128,7 +4124,7 @@ class MiniMaxH3Pipeline(
             )
 
         branch = inputs["branch"]
-        video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+        video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
             positive=branch,
             initial_video_rows=inputs["video_rows"],
             initial_audio_rows=inputs["audio_rows"],
@@ -4156,15 +4152,11 @@ class MiniMaxH3Pipeline(
                 _STEP_BRANCH: branch,
                 _STEP_TRANSFORMER: self._transformer_for_task(context["task"]),
                 _STEP_AUDIO_ROWS: audio_rows,
-                _STEP_COND_ANCHOR: cond_anchor,
-                _STEP_AUDIO_ANCHOR: audio_anchor,
                 _STEP_SAMPLER: inputs.get("sampler", "euler"),
                 _STEP_SAMPLING_STATE: SamplingState(
                     (video_rows[branch.update_mask_dev], audio_rows[branch.audio_update_mask_dev]),
                     (sigmas_video, sigmas_audio),
                 ),
-                _STEP_SIGMAS_VIDEO: sigmas_video,
-                _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
                 _STEP_AUDIO_EDIT: inputs.get("audio_edit"),
                 _STEP_SHAPE: {

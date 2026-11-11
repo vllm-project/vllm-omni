@@ -271,12 +271,12 @@ def minimax_h3_prepare_denoise_rows(
     keyframe_cond_rows: torch.Tensor | None,
     audio_ref_rows: torch.Tensor | None,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate the initial rows against the layout and pin the condition rows.
 
-    Returns ``(video_rows, audio_rows, cond_anchor, audio_anchor)`` with the
-    anchors already written into their rows, which is the state both the
-    request-mode loop and step-mode ``prepare_encode()`` start from.
+    Returns ``(video_rows, audio_rows)`` with the condition rows already written
+    in, which is the state both the request-mode loop and step-mode
+    ``prepare_encode()`` start from.
     """
     n_cond = int((~positive.update_mask).sum())
     if keyframe_cond_rows is None:
@@ -311,7 +311,7 @@ def minimax_h3_prepare_denoise_rows(
         video_rows[~update] = cond_anchor
     if audio_anchor is not None:
         audio_rows[~audio_update] = audio_anchor
-    return video_rows, audio_rows, cond_anchor, audio_anchor
+    return video_rows, audio_rows
 
 
 def minimax_h3_denoise_loop(
@@ -349,7 +349,7 @@ def minimax_h3_denoise_loop(
     # Ascend-specific performance optimization and must not alter that path.
     if current_omni_platform.is_npu():
         positive.prepare_rope_table(model)
-    video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+    video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
         initial_audio_rows=initial_audio_rows,

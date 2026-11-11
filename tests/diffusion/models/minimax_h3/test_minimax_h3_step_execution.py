@@ -143,10 +143,6 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
         # treats the batch as mixed-task and falls back to one forward each.
         mod._STEP_TRANSFORMER: model,
         mod._STEP_AUDIO_ROWS: audio_rows.clone(),
-        mod._STEP_COND_ANCHOR: None,
-        mod._STEP_AUDIO_ANCHOR: None,
-        mod._STEP_SIGMAS_VIDEO: sigmas_video,
-        mod._STEP_SIGMAS_AUDIO: sigmas_audio,
     }
     return state
 
@@ -290,7 +286,7 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
 
     model = RecordingModel()
     pipeline = _step_pipeline(model)
-    states, expected, target_shapes = [], [], []
+    states, expected, target_shapes, anchors = [], [], [], {}
     for index in range(2):
         inputs_kwargs = dict(
             task="ref2va",
@@ -353,7 +349,7 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
             device=torch.device("cpu"),
         )
         expected.append((video, audio))
-        video_rows, audio_rows, visual_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+        video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
             positive=branch,
             initial_video_rows=inputs["video_rows"],
             initial_audio_rows=inputs["audio_rows"],
@@ -364,8 +360,7 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
         state = _make_state(
             str(index), model, branch, video_rows, audio_rows, inputs["sigmas_video"], inputs["sigmas_audio"]
         )
-        state.extra[mod._STEP_COND_ANCHOR] = visual_anchor
-        state.extra[mod._STEP_AUDIO_ANCHOR] = audio_anchor
+        anchors[state.request_id] = (inputs["cond_anchor"], inputs["audio_anchor"])
         states.append(state)
     batch_sizes.clear()
     active = list(states)
@@ -375,13 +370,18 @@ def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_
         }
         for state in active:
             branch = state.extra[mod._STEP_BRANCH]
-            torch.testing.assert_close(state.latents[~branch.update_mask], state.extra[mod._STEP_COND_ANCHOR])
-            if state.extra[mod._STEP_AUDIO_ANCHOR] is None:
+            cond_anchor, audio_anchor = anchors[state.request_id]
+            # Condition rows stay pinned to their anchors through every step.
+            if cond_anchor is None:
+                assert branch.update_mask.all()
+            else:
+                torch.testing.assert_close(state.latents[~branch.update_mask], cond_anchor.float())
+            if audio_anchor is None:
                 assert branch.audio_update_mask.all()
             else:
                 torch.testing.assert_close(
                     state.extra[mod._STEP_AUDIO_ROWS][~branch.audio_update_mask],
-                    state.extra[mod._STEP_AUDIO_ANCHOR],
+                    audio_anchor.float(),
                 )
         active = [state for state in active if not state.denoise_completed]
     assert 2 in batch_sizes and batch_sizes[-1] == 1
@@ -720,8 +720,8 @@ def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
             assert result == {state.request_id: None for state in states}
             after = _denoise_progress(get_forward_context())
 
-    first_sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
-    second_sigmas = states[1].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    first_sigmas = states[0].extra[pipeline_minimax_h3._STEP_SAMPLING_STATE].sigmas[0]
+    second_sigmas = states[1].extra[pipeline_minimax_h3._STEP_SAMPLING_STATE].sigmas[0]
     assert packed_progress == [(None, None, None, None, 2)]
     assert model.progress == [
         (0, float(first_sigmas[0]), 6, "sparse", 1),
@@ -985,7 +985,7 @@ def test_scheduled_step_batch_at_one_progress_is_packed():
         result = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
     assert result == {state.request_id: None for state in states}
 
-    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SAMPLING_STATE].sigmas[0]
     assert model.progress == [(1, float(sigmas[1]), 4, "sparse", 2)]
 
     model.progress.clear()
