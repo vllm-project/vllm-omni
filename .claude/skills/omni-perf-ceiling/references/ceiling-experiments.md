@@ -60,6 +60,13 @@ On Ascend use `npu-smi info watch` with a timestamp prefix instead; the command
 and its caveats are in [npu-ceiling.md](npu-ceiling.md). `ceiling_report.py`
 detects either format from the header.
 
+Timestamped samples are restricted to the measured window, trimming two seconds
+from each end only when the run lasts more than four seconds. Shorter runs keep
+their full measured span. No usable samples means unavailable utilisation (`null`
+in JSON, `-` in the report), with a warning; a measured zero remains zero. If no
+stage has a positive measured device time, the report cannot infer a finite
+throughput bound from `--stage-util`.
+
 Build the ledger:
 
 ```bash

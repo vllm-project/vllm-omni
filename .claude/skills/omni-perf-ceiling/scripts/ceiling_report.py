@@ -196,8 +196,8 @@ def _npu_smi_samples(lines: list[str], column: str) -> list[tuple[dt.datetime | 
 
 def device_busy_share(
     util_path: Path, window: tuple[dt.datetime, dt.datetime] | None, npu_column: str
-) -> tuple[float, int, bool]:
-    """Mean busy share in the measured window, sample count, and whether trimmed."""
+) -> tuple[float | None, int, bool]:
+    """Mean busy share (None without samples), sample count, and whether trimmed."""
     lines = util_path.read_text(errors="replace").splitlines()
     if any("AI Core(%)" in line for line in lines):
         samples = _npu_smi_samples(lines, npu_column)
@@ -207,7 +207,7 @@ def device_busy_share(
     # scoped to the measured window.
     trimmed = bool(window) and bool(samples) and all(ts is not None for ts, _ in samples)
     values = [v for ts, v in samples if not (window and ts) or window[0] <= ts <= window[1]]
-    return (sum(values) / len(values) if values else 0.0), len(values), trimmed
+    return (sum(values) / len(values) if values else None), len(values), trimmed
 
 
 def measured_window(result: dict) -> tuple[dt.datetime, dt.datetime] | None:
@@ -218,6 +218,9 @@ def measured_window(result: dict) -> tuple[dt.datetime, dt.datetime] | None:
         return None
     start = end - dt.timedelta(seconds=float(result["duration"]))
     slack = dt.timedelta(seconds=2)
+    # Keep the full measured span when trimming would empty or invert it.
+    if end - start <= 2 * slack:
+        return start, end
     return start + slack, end - slack
 
 
@@ -301,7 +304,7 @@ def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
         cell["gpu_busy_share"] = busy
         cell["gpu_samples"] = samples
         cell["util_trimmed"] = trimmed
-        if throughput and busy:
+        if throughput and busy is not None:
             # GPU-seconds per audio-second across all stages on this device.
             cell["g_total"] = busy / throughput
             # Same work with zero idle time.
@@ -320,7 +323,7 @@ def parse_bound(raw: str) -> tuple[str, str | None, list[str]]:
     return name, stage or None, values.split(",")
 
 
-def measured_stage_g(cell: dict) -> dict[str, float]:
+def measured_stage_g(cell: dict) -> dict[str, float | None]:
     """Measured device-s per audio-s by stage id; one device per stage beats pmon."""
     return cell.get("stage_device_g") or cell.get("pmon_stage_g") or {}
 
@@ -669,11 +672,13 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             lines.append(f"Per-stage busy share and g_i from one device per stage ({c['name']}):")
             for stage, share in shares.items():
                 g = c["stage_device_g"][stage]
-                lines.append(f"  stage {stage}: busy {share:.2f}, g {g:.4f} device-s per audio-s")
-            binding = max(shares, key=shares.get)
-            lines.append(
-                f"  binding stage {binding}; X bound by it: {1.0 / c['stage_device_g'][binding]:.2f} audio-s/s"
-            )
+                lines.append(f"  stage {stage}: busy {fmt(share, 2)}, g {fmt(g, 4)} device-s per audio-s")
+            positive_g = {stage: g for stage, g in c["stage_device_g"].items() if g is not None and g > 0}
+            if positive_g:
+                binding = max(positive_g, key=lambda stage: positive_g[stage])
+                lines.append(f"  binding stage {binding}; X bound by it: {1.0 / positive_g[binding]:.2f} audio-s/s")
+            else:
+                lines.append("  X bound unavailable: no positive measured stage time")
         if terms := c.get("bound_terms"):
             lines.append(f"Physical bound at batch {c['concurrency']} ({c['name']}), seconds per audio-s:")
             for name, e in terms.items():
@@ -752,6 +757,19 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
     ]
     warnings += [f"{c['name']}: {c['failed']} failed requests" for c in cells if c["failed"]]
     for c in cells:
+        if c.get("gpu_samples") == 0:
+            warnings.append(f"{c['name']}: no utilisation samples in the measured window; busy share is unavailable")
+        for stage, samples in (c.get("stage_device_samples") or {}).items():
+            if not samples:
+                warnings.append(
+                    f"{c['name']}: stage {stage} has no utilisation samples in the measured window; "
+                    "busy share and g_i are unavailable"
+                )
+            elif not c["stage_util_trimmed"][stage]:
+                warnings.append(
+                    f"{c['name']}: stage {stage} utilisation samples could not be trimmed to the measured "
+                    "window; check the sample timestamps and result date"
+                )
         for metric, key, measured in (("TTFT", "ttft", "mean_ttft_ms"), ("TTFP", "ttfp", "mean_audio_ttfp_ms")):
             if (c.get(f"{key}_pct_of_sol") or 0.0) > 1.05:
                 warnings.append(
@@ -904,9 +922,13 @@ def main() -> int:
         if not util_path:
             parser.error(f"--stage-util {raw!r} must be NAME=STAGE:UTIL")
         cell = by_name[name]
-        busy, _, _ = device_busy_share(Path(util_path), measured_window_of(cell), args.npu_util_column)
+        busy, samples, trimmed = device_busy_share(Path(util_path), measured_window_of(cell), args.npu_util_column)
         cell.setdefault("stage_device_share", {})[stage] = busy
-        cell.setdefault("stage_device_g", {})[stage] = busy / cell["audio_throughput"]
+        cell.setdefault("stage_device_samples", {})[stage] = samples
+        cell.setdefault("stage_util_trimmed", {})[stage] = trimmed
+        cell.setdefault("stage_device_g", {})[stage] = (
+            busy / cell["audio_throughput"] if busy is not None and cell["audio_throughput"] else None
+        )
     for raw in args.pmon:
         name, _, spec = raw.partition("=")
         pmon_path, server_log = spec.split(":")
