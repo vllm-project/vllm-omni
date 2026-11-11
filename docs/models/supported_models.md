@@ -30,6 +30,8 @@ th {
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | ✅︎ | — |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen-Image) |
+| `MiniMaxH3ImagePipeline` | MiniMax-H3-Image (text-to-image and editing, MI325X and MI350X) | `MiniMaxAI/MiniMax-H3-Image` | | ✅︎ | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md) |
+| `MiniMaxH3ImagePipeline` | MiniMax-H3-Image (text-to-image and editing, Arc Pro B70) | `MiniMaxAI/MiniMax-H3-Image` | | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-XPU.md) |
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2512.md) |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `JoyImageEditPipeline` | JoyAI-Image-Edit | `jdopensource/JoyAI-Image-Edit-Diffusers` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/JD/JoyAI-Image-Edit.md) |
@@ -66,6 +68,7 @@ th {
 | `SanaImageToVideoPipeline` | SANA-Video-2B I2V (native and Diffusers adapter validated at 480p/720p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
 | `MiniMaxH3Pipeline` | MiniMax H3 T2VA, first/last-keyframe FL2VA, and mixed-reference Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎ | | | [Published](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) |
+| `MiniMaxH3ImagePipeline` | MiniMax-H3-Image text-to-image and editing with up to nine reference images | `MiniMaxAI/MiniMax-H3-Image` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-H200.md) |
 | `MiniMaxH3Pipeline` | FastH3 four-step Preview V1 T2VA adapter | `MiniMaxAI/MiniMax-H3` + `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3.md) |
 | `MiniMaxH3Pipeline` | Open-H3-Regenerate-2K: regenerate a 768P H3 draft at 2560x1440 | `MiniMaxAI/MiniMax-H3` + `Efficient-Large-Model/Open-H3-Regenerate-2K` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md) |
 | `MiniMaxH3Pipeline` | FastH3 V2 eight-step T2VA (tile-64 VSA; full-model qualification pending) | `FastVideo/FastVideo-FastH3-8-Step-V2` | Experimental | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3-V2.md) |
