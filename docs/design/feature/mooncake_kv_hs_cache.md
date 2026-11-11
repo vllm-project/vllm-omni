@@ -68,7 +68,10 @@ that the read fits `max_hs_bytes`.
 A lookup that exceeds `load_timeout_seconds` is treated as a miss. That request
 computes its whole prompt without another lookup. The native client
 sends lookups one at a time over one socket, so later requests are also misses,
-without a lookup, until the stalled reply returns.
+without a lookup, until the stalled reply returns. The connector detects that
+reply by queueing a marker job behind the pending lookups, which is valid only
+while the client runs lookups on a single worker in submission order; startup
+fails if the pinned client no longer does.
 
 ### Load
 
@@ -94,12 +97,14 @@ preempted attempt already handed to Talker.
 
 Complete prompt blocks are copied out of each step's captures. Saving is best
 effort: blocks are skipped when the staging budget or save queue is full, and
-the response does not change. A save worker writes each HS object and reads
-back the stored winner, because a put to an existing key keeps the first
-value. It then releases the staging reservation and polls for the blocks' KV
-objects until `load_timeout_seconds`. Each completion record is published when
-its KV object exists. If the KV object never appears, no record is written and
-normal Store eviction removes the HS object.
+the response does not change. A lookup stops at the first missing block, so a
+request stops saving after it skips one. A save worker writes each HS object
+and reads back the stored winner, because a put to an existing key keeps the
+first value. It then releases the staging reservation and polls for the
+blocks' KV objects until `load_timeout_seconds`. Completion records are
+published in block order, stopping at the first block whose KV object is still
+missing. If a KV object never appears, no record is written for it or for
+later blocks, and normal Store eviction removes the orphaned HS objects.
 
 ### Cancellation and preemption
 
@@ -116,9 +121,13 @@ CPU reservation is held until the HS read that uses it ends.
 
 `reset_cache()` returns `False`. The native reset drains native KV writes and
 then removes every object in the Store, including other namespaces, while Omni
-HS writes may still be running. Use a new namespace to start from an empty
-cache. Shutdown cancels attempts and pending saves and waits for the HS workers
-before closing the native Store handle.
+HS writes may still be running. The failure reaches the caller:
+`reset_prefix_cache(reset_connector=True)` returns `False` from the scheduler
+and from `AsyncOmni`, and `POST /reset_prefix_cache?reset_external=true`
+reports `"success": false`. Entries
+written under earlier weights stay in the Store, so a weight change requires a
+new namespace or `model_revision`. Shutdown cancels attempts and pending saves
+and waits for the HS workers before closing the native Store handle.
 
 ## Concurrency and resource limits
 
@@ -214,8 +223,10 @@ CPU tests cover HS encoding and row assembly (`tests/distributed/test_mooncake_h
 the connector protocol (`tests/distributed/test_mooncake_connector.py`), the
 runner rewrite (`tests/worker_v2/test_mooncake.py`), and configuration
 (`tests/engine/test_map_offload_config.py`). The connector tests include a
-stalled lookup driven through the production AR scheduler, saves waiting for
-KV on real worker threads, cancellation during an HS read, and rejected reset.
+stalled lookup driven through the production AR scheduler and the pinned
+lookup client, saves waiting for KV on real worker threads, completion records
+published in block order, cancellation during an HS read, and a rejected reset
+reaching the scheduler's caller.
 
 Opt-in tests need a running Mooncake master and `MOONCAKE_CONFIG_PATH`:
 `tests/distributed/test_mooncake_hs_store.py` exercises the native Store with KV

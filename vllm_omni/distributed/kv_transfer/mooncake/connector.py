@@ -237,6 +237,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self._kv_cache_events = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = MooncakeStoreScheduler(vllm_config, kv_cache_config)
+            self._require_ordered_async_lookup(self.connector_scheduler)
         else:
             # The pinned upstream constructor reads a process environment
             # variable. Keep this scoped to construction and restore it.
@@ -259,6 +260,29 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             # object must never hold the worker a load needs.
             self._read_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni-mooncake-hs-read")
             self._save_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omni-mooncake-hs-save")
+
+    @staticmethod
+    def _require_ordered_async_lookup(scheduler: MooncakeStoreScheduler) -> None:
+        """Fail at startup if the pinned lookup client contract has changed.
+
+        The stall guard queues a marker job behind pending lookups and treats
+        its completion as proof that they have ended. That holds only while
+        the client runs lookups one at a time, in submission order.
+        """
+        client = scheduler.client
+        executor = getattr(client, "executor", None)
+        if (
+            scheduler.lookup_async is not True
+            or not isinstance(executor, ThreadPoolExecutor)
+            or executor._max_workers != 1
+            or not isinstance(getattr(client, "futures", None), dict)
+            or not callable(getattr(client, "discard", None))
+        ):
+            raise ValueError(
+                "Mooncake KV/HS requires the pinned vLLM lookup client, which runs "
+                "asynchronous lookups one at a time; recheck the lookup stall guard "
+                "before upgrading vLLM"
+            )
 
     @staticmethod
     def _validate_supported(config: VllmConfig, kv_config: KVCacheConfig | None) -> None:
@@ -601,7 +625,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         attempt = save.attempt
         store = self.connector_worker.store
         deadline = time.monotonic() + self.settings.load_timeout_seconds
-        commits: dict[str, tuple[str, bytes]] = {}
+        commits: list[tuple[str, str, bytes]] = []
         try:
             # Indexing leaves no tensor reference in this frame for the KV wait.
             for position in range(len(save.blocks)):
@@ -610,16 +634,22 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 written = self._write_hs_block(store, attempt, save.blocks[position])
                 if written is None:
                     break
-                kv_key, ready_key, digest = written
-                commits[kv_key] = (ready_key, digest)
+                commits.append(written)
         finally:
             save.blocks.clear()
             self._release_staging(save)
+        # Publish in block order and stop at the first block whose KV is still
+        # missing: a record past a gap could never extend a joint lookup.
         while commits and not attempt.cancelled and time.monotonic() < deadline:
-            kv_keys = list(commits)
-            for kv_key, exists in zip(kv_keys, store.batch_is_exist(kv_keys)):
-                if exists == 1 and not attempt.cancelled:
-                    self._publish_ready(store, *commits.pop(kv_key))
+            exists = store.batch_is_exist([kv_key for kv_key, _, _ in commits])
+            ready = 0
+            while ready < min(len(commits), len(exists)) and exists[ready] == 1:
+                ready += 1
+            for _, ready_key, digest in commits[:ready]:
+                if attempt.cancelled:
+                    return
+                self._publish_ready(store, ready_key, digest)
+            del commits[:ready]
             if commits:
                 time.sleep(_KV_POLL_SECONDS)
 
@@ -653,15 +683,19 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 3 * sum(t.numel() * t.element_size() for _, _, group in blocks for t in group.values())
                 + _HS_HEADER_ALLOWANCE
             )
-            if (
-                blocks
-                and len(self._saves) < self.settings.max_pending_transfers
-                and self._memory_used() + reserve <= self.settings.max_hs_bytes
-            ):
-                self._reserved_bytes += reserve
-                save = PendingSave(attempt, blocks, reserve)
-                assert self._save_executor is not None
-                self._saves[self._save_executor.submit(self._save_hs, save)] = save
+            if blocks:
+                if (
+                    len(self._saves) < self.settings.max_pending_transfers
+                    and self._memory_used() + reserve <= self.settings.max_hs_bytes
+                ):
+                    self._reserved_bytes += reserve
+                    save = PendingSave(attempt, blocks, reserve)
+                    assert self._save_executor is not None
+                    self._saves[self._save_executor.submit(self._save_hs, save)] = save
+                else:
+                    # Lookups stop at the first missing block, so blocks
+                    # after a dropped one would be stored but never reused.
+                    attempt.rows.save_enabled = False
             # Preemption rebuilds KV/HS, but the downstream accumulator still
             # owns already published rows. Keep its watermark across attempts.
             end = start_token + tensors["embedding"].shape[0]

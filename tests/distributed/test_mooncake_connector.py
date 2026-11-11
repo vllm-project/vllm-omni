@@ -149,6 +149,7 @@ class ParallelConfigSeam:
     data_parallel_size: int = 1
     decode_context_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    data_parallel_index: int = 0
 
 
 @dataclass
@@ -504,14 +505,56 @@ def test_capture_first_partial_and_full_hit_have_each_prompt_row_once(connector)
     assert cold.rows is not None
 
 
-def test_full_save_queue_preserves_output_without_extra_task(connector):
+def test_full_save_queue_preserves_output_and_stops_later_saves(connector):
     attempt = install_attempt(connector)
     connector.settings = replace(connector.settings, max_pending_transfers=1)
-    connector._saves[Future()] = PendingSave(attempt, [], 0)
+    queued: Future[None] = Future()
+    connector._saves[queued] = PendingSave(attempt, [], 0)
     output = connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
     assert torch.equal(output["embedding"], captures(0, 4)["embedding"])
     assert not connector._save_executor.jobs
     assert attempt.rows.buffered_bytes == 0
+    # Lookups stop at the dropped block, so later blocks are not saved even
+    # once the queue has room again.
+    del connector._saves[queued]
+    output = connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
+    assert torch.equal(output["embedding"], captures(4, 8)["embedding"])
+    assert not connector._save_executor.jobs
+
+
+class LateKVStore(MemoryStore):
+    """The first block's KV object appears only at the second existence poll."""
+
+    def __init__(self, late_kv_key: str) -> None:
+        super().__init__()
+        self.late_kv_key = late_kv_key
+        self.polls = 0
+        self.records: list[str] = []
+        self.records_before_late_kv: int | None = None
+
+    def batch_is_exist(self, keys: list[str]) -> list[int]:
+        self.polls += 1
+        if self.polls == 2:
+            self.records_before_late_kv = len(self.records)
+            self.objects[self.late_kv_key] = b"kv"
+        return super().batch_is_exist(keys)
+
+    def put(self, key: str, payload: bytes) -> int:
+        if key.endswith(":ready"):
+            self.records.append(key)
+        return super().put(key, payload)
+
+
+def test_save_publishes_completion_records_in_block_order(connector):
+    attempt = install_attempt(connector)
+    first_kv, second_kv = ("kv:" + block_hash.hex() for block_hash in attempt.hashes[:2])
+    store = LateKVStore(first_kv)
+    store.objects[second_kv] = b"kv"
+    connector.connector_worker = WorkerSeam(store)
+    connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4)), (4, 8, captures(4, 8))], 0))
+    # The second block's KV existed first, but its record waited for the first.
+    assert store.records_before_late_kv == 0
+    assert store.records == [hs_key(connector.namespace, block_hash) + ":ready" for block_hash in attempt.hashes[:2]]
 
 
 def test_hs_admission_failure_still_waits_for_native_gpu_copy(connector):
@@ -911,56 +954,40 @@ BLOCK16_KV_CONFIG = KVCacheConfig(
 )
 
 
-class BlockedLookupClient(LookupKeyClient):
-    """The pinned asynchronous lookup client, with a Store RPC the test releases."""
+class LookupRpcGate:
+    """Replaces only the Store RPC of the real lookup client until released."""
 
     def __init__(self) -> None:
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-mooncake-lookup")
-        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
         self.release = threading.Event()
         self.rpcs: list[int] = []
 
-    def _lookup(self, num_tokens, block_hashes):
+    def __call__(self, num_tokens, block_hashes):
         self.rpcs.append(num_tokens)
-        # Bounded so that a failing test cannot leave this worker blocked.
+        # Bounded so that a failing test cannot leave the client's worker blocked.
         self.release.wait(timeout=10)
         return MooncakeLookupResult(0)
 
-    def close(self) -> None:
-        self.release.set()
-        self.executor.shutdown(wait=True)
+
+def lookup_scheduler(vllm_config, kv_cache_config):
+    """The pinned scheduler's lookup path and real client, without its store coordinator."""
+    options = vllm_config.kv_transfer_config.kv_connector_extra_config
+    scheduler = MooncakeStoreScheduler.__new__(MooncakeStoreScheduler)
+    # Same option defaults as the pinned constructor.
+    scheduler.enable_lookup = options.get("enable_lookup", True)
+    scheduler.lookup_async = options.get("lookup_async", False)
+    scheduler.load_async = options.get("load_async", True)
+    scheduler.enable_partial_hash_hits = False
+    scheduler._block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+    scheduler._hash_block_size = scheduler._block_size
+    scheduler.client = LookupKeyClient(vllm_config)
+    scheduler.load_specs = {}
+    return scheduler
 
 
-def lookup_scheduler(client):
-    """Build the pinned scheduler's lookup state from the connector's options."""
-
-    def build(vllm_config, kv_cache_config):
-        options = vllm_config.kv_transfer_config.kv_connector_extra_config
-        scheduler = MooncakeStoreScheduler.__new__(MooncakeStoreScheduler)
-        # Same option defaults as the pinned constructor, without its ZMQ
-        # client or store-coordinator setup.
-        scheduler.enable_lookup = options.get("enable_lookup", True)
-        scheduler.lookup_async = options.get("lookup_async", False)
-        scheduler.load_async = options.get("load_async", True)
-        scheduler.enable_partial_hash_hits = False
-        scheduler._block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-        scheduler._hash_block_size = scheduler._block_size
-        scheduler.client = client
-        scheduler.load_specs = {}
-        return scheduler
-
-    return build
-
-
-@pytest.fixture
-def lookup_connector(monkeypatch):
-    """A scheduler-role connector from its constructor, with a blocked Store lookup."""
-    monkeypatch.setattr(connector_module, "current_platform", PlatformSeam(cuda=True))
-    client = BlockedLookupClient()
-    monkeypatch.setattr(connector_module, "MooncakeStoreScheduler", lookup_scheduler(client))
+def scheduler_role_config():
     hf_config = Qwen3OmniMoeConfig()
     settings = {"config_file": "unused.json", "namespace": "qwen-test", "model_revision": "pinned-model-revision"}
-    config = ServingConfigSeam(
+    return ServingConfigSeam(
         kv_transfer_config=KVTransferConfig(
             kv_connector="OmniMooncakeStoreConnector",
             kv_load_failure_policy="recompute",
@@ -969,18 +996,62 @@ def lookup_connector(monkeypatch):
         ),
         model_config=ModelConfigSeam(hf_config=hf_config, hf_text_config=hf_config.thinker_config.text_config),
     )
-    connector = OmniMooncakeStoreConnector(config, KVConnectorRole.SCHEDULER, BLOCK16_KV_CONFIG)
-    yield connector, client
+
+
+@pytest.fixture
+def scheduler_role(monkeypatch):
+    """Patch the platform and the client's IPC path for scheduler-role construction."""
+    monkeypatch.setattr(connector_module, "current_platform", PlatformSeam(cuda=True))
+    # The real client connects its ZMQ socket lazily; keep the IPC path short.
+    monkeypatch.setenv("VLLM_RPC_BASE_PATH", "/tmp")
+    return monkeypatch
+
+
+@pytest.fixture
+def lookup_connector(scheduler_role):
+    """A scheduler-role connector from its constructor, using the pinned lookup client."""
+    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", lookup_scheduler)
+    connector = OmniMooncakeStoreConnector(scheduler_role_config(), KVConnectorRole.SCHEDULER, BLOCK16_KV_CONFIG)
+    client = connector.connector_scheduler.client
+    gate = LookupRpcGate()
+    # lookup(), discard() and the executor stay those of the pinned client.
+    scheduler_role.setattr(client, "_lookup", gate)
+    yield connector, gate
+    gate.release.set()
     client.close()
 
 
-def test_scheduler_role_requests_async_lookup_in_its_namespace(lookup_connector):
+def test_scheduler_role_uses_the_pinned_async_lookup_client(lookup_connector):
     connector, _ = lookup_connector
     options = connector._kv_transfer_config.kv_connector_extra_config
     assert options["lookup_async"] is True
     assert options["load_async"] is True
     assert options["cache_prefix"] == connector.namespace
     assert connector.connector_scheduler.lookup_async
+    assert type(connector.connector_scheduler.client) is LookupKeyClient
+
+
+@pytest.mark.parametrize("change", ["two_lookup_workers", "synchronous_lookup"])
+def test_constructor_rejects_lookup_clients_that_break_the_stall_guard(scheduler_role, change):
+    clients = []
+
+    def changed_scheduler(vllm_config, kv_cache_config):
+        scheduler = lookup_scheduler(vllm_config, kv_cache_config)
+        clients.append(scheduler.client)
+        if change == "two_lookup_workers":
+            scheduler.client.executor.shutdown()
+            scheduler.client.executor = ThreadPoolExecutor(max_workers=2)
+        else:
+            scheduler.lookup_async = False
+        return scheduler
+
+    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", changed_scheduler)
+    try:
+        with pytest.raises(ValueError, match="one at a time"):
+            OmniMooncakeStoreConnector(scheduler_role_config(), KVConnectorRole.SCHEDULER, BLOCK16_KV_CONFIG)
+    finally:
+        for client in clients:
+            client.close()
 
 
 def wait_for_lookup(connector, request, timeout=5.0):
@@ -992,7 +1063,7 @@ def wait_for_lookup(connector, request, timeout=5.0):
 
 
 def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector):
-    connector, client = lookup_connector
+    connector, gate = lookup_connector
     slow = Request("slow", list(range(32)), SamplingParams(max_tokens=1), None)
     queued = Request("queued", list(range(32)), SamplingParams(max_tokens=1), None)
     assert connector.get_num_new_matched_tokens(slow, 0) == (None, False)
@@ -1002,15 +1073,15 @@ def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector
     assert connector.get_num_new_matched_tokens(slow, 0) == (0, False)
     # A lookup queued behind the stalled reply is cancelled, not waited for.
     assert connector.get_num_new_matched_tokens(queued, 0) == (0, False)
-    assert client.futures == {}
-    assert client.rpcs == [32]
-    client.release.set()
+    assert connector.connector_scheduler.client.futures == {}
+    assert gate.rpcs == [32]
+    gate.release.set()
     connector._lookup_probe.result(timeout=5)
     # Once the stalled reply returns, lookups reach the Store again; the
     # timed-out request keeps computing without the cache.
     assert wait_for_lookup(connector, queued) == (0, False)
     assert connector.get_num_new_matched_tokens(slow, 0) == (0, False)
-    assert client.rpcs == [32, 32]
+    assert gate.rpcs == [32, 32]
 
 
 def ar_scheduler(connector):
@@ -1060,7 +1131,7 @@ def sampled(*requests):
 
 
 def test_stalled_lookup_does_not_delay_a_decoding_request(lookup_connector):
-    connector, client = lookup_connector
+    connector, gate = lookup_connector
     scheduler = ar_scheduler(connector)
     decoding = Request("decoding", list(range(8)), SamplingParams(max_tokens=16), None)
     scheduler.add_request(decoding)
@@ -1078,7 +1149,7 @@ def test_stalled_lookup_does_not_delay_a_decoding_request(lookup_connector):
         assert time.monotonic() - started < 5
         assert step.num_scheduled_tokens == {"decoding": 1}
         scheduler.update_from_output(step, sampled(decoding))
-    assert client.rpcs == [32]
+    assert gate.rpcs == [32]
 
     # Past its deadline, the stalled request computes its whole prompt. A
     # request arriving during the stall does not queue behind it.
@@ -1087,4 +1158,14 @@ def test_stalled_lookup_does_not_delay_a_decoding_request(lookup_connector):
     scheduler.add_request(arriving)
     step = scheduler.schedule()
     assert step.num_scheduled_tokens == {"decoding": 1, "stalled": 32, "arriving": 32}
-    assert client.rpcs == [32]
+    assert gate.rpcs == [32]
+
+
+def test_rejected_connector_reset_fails_the_scheduler_reset(lookup_connector):
+    connector, _ = lookup_connector
+    scheduler = ar_scheduler(connector)
+    scheduler.connector.reset_cache.side_effect = connector.reset_cache
+    # A local reset still succeeds; a connector reset reaches the caller as a
+    # failure, which AsyncOmni and the HTTP endpoint report unchanged.
+    assert scheduler.reset_prefix_cache() is True
+    assert scheduler.reset_prefix_cache(reset_connector=True) is False

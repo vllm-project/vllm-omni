@@ -191,10 +191,12 @@ together with LMCache, a separate `kv_transfer_config`, local Thinker prefix
 caching, or a producer-only/consumer-only role is rejected. Keep Talker prefix
 caching disabled when comparing Thinker cache behavior.
 
-Online connector reset, `reset_prefix_cache(reset_connector=True)`, returns
-`False`. The pinned reset removes every object in the Store, including other
-namespaces, and does not wait for HS writes. Use a new namespace to start from
-an empty cache.
+Online connector reset is not supported: `reset_prefix_cache(reset_connector=True)`
+returns `False`, and `POST /reset_prefix_cache?reset_external=true` reports
+`"success": false`. The pinned
+reset removes every object in the Store, including other namespaces, and does
+not wait for HS writes. Entries written under earlier weights remain, so after
+changing weights, restart with a new namespace or `model_revision`.
 
 ### Correctness contract
 
