@@ -73,17 +73,18 @@ def test_attention_rejects_a_buffer_wider_than_the_live_span(cached):
     batch, frames, heads, dim = 2, 6, 2, 16
     attn = decoder.Attention(heads * dim, heads, dim, qkv_bias=False, qk_norm=True).npu().eval()
     x = torch.randn(batch, frames, heads * dim, device="npu")
-    # A padded buffer would attend tail frames nobody wrote, and the refusal
-    # sits after both the in-place cache copy and the cat branch, so exercise
-    # it with and without a cache. The tail frames must stay untouched.
+    # A padded buffer would attend tail frames nobody wrote. The refusal now
+    # runs before either write branch (the in-place cache copy and the cat
+    # path), so the whole buffer must stay untouched -- snapshot it instead of
+    # only the tail, which is never written in either order.
     kv = torch.randn(2, batch, heads, frames + cached + 3, dim, device="npu")
     span = frames + cached
-    tail = kv[:, :, :, span:].clone()
+    before = kv.clone()
     cache = kv[:, :, :, frames:span] if cached else None
     with npu_token2wav_sdpa_context(require_math=True):
         with pytest.raises(ValueError, match="live span"):
             BatchedToken2Wav._attend_in_place(attn, x, cache, None, kv)
-        torch.testing.assert_close(kv[:, :, :, span:], tail)
+        torch.testing.assert_close(kv, before)
 
 
 @pytest.mark.parametrize("inference", [False, True])

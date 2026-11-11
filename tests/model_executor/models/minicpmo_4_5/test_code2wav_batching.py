@@ -2555,7 +2555,9 @@ def test_eager_per_request_history_matches_stacked_history():
     # ``previous`` is the split K/V stack ``(n_t, depth, 2, 2B, H, L, d)``:
     # the CFG-stacked batch is dim 3, so a request row pairs the row-th and
     # (2 + row)-th CFG entries along that axis.
-    rows = [torch.cat((previous[:, :, :, row : row + 1], previous[:, :, :, 2 + row : 3 + row]), dim=3) for row in range(2)]
+    rows = [
+        torch.cat((previous[:, :, :, row : row + 1], previous[:, :, :, 2 + row : 3 + row]), dim=3) for row in range(2)
+    ]
     expected, expected_cnn, expected_att = adapter._decode_cfm(mu, speakers, cond, cnn_cache=cnn, att_cache=previous)
     actual, actual_cnn, actual_rows = adapter._decode_cfm(
         mu, speakers, cond, cnn_cache=cnn, att_cache=rows, att_keep=(2, 2)
