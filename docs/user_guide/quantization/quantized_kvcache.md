@@ -53,7 +53,8 @@ internal alignment padding, as in the revision specified under
 Arbitrary packed documents and caller masks remain unsupported. H3 end-to-end
 quality and performance still require validation on the target NPU.
 
-If `diffusion_kv_cache_dtype` is not set, attention runs in the native dtype.
+If neither `diffusion_kv_cache_dtype` nor a backend-specific quantization
+precision is set, attention runs in the native dtype.
 
 ## Hardware Support
 
@@ -144,23 +145,23 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 
 Selectors use comma-separated integers and inclusive ranges. Listed steps or
 layers run floating-point attention through the selected Dense or BSA backend;
-all other eligible forwards use `diffusion_kv_cache_dtype`.
+all other eligible forwards use the configured quantization precision.
 
 ### MindIE-SD quantization options
 
-Use the existing `diffusion_attention_config` to pass optional MindIE-SD
-settings through the `FLASH_ATTN` backend's `quant` block. The global
-`diffusion_kv_cache_dtype` still selects the precision; these options do not
-enable quantization by themselves.
+Use the existing `diffusion_attention_config` to select a precision and pass
+MindIE-SD settings through the `FLASH_ATTN` backend's `quant` block.
+Set `quant.precision` to `fp8`, `mxfp8`, or `mxfp4`; this enables quantized
+attention without `diffusion_kv_cache_dtype`.
 
 ```yaml
 stages:
   - stage_id: 0
-    diffusion_kv_cache_dtype: fp8
     diffusion_attention_config:
       default:
         backend: FLASH_ATTN
         quant:
+          precision: fp8
           fp8_fa_mode: C8V16_TILING512
           mxfp4_scale_alg: null
           mxfp4_dst_type_max: null
@@ -169,11 +170,20 @@ stages:
 For CLI use:
 
 ```bash
-vllm serve <your-model> --omni --diffusion-kv-cache-dtype fp8 \
-    --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN","quant":{"fp8_fa_mode":"C8V16_TILING512"}}}'
+vllm serve <your-model> --omni \
+    --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN","quant":{"precision":"fp8","fp8_fa_mode":"C8V16_TILING512"}}}'
 ```
 
-The same `quant` block can be placed under a `per_role` backend selection.
+The same `quant` block can be placed under a `per_role` backend selection or
+an attention schedule profile. Each profile uses its own precision selection;
+it does not inherit `quant.precision` from the baseline configuration.
+
+The existing global `diffusion_kv_cache_dtype` option remains supported. When
+using it, omit `quant.precision` and supply only execution options in `quant`.
+Setting both an explicit `quant.precision` and a quantized global dtype is
+rejected at config load. Execution options such as `fp8_fa_mode` alone do not
+select a precision or enable quantization.
+
 Only non-null options for the active precision are passed to MindIE-SD:
 
 | Option | Precision | Behavior when omitted |
@@ -182,9 +192,10 @@ Only non-null options for the active precision are passed to MindIE-SD:
 | `mxfp4_scale_alg` | `mxfp4` | Installed MX quantization operator's default scaling algorithm |
 | `mxfp4_dst_type_max` | `mxfp4` | Installed MX quantization operator's default destination maximum |
 
-Changing `diffusion_kv_cache_dtype` to `mxfp4` selects the MXFP4 options;
+Changing `quant.precision` to `mxfp4` selects the MXFP4 options;
 the FP8 mode is not forwarded. Existing skip-step and skip-layer selectors
-continue to choose floating-point attention.
+and model opt-outs continue to choose floating-point attention with either
+precision configuration entry point.
 
 `C8V16_TILING512` requires batch size 1, Q/K/V head dimensions of 128, and a
 compatible MindIE-SD build with the C8V16 custom operator. It selects Q/K/V

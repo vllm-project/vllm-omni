@@ -169,11 +169,18 @@ def test_dense_legacy_allows_attention_quantization(dtype) -> None:
 
 
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
-def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls) -> None:
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "fp8"}},
+    ],
+)
+def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls, spec) -> None:
     with pytest.raises(ValueError, match="conflicts with a diffusion_attention_config quant spec"):
         config_cls.from_kwargs(
             diffusion_kv_cache_dtype="fp8",
-            diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+            diffusion_attention_config={"default": spec},
         )
 
 
@@ -212,8 +219,19 @@ def test_unified_knob_allows_mindie_execution_options(config_cls, dtype, quant, 
 
 
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
-def test_explicit_quant_spec_without_knob_is_allowed(config_cls) -> None:
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "fp8", "fp8_fa_mode": "C8V16_TILING512"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "mxfp8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "mxfp4", "mxfp4_scale_alg": 0}},
+    ],
+)
+def test_explicit_quant_spec_without_knob_is_allowed(config_cls, spec) -> None:
     config = config_cls.from_kwargs(
-        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+        diffusion_attention_config={"default": spec},
     )
     assert config.diffusion_kv_cache_dtype is None
+    backend_kwargs = config.diffusion_attention_config.default.backend_kwargs()
+    assert backend_kwargs["quant"].items() >= spec["quant"].items()

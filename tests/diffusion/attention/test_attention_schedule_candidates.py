@@ -196,6 +196,24 @@ def test_identical_effective_profiles_dedup_to_shared_record(attention_env):
     assert attention._schedule_candidates["a"].impl is attention._schedule_candidates["b"].impl
 
 
+def test_profiles_with_different_quant_precision_keep_separate_records(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={
+            precision: AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN", quant={"precision": precision}))
+            for precision in ("fp8", "mxfp4")
+        },
+        default=[{"start": 0, "end": None, "profile": "fp8"}],
+    )
+    layer = attention_env.build(_make_config(schedule=schedule))
+    fp8 = layer._schedule_candidates["fp8"]
+    mxfp4 = layer._schedule_candidates["mxfp4"]
+
+    assert fp8 is not mxfp4
+    assert fp8.impl is not mxfp4.impl
+    assert fp8.spec.quant.precision == "fp8"
+    assert mxfp4.spec.quant.precision == "mxfp4"
+
+
 def test_candidate_with_the_baseline_identity_reuses_the_baseline_impl(attention_env):
     """A profile resolving to the baseline's backend, flag, impl class and kwargs builds no second impl."""
     schedule = AttentionScheduleConfig(
@@ -482,6 +500,34 @@ def test_startup_validation_rejects_candidate_without_kv_cache_dtype_support(att
 
     with pytest.raises(ValueError, match=r"profile 'quant'.*kv_cache_dtype='fp8'"):
         layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_unsupported_explicit_quant_precision(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"quant": AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN", quant={"precision": "mxfp4"}))},
+        default=[{"start": 0, "end": None, "profile": "quant"}],
+    )
+    config = _make_config(schedule=schedule)
+    attention_env.monkeypatch.setattr(_fake_impl("FLASH_ATTN"), "_kv_cache_dtypes_ok", ("fp8",))
+    layer = attention_env.build(config)
+
+    with pytest.raises(ValueError, match=r"profile 'quant'.*not support kv_cache_dtype='mxfp4'"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_matching_quant_precision_under_ring(attention_env):
+    baseline = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN", quant={"precision": "fp8"}))
+    schedule = AttentionScheduleConfig(
+        profiles={"quant": baseline},
+        default=[{"start": 0, "end": None, "profile": "quant"}],
+    )
+    attention_env.monkeypatch.setattr(_fake_impl("FLASH_ATTN"), "_kv_cache_dtypes_ok", ("fp8",))
+    layer = attention_env.build(_make_config(baseline=baseline, schedule=schedule))
+
+    # Matching identities pass the existing ring identity check, so precision must be checked too.
+    assert layer._schedule_candidates["quant"].impl is layer.attention
+    with pytest.raises(ValueError, match=r"profile 'quant'.*KV quantization is not compatible with ring attention"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), _ring_config(schedule, baseline=baseline))
 
 
 def test_startup_validation_rejects_candidate_without_resolvable_calibration(attention_env):

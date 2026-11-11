@@ -12,6 +12,7 @@ import torch
 from vllm_omni.diffusion.attention import layer as layer_mod
 from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, VideoTokenLayout
+from vllm_omni.diffusion.data import AttentionSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 _DEFAULT_SKIP_STEPS = frozenset({0, 1, 38, 39})
@@ -265,6 +266,7 @@ def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_ST
     torch.nn.Module.__init__(layer)
     layer.attention = flash(head_size=head_size, quant=quant)
     layer.attn_backend = flash_attn.FlashAttentionBackend
+    layer.attn_spec = AttentionSpec(backend="FLASH_ATTN", quant=quant)
     layer._disable_kv_quant = False
     layer.layer_idx = 3
     cfg = SimpleNamespace(
@@ -278,8 +280,12 @@ def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_ST
 
 
 @pytest.mark.parametrize("skip_reason", ["step", "layer", "optout"])
-def test_fp8_options_preserve_float_skips(runtime, monkeypatch, mocker, skip_reason):
-    layer = make_layer(runtime, monkeypatch, method="fp8", head_size=128, quant={"fp8_fa_mode": "C8V16_TILING512"})
+@pytest.mark.parametrize("spec_precision", [False, True])
+def test_fp8_options_preserve_float_skips(runtime, monkeypatch, mocker, skip_reason, spec_precision):
+    quant = {"fp8_fa_mode": "C8V16_TILING512"}
+    if spec_precision:
+        quant["precision"] = "fp8"
+    layer = make_layer(runtime, monkeypatch, method=None if spec_precision else "fp8", head_size=128, quant=quant)
     ctx = SimpleNamespace(denoise_step_idx=2)
     monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(layer_mod, "get_forward_context", lambda: ctx)
@@ -298,6 +304,65 @@ def test_fp8_options_preserve_float_skips(runtime, monkeypatch, mocker, skip_rea
     layer.attention.forward_npu(query, query, query, layer._with_kv_cache_dtype(None))
     float_attention.assert_called_once()
     runtime.quant_attention.assert_called_once()
+
+
+@pytest.mark.parametrize("global_dtype", [None, "auto", "float"])
+@pytest.mark.parametrize(
+    "method,options",
+    [
+        ("fp8", {"fp8_fa_mode": "C8V16_TILING512"}),
+        ("mxfp8", {}),
+        ("mxfp4", {"mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 7.25}),
+    ],
+)
+def test_spec_precision_enables_quant_without_global_dtype(runtime, monkeypatch, global_dtype, method, options):
+    layer = make_layer(
+        runtime,
+        monkeypatch,
+        method=global_dtype,
+        skip_steps=None,
+        head_size=128,
+        quant={"precision": method, **options},
+    )
+    query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    metadata = layer._with_kv_cache_dtype(None)
+    layer.attention.forward_npu(query, query, query, metadata)
+    kwargs = runtime.quant_attention.call_args.kwargs
+    assert kwargs["precision"] == method
+    assert {name: kwargs[name] for name in options} == options
+
+
+@pytest.mark.parametrize("baseline_precision", [None, "fp8"])
+def test_spec_precision_tracks_active_schedule(runtime, monkeypatch, mocker, baseline_precision):
+    quant = {"precision": baseline_precision} if baseline_precision else None
+    layer = make_layer(runtime, monkeypatch, method=None, skip_steps=None, head_size=128, quant=quant)
+    layer._schedule_configured = True
+    layer._schedule_candidates = {}
+    for name, precision in (("fp8", "fp8"), ("mxfp4", "mxfp4"), ("float", None)):
+        spec = AttentionSpec(backend="FLASH_ATTN", quant={"precision": precision} if precision else None)
+        impl = flash(head_size=128, quant=spec.backend_kwargs()["quant"] if precision else None)
+        layer._schedule_candidates[name] = layer_mod.ScheduleCandidate(
+            backend_cls=flash_attn.FlashAttentionBackend, spec=spec, impl=impl, backend_explicit=True
+        )
+    query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    float_attention = mocker.patch.object(flash_attn.FlashAttentionImpl, "forward_fa_npu", return_value=query)
+    source = video_metadata(kv_cache_dtype="mxfp8")
+    for profile in ("mxfp4", "float", "fp8", None, "float"):
+        monkeypatch.setattr(layer_mod, "get_attention_schedule_profile", lambda: profile)
+        impl, _, _ = layer.effective_attention()
+        metadata = layer._with_kv_cache_dtype(source)
+        impl.forward_npu(query, query, query, metadata)
+    assert [call.kwargs["precision"] for call in runtime.quant_attention.call_args_list] == (
+        ["mxfp4", "fp8", "fp8"] if baseline_precision else ["mxfp4", "fp8"]
+    )
+    assert float_attention.call_count == (2 if baseline_precision else 3)
+    assert source.extra["kv_cache_dtype"] == "mxfp8"
+
+
+def test_spec_precision_rejects_unsupported_platform(runtime, monkeypatch):
+    monkeypatch.setattr(layer_mod, "current_omni_platform", SimpleNamespace(device_name="cuda"))
+    with pytest.raises(ValueError, match="does not support.*mxfp4.*cuda"):
+        make_layer(runtime, monkeypatch, method=None, quant={"precision": "mxfp4"})
 
 
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
@@ -338,9 +403,11 @@ def test_step_skip_is_request_local_and_cross_optout(runtime, monkeypatch):
     assert layer._with_kv_cache_dtype(source).extra["kv_cache_dtype"] == "float"
 
 
-def test_ring_attention_is_rejected(runtime, monkeypatch):
-    layer = make_layer(runtime, monkeypatch)
-    cfg = SimpleNamespace(diffusion_kv_cache_dtype="mxfp8", parallel_config=SimpleNamespace(ring_degree=2))
+@pytest.mark.parametrize("spec_precision", [False, True])
+def test_ring_attention_is_rejected(runtime, monkeypatch, spec_precision):
+    method = None if spec_precision else "mxfp8"
+    layer = make_layer(runtime, monkeypatch, method=method, quant={"precision": "mxfp8"} if spec_precision else None)
+    cfg = SimpleNamespace(diffusion_kv_cache_dtype=method, parallel_config=SimpleNamespace(ring_degree=2))
     with pytest.raises(ValueError, match="ring"):
         layer._init_kv_cache_quantization(cfg)
 

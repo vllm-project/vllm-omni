@@ -222,10 +222,12 @@ FP8 attention can therefore be slower than BF16, especially for short
 sequences. This option does not promise lower peak memory use or faster
 end-to-end generation.
 
-An explicit `diffusion_attention_config.*.quant` spec that sets `dtype_qk` or
-`dtype_vo` conflicts with the knob and is rejected at config load; drop one
-of the precision selections. A `flashinfer_backend` variant pin or MindIE-SD
-execution options without those dtype fields can be combined with the knob.
+An explicit `diffusion_attention_config.*.quant` spec that sets `dtype_qk`,
+`dtype_vo`, or `precision` conflicts with the knob and is rejected at config
+load; drop one of the precision selections. `FLASH_ATTN` can select its
+precision through `quant.precision` without the global knob. A
+`flashinfer_backend` variant pin or MindIE-SD execution options without a
+precision selection can be combined with the knob.
 
 ## Compatibility anchors
 

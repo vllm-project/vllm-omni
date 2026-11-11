@@ -2149,12 +2149,14 @@ class AttnQuantSpec:
     q_block_size: int = 1
     k_block_size: int = 16
     flashinfer_backend: str | None = None
+    precision: str | None = None
     fp8_fa_mode: str | None = None
     mxfp4_scale_alg: int | None = None
     mxfp4_dst_type_max: float | None = None
 
     _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
     _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
+    _VALID_PRECISIONS = frozenset({"fp8", "mxfp8", "mxfp4"})
     _VALID_FP8_FA_MODES = frozenset({"HIGH_PRECISION", "C8V16_TILING512"})
 
     def __post_init__(self) -> None:
@@ -2167,6 +2169,10 @@ class AttnQuantSpec:
                     f"quant.{block_name}={block_value!r} unsupported; "
                     f"kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
                 )
+        if self.precision is not None and self.precision not in self._VALID_PRECISIONS:
+            raise ValueError(
+                f"quant.precision={self.precision!r} unsupported; use one of {sorted(self._VALID_PRECISIONS)}."
+            )
         if self.fp8_fa_mode is not None and self.fp8_fa_mode not in self._VALID_FP8_FA_MODES:
             raise ValueError(
                 f"quant.fp8_fa_mode={self.fp8_fa_mode!r} unsupported; use one of {sorted(self._VALID_FP8_FA_MODES)}."
@@ -2180,6 +2186,7 @@ class AttnQuantSpec:
                 self.dtype_qk,
                 self.dtype_vo,
                 self.flashinfer_backend,
+                self.precision,
                 self.fp8_fa_mode,
                 self.mxfp4_scale_alg,
                 self.mxfp4_dst_type_max,
@@ -2319,10 +2326,15 @@ class AttentionSpec:
                     or q.k_block_size != 16
                 ):
                     raise ValueError(
-                        "FLASH_ATTN quant supports only MindIE execution options; "
-                        "use diffusion_kv_cache_dtype to select the quantization precision."
+                        "FLASH_ATTN quant supports only MindIE precision and execution options; "
+                        "use quant.precision to select the quantization precision."
                     )
-            elif q.fp8_fa_mode is not None or q.mxfp4_scale_alg is not None or q.mxfp4_dst_type_max is not None:
+            elif (
+                q.precision is not None
+                or q.fp8_fa_mode is not None
+                or q.mxfp4_scale_alg is not None
+                or q.mxfp4_dst_type_max is not None
+            ):
                 raise ValueError("MindIE quant options require the FLASH_ATTN backend.")
         if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton"):
             raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn or triton")
@@ -2388,7 +2400,7 @@ class AttentionSpec:
                     quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
-            for name in ("fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max"):
+            for name in ("precision", "fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max"):
                 value = getattr(q, name)
                 if value is not None:
                     quant_kw[name] = value
@@ -2681,13 +2693,15 @@ def validate_kv_cache_dtype_vs_attention_specs(
     attention_config: "AttentionConfig | None",
     schedule: "AttentionScheduleConfig | None" = None,
 ) -> None:
-    """Reject a global attention-quant knob combined with per-backend quant dtypes.
+    """Reject a global attention-quant knob combined with per-backend quant precision.
 
     ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
-    explicit ``quant.dtype_qk`` or ``quant.dtype_vo`` overrides conflict with it.
-    Execution options such as ``flashinfer_backend`` or MindIE modes without
-    dtypes may coexist with the global knob. Attention schedule profiles follow
-    the same rule, because a scheduled step keeps the global knob.
+    explicit ``quant.dtype_qk``, ``quant.dtype_vo`` or ``quant.precision`` overrides
+    conflict with it.
+    Execution options such as ``flashinfer_backend`` or MindIE modes may coexist
+    with the global knob when no quant dtype or precision is set. Attention
+    schedule profiles follow the same rule, because a scheduled step keeps the
+    global knob.
     """
     if kv_cache_dtype in (None, "auto", "float"):
         return
@@ -2705,7 +2719,7 @@ def validate_kv_cache_dtype_vs_attention_specs(
     for source, spec in specs:
         if spec is None or spec.quant is None:
             continue
-        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
+        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None or spec.quant.precision is not None:
             raise ValueError(
                 f"diffusion_kv_cache_dtype conflicts with a {source} quant spec: "
                 "the unified knob already requests quantized attention. Remove the explicit "

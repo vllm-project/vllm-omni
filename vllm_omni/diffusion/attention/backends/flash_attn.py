@@ -738,7 +738,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             if kv_quant_method != "fp8":
                 raise ValueError(
                     f"CUDA FLASH_ATTN supports only 'fp8' attention precision, got {kv_quant_method!r}. "
-                    "Use the NPU backend for mxfp8/mxfp4 or set diffusion_kv_cache_dtype='auto'."
+                    "Use the NPU backend for mxfp8/mxfp4 or disable attention quantization."
                 )
             return self.forward_fa_quant_cuda(query, key, value, attn_metadata)
 
@@ -884,7 +884,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if reason is not None:
             raise ValueError(
                 f"CUDA attention precision 'fp8' is unavailable: {reason}. "
-                "Set diffusion_kv_cache_dtype to 'auto', or select a backend with fp8 "
+                "Disable attention quantization, or select a backend with fp8 "
                 "support. Automatic precision fallback is not performed."
             )
 
@@ -1099,8 +1099,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if reason is not None:
             raise ValueError(
                 f"NPU attention precision {method!r} is unavailable: {reason}. "
-                "Set diffusion_kv_cache_dtype to a supported method, or set it to "
-                "'auto'. Automatic precision fallback is not performed."
+                "Select a supported quant.precision or diffusion_kv_cache_dtype, or disable "
+                "attention quantization. Automatic precision fallback is not performed."
             )
 
     def forward_fa_quant_npu(
@@ -1131,7 +1131,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             raise ImportError(
                 f"NPU attention precision {method!r} requires a compatible MindIE-SD "
                 "quant Runtime. Install a compatible MindIE-SD build, select another "
-                "diffusion_kv_cache_dtype, or set it to 'auto'. Automatic precision "
+                "quant.precision or diffusion_kv_cache_dtype, or disable quantization. Automatic precision "
                 "fallback is not performed."
             ) from exc
         kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
