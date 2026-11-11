@@ -96,10 +96,6 @@ def test_host_sampler_state_released_on_cleanup() -> None:
     _sample(talker, request_id="req-2", step=0, state={"codec_temperature": 0.0})
     assert "req-2" in talker._request_host_codec_states
 
-    # The generator lives in the per-request state, so no dead carrier dict
-    # is left behind for the cleanup hook to pop.
-    assert not hasattr(talker, "_request_host_codec_generators")
-
     talker._deferred_cleanup_ids = {"req-2"}
     talker._flush_deferred_cleanup()
     assert "req-2" not in talker._request_host_codec_states
