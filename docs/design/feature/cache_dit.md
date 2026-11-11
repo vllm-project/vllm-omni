@@ -226,6 +226,9 @@ CUSTOM_DIT_ENABLERS.update(
         "YourCustomPipeline": enable_cache_for_your_model,  # Add here
     }
 )
+```
+
+---
 
 ## Testing
 
