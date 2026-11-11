@@ -50,6 +50,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
     iter_mm_outputs,
+    iter_request_output_items,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.watermarking import WATERMARKER_REGISTRY, Watermarker
@@ -1130,7 +1131,7 @@ class StagePool:
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
-            return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
+            return any(bool(getattr(output, "text", "")) for output in iter_request_output_items(request_output))
 
         if getattr(request_output, "images", None):
             return True
@@ -1144,8 +1145,10 @@ class StagePool:
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
-        for output in getattr(request_output, "outputs", None) or []:
+        for output in iter_request_output_items(request_output):
             if getattr(output, "text", None):
+                return True
+            if self._is_non_empty_value(getattr(output, "data", None)):
                 return True
             token_ids = getattr(output, "token_ids", None)
             if self._is_non_empty_value(token_ids):
