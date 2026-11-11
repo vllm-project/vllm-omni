@@ -657,7 +657,8 @@ class DiffusionWorker:
         on cache hits, so it is entered only for the first forward of each new batch composition
         (the sorted per-request signatures of ``_flashinfer_tune_signature``, so a batch of two ``S``
         requests differs from one; with step execution: every step of the requests in that batch
-        until they finish, since prefill and decode differ). All other forwards run in normal mode, which looks the tuned tactics up.
+        until they finish, since prefill and decode differ). All other forwards run in normal mode,
+        which looks the tuned tactics up.
         The per-rank cache file is loaded once and rewritten when new tactics were profiled.
         Graph-captured paths are safe: their eager warm-up runs before capture, so capture only
         sees cache hits.
