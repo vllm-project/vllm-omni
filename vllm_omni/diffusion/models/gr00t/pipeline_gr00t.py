@@ -149,6 +149,20 @@ class Gr00tN1d7Pipeline(nn.Module):
             policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
             pending.append((idx, policy_obs, _noise_generator(request.sampling_params, self.device)))
 
+        if len(pending) > 1 and self.policy.strict:
+            # Strict mode validates the observation inside get_action(). Check each request
+            # first, so one invalid request (for example a float64 state) fails alone instead
+            # of failing the merged call and sending every wave it joins down the slow path.
+            valid = []
+            for idx, policy_obs, generator in pending:
+                try:
+                    self.policy.check_observation(policy_obs)
+                except (AssertionError, TypeError) as exc:
+                    outputs[idx] = DiffusionOutput(error=f"GR00T observation is invalid: {exc}")
+                else:
+                    valid.append((idx, policy_obs, generator))
+            pending = valid
+
         if len(pending) == 1:
             # A single request keeps the unbatched path; its exceptions reach the runner as before.
             idx, policy_obs, generator = pending[0]
@@ -256,7 +270,7 @@ def _merge_observations(observations: list[dict[str, Any]]) -> dict[str, Any] | 
     Mirrors ``Gr00tPolicy._unbatch_observation``: video and state arrays carry a leading
     batch dimension and language is a per-sample list. Returns ``None`` when the
     observations cannot be merged: different modalities or keys, a sample with a batch
-    size other than one, or mismatched trailing shapes.
+    size other than one, different dtypes, or mismatched trailing shapes.
     """
     first = observations[0]
     if not isinstance(first.get("video"), Mapping) or not first["video"]:
@@ -271,6 +285,12 @@ def _merge_observations(observations: list[dict[str, Any]]) -> dict[str, Any] | 
                 # A value without a length (None, a scalar) raises TypeError here, so the
                 # wave falls back to one call per request and only that request errors.
                 if any(len(value) != 1 for value in obs[modality].values()):
+                    return None
+                # Concatenating would silently upcast, e.g. uint8 frames next to float ones.
+                if modality != "language" and any(
+                    np.asarray(obs[modality][key]).dtype != np.asarray(first[modality][key]).dtype
+                    for key in first[modality]
+                ):
                     return None
         merged: dict[str, Any] = {}
         for modality, keys in first.items():

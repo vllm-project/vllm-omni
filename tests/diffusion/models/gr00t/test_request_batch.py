@@ -32,7 +32,8 @@ class _BatchRecordingPolicy:
     """Stand-in for ``Gr00tPolicy`` whose action echoes each sample's last state value."""
 
     def __init__(self, *, model_path: str, embodiment_tag: str, device: str, strict: bool) -> None:
-        del model_path, embodiment_tag, device, strict
+        del model_path, embodiment_tag, device
+        self.strict = strict
         self.language_key = LANGUAGE_KEY
         self.calls: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
         self.fail_batched = False
@@ -40,8 +41,13 @@ class _BatchRecordingPolicy:
         self.noise: list[list[torch.Tensor]] = []
         self.reset_calls = 0
 
+    def check_observation(self, obs: dict[str, Any]) -> None:
+        assert obs["state"]["joint"].dtype == np.float32, "state must be float32"
+
     def get_action(self, obs: dict[str, Any], options: dict[str, Any] | None = None):
         self.calls.append((obs, options))
+        if self.strict:
+            self.check_observation(obs)
         if self.draw_noise:
             # Like the action head, draw each sample's noise before anything can fail.
             generator = (options or {}).get("generator")
@@ -62,6 +68,8 @@ class _BatchRecordingPolicy:
 @pytest.fixture
 def pipeline(monkeypatch) -> Gr00tN1d7Pipeline:
     monkeypatch.setattr(pipeline_gr00t, "Gr00tPolicy", _BatchRecordingPolicy)
+    # The batching logic is device independent; keep generators on CPU so no GPU is needed.
+    monkeypatch.setattr(pipeline_gr00t, "get_local_device", lambda: torch.device("cpu"))
     od_config = OmniDiffusionConfig(
         model="nvidia/GR00T-N1.7-3B",
         model_config={"embodiment_tag": "LIBERO_PANDA", "strict": False},
@@ -214,6 +222,33 @@ def test_retry_after_a_failed_batch_draws_each_requests_solo_noise(pipeline):
     assert len(batched) == 2
     for (drawn,), seed in zip(retries, seeds):
         assert torch.equal(drawn, torch.randn(1, generator=torch.Generator().manual_seed(seed)))
+
+
+def test_strict_mode_rejects_an_invalid_request_alone_and_batches_the_rest(pipeline):
+    pipeline.policy.strict = True
+    bad = _robot_obs(2.0)
+    bad["state"]["joint"] = bad["state"]["joint"].astype(np.float64)
+    wave = DiffusionRequestBatch(
+        requests=[_request("ok-1", _robot_obs(1.0)), _request("bad", bad), _request("ok-2", _robot_obs(3.0))]
+    )
+
+    outputs = pipeline.forward(wave)
+
+    assert _arm(outputs[0]) == 1.0
+    assert "GR00T observation is invalid: state must be float32" in outputs[1].error
+    assert _arm(outputs[2]) == 3.0
+    assert [obs["state"]["joint"].shape[0] for obs, _ in pipeline.policy.calls] == [2]
+
+
+def test_requests_with_different_dtypes_are_not_merged(pipeline):
+    float_frames = _robot_obs(2.0)
+    float_frames["images"]["cam"] = float_frames["images"]["cam"].astype(np.float32)
+    wave = DiffusionRequestBatch(requests=[_request("a", _robot_obs(1.0)), _request("b", float_frames)])
+
+    outputs = pipeline.forward(wave)
+
+    assert [_arm(output) for output in outputs] == [1.0, 2.0]
+    assert [obs["video"]["cam"].dtype for obs, _ in pipeline.policy.calls] == [np.uint8, np.float32]
 
 
 def test_reset_from_any_request_resets_the_shared_policy_once_per_request(pipeline):
