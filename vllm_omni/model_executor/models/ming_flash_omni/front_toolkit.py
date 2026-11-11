@@ -10,13 +10,6 @@ PROTECTED_LEXEME = re.compile(
 )
 
 
-def tokenize_mixed_text(text: str):
-    """
-    将混合文本字符串处理为标记列表，并保留原始的空格。
-    """
-    return re.findall(TOKENIZE_PATTERN, text)
-
-
 def tokenize_mixed_text_iterator(text_iterator: Iterable[str]):
     """
     Args:
@@ -43,8 +36,6 @@ def clean_text_formatting(text):
 
     # 替换开头标点
     text = re.sub(leading_punct_pattern, " ", text)
-    # # 聚合连续空格
-    # text = re.sub(r'\s+', ' ', text)
     # 去除首尾多余空格
     return text.strip()
 
@@ -57,14 +48,7 @@ def chinese_punc_en2cn(text):
     3. 修复异类标点堆叠的匹配规则。
     4、修复开头符号
     """
-    # # 允许的字符范围：汉字、中文标点、全角符号、空格、以及常见的英文标点
-    # # 明确排除：a-zA-Z（英文字母）、0-9（数字）
-    # # gen_tag = 'tn'
-    # if re.search(r'[a-zA-Z0-9]', text):
-    #     return text
-
     # 仅检查是否包含中文，无中文则直接返回原文本
-    # gen_tag = 'tn_v1'
     if not text or not re.search(r"[\u4e00-\u9fa5]", text):
         return clean_text_formatting(text)
 
@@ -522,12 +506,3 @@ def strip_web_markup(text):
     if not text:
         return text
     return collapse_markup_residue(WebMarkupScrubber().feed(text, final=True))
-
-
-def preprosess_text(text):
-    """
-    文本预处理：
-    清除 Markdown 行内代码标记
-    """
-    text = strip_markdown_code(text)
-    return text

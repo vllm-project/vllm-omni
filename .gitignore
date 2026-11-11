@@ -242,6 +242,7 @@ data/
 datasets/
 *.csv
 *.json
+!vllm_omni/diffusion/models/hy_nomas/camera_trajectories.json
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
@@ -295,7 +296,3 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
-
-# Local Transformers/PyTorch inference experiment for Ming3.
-/examples/offline_inference/ming3_audio/transformers_thinker_talker.py
-/vllm_omni/model_executor/models/ming3_audio/hf_talker.py
