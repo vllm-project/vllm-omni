@@ -3,8 +3,10 @@
 """Choose a Buildkite shard count from measured durations.
 
 ``automatic_shard: true`` does not reserve a pool. The uploader keeps one job
-unless this step's own timings show its measured files would miss
-``timeout_in_minutes``. It then packs those files with a greedy
+unless this step's own timings show its measured files would miss 80% of
+``timeout_in_minutes``. The rest of the job timeout is left for checkout,
+collection, and process startup, which are not in the file durations. It then
+packs those files with a greedy
 longest-processing-time assignment, never more than ``MAX_AUTOMATIC_SHARDS``,
 and each shard runs only the files in its bin. Pytest still receives the
 original directories, so a directory ``conftest.py`` loads with those tests;
@@ -32,6 +34,9 @@ from pathlib import Path
 from typing import Any
 
 MAX_AUTOMATIC_SHARDS = 4
+# File seconds stop at each test. Checkout, collection, and startup still run
+# inside ``timeout_in_minutes``, so packing uses only this fraction of it.
+FILE_TIME_BUDGET_RATIO = 0.8
 PLUGIN_MODULE = "pytest_file_timings"
 PLUGIN_FLAG = f"-p {PLUGIN_MODULE}"
 SCRIPTS_DIR = ".buildkite/common/scripts"
@@ -208,7 +213,7 @@ def apply_automatic_shard(
 
     timeout_min = step.get("timeout_in_minutes")
     try:
-        budget_seconds = float(timeout_min) * 60.0
+        budget_seconds = float(timeout_min) * 60.0 * FILE_TIME_BUDGET_RATIO
     except (TypeError, ValueError):
         budget_seconds = 0.0
     step_timings = None if not timings else timings.get(base_label(label))
@@ -227,7 +232,10 @@ def apply_automatic_shard(
     bins = pack_files(weights, budget_seconds)
     if len(bins) <= 1:
         reason = f"measured {measured}/{len(files)} files fit"
-        log(f"automatic-shard: {label!r} stays 1 job ({reason}; budget {timeout_min} min)")
+        log(
+            f"automatic-shard: {label!r} stays 1 job "
+            f"({reason}; file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min)"
+        )
         step["commands"] = _instrument_commands(commands, instrumentable)
         return step
 
@@ -245,7 +253,7 @@ def apply_automatic_shard(
     step["commands"] = _instrument_commands(rewritten, instrumentable)
     log(
         f"automatic-shard: {label!r} -> {len(bins)} jobs "
-        f"(measured {measured}/{len(files)} files, budget {timeout_min} min)"
+        f"(measured {measured}/{len(files)} files, file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min)"
     )
     return step
 

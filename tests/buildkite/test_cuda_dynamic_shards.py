@@ -38,7 +38,14 @@ from merge_shard_timings import (  # noqa: E402
     prepare_profile_from_history,
     write_merged_profile,
 )
-from runtime_shard import PLUGIN_MODULE, _file_shard_command, _inject_plugin, pack_files, plan_shard_count  # noqa: E402
+from runtime_shard import (  # noqa: E402
+    FILE_TIME_BUDGET_RATIO,
+    PLUGIN_MODULE,
+    _file_shard_command,
+    _inject_plugin,
+    pack_files,
+    plan_shard_count,
+)
 from upload_pipeline import _render_test_pipeline, filter_pipeline_by_source_dependencies  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -157,6 +164,56 @@ def test_uploader_splits_simple_test_when_durations_exceed_the_budget(
     assert PLUGIN_MODULE in command
     lists = _read_shard_lists("simple-test")
     assert lists == [["tests/a_test.py"], ["tests/b_test.py"]]
+
+
+def test_file_budget_leaves_room_beyond_measured_test_time(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # 700+700 = 1400s fits a 25 min job, but not 80% of it. Three shards do.
+    files = ["tests/a_test.py", "tests/b_test.py", "tests/c_test.py"]
+    weights = [700, 700, 700]
+    full_budget = 25 * 60
+    file_budget = full_budget * FILE_TIME_BUDGET_RATIO
+    assert plan_shard_count(weights, budget_seconds=full_budget) == 2
+    assert plan_shard_count(weights, budget_seconds=file_budget) == 3
+
+    timings = tmp_path / "timings.json"
+    timings.write_text(
+        json.dumps({"steps": {"Simple Test": dict(zip(files, weights))}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(timings))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files",
+        lambda command, root: list(files) if "tests/" in command else [],
+    )
+
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    assert step["parallelism"] == 3
+
+
+def test_shorter_file_time_still_stays_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    files = ["tests/a_test.py", "tests/b_test.py"]
+    timings = tmp_path / "timings.json"
+    timings.write_text(
+        json.dumps({"steps": {"Simple Test": {name: 400 for name in files}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(timings))
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files",
+        lambda command, root: list(files) if "tests/" in command else [],
+    )
+
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if leaf.get("label") == "Simple Test")
+    assert "parallelism" not in step
 
 
 def _read_shard_lists(slug: str) -> list[list[str]]:

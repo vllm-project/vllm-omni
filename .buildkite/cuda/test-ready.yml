@@ -5,7 +5,9 @@
 # profile from the last 20 passed non-main builds of this pipeline
 # (or VLLM_OMNI_SHARD_TIMINGS). Those builds are other pull requests, so the
 # estimate includes whatever those pull requests changed. The profile is a
-# greedy packing of measured files into bins that fit `timeout_in_minutes`.
+# greedy packing of measured files into bins that fit 80% of
+# `timeout_in_minutes`. The remaining 20% covers checkout, collection, and
+# startup, which are not in the file durations.
 # Each bin is a file list and that shard runs only those files. No profile
 # means one job: a pool is not reserved
 # up front. Enrolled steps always write
