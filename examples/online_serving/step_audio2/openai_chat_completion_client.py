@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible client for Step-Audio2 online serving.
 
@@ -195,10 +195,6 @@ def run_step_audio2(args) -> None:
         "detokenize": True,
         "repetition_penalty": 1.1 if args.query_type != "audio_to_text" else 1.05,
     }
-
-    # For ASR, stop at EOS token
-    if args.query_type == "audio_to_text":
-        thinker_sampling_params["stop_token_ids"] = [151645]
 
     token2wav_sampling_params = {
         "temperature": 0.0,

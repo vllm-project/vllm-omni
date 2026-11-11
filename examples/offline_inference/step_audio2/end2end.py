@@ -257,17 +257,7 @@ def main(args):
 
     omni_llm = Omni(**omni_kwargs)
 
-    # Configure sampling parameters for each stage
-    # Stage 0 (Thinker): Generate text and audio tokens
-    # Note: For audio generation tasks, we need to allow the model to generate audio tokens
-    # Audio tokens are in range [151696, 158257], so we should not stop too early
-    # Qwen EOS token is typically 151645 (<|im_end|>), but we want to allow audio generation
-    # So we don't set stop_token_ids for audio tasks, but we do set it for text-only tasks
-    stop_token_ids = None
-    if args.query_type == "audio_to_text":
-        # For ASR, stop at EOS token
-        stop_token_ids = [151645]  # Qwen EOS token <|im_end|>
-
+    # The model tokenizer provides the native EOT EOS for every task.
     # Adjust sampling parameters based on query type
     # For audio generation tasks, we need higher repetition_penalty to avoid text loops
     # and allow the model to transition to audio token generation
@@ -281,7 +271,6 @@ def main(args):
         seed=SEED,
         detokenize=True,
         repetition_penalty=repetition_penalty,
-        stop_token_ids=stop_token_ids,
     )
 
     # Stage 1 (Token2Wav): Convert audio tokens to waveform

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 set -euo pipefail
 
 # Step-Audio2 curl client for online serving
@@ -16,8 +19,6 @@ if [[ ! "$QUERY_TYPE" =~ ^(audio_to_text|text_to_audio|audio_to_audio)$ ]]; then
     echo "  audio_to_audio: Voice conversion"
     exit 1
 fi
-
-SEED=42
 
 # Default test audio URL
 MARY_HAD_LAMB_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
@@ -51,7 +52,7 @@ case "$QUERY_TYPE" in
       {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
       {"type": "text", "text": "Please transcribe this audio."}
     ]'
-    # Add stop token for ASR
+    # Use the model EOT EOS; no additional legacy stop token.
     thinker_sampling_params='{
       "temperature": 0.7,
       "top_p": 0.9,
@@ -59,8 +60,7 @@ case "$QUERY_TYPE" in
       "max_tokens": 1024,
       "seed": 42,
       "detokenize": true,
-      "repetition_penalty": 1.05,
-      "stop_token_ids": [151645]
+      "repetition_penalty": 1.05
     }'
     ;;
   text_to_audio)
