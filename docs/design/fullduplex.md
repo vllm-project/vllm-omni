@@ -358,8 +358,10 @@ Every non-placeholder history insertion must call `_track_history_message`,
 and removal must call `_forget_history_message`, keeping the source map complete
 for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
 
-The prompt path uses `session.history` for Qwen retained-PCM identity. Unlike
-`snapshot.messages`, it copies only top-level message dictionaries; nested
+The default prompt path uses `session.history_for_prompt()` to capture aligned
+history and item IDs while preserving Qwen retained-PCM identity. Like
+`session.history` and unlike `snapshot.messages`, it copies only top-level
+message dictionaries; nested
 protocol/media containers and payloads remain shared with authoritative history
 and must be treated as read-only by prompt consumers.
 
@@ -382,6 +384,66 @@ Re-leasing the same live session on resume preserves IDs and revisions;
 dropping the session drops this state. Snapshots do not imply persistence
 across process restarts. Existing prompt construction remains unchanged;
 memory or stage-view consumers can adopt the snapshot in their own changes.
+
+### Derived context and per-stage views
+
+`DuplexEngineSession.context_ledger` holds derived nodes. A node records the
+`(source_id, revision)` pairs it was built from and the IDs of its parent
+nodes; parents always have smaller IDs. Nodes never write to history or
+advance a revision, and node IDs are never reused.
+
+A node is valid only while every recorded source has the recorded revision in
+the current snapshot and every parent is valid. `refresh(snapshot)` walks the
+nodes in ID order and prunes the invalid ones, so a content edit, a transcript
+update, a deleted source, an accepted heard prefix or a tighter hard cutoff
+removes the affected nodes and all of their descendants. An epoch change alone
+removes nothing. `add_node` admits a node only if its sources and parents are
+valid against the snapshot it is given, so a result computed from older
+sources is rejected when checked against a current snapshot. Admission with
+a historical snapshot does not displace a newer L1 source lookup; duplicate
+L1 nodes for the same source revision are rejected through either admission
+API. Callers refresh against a current authoritative snapshot before reading
+valid nodes.
+
+Admission detaches message dictionaries, lists and tuples from the caller while
+sharing opaque payloads. Batch admission prepares every message before writing
+nodes, so a preparation failure leaves the graph and next node ID unchanged.
+The ledger owns admitted message containers; node readers must treat them and
+opaque payloads as read-only. Rendered views are detached from ledger messages.
+
+A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
+`context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
+the prompt config is built exactly as before and no L1 view is rendered. With a
+policy, `conversation` stays the authoritative history and the stage also
+receives `conversation_view`, a list aligned one-to-one with `conversation`:
+
+- User messages before the `keep_media_user_turns` most recent user runs
+  (consecutive user messages) drop their `audio_url` and `image_url` parts and
+  keep their text. The transcript is added as a text part when no text part
+  already carries it.
+- A user run is never emptied. If every message in a run would be empty, the
+  whole run is passed through unchanged.
+- Assistant, system and tool messages are never rewritten. Assistant text
+  already reflects the accepted heard prefix.
+
+This is a candidate context view, not a complete prompt: with a zero-keep
+policy, unanswered input is eligible too. Plugins must preserve current
+request media from `conversation`, and keep binding audio and validating
+sources against it. ModelChannel reuses the snapshot captured for item IDs
+when rendering the view, so both come from the same capture. Policy config
+is deployment-owned; plugin request runtime state is a separate input.
+
+Qwen3-Omni opts in its Thinker stage when
+`duplex_session.context_keep_media_turns` is set (default `null`). It then
+formats older user items from the view, including mixed text/media items.
+Dropped images are never decoded, and a text-only view replaces old audio
+even while its payload remains in the retained audio slots. A turn whose
+audio left those slots keeps its available transcript instead of being
+dropped. The current unanswered user input remains verbatim, including during
+tool continuations, after intervening system instructions, and for audio and
+image items when the knob is `0`.
+The 16-message window, the
+audio-slot limits and the no-empty-run fallback are unchanged.
 
 ## Session lifecycle
 
