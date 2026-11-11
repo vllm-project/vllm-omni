@@ -186,6 +186,11 @@ steps:
 
       - label: "TTS · Ming · GLM · IndexTTS · Breeze · L4"
         timeout_in_minutes: 90
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
+        artifact_paths:
+          - failed_speech_*.wav
+          - failed_speech_*.json
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -208,6 +213,11 @@ steps:
 
       - label: "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
         timeout_in_minutes: 90
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
+        artifact_paths:
+          - failed_speech_*.wav
+          - failed_speech_*.json
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -228,6 +238,11 @@ steps:
 
       - label: "TTS · H100"
         timeout_in_minutes: 90
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
+        artifact_paths:
+          - failed_speech_*.wav
+          - failed_speech_*.json
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
