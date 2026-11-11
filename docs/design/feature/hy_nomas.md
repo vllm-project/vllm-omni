@@ -19,7 +19,7 @@ separate changes.
 
 The [model integration contract](../module/diffusion/diffusion_model_integration.md)
 and [AR session contract](realtime_ar_diffusion.md) own runtime boundaries.
-The [recipe](../../../recipes/Tencent/Hy-Nomas.md#experimental-cpu-history-archive-c1)
+The [recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md#experimental-cpu-history-archive-c1)
 owns runnable configuration.
 
 ## C1: bounded CPU archive
