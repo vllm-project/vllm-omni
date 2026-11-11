@@ -104,7 +104,10 @@ def _sdxl(od_config, g):
     return StableDiffusionXLPipeline, model, make
 
 
-def _flux(kontext: bool):
+def _flux(kontext: bool, ids_collide: bool = False):
+    """``ids_collide`` makes the unbatched ``img_ids`` as long as the branch batch, which
+    is the case that would be concatenated if the pipeline did not declare it shared."""
+
     def build(od_config, g):
         from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 
@@ -124,7 +127,8 @@ def _flux(kontext: bool):
         )
 
         def make(batch):
-            n_img = 32 if kontext else 16  # Kontext appends the reference image tokens
+            # Kontext appends the reference image tokens.
+            n_img = batch if ids_collide else (32 if kontext else 16)
             latents, timestep = _randn(g, batch, n_img, 64), torch.full((batch,), 0.5, device=g.device)
             img_ids = torch.rand(n_img, 3, generator=g, device=g.device).mul(4).floor()
             out = []
@@ -286,7 +290,9 @@ CASES: dict[str, Callable] = {
     "sd3": _sd3,
     "sdxl": _sdxl,
     "flux": _flux(kontext=False),
+    "flux-ids-collide": _flux(kontext=False, ids_collide=True),
     "flux-kontext": _flux(kontext=True),
+    "flux-kontext-ids-collide": _flux(kontext=True, ids_collide=True),
     "flux2": _flux2(klein=False),
     "flux2-klein": _flux2(klein=True),
     "wan2.2-t2v": _wan(i2v=False),
