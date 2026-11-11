@@ -162,9 +162,10 @@ def test_text_encoder_root_resolution(tmp_path):
     }
     assert h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root(index, release) == str(base)
     assert h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root({}, release) == str(release)
+    # The Hub release bundles text_encoder/ while model_index.json still names
+    # the base repository: the bundled copy wins and nothing is downloaded.
     (release / "text_encoder").mkdir()
-    with pytest.raises(ValueError, match="also has text_encoder"):
-        h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root(index, release)
+    assert h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root(index, release) == str(release)
     index["text_encoder"][2]["subfolder"] = "encoder"
     with pytest.raises(ValueError, match="unsupported"):
         h3i.MiniMaxH3ImagePipeline._resolve_text_encoder_root(index, tmp_path)

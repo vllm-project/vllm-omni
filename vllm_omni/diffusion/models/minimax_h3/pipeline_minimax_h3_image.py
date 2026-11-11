@@ -384,8 +384,12 @@ class MiniMaxH3ImagePipeline(
         if type(tile_parallel) is not bool:
             raise ValueError(f"vae_tile_parallel must be a bool, got {tile_parallel!r}")
         self._vae_group = dit_group if dit_world > 1 and tile_parallel else None
-        self._vae_cuda_graph = bool(getattr(od_config, "enable_cuda_graph_decode", True)) and not bool(
-            getattr(od_config, "enforce_eager", False)
+        # decode_latent only captures graphs on CUDA devices (CUDA and ROCm);
+        # elsewhere (e.g. XPU) the tiles decode eagerly.
+        self._vae_cuda_graph = (
+            self.device.type == "cuda"
+            and bool(getattr(od_config, "enable_cuda_graph_decode", True))
+            and not bool(getattr(od_config, "enforce_eager", False))
         )
         tp_size = int(getattr(parallel, "text_encoder_tp_size", 1))
         if not 1 <= tp_size <= dit_world or 64 % tp_size or 8 % tp_size:
@@ -468,8 +472,12 @@ class MiniMaxH3ImagePipeline(
         repo, subfolder = source.get("pretrained_model_name_or_path"), source.get("subfolder")
         if subfolder != "text_encoder" or not isinstance(repo, str) or not repo:
             raise ValueError(f"unsupported MiniMax H3 image text_encoder source {source!r}")
-        if (root / "text_encoder").exists():
-            raise ValueError(f"model_index.json loads text_encoder from {repo!r}, but {root} also has text_encoder/")
+        if (root / "text_encoder").is_dir():
+            # The release bundles a copy of the base repository's text encoder
+            # (same shards) while model_index.json still names the base repo.
+            # Prefer the local copy: it needs no second download.
+            logger.info("MiniMax-H3-Image: using bundled text_encoder/ instead of %s", repo)
+            return str(root)
         if os.path.isdir(repo):
             return repo
         return download_weights_from_hf_specific(
