@@ -97,7 +97,9 @@ def cache_pipeline():
                 final_stage_id=1,
             )
             orch.request_states[request_id] = state
-            await orch._forward_to_next_stage_unguarded(request_id, 0, _build_request_output(request_id), state)
+            await orch._forward_to_next_stage_unguarded(
+                request_id, 0, _build_request_output(request_id), state, next_logical=state.final_stage_id
+            )
 
     yield SimpleNamespace(
         orch=orch,

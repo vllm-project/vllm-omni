@@ -147,7 +147,10 @@ def prepare_stage_config_inputs(
 
 
 def get_final_stage_id_for_e2e(
-    output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
+    output_modalities: list[str] | None,
+    default_modalities: list[str],
+    stage_list: list,
+    stage_order: tuple[int, ...] | None = None,
 ) -> int:
     """Get the final stage id for e2e.
 
@@ -157,8 +160,14 @@ def get_final_stage_id_for_e2e(
     Returns:
         Final stage id for e2e
     """
-    last_stage_id = len(stage_list) - 1
+    order = stage_order if stage_order is not None else tuple(range(len(stage_list)))
+    last_stage_id = order[-1]
     if output_modalities is not None:
+        active_outputs = {stage_list[sid].final_output_type for sid in order if stage_list[sid].final_output}
+        configured_outputs = {stage.final_output_type for stage in stage_list if stage.final_output}
+        unreachable = (set(output_modalities) & configured_outputs) - active_outputs
+        if unreachable:
+            raise ValueError(f"Requested output modalities are unreachable on the stage route: {sorted(unreachable)}")
         prompt_modalities = []
         for modality in output_modalities:
             if modality not in default_modalities:
@@ -170,25 +179,10 @@ def get_final_stage_id_for_e2e(
     else:
         output_modalities = default_modalities
 
-    try:
-        final_stage_id_for_e2e = last_stage_id
-        for _sid in range(last_stage_id, -1, -1):
-            if (
-                getattr(stage_list[_sid], "final_output", False)
-                and stage_list[_sid].final_output_type in output_modalities
-            ):
-                final_stage_id_for_e2e = _sid
-                break
-    except Exception as e:
-        logger.debug(
-            "[Orchestrator] Failed to determine final stage for E2E; \
-                falling back to last: %s",
-            e,
-            exc_info=True,
-        )
-        final_stage_id_for_e2e = last_stage_id
-
-    return final_stage_id_for_e2e
+    for sid in reversed(order):
+        if stage_list[sid].final_output and stage_list[sid].final_output_type in output_modalities:
+            return sid
+    return last_stage_id
 
 
 def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:

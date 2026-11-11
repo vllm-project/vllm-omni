@@ -14,6 +14,8 @@ For a specific example, see the [Qwen2.5-Omni deploy config](gh-file:vllm_omni/d
 
 For an introduction, see [Pipeline and deploy configurations](./stage_configs.md).
 
+For developer-owned control flow, see [Static stage transitions](./stage_routing.md).
+
 ## Memory Configuration
 
 - **[GPU Memory Calculation and Configuration](./gpu_memory_utilization.md)** - Guide on how to calculate memory requirements and set up `gpu_memory_utilization` for optimal performance

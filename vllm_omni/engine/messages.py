@@ -152,22 +152,29 @@ class NextStageInputMessage(EngineQueueMessage, kw_only=True):
     sampling_params_list: list[OmniSamplingParams]
     requested_replica_id: int | None = None
 
-    def ensure_valid(self, stage_types: Sequence[str | None]) -> None:
+    def ensure_valid(self, stage_types: Sequence[str | None], *, stage_order: Sequence[int] | None = None) -> None:
         """Raise ValueError if this input can't be submitted to its receiver stage correctly.
 
         Fields come from the caller, so they may be any type.
         """
-        self.check_stage_ids(len(stage_types))
+        self.check_stage_ids(len(stage_types), stage_order=stage_order)
         receiver_type = stage_types[self.receiver_stage_id]
         self._check_requests(receiver_type)
         self._check_sampling_params(stage_types)
         self._check_submit_kwargs(receiver_type)
 
-    def check_stage_ids(self, num_stages: int) -> None:
+    def check_stage_ids(self, num_stages: int, *, stage_order: Sequence[int] | None = None) -> None:
         """Raise ValueError unless the source stage precedes a receiver stage in the pipeline."""
         source = self.source_stage_id
         receiver = self.receiver_stage_id
-        if not (isinstance(source, int) and isinstance(receiver, int) and 0 <= source < receiver < num_stages):
+        order = stage_order if stage_order is not None else range(num_stages)
+        if not (
+            isinstance(source, int)
+            and isinstance(receiver, int)
+            and source in order
+            and receiver in order
+            and order.index(source) < order.index(receiver)
+        ):
             raise ValueError(
                 f"stage_input has source stage {source!r} and receiver stage {receiver!r}, "
                 f"which does not fit the {num_stages}-stage pipeline"

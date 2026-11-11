@@ -17,8 +17,10 @@ from vllm.v1.kv_hints import KvHintsEnvelope
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import AsyncOmniParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
+from vllm_omni.engine.stage_runtime import StageRuntimeInfo
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -85,10 +87,12 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni.engine = SimpleNamespace(
         num_stages=1,
         stage_configs=[],
+        pipeline_config=None,
         add_request_async=fake_add_request,
         abort_async=fake_abort_request,
     )
     omni.log_stats = False
+    omni._stage_meta_list = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     omni.request_states = {}
     omni._final_output_handler = lambda: None
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
@@ -895,12 +899,21 @@ def _next_stage_input(request_id: str) -> NextStageInputMessage:
 
 
 @pytest.mark.cpu
-def test_run_entry_stage_yields_at_entry_stage():
+@pytest.mark.parametrize("transitions, endpoint", [(None, 2), (((0, 2),), 2), (((0, 2), (2, 1)), 1)])
+def test_run_entry_stage_yields_at_entry_stage(transitions, endpoint):
     """Ensure the entry stage call yields at stage 0 with FINAL_ONLY params and returns the next stage input."""
 
     async def run():
         omni = get_async_omni_instance()
-        omni.engine.num_stages = 2
+        omni.engine.num_stages = 3
+        omni.engine.pipeline_config = PipelineConfig(
+            model_type="test",
+            stages=tuple(
+                StagePipelineConfig(stage_id=i, model_stage=f"stage{i}", final_output=i == endpoint) for i in range(3)
+            ),
+            stage_transitions=transitions,
+        )
+        omni._stage_meta_list = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")] * 3
         submitted: dict[str, Any] = {}
 
         async def fake_add_request_async(*, request_id, **kwargs):
@@ -912,7 +925,7 @@ def test_run_entry_stage_yields_at_entry_stage():
 
         response = await omni.run_entry_stage(
             {"prompt": "hi"},
-            [delta_params, SamplingParams()],
+            [delta_params, SamplingParams(), SamplingParams()],
             request_id="entry-call",
             requested_replica_id=1,
         )
@@ -920,7 +933,7 @@ def test_run_entry_stage_yields_at_entry_stage():
         assert isinstance(response, NextStageInputMessage)
         assert re.fullmatch(r"entry-call-[0-9a-f]{8}-0", submitted["request_id"])
         assert submitted["requested_replica_id"] == 1
-        assert (submitted["final_stage_id"], submitted["yield_stage_id"]) == (1, 0)
+        assert (submitted["final_stage_id"], submitted["yield_stage_id"]) == (endpoint, 0)
         assert all(params.output_kind == RequestOutputKind.FINAL_ONLY for params in submitted["sampling_params_list"])
         assert omni.request_states == {}
 

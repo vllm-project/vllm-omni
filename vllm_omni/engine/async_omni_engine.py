@@ -20,6 +20,7 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -49,7 +50,11 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
-        return Orchestrator(**orchestrator_kwargs)
+        pipeline = self.pipeline_config
+        return Orchestrator(
+            stage_transitions=pipeline.stage_transitions if pipeline is not None else None,
+            **orchestrator_kwargs,
+        )
 
     # ---- request helpers ----
 
@@ -390,9 +395,16 @@ class AsyncOmniEngine(OmniEngineBase):
                 # orchestrator request_id to find the correct req_state in Orchestrator.request_states.
                 request.external_req_id = request_id
                 # A run request's yielded stage returns its payload when the next stage takes a full payload.
-                return_stage_payload = (
-                    yield_stage_id is not None and self.stage_pools[yield_stage_id + 1].takes_full_payload_input
-                )
+                return_stage_payload = False
+                if yield_stage_id is not None:
+                    pipeline = self.pipeline_config
+                    routing = StageRouting.from_transitions(
+                        len(self.stage_pools), pipeline.stage_transitions if pipeline is not None else None
+                    )
+                    next_stage_id = routing.next_stage(yield_stage_id, final_stage_id)
+                    return_stage_payload = (
+                        next_stage_id is not None and self.stage_pools[next_stage_id].takes_full_payload_input
+                    )
                 request = apply_omni_final_stage_metadata(
                     request, final_stage_id, return_stage_payload=return_stage_payload
                 )

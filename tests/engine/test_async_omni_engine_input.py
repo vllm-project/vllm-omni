@@ -16,11 +16,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import OmniClientError
@@ -412,26 +414,32 @@ def _replica(input_addr: str) -> ReplicaInfo:
     )
 
 
-@pytest.mark.parametrize(
-    ("stage1_vllm_config", "returns_payload"),
-    [
-        (None, False),  # Currently this is the case for diffusion
-        (SimpleNamespace(model_config=SimpleNamespace(stage_id=1, requires_full_payload_input=True)), True),
-    ],
-)
+@pytest.mark.parametrize("returns_payload", [False, True])
+@pytest.mark.parametrize("transitions", [None, ((0, 2), (2, 1))])
 def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_stage(
-    mocker: MockerFixture, stage1_vllm_config: SimpleNamespace | None, returns_payload: bool
+    mocker: MockerFixture, returns_payload: bool, transitions
 ):
     """Ensure a run request's entry stage returns its payload only when the next stage takes a full payload."""
     engine = object.__new__(AsyncOmniEngine)
+    engine.pipeline_config = PipelineConfig(
+        model_type="test",
+        stages=tuple(StagePipelineConfig(stage_id=i, model_stage=f"stage{i}", final_output=True) for i in range(3)),
+        stage_transitions=transitions,
+    )
     params = SamplingParams(max_tokens=8)
-    engine.default_sampling_params_list = [params, params]
+    engine.default_sampling_params_list = [params, params, params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
     engine.stage_pools = [
         StagePool(0, [_FakeStageClient()]),
-        StagePool(1, [_FakeStageClient()], stage_vllm_config=stage1_vllm_config),
+        StagePool(1, [_FakeStageClient()]),
+        StagePool(2, [_FakeStageClient()]),
     ]
+    receiver = 1 if transitions is None else 2
+    if returns_payload:
+        engine.stage_pools[receiver]._stage_vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(stage_id=receiver, requires_full_payload_input=True)
+        )
     input_processor = mocker.Mock()
     input_processor.process_inputs.return_value = _make_engine_core_request()
     engine.input_processor = input_processor
@@ -439,8 +447,8 @@ def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_st
     msg = engine._build_add_request_message(
         request_id="req-1",
         prompt={"prompt_token_ids": [1, 1, 1]},
-        sampling_params_list=[params, params],
-        final_stage_id=1,
+        sampling_params_list=[params, params, params],
+        final_stage_id=2 if transitions is None else 1,
         yield_stage_id=0,
         requested_replica_id=0,
     )
@@ -719,13 +727,17 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
 
-    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
-    # those keys fails instead of sending them to replica 1, while routing moves on.
+    # Keep the failed route until cleanup; the receiver may know this sender.
     stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
     with pytest.raises(StageUnavailableError):
         await stage_pool.submit_initial(
-            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
+            "req-1",
+            OrchestratorRequestState(request_id="req-1", sampling_params_list=[params]),
+            _make_engine_core_request(),
+            expected_replica_id=0,
         )
+    assert stage_pool.get_bound_replica_id("req-1") == 0
+    stage_pool.release("req-1")
     assert stage_pool.get_bound_replica_id("req-1") is None
     assert await stage_pool.pick("req-1") == 1
 

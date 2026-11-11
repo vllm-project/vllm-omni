@@ -731,7 +731,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         Returns the next stage's input, or the raw output if the entry stage is the final stage.
         """
-        final_stage_id = self.num_stages - 1
+        final_stage_id = self._configured_stage_routing().stage_order[-1]
         # Each call returns one complete output, so we use FINAL_ONLY
         sampling_params_list = coerce_param_message_types(list(sampling_params_list), is_streaming=False)
         async with self._stage_request(request_id, stage_id=0) as req_state:

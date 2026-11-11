@@ -582,7 +582,7 @@ def _build_bare_orchestrator(stage_pools) -> tuple[Orchestrator, tuple[janus.Que
 
 
 def _register_request(orchestrator: Orchestrator, request_id: str, *, submitted_stage: int | None = 0) -> None:
-    state = OrchestratorRequestState(request_id=request_id)
+    state = OrchestratorRequestState(request_id=request_id, final_stage_id=len(orchestrator.stage_pools) - 1)
     if submitted_stage is not None:
         state.stage_submit_ts[submitted_stage] = time.time()
     orchestrator.request_states[request_id] = state
