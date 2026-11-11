@@ -80,13 +80,10 @@ The AR sampler preserves comprehension token blocking, image-generation stage
 transitions, and greedy aspect-ratio selection using MRv2's device-side
 token history. Speculative decoding must be disabled for this stage.
 
-On NPU, the model state uses Ascend attention metadata and restores
-bidirectional attention within each input-image span. Image-prefix prefill
-requires eager execution, PCP/DCP sizes of one, and unquantized KV caches.
-The supplied NPU profiles use eager BF16 execution and
-`disable_chunked_mm_input: true` so prefill chunks keep each image intact.
-Unsupported execution, cache and attention-backend configurations fail during
-model-state initialization.
+On NPU, the model state combines Omni inputs, M-RoPE and sampling with
+Ascend's existing attention metadata. The MR2 adapter preserves the backend's
+attention behavior; it does not add image-span PrefixLM support. The validated
+eager BF16 AR path uses causal attention with both V1 and MR2.
 
 ### Shared T2I/IT2I offline examples
 

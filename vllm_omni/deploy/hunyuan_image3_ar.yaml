@@ -36,7 +36,6 @@ platforms:
     stages:
       - stage_id: 0
         model_runner: v2
-        disable_chunked_mm_input: true
         gpu_memory_utilization: 0.75
         devices: "0,1,2,3,4,5,6,7"
         tensor_parallel_size: 8
