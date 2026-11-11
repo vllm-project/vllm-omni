@@ -791,7 +791,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             extra_body.pop("tts_ref_audio")
             ref_audio = extra_tts_ref_audio
 
-        requests_audio = any(str(modality).lower() == "audio" for modality in config.modalities)
+        capabilities = self.deployment_capabilities(max_sessions=1)
+        requests_audio = "audio" in capabilities.resolve_output_modalities(config.modalities)
         default_ref_audio = None
         if ref_audio is None and requests_audio:
             default_ref_audio = await resolve_default_ref_audio(model_config)
