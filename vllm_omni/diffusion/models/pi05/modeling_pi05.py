@@ -340,6 +340,22 @@ class Pi05KVCache:
         self.value[layer_idx, :, :, self.prefix_len :].copy_(value)
         return self.key[layer_idx], self.value[layer_idx]
 
+    def rows(self, batch_size: int) -> Pi05KVCache:
+        """A cache over this cache's first ``batch_size`` request rows, sharing its storage.
+
+        A smaller batch writes and reads its K/V in place in a larger cache, so
+        the larger cache's denoising graph can serve it (the rows behind it
+        are ignored). The view is not a new allocation."""
+        if not 1 <= batch_size <= self.batch_size:
+            raise ValueError(f"A view of {batch_size} rows does not fit a cache of {self.batch_size}.")
+        view = Pi05KVCache.__new__(Pi05KVCache)
+        view.key = self.key[:, :batch_size]
+        view.value = self.value[:, :batch_size]
+        view.batch_size = batch_size
+        view.prefix_len = self.prefix_len
+        view.suffix_len = self.suffix_len
+        return view
+
 
 def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
     """Cast ``tensor`` to the dtype ``module``'s weight expects."""
@@ -2232,7 +2248,11 @@ class Pi05ForActionPrediction(nn.Module):
         #    the cache the denoising steps then extend and read.
         kv_cache = self.kv_cache
         if kv_cache is None or not kv_cache.fits(bsize, prefix_embs.shape[1]):
-            kv_cache = self.new_kv_cache(bsize, prefix_embs.shape[1])
+            # A formed batch of a captured size runs over the KV cache of its
+            # denoising graph; any other call takes a one-off cache.
+            kv_cache = None if graphs is None else graphs.kv_cache_for(bsize, prefix_embs.shape[1])
+            if kv_cache is None:
+                kv_cache = self.new_kv_cache(bsize, prefix_embs.shape[1])
         _, past_key_values = prefix_forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,

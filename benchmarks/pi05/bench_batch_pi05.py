@@ -167,6 +167,7 @@ def run(args) -> None:
         precompute_adarms=on,
         hoist_denoise_invariants=on,
         prefix_kv_only=on,
+        max_num_seqs=max(args.batches),
     )
     graphs, stages = model.cuda_graphs, Stages(model)
     dcgm = Dcgm(args.dcgm_gpu) if shutil.which("dcgmi") else None

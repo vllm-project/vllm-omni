@@ -63,9 +63,11 @@ def build_model(
     hoist_denoise_invariants: bool | None = None,
     prefix_kv_only: bool | None = None,
     execution_mode: str | None = None,
+    max_num_seqs: int = 1,
 ):
     """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
-    ``enforce_eager`` unset its fused kernels and CUDA graphs."""
+    ``enforce_eager`` unset its fused kernels and CUDA graphs (the denoising
+    step's for the batch sizes ``max_num_seqs`` declares)."""
     import yaml
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -97,6 +99,7 @@ def build_model(
         model_config=stage["model_config"],
         enforce_eager=execution_mode != "graph",
         custom_pipeline_args=custom_args,
+        max_num_seqs=max_num_seqs,
     )
     # Under the serving dtype as torch's default, as the server's loader builds
     # (and captures) the pipeline.

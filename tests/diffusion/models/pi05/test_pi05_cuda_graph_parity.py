@@ -121,6 +121,8 @@ def pipeline(request):
         dtype=request.param,
         model_config=_deploy_model_config(),
         enforce_eager=False,
+        # Formed batches: the denoising step is captured for 1, 2 and 4 requests.
+        max_num_seqs=4,
     )
     # Constructed the way DiffusersLoader does it: under the serving dtype as
     # torch's default dtype, which is also when the CUDA graphs are captured.
@@ -362,3 +364,118 @@ def test_other_default_dtype_runs_eagerly(pipeline):
     with set_default_torch_dtype(torch.bfloat16):
         _sample(model, inputs, num_steps=None, seed=0)
     assert graphs.num_replays == replays_before
+
+
+# ── Formed batches ───────────────────────────────────────────────
+# The rows of a batch are cases at the default step count; each row carries
+# the noise its case draws alone, so the batch can be compared row by row.
+BATCH_ROWS = {2: ((3, None), (2, None)), 4: ((1, None), (2, None), (3, None), (2, None))}
+
+
+def _batch_inputs(pipeline, outputs, rows) -> dict:
+    """One ``sample_actions`` call from the per-request inputs of ``rows``."""
+    model = pipeline.model
+    parts = [outputs.inputs[row] for row in rows]
+    device = parts[0][2].device
+    noise = torch.cat(
+        [
+            torch.randn(
+                1,
+                model.action_horizon,
+                model.action_dim,
+                dtype=torch.float32,
+                device=device,
+                generator=torch.Generator(device=device).manual_seed(CASES.index(row)),
+            )
+            for row in rows
+        ]
+    )
+    return dict(
+        images=[torch.cat([part[0][cam] for part in parts]) for cam in range(len(parts[0][0]))],
+        image_masks=[torch.cat([part[1][cam] for part in parts]) for cam in range(len(parts[0][1]))],
+        lang_tokens=torch.cat([part[2] for part in parts]),
+        lang_masks=torch.cat([part[3] for part in parts]),
+        noise=noise,
+    )
+
+
+def _sample_batch(model, inputs: dict) -> torch.Tensor:
+    with torch.inference_mode():
+        return model.sample_actions(**inputs).cpu()
+
+
+def _assert_rows_as_alone(pipeline, outputs, actual: torch.Tensor, rows, label: str) -> None:
+    """Each row of ``actual`` is the chunk its request gets alone on the optimized path, within ``TOLERANCE``."""
+    max_rel, max_abs = TOLERANCE[pipeline._torch_dtype]
+    for index, row in enumerate(rows):
+        alone = outputs.optimized[(0, *row)].double()
+        mine = actual[index : index + 1].double()
+        rel = ((mine - alone).norm() / alone.norm()).item()
+        abs_diff = (mine - alone).abs().max().item()
+        print(
+            f"\n{pipeline._torch_dtype} {label} row {index} views={row[0]}: rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}"
+        )
+        assert rel <= max_rel and abs_diff <= max_abs, (
+            f"row {index} of the batch moved from the request alone by rel L2 {rel:.3e}, "
+            f"max |diff| {abs_diff:.3e}; allowed {max_rel:.1e}, {max_abs:.1e}"
+        )
+
+
+@pytest.mark.parametrize("batch", sorted(BATCH_ROWS), ids=lambda batch: f"batch={batch}")
+def test_formed_batch_replays_its_denoise_graph(outputs, pipeline, batch):
+    """A batch of a declared size replays the denoising graph captured for it
+    (its prefix regions run eagerly), equals its kernels run eagerly on the
+    batch bit for bit, and gives each request the chunk it gets alone within
+    ``TOLERANCE``: the vision tower and prefix run batched."""
+    model = pipeline.model
+    graphs = model.cuda_graphs
+    rows = BATCH_ROWS[batch]
+    inputs = _batch_inputs(pipeline, outputs, rows)
+
+    replays_before = graphs.num_replays.copy()
+    actual = _sample_batch(model, inputs)
+    assert graphs.num_replays - replays_before == {"denoise_step": pipeline.config.num_inference_steps}
+    assert actual.shape == (batch, pipeline.config.chunk_size, pipeline.config.max_action_dim)
+    assert torch.isfinite(actual).all()
+
+    with _path(model, graphs=None, fused_kernels=True):
+        fused_eager = _sample_batch(model, inputs)
+    assert torch.equal(actual, fused_eager), "the batched denoising graph differs from its kernels run eagerly"
+    _assert_rows_as_alone(pipeline, outputs, actual, rows, f"batch={batch}")
+
+
+def test_batch_between_captured_sizes_pads_to_the_next_graph(outputs, pipeline):
+    """A batch of 3 runs over the first rows of the batch-4 cache and replays
+    the batch-4 graph; the stale fourth row changes nothing. In bfloat16 every
+    GEMM of the step runs in Triton, so the chunks are the ones its kernels
+    give the batch of 3 eagerly, bit for bit; in float32 the expert GEMMs stay
+    on cuBLAS, which rounds a row of 200 differently than a row of 150, so the
+    rows are checked against the requests alone."""
+    model = pipeline.model
+    graphs = model.cuda_graphs
+    rows = ((1, None), (2, None), (3, None))
+    inputs = _batch_inputs(pipeline, outputs, rows)
+    replays_before = graphs.num_replays.copy()
+    actual = _sample_batch(model, inputs)
+    assert graphs.num_replays - replays_before == {"denoise_step": pipeline.config.num_inference_steps}
+    assert actual.shape[0] == 3
+    with _path(model, graphs=None, fused_kernels=True):
+        fused_eager = _sample_batch(model, inputs)
+    diff = (actual.double() - fused_eager.double()).abs().max().item()
+    print(f"\n{pipeline._torch_dtype} batch=3 on the batch-4 graph vs its kernels eagerly on 3: max |diff| {diff:.3e}")
+    if pipeline._torch_dtype == torch.bfloat16:
+        assert torch.equal(actual, fused_eager)
+    _assert_rows_as_alone(pipeline, outputs, actual, rows, "batch=3 on the batch-4 graph")
+
+
+def test_batch_above_the_largest_captured_size_runs_without_a_graph(outputs, pipeline):
+    """A batch of 5 exceeds every captured size: nothing replays, and the chunks
+    are the ones its kernels give eagerly."""
+    model = pipeline.model
+    graphs = model.cuda_graphs
+    inputs = _batch_inputs(pipeline, outputs, ((1, None), (2, None), (3, None), (2, None), (1, None)))
+    replays_before = graphs.num_replays.copy()
+    actual = _sample_batch(model, inputs)
+    assert graphs.num_replays == replays_before
+    with _path(model, graphs=None, fused_kernels=True):
+        assert torch.equal(actual, _sample_batch(model, inputs))

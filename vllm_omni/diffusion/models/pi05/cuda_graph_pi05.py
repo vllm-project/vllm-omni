@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA Graph path for π0.5 ``sample_actions`` (batch size 1).
+"""CUDA Graph path for π0.5 ``sample_actions``.
 
 ``sample_actions`` has three regions that are captured and replayed separately:
 
@@ -16,6 +16,16 @@ batch 1, ``max_cameras`` image slots (a missing camera only flips its mask),
 count only changes how often region 3 replays. With it on, the default schedule
 supplies a new conditioning/modulation row on every replay; unsupported
 schedules use eager denoising. No captured control flow depends on tensor data.
+
+Region 3 is also captured for every other size in ``batch_sizes`` (the
+pipeline declares them from ``max_num_seqs``): a formed batch of such a size
+replays its own denoising graph over its own KV cache, which ``kv_cache_for``
+hands ``sample_actions``. Its prefix embedding and prefix forward are not
+captured yet; they run eagerly, batched, into that cache. A batch between two
+captured sizes runs over the first rows of the next larger size's cache and
+replays that graph: the rows behind it carry stale data and are dropped from
+the output (every row is computed on its own). A batch above the largest
+captured size runs its steps without a graph.
 
 Optional request-invariant masks, positions and RoPE tables are copied into
 stable buffers once per request, before its denoising loop. Optional KV-only
@@ -48,6 +58,7 @@ from __future__ import annotations
 
 import weakref
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -89,6 +100,36 @@ def _matches(src, static: torch.Tensor) -> bool:
 def _load(static: torch.Tensor, src: torch.Tensor) -> None:
     if src is not static:
         static.copy_(src)
+
+
+def _matches_rows(src, static: torch.Tensor) -> bool:
+    """``src`` is the first rows of ``static``'s shape: a batch no larger than the captured one."""
+    return (
+        isinstance(src, torch.Tensor)
+        and src.dim() == static.dim()
+        and 0 < src.shape[0] <= static.shape[0]
+        and src.shape[1:] == static.shape[1:]
+        and src.dtype == static.dtype
+        and src.device == static.device
+    )
+
+
+def _load_rows(static: torch.Tensor, src: torch.Tensor) -> None:
+    if src.shape[0] == static.shape[0]:
+        _load(static, src)
+    else:
+        static[: src.shape[0]].copy_(src)
+
+
+def _serves(cache, static: Pi05KVCache) -> bool:
+    """``cache`` is the captured cache or a row view of it (``Pi05KVCache.rows``)."""
+    return cache is static or (
+        isinstance(cache, Pi05KVCache)
+        and cache.batch_size <= static.batch_size
+        and cache.prefix_len == static.prefix_len
+        and cache.key.data_ptr() == static.key.data_ptr()
+        and cache.value.data_ptr() == static.value.data_ptr()
+    )
 
 
 def _rotary_matches(src, static: tuple[torch.Tensor, torch.Tensor] | None) -> bool:
@@ -153,7 +194,7 @@ class _DenoiseStepGraph:
 class Pi05CUDAGraphs:
     """Per-region CUDA Graph capture/replay for one ``Pi05ForActionPrediction``."""
 
-    def __init__(self, model: Pi05ForActionPrediction):
+    def __init__(self, model: Pi05ForActionPrediction, batch_sizes: Iterable[int] = (1,)):
         # The model owns this object through ``model.cuda_graphs``; a weak
         # reference back keeps that from forming a cycle, so dropping the model
         # frees its GPU memory immediately rather than at the next GC pass.
@@ -164,11 +205,19 @@ class Pi05CUDAGraphs:
         self._embed_prefix: _EmbedPrefixGraph | None = None
         self._prefix_forward: _PrefixForwardGraph | None = None
         self._denoise_step: _DenoiseStepGraph | None = None
+        # Batch 1 is always captured, all three regions; ``batch_sizes`` adds
+        # the formed-batch sizes the denoising step is also captured for.
+        sizes = tuple(sorted(set(batch_sizes)))
+        if any(not isinstance(size, int) or size < 1 for size in sizes):
+            raise ValueError(f"batch_sizes must be positive integers, got {sizes}.")
+        self._batch_sizes = sizes
+        self._denoise_batches: dict[int, _DenoiseStepGraph] = {}
         self.num_replays: Counter[str] = Counter()
 
     # ── Capture ──────────────────────────────────────────────────────
     def capture(self) -> None:
-        """Capture all three regions at the deployed shapes, batch size 1.
+        """Capture all three regions at the deployed shapes, batch size 1, and
+        the denoising step at every other declared batch size.
 
         Needs ``model.kv_cache``. Raises on failure: ``enforce_eager=False`` asks
         for the graph path, so a silent eager fallback would hide a slowdown.
@@ -177,6 +226,7 @@ class Pi05CUDAGraphs:
             self._capture()
         except Exception as exc:
             self._embed_prefix = self._prefix_forward = self._denoise_step = None
+            self._denoise_batches = {}
             raise RuntimeError(
                 "π0.5 CUDA Graph capture failed. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
@@ -292,8 +342,69 @@ class Pi05CUDAGraphs:
                     **denoise_kwargs,
                 )
             denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
+            denoise_batches = {
+                batch: self._capture_denoise_batch(batch, kv_cache.prefix_len, device)
+                for batch in self._batch_sizes
+                if batch > 1
+            }
 
         self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
+        self._denoise_batches = denoise_batches
+
+    def _capture_denoise_batch(self, batch: int, prefix_len: int, device: torch.device) -> _DenoiseStepGraph:
+        """Region 3 for a formed batch of ``batch`` requests, over its own KV cache.
+
+        The batch's prefix embedding and prefix forward run eagerly into that
+        cache before its steps replay. The graph gets its own memory pool:
+        batches of different sizes replay in any order, so none may share the
+        pool of another. The AdaRMS schedule table serves batch 1 only; a batch
+        embeds its timestep inside the graph.
+        """
+        model = self._model
+        kv_cache = model.new_kv_cache(batch, prefix_len)
+        # Dummy prefix K/V; only shapes and addresses are captured.
+        kv_cache.key.zero_()
+        kv_cache.value.zero_()
+        prefix_pad_masks = torch.ones(batch, prefix_len, dtype=torch.bool, device=device)
+        x_t = torch.zeros(batch, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
+        timestep = torch.ones(batch, dtype=torch.float32, device=device)
+        context = None
+        kwargs = {}
+        if self._runtime_options.hoist_denoise_invariants:
+            context = model.prepare_denoise_context(prefix_pad_masks)
+            kwargs["context"] = context
+
+        def step():
+            return model.denoise_step(
+                prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep, **kwargs
+            )
+
+        step()  # eager warmup, outside capture
+        torch.accelerator.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+            v_t = step()
+        return _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context)
+
+    def kv_cache_for(self, batch_size: int, prefix_len: int) -> Pi05KVCache | None:
+        """The KV cache a formed batch of ``batch_size`` requests runs over: the
+        cache of the denoising graph that serves the size (the first rows of it
+        when the batch is smaller), or None when no graph does. Batch 1 runs
+        over ``model.kv_cache``."""
+        g = None if batch_size == 1 else self._denoise_graph(batch_size)
+        if g is None or not g.kv_cache.fits(g.kv_cache.batch_size, prefix_len):
+            return None
+        return g.kv_cache if g.kv_cache.batch_size == batch_size else g.kv_cache.rows(batch_size)
+
+    def _denoise_graph(self, batch_size: int) -> _DenoiseStepGraph | None:
+        """The graph that serves ``batch_size``: its own, else the smallest larger one."""
+        if batch_size == 1:
+            return self._denoise_step
+        g = self._denoise_batches.get(batch_size)
+        if g is None:
+            larger = [size for size in self._denoise_batches if size > batch_size]
+            g = self._denoise_batches[min(larger)] if larger else None
+        return g
 
     # ── Region 1: prefix embedding ───────────────────────────────────
     def embed_prefix(
@@ -396,22 +507,22 @@ class Pi05CUDAGraphs:
 
         ``sample_actions`` owns the request context and calls this before its
         denoising loop. The returned static context is valid until the next
-        request prepares it; graph buffers do not support concurrent requests.
-        An incompatible context stays request-local and uses eager denoising.
+        request of its batch size prepares it; graph buffers do not support
+        concurrent requests. An incompatible context stays request-local and
+        uses eager denoising.
         """
-        g = self._denoise_step
+        g = self._denoise_graph(context.attention_mask.shape[0]) if isinstance(context, Pi05DenoiseContext) else None
         if g is None or g.context is None:
             return context
         tensors = ("attention_mask", "position_ids", "cos", "sin")
         if not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
-            and isinstance(context, Pi05DenoiseContext)
-            and all(_matches(getattr(context, name), getattr(g.context, name)) for name in tensors)
+            and all(_matches_rows(getattr(context, name), getattr(g.context, name)) for name in tensors)
         ):
             logger.warning_once("π0.5 denoising context differs from the captured one; it runs eagerly.")
             return context
         for name in tensors:
-            _load(getattr(g.context, name), getattr(context, name))
+            _load_rows(getattr(g.context, name), getattr(context, name))
         self.num_replays["prepare_denoise_context"] += 1
         return g.context
 
@@ -425,13 +536,13 @@ class Pi05CUDAGraphs:
         context: Pi05DenoiseContext | None = None,
         step_data: Pi05DenoiseStepData | None = None,
     ) -> torch.Tensor:
-        g = self._denoise_step
+        g = self._denoise_graph(x_t.shape[0])
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
-            and past_key_values is g.kv_cache
-            and _matches(prefix_pad_masks, g.prefix_pad_masks)
-            and _matches(x_t, g.x_t)
-            and _matches(timestep, g.timestep)
+            and _serves(past_key_values, g.kv_cache)
+            and _matches_rows(prefix_pad_masks, g.prefix_pad_masks)
+            and _matches_rows(x_t, g.x_t)
+            and _matches_rows(timestep, g.timestep)
             and context is g.context
             and _step_data_matches(step_data, g.step_data)
         ):
@@ -439,7 +550,8 @@ class Pi05CUDAGraphs:
             g = None
         if g is None:
             kwargs = {}
-            if context is not None:
+            # A static context prepared for a larger graph does not fit the eager call.
+            if context is not None and context.attention_mask.shape[0] == x_t.shape[0]:
                 kwargs["context"] = context
             if step_data is not None:
                 kwargs["step_data"] = step_data
@@ -452,9 +564,9 @@ class Pi05CUDAGraphs:
             )
 
         if g.context is None:
-            _load(g.prefix_pad_masks, prefix_pad_masks)
-        _load(g.x_t, x_t)
-        _load(g.timestep, timestep)
+            _load_rows(g.prefix_pad_masks, prefix_pad_masks)
+        _load_rows(g.x_t, x_t)
+        _load_rows(g.timestep, timestep)
         if g.step_data is not None:
             # ``modulations`` contains every layer's input/post-attention norm
             # and final norm in one tensor: one copy, not a copy per layer.
@@ -462,4 +574,4 @@ class Pi05CUDAGraphs:
             _load(g.step_data.modulations, step_data.modulations)
         g.graph.replay()
         self.num_replays["denoise_step"] += 1
-        return g.v_t
+        return g.v_t if x_t.shape[0] == g.v_t.shape[0] else g.v_t[: x_t.shape[0]]

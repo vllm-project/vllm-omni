@@ -122,6 +122,20 @@ def _set_inference_dtype(model: Pi05ForActionPrediction, dtype: torch.dtype) -> 
         raise ValueError(f"Unsupported π0.5 inference dtype: {dtype!r}.")
 
 
+def graph_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
+    """The batch sizes the denoising step is captured for: 1, every power of
+    two below ``max_num_seqs``, and ``max_num_seqs`` itself. Each size holds a
+    KV cache of its own, so every size up to a large ``max_num_seqs`` would not
+    fit; a batch of an undeclared size runs its steps without a graph."""
+    max_num_seqs = max(1, int(max_num_seqs))
+    sizes = {1, max_num_seqs}
+    size = 2
+    while size < max_num_seqs:
+        sizes.add(size)
+        size *= 2
+    return tuple(sorted(sizes))
+
+
 class Pi05Pipeline(nn.Module):
     """π0.5 VLA pipeline: raw robot obs → continuous action chunk.
 
@@ -313,14 +327,18 @@ class Pi05Pipeline(nn.Module):
                 "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
             ) from exc
-        graphs = Pi05CUDAGraphs(self.model)
+        batch_sizes = graph_batch_sizes(getattr(od_config, "max_num_seqs", 1))
+        graphs = Pi05CUDAGraphs(self.model, batch_sizes=batch_sizes)
         start = time.perf_counter()
+        allocated = torch.accelerator.memory_allocated()
         graphs.capture()
         self.model.cuda_graphs = graphs
         logger.info(
-            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s; "
-            "sample_actions runs its optimized path.",
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s "
+            "(denoising step at batch sizes %s, %.2f GB); sample_actions runs its optimized path.",
             time.perf_counter() - start,
+            list(batch_sizes),
+            (torch.accelerator.memory_allocated() - allocated) / 2**30,
         )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:

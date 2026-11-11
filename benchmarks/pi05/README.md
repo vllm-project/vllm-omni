@@ -93,8 +93,10 @@ python benchmarks/pi05/bench_batch_pi05.py --mode graph --vision-precision selec
 python benchmarks/pi05/bench_batch_pi05.py --report pi05_stages/ --out-md pi05_stages/report.md
 ```
 
-`--all4` turns on the four opt-in runtime switches above. A batch size the optimized path has no CUDA graph for
-is reported as such rather than timed on its eager fallback.
+`--all4` turns on the four opt-in runtime switches above. The optimized path captures the denoising step for
+batch sizes 1, the powers of two below the largest `--batches` value, and that value; a batch size between two
+of them runs the denoising step on the next larger graph. A batch size the optimized path has no CUDA graph
+for is reported as such rather than timed on its eager fallback.
 
 ## Reference results
 

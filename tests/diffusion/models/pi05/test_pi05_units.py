@@ -587,6 +587,90 @@ def test_p0_graph_kv_only_capture_preserves_general_forward_fallback():
     assert kv[0] is None and graphs.num_replays["prefix_forward"] == 1
 
 
+def test_graph_batch_sizes_are_the_powers_of_two_up_to_max_num_seqs():
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import graph_batch_sizes
+
+    assert graph_batch_sizes(1) == (1,)
+    assert graph_batch_sizes(4) == (1, 2, 4)
+    assert graph_batch_sizes(6) == (1, 2, 4, 6)
+    assert graph_batch_sizes(32) == (1, 2, 4, 8, 16, 32)
+    assert graph_batch_sizes(0) == (1,)
+
+
+def _tiny_kv_cache(batch_size: int, prefix_len: int = 3) -> modeling_pi05.Pi05KVCache:
+    return modeling_pi05.Pi05KVCache(
+        num_layers=2,
+        batch_size=batch_size,
+        num_kv_heads=1,
+        prefix_len=prefix_len,
+        suffix_len=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
+def test_kv_cache_rows_is_a_view_of_the_first_requests():
+    cache = _tiny_kv_cache(4)
+    cache.key.zero_()
+    cache.value.zero_()
+    view = cache.rows(3)
+    assert view.fits(3, 3) and view.key.shape == (2, 3, 1, 5, 4) and view.key.data_ptr() == cache.key.data_ptr()
+    view.write_prefix(1, torch.ones(3, 1, 3, 4), torch.full((3, 1, 3, 4), 2.0))
+    assert torch.equal(cache.key[1, :3, 0, :3], torch.ones(3, 3, 4)) and cache.key[1, 3].abs().sum() == 0
+    assert torch.equal(cache.value[1, :3, 0, :3], torch.full((3, 3, 4), 2.0))
+    key, _ = view.write_suffix(0, torch.full((3, 1, 2, 4), 3.0), torch.full((3, 1, 2, 4), 4.0))
+    assert key.shape == (3, 1, 5, 4) and torch.equal(cache.key[0, :3, 0, 3:], torch.full((3, 2, 4), 3.0))
+    for bad in (0, 5):
+        with pytest.raises(ValueError):
+            cache.rows(bad)
+
+
+def test_batched_denoise_graph_serves_its_size_and_pads_smaller_batches():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import cuda_graph_pi05 as adapter
+
+    model = _P0GraphAdapterModel(Pi05RuntimeOptions())
+    with pytest.raises(ValueError):
+        Pi05CUDAGraphs(model, batch_sizes=(1, 0))
+    graphs = Pi05CUDAGraphs(model, batch_sizes=(4, 1))
+    cache = _tiny_kv_cache(4)
+    mask, actions, timestep = torch.ones(4, 3, dtype=torch.bool), torch.zeros(4, 2, 2), torch.ones(4)
+    output = torch.zeros(4)
+    static = adapter._DenoiseStepGraph(
+        SimpleNamespace(replay=lambda: output.copy_(static.x_t.sum(dim=(1, 2)) + 7)),
+        mask.clone(),
+        cache,
+        actions.clone(),
+        timestep.clone(),
+        output,
+    )
+    graphs._denoise_batches[4] = static
+    assert graphs.kv_cache_for(4, 3) is cache
+    assert graphs.kv_cache_for(4, 5) is None and graphs.kv_cache_for(1, 3) is None and graphs.kv_cache_for(5, 3) is None
+    view = graphs.kv_cache_for(3, 3)
+    assert view is not cache and view.batch_size == 3 and view.key.data_ptr() == cache.key.data_ptr()
+
+    result = graphs.denoise_step(mask, cache, actions, timestep)
+    assert result is output and result.tolist() == [7.0] * 4 and graphs.num_replays["denoise_step"] == 1
+    # Three rows run on the batch-4 graph: only their rows are loaded and returned.
+    result = graphs.denoise_step(mask[:3], view, torch.ones(3, 2, 2), timestep[:3])
+    assert result.shape == (3,) and result.tolist() == [11.0] * 3 and graphs.num_replays["denoise_step"] == 2
+    assert static.x_t[3].abs().sum() == 0 and output[3].item() == 7.0
+    # A row view of another cache, a batch above the graph's size, and batch 1
+    # without its graph fall back to the model.
+    other = _tiny_kv_cache(4).rows(3)
+    assert graphs.denoise_step(mask[:3], other, actions[:3], timestep[:3]).item() == -999
+    assert (
+        graphs.denoise_step(torch.ones(5, 3, dtype=torch.bool), cache, torch.zeros(5, 2, 2), torch.ones(5)).item()
+        == -999
+    )
+    assert graphs.denoise_step(mask[:1], cache, actions[:1], timestep[:1]).item() == -999
+    assert [call[0] for call in model.calls] == ["denoise"] * 3
+    assert graphs.num_replays["denoise_step"] == 2
+
+
 # ----------------------------------------------------------------------------
 # Pi05Config dataclass + checkpoint resolver
 # ----------------------------------------------------------------------------
