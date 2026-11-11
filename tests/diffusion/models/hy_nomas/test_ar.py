@@ -817,6 +817,7 @@ def test_archive_limit_reclaims_session_and_allows_fresh_generation(recent_runne
     np.testing.assert_array_equal(execute(runner, batch()).output["payload"]["video"], expected)
     runner.close_session("s")
 
+
 @pytest.mark.parametrize("limit", ["history_archive_max_bytes", "history_archive_max_frames"])
 def test_archive_client_error_response_reclaims_runner_session(recent_runner, monkeypatch, limit):
     from vllm_omni.diffusion.data import DiffusionOutput
