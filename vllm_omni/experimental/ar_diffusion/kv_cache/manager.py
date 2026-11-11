@@ -318,10 +318,17 @@ class ARDiffusionKVCache:
         blocks_per_frame = -(-config.chunk_size // block_size)
         self.blocks_per_frame = blocks_per_frame
         minimum_scratch_blocks = self.frames_per_block * blocks_per_frame + declared_scratch_blocks
-        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
-        override_blocks = int(override) if override is not None else 0
-        if override_blocks < 0:
-            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+        override_blocks = config.scratch_blocks_per_branch
+        if override_blocks is None:
+            override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+            override_blocks = int(override) if override is not None else 0
+            if override_blocks < 0:
+                raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+            if override is not None:
+                _log.warning_once(
+                    "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH is deprecated and will be removed in a future "
+                    "release. Set ar_diffusion_kv_config.scratch_blocks_per_branch instead."
+                )
         scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
         if segmented is not None:
             # Segmented attention writes live rows into contiguous staging;
@@ -889,7 +896,7 @@ class ARDiffusionKVCache:
                 "AR-Diffusion paged attention scratch blocks exhausted: "
                 f"need [{start}, {start + count}) of {self.scratch_blocks_per_kv_branch}. "
                 "Declare max_scratch_tokens_per_branch in the pipeline capability "
-                "or increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
+                "or increase ar_diffusion_kv_config.scratch_blocks_per_branch."
             )
         kv_branch_offset = self.scratch_blocks_per_kv_branch * self._kv_branch_index(kv_branch)
         base = self.managed_num_blocks + kv_branch_offset + start
