@@ -56,6 +56,7 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
 )
 from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import get_tokenizer_worker
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -805,7 +806,8 @@ class MiMoAudioForConditionalGeneration(
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
-                    "model_outputs": audio_result.reshape(1, -1) if audio_result is not None else audio_result
+                    "model_outputs": audio_result.reshape(1, -1) if audio_result is not None else audio_result,
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.token2wav.sample_rate),
                 },
             )
 

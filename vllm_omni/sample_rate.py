@@ -3,12 +3,13 @@
 
 """Canonical audio sampling-rate key and model-output payload resolution.
 
-Single source of truth for reading the rate audio models must emit
-alongside their waveform. Producers use ``SAMPLE_RATE_KEY`` ("sr");
-consumers read it with :func:`get_sampling_rate`. Legacy spellings still
-resolve but warn (removed in 0.36). :func:`find_sample_rate` is the
-separate lenient, warning-free scan for config objects. Deliberately a
-leaf module (stdlib + torch only) to avoid import cycles.
+Single source of truth for the rate audio models must emit alongside
+their waveform. Producers build payloads with ``SAMPLE_RATE_KEY`` ("sr")
+via :func:`make_sample_rate_tensors`; consumers read with
+:func:`get_sampling_rate`. Legacy spellings still resolve but warn
+(removed in 0.36). :func:`find_sample_rate` is the separate lenient,
+warning-free scan for config objects. Deliberately a leaf module
+(stdlib + torch only) to avoid import cycles.
 """
 
 from __future__ import annotations
@@ -235,6 +236,29 @@ def _coerce_strict(value: object, source: str) -> int:
             raise InvalidSampleRateError(f"audio sample rate from {source!r} could not be unpacked: {exc}") from exc
         return _coerce_strict(unpacked, source)
     raise InvalidSampleRateError(f"audio sample rate from {source!r} must be an integer, got {type(value).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Producer helper
+# ---------------------------------------------------------------------------
+
+
+def make_sample_rate_tensors(sample_rate: int, num_requests: int = 1) -> list[torch.Tensor]:
+    """Build the canonical ``SAMPLE_RATE_KEY`` payload value for producers.
+
+    Returns one 0-d ``torch.int32`` tensor per request, parallel to the
+    per-request ``model_outputs`` list that audio-emitting stages already
+    produce. Single-request stages pass a length-1 list; consumers read
+    either shape via :func:`get_sampling_rate`.
+
+    The rate is validated here so a misconfigured model fails at emission
+    rather than at the first consumer.
+    """
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise InvalidSampleRateError(f"audio sample rate must be a positive integer, got {sample_rate!r}")
+    if num_requests < 1:
+        raise ValueError(f"num_requests must be at least 1, got {num_requests}")
+    return [torch.tensor(sample_rate, dtype=torch.int32) for _ in range(num_requests)]
 
 
 # ---------------------------------------------------------------------------

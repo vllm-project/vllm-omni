@@ -27,6 +27,10 @@ def _bare_model(stage: str) -> Qwen2_5OmniForConditionalGeneration:
     model = object.__new__(Qwen2_5OmniForConditionalGeneration)
     nn.Module.__init__(model)
     model.model_stage = stage
+    if stage == "code2wav":
+        # forward resolves the emission sample rate from this attribute;
+        # the real __init__ always sets it, only test stubs need this.
+        model.token2wav_config = None
     return model
 
 
