@@ -94,9 +94,15 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
 )
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+    from vllm.v1.worker.gpu.sample.sampler import Sampler as MRv2Sampler
+
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
+    from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
 
@@ -2075,6 +2081,24 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     #   2. _ConditionalSliceVocabLogitsProcessor — after <img_size_*>,
     #      restrict vocab to ratio tokens only (greedy).
     # ------------------------------------------------------------------
+
+    def create_omni_model_state(
+        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
+    ) -> "OmniModelState":
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.hunyuan_image3_model_state import NPUHunyuanImage3ModelState
+
+            return NPUHunyuanImage3ModelState(vllm_config, self, encoder_cache, device)
+        return OmniModelState(vllm_config, self, encoder_cache, device)
+
+    def mrv2_custom_sampler(self, sampler: "MRv2Sampler") -> tuple["HunyuanImage3ARSampler", None]:
+        from vllm_omni.model_executor.models.hunyuan_image3.ar_sampler import HunyuanImage3ARSampler
+
+        if self.vllm_config.speculative_config is not None:
+            raise NotImplementedError("HunyuanImage3 AR on MRv2 requires speculative decoding to be disabled")
+        return HunyuanImage3ARSampler(sampler, self), None
 
     def sample(
         self,

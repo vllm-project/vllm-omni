@@ -24,6 +24,28 @@ from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("num_tokens", "max_num_reqs", "max_model_len", "expected_tokens"),
+    [
+        (32768, 1, 22800, 22800),
+        (32768, 2, 22800, 32768),
+        (32768, 2, 8192, 16384),
+        (16384, 2, 8192, 16384),
+        (1, 1, 22800, 1),
+    ],
+)
+def test_dummy_run_respects_context_capacity(mocker, num_tokens, max_num_reqs, max_model_len, expected_tokens):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.max_num_reqs = max_num_reqs
+    runner.max_model_len = max_model_len
+    parent_run = mocker.patch.object(
+        omni_ar_model_runner.OmniGPUModelRunner, "_dummy_run", return_value=mocker.sentinel.outputs
+    )
+    assert runner._dummy_run(num_tokens, skip_attn=False, context_len=0) is mocker.sentinel.outputs
+    parent_run.assert_called_once_with(expected_tokens, skip_attn=False, context_len=0)
+
+
 class _FakeStream:
     def wait_stream(self, _stream) -> None:
         pass

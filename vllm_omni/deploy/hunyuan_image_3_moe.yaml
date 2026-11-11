@@ -72,9 +72,15 @@ stages:
       guidance_scale: 0
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        model_runner: v2
+
   npu:
     stages:
       - stage_id: 0
+        model_runner: v2
         gpu_memory_utilization: 0.8
         devices: "0,1,2,3"
         tensor_parallel_size: 4

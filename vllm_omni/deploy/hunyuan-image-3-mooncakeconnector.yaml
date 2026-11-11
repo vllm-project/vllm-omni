@@ -74,3 +74,13 @@ stages:
 edges:
   - from: 0
     to: 1
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        model_runner: v2
+  npu:
+    stages:
+      - stage_id: 0
+        model_runner: v2
