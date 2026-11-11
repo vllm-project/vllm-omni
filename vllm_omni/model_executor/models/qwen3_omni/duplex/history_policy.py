@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import json
 import math
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
+from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import QwenVisualHistory, VisualWork
 
 Message = Mapping[str, object]
@@ -112,18 +113,6 @@ def has_audio(message: Message) -> bool:
     )
 
 
-def source_digest(history: Sequence[Message]) -> str:
-    """Include media identity as well as text: two empty audio items differ."""
-    digest = hashlib.sha256()
-    for message in history:
-        content = message.get("content")
-        digest.update(json.dumps(dict(message), sort_keys=True, ensure_ascii=False).encode())
-        if has_audio(message):
-            digest.update(str(id(content)).encode())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
 def turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
     """Return ordered half-open turns, keeping consecutive user items together."""
     starts = []
@@ -157,7 +146,7 @@ class HistoryFold:
     """Unpublished memory for a source prefix that still needs more excerpts."""
 
     end: int
-    digest: str
+    sources: tuple[DuplexSourceRef, ...]
     offset: int
     text: str
 
@@ -168,9 +157,10 @@ class HistoryWork:
 
     start: int
     end: int
-    digest: str
+    sources: tuple[DuplexSourceRef, ...]
     generation: int
     previous_summary: str
+    previous_node_id: int | None
     previous_partial: HistoryFold | None = None
     end_offset: int | None = None
     complete: bool = True
@@ -185,9 +175,12 @@ class QwenHistoryState:
     including on cancellation; it must not be cleared while that worker runs.
     """
 
-    summary: str = ""
+    summary_node_id: int | None = None
+    snapshot: DuplexHistorySnapshot | None = None
+    ledger: DuplexContextLedger | None = None
+    sources: tuple[DuplexSourceRef, ...] = ()
     processed: int = 0
-    processed_digest: str = ""
+    processed_sources: tuple[DuplexSourceRef, ...] = ()
     generation: int = 0
     audio: list[RetainedAudio] = field(default_factory=list)
     # A borrowed Session view, not another accumulated transcript.
@@ -201,32 +194,52 @@ class QwenHistoryState:
     partial: HistoryFold | None = None
     visual: QwenVisualHistory = field(default_factory=QwenVisualHistory)
 
-    def reconcile(self, history: Sequence[Message]) -> None:
-        """Bind effective history and invalidate memory whose prefix was edited.
+    @property
+    def summary(self) -> str:
+        """Read published memory from Session authority, never a second store."""
+        node = self.ledger.get(self.summary_node_id) if self.ledger and self.summary_node_id is not None else None
+        return str(node.message["content"]) if node is not None else ""
 
-        Caller must use current Session records, including playback truncation.
-        This scans history; unchanged stream events use the policy cache instead.
+    def bind_context(self, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger) -> None:
+        """Bind authority refreshed by the Session owner before plugin hooks."""
+        if self.ledger is not None and self.ledger is not ledger:
+            raise ValueError("Qwen history state cannot move between Session ledgers")
+        if self.snapshot is not snapshot:
+            self.sources = source_refs(snapshot, *snapshot.source_ids)
+        self.snapshot, self.ledger = snapshot, ledger
+        if (self.summary_node_id is not None and not ledger.valid(self.summary_node_id)) or any(
+            not ledger.valid(node) for node in self.visual.nodes.values()
+        ):
+            self.policy_cache_key = None
+
+    def reconcile(self, history: Sequence[Message]) -> None:
+        """Update Qwen progress using public source IDs and revisions.
+
+        The separate shallow message view preserves retained PCM bindings.
+        Source validity comes from the snapshot bound on the same owner loop.
         """
+        if self.snapshot is None or self.ledger is None or len(history) != len(self.sources):
+            raise RuntimeError("Bind the current Session history context before Qwen history hooks")
         self.policy_cache_key = None
         self.cached_work = None
-        if self.processed and (
-            len(history) < self.processed or source_digest(history[: self.processed]) != self.processed_digest
+        if (self.processed and self.sources[: self.processed] != self.processed_sources) or (
+            self.summary_node_id is not None and not self.ledger.valid(self.summary_node_id)
         ):
-            self.summary = ""
+            if self.summary_node_id is not None:
+                self.ledger.remove(self.summary_node_id)
+            self.summary_node_id = None
             self.processed = 0
-            self.processed_digest = ""
+            self.processed_sources = ()
             self.generation += 1
             self.omissions.clear()
             self.partial = None
             self.counts["invalidations"] += 1
-        if self.partial is not None and (
-            len(history) < self.partial.end or source_digest(history[: self.partial.end]) != self.partial.digest
-        ):
+        if self.partial is not None and self.sources[: self.partial.end] != self.partial.sources:
             self.partial = None
             self.generation += 1
             self.counts["partial_invalidations"] += 1
         self.history = tuple(history)
-        self.visual.reconcile(history)
+        self.visual.reconcile(history, self.snapshot, self.ledger)
         live = {id(m.get("content")) for m in history if has_audio(m)}
         self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in live for c in a.contents)]
 
@@ -296,10 +309,11 @@ class QwenHistoryState:
         return (
             work.generation == self.generation
             and work.start == self.processed
+            and work.previous_node_id == self.summary_node_id
             and work.previous_summary == self.summary
             and work.previous_partial == self.partial
             and len(history) >= work.end
-            and source_digest(history[: work.end]) == work.digest
+            and self.sources[: work.end] == work.sources
         )
 
     def advance(self, work: HistoryWork, *, summary: str | None = None, omission: str | None = None) -> None:
@@ -311,14 +325,21 @@ class QwenHistoryState:
         if not self.matches(work, self.history):
             raise ValueError("History source changed before commit")
         if summary is not None:
-            self.summary = summary
+            assert self.ledger is not None and self.snapshot is not None
+            node = self.ledger.replace_summary(
+                self.snapshot,
+                sources=work.sources[work.start : work.end],
+                replaces=() if work.previous_node_id is None else (work.previous_node_id,),
+                message={"role": "system", "content": summary},
+            )
+            self.summary_node_id = node.node_id
             self.counts["summaries"] += 1
         if omission is not None:
             self.omissions.append((work.start, work.end, omission))
             self.counts["omissions"] += 1
         self.processed = work.end
         self.partial = None
-        self.processed_digest = work.digest
+        self.processed_sources = work.sources
         self.generation += 1
         self.policy_cache_key = None
         self.cached_work = None

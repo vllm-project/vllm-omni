@@ -11,6 +11,25 @@ clips original images without summarizing them. Both reject tool configuration. 
 records retain their existing query, deletion and playback semantics. Their
 total storage is not bounded by this feature.
 
+## Summary ownership and invalidation
+
+Published dialogue and visual summaries live in the Session's shared context
+ledger as `SUMMARY` nodes. Qwen retains its four policy hooks, token budget and
+media limits. The plugin uses the public history snapshot's source IDs and
+revisions to bind a compression request to its evidence.
+
+Before accepting a result or preparing foreground input, the Session owner
+refreshes the ledger against current history. A rolling summary inherits the
+previous summary's complete source dependencies before replacing its node.
+Corrections, deletion/recreation and playback revisions therefore invalidate
+memory even after several rolling updates. Visual merges use the same ledger
+mechanism; retiring an old visual summary also removes its node. Unfinished
+text excerpts remain private until the complete source turn is summarized.
+
+These source dependencies and original Session records can grow with a
+conversation. The policy bounds model input, published summary text and retained
+media, not total Session memory or source-validation CPU cost.
+
 ## Deployment
 
 Create an overlay outside the repository, using an absolute base path:

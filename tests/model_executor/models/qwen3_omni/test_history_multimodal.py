@@ -11,7 +11,13 @@ import pytest
 from PIL import Image
 
 from tests.model_executor.models.qwen3_omni.test_history_compression import StructuredMemoryPolicy
-from tests.model_executor.models.qwen3_omni.test_history_policy import audio_message, completion, runtime, text_history
+from tests.model_executor.models.qwen3_omni.test_history_policy import (
+    audio_message,
+    completion,
+    runtime,
+    sync_history,
+    text_history,
+)
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.visual_memory import VisualMemory
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import QwenHistoryState
@@ -39,7 +45,7 @@ def long_history():
 async def test_large_text_turn_folds_all_sources_before_publishing():
     owner, state = runtime(summary_tokens=64, recent_messages=8), QwenHistoryState()
     owner.max_model_len = 1200
-    state.reconcile(long_history())
+    sync_history(state, long_history())
     requests = []
     for _ in range(50):
         request = await owner.prepare(state)
@@ -69,7 +75,7 @@ async def test_partial_text_reject_retry_source_edit_and_late_result():
     owner, state = runtime(summary_tokens=64), QwenHistoryState()
     owner.max_model_len = 1200
     history = long_history()
-    state.reconcile(history)
+    sync_history(state, history)
     first = await owner.prepare(state)
     assert owner.apply(state, first, completion("first fold"))
     second = await owner.prepare(state)
@@ -78,10 +84,10 @@ async def test_partial_text_reject_retry_source_edit_and_late_result():
     assert state.partial == partial and state.processed == 0
     retry = await owner.prepare(state)
     assert retry.model_source.end_offset == second.model_source.end_offset
-    state.reconcile([*history, {"role": "user", "content": "another topic"}])
+    sync_history(state, [*history, {"role": "user", "content": "another topic"}])
     assert owner.source_matches(state, second.model_source)
     history[0] = {"role": "user", "content": "corrected budget 5000"}
-    state.reconcile(history)
+    sync_history(state, history)
     assert state.partial is None
     assert not owner.apply(state, second, completion("stale fold"))
 
@@ -91,7 +97,7 @@ async def test_text_fold_preserves_custom_compressor_and_parser():
     owner, state = runtime(summary_tokens=64), QwenHistoryState()
     owner.policy = StructuredMemoryPolicy()
     owner.max_model_len = 800
-    state.reconcile(long_history())
+    sync_history(state, long_history())
     request = await owner.prepare(state)
     assert "JSON object" in request.prompt["prompt"]
     assert not owner.apply(state, request, completion("invalid JSON"))
@@ -113,7 +119,7 @@ async def test_visual_frames_to_mid_to_long_and_foreground_reuse():
         {"role": "assistant", "content": "blue"},
         *text_history(4),
     ]
-    state.reconcile(history)
+    sync_history(state, history)
     assert isinstance(state.visual.memory, VisualMemory)
     for color in ("red", "blue"):
         request = await owner.prepare(state)
@@ -140,13 +146,13 @@ async def test_visual_frames_to_mid_to_long_and_foreground_reuse():
 async def test_visual_failure_retains_sources_edit_revokes_and_append_does_not():
     owner, state = runtime(recent_messages=2), QwenHistoryState()
     history = [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]
-    state.reconcile(history)
+    sync_history(state, history)
     request = await owner.prepare(state)
     assert not owner.apply(state, request, completion("", "length"))
     assert state.visual.covered == 0 and len(state.visual.memory.pending) == 1
-    state.reconcile([*history, {"role": "user", "content": "later"}])
+    sync_history(state, [*history, {"role": "user", "content": "later"}])
     assert owner.source_matches(state, request.model_source)
-    state.reconcile([image_message("blue"), *history[1:]])
+    sync_history(state, [image_message("blue"), *history[1:]])
     assert not owner.apply(state, request, completion("stale red"))
     assert state.visual.covered == 0 and not state.visual.memory.pending
     replacement = await owner.prepare(state)
@@ -158,14 +164,15 @@ async def test_visual_capacity_shrinks_batch_without_retiring_unprocessed_frames
     owner, state = runtime(summary_tokens=64, recent_messages=2), QwenHistoryState()
     owner.processor.image_tokens = 1000
     owner.max_model_len = 1800
-    state.reconcile(
+    sync_history(
+        state,
         [
             image_message(),
             {"role": "assistant", "content": "red"},
             image_message("blue"),
             {"role": "assistant", "content": "blue"},
             *text_history(4),
-        ]
+        ],
     )
     first = await owner.prepare(state)
     assert len(first.prompt["multi_modal_data"]["image"]) == 1
@@ -180,7 +187,7 @@ def test_current_mixed_audio_image_input_and_image_capacity():
     owner, state = runtime(), QwenHistoryState()
     message, payload = audio_message(0)
     message["content"].extend(image_message()["content"])
-    state.reconcile([message])
+    sync_history(state, [message])
     prompt = owner.build_foreground(owner.foreground(state, payload), {}, 128)
     assert set(prompt["multi_modal_data"]) == {"image", "audio"}
     owner.processor.image_tokens = 10000
@@ -196,7 +203,7 @@ def test_image_captions_remain_interleaved_in_foreground():
         {"type": "text", "text": "before blue"},
         *image_message("blue")["content"],
     ]
-    state.reconcile([{"role": "user", "content": content}])
+    sync_history(state, [{"role": "user", "content": content}])
     group = owner.foreground(state, {}).groups[0]
     assert group.messages[0]["content"] == [
         {"type": "text", "text": "before red"},
@@ -211,10 +218,10 @@ async def test_unfinished_text_fold_continues_after_unrelated_tail_is_deleted():
     owner, state = runtime(summary_tokens=64), QwenHistoryState()
     owner.max_model_len = 1200
     history = long_history()
-    state.reconcile(history)
+    sync_history(state, history)
     first = await owner.prepare(state)
     assert owner.apply(state, first, completion("partial"))
-    state.reconcile(history[:2])
+    sync_history(state, history[:2])
     second = await owner.prepare(state)
     assert second is not None
     assert second.model_source.end_offset > state.partial.offset
@@ -223,7 +230,7 @@ async def test_unfinished_text_fold_continues_after_unrelated_tail_is_deleted():
 @pytest.mark.asyncio
 async def test_visual_preparation_cancellation_joins_worker(monkeypatch):
     owner, state = runtime(recent_messages=2), QwenHistoryState()
-    state.reconcile([image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     entered, release = threading.Event(), threading.Event()
     original = owner._decode_visual_batch
 
@@ -250,7 +257,7 @@ async def test_visual_preparation_cancellation_joins_worker(monkeypatch):
 @pytest.mark.asyncio
 async def test_bounded_recent_uses_images_without_creating_memory():
     owner, state = runtime("bounded_recent"), QwenHistoryState()
-    state.reconcile([image_message(), {"role": "assistant", "content": "red"}, *text_history(10)])
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(10)])
     assert await owner.prepare(state) is None
     prompt = owner.build_foreground(owner.foreground(state, {}), {}, 128)
     assert len(prompt["multi_modal_data"]["image"]) == 1
@@ -305,7 +312,7 @@ async def test_visual_result_uses_session_runtime_and_releases_request():
         h.deliver(summary_output(submission.context.request_id, "red object"), stage_id=0, segment_finished=True)
         events = await h.settle()
         visual = h.runner.model_state.history_policy_state.visual
-        assert visual.covered == 1 and visual.memory.mid_term[0].text == "red object"
+        assert visual.covered == 1 and visual.resolved(visual.memory.mid_term)[0].text == "red object"
         assert not any(event.to_realtime()["type"].startswith("response.") for event in events)
         assert submission.context.request_id not in h.session.resource_request_ids()
     finally:
@@ -316,12 +323,12 @@ async def test_visual_result_uses_session_runtime_and_releases_request():
 async def test_visual_memory_is_revoked_after_published_source_is_deleted():
     owner, state = runtime(recent_messages=2, visual_mid_group=1), QwenHistoryState()
     history = [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]
-    state.reconcile(history)
+    sync_history(state, history)
     for text in ("mid red", "long red"):
         request = await owner.prepare(state)
         assert owner.apply(state, request, completion(text))
     assert state.visual.memory.long_term
-    state.reconcile(history[1:])
+    sync_history(state, history[1:])
     assert state.visual.covered == 0
     assert not state.visual.summaries()
 
@@ -329,7 +336,7 @@ async def test_visual_memory_is_revoked_after_published_source_is_deleted():
 @pytest.mark.asyncio
 async def test_visual_byte_limit_keeps_source_pending_without_omission():
     owner, state = runtime(recent_messages=2, max_visual_bytes=1), QwenHistoryState()
-    state.reconcile([image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     assert await owner.prepare(state) is None
     assert state.visual.admitted == state.visual.covered == state.processed == 0
     assert not state.omissions
@@ -343,13 +350,13 @@ async def test_visual_compression_uses_custom_builder_parser_and_reference_guard
 
     owner, state = runtime(recent_messages=2), QwenHistoryState()
     owner.policy = StructuredMemoryPolicy()
-    state.reconcile([image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
     request = await owner.prepare(state)
     assert "JSON object" in request.prompt["prompt"]
     assert not owner.apply(state, request, completion("not JSON"))
     assert state.visual.covered == 0
     assert owner.apply(state, request, completion('{"facts":["red square"]}'))
-    assert state.visual.memory.mid_term[0].text == '{"facts":["red square"]}'
+    assert state.visual.resolved(state.visual.memory.mid_term)[0].text == '{"facts":["red square"]}'
 
     class MissingImagePolicy(StructuredMemoryPolicy):
         def build_compression(self, batch, previous_memory, limits):
@@ -359,7 +366,7 @@ async def test_visual_compression_uses_custom_builder_parser_and_reference_guard
             )
 
     owner.policy = MissingImagePolicy()
-    state.reconcile([image_message("blue"), {"role": "assistant", "content": "blue"}, *text_history(4)])
+    sync_history(state, [image_message("blue"), {"role": "assistant", "content": "blue"}, *text_history(4)])
     with pytest.raises(ValueError, match="image reference"):
         await owner.prepare(state)
     assert state.visual.covered == 0

@@ -47,6 +47,8 @@ from vllm_omni.utils.speakers import (
 
 if TYPE_CHECKING:
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
 logger = init_logger(__name__)
 
@@ -372,6 +374,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self._history_runtime = QwenHistoryRuntime(policy_name, history_limits)
         self._history_configuration = (policy_name, dict(history_limits))
         self.supports_auxiliary_requests = self._history_runtime.policy is not None
+
+    @property
+    def uses_history_context(self) -> bool:
+        return self._history_runtime.policy is not None
+
+    def bind_history_context(
+        self, *, state: QwenDuplexSessionState, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        state.history_policy_state.bind_context(snapshot, ledger)
 
     def auxiliary_policy(
         self, *, state: QwenDuplexSessionState, history_revision: int, history: Sequence[Message]
@@ -969,10 +980,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         Prompt selection is performed separately by each history policy.
         """
         history = config.get("conversation", [])
-        # Formatting may read the L1 view; audio binding stays on ``history``.
-        view = config.get("conversation_view")
-        if not isinstance(view, list) or len(view) != len(history):
-            view = None
         bind_from = 0
         lengths = []
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
@@ -995,19 +1002,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # before response.create. Search only the unanswered user turn so a new
         # payload can never overwrite an earlier, already answered utterance.
         current_contents = []
-        current_turn_start = len(history)
-        if view is not None:
-            # System instructions do not answer a pending user question.
-            # Protect its media even when they follow the user item.
-            for index in range(len(history) - 1, -1, -1):
-                role = history[index].get("role")
-                if role == "assistant":
-                    break
-                if role == "user":
-                    current_turn_start = index
         if has_audio:
             # Keep payload binding on its existing trailing-user boundary;
-            # formatting protection above has a separate responsibility.
+            # prompt formatting protects current media separately.
             for index, message in reversed(list(enumerate(history))):
                 if index < bind_from or message.get("role") != "user":
                     break
@@ -1036,6 +1033,20 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def _prepare_recent_prompt_config(self, config, *, state, payload):
         current_is_in_history = self._bind_audio_history(config, state=state, payload=payload)
         history = config.get("conversation", [])
+        # Formatting may read the L1 view; audio binding stays on ``history``.
+        view = config.get("conversation_view")
+        if not isinstance(view, list) or len(view) != len(history):
+            view = None
+        current_turn_start = len(history)
+        if view is not None:
+            # System instructions do not answer a pending user question.
+            # Protect its media even when they follow the user item.
+            for index in range(len(history) - 1, -1, -1):
+                role = history[index].get("role")
+                if role == "assistant":
+                    break
+                if role == "user":
+                    current_turn_start = index
         has_audio = bool(payload.get("audio"))
         retained = state.audio_history
         # Match the official demo's unit of history: consecutive user items

@@ -8,14 +8,16 @@ invented video clock; input_image may represent a photo or an extracted frame.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from io import BytesIO
 
 import pybase64
 from PIL import Image
 from vllm.multimodal.image import open_image
 
-from vllm_omni.engine.duplex.visual_memory import VisualMemory, VisualMemorySource
+from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
+from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+from vllm_omni.engine.duplex.visual_memory import VisualMemory, VisualMemorySource, VisualSummary
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,7 @@ class VisualInput:
     message_index: int
     part_index: int
     url: str
+    source: DuplexSourceRef
 
 
 @dataclass(frozen=True)
@@ -52,16 +55,27 @@ class QwenVisualHistory:
     inputs: tuple[VisualInput, ...] = ()
     admitted: int = 0
     covered: int = 0
+    # Shared VisualMemory keeps frame/batch metadata. Published text is read
+    # exclusively from these Session ledger nodes, keyed by last frame ID.
+    nodes: dict[int, int] = field(default_factory=dict)
+    snapshot: DuplexHistorySnapshot | None = None
+    ledger: DuplexContextLedger | None = None
 
-    def reconcile(self, history: Sequence[Mapping[str, object]]) -> None:
+    def reconcile(
+        self, history: Sequence[Mapping[str, object]], snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        self.snapshot, self.ledger = snapshot, ledger
+        refs = source_refs(snapshot, *snapshot.source_ids)
         inputs = tuple(
-            VisualInput(index, part_index, part["image_url"]["url"])
+            VisualInput(index, part_index, part["image_url"]["url"], refs[index])
             for index, message in enumerate(history)
             if isinstance(message.get("content"), list)
             for part_index, part in enumerate(message["content"])
             if isinstance(part, dict) and part.get("type") == "image_url"
         )
-        if inputs[: len(self.inputs)] != self.inputs:
+        if inputs[: len(self.inputs)] != self.inputs or any(not ledger.valid(node) for node in self.nodes.values()):
+            ledger.remove(*self.nodes.values())
+            self.nodes.clear()
             self.memory.clear()
             self.admitted = self.covered = 0
         self.inputs = inputs
@@ -96,26 +110,63 @@ class QwenVisualHistory:
 
     def matches(self, work: VisualWork) -> bool:
         return (
-            work.generation == self.memory.generation
+            self.ledger is not None
+            and all(self.ledger.valid(node) for node in self.nodes.values())
+            and work.generation == self.memory.generation
             and self.inputs[: len(work.inputs)] == work.inputs
             and (self.memory.matches(work.source) if work.source is not None else self.admitted == work.start)
         )
 
+    def resolved(self, items: Sequence[VisualSummary]) -> tuple[VisualSummary, ...]:
+        """Detach ledger text for one worker; the shared store holds metadata."""
+        assert self.ledger is not None
+        result = []
+        for item in items:
+            node = self.ledger.get(self.nodes[item.last_id])
+            if node is None:
+                raise ValueError("Visual summary was invalidated before rendering")
+            result.append(replace(item, text=str(node.message["content"])))
+        return tuple(result)
+
     def summaries(self) -> tuple[str, ...]:
+        if not self.nodes:
+            return ()
         return tuple(
             f"Visual observations from source messages "
             f"{self.inputs[int(item.first_source_id)].message_index + 1}–"
             f"{self.inputs[int(item.last_source_id)].message_index + 1}:\n{item.text}"
-            for item in [*self.memory.long_term, *self.memory.mid_term]
+            for item in self.resolved([*self.memory.long_term, *self.memory.mid_term])
         )
 
     def apply(self, work: VisualWork, *, text: str, token_count: int) -> bool:
         if work.source is None or not self.matches(work):
             return False
+        assert self.ledger is not None and self.snapshot is not None
+        count = len(work.source.covered_ids)
         covered = self.covered
+        sources: tuple[DuplexSourceRef, ...] = ()
+        replaces: tuple[int, ...] = ()
         if work.source.kind == "frames":
-            covered = int(self.memory.pending[len(work.source.covered_ids) - 1].source_id) + 1
+            frames = self.memory.pending[:count]
+            sources = tuple(dict.fromkeys(self.inputs[int(frame.source_id)].source for frame in frames))
+            covered = int(frames[-1].source_id) + 1
+        else:
+            replaces = tuple(self.nodes[item.last_id] for item in self.memory.mid_term[:count])
+        # No yield between validation, shared batch advancement and publication.
+        # The owner refreshed the ledger and reconciled sources before apply.
         if not self.memory.apply(work.source, text=text, token_count=token_count):
             return False
+        node = self.ledger.replace_summary(
+            self.snapshot, sources=sources, replaces=replaces, message={"role": "system", "content": text}
+        )
+        target = self.memory.mid_term if work.source.kind == "frames" else self.memory.long_term
+        published = target[-1]
+        target[-1] = replace(published, text="")
+        # Long-memory caps and merges retire only this model's old nodes.
+        live = {item.last_id for item in [*self.memory.mid_term, *self.memory.long_term]}
+        retired = [node_id for last_id, node_id in self.nodes.items() if last_id not in live or node_id in replaces]
+        self.ledger.remove(*retired)
+        self.nodes = {last_id: node_id for last_id, node_id in self.nodes.items() if node_id not in retired}
+        self.nodes[published.last_id] = node.node_id
         self.covered = covered
         return True

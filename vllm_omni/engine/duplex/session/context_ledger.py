@@ -190,6 +190,84 @@ class DuplexContextLedger:
                     del self._media_dropped_by_source[source_id]
         return tuple(removed)
 
+    def get(self, node_id: int) -> DuplexContextNode | None:
+        """Read a node after the owner has refreshed against current history."""
+        return self._nodes.get(node_id)
+
+    def remove(self, *node_ids: int) -> tuple[int, ...]:
+        """Retire nodes and their descendants; unrelated nodes remain valid."""
+        removed = set(node_ids)
+        result = []
+        reindex: set[int] = set()
+        for node in tuple(self._nodes.values()):
+            if node.node_id not in removed and not any(parent in removed for parent in node.parents):
+                continue
+            removed.add(node.node_id)
+            result.append(node.node_id)
+            del self._nodes[node.node_id]
+            if node.level is DuplexContextLevel.MEDIA_DROPPED:
+                source_id = node.sources[0].source_id
+                if self._media_dropped_by_source.get(source_id) == node.node_id:
+                    del self._media_dropped_by_source[source_id]
+                    reindex.add(source_id)
+        # Historical admission can leave multiple L1 revisions. Keep lookup
+        # and duplicate-admission checks correct after explicitly retiring one.
+        for source_id in reindex:
+            candidates = [
+                node
+                for node in self._nodes.values()
+                if node.level is DuplexContextLevel.MEDIA_DROPPED and node.sources[0].source_id == source_id
+            ]
+            if candidates:
+                self._media_dropped_by_source[source_id] = max(
+                    candidates, key=lambda node: node.sources[0].revision
+                ).node_id
+        return tuple(result)
+
+    def replace_summary(
+        self,
+        snapshot: DuplexHistorySnapshot,
+        *,
+        sources: tuple[DuplexSourceRef, ...] = (),
+        replaces: tuple[int, ...] = (),
+        message: Mapping[str, object],
+    ) -> DuplexContextNode:
+        """Publish a rolling summary and retire its previous summary nodes.
+
+        Inherit the full source closure before removing old nodes. The new
+        node has no parent edges, so rolling updates retain source validity
+        without retaining a chain of obsolete summaries. Validation and
+        message copying finish before any mutation. Call on the owner loop
+        with its current snapshot; admission never refreshes implicitly.
+        """
+        current = _current_revisions(snapshot)
+        memo: dict[int, bool] = {}
+        for node_id in replaces:
+            node = self._nodes.get(node_id)
+            if node is None or node.level is not DuplexContextLevel.SUMMARY:
+                raise DuplexContextNodeRejectedError("replacement_is_not_a_summary")
+            if not self._valid_against(node_id, current, memo):
+                raise DuplexContextNodeRejectedError("replacement_not_valid")
+        dependencies = dict.fromkeys(sources)
+        pending = list(replaces)
+        visited: set[int] = set()
+        while pending:
+            node_id = pending.pop()
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            node = self._nodes[node_id]
+            dependencies.update(dict.fromkeys(node.sources))
+            pending.extend(node.parents)
+        node = self.add_node(
+            snapshot,
+            level=DuplexContextLevel.SUMMARY,
+            sources=tuple(dependencies),
+            message=message,
+        )
+        self.remove(*replaces)
+        return node
+
     def valid(self, node_id: int) -> bool:
         """Whether the node survived the latest refresh."""
         return node_id in self._nodes

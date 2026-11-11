@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
@@ -701,6 +703,24 @@ class DuplexModelPlugin(ABC):
 
     @abstractmethod
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
+
+    @property
+    def uses_history_context(self) -> bool:
+        """Whether this plugin consumes Session snapshots and the context ledger."""
+        return False
+
+    def bind_history_context(
+        self, *, state: DuplexModelSessionState, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        """Bind current source authority before prompt/planning/result hooks.
+
+        Opt in with ``uses_history_context``. The Session owner calls this
+        synchronously after refreshing its ledger, including immediately before
+        auxiliary source validation and writeback. Plugins may keep node IDs and
+        planning state; published derived messages belong in this ledger.
+        Snapshot containers and ledger nodes must be treated as read-only.
+        """
+        del state, snapshot, ledger
 
     def context_view_policy(
         self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig

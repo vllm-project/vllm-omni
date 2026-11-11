@@ -31,7 +31,6 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     RetainedAudio,
     has_audio,
     load_history_policy,
-    source_digest,
     turn_ranges,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import VisualWork, decode_image
@@ -353,7 +352,7 @@ class QwenHistoryRuntime:
         if start != state.processed or not start < end <= len(state.history) or end not in boundaries:
             raise ValueError("History policy selected an invalid compression range")
         return HistoryWork(
-            start, end, source_digest(state.history[:end]), state.generation, state.summary, state.partial
+            start, end, state.sources[:end], state.generation, state.summary, state.summary_node_id, state.partial
         )
 
     def _render_compression(self, group: PromptGroup, previous_memory: str) -> tuple[dict, int, float]:
@@ -472,7 +471,7 @@ class QwenHistoryRuntime:
             # Source URLs remain in model state; avoid making the runtime's
             # scheduling key another owner of the whole visual history.
             return ("visual", work.generation, work.source, work.start, work.end)
-        return (work.start, work.end, work.digest, work.generation)
+        return (work.start, work.end, work.sources, work.generation)
 
     def policy_for(
         self, state: QwenHistoryState, history: Sequence[Message], history_revision: int | None = None
@@ -575,7 +574,9 @@ class QwenHistoryRuntime:
         assert work.source is not None
         count = len(work.source.covered_ids)
         entries = tuple(
-            visual.memory.pending[:count] if work.source.kind == "frames" else visual.memory.mid_term[:count]
+            visual.memory.pending[:count]
+            if work.source.kind == "frames"
+            else visual.resolved(visual.memory.mid_term[:count])
         )
         result = await self._joined_worker(self._render_visual, work, entries)
         if result is None:
@@ -634,9 +635,10 @@ class QwenHistoryRuntime:
                 candidate = HistoryWork(
                     work.start,
                     end,
-                    source_digest(state.history[:end]),
+                    state.sources[:end],
                     work.generation,
                     work.previous_summary,
+                    work.previous_node_id,
                     work.previous_partial,
                 )
                 if candidate.end - candidate.start > self.limits.chunk_messages and len(boundaries) > 1:
@@ -697,7 +699,11 @@ class QwenHistoryRuntime:
                 if count + self.limits.summary_tokens <= self.max_model_len:
                     state.counts["planned_requests"] += 1
                     state.counts["planned_input_tokens"] += count
-                    logger.debug("Qwen history planned summary source=%s input_tokens=%d", candidate.digest, count)
+                    logger.debug(
+                        "Qwen history planned summary source=%s input_tokens=%d",
+                        (candidate.start, candidate.end),
+                        count,
+                    )
                     return DuplexAuxiliaryRequest(
                         stage_id=0,
                         prompt=prompt,
@@ -708,7 +714,7 @@ class QwenHistoryRuntime:
                             detokenize=True,
                         ),
                         history_length=candidate.end,
-                        history_digest=candidate.digest,
+                        history_digest="",
                         model_source=candidate,
                         retry_delays_s=(1.0, 3.0),
                     )
@@ -761,7 +767,7 @@ class QwenHistoryRuntime:
         assert isinstance(work, HistoryWork)
         if not work.complete:
             assert work.end_offset is not None
-            state.partial = HistoryFold(work.end, work.digest, work.end_offset, memory)
+            state.partial = HistoryFold(work.end, work.sources, work.end_offset, memory)
             state.generation += 1
             state.counts["partial_summaries"] += 1
             return True

@@ -11,6 +11,8 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
     audio_message,
     completion,
     runtime,
+    seed_summary,
+    sync_history,
     text_history,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
@@ -73,7 +75,7 @@ async def test_external_compressor_config_to_prompt_to_stored_memory():
     reference = runtime()
     owner.processor, owner.max_model_len = reference.processor, reference.max_model_len
     state = QwenHistoryState()
-    state.reconcile(text_history())
+    sync_history(state, text_history())
     request = await owner.prepare(state)
     assert "JSON object" in request.prompt["prompt"]
     assert "Maintain a durable" not in request.prompt["prompt"]
@@ -94,8 +96,8 @@ async def test_external_compressor_config_to_prompt_to_stored_memory():
 @pytest.mark.parametrize("text", ["not json", '{"facts": 1}', '{"facts": [1]}', "{}"])
 async def test_invalid_custom_output_keeps_memory_and_batch_for_retry(text):
     owner, state = runtime(__name__ + ":StructuredMemoryPolicy"), QwenHistoryState()
-    state.reconcile(text_history())
-    state.summary = '{"facts":["old fact"]}'
+    sync_history(state, text_history())
+    seed_summary(state, '{"facts":["old fact"]}')
     request = await owner.prepare(state)
     assert not owner.apply(state, request, completion(text))
     assert state.summary == '{"facts":["old fact"]}'
@@ -109,7 +111,7 @@ async def test_invalid_custom_output_keeps_memory_and_batch_for_retry(text):
 @pytest.mark.parametrize("result", [None, " ", "x" * 4096])
 async def test_parsed_memory_cannot_bypass_nonempty_or_output_limit(mocker, result):
     owner, state = runtime(summary_tokens=64), QwenHistoryState()
-    state.reconcile(text_history())
+    sync_history(state, text_history())
     request = await owner.prepare(state)
     mocker.patch.object(owner.policy, "parse_compression", return_value=result)
     assert not owner.apply(state, request, completion("short raw output"))
@@ -121,8 +123,8 @@ async def test_parsed_memory_cannot_bypass_nonempty_or_output_limit(mocker, resu
 async def test_invalid_parser_type_is_counted_and_keeps_batch_retryable(mocker, caplog, result):
     owner, state = runtime(), QwenHistoryState()
     history = text_history()
-    state.reconcile(history)
-    state.summary = "previous memory"
+    sync_history(state, history)
+    seed_summary(state, "previous memory")
     request = await owner.prepare(state)
     assert owner.policy_for(state, history, 1) is not None
     parser = mocker.patch.object(owner.policy, "parse_compression", return_value=result)
@@ -145,7 +147,7 @@ async def test_invalid_parser_type_is_counted_and_keeps_batch_retryable(mocker, 
 @pytest.mark.parametrize("failure", ["truncated", "oversize", "edited_source"])
 async def test_public_guards_reject_before_custom_parser(mocker, failure):
     owner, state = runtime(__name__ + ":StructuredMemoryPolicy", summary_tokens=64), QwenHistoryState()
-    state.reconcile(text_history())
+    sync_history(state, text_history())
     request = await owner.prepare(state)
     parse = mocker.spy(owner.policy, "parse_compression")
     output = completion('{"facts": []}')
@@ -156,7 +158,7 @@ async def test_public_guards_reject_before_custom_parser(mocker, failure):
     else:
         history = text_history()
         history[0]["content"] = "edited source"
-        state.reconcile(history)
+        sync_history(state, history)
     assert not owner.apply(state, request, output)
     parse.assert_not_called()
     assert state.processed == 0
@@ -165,7 +167,7 @@ async def test_public_guards_reject_before_custom_parser(mocker, failure):
 @pytest.mark.asyncio
 async def test_capacity_reduction_rebuilds_custom_prompt_for_actual_batch(mocker):
     owner, state = runtime(__name__ + ":StructuredMemoryPolicy", summary_tokens=64), QwenHistoryState()
-    state.reconcile(text_history())
+    sync_history(state, text_history())
     first_turn = owner.group(state, 0, 2)
     _, count, _ = owner._render_compression(first_turn, "")
     owner.max_model_len = count + owner.limits.summary_tokens
@@ -188,7 +190,7 @@ async def test_custom_prompt_cannot_drop_duplicate_or_rebind_audio(mocker, indic
         message, payload = audio_message(i)
         history.extend((message, {"role": "assistant", "content": "heard"}))
         entries.append(((message["content"],), payload))
-    state.reconcile([*history, *text_history(12)])
+    sync_history(state, [*history, *text_history(12)])
     state.retain(entries, owner.limits)
     mocker.patch.object(
         owner.policy,
@@ -205,7 +207,7 @@ async def test_custom_prompt_cannot_drop_duplicate_or_rebind_audio(mocker, indic
 async def test_compression_hook_cannot_mutate_source_messages(mocker):
     owner, state = runtime(), QwenHistoryState()
     history = text_history()
-    state.reconcile(history)
+    sync_history(state, history)
     original = owner.policy.build_compression
 
     def checked_build(batch, previous_memory, limits):

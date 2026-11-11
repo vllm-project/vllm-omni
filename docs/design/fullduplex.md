@@ -105,18 +105,46 @@ Qwen can opt into a bounded history policy through server-owned
 `bounded_recent` provides an equal-context/media-budget clipping control;
 `incremental` folds older text and original audio into a bounded text memory,
 and images into intermediate and long-term visual memories.
-Model-specific selection, source retention, prompt construction and validation
-remain in the Qwen plugin. Qwen and JoyAI share `engine/duplex/text_folding.py`
-for labeled text excerpts and `engine/duplex/visual_memory.py` for visual source
-retention and summary commits. `SessionMemoryRuntime` executes private requests
-with the Thinker as both entry and final stage.
+Model-specific selection, source retention, compression prompts and token budgets
+remain in the Qwen plugin. Published dialogue and visual summaries are `SUMMARY`
+nodes in `DuplexEngineSession.context_ledger`; the public history snapshot supplies
+their source IDs and revisions. Qwen and JoyAI share `engine/duplex/text_folding.py`
+for labeled text excerpts and `engine/duplex/visual_memory.py` for visual batching
+and retention. `SessionMemoryRuntime` executes private requests with the Thinker
+as both entry and final stage.
 
-Each Session holds `QwenDuplexSessionState.history_policy_state`. Source
-fingerprints include effective text and media identity. Deletion or playback
-changes revoke affected memory; late results cannot restore an older source.
-A missing source records an omission and does not block later work. Media
-eligibility is independent of the recent text window. Original Session records
-are retained, so this policy does not bound total Session storage.
+Each Session holds `QwenDuplexSessionState.history_policy_state`. This state keeps
+summary node IDs, selection progress, retained media and unfinished text excerpts.
+Summary text is read from the Session ledger. Qwen's visual store keeps batch
+metadata; its published text is also read from ledger nodes. Original Session
+records and source dependencies remain retained, so the bounded prompt and media
+limits do not bound total Session storage.
+
+The summary lifecycle is:
+
+1. The Session owner supplies a current snapshot and refreshed ledger through
+   `bind_history_context`. Qwen selects sources by position in that snapshot and
+   captures their public `(source_id, revision)` references.
+2. Qwen's compression policy prepares one private Thinker request. The existing
+   `SessionMemoryRuntime` handles submission, cancellation, cleanup and retry.
+3. Before applying its result, the runtime supplies the current snapshot again.
+   Qwen checks source references and its selection progress, validates the model
+   output, and publishes through `ledger.replace_summary` on the owner loop.
+4. A rolling dialogue summary inherits all dependencies of the previous summary
+   plus the new batch's sources. A long-term visual summary inherits all sources
+   of its intermediate summaries. Replaced nodes are retired after publication.
+5. Before foreground preparation, the owner refreshes the ledger against current
+   history. Qwen reads surviving nodes and applies its own selection and token
+   budget. Deletion, correction, transcript or playback revision changes revoke
+   affected summaries, including when a tighter cutoff leaves visible text equal.
+
+Replacing summaries flattens their source dependencies, so obsolete summary
+nodes do not accumulate into a parent chain. Qwen rewinds its dialogue selection
+progress after invalidation; an invalidated visual batch resets its visual plan.
+Evicting a long-term visual summary also removes its ledger node. L1 nodes remain
+independent. A missing audio source records an omission and does not block later
+work; the omitted source is not claimed as summary evidence. Media eligibility
+remains independent of the recent text window.
 
 External policies inherit `QwenHistoryPolicy` and supply four methods:
 
@@ -505,7 +533,8 @@ Epoch changes fence in-flight work independently of source validity.
 Re-leasing the same live session on resume preserves IDs and revisions;
 dropping the session drops this state. Snapshots do not imply persistence
 across process restarts. Existing prompt construction remains unchanged;
-memory or stage-view consumers can adopt the snapshot in their own changes.
+stage views and Qwen L2 memory consume these snapshots without changing Session
+history ownership.
 
 ### Derived context and per-stage views
 
@@ -526,6 +555,17 @@ a historical snapshot does not displace a newer L1 source lookup; duplicate
 L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
+
+`get(node_id)` reads a node after refresh. `remove(*node_ids)` explicitly retires
+nodes and their descendants, preserving unrelated nodes and L1 lookup indexes.
+`replace_summary(snapshot, sources=..., replaces=..., message=...)` validates new
+source references and all replaced summaries against the supplied snapshot. It
+copies the complete transitive source dependencies into the new `SUMMARY`, then
+removes the old summaries and their descendants. The new node has no parent edges,
+so retiring old summaries does not invalidate their replacement. Invalid sources,
+missing replacements, non-summary replacements or message-copy failures leave the
+ledger unchanged. This API does not refresh implicitly: the caller supplies the
+current authoritative snapshot for result acceptance.
 
 Admission detaches message dictionaries, lists and tuples from the caller while
 sharing opaque payloads. Batch admission prepares every message before writing
@@ -556,8 +596,11 @@ when rendering the view, so both come from the same capture. Policy config
 is deployment-owned; plugin request runtime state is a separate input.
 
 Qwen3-Omni opts in its Thinker stage when
-`duplex_session.context_keep_media_turns` is set (default `null`). It then
-formats older user items from the view, including mixed text/media items.
+`duplex_session.context_keep_media_turns` is set (default `null`). Its default
+`recent` policy formats older user items from the view, including mixed
+text/media items. The experimental Qwen history policies instead select original
+turns and ledger summaries using their own context and media budgets; the L1
+candidate view does not override that selection.
 Dropped images are never decoded, and a text-only view replaces old audio
 even while its payload remains in the retained audio slots. A turn whose
 audio left those slots keeps its available transcript instead of being
@@ -732,8 +775,18 @@ Requests may specify short retry delays and a cooldown for subsequent attempts;
 failures remain keyed to the same source as newer observations arrive. Background
 failures are logged on the server. Successful application allows the next
 bounded chunk to catch up without waiting for new input.
-The session's committed-history revision lets unchanged input events skip history
-snapshotting and hashing. Prefix fingerprints still validate summary writeback.
+Plugins with `uses_history_context=True` also receive
+`bind_history_context(state=..., snapshot=..., ledger=...)` before foreground
+preparation, auxiliary planning and auxiliary source validation. The owner first
+refreshes the Session ledger; validation and result application run consecutively
+on the owner loop without yielding. The hook supplies source authority while
+leaving existing model-specific auxiliary request and compression interfaces
+unchanged. Plugins that do not opt in retain their existing path.
+
+The committed-history revision lets auxiliary events reuse an unchanged snapshot.
+The ledger is still refreshed before use, and Qwen compares public source IDs and
+revisions before submission and writeback. These checks can grow with retained
+history and summary dependencies; they do not provide constant CPU or memory cost.
 The runner delegates auxiliary lifecycle and retry state to this helper through
 `DuplexSessionContext`, tracks its tasks, and dispatches completion events through
 the existing mailbox. Model plugins retain the existing policy hooks and own
