@@ -323,10 +323,10 @@ steps:
         - |
           timeout --signal=TERM --kill-after=1m 30m bash <<'PAUSE_KEEP_READY'
           set -euo pipefail
-          # Cold AITER JIT can consume the default 600-second DLO wave budget
-          # before the first execute_model returns. Keep AITER enabled while
-          # leaving the 30-minute command as the outer bound.
-          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900
+          # Cold AITER JIT has exceeded 900 seconds before the first
+          # execute_model returns. Keep AITER enabled, give the compile a
+          # 20-minute wave budget, and retain the 30-minute outer fail-close.
+          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200
           nodes=(
             "tests/diffusion/distributed/test_pause_keep_two_ranks.py::test_keep_pause_two_ranks_ack_and_rank_failure"
           )
@@ -913,7 +913,7 @@ steps:
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 30
   env:
     VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -931,7 +931,6 @@ steps:
     # the run below fails when JUnit is not exactly three tests and zero skips.
     # The inner timeout leaves five minutes for teardown verification and
     # artifact generation before the Buildkite step timeout.
-    # Grade stays NonBlocking until this selection has a green MI300 run.
     - >-
       bash .buildkite/amd/scripts/assert-pytest-collection.sh 3
       tests/entrypoints/
@@ -1014,7 +1013,7 @@ steps:
   agent_pool: mi300_2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 25
   artifact_paths:
     - artifacts/rocm-qwen3-omni-ready/**/*
@@ -1389,7 +1388,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 40
       artifact_paths:
         - "artifacts/rocm-drama3-ready/**/*"
