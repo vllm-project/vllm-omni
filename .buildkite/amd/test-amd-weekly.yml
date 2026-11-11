@@ -209,6 +209,134 @@ steps:
             fi
             (exit "$$status")
 
+      - label: "Reliability Test · minicpmo-4.5"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_minicpmo_4_5_reliability
+        artifact_paths:
+          - artifacts/rocm-minicpmo-reliability/**/*
+        commands:
+          - export ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-reliability"
+          - mkdir -p "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_minicpmo_4_5.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_1" \
+              > "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 3 ]]; then
+              echo "Expected exactly 3 MiniCPM-o 4.5 reliability nodes, found $$count." >&2
+              cat "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_minicpmo_4_5.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_1" \
+                --junitxml="$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly 3 executed MiniCPM-o 4.5 reliability tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Reliability Test · Invalid parameters · MI300 · Single-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: reliability_invalid_param_h100
+        artifact_paths:
+          - artifacts/rocm-invalid-parameters-single/**/*
+        commands:
+          - export ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-invalid-parameters-single"
+          - mkdir -p "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/invalid_param_test/ \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and H100 and cards_1" \
+              > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 76 ]]; then
+              echo "Expected exactly 76 single-GPU invalid-parameter nodes, found $$count." >&2
+              cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra tests/dfx/reliability/invalid_param_test/ \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and H100 and cards_1" \
+                --junitxml="$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 76 or skipped != 5:
+                print(
+                    f"Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
       - label: "Reliability Test · Invalid parameters · MI300 · 2-GPU"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -225,7 +353,7 @@ steps:
             pytest --collect-only -q \
               tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
               --shard-id=0 --num-shards=1 \
-              -m "slow and rocm and MI325 and cards_2" \
+              -m "slow and rocm and MI325 and H100 and cards_2" \
               > "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt")
@@ -242,7 +370,7 @@ steps:
                 pytest -s -v -ra \
                 tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and rocm and MI325 and cards_2" \
+                -m "slow and rocm and MI325 and H100 and cards_2" \
                 --junitxml="$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.log"
               exit "$${PIPESTATUS[0]}"
@@ -275,8 +403,72 @@ steps:
             fi
             (exit "$$status")
 
-  # CUDA weekly Omni H100 full_model sweeps. Only the ROCm-marked cases run
-  # here. Ming online is skipped for 4x H100, and Covo has no MI325 mark.
+      - label: "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: reliability_invalid_param_l4
+        artifact_paths:
+          - artifacts/rocm-invalid-parameters-audio/**/*
+        commands:
+          - export ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-invalid-parameters-audio"
+          - mkdir -p "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/invalid_param_test/ \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and L4 and cards_1" \
+              > "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 127 ]]; then
+              echo "Expected exactly 127 audio invalid-parameter nodes, found $$count." >&2
+              cat "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 105m \
+                pytest -s -v -ra tests/dfx/reliability/invalid_param_test/ \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and L4 and cards_1" \
+                --junitxml="$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 127 or skipped != 26:
+                print(
+                    f"Expected exactly 127 audio invalid-parameter tests with 26 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  # CUDA weekly Omni full_model sweeps. Run the ROCm-marked MiMo, Covo, Ming,
+  # and Qwen2.5 cases here; Ming online remains skipped for 4x H100.
   - group: "Omni E2E Weekly"
     steps:
       - label: "MiMo-Audio · 1-GPU"
@@ -344,6 +536,96 @@ steps:
                 )
                 raise SystemExit(5)
             ' "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Covo-Audio · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_covo_audio_function
+        artifact_paths:
+          - artifacts/rocm-covo-audio-weekly/**/*
+        commands:
+          - export ROCM_COVO_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-covo-audio-weekly"
+          - mkdir -p "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR"
+          - |
+            files=(
+              "tests/e2e/online_serving/test_covo_audio_expansion.py"
+              "tests/e2e/offline_inference/test_covo_audio_expansion.py"
+            )
+            pytest --collect-only -q "$${files[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and omni and cards_1" \
+              --run-level full_model \
+              2>&1 | tee "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 2 ]]; then
+              echo "Expected exactly two Covo-Audio ROCm nodes, found $$count." >&2
+              cat "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            expected_nodes=(
+              "tests/e2e/online_serving/test_covo_audio_expansion.py::test_audio_to_audio_001"
+              "tests/e2e/offline_inference/test_covo_audio_expansion.py::test_audio_to_audio"
+            )
+            for node in "$${expected_nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+                echo "Covo-Audio node was not collected: $$node" >&2
+                cat "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              files=(
+                "tests/e2e/online_serving/test_covo_audio_expansion.py"
+                "tests/e2e/offline_inference/test_covo_audio_expansion.py"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${files[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and omni and cards_1" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 2 or skipped != 0:
+                print(
+                    f"Expected exactly two executed Covo-Audio tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.xml"
               then
                 status=0
               else

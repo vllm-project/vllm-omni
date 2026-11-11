@@ -33,7 +33,7 @@ keeps them in pinned host memory and streams one block at a time.
 | Task | Endpoint | Inputs | Output |
 | --- | --- | --- | --- |
 | `t2i` | `POST /v1/images/generations` (JSON) | prompt | one image |
-| `edit` | `POST /v1/images/edits` (multipart) | prompt and 1–9 reference images, one `image` part each | one image |
+| `edit` | `POST /v1/images/edits` (multipart) | prompt and 1–16 reference images, one `image` part each | one image |
 
 A request with reference images is an edit; there is no task flag.
 
@@ -74,7 +74,7 @@ curl -s http://localhost:8000/v1/images/edits \
   | jq -r '.data[0].b64_json' | base64 -d > edit.png
 ```
 
-Repeat `-F image=@...` for up to nine references, in the order the prompt
+Repeat `-F image=@...` for up to 16 references, in the order the prompt
 names them.
 
 ## References
