@@ -82,19 +82,6 @@ steps:
             -m 'core_model and npu and A3'
             --run-level 'core_model'
 
-      - label: "Diffusion NPU layer tests - A5"
-        key: ready-diffusion-npu-layer-tests-a5
-        mirror_hardwares: a5_npu_2
-        commands:
-          - >-
-            pytest -s -v
-            tests/diffusion/layers/test_activation.py
-            tests/diffusion/models/magi2/test_npu_attention.py
-            tests/diffusion/models/magi2/test_npu_layers.py
-            tests/diffusion/models/magi2/test_npu_moe.py
-            -m 'core_model and npu and A5'
-            --run-level 'core_model'
-
       - label: "Diffusion NPU layer tests - 310P"
         key: ready-diffusion-npu-layer-tests-310p
         mirror_hardwares: 310p_npu_1

@@ -39,6 +39,17 @@ from vllm_omni.lora.utils import stable_lora_int_id
 logger = init_logger(__name__)
 
 
+def invalidate_denoise_graphs(reason: str) -> None:
+    """Drop captured diffusion denoise graphs that froze the previous adapter state.
+
+    Imported lazily so the shared manager does not load diffusion code at import
+    time; with no denoise graph runner in the process this is a no-op.
+    """
+    from vllm_omni.diffusion.graph import invalidate_denoise_graphs as invalidate
+
+    invalidate(reason)
+
+
 def _moe_lora_proj_names(moe_config: object | None) -> list[str]:
     """Map PEFT projection names to upstream ``[w1, w2, w3]`` order.
 
@@ -262,6 +273,7 @@ class LoRAManager:
         self._adapter_access_order.clear()
         self._pinned_adapters.clear()
         self._active_adapter_id = self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA manager closed")
 
     def _compute_supported_lora_modules(self) -> set[str]:
         """Compute supported LoRA module suffixes for this pipeline.
@@ -860,6 +872,7 @@ class LoRAManager:
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
         self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA buffers reallocated")
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -1294,6 +1307,7 @@ class LoRAManager:
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
         self._suspended_adapter_id = None
+        invalidate_denoise_graphs("LoRA layers reset")
 
     def _moe_token_lora_mapping(self) -> tuple[LoRAMapping, list[int | None]]:
         """Build a uniform token mapping for the current adapter state.
@@ -1389,6 +1403,7 @@ class LoRAManager:
             self._suspended_adapter_id = None
             self._active_adapter_id = adapter_id
             self._publish_moe_lora_context()
+            invalidate_denoise_graphs(f"LoRA adapter {adapter_id} re-armed")
             logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
@@ -1435,6 +1450,7 @@ class LoRAManager:
         # still binds slot 0; without this the MoE kernels would keep taking
         # the no-LoRA path and silently skip the expert contribution.
         self._publish_moe_lora_context()
+        invalidate_denoise_graphs(f"LoRA adapter {adapter_id} activated")
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
@@ -1449,6 +1465,7 @@ class LoRAManager:
         self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
         self._publish_moe_lora_context()
+        invalidate_denoise_graphs("LoRA adapters suspended")
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:
