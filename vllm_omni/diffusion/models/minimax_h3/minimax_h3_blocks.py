@@ -155,6 +155,9 @@ class MiniMaxH3DiTArchConfig:
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
     pdd_steps: int | None = None
+    # False for an image checkpoint without the audio input/output projections
+    # (audio_patch_proj, final_layer.audio_out); it serves no audio rows.
+    audio_enabled: bool = True
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
@@ -175,6 +178,10 @@ class MiniMaxH3DiTArchConfig:
         if "patch_size" in values:
             values["patch_size"] = tuple(values["patch_size"])
         arch = cls(**values)
+        if type(arch.audio_enabled) is not bool:
+            raise ValueError(f"audio_enabled must be a bool, got {arch.audio_enabled!r}")
+        if not arch.audio_enabled and arch.pdd_steps is not None:
+            raise ValueError("an audio-free MiniMax H3 DiT cannot use the FastH3 pdd_steps heads")
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
         return arch
