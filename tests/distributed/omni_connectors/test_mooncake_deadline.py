@@ -213,39 +213,45 @@ def test_tcp_capability_mismatch_rejects_before_native_submission(connectors):
     assert not sender.engine.calls
 
 
-def test_tcp_sender_rejects_unsupported_peer_before_native_submission(connectors):
-    sender = connectors("sender", protocol="tcp", native_tcp_proto_version=2)
+@pytest.mark.parametrize("protocol", ["tcp", "rdma"])
+@pytest.mark.parametrize("peer_capability", [1, 2])
+def test_sender_checks_tcp_completion_before_native_submission(connectors, monkeypatch, protocol, peer_capability):
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    sender = connectors("sender", protocol=protocol, native_tcp_proto_version=2)
     publish(sender)
+    key = sender._make_key("key", "0", "1")
+    sources, lengths = sender._local_buffers[key][:2]
+    expected = [ctypes.string_at(address, size) for address, size in zip(sources, lengths)]
+    # Valid, matching destinations make removing the guard reach the fake WRITE
+    # safely instead of passing via a missing-source or length-mismatch rejection.
+    destinations = [ctypes.create_string_buffer(size) for size in lengths]
+    if protocol == "rdma":
+        # Exercise the sender-side defense after passing the startup guard.
+        monkeypatch.setenv("MC_FORCE_TCP", "1")
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REQ)
     sock.setsockopt(zmq.RCVTIMEO, 2000)
     try:
         sock.connect(f"tcp://127.0.0.1:{sender.zmq_port}")
         request = module.MooncakeAgentMetadata(
-            "127.0.0.1", 1, "key@0_1", [123], [8], protocol_version=2, native_tcp_proto_version=1
+            "127.0.0.1",
+            1,
+            key,
+            [ctypes.addressof(buffer) for buffer in destinations],
+            lengths,
+            protocol_version=2,
+            native_tcp_proto_version=peer_capability,
         )
         sock.send(msgspec.msgpack.encode(request))
-        assert sock.recv() == module.TRANS_NOT_SUBMITTED
-        assert not sender.engine.calls
-    finally:
-        sock.close(linger=0)
-        ctx.term()
-
-
-def test_rdma_tcp_fallback_rejects_before_native_submission(connectors, monkeypatch):
-    sender = connectors("sender", protocol="rdma", native_tcp_proto_version=2)
-    monkeypatch.setenv("MC_FORCE_TCP", "1")
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.REQ)
-    sock.setsockopt(zmq.RCVTIMEO, 2000)
-    try:
-        sock.connect(f"tcp://127.0.0.1:{sender.zmq_port}")
-        request = module.MooncakeAgentMetadata(
-            "127.0.0.1", 1, "key@0_1", [123], [8], protocol_version=2, native_tcp_proto_version=1
-        )
-        sock.send(msgspec.msgpack.encode(request))
-        assert sock.recv() == module.TRANS_NOT_SUBMITTED
-        assert not sender.engine.calls
+        reply = sock.recv()
+        if peer_capability == 2:
+            assert reply == module.TRANS_DONE
+            assert len(sender.engine.calls) == 1
+            assert [buffer.raw for buffer in destinations] == expected
+        else:
+            assert reply == module.TRANS_NOT_SUBMITTED
+            assert not sender.engine.calls
+            assert key in sender._local_buffers
     finally:
         sock.close(linger=0)
         ctx.term()
