@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import json
+import weakref
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -850,3 +852,51 @@ def test_archive_client_error_response_reclaims_runner_session(recent_runner, mo
     actual = runner.execute_model(batch().requests[0]).output["payload"]["video"]
     np.testing.assert_array_equal(actual, expected)
     runner.close_session("s")
+
+
+def test_worker_cancellation_reclaims_committed_and_pending_archive_tensors(recent_runner):
+    from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_archive_max_bytes=1 << 20)
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = runner
+    worker._step_lora_state = {}
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+
+    def stage_pending_and_observe(archive):
+        record = archive.records[-1]
+        archive.stage(
+            record.layers,
+            record.mask,
+            frame_start=archive.frames,
+            frame_count=record.frame_count,
+            tokens_per_frame=record.tokens_per_frame,
+            segment=record.segment + 1,
+            text_tokens=record.text_tokens,
+            action_start=record.action_start,
+        )
+        return [
+            weakref.ref(tensor)
+            for chunk in archive._pending
+            for tensor in (chunk.mask, *(tensor for pair in chunk.layers for tensor in pair))
+        ]
+
+    expected = None
+    for _ in range(3):
+        video = execute(runner, batch()).output["payload"]["video"]
+        if expected is None:
+            expected = video.copy()
+        np.testing.assert_array_equal(video, expected)
+        archive = runner.pipeline._ar_sessions["s"].history_archive
+        refs = stage_pending_and_observe(archive)
+        # The last held request may never see another scheduling wave.
+        worker.release_step_requests(["s"])
+        worker.release_step_requests(["s"])
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+        assert archive.records == () and archive.frames == archive.payload_bytes == 0
+        with pytest.raises(RuntimeError, match="no pending"):
+            archive.publish()
+        assert not runner._sessions and not runner.pipeline._ar_sessions
+        assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
