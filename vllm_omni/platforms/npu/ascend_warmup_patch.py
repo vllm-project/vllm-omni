@@ -170,33 +170,35 @@ def _apply_contiguous_kv_patch() -> None:
     import_errors: list[str] = []
     runner_module = None
     for candidate in (
+        # The transplant lands on a *consumer module's* from-import binding, so the
+        # target tracks the runner generation: v1's model runner, the pre-0.33
+        # legacy name, and v2's attention utils (verified in the nightly images:
+        # nightly-main ships only the v2 consumer, 0.32.0rc-a3 ships v1 + v2).
         "vllm_ascend.worker.v1.model_runner",
         "vllm_ascend.worker.model_runner_v1",
+        "vllm_ascend.worker.v2.attn_utils",
     ):
         try:
-            runner_module = importlib.import_module(candidate)
-            break
+            module = importlib.import_module(candidate)
         except Exception as error:  # pragma: no cover - non-ascend builds
             import_errors.append(f"{candidate}: {error}")
+            continue
+        if not hasattr(module, "requires_contiguous_pa_kv_cache"):
+            import_errors.append(f"{candidate}: no requires_contiguous_pa_kv_cache")
+            continue
+        runner_module = module
+        break
 
     if runner_module is None:
         logger.error(
-            "[npu] contiguous KV patch NOT applied: no vllm-ascend model-runner module could be "
-            "imported (%s). The KV cache stays strided, and the one-query FIA graph pays for the "
-            "stride indirection on every frame.",
+            "[npu] contiguous KV patch NOT applied: no vllm-ascend consumer module exposes "
+            "requires_contiguous_pa_kv_cache (%s). The KV cache stays strided, and the one-query "
+            "FIA graph pays for the stride indirection on every frame.",
             "; ".join(import_errors),
         )
         return
 
-    original = getattr(runner_module, "requires_contiguous_pa_kv_cache", None)
-    if original is None:
-        logger.error(
-            "[npu] contiguous KV patch NOT applied: %s does not export "
-            "requires_contiguous_pa_kv_cache. The KV cache stays strided, and the one-query FIA "
-            "graph pays for the stride indirection on every frame.",
-            runner_module.__name__,
-        )
-        return
+    original = runner_module.requires_contiguous_pa_kv_cache
     if getattr(original, "_vllm_omni_contiguous", False):
         return
 
