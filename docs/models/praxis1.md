@@ -31,30 +31,17 @@ the paths.
   text_encoder/      # Qwen/Qwen3.5-2B snapshot
 ```
 
-Pass the local directory to Omni with a deployment that selects the
-pipeline. A minimal deployment runs one stage on one GPU; the same file works
-for the DROID and the YAM checkpoint:
-
-```yaml
-# praxis1-deploy.yaml
-async_chunk: false
-dtype: bfloat16
-stages:
-  - stage_id: 0
-    devices: "0"
-    max_num_seqs: 1
-    enforce_eager: true
-    model_class_name: Praxis1Pipeline
-    model_config:
-      max_context_chunks: 1
-```
+Pass the local directory to Omni with the matching deployment:
 
 ```bash
 vllm serve /path/to/praxis-1-droid --omni --served-model-name praxis-1 \
-  --deploy-config praxis1-deploy.yaml --stage-init-timeout 1800
+  --deploy-config vllm_omni/deploy/praxis1.yaml --stage-init-timeout 1800
 ```
 
-The
+Use `vllm_omni/deploy/praxis1_yam.yaml` for the YAM checkpoint. Both files
+carry the `policy_server_config` handshake that the robot-policy servers
+advertise to clients; the worker refuses a handshake that does not match the
+checkpoint. The
 [recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1-H100.md)
 has a runnable `Omni.generate` example. Offline requests pass `robot_obs` and a nonempty `session_id` in
 `OmniDiffusionSamplingParams.extra_args`; reuse the id for continuation,
@@ -165,7 +152,10 @@ The port is checked at three levels. Commands are in the
    WebSocket API, are the qualification that matters. Results are recorded in
    the recipe.
 
-Weight-free CPU and GPU tests cover the config contract, masks,
+The checkpoint-gated tests in `tests/e2e/offline_inference/test_praxis1.py`
+cover cold start, continuation through depth 3, video diagnostics and reset,
+and guard against gross regressions with a loose bound against reference
+actions. Weight-free CPU and GPU tests cover the config contract, masks,
 rotary tables, the sampler, weight mapping, observation processing and the
 worker's session lifecycle.
 

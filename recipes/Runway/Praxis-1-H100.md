@@ -24,7 +24,7 @@ and minimum-memory configurations are not qualified here.
 | Canvas | two 224x416 tiles (224x832) | three 256x416 tiles (256x1248) |
 | Targets | float32 `(T, 13)`: xyz, R_flat9, gripper | float32 `(T, 26)`: left arm then right arm |
 | Horizon | 21 cold-start targets, then 24 with history | same |
-| Deployment | `praxis1-deploy.yaml` from the [model guide](../../docs/models/praxis1.md#usage) | same file |
+| Deployment | `vllm_omni/deploy/praxis1.yaml` | `vllm_omni/deploy/praxis1_yam.yaml` |
 
 See the [model guide](../../docs/models/praxis1.md) for observation keys, pose
 frames, settings and the episode lifecycle.
@@ -32,6 +32,7 @@ frames, settings and the episode lifecycle.
 ## References
 
 - Reference implementation: [runwayml/praxis-1-oss](https://github.com/runwayml/praxis-1-oss), revision `3219e555fc05b2d5d8e77650f4c266f9e8fd7ebc` (simulation suites and the comparison runs below).
+- Deployments: [praxis1.yaml](../../vllm_omni/deploy/praxis1.yaml), [praxis1_yam.yaml](../../vllm_omni/deploy/praxis1_yam.yaml).
 - Protocol guide: [OpenPI API](../../docs/serving/openpi_api.md). The Positronic session API is documented with its serving PR.
 - No model-specific example: offline requests use the generic `Omni.generate` call shown below.
 
@@ -72,12 +73,6 @@ Use `runwayml/praxis-1-yam` and `PRAXIS_YAM_CHECKPOINT` for the two-arm rig.
 Optional text-encoder kernels: `uv pip install flash-linear-attention` and
 `uv pip install --no-build-isolation causal-conv1d`.
 
-### Deployment
-
-Write the minimal single-stage deployment from the
-[model guide](../../docs/models/praxis1.md#usage) to `praxis1-deploy.yaml` in
-the working directory; the commands below pass it to Omni.
-
 ### Offline example
 
 ```bash
@@ -98,7 +93,7 @@ observation = {
     "task": "Move the gripper forward.",
     "descriptor": "praxis.sim",  # simulator pose frame; real DROID rigs use the default FR3 hand frame
 }
-engine = Omni(model=os.environ["PRAXIS_CHECKPOINT"], deploy_config="praxis1-deploy.yaml")
+engine = Omni(model=os.environ["PRAXIS_CHECKPOINT"], deploy_config="vllm_omni/deploy/praxis1.yaml")
 try:
     outputs = engine.generate(
         {"prompt": observation["task"]},
@@ -120,7 +115,7 @@ python /tmp/praxis1_offline.py
 
 ```bash
 vllm serve "$PRAXIS_CHECKPOINT" --omni --host 127.0.0.1 --port 8123 \
-  --served-model-name praxis-1 --deploy-config praxis1-deploy.yaml \
+  --served-model-name praxis-1 --deploy-config vllm_omni/deploy/praxis1.yaml \
   --stage-init-timeout 1800
 ```
 
@@ -135,6 +130,13 @@ Weight-free checks (CPU, plus one CUDA GPU for the attention test):
 
 ```bash
 pytest tests/diffusion/models/praxis1 -q
+```
+
+Checkpoint-gated engine checks (one H100; skipped without weights):
+
+```bash
+PRAXIS_CHECKPOINT=/path/to/praxis-1-droid PRAXIS_YAM_CHECKPOINT=/path/to/praxis-1-yam \
+  pytest tests/e2e/offline_inference/test_praxis1.py --run-level=advanced_model -q
 ```
 
 ### Numerical comparison with the reference
