@@ -32,8 +32,8 @@ from vllm.platforms import current_platform
 
 from ..runtime import cosyvoice3_flow_graph_max
 from .packed_dit import (
-    _FLOW_GRAPH_MAX_TOTAL,
-    _FLOW_GRAPH_SLOTS,
+    FLOW_GRAPH_MAX_TOTAL,
+    FLOW_GRAPH_SLOTS,
     PackedDiT,
     attn_norm_preserving_eager,
     final_norm_preserving_eager,
@@ -55,6 +55,20 @@ _SCRATCH_PAGE = 0
 # reach the KV cache through the forward context: Inductor never sees the
 # pools as graph inputs, so it can neither copy nor reorder their updates.
 _ACTIVE_CACHE: FlowPrefixCache | None = None
+
+# The int64 columns of a PrefixPlan, in the order they sit in its flat table,
+# each with the rows it holds per CFG branch pair: "query" (new rows),
+# "context" (cached convolution rows) or "window" (both).
+_COLUMNS = (
+    ("slots", "query"),
+    ("context_slots", "context"),
+    ("conv_order", "window"),
+    ("conv_positions", "window"),
+    ("conv_window_ids", "window"),
+    ("conv_take", "query"),
+    ("row_ids", "query"),
+    ("positions", "query"),
+)
 
 
 @dataclass(eq=False)
@@ -89,6 +103,14 @@ class _Entry:
     start: int
     end: int
     context: int
+
+
+def _padding_entry(entries: list[_Entry], query: int, context: int) -> _Entry:
+    """The entry filling a plan to ``query`` new rows and ``context`` cached
+    convolution rows per CFG branch; its rows live on the scratch page."""
+    pad_query = query - sum(entry.end - entry.start for entry in entries)
+    pad_context = context - sum(entry.context for entry in entries)
+    return _Entry(None, pad_context, pad_context + pad_query, pad_context)
 
 
 @dataclass
@@ -127,12 +149,14 @@ class PrefixPlan:
 
 
 def _plan_views(table64: torch.Tensor, table32: torch.Tensor, sizes: _PlanSizes, chunk: int) -> PrefixPlan:
+    """Slice the two flat tables of ``_build_tables`` into a PrefixPlan's named views."""
     query, context = 2 * sizes.query, 2 * sizes.context
-    window = query + context
-    parts = table64.split((query, context, window, window, window, query, query, query))
+    rows = {"query": query, "context": context, "window": query + context}
+    parts = table64.split([rows[kind] for _, kind in _COLUMNS])
+    columns = {name: part for (name, _), part in zip(_COLUMNS, parts)}
     seqlens, cu, table = table32.split((sizes.segments, sizes.segments + 1, sizes.segments * sizes.width))
     return PrefixPlan(
-        *parts,
+        **columns,
         cache_seqlens=seqlens,
         cu_seqlens_q=cu,
         page_table=table.view(sizes.segments, sizes.width),
@@ -267,6 +291,8 @@ def attend_prefix(
     slots: torch.Tensor,
     page_table: torch.Tensor,
 ) -> torch.Tensor:
+    """Self-attention of one layer over the new rows: project and rotate
+    Q/K/V, store the new K/V at ``slots`` and attend over the paged prefix."""
     x = x.to(attn.to_q.weight.dtype)
     query, key, value = attn.to_q(x), attn.to_k(x), attn.to_v(x)
     rotate_in_place(query, *rope)
@@ -428,7 +454,7 @@ class FlowPrefixCache:
         global _ACTIVE_CACHE
         _ACTIVE_CACHE = self
         outputs: list[torch.Tensor] = []
-        group_size = _FLOW_GRAPH_SLOTS[-1]
+        group_size = FLOW_GRAPH_SLOTS[-1]
         for begin in range(0, len(queries), group_size):
             outputs += self._solve_group(queries[begin : begin + group_size], time_span, cfg_rate, modulation_key)
         return outputs
@@ -462,22 +488,24 @@ class FlowPrefixCache:
         mu = torch.cat([q.mu for q in queries]).unsqueeze(0)
         cond = torch.cat([q.cond for q in queries]).unsqueeze(0)
         spks = torch.cat([q.spks for q in queries])
-        rows = next((slots for slots in _FLOW_GRAPH_SLOTS if slots >= len(queries)), None)
+        rows = next((slots for slots in FLOW_GRAPH_SLOTS if slots >= len(queries)), None)
         total = flow_graph_total(query)
         if (
             self.graphs is not None
             and rows is not None
-            and total <= _FLOW_GRAPH_MAX_TOTAL
+            and total <= FLOW_GRAPH_MAX_TOTAL
             and not torch.cuda.is_current_stream_capturing()
         ):
             solved = self._replay(entries, rows, total, noise, mu, cond, spks, time_span, cfg_rate, modulation_key)
         else:
+            # No graph bucket to fill: size the plan to exactly these entries.
+            segments = 2 * sum(len(self._segment_ends(entry.start, entry.end)) for entry in entries)
             sizes = self._sizes(
                 entries,
                 rows=len(entries),
                 query=query,
                 context=sum(entry.context for entry in entries),
-                segments=None,
+                segments=segments,
                 width=max(len(entry.pages) for entry in entries),
             )
             table64, table32 = self._build_tables(entries, sizes)
@@ -489,18 +517,22 @@ class FlowPrefixCache:
         return list(solved[0, :query].float().split(lengths))
 
     def _sizes(
-        self, entries: list[_Entry], *, rows: int, query: int, context: int, segments: int | None, width: int
+        self, entries: list[_Entry], *, rows: int, query: int, context: int, segments: int, width: int
     ) -> _PlanSizes:
-        """Plan sizes; ``segments=None`` sizes them exactly instead of to a graph bucket."""
-        real_query = sum(entry.end - entry.start for entry in entries)
-        real_context = sum(entry.context for entry in entries)
-        pad_query, pad_context = query - real_query, context - real_context
-        if segments is None:
-            spans = [(e.start, e.end) for e in entries] + [(pad_context, pad_context + pad_query)]
-            segments = 2 * sum(len(self._segment_ends(start, end)) for start, end in spans)
-        spans = [e.context + e.end - e.start for e in entries] + [pad_context + pad_query]
-        windows = 2 * sum(1 for span in spans if span > 0)
-        return _PlanSizes(query, context, segments, max(width, 1), rows, windows, max(spans))
+        """Sizes of a plan holding ``entries`` padded to ``query`` new rows and
+        ``context`` cached convolution rows per CFG branch."""
+        pad = _padding_entry(entries, query, context)
+        window_spans = [entry.context + entry.end - entry.start for entry in entries + [pad]]
+        occupied = [span for span in window_spans if span > 0]
+        return _PlanSizes(
+            query=query,
+            context=context,
+            segments=segments,
+            width=max(width, 1),
+            rows=rows,
+            windows=2 * len(occupied),
+            window_width=max(window_spans),
+        )
 
     def _segment_ends(self, start: int, end: int) -> list[int]:
         """Ends of the attention chunks covering frames [start, end)."""
@@ -508,68 +540,79 @@ class FlowPrefixCache:
             return []
         return list(range((start // self.chunk + 1) * self.chunk, end, self.chunk)) + [end]
 
+    def _entry_slots(self, entry: _Entry, branch: int) -> tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Where one entry's rows live in the pool for Euler step 0 of a CFG branch.
+
+        Returns its block-table row, the pool slot of each new frame, the pool
+        slot of each cached convolution frame, and each new frame's position.
+        """
+        page = PAGE_FRAMES
+        frames = torch.arange(entry.start, entry.end)
+        prior = torch.arange(entry.start - entry.context, entry.start)
+        if entry.pages is None:
+            # Padding rows only ever touch (and attend to) the scratch page.
+            block = _SCRATCH_PAGE * self.sequences + branch
+            return [block], block * page + frames % page, block * page + prior % page, frames - entry.start
+        pages = torch.tensor(entry.pages, dtype=torch.long)
+        blocks = pages * self.sequences + branch
+        slots = blocks[frames // page] * page + frames % page
+        context_slots = blocks[prior // page] * page + prior % page
+        return blocks.tolist(), slots, context_slots, frames
+
     def _build_tables(self, entries: list[_Entry], sizes: _PlanSizes) -> tuple[torch.Tensor, torch.Tensor]:
         """Host int64 / int32 tables backing a PrefixPlan (see _plan_views for the layout)."""
-        real_query = sum(entry.end - entry.start for entry in entries)
-        real_context = sum(entry.context for entry in entries)
-        pad_query, pad_context = sizes.query - real_query, sizes.context - real_context
         empty = [_Entry([], 0, 0, 0)] * (sizes.rows - len(entries))
-        pad = _Entry(None, pad_context, pad_context + pad_query, pad_context)
-        entries = entries + empty + [pad]
-        count, page, sequences = len(entries), PAGE_FRAMES, self.sequences
-        columns: dict[str, list[torch.Tensor]] = {name: [] for name in _COLUMNS}
+        entries = entries + empty + [_padding_entry(entries, sizes.query, sizes.context)]
+        columns: dict[str, list[torch.Tensor]] = {name: [] for name, _ in _COLUMNS}
         seqlens: list[int] = []
         cu = [0]
         table: list[list[int]] = []
-        query_offset, context_offset, window_start, window_index = 0, 2 * sizes.context, 0, 0
+        # The convolution reads cat(context rows, query rows): query rows start
+        # after the context rows of both CFG branches.
+        first_query_row = 2 * sizes.context
+        # Running offsets of the entry being laid out.
+        query_row = 0  # its first query row
+        window_row = 0  # its first row in the concatenated windows
+        window_id = 0  # its window, counting non-empty ones only
         for branch in (0, 1):
-            context_base = branch * sizes.context
+            context_row = branch * sizes.context  # its first cached convolution row
             for index, entry in enumerate(entries):
-                frames = torch.arange(entry.start, entry.end)
-                prior = torch.arange(entry.start - entry.context, entry.start)
-                if entry.pages is None:
-                    # Padding rows only ever touch (and attend to) the scratch page.
-                    blocks = [_SCRATCH_PAGE * sequences + branch]
-                    columns["slots"].append(blocks[0] * page + frames % page)
-                    columns["context_slots"].append(blocks[0] * page + prior % page)
-                    columns["positions"].append(frames - entry.start)
-                else:
-                    pages = torch.tensor(entry.pages, dtype=torch.long)
-                    blocks = (pages * sequences + branch).tolist()
-                    columns["slots"].append((pages[frames // page] * sequences + branch) * page + frames % page)
-                    columns["context_slots"].append((pages[prior // page] * sequences + branch) * page + prior % page)
-                    columns["positions"].append(frames)
                 length = entry.end - entry.start
                 window = entry.context + length
-                columns["conv_order"].append(
-                    torch.cat(
-                        (
-                            context_base + torch.arange(entry.context),
-                            context_offset + query_offset + torch.arange(length),
-                        )
-                    )
-                )
+                blocks, slots, context_slots, positions = self._entry_slots(entry, branch)
+                columns["slots"].append(slots)
+                columns["context_slots"].append(context_slots)
+                columns["positions"].append(positions)
+                cached_rows = context_row + torch.arange(entry.context)
+                new_rows = first_query_row + query_row + torch.arange(length)
+                columns["conv_order"].append(torch.cat((cached_rows, new_rows)))
                 columns["conv_positions"].append(torch.arange(window))
-                columns["conv_window_ids"].append(torch.full((window,), window_index))
-                columns["conv_take"].append(window_start + entry.context + torch.arange(length))
-                columns["row_ids"].append(torch.full((length,), branch * count + index))
+                columns["conv_window_ids"].append(torch.full((window,), window_id))
+                columns["conv_take"].append(window_row + entry.context + torch.arange(length))
+                columns["row_ids"].append(torch.full((length,), branch * len(entries) + index))
+                # One attention segment per chunk: its queries see the keys up to the chunk's end.
+                table_row = blocks + [0] * (sizes.width - len(blocks))
                 previous = entry.start
                 for end in self._segment_ends(entry.start, entry.end):
                     cu.append(cu[-1] + end - previous)
-                    seqlens.append(1 if entry.pages is None else end)
-                    table.append(blocks + [0] * (sizes.width - len(blocks)))
+                    if entry.pages is None:
+                        seqlens.append(1)
+                    else:
+                        seqlens.append(end)
+                    table.append(table_row)
                     previous = end
-                context_base += entry.context
-                query_offset += length
-                window_start += window
-                window_index += window > 0
+                context_row += entry.context
+                query_row += length
+                window_row += window
+                if window > 0:
+                    window_id += 1
         if len(seqlens) > sizes.segments:
             raise ValueError(f"prefix plan needs {len(seqlens)} attention segments, bucket has {sizes.segments}")
         for _ in range(sizes.segments - len(seqlens)):
             seqlens.append(0)
             cu.append(cu[-1])
             table.append([0] * sizes.width)
-        table64 = torch.cat([torch.cat(columns[name]).long() for name in _COLUMNS])
+        table64 = torch.cat([torch.cat(columns[name]).long() for name, _ in _COLUMNS])
         table32 = torch.tensor(seqlens + cu + [block for row in table for block in row], dtype=torch.int32)
         return table64, table32
 
@@ -686,15 +729,3 @@ class FlowPrefixCache:
             self.graphs[key] = state
         state.graph.replay()
         return state.output
-
-
-_COLUMNS = (
-    "slots",
-    "context_slots",
-    "conv_order",
-    "conv_positions",
-    "conv_window_ids",
-    "conv_take",
-    "row_ids",
-    "positions",
-)

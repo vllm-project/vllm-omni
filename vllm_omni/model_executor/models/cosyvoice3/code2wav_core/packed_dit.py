@@ -658,8 +658,8 @@ def pad_to_graph_bucket(rows, noise, mu, spks, cond):
     )
 
 
-_FLOW_GRAPH_SLOTS = (1, 2, 4, 8)
-_FLOW_GRAPH_MAX_TOTAL = int(__import__("os").environ.get("COSYVOICE3_FLOW_GRAPH_MAX_TOTAL", "16384"))
+FLOW_GRAPH_SLOTS = (1, 2, 4, 8)
+FLOW_GRAPH_MAX_TOTAL = int(__import__("os").environ.get("COSYVOICE3_FLOW_GRAPH_MAX_TOTAL", "16384"))
 _FLOW_GRAPH_SEGMENT_STEP = 16
 
 
@@ -738,9 +738,9 @@ class FlowGraphRunner:
 
     def _layout(self, lengths: tuple[int, ...], streaming: bool):
         n, total = len(lengths), sum(lengths)
-        slots = next((b for b in _FLOW_GRAPH_SLOTS if b >= n), None)
+        slots = next((b for b in FLOW_GRAPH_SLOTS if b >= n), None)
         padded_total = flow_graph_total(total)
-        if slots is None or padded_total > _FLOW_GRAPH_MAX_TOTAL:
+        if slots is None or padded_total > FLOW_GRAPH_MAX_TOTAL:
             return None
         twin = (tuple(lengths) + (0,) * (slots - n) + (padded_total - total,)) * 2
         chunk = self.estimator.dit.static_chunk_size if streaming else None

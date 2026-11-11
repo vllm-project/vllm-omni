@@ -34,6 +34,8 @@ from .packed_dit import to_device_async
 # cuDNN reuses its plans and loaded kernels instead of building them for each
 # new rows-by-width pair, and decode graphs, when on, stay few.
 _ROW_SLOTS = (1, 2, 4, 8, 16)
+# Most windows one batched call takes.
+MAX_BATCH_ROWS = _ROW_SLOTS[-1]
 _FRAME_STEP = 64
 # Mel frames a decoded sample depends on to its left: CosyVoice3's HiFT reaches
 # 29 (conv_pre, upsampling and dilated resblocks); a test measures it.
