@@ -31,6 +31,7 @@ class _TurnState:
     sent_segment_text: str = ""
     has_text: bool = False
     tts_eos_done: bool = False
+    last_tts_chunk: tuple[int, int] | None = None
     turn_eos_done: bool = False
 
 
@@ -216,19 +217,35 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         )
         stage_turn_end = _bool_metadata(mm_output, ("turn_end", "end_of_turn"), default=False)
         terminal_turn_state = request_state.turn(output_turn_id) if request_state is not None else None
+        audio_cache_epoch = _first_metadata_int(mm_output, "duplex_audio_cache_epoch")
+        audio_chunk_seq = _first_metadata_int(mm_output, "duplex_audio_chunk_seq")
+        chunk_key = (
+            (audio_cache_epoch, audio_chunk_seq)
+            if audio_cache_epoch is not None and audio_chunk_seq is not None
+            else None
+        )
+        # Input submissions can run ahead of TTS output. Re-arming a boolean
+        # in begin_request cannot distinguish two queued segment endings, or
+        # an old ending replayed after a new input. Use the producer's output
+        # identity when present; retain the legacy path for token-only output.
+        new_tts_boundary = terminal_turn_state is None or not terminal_turn_state.tts_eos_done
+        if terminal_turn_state is not None and chunk_key is not None:
+            new_tts_boundary = (
+                terminal_turn_state.last_tts_chunk is None or chunk_key > terminal_turn_state.last_tts_chunk
+            )
         stage_tts_eos = (
             context.auto_responds
             and 151645 in token_ids
             and not audio_chunks
             and raw_audio_samples is not None
             and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
-            and (terminal_turn_state is None or not terminal_turn_state.tts_eos_done)
+            and new_tts_boundary
         )
-        tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and (
-            terminal_turn_state is None or not terminal_turn_state.tts_eos_done
-        )
+        tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and new_tts_boundary
         if tts_segment_end and terminal_turn_state is not None:
             terminal_turn_state.tts_eos_done = True
+            if chunk_key is not None:
+                terminal_turn_state.last_tts_chunk = chunk_key
         stage_turn_end_new = bool(stage_turn_end) and (
             terminal_turn_state is None or not terminal_turn_state.turn_eos_done
         )
