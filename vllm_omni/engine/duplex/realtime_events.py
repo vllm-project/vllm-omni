@@ -114,6 +114,9 @@ class _ResponseProjection:
     text_parts: list[str] = field(default_factory=list)
     audio_duration_ms: int | None = None
     audio_text_marks: list[dict[str, int]] = field(default_factory=list)
+    # Deduplicate incoming marks without scanning history. Merge/sort remains
+    # deferred to materialization, keeping the per-delta path O(delta).
+    pending_audio_text_marks: dict[tuple[int, int], dict[str, int]] = field(default_factory=dict)
     audio_delta_emitted: bool = False
     audio_done_emitted: bool = False
     audio_part_added: bool = False
@@ -149,6 +152,9 @@ class RealtimeProjectionState:
     # Only responses between response.created and their terminal retain buffers.
     response_states: dict[str, _ResponseProjection] = field(default_factory=dict)
     item_truncation_cursors: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Completed items no longer have a projection to rebuild from. Keep the
+    # original transcript only for items that have been truncated.
+    item_truncation_sources: dict[str, dict[int, str]] = field(default_factory=dict)
     active_response_id: str | None = None
     last_response_id: str | None = None
     conversation_items: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -299,7 +305,36 @@ def _remove_conversation_item(state: RealtimeProjectionState, item_id: str) -> b
         remaining_ids = list(state.conversation_items)
         state.last_conversation_item_id = remaining_ids[-1] if remaining_ids else None
     state.item_truncation_cursors.pop(item_id, None)
+    state.item_truncation_sources.pop(item_id, None)
     return removed
+
+
+def _record_item_truncation_cursor(
+    state: RealtimeProjectionState, item_id: str, content_index: int, audio_end_ms: int
+) -> tuple[int, int]:
+    """Keep the shortest cutoff, as the engine does for its conversation history."""
+    previous = state.item_truncation_cursors.get(item_id)
+    if previous is not None and previous[0] == content_index:
+        audio_end_ms = min(previous[1], audio_end_ms)
+    cursor = (content_index, audio_end_ms)
+    state.item_truncation_cursors[item_id] = cursor
+    return cursor
+
+
+def _truncate_item_at_cursor(state: RealtimeProjectionState, item: dict[str, object], cursor: tuple[int, int]) -> None:
+    content_index, audio_end_ms = cursor
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item.get("status") != "in_progress":
+        content = item.get("content")
+        if isinstance(content, list) and 0 <= content_index < len(content):
+            part = content[content_index]
+            if isinstance(part, dict):
+                transcript = part.get("transcript")
+                if isinstance(transcript, str):
+                    sources = state.item_truncation_sources.setdefault(item_id, {})
+                    sources.setdefault(content_index, transcript)
+                    part["transcript"] = sources[content_index]
+    truncate_realtime_item_content(item, content_index=content_index, audio_end_ms=audio_end_ms)
 
 
 def _apply_pending_item_truncation(state: RealtimeProjectionState, item: dict[str, object]) -> None:
@@ -309,8 +344,7 @@ def _apply_pending_item_truncation(state: RealtimeProjectionState, item: dict[st
     cursor = state.item_truncation_cursors.get(item_id)
     if cursor is None:
         return
-    content_index, audio_end_ms = cursor
-    truncate_realtime_item_content(item, content_index=content_index, audio_end_ms=audio_end_ms)
+    _truncate_item_at_cursor(state, item, cursor)
 
 
 def _response_done_output_item(
@@ -318,6 +352,8 @@ def _response_done_output_item(
 ) -> dict[str, object]:
     item_id = _response_item_id(state, response_id)
     projection = _response_state(state, response_id)
+    if projection is not None:
+        _sync_response_audio_text_marks(projection)
     transcript = projection.transcript if projection is not None else ""
     text = projection.text if projection is not None else ""
     audio_duration_ms = projection.audio_duration_ms if projection is not None else None
@@ -359,6 +395,7 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
     projection = _response_state(state, response_id)
     if projection is None:
         return
+    _sync_response_audio_text_marks(projection)
     transcript = projection.transcript
     audio_duration_ms = projection.audio_duration_ms
     audio_text_marks = projection.audio_text_marks
@@ -388,6 +425,22 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
         else:
             content.insert(text_index, text_part)
     _apply_pending_item_truncation(state, item)
+
+
+def _materialize_stored_response_item(state: RealtimeProjectionState, item_id: str) -> None:
+    """Bring a stored in-progress item up to date with its projection.
+
+    Deltas only accumulate into the projection; the stored copy is rebuilt
+    here, at the boundaries that actually read it (retrieve, truncate),
+    instead of on every delta.
+    """
+    item = state.conversation_items.get(item_id)
+    if not isinstance(item, dict) or item.get("status") != "in_progress":
+        return
+    for response_id, projection in state.response_states.items():
+        if projection.item_id == item_id:
+            _refresh_in_progress_response_item(state, response_id)
+            return
 
 
 def _append_response_transcript(state: RealtimeProjectionState, response_id: object, text: str) -> None:
@@ -426,6 +479,18 @@ def _ensure_response_audio_part_added(state: RealtimeProjectionState, response_i
     ]
 
 
+def _sync_response_audio_text_marks(projection: _ResponseProjection) -> None:
+    """Fold pending marks into the deduped, ordered history (boundary-only)."""
+    pending = projection.pending_audio_text_marks
+    if not pending:
+        return
+    projection.pending_audio_text_marks = {}
+    deduped: dict[tuple[int, int], dict[str, int]] = {}
+    for mark in (*projection.audio_text_marks, *pending.values()):
+        deduped[(int(mark["audio_end_ms"]), int(mark["text_chars"]))] = mark
+    projection.audio_text_marks = sorted(deduped.values(), key=lambda mark: (mark["audio_end_ms"], mark["text_chars"]))
+
+
 def _remember_response_audio_metadata(
     state: RealtimeProjectionState, response_id: object, event: Mapping[str, object]
 ) -> None:
@@ -441,7 +506,6 @@ def _remember_response_audio_metadata(
     marks = event.get("audio_text_marks")
     if not isinstance(marks, list):
         return
-    clean_marks: list[dict[str, int]] = []
     for mark in marks:
         if not isinstance(mark, dict):
             continue
@@ -449,16 +513,12 @@ def _remember_response_audio_metadata(
         audio_end_ms = mark.get("audio_end_ms", mark.get("audio_ms"))
         if not isinstance(text_chars, int | float) or not isinstance(audio_end_ms, int | float):
             continue
-        clean_marks.append({"text_chars": max(0, int(text_chars)), "audio_end_ms": max(0, int(audio_end_ms))})
-    if clean_marks:
-        merged = list(projection.audio_text_marks)
-        merged.extend(clean_marks)
-        deduped: dict[tuple[int, int], dict[str, int]] = {}
-        for mark in merged:
-            deduped[(int(mark["audio_end_ms"]), int(mark["text_chars"]))] = mark
-        projection.audio_text_marks = sorted(
-            deduped.values(), key=lambda mark: (mark["audio_end_ms"], mark["text_chars"])
-        )
+        text_chars = max(0, int(text_chars))
+        audio_end_ms = max(0, int(audio_end_ms))
+        projection.pending_audio_text_marks[(audio_end_ms, text_chars)] = {
+            "text_chars": text_chars,
+            "audio_end_ms": audio_end_ms,
+        }
 
 
 def _response_created_event(event: Mapping[str, object]) -> ResponseCreated:
@@ -876,13 +936,11 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if isinstance(audio, str) and audio:
             events.extend(_ensure_response_audio_part_added(state, response_id))
             events.extend(_realtime_audio_delta_events(state, event, response_id, audio))
-            _refresh_in_progress_response_item(state, response_id)
         text = event.get("text")
         has_text = isinstance(text, str) and bool(text)
         has_audio_delta = isinstance(audio, str) and bool(audio)
         if has_text:
             _append_response_transcript(state, response_id, cast("str", text))
-            _refresh_in_progress_response_item(state, response_id)
         # Keep the audio.delta + transcript.delta pair invariant even for
         # text-less units so clients that treat the pair as unit-complete work.
         if has_text or has_audio_delta:
@@ -912,7 +970,6 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         projection = _response_state(state, response_id)
         if projection is not None and isinstance(text, str) and text:
             projection.text_parts.append(text)
-            _refresh_in_progress_response_item(state, response_id)
         events = _ensure_response_text_part_added(state, response_id)
         events.append(
             TextDelta(
@@ -1032,10 +1089,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if isinstance(committed_ms, int | float):
             item_id = _response_item_id(state, response_id)
             committed_audio_ms = max(0, int(committed_ms))
-            state.item_truncation_cursors[item_id] = (0, committed_audio_ms)
-            cancelled_item = state.conversation_items.get(item_id)
-            if cancelled_item is not None:
-                truncate_realtime_item_content(cancelled_item, content_index=0, audio_end_ms=committed_audio_ms)
+            _record_item_truncation_cursor(state, item_id, 0, committed_audio_ms)
         events.extend(_realtime_audio_done_events(state, event, response_id))
         events.extend(
             _realtime_response_terminal_events(
@@ -1077,11 +1131,13 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if isinstance(truncated_item_id, str):
             truncated_item = state.conversation_items.get(truncated_item_id)
             if truncated_item is not None:
-                truncate_realtime_item_content(
-                    truncated_item,
-                    content_index=_int_or(content_index),
-                    audio_end_ms=_int_or(audio_end_ms),
+                # Native SignalTurn bypasses resolve_truncate_item. Preserve
+                # its cursor for the next read or terminal rebuild as well.
+                cursor = _record_item_truncation_cursor(
+                    state, truncated_item_id, _int_or(content_index), _int_or(audio_end_ms)
                 )
+                if truncated_item.get("status") != "in_progress":
+                    _truncate_item_at_cursor(state, truncated_item, cursor)
         return [
             ItemTruncated(
                 item_id=_str_or_none(truncated_item_id),
@@ -1196,6 +1252,7 @@ def retrieve_item_events(state: RealtimeProjectionState, payload: Mapping[str, o
     item_id = payload.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return [error_event("missing_item_id", "conversation.item.retrieve requires item_id", event_id=event_id)]
+    _materialize_stored_response_item(state, item_id)
     item = state.conversation_items.get(item_id)
     if item is None:
         return [error_event("item_not_found", f"Conversation item not found: {item_id}", event_id=event_id)]
@@ -1447,6 +1504,7 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
 
 def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem, *, has_audio: bool) -> ResolvedControl:
     """Validate item shape and engine-owned audio provenance before any mutation."""
+    _materialize_stored_response_item(state, command.item_id)
     item = state.conversation_items.get(command.item_id)
     if not isinstance(item, dict):
         return ResolvedControl(
@@ -1466,7 +1524,7 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem,
         return ResolvedControl(
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
         )
-    state.item_truncation_cursors[command.item_id] = (command.content_index, command.audio_end_ms)
+    _record_item_truncation_cursor(state, command.item_id, command.content_index, command.audio_end_ms)
     ack_payload: dict[str, object] = {
         "type": "playback.ack",
         "item_id": command.item_id,

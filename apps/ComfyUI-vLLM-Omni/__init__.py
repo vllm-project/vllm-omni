@@ -22,10 +22,12 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
     VLLMOmniLatentMaskEditing,
+    VLLMOmniMiniMaxH3Guide,
     VLLMOmniMiniMaxH3Params,
     VLLMOmniMiniMaxH3TemporalMask,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
+    VLLMOmniRestoreVideo,
     VLLMOmniSamplingParamsList,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
@@ -40,6 +42,7 @@ NODE_CLASS_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
+    "VLLMOmniRestoreVideo": VLLMOmniRestoreVideo,
     "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
@@ -47,6 +50,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
     "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
     "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
+    "VLLMOmniMiniMaxH3Guide": VLLMOmniMiniMaxH3Guide,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
     "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
@@ -64,6 +68,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
+    "VLLMOmniRestoreVideo": "Restore Video (SeedVR2)",
     "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniGenerateMusic": "Generate Music",
@@ -71,6 +76,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniVideoReferences": "Video References",
     "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
     "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
+    "VLLMOmniMiniMaxH3Guide": "MiniMax H3 Add Guide",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
     "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",

@@ -173,6 +173,90 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+### Ascend Stage-1 graph regions
+
+On Ascend NPU, Stage 1 can capture the complete Flow Euler solve and the
+deterministic HiFT decode as separate exact-shape NPUGraph regions. In a copy
+of the deploy YAML, set Stage 1 to the following and opt in through the server
+environment:
+
+```bash
+export COSYVOICE3_STAGE1_NPU_GRAPH=1
+```
+
+```yaml
+enforce_eager: false
+compilation_config:
+  mode: 0
+  cudagraph_mode: NONE
+```
+
+The outer stage remains dynamic; graph capture happens inside Code2Wav.
+The opt-in NPU path uses `torch_npu.npu_fused_infer_attention_score` for the
+DiT's dense noncausal FP16/BF16 attention and the existing real-valued DFT
+implementation for HiFT. FIA applies whenever the adapter is enabled,
+including eager warmup, unsupported graph signatures, and new shapes beyond
+the graph-cache limit. Other attention backend selections do not replace FIA
+on these adapter-owned paths.
+Keep Stage 1 eager when comparing another attention backend.
+Fresh noise, reference preprocessing, CPU F0, oscillator state, and request
+cache updates stay outside capture. Final and non-final HiFT calls use
+separate signatures; output buffers remain owned by each request.
+
+The adapter is disabled by default. Leave `COSYVOICE3_STAGE1_NPU_GRAPH` unset,
+set it to `0`, or use Stage-1 `enforce_eager: true` to retain the generic path.
+`COSYVOICE3_STAGE1_NPU_GRAPH_MAX` defaults to 8 graphs per
+region; new shapes beyond that limit run eagerly. A new shape first runs an
+eager warmup and capture, so warm up at the intended concurrency before
+reporting steady-state latency. Capture errors require restarting the stage;
+they are not silently recovered in the same process. `ASCEND_LAUNCH_BLOCKING=1`
+is incompatible with this graph mode. The generic deploy YAML and non-NPU
+execution paths retain their defaults.
+
+### Optional padded DiT compilation
+
+The generic CUDA Code2Wav path can opt into DiT compilation through the existing HF override interface:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
+  --trust-remote-code --deploy-config cosyvoice3.yaml \
+  --hf-overrides '{"cosyvoice3_compile_dit": true}'
+```
+
+This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.
+
+Selecting `cosyvoice3_compile_dit=true` keeps the PyTorch Flow estimator and prevents its lazy replacement by TensorRT, even when `COSYVOICE3_TRT=1` (the default). This precedence affects only the Flow estimator; the independent speaker-embedding TensorRT path retains its existing setting. With compilation disabled, the existing TensorRT selection is unchanged.
+
+Compilation occurs on first use, so warm up representative request batches and mel lengths before measuring serving latency. The default `torch.compile` automatic-dynamic policy can recompile when shapes change; warmup for one shape does not cover every future length. Use `TORCH_LOGS=recompiles` to check recompilation and fallback on the deployment workload, and measure cold-start latency separately. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. To measure its contribution, compare the same V2 deployment with compilation disabled and enabled; a combined V1-to-V2 deployment result does not isolate this option. Validate audio quality and latency for your deployment before enabling it.
+
+### Optional DSpark speculative decoding
+
+CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav.
+
+The public checkpoint used for validation is [yuekai/cosyvoice3_llm_dspark](https://huggingface.co/yuekai/cosyvoice3_llm_dspark) at revision `0b1b28dbb751bac3b74eea5dcc11e0570c91563b`. Download that revision as `/path/to/dspark-checkpoint`, then use the conversion below; the raw unified-vocabulary checkpoint is not the serving-ready speech-vocabulary directory.
+
+Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
+
+```bash
+python -m vllm_omni.entrypoints.convert_cosyvoice3_dspark \
+  /path/to/dspark-checkpoint /path/to/draft-speech
+```
+
+This packaged entry point works with wheel installations. A repository checkout with vLLM-Omni installed can also use `python tools/convert_cosyvoice3_dspark.py` with the same arguments. The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Keep its input embedding and output-head weights: the target Qwen decoder has a text embedding, not the drafter's speech-vocabulary embedding. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
+
+```yaml
+model_runner: v2
+speculative_config:
+  model: /path/to/draft-speech
+  method: dspark
+  num_speculative_tokens: 7
+  draft_sample_method: probabilistic
+```
+
+RAS verification includes each draft prefix in the generated-token history while excluding reference-prompt tokens. Standard sampling uses the native rejection sampler. Acceptance and end-to-end gains depend on the workload and Code2Wav cost; enabling speculative decoding does not guarantee lower latency or higher audio throughput.
+
+RAS probability compilation is also lazy: warmup must exercise an actual draft-verification step, not just prefill or ordinary one-token decode. Check both the Talker verification and Code2Wav compiled paths before collecting steady-state metrics. A comparison against a V1 server measures the complete deployment change; to attribute gains to DSpark or DiT compilation, use a separate V2 baseline with both features disabled and change one feature at a time.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:
@@ -222,6 +306,7 @@ vllm serve fishaudio/drama-3 --omni --port 8091
 ```
 
 The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+On Ascend, the same command uses the `npu` profile: Model Runner V2 with tensor parallel 2 and expert parallel across two 910B cards, and the DAC stage sharing the second card. See the recipe.
 
 ### Voice cloning
 
@@ -448,7 +533,7 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 
@@ -456,7 +541,7 @@ Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **
 huggingface-cli download k2-fsa/OmniVoice
 ```
 
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`. When `ref_text` is omitted, OmniVoice loads `openai/whisper-large-v3-turbo` on the worker device to transcribe the reference audio. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true` to load Whisper during worker startup, or set `additional_config.omnivoice_asr.asr_device` to use another GPU or the CPU.
 
 ### Launch
 
@@ -472,13 +557,35 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 cd examples/online_serving/text_to_speech/omnivoice
 python speech_client.py --text "Hello, how are you?"
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+python speech_client.py --text "hello" --ref-audio /path/to/ref_audio.wav
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`,
+`--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`,
+`--seed`, and `--output`.
 
 ### Notes
 
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#omnivoice).
+- The explicit `--ref-text` path is faster because it does not load Whisper.
+- By default, the first request with reference audio and no reference text loads
+  `openai/whisper-large-v3-turbo` on the worker device, which adds latency and
+  device memory use. Set `additional_config.omnivoice_asr.load_asr_on_startup` to
+  `true` to move that load to worker startup. Generated audio is mono at 24 kHz.
+
+### Reference audio and output processing
+
+When a request includes `ref_audio`, OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `ref_text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `ref_text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice processes voice cloning output by removing middle gaps of at least 500 milliseconds and trimming edge silence while keeping 100 milliseconds at each edge. It uses the original reference RMS when the RMS is below `0.1`, and it leaves the level unchanged when the RMS is at least `0.1`. It fades the first and last 100 milliseconds, then adds 100 milliseconds of silence at both edges. Text only output returns the decoder tensor without this processing.
 
 ---
 

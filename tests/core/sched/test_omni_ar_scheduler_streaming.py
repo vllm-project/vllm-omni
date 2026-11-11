@@ -61,6 +61,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
+    sched._outputs_awaiting_stage_payload = {}
     return sched
 
 
@@ -164,6 +165,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -303,7 +305,11 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize(
+    "processor",
+    [None, talker2code2wav_async_chunk, SimpleNamespace(_requires_full_token_history=True)],
+    ids=["no_opt_in", "cosyvoice3", "full_token_history"],
+)
 @pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
 @pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
 def test_running_decode_step_without_inter_stage_payload_does_not_raise(
@@ -320,6 +326,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -414,6 +421,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -579,6 +587,40 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_stage0_streaming_update_keeps_full_hash_block() -> None:
+    """A fully computed length that is a multiple of hash_block_size must keep that block.
+
+    The pin deletes ``block_hashes[keep_end // hash_block_size:]`` with
+    ``keep_end = num_tokens - 1``. Clamping the computed frontier to
+    ``num_tokens - 1`` before that delete drops hash 0 when the length is 16.
+    """
+    sched = _make_scheduler(stage_id=0)
+    # Request stores this list. Compare against a copy so the extension
+    # inside _update_request_as_session does not rewrite the expected prefix.
+    prompt = list(range(16))
+    expected_prefix = list(prompt)
+    session = Request(
+        request_id="req-ar-hash-block",
+        prompt_token_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=100.0,
+        block_hasher=None,
+    )
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.block_hashes.append("h0")
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids[:16] == expected_prefix
+    assert list(session._all_token_ids[:16]) == expected_prefix
+    assert session.prompt_token_ids[-2:] == [10, 20]
+    assert list(session._all_token_ids[-2:]) == [10, 20]
+    assert session.block_hashes[0] == "h0"
+    assert session.num_computed_tokens >= 16
 
 
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
@@ -1401,6 +1443,8 @@ def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_pub
     other.status = RequestStatus.RUNNING
     sched.running.append(other)
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    # EngineCore.__init__ sets this; __new__ skips it. False is the unpaused default.
+    engine.reject_new_requests = False
     engine.scheduler = sched
     engine.engines_running = False
     engine.batch_queue = None

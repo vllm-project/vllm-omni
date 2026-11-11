@@ -94,14 +94,15 @@
       "mode": 0,
       "inputs": [
         {"localized_name": "audio_flow_shift", "name": "audio_flow_shift", "type": "FLOAT", "widget": {"name": "audio_flow_shift"}, "link": null},
-        {"localized_name": "flow_shift", "name": "flow_shift", "type": "FLOAT", "widget": {"name": "flow_shift"}, "link": null}
+        {"localized_name": "flow_shift", "name": "flow_shift", "type": "FLOAT", "widget": {"name": "flow_shift"}, "link": null},
+        {"localized_name": "audio_mode", "name": "audio_mode", "type": "COMBO", "widget": {"name": "audio_mode"}, "link": null}
       ],
       "outputs": [
         {"localized_name": "MiniMax-H3 video params", "name": "MiniMax-H3 video params", "type": "VIDEO_PARAMS", "links": [3]}
       ],
       "title": "Base H3 Flow Shifts",
       "properties": {"Node name for S&R": "VLLMOmniMiniMaxH3Params"},
-      "widgets_values": [3, 12]
+      "widgets_values": [3, 12, "native"]
     },
     {
       "id": 6,

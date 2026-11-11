@@ -77,7 +77,10 @@ class GpuOomConcurrent(FaultScenario):
 
 
 class GpuOomRecovery(FaultScenario):
-    server_set = "default"
+    # Captured graph pools can serve the probe without a new allocation, so
+    # recovery must use the eager OOM server. Models with no eager stage ids
+    # keep their normal deploy when this set is selected.
+    server_set = "oom"
 
     def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
         model.run_oom_recovery(server, client)

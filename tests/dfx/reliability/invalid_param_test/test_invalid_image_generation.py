@@ -19,7 +19,7 @@ _PARAMS = [
     pytest.param(
         OmniServerParams(model="Qwen/Qwen-Image"),
         id="qwen_image",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
