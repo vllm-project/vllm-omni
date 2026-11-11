@@ -1,0 +1,11 @@
+# LFM3-Audio-2B speech profile on the LFM3-Omni eager bring-up runtime, with
+# the checkpoint's speech sampling defaults (generation_config.json).
+base_config: lfm3_omni.yaml
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      extra_args:
+        audio_temperature: 1.0
+        audio_top_k: 128
+        audio_repetition_penalty: 1.1
+        audio_repetition_window: 4096
