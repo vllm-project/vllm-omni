@@ -1,7 +1,7 @@
 # Attention Schedules
 
 An attention schedule selects a named attention profile by zero-based denoising
-step range or by normalized sigma window (see [Sigma windows](#sigma-windows)).
+step range or by sigma window (see [Sigma windows](#sigma-windows)).
 Profiles are prepared at startup; requests select ranges or windows, not new
 backends. Steps outside every range or window use the base attention
 configuration.
@@ -58,32 +58,18 @@ step-0 DiT forward with the step-0 profile and reuses it on later steps; only
 the AR KV-reuse prefill runs with the base configuration. Deeper layers' prompt
 K/V also depend on earlier layers' step-0 attention outputs, so on this model
 the step-0 profile affects every step, not only step 0. A range that starts at
-step 0 with an approximate profile therefore also changes the later steps; the
-server logs this at startup when its default schedule does so. A sigma window
-that covers 1.0 selects the step-0 profile in the same way; the startup log
-covers only step ranges.
+step 0 with an approximate profile therefore also changes the later steps, and
+so does a sigma window that covers 1.0. The server logs this at startup when its
+default schedule does either.
 
 ## Sigma windows
 
-Sigma schedules use the same prepared profiles, selected by normalized scheduler
-noise rather than step index or raw model timestep. MiniMax-H3 publishes its
-shifted rectified-flow video sigma. HunyuanImage-3.0 and Wan2.2 publish
-`scheduler.sigmas[i] / scheduler.sigmas[0]`. Wan2.2 DMD checkpoints, which
-denoise over a fixed timestep table, publish that timestep divided by the
-training timestep scale. Missing or invalid sigma fails rather than silently
-selecting the base backend.
-
-MiniMax-H3 windows therefore refer to absolute noise, while Wan2.2 and
-HunyuanImage-3.0 windows refer to noise relative to the run's first scheduler
-sigma. The two agree, to within the first sigma's distance from 1.0, only for a
-run that starts at the top of its ladder, which every supported Wan2.2 and
-HunyuanImage-3.0 path does: none takes a `strength` or custom sigmas, or starts
-part-way down the schedule. Request `latents` replace the initial noise, not the
-schedule. The first sigma is 1.0, except under Wan's UniPC solver, whose ladder
-starts at the shifted top of its training range: 0.999 at `flow_shift` 1, closer
-to 1.0 above it (0.9998 at 5), and lower below it (0.998 at 0.5). The MiniMax-H3
-`latent_refine` pass does start below full noise and selects by the absolute
-sigma of its own steps.
+Sigma schedules use the same prepared profiles, selected by each step's noise
+level instead of its index. Every supported model publishes the sigma its
+scheduler uses for the step, from 1.0 (pure noise) toward 0.0. Runs start at
+1.0, or just below it under Wan's UniPC solver (0.999 at `flow_shift` 1); the
+MiniMax-H3 `latent_refine` pass starts lower. A step without a valid sigma fails
+rather than silently selecting the base backend.
 
 Each window has exactly `low`, `high` and `profile`. Bounds must be finite
 numbers with `0 <= low < high <= 1`. List windows by ascending `low`, the
@@ -107,14 +93,11 @@ The dotted flag is `--diffusion-attention-schedule.sigma`; deploy YAML uses
 list. There is no separate sigma flag or environment variable.
 
 Use `attention_sigma_schedule` in the same request extras or offline sampling
-parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables
-sigma windows only, and non-empty windows replace defaults of both kinds: a
-request that sends sigma windows does not inherit the service step ranges, and a
-request that sends step ranges does not inherit the service sigma windows. A
-request cannot set both kinds; a stage's `default_sampling_params` count as
-request values, so send `[]` for the other field to replace a stage default of
-the other kind. Request and step modes validate the resolved schedules before
-denoising.
+parameters as `attention_schedule`. Omitted or `null` inherits the service
+windows, and `[]` turns them off. A request uses one kind: non-empty values in
+either field replace the service defaults of both kinds, and non-empty values in
+both fields are rejected. A stage's `default_sampling_params` count as request
+values, so send `[]` for the other field to switch kinds against such a default.
 
 ## Server configuration
 
@@ -223,14 +206,14 @@ deployments above, this happens after stage 0 has finished: the H3 encoder, the
 HunyuanImage-3.0 AR stage or the Wan2.2 encode stage. A bounded range in the
 request's own schedule that ends after the sequence fails before denoising and
 retains the client error through the runner and multiprocess executor. Under
-sigma windows, Wan2.2 and HunyuanImage-3.0 check each step's scheduler sigma
-once, right after building the timesteps. Sigmas that cannot be normalized into
-`[0, 1]`, for example from an infinite Wan2.2 `flow_shift`, raise the same
-`invalid_attention_schedule` client error as the other checks here, before any
-denoise forward. In step mode the request fails during its own preparation, not
-in a step shared with other requests. MiniMax-H3 solvers reject such sigmas when
-the request's schedule is prepared. Asynchronous `/v1/videos` reports all of
-these errors on the job record rather than the creation response.
+sigma windows, Wan2.2 and HunyuanImage-3.0 check the scheduler's sigmas once,
+right after building the timesteps. Sigmas outside `[0, 1]`, for example from an
+infinite Wan2.2 `flow_shift`, raise the same `invalid_attention_schedule` client
+error as the other checks here, before any denoise forward. In step mode the
+request fails during its own preparation, not in a step shared with other
+requests. MiniMax-H3 solvers reject such sigmas when the request's schedule is
+prepared. Asynchronous `/v1/videos` reports all of these errors on the job
+record rather than the creation response.
 
 ## Compatibility limits
 
