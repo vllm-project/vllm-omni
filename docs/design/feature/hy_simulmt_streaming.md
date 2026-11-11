@@ -92,12 +92,31 @@ identities only; buffer ownership and cleanup belong to the adapter.
 
 `PendingWorkPolicy.admit()` atomically reserves capacity. Its outcomes are
 `ACCEPTED`, `COALESCED` (replace a queued partial for this segment), or
-`BACKPRESSURE` (no state change). `release()` returns a reservation only after
-completion or acknowledged cancellation. The owner validates the operation
-and cadence before reserving, then allocates the revision and enqueues its
-snapshot synchronously, with no intervening await. Empty input completion
-needs no reservation. If snapshot construction fails, release the reservation
-and terminate with an error, rather than leaving an admitted final stranded.
+`BACKPRESSURE` (no state change). Before final admission, the owner calls
+`session.needs_finalization(end_input=...)`: it rejects invalid phases and
+empty ordinary commits before any reservation, returns false for empty input
+completion, and returns true when a final inference request is needed.
+
+```python
+needs_final = session.needs_finalization(end_input=end_input)
+admission = policy.admit("final") if needs_final else None
+revision = session.commit(admission, end_input=end_input)
+```
+
+Run this sequence and enqueue the snapshot synchronously, with no intervening
+await or session mutation. Empty input completion requires `admission=None`;
+it closes without reserving a slot, even when the policy has no capacity.
+Nonempty input requires `ACCEPTED` or `BACKPRESSURE`. A returned revision owns
+the reservation until the request finishes or cancellation is acknowledged;
+the owner then calls `release()` exactly once. A `None` return owns no slot:
+neither empty completion nor backpressure calls `release()`.
+
+Invalid admission combinations raise without changing state. If a caller
+reserved before an invalid commit, it must release that unused slot on the
+exception. Likewise, if snapshot construction fails before dispatch, release
+the reservation and terminate with an error rather than stranding a final.
+Partial admission still requires validation of phase and cadence before
+reserving; replacing a queued partial reuses its slot without releasing it.
 
 `max_pending_requests=2` by default, configurable from **1 through 8**. It
 counts queued plus running requests, including aborts awaiting cleanup. At

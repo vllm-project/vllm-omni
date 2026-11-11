@@ -109,7 +109,10 @@ class PendingWorkPolicy(Protocol):
         """Release one reservation after completion or acknowledged abort.
 
         Replacing a queued partial reuses its reservation, so does not release
-        it. The owner must release each reservation exactly once.
+        it. The owner must release each reservation exactly once. If commit()
+        or snapshot construction fails before dispatch, the owner releases
+        the unused reservation immediately instead. BACKPRESSURE and empty
+        input completion reserve nothing and must not call release().
         """
         ...
 
@@ -171,19 +174,40 @@ class StreamingSession:
         self._partial_samples = self.segment_samples
         return self._next_revision("partial")
 
-    def commit(self, admission: Admission, *, end_input: bool = False) -> Revision | None:
-        """Seal this segment only after final capacity has been reserved.
+    def needs_finalization(self, *, end_input: bool = False) -> bool:
+        """Validate commit before admission; return whether inference is needed.
 
-        Empty commit is invalid. Empty end-of-input closes without inference.
-        A backpressured final consumes neither audio nor a revision ID.
+        Raises ValueError for a non-open session or an empty ordinary commit.
+        False means empty input completion: skip policy.admit() and pass None
+        to commit(). True means reserve final capacity first. The owner must
+        serialize this preflight, admission and commit with no intervening await
+        or session mutation. This method does not change session state.
         """
         self._require_open()
-        if not self.segment_samples:
-            if not end_input:
-                raise ValueError("cannot commit an empty segment")
+        if not self.segment_samples and not end_input:
+            raise ValueError("cannot commit an empty segment")
+        return self.segment_samples > 0
+
+    def commit(self, admission: Admission | None = None, *, end_input: bool = False) -> Revision | None:
+        """Seal this segment only after final capacity has been reserved.
+
+        Call needs_finalization() before policy.admit(). Empty end-of-input
+        requires admission=None and closes without inference or a reservation.
+        Nonempty input requires ACCEPTED or BACKPRESSURE. A returned Revision
+        transfers the reservation to the request; its owner releases it once
+        after completion/acknowledged abort. A None return never owns a slot.
+
+        Invalid combinations raise ValueError without changing state. If the
+        caller already reserved a slot, it must release it on that exception.
+        A backpressured final consumes neither audio nor a revision ID, and
+        has no reservation to release.
+        """
+        if not self.needs_finalization(end_input=end_input):
+            if admission is not None:
+                raise ValueError("empty input completion requires no admission")
             self.phase = SessionPhase.CLOSED
             return None
-        if admission is Admission.COALESCED:
+        if admission not in (Admission.ACCEPTED, Admission.BACKPRESSURE):
             raise ValueError("finalization requires explicit admission")
         if admission is Admission.BACKPRESSURE:
             return None

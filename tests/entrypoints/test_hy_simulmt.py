@@ -191,12 +191,110 @@ def test_final_admission_and_barrier(end_input: bool) -> None:
 def test_empty_completion_and_empty_commit() -> None:
     state = session()
     with pytest.raises(ValueError, match="empty"):
-        state.commit(Admission.ACCEPTED)
+        state.commit()
     assert state.phase is SessionPhase.OPEN
-    assert state.commit(Admission.ACCEPTED, end_input=True) is None
+    assert state.commit(end_input=True) is None
     assert state.phase is SessionPhase.CLOSED
     state.cancel()
     assert state.phase is SessionPhase.CLOSED
+
+
+class FinalReservations:
+    """Count final reservations at the caller boundary without a queue."""
+
+    def __init__(self, available: bool = True) -> None:
+        self.available = available
+        self.admissions = 0
+        self.pending = 0
+        self.releases = 0
+
+    def admit(self) -> Admission:
+        self.admissions += 1
+        if not self.available:
+            return Admission.BACKPRESSURE
+        self.pending += 1
+        return Admission.ACCEPTED
+
+    def release(self) -> None:
+        assert self.pending > 0
+        self.pending -= 1
+        self.releases += 1
+
+
+@pytest.mark.parametrize("has_audio,end_input", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("available", [False, True])
+def test_commit_reservation_accounting(has_audio: bool, end_input: bool, available: bool) -> None:
+    state = session()
+    policy = FinalReservations(available)
+    if has_audio:
+        state.append_samples(1)
+
+    def commit() -> Revision | None:
+        admission = policy.admit() if state.needs_finalization(end_input=end_input) else None
+        return state.commit(admission, end_input=end_input)
+
+    if not has_audio and not end_input:
+        with pytest.raises(ValueError, match="empty"):
+            commit()
+        assert state.phase is SessionPhase.OPEN
+        assert policy.admissions == policy.pending == policy.releases == 0
+        return
+
+    revision = commit()
+    assert policy.admissions == int(has_audio)
+    if not has_audio:
+        assert revision is None
+        assert state.phase is SessionPhase.CLOSED
+    elif not available:
+        assert revision is None
+        assert state.phase is SessionPhase.OPEN
+        assert state.segment_samples == 1
+        policy.available = True
+        revision = commit()
+        assert revision == Revision(0, 0, 1, "final")
+    if revision is not None:
+        assert policy.pending == 1
+        state.complete(revision, "final")
+        policy.release()
+    assert policy.pending == 0
+    assert policy.releases == int(has_audio)
+
+
+@pytest.mark.parametrize("end_input", [False, True])
+def test_empty_commit_after_accidental_reservation_requires_rollback(end_input: bool) -> None:
+    state = session()
+    policy = FinalReservations()
+    admission = policy.admit()  # Incorrect caller: skipped needs_finalization().
+    with pytest.raises(ValueError):
+        state.commit(admission, end_input=end_input)
+    policy.release()  # No request was dispatched, so the caller rolls back now.
+    assert state.phase is SessionPhase.OPEN
+    assert policy.pending == 0 and policy.releases == 1
+
+
+def test_nonempty_commit_requires_admission() -> None:
+    state = session()
+    state.append_samples(1)
+    assert state.needs_finalization()
+    with pytest.raises(ValueError, match="admission"):
+        state.commit()
+    assert state.phase is SessionPhase.OPEN
+    assert state.segment_samples == 1
+    assert state.commit(Admission.ACCEPTED) == Revision(0, 0, 1, "final")
+
+
+@pytest.mark.parametrize("phase", ["finalizing", "draining", "cancelled", "closed"])
+def test_commit_preflight_rejects_nonopen_phase(phase: str) -> None:
+    state = session()
+    if phase == "closed":
+        state.commit(end_input=True)
+    elif phase == "cancelled":
+        state.cancel()
+    else:
+        state.append_samples(1)
+        state.commit(Admission.ACCEPTED, end_input=phase == "draining")
+    with pytest.raises(ValueError, match=f"session is {phase}"):
+        state.needs_finalization(end_input=True)
 
 
 def test_reset_boundary_across_segments_and_crossing_append() -> None:
