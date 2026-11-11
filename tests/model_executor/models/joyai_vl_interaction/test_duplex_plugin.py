@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from tests.engine.duplex.test_session_runner import (
@@ -55,7 +55,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
-from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai
+from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai, joyai_action_to_tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -96,6 +96,7 @@ async def open_joyai(*, modalities=("text", "audio"), asr=False, runtime_config=
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE if asr else JOYAI_VL_INTERACTION_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     port = RecordingStagePort(stage_count=4 if asr else 3)
     output: asyncio.Queue[object] = asyncio.Queue()
     results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
@@ -313,10 +314,194 @@ def test_opt_in_profile_preserves_turn_pipeline():
     assert duplex.session_mode == "duplex"
     assert normal.stages == duplex.stages
     assert normal.connectors == duplex.connectors
-    assert not duplex.async_chunk
+    assert duplex.async_chunk
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_limit", [2, 999])
+async def test_runtime_uses_deployed_image_limit(mocker, image_limit):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    mocker.patch("vllm.transformers_utils.processor.cached_processor_from_config", return_value=Processor())
+    get_limit = mocker.Mock(return_value=image_limit)
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=get_limit),
+    )
+    await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    get_limit.assert_called_once_with("image")
+    assert plugin.max_images == image_limit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_model_len,image_limit,error", [(8192, 256, "max_model_len"), (16384, 0, "image")])
+async def test_invalid_memory_budget_rejects_repeated_session_opens(mocker, max_model_len, image_limit, error):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    loader = mocker.patch(
+        "vllm.transformers_utils.processor.cached_processor_from_config",
+        side_effect=lambda *args, **kwargs: Processor(),
+    )
+    prepare_budget = mocker.spy(plugin, "_prepare_memory_budget")
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=max_model_len,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: image_limit),
+    )
+    results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    manager = DuplexSessionManager(
+        plugin=plugin,
+        stage_port=RecordingStagePort(stage_count=3),
+        output_sink=asyncio.Queue(),
+        result_sink=results,
+        runtime_config=DuplexSessionRuntimeConfig(),
+        model_config=model_config,
+    )
+    try:
+        attempts = []
+        for index in range(2):
+            await manager.open(
+                OpenDuplexSessionMessage(
+                    control_id=f"open-{index}",
+                    session_id=SESSION_ID,
+                    session_config=DuplexSessionConfig(model="joyai", modalities=["text"]),
+                    output_buffer=DuplexOutputBuffer(max_bytes=1024 * 1024, max_events=512),
+                )
+            )
+            attempts.append(await results.get())
+        assert [result.ok for result in attempts] == [False, False]
+        assert all(error in result.error_message for result in attempts)
+        assert not manager.runners
+        assert plugin.processor is None
+        assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == (0, 0, 0)
+        assert loader.call_count == prepare_budget.call_count == int(image_limit > 0)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_opens_share_invalid_memory_budget_result(mocker):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    loader = mocker.patch("vllm.transformers_utils.processor.cached_processor_from_config", return_value=Processor())
+    prepare_budget = mocker.spy(plugin, "_prepare_memory_budget")
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=8192,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    results = await asyncio.gather(
+        *(plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config) for _ in range(8)),
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, DuplexRuntimeConfigError) and "max_model_len" in str(result) for result in results)
+    assert len({str(result) for result in results}) == 1
+    assert loader.call_count == prepare_budget.call_count == 1
+    assert plugin.processor is None
+    assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_during", ["load", "budget"])
+async def test_transient_runtime_initialization_failure_can_retry(mocker, failure_during):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    processor = Processor()
+    loader = mocker.patch("vllm.transformers_utils.processor.cached_processor_from_config", return_value=processor)
+    if failure_during == "load":
+        loader.side_effect = [OSError("temporary load failure"), processor]
+    else:
+        prepare_budget = plugin._prepare_memory_budget
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=OSError("temporary budget failure"))
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    with pytest.raises(OSError, match="temporary"):
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    assert plugin.processor is None
+    assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+    if failure_during == "budget":
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=prepare_budget)
+    await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    assert plugin.processor is processor
+    assert loader.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during", ["load", "budget"])
+async def test_cancelled_runtime_initialization_can_retry_without_stale_publication(mocker, cancel_during):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def block_first(call):
+        def wrapped(*args, **kwargs):
+            if started.is_set():
+                return call(*args, **kwargs)
+            started.set()
+            try:
+                assert release.wait(timeout=10)
+                return call(*args, **kwargs)
+            finally:
+                finished.set()
+
+        return wrapped
+
+    def load(*args, **kwargs):
+        return Processor()
+
+    loader = mocker.patch(
+        "vllm.transformers_utils.processor.cached_processor_from_config",
+        side_effect=block_first(load) if cancel_during == "load" else load,
+    )
+    if cancel_during == "budget":
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=block_first(plugin._prepare_memory_budget))
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    task = asyncio.create_task(plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert plugin.processor is None
+        assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == (0, 0, 0)
+        retry_config = SimpleNamespace(
+            model="joyai",
+            trust_remote_code=True,
+            max_model_len=32768,
+            multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 2),
+        )
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=retry_config)
+        processor = plugin.processor
+        budget = (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens)
+        assert processor is not None and all(value > 0 for value in budget)
+        # The cancelled to_thread call still finishes, but cannot overwrite the
+        # successful retry's processor, deployment limits or budget estimates.
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        assert plugin.processor is processor
+        assert (plugin.max_model_len, plugin.max_images) == (32768, 2)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == budget
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=retry_config)
+        assert loader.call_count == 2
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(finished.wait, 5)
 
 
 def test_asr_profile_and_sampling_keep_joyai_ownership():
@@ -960,6 +1145,19 @@ async def test_batched_commits_cleanup_finished_asr_without_local_resource(monke
 async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
     h = await open_joyai(asr=True, modalities=("text",))
     try:
+        await h.run(
+            translate_realtime_command(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": "previous-query",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "What color is the pot?"}],
+                    },
+                }
+            )
+        )
         pcm = struct.pack("<hh", 1000, 2000)
         await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000, video_frames=(frame(),)))
         await h.run(Commit(final=True, create_response=True))
@@ -970,6 +1168,10 @@ async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
         assert "Watch the pot." in info["joyai_prompt_context"]["system"]
         assert info["joyai_prompt_budget"] == h.runner.plugin.max_model_len - 8
         request_id = submission.context.request_id
+        observation = h.runner.plugin.data_plane.requests[request_id]
+        assert observation.query == ""
+        assert observation.query_reference is None
+        assert info["realtime_item_id"] in observation.history_anchor_item_ids
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
             final_stage_id=3,
@@ -1039,6 +1241,90 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
         (joyai_prompt,) = asr_to_joyai([output], raw_prompt)
         assert joyai_prompt["multi_modal_data"]["image"][0] is image
         assert "Describe this image." in joyai_prompt["prompt"]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    # joyai_vl_interaction_duplex.yaml: the Talker is orchestrator-fed, Code2Wav is prewarmed.
+    orchestrator.async_chunk = True
+    clients[1].custom_process_input_func = joyai_action_to_tts
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        assert not clients[1].add_request_calls
+        (prewarm,) = [call[0] for call in clients[2].add_request_calls]
+        MsgpackDecoder(type(prewarm)).decode(MsgpackEncoder().encode(prewarm))
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "last_response_text"),
+    [
+        ("</silence>", ""),
+        ("</response> The pot is smoking.", "The pot is smoking."),  # suppressed repeat
+        ("</response> Let me check.</delegation> What is in the pot?", ""),  # no delegate tool declared
+        ("</response> The pot is boiling.", ""),  # the harness session is text-only
+    ],
+    ids=["silence", "repeat", "undeclared-delegation", "text-only"],
+)
+async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker, text, last_response_text):
+    from tests.engine.test_duplex_orchestrator import _settle
+
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    orchestrator.async_chunk = True
+    clients[1].custom_process_input_func = joyai_action_to_tts
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        runner.model_state.last_response_text = last_response_text
+        await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        assert [call[0].request_id for call in clients[2].add_request_calls] == [request_id]
+        request = orchestrator.request_states[request_id]
+        runner.on_stage_output(
+            0,
+            tts_output(request_id, finished=True, text=text),
+            None,
+            request_id=request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
+                final_stage_id=2,
+                segment_finished=True,
+            ),
+        )
+        await _settle(orchestrator)
+        assert not clients[1].add_request_calls
+        # Nothing feeds the prewarmed Code2Wav request; abort it rather than let it
+        # wait out VLLM_OMNI_INPUT_WAIT_TIMEOUT_S.
+        assert any(request_id in ids for ids in clients[2].abort_calls)
+        assert request_id not in orchestrator.request_states
+        assert not runner.session.resource_request_ids()
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -1199,6 +1485,94 @@ async def test_spoken_action_forwards_once_and_audio_completes_response():
         assert any(e.get("delta") == "The pot is smoking." for e in events)
         assert any(e["type"] == "response.output_audio.delta" for e in events)
         assert h.port.cleanups[-1][0] == [request_id]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_audio_chunks_complete_on_empty_final_delta():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    params = plugin.configure_sampling_params(runtime_config={}, defaults=tuple(SamplingParams() for _ in range(3)))
+    assert [p.output_kind for p in params] == [
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.DELTA,
+    ]
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        # A spoken turn hands its text to the Talker; the prewarmed Code2Wav request must survive.
+        assert not h.port.aborts
+        # DELTA Code2Wav: each output carries only new samples, and the final one may carry none.
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        final = tts_output(request_id, finished=True)
+        final.multimodal_output = {"audio": []}
+        await h.deliver_and_settle(final, stage_id=2, segment_finished=True)
+        await h.run(AckPlayback(response_id=response_id, played_ms=200))
+        assert h.session.active_response_id is None
+        events = [event.to_realtime() for event in h.events]
+        assert sum(e["type"] == "response.output_audio.delta" for e in events) == 2
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "completed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_audio_without_samples_still_reports_missing_audio():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Smoke!", finished=True), stage_id=0, segment_finished=True
+        )
+        # Every DELTA output is empty, the final one included: the request never emitted audio.
+        await h.deliver_and_settle(tts_output(request_id, samples=0), stage_id=2)
+        final = tts_output(request_id, finished=True)
+        final.multimodal_output = {"audio": []}
+        await h.deliver_and_settle(final, stage_id=2, segment_finished=True)
+        assert h.session.active_response_id is None
+        assert h.runner.plugin.data_plane.is_terminal(request_id)
+        events = [event.to_realtime() for event in h.events]
+        assert not any(e["type"] == "response.output_audio.delta" for e in events)
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "failed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_between_streamed_audio_chunks_stops_audio_and_commits_no_text():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=50))
+        await h.run(CancelResponse())
+        assert h.runner.plugin.data_plane.is_terminal(request_id)
+        # Chunks Code2Wav decoded before the abort landed arrive on the old epoch.
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2, epoch=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True, epoch=0)
+        events = [event.to_realtime() for event in h.events]
+        assert sum(e["type"] == "response.output_audio.delta" for e in events) == 1
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "cancelled"
+        # JoyAI text is not aligned with its audio, so a partly played answer commits no transcript.
+        assert not any("smoking" in str(message.get("content")) for message in h.session.history)
     finally:
         await h.manager.shutdown()
 
@@ -1488,7 +1862,8 @@ async def test_new_camera_commit_supersedes_queued_promotion():
         latest = h.port.submissions[-1]
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
         assert not any(abort for _, abort in h.port.cleanups)
-        assert not h.port.aborts
+        # A's silent terminal frees its own async-chunk prewarm; nothing else may be aborted.
+        assert h.port.aborts == [[request_id]]
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(latest.context.request_id, text="</silence>", finished=True),
@@ -1561,6 +1936,7 @@ async def test_conversation_images_and_camera_frames_share_input_order():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     state = plugin.create_session_state()
     conversation: list[dict[str, object]] = []
     config = {"conversation": conversation, "modalities": ["text", "audio"]}
@@ -1591,12 +1967,12 @@ async def test_conversation_images_and_camera_frames_share_input_order():
         "content": [{"type": "image_url", "image_url": {"url": frame("blue")}}],
     }
     conversation.append(image_message)
-    assert await prepare() == [red, red, red, blue]
-    assert await prepare([frame("green")]) == [red, red, blue, green]
+    assert await prepare() == [red] * 4 + [blue]
+    assert await prepare([frame("green")]) == [red] * 4 + [blue, green]
     conversation.append({"role": "user", "content": "What changed?"})
-    assert await prepare() == [red, red, blue, green]
+    assert await prepare() == [red] * 4 + [blue, green]
     conversation.append(image_message.copy())
-    assert await prepare() == [red, blue, green, blue]
+    assert await prepare() == [red] * 4 + [blue, green, blue]
     config["conversation"] = [{"role": "user", "content": "New scene"}]
     assert await prepare([frame("green")]) == [green]
 
@@ -1605,6 +1981,7 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 1500
+    plugin.max_images = 999
     config = DuplexSessionConfig(instructions="Watch the pot.")
     runtime = plugin.runtime_config_for_update(config, {})
     kwargs = dict(
@@ -1712,6 +2089,12 @@ async def test_failed_append_preserves_visual_history_and_next_observation_runs(
         state = h.runner.model_state
         state.frames = [frame("red")]
         state.conversation_images = (frame("green"),)
+        h.session.append_history_message(
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": frame("green")}}],
+            }
+        )
         before = (list(state.frames), state.conversation_images)
         failed_frame = frame("blue")
         if failure == "image":
@@ -1810,6 +2193,7 @@ async def test_teardown_aborts_accepted_submission_before_ack(close_session, mon
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
     accepted, ack = asyncio.Event(), asyncio.Event()
     add_request = clients[0].add_request_async
@@ -1960,6 +2344,7 @@ def test_prompt_budget_matches_qwen3_vl_processor(sizes):
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = processor
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     kwargs = dict(
         request_id="r",
         fence=DuplexFence("s"),

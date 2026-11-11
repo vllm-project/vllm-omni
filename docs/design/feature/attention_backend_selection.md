@@ -53,6 +53,14 @@ The active `OmniPlatform` owns compatibility policy through
 - account for head size and other platform-visible constraints; and
 - return a qualified class path implementing `AttentionBackend`.
 
+Hub preflight and execution share the same version resolver. FlashAttention 2
+tries versions 1, 2, then 3 so Torch stable-ABI builds remain available when
+older per-Torch builds do not match. An explicit selection still fails when
+no compatible published build resolves.
+
+Explicit backend validation must avoid initializing unrelated runtimes. The
+cuDNN version probe belongs to automatic Blackwell fallback selection.
+
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
 
@@ -65,7 +73,8 @@ unstructured keyword dictionaries:
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
-- `fastvideo_vsa_topk` is consumed by FastVideo VSA.
+- `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
+- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -112,6 +121,16 @@ provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
 
+Qwen-Image-2.1 publishes a zero-based denoising index in
+`ForwardContext.denoise_step_idx` before running the transformer. Both CFG
+branches see the same index. In step execution, Qwen defers new first-step
+requests while a batch is decoding. The runner advances each scheduled request
+once per iteration, so requests admitted together share an index even if their
+total step counts differ. After prefix-length grouping, each transformer forward
+requires a common index. Mixed indices within a group raise a `ValueError`
+before step publication, including in native precision. On exit the pipeline restores the
+previous index directly, preserving the worker's paged-KV activation scope.
+
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
 For tile128 it expands the selected mask into 64-token compute blocks
 without recomputing top-k or splitting the softmax reduction. Ada tile128
@@ -155,3 +174,16 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 `models/minimax_h3/attention/fastvideo_h3.py` owns its prefix layout, video tiling, and
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
+
+## CosyVoice3 Ascend graph region
+
+CosyVoice3 has an opt-in, model-owned NPU graph adapter around the complete
+Flow Euler solve. The adapter directly calls the FIA inference API for dense,
+noncausal FP16/BF16 DiT attention with a boolean key-padding mask. It converts
+keep-mask semantics to FIA's blocked-mask semantics and preserves masking of
+padded query outputs in the model. FIA also serves the adapter's eager warmup
+and graph-limit fallback paths. Selecting another backend does not replace FIA
+while the adapter is enabled. Disable the adapter to exercise the generic
+backend path. The ordinary selector and other models are unchanged.
+See the [CosyVoice3 serving guide](../../user_guide/examples/online_serving/text_to_speech.md#ascend-stage-1-graph-regions)
+for enablement, supported dtypes, capture limits, and failure behavior.

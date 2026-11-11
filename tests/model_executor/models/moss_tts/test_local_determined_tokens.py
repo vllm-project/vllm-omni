@@ -24,7 +24,7 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("seed", [None, 17])
 @pytest.mark.parametrize("temperature", [0.0, 1.7])
 def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed, temperature):
@@ -65,7 +65,7 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
     torch.testing.assert_close(actual.sampled_token_ids, snapshot, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "constraint",
     [

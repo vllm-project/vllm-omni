@@ -49,7 +49,7 @@ def test_facade_rejects_non_torch_speaker():
         facade.enable_speaker_cuda_graph(_config())
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_replay_ownership_shape_capacity_and_precision_fallback():

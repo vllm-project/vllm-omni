@@ -184,6 +184,14 @@ def test_set_onnx_cfg_batch_dynamic_requires_expected_io(missing):
         flow_estimator_trt._set_onnx_cfg_batch_dynamic(_FakeModel(omit=missing))
 
 
+def test_set_onnx_cfg_batch_dynamic_rejects_scalar_input():
+    model = _FakeModel()
+    model.graph.input[0].type.tensor_type.shape.dim.clear()
+
+    with pytest.raises(ValueError, match="ONNX tensor 'x' has no batch dimension"):
+        flow_estimator_trt._set_onnx_cfg_batch_dynamic(model)
+
+
 def test_fixed_cfg_batch_profile_covers_all_trt_inputs():
     profile = flow_estimator_trt._fixed_cfg_batch_profile()
 
@@ -563,18 +571,9 @@ def test_context_session_binds_once_for_repeated_steps(monkeypatch):
     wrapper.release_estimator(reused_context, reused_stream)
 
 
-@pytest.mark.parametrize("caller_dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("n_timesteps", [3, 10])
-@pytest.mark.parametrize("requests", [1, 2, 8])
-def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dtype, n_timesteps, requests):
-    from contextlib import contextmanager, nullcontext
-
-    import torch
-    from omegaconf import DictConfig
-
-    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
-        CausalConditionalCFM,
-    )
+@pytest.fixture
+def fake_trt_engine(monkeypatch):
+    from contextlib import nullcontext
 
     # Resolve bindings to live CPU tensors, while exercising the real session,
     # dtype conversions, CFM dispatch and legacy per-step binding path.
@@ -595,8 +594,9 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
         def wait_stream(self, other):
             pass
 
-    class FakeContext:
+    class FakeContext(_FakeContext):
         def __init__(self):
+            super().__init__()
             self.shapes = {}
             self.bindings = {}
             self.bind_count = 0
@@ -605,9 +605,6 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
 
         def set_input_shape(self, name, shape):
             self.shapes[name] = shape
-
-        def set_optimization_profile_async(self, profile_index, stream_handle):
-            return True
 
         def set_tensor_address(self, name, address):
             self.bindings[name] = tensors[address]
@@ -628,30 +625,48 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
                 self.after_first_call()
             return True
 
-    class FakeEngine:
+    class FakeEngine(_DynamicEngine):
         def __init__(self, profiles=1):
-            self.context = FakeContext()
+            super().__init__(FakeContext())
             self.num_optimization_profiles = profiles
-
-        def create_execution_context(self):
-            return self.context
 
         @staticmethod
         def get_tensor_name(index):
             return names[index]
 
-        @staticmethod
-        def get_tensor_profile_shape(name, profile_index):
-            assert name == "x"
-            if profile_index == 0:
-                return ((2, 80, 4), (2, 80, 500), (2, 80, 3000))
-            return ((4, 80, 4), (8, 80, 500), (16, 80, 1024))
-
     monkeypatch.setattr(torch.cuda, "Stream", lambda device: FakeStream())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: FakeStream())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
-    session_engine, legacy_engine = FakeEngine(profiles=2), FakeEngine()
+    return FakeEngine
+
+
+def _make_cfm(estimator):
+    from omegaconf import DictConfig
+
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+
+    params = DictConfig(
+        {
+            "sigma_min": 1e-6,
+            "solver": "euler",
+            "t_scheduler": "cosine",
+            "training_cfg_rate": 0.2,
+            "inference_cfg_rate": 0.7,
+        }
+    )
+    return CausalConditionalCFM(80, params, n_spks=1, spk_emb_dim=80, estimator=estimator)
+
+
+@pytest.mark.parametrize("caller_dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("n_timesteps", [3, 10])
+@pytest.mark.parametrize("requests", [1, 2, 8])
+def test_cfm_trt_session_matches_legacy_nonzero_estimator(
+    monkeypatch, fake_trt_engine, caller_dtype, n_timesteps, requests
+):
+    from contextlib import contextmanager
+
+    session_engine, legacy_engine = fake_trt_engine(profiles=2), fake_trt_engine()
     session_pool = flow_estimator_trt.TrtContextWrapper(session_engine, "cpu", io_dtype=torch.float16)
     legacy_pool = flow_estimator_trt.TrtContextWrapper(legacy_engine, "cpu", io_dtype=torch.float16)
     monkeypatch.setattr(legacy_pool, "estimation_session", None)
@@ -669,17 +684,8 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
             exits += 1
 
     monkeypatch.setattr(session_pool, "estimation_session", counted_session)
-    params = DictConfig(
-        {
-            "sigma_min": 1e-6,
-            "solver": "euler",
-            "t_scheduler": "cosine",
-            "training_cfg_rate": 0.2,
-            "inference_cfg_rate": 0.7,
-        }
-    )
-    session_cfm = CausalConditionalCFM(80, params, n_spks=1, spk_emb_dim=80, estimator=session_pool)
-    legacy_cfm = CausalConditionalCFM(80, params, n_spks=1, spk_emb_dim=80, estimator=legacy_pool)
+    session_cfm = _make_cfm(session_pool)
+    legacy_cfm = _make_cfm(legacy_pool)
     dtype = getattr(torch, caller_dtype)
     x = torch.linspace(-0.5, 0.5, requests * 80 * 4, dtype=dtype).reshape(requests, 80, 4)
     mu = torch.linspace(0.1, 0.7, requests * 80 * 4, dtype=dtype).reshape(requests, 80, 4)
@@ -718,7 +724,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
         pairs = legacy_engine.context.calls[step * requests : (step + 1) * requests]
         expected_inputs = tuple(
             torch.cat([pair[index][:1] for pair in pairs] + [pair[index][1:] for pair in pairs])
-            for index in range(len(names) - 1)
+            for index in range(len(actual_inputs))
         )
         for actual_input, expected_input in zip(actual_inputs, expected_inputs):
             torch.testing.assert_close(actual_input, expected_input, rtol=0, atol=0)
@@ -733,6 +739,51 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
     first, last = session_engine.context.calls[0], session_engine.context.calls[-1]
     assert not torch.equal(first[0], last[0])
     assert not torch.equal(first[3], last[3])
+
+
+@pytest.mark.parametrize(("requests", "length"), [(2, 1025), (9, 4)], ids=["long-sequence", "large-group"])
+def test_cfm_trt_unsupported_group_runs_serial_cfg2(monkeypatch, fake_trt_engine, requests, length):
+    engine = fake_trt_engine(profiles=2)
+    wrapper = flow_estimator_trt.TrtContextWrapper(engine, "cpu", io_dtype=torch.float16)
+    reference = flow_estimator_trt.TrtContextWrapper(fake_trt_engine(), "cpu", io_dtype=torch.float16)
+    cfm = _make_cfm(wrapper)
+    reference_cfm = _make_cfm(reference)
+
+    # Start with the dynamic profile active, as after a supported batched solve.
+    (context, stream), _ = wrapper.acquire_estimator(4, 4)
+    wrapper.release_estimator(context, stream)
+    acquire_estimator = wrapper.acquire_estimator
+    acquisitions = []
+
+    def record_acquisition(batch_size=2, sequence_length=None):
+        acquisitions.append((batch_size, sequence_length))
+        return acquire_estimator(batch_size, sequence_length)
+
+    monkeypatch.setattr(wrapper, "acquire_estimator", record_acquisition)
+
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(requests, 80, length, generator=generator)
+    mu = torch.randn(requests, 80, length, generator=generator)
+    mask = torch.ones(requests, 1, length)
+    spks = torch.randn(requests, 80, generator=generator)
+    cond = torch.randn(requests, 80, length, generator=generator)
+    t_span = torch.tensor([0.0, 0.25, 0.625, 1.0])
+    with torch.inference_mode():
+        expected = torch.cat(
+            [
+                reference_cfm.solve_euler(x_i, t_span, mu_i, mask_i, spks_i, cond_i)
+                for x_i, mu_i, mask_i, spks_i, cond_i in zip(
+                    x.split(1), mu.split(1), mask.split(1), spks.split(1), cond.split(1), strict=True
+                )
+            ]
+        )
+        actual = cfm.solve_euler(x, t_span, mu, mask, spks, cond)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert acquisitions == [(2, length)] * (requests * (len(t_span) - 1))
+    assert context.profile_switches == [(1, stream.cuda_stream), (0, stream.cuda_stream)]
+    assert len(context.calls) == len(acquisitions)
+    assert wrapper._pool.qsize() == 1
 
 
 @pytest.mark.parametrize(

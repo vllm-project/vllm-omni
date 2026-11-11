@@ -422,7 +422,7 @@ class TrtContextWrapper:
 
     @contextmanager
     def estimation_session(self, *inputs: torch.Tensor):
-        """Hold one pooled TRT context and fixed I/O binding for one flow solve."""
+        """Yield a bound context for the flow solve, or None for an unsupported shape."""
         if len(inputs) != len(_TRT_INPUT_NAMES):
             raise ValueError(f"expected {len(_TRT_INPUT_NAMES)} estimator inputs, got {len(inputs)}")
         batch_size, sequence_length = int(inputs[0].shape[0]), int(inputs[0].shape[2])
