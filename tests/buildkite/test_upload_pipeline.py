@@ -1168,3 +1168,35 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert any("test_qwen_image_21.py" in command for command in step["commands"])
     assert any(selector in command for command in step["commands"])
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
+
+
+@pytest.mark.parametrize(
+    "changed_path,selected",
+    [
+        ("tests/e2e/online_serving/test_qwen_image_21.py", True),
+        ("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py", True),
+        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", True),
+        ("vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py", True),
+        ("vllm_omni/model_extras/qwen_image_21.py", True),
+        ("tests/e2e/accuracy/qwen_image_21/thresholds.json", False),
+        ("vllm_omni/diffusion/attention/backends/sdpa.py", False),
+    ],
+)
+def test_qwen_image_21_ready_smoke_dependencies(
+    monkeypatch: pytest.MonkeyPatch, changed_path: str, selected: bool
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    # Include a known model match so the no-match fallback cannot mask routing.
+    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=pipeline_path)
+    steps = [step for step in _iter_steps(rendered) if step.get("label") == "Diffusion · Qwen Image 2.1 Test"]
+    assert len(steps) == int(selected)
+    if not selected:
+        return
+    step = steps[0]
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert not step.get("skip")
+    assert any("tests/e2e/online_serving/test_qwen_image_21.py" in command for command in step["commands"])
+    assert any("advanced_model and diffusion and cuda" in command for command in step["commands"])
