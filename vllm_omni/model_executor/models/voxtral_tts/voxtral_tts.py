@@ -135,6 +135,8 @@ class VoxtralTTSForConditionalGeneration(
             self._vllm_config = vllm_config
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
+            # The next decode step embeds this frame, so keep it on device.
+            self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("codes", "audio")}
             speaker_id = config.audio_config.get("speaker_id", None)
             if speaker_id:
                 self.voice_to_embedding = {}
@@ -250,6 +252,34 @@ class VoxtralTTSForConditionalGeneration(
             )
             return input_ids, input_embeds, info_dict
         return input_ids, input_embeds, info_dict
+
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, object]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, object]]]:
+        """Batched decode branch of ``tts_preprocess``: embed every row's last audio frame at once."""
+        if input_ids.numel() != len(req_infos):
+            raise ValueError(f"Expected one decode token per request, got {input_ids.numel()} for {len(req_infos)}")
+        self.post_process_idx = 0
+        frames = []
+        for info in req_infos:
+            codes = info.get("codes")
+            frame = codes.get("audio") if isinstance(codes, Mapping) else None
+            if frame is None:
+                # Same legacy top-level fallback as tts_preprocess.
+                frame = info.get("audio")
+            if not isinstance(frame, torch.Tensor):
+                raise ValueError("Voxtral TTS decode requires the previous step's audio frame")
+            frames.append(frame.reshape(1, -1))
+        audio_codes = torch.cat(frames).to(input_ids.device)  # (B, num_codebooks)
+        audio_embeds = self.model.audio_tokenizer.encode_tokens([audio_codes.unsqueeze(-1)])[0]
+        audio_embeds = audio_embeds.reshape(len(req_infos), -1)
+        text_embeds = self.model.embed_input_ids(input_ids)
+        is_audio = (input_ids == self._audio_token_id).unsqueeze(-1)
+        embeds = torch.where(is_audio, audio_embeds.to(text_embeds.dtype), text_embeds)
+        return input_ids, embeds, [{} for _ in req_infos]
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
