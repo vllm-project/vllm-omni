@@ -173,6 +173,7 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
 
 
 _ALLOC_ATTEMPT_TIMEOUT_SEC = 2.0
+_OOM_RESIDUAL_SLACK_BYTES = 4 * 1024 * 1024
 
 
 def reliability_scenarios_for_eager_oom(
@@ -246,6 +247,7 @@ def _build_sidecar_cmd(
         "from collections.abc import Callable\n"
         "from typing import Any\n"
         f"_ALLOC_ATTEMPT_TIMEOUT_SEC = {_ALLOC_ATTEMPT_TIMEOUT_SEC!r}\n\n"
+        f"_OOM_RESIDUAL_SLACK_BYTES = {_OOM_RESIDUAL_SLACK_BYTES!r}\n\n"
         + inspect.getsource(allocate_device_chunk)
         + r"""
 import sys
@@ -307,11 +309,17 @@ if strict and not rejected:
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-# A full device is readiness, even when the byte target was not met.
-residual_floor = 64 * 1024 * 1024 if max_free_bytes is None else max_free_bytes
+# A full device is readiness, even when the byte target was not met. Allow a
+# few MiB of reported allocator reserve above an explicit ceiling. This can
+# remain after an exact target allocation even when non-strict callers do not
+# probe until allocator rejection.
+if max_free_bytes is None:
+    residual_floor = 64 * 1024 * 1024
+else:
+    residual_floor = max_free_bytes + _OOM_RESIDUAL_SLACK_BYTES
 allocator_full = rejected and int(free_after) <= residual_floor
 ratio_target_missed = strict and allocated < ratio_target_bytes and not allocator_full
-free_ceiling_missed = max_free_bytes is not None and int(free_after) > max_free_bytes
+free_ceiling_missed = max_free_bytes is not None and int(free_after) > residual_floor
 if ratio_target_missed or free_ceiling_missed:
     print(
         "ERROR:"

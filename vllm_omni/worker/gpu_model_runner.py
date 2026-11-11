@@ -234,6 +234,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+        # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
+        self._ensure_moe_specialty_runner_compatible()
+
+    def _ensure_moe_specialty_runner_compatible(self) -> None:
+        from vllm_omni.cudagraph.moe_routing_compat import (
+            ensure_moe_specialty_runner_compatible,
+        )
+
+        ensure_moe_specialty_runner_compatible(self)
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
@@ -996,6 +1005,24 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([])
         return super()._dummy_sampler_run(hidden_states=hidden_states)
 
+    def _annotate_moe_routing_batch_descriptor(
+        self,
+        batch_desc,
+        *,
+        num_tokens: int,
+        force_moe_routing_key: int | None = None,
+    ):
+        """Hook for MoE specialty capture; default no-op (Mammoth overrides)."""
+        # Same gate as post-``load_model``; keeps capture/replay fail-fast if
+        # the flag is flipped after load on a non-specialty V1 runner.
+        self._ensure_moe_specialty_runner_compatible()
+        return batch_desc
+
+    def _select_moe_replay_batch_descriptor(self, mode, batch_desc, num_tokens: int):
+        """Hook for MoE specialty replay; default no-op (Mammoth overrides)."""
+        self._ensure_moe_specialty_runner_compatible()
+        return batch_desc
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1012,6 +1039,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        force_moe_routing_key: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -1124,6 +1152,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
             )
+        )
+        # #9865: Mammoth overrides this hook to pin moe_routing_key on capture.
+        batch_desc = self._annotate_moe_routing_batch_descriptor(
+            batch_desc,
+            num_tokens=num_tokens_unpadded,
+            force_moe_routing_key=force_moe_routing_key,
         )
 
         if cudagraph_runtime_mode is None:

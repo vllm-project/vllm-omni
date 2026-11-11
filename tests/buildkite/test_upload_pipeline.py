@@ -544,7 +544,7 @@ def _iter_steps(doc: dict):
     "changed_file,select_legacy",
     [
         ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", True),
         ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
         ("vllm_omni/clients/duplex.py", False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
