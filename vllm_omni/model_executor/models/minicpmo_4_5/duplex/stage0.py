@@ -428,6 +428,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return result
         state.attempted_append_identity = append_identity
         self._require_special_token_ids()
+        worker_pending_terminator = state.pending_terminator_token
         if isinstance(stage0_window, dict):
             completed_ids = stage0_window.get("completed_token_ids")
             if isinstance(completed_ids, list):
@@ -594,6 +595,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                         "append_input_tokens_so_far": len(token_ids),
                         "previous_terminator": state.last_terminator_token,
                         "injected_terminator": injected_terminator,
+                        "worker_pending_terminator_before_sync": worker_pending_terminator,
                         "scheduler_completed_terminator": (stage0_window or {}).get("completed_terminator_token_id"),
                         "is_speech": is_speech,
                         "final": final,

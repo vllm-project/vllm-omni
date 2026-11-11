@@ -1022,6 +1022,30 @@ def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(p
     assert 41 not in result["input_token_ids"]
 
 
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_without_window_reconciles_accepted_terminator(pending_terminator):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-no-window", window_enabled=False)
+    runtime._stage_prefill_embeddings_only(state, None, video_frames=[object()], seq=1)
+    # Emulate a late async sample overwriting the accepted listen boundary.
+    state.pending_terminator_token = pending_terminator
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        None,
+        video_frames=[object()],
+        seq=2,
+        stage0_window={"completed_token_ids": [], "completed_terminator_token_id": 3},
+    )
+    assert result["input_token_ids"][:3] == [3, 2, 1]  # listen, </unit>, <unit>
+    assert result["stage0_window_replaced"] is False
+    assert state.pending_terminator_token is None
+    assert not state.window_units
+
+
 def _stage0_vision_runtime():
     import torch
 
