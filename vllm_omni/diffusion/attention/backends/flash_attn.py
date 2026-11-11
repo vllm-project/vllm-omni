@@ -281,6 +281,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else "aiter" if IS_AITER else None
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
+        backend_kwargs = dict(backend_kwargs or {})
+        self.quant_options = dict(backend_kwargs.pop("quant", None) or {})
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -1077,8 +1079,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             or extra.get("npu_attn_varlen")
         )
         # Only producer-validated [real, pad] inputs can become dense.
-        # MXFP4 currently includes its internal alignment padding in softmax.
-        supports_packed_padding = packed is not None and method in ("fp8", "mxfp8")
+        supports_packed_padding = packed is not None and method in ("fp8", "mxfp8", "mxfp4")
 
         reason = None
         if self.causal:
@@ -1134,6 +1135,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "fallback is not performed."
             ) from exc
         kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
+        if method == "fp8" and self.quant_options.get("fp8_fa_mode") is not None:
+            kwargs["fp8_fa_mode"] = self.quant_options["fp8_fa_mode"]
+        elif method == "mxfp4":
+            for name in ("mxfp4_scale_alg", "mxfp4_dst_type_max"):
+                if self.quant_options.get(name) is not None:
+                    kwargs[name] = self.quant_options[name]
         # Apply Omni's deterministic Q/K rotation before every Dense quantized path.
         if method in ("fp8", "mxfp8", "mxfp4"):
             from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation

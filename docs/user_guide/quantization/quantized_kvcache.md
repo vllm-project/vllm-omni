@@ -44,12 +44,14 @@ conversions, and kernel launches, so enabling it can increase latency,
 especially for short sequences. Faster generation or lower peak memory use
 is not guaranteed.
 
-On Ascend, FP8/MXFP8 also accept the single-document suffix-padding metadata
+On Ascend, FP8/MXFP8/MXFP4 also accept the single-document suffix-padding metadata
 emitted by MiniMax-H3. The backend trims the valid Q and K/V prefixes
 independently before quantization and restores the padded query shape afterwards.
-Arbitrary packed documents and caller masks remain unsupported; MXFP4 does not
-use this path. H3 end-to-end quality and performance still require validation
-on the target NPU.
+MXFP4 requires MindIE-SD to preserve the original sequence lengths when adding
+internal alignment padding, as in the revision specified under
+[Requirement and interface test](#requirement-and-interface-test).
+Arbitrary packed documents and caller masks remain unsupported. H3 end-to-end
+quality and performance still require validation on the target NPU.
 
 If `diffusion_kv_cache_dtype` is not set, attention runs in the native dtype.
 
@@ -143,6 +145,53 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 Selectors use comma-separated integers and inclusive ranges. Listed steps or
 layers run floating-point attention through the selected Dense or BSA backend;
 all other eligible forwards use `diffusion_kv_cache_dtype`.
+
+### MindIE-SD quantization options
+
+Use the existing `diffusion_attention_config` to pass optional MindIE-SD
+settings through the `FLASH_ATTN` backend's `quant` block. The global
+`diffusion_kv_cache_dtype` still selects the precision; these options do not
+enable quantization by themselves.
+
+```yaml
+stages:
+  - stage_id: 0
+    diffusion_kv_cache_dtype: fp8
+    diffusion_attention_config:
+      default:
+        backend: FLASH_ATTN
+        quant:
+          fp8_fa_mode: C8V16_TILING512
+          mxfp4_scale_alg: null
+          mxfp4_dst_type_max: null
+```
+
+For CLI use:
+
+```bash
+vllm serve <your-model> --omni --diffusion-kv-cache-dtype fp8 \
+    --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN","quant":{"fp8_fa_mode":"C8V16_TILING512"}}}'
+```
+
+The same `quant` block can be placed under a `per_role` backend selection.
+Only non-null options for the active precision are passed to MindIE-SD:
+
+| Option | Precision | Behavior when omitted |
+| --- | --- | --- |
+| `fp8_fa_mode` | `fp8` | MindIE-SD's default `HIGH_PRECISION`; set `C8V16_TILING512` to select C8V16 with V512 tiling |
+| `mxfp4_scale_alg` | `mxfp4` | Installed MX quantization operator's default scaling algorithm |
+| `mxfp4_dst_type_max` | `mxfp4` | Installed MX quantization operator's default destination maximum |
+
+Changing `diffusion_kv_cache_dtype` to `mxfp4` selects the MXFP4 options;
+the FP8 mode is not forwarded. Existing skip-step and skip-layer selectors
+continue to choose floating-point attention.
+
+`C8V16_TILING512` requires batch size 1, Q/K/V head dimensions of 128, and a
+compatible MindIE-SD build with the C8V16 custom operator. It selects Q/K/V
+sequence blocks of 128/256/512, V column blocks of 64, quantization modes
+7/7/12, and FIA `inner_precise=4`. MiniMax-H3's suffix-padding adapter also
+applies to these options. Validate output quality and performance on the
+target NPU for the intended workload.
 
 ### Qwen-Image-2.1 on Ascend
 

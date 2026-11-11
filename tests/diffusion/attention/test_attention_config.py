@@ -106,6 +106,53 @@ class TestAttentionSpec:
         assert spec.quant.enabled is True
         assert spec.backend_kwargs() == {"quant": {"flashinfer_backend": "fa2"}}
 
+    @pytest.mark.parametrize(
+        "quant",
+        [
+            {"fp8_fa_mode": "HIGH_PRECISION"},
+            {"fp8_fa_mode": "C8V16_TILING512"},
+            {"mxfp4_scale_alg": 0},
+            {"mxfp4_dst_type_max": 0.0},
+            {"fp8_fa_mode": "C8V16_TILING512", "mxfp4_scale_alg": 1, "mxfp4_dst_type_max": 6.0},
+        ],
+    )
+    def test_mindie_quant_serialized_without_dtype(self, quant):
+        spec = AttentionSpec(backend="FLASH_ATTN", quant=quant)
+        assert spec.quant.enabled is True
+        assert spec.backend_kwargs() == {"quant": quant}
+
+    def test_mindie_quant_null_options_are_omitted(self):
+        spec = AttentionSpec(
+            backend="FLASH_ATTN",
+            quant={"fp8_fa_mode": None, "mxfp4_scale_alg": 0, "mxfp4_dst_type_max": None},
+        )
+        assert spec.backend_kwargs() == {"quant": {"mxfp4_scale_alg": 0}}
+        empty = AttentionSpec(backend="FLASH_ATTN", quant={})
+        assert empty.quant.enabled is False
+        assert empty.backend_kwargs() is None
+
+    @pytest.mark.parametrize(
+        "quant",
+        [
+            {"dtype_qk": "int8"},
+            {"dtype_vo": "fp8_e4m3"},
+            {"flashinfer_backend": "fa2"},
+            {"q_block_size": 4},
+            {"k_block_size": 4},
+        ],
+    )
+    def test_flash_attention_rejects_other_backend_quant_options(self, quant):
+        with pytest.raises(ValueError, match="FLASH_ATTN quant supports only MindIE execution options"):
+            AttentionSpec(backend="FLASH_ATTN", quant=quant)
+
+    @pytest.mark.parametrize("backend", ["TRTLLM_ATTN", "FLASHINFER_ATTN"])
+    @pytest.mark.parametrize(
+        "quant", [{"fp8_fa_mode": "C8V16_TILING512"}, {"mxfp4_scale_alg": 0}, {"mxfp4_dst_type_max": 6.0}]
+    )
+    def test_mindie_quant_rejected_for_other_quant_backends(self, backend, quant):
+        with pytest.raises(ValueError, match="MindIE quant options require the FLASH_ATTN"):
+            AttentionSpec(backend=backend, quant=quant)
+
     def test_quant_and_skip_softmax_coexist(self):
         bk = AttentionSpec(
             backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
@@ -118,6 +165,8 @@ class TestAttentionSpec:
             ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "only supported by the TRTLLM_ATTN"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int4"}}, "quant.dtype_qk"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8", "k_block_size": 8}}, "quant.k_block_size"),
+            ({"backend": "FLASH_ATTN", "quant": {"fp8_fa_mode": "C8V16"}}, "quant.fp8_fa_mode"),
+            ({"backend": "TORCH_SDPA", "quant": {"fp8_fa_mode": "C8V16_TILING512"}}, "only supported by"),
         ],
     )
     def test_quant_validation_rejects(self, spec, match):
@@ -381,6 +430,18 @@ class TestAttentionConfig:
         )
         assert config.per_role["ltx2.audio_self"].backend == "FLASH_ATTN"
         assert config.per_role["ltx2.audio_to_video"].backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("json_roundtrip", [False, True])
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_mindie_quant_config_roundtrip(self, json_roundtrip, nested):
+        default_quant = {"fp8_fa_mode": "C8V16_TILING512"}
+        role_quant = {"mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 6.0}
+        role_spec = {"backend": "FLASH_ATTN", "quant": role_quant}
+        roles = {"minimax_h3": {"self": role_spec}} if nested else {"minimax_h3.self": role_spec}
+        raw = {"default": {"backend": "FLASH_ATTN", "quant": default_quant}, "per_role": roles}
+        config = parse_attention_config(json.loads(json.dumps(raw)) if json_roundtrip else raw)
+        assert config.default.backend_kwargs() == {"quant": default_quant}
+        assert config.per_role["minimax_h3.self"].backend_kwargs() == {"quant": role_quant}
 
     @pytest.mark.parametrize("nested", [False, True])
     def test_vsa_provider_precision_in_per_role_mapping(self, nested):

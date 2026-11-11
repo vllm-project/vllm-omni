@@ -21,7 +21,20 @@ _DEFAULT_SKIP_STEPS = frozenset({0, 1, 38, 39})
 def runtime(monkeypatch):
     mod = ModuleType("mindiesd")
 
-    def execute(q, k, v, *, precision, layout, scale, q_rot=None, k_rot=None):
+    def execute(
+        q,
+        k,
+        v,
+        *,
+        precision,
+        layout,
+        scale,
+        q_rot=None,
+        k_rot=None,
+        fp8_fa_mode=None,
+        mxfp4_scale_alg=None,
+        mxfp4_dst_type_max=None,
+    ):
         return q
 
     setattr(mod, "quant_attention", Mock(side_effect=execute))
@@ -37,12 +50,13 @@ def runtime(monkeypatch):
     supports_precision.cache_clear()
 
 
-def flash(layout="BSND", head_size=64):
+def flash(layout="BSND", head_size=64, quant=None):
     return flash_attn.FlashAttentionImpl(
         num_heads=2,
         head_size=head_size,
         softmax_scale=0.37,
         qkv_layout=layout,
+        backend_kwargs={"quant": quant} if quant is not None else None,
     )
 
 
@@ -76,10 +90,40 @@ def test_exact_runtime_layout_scale_and_rotation(runtime, method, layout):
     assert args[0] is q  # no unconditional transpose or extra quantization
     assert kwargs["layout"] == (layout or "BSND") and kwargs["scale"] == 0.37 and kwargs["precision"] == method
     assert "attn_mask" not in kwargs
+    assert not {"fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max"} & kwargs.keys()
     from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
     assert kwargs["q_rot"] is kwargs["k_rot"]
     torch.testing.assert_close(kwargs["q_rot"], get_quant_attention_rotation(q.device, q.dtype, 64))
+
+
+@pytest.mark.parametrize(
+    "method,expected",
+    [
+        ("fp8", {"fp8_fa_mode": "C8V16_TILING512"}),
+        ("mxfp8", {}),
+        ("mxfp4", {"mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 7.25}),
+    ],
+)
+def test_quant_options_follow_actual_precision(runtime, method, expected):
+    quant = {"fp8_fa_mode": "C8V16_TILING512", "mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 7.25}
+    original = quant.copy()
+    impl = flash(head_size=128, quant=quant)
+    query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    impl.forward_npu(query, query, query, AttentionMetadata(extra={"kv_cache_dtype": method}))
+    kwargs = runtime.quant_attention.call_args.kwargs
+    assert {name: kwargs[name] for name in quant if name in kwargs} == expected
+    assert quant == original
+
+
+@pytest.mark.parametrize("method", [None, "auto", "float"])
+def test_quant_options_do_not_enable_quantization(runtime, mocker, method):
+    impl = flash(head_size=128, quant={"fp8_fa_mode": "C8V16_TILING512"})
+    query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    float_attention = mocker.patch.object(impl, "forward_fa_npu", return_value=query)
+    impl.forward_npu(query, query, query, AttentionMetadata(extra={"kv_cache_dtype": method}))
+    float_attention.assert_called_once()
+    runtime.quant_attention.assert_not_called()
 
 
 def test_missing_runtime_requires_config_change(runtime):
@@ -130,17 +174,27 @@ def packed_metadata(q_length, kv_length, total_q, total_kv, method="mxfp8"):
     )
 
 
-@pytest.mark.parametrize("method", ["fp8", "mxfp8"])
+@pytest.mark.parametrize(
+    "method,quant",
+    [
+        ("fp8", {}),
+        ("fp8", {"fp8_fa_mode": "C8V16_TILING512"}),
+        ("mxfp8", {}),
+        ("mxfp4", {}),
+        ("mxfp4", {"mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 7.25}),
+    ],
+)
 @pytest.mark.parametrize("q_length,kv_length,q_pad,kv_pad", [(5, 5, 3, 3), (8, 8, 0, 0), (3, 7, 2, 2), (5, 7, 0, 3)])
-def test_quant_packed_padding_matches_masked_attention(runtime, method, q_length, kv_length, q_pad, kv_pad):
+def test_quant_packed_padding_matches_masked_attention(runtime, method, quant, q_length, kv_length, q_pad, kv_pad):
     query = torch.randn(1, q_length + q_pad, 2, 128, dtype=torch.bfloat16)
     key = torch.randn(1, kv_length + kv_pad, 2, 128, dtype=torch.bfloat16)
     value = torch.randn_like(key)
     metadata = packed_metadata(q_length, kv_length, query.shape[1], key.shape[1], method)
-    impl = flash(head_size=128)
+    impl = flash(head_size=128, quant=quant)
 
-    def dense_attention(q, k, v, *, precision, layout, scale, q_rot, k_rot):
+    def dense_attention(q, k, v, *, precision, layout, scale, q_rot, k_rot, **options):
         assert precision == method and layout == "BSND"
+        assert options == quant
         assert q.shape[1] == q_length and k.shape[1] == v.shape[1] == kv_length
         assert q_rot is k_rot
         return (
@@ -190,10 +244,10 @@ def test_quant_packed_padding_rejects_out_of_bounds_lengths(runtime, q_length, k
     runtime.quant_attention.assert_not_called()
 
 
-@pytest.mark.parametrize("case", ["mxfp4", "mask", "causal", "layout", "batch"])
+@pytest.mark.parametrize("case", ["mask", "causal", "layout", "batch"])
 def test_quant_packed_padding_preserves_unsupported_requests(runtime, case):
     query = torch.randn(2 if case == "batch" else 1, 8, 2, 64, dtype=torch.bfloat16)
-    metadata = packed_metadata(5, 5, 8, 8, "mxfp4" if case == "mxfp4" else "fp8")
+    metadata = packed_metadata(5, 5, 8, 8, "fp8")
     impl = flash("BNSD" if case == "layout" else "BSND")
     if case == "mask":
         metadata.attn_mask = torch.ones(1, 8, dtype=torch.bool)
@@ -206,10 +260,10 @@ def test_quant_packed_padding_preserves_unsupported_requests(runtime, case):
     runtime.quant_attention.assert_not_called()
 
 
-def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_STEPS):
+def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_STEPS, quant=None, head_size=64):
     layer = object.__new__(layer_mod.Attention)
     torch.nn.Module.__init__(layer)
-    layer.attention = flash()
+    layer.attention = flash(head_size=head_size, quant=quant)
     layer.attn_backend = flash_attn.FlashAttentionBackend
     layer._disable_kv_quant = False
     layer.layer_idx = 3
@@ -221,6 +275,29 @@ def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_ST
     )
     layer._init_kv_cache_quantization(cfg)
     return layer
+
+
+@pytest.mark.parametrize("skip_reason", ["step", "layer", "optout"])
+def test_fp8_options_preserve_float_skips(runtime, monkeypatch, mocker, skip_reason):
+    layer = make_layer(runtime, monkeypatch, method="fp8", head_size=128, quant={"fp8_fa_mode": "C8V16_TILING512"})
+    ctx = SimpleNamespace(denoise_step_idx=2)
+    monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(layer_mod, "get_forward_context", lambda: ctx)
+    query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    float_attention = mocker.patch.object(layer.attention, "forward_fa_npu", return_value=query)
+
+    layer.attention.forward_npu(query, query, query, layer._with_kv_cache_dtype(None))
+    assert runtime.quant_attention.call_args.kwargs["fp8_fa_mode"] == "C8V16_TILING512"
+
+    if skip_reason == "step":
+        ctx.denoise_step_idx = 0
+    elif skip_reason == "layer":
+        layer._kv_cache_skip_layers = {layer.layer_idx}
+    else:
+        layer._disable_kv_quant = True
+    layer.attention.forward_npu(query, query, query, layer._with_kv_cache_dtype(None))
+    float_attention.assert_called_once()
+    runtime.quant_attention.assert_called_once()
 
 
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])

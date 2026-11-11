@@ -2149,9 +2149,13 @@ class AttnQuantSpec:
     q_block_size: int = 1
     k_block_size: int = 16
     flashinfer_backend: str | None = None
+    fp8_fa_mode: str | None = None
+    mxfp4_scale_alg: int | None = None
+    mxfp4_dst_type_max: float | None = None
 
     _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
     _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
+    _VALID_FP8_FA_MODES = frozenset({"HIGH_PRECISION", "C8V16_TILING512"})
 
     def __post_init__(self) -> None:
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
@@ -2163,11 +2167,24 @@ class AttnQuantSpec:
                     f"quant.{block_name}={block_value!r} unsupported; "
                     f"kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
                 )
+        if self.fp8_fa_mode is not None and self.fp8_fa_mode not in self._VALID_FP8_FA_MODES:
+            raise ValueError(
+                f"quant.fp8_fa_mode={self.fp8_fa_mode!r} unsupported; use one of {sorted(self._VALID_FP8_FA_MODES)}."
+            )
 
     @property
     def enabled(self) -> bool:
-        # Include flashinfer_backend so a variant pin without dtypes is serialized.
-        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
+        return any(
+            value is not None
+            for value in (
+                self.dtype_qk,
+                self.dtype_vo,
+                self.flashinfer_backend,
+                self.fp8_fa_mode,
+                self.mxfp4_scale_alg,
+                self.mxfp4_dst_type_max,
+            )
+        )
 
 
 @dataclass
@@ -2286,11 +2303,27 @@ class AttentionSpec:
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
                 "Remove skip_softmax or set backend to TRTLLM_ATTN."
             )
-        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
-            raise ValueError(
-                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
-                f"backend={self.backend!r}. Remove quant or set a supported backend."
-            )
+        if self.quant is not None:
+            q = self.quant
+            if self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN", "FLASH_ATTN"):
+                raise ValueError(
+                    f"quant is only supported by the TRTLLM_ATTN, FLASHINFER_ATTN and FLASH_ATTN backends, but "
+                    f"backend={self.backend!r}. Remove quant or set a supported backend."
+                )
+            if self.backend.upper() == "FLASH_ATTN":
+                if (
+                    q.dtype_qk is not None
+                    or q.dtype_vo is not None
+                    or q.flashinfer_backend is not None
+                    or q.q_block_size != 1
+                    or q.k_block_size != 16
+                ):
+                    raise ValueError(
+                        "FLASH_ATTN quant supports only MindIE execution options; "
+                        "use diffusion_kv_cache_dtype to select the quantization precision."
+                    )
+            elif q.fp8_fa_mode is not None or q.mxfp4_scale_alg is not None or q.mxfp4_dst_type_max is not None:
+                raise ValueError("MindIE quant options require the FLASH_ATTN backend.")
         if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton"):
             raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn or triton")
         if self.fastvideo_vsa_precision not in ("bf16", "sage"):
@@ -2355,6 +2388,10 @@ class AttentionSpec:
                     quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
+            for name in ("fp8_fa_mode", "mxfp4_scale_alg", "mxfp4_dst_type_max"):
+                value = getattr(q, name)
+                if value is not None:
+                    quant_kw[name] = value
             if quant_kw:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
@@ -2644,14 +2681,13 @@ def validate_kv_cache_dtype_vs_attention_specs(
     attention_config: "AttentionConfig | None",
     schedule: "AttentionScheduleConfig | None" = None,
 ) -> None:
-    """Reject a global attention-quant knob combined with per-backend quant specs.
+    """Reject a global attention-quant knob combined with per-backend quant dtypes.
 
     ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
-    an explicit ``quant`` spec is the advanced per-backend override. Setting both
-    is contradictory intent — fail fast instead of picking one silently. A pure
-    ``flashinfer_backend`` variant pin without dtypes is not a conflict. Attention
-    schedule profiles follow the same rule, because a scheduled step keeps the
-    global knob.
+    explicit ``quant.dtype_qk`` or ``quant.dtype_vo`` overrides conflict with it.
+    Execution options such as ``flashinfer_backend`` or MindIE modes without
+    dtypes may coexist with the global knob. Attention schedule profiles follow
+    the same rule, because a scheduled step keeps the global knob.
     """
     if kv_cache_dtype in (None, "auto", "float"):
         return
