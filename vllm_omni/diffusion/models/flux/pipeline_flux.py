@@ -72,6 +72,12 @@ def get_flux_post_process_func(
 class FluxPipeline(
     nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
+    # Both CFG branches share latents and timestep; T5 prompts are padded to a
+    # fixed length. Text and image position ids are unbatched [L, 3] tensors,
+    # so they are shared rather than concatenated (their length can coincide
+    # with the branch batch size, e.g. one image token at batch 1).
+    supports_cfg_batching = True
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
     supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
