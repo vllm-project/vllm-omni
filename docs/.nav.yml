@@ -65,6 +65,7 @@ nav:
       - Online Quantization: user_guide/quantization/online.md
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
+      - Online FP8 Block Scaling (ROCm): user_guide/quantization/rocm_online_fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
       - ConvRot W8A8/W4A4/MXFP8/MXFP4: user_guide/quantization/convrot.md
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
@@ -110,6 +111,7 @@ nav:
         - Attention Schedules: user_guide/diffusion/attention_backends/schedules.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - MiniMax-H3 LiteVAE Decoder: user_guide/diffusion/light_vae.md
+      - Denoise Step Graphs: user_guide/diffusion/denoise_graph.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
