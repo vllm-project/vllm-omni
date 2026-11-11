@@ -34,6 +34,7 @@ import json
 import math
 import time
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Callable, Iterator
 from http import HTTPStatus
 from typing import Any, cast
@@ -82,6 +83,25 @@ _MAX_CONTROL_MESSAGE_SIZE = 128 * 1024
 _MAX_INTERACTION_QUEUE_SIZE = 64
 _MAX_INTERACTION_HISTORY_SIZE = 4096
 _MAX_CONTROL_RESPONSE_QUEUE_SIZE = 64
+
+
+_ENCODER_CONCURRENCY = 2
+_encoder_limiters: weakref.WeakKeyDictionary[Any, anyio.CapacityLimiter] = weakref.WeakKeyDictionary()
+
+
+def _encoder_limiter() -> anyio.CapacityLimiter:
+    """Share one encode ceiling per event loop across concurrent sessions.
+
+    PyAV already splits a single encode across threads, so letting every
+    streaming session start its own encode oversubscribes the host. A small
+    per-loop ceiling bounds that without serializing a single session.
+    """
+    loop = asyncio.get_running_loop()
+    limiter = _encoder_limiters.get(loop)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_ENCODER_CONCURRENCY)
+        _encoder_limiters[loop] = limiter
+    return limiter
 
 
 class _SessionProgress:
@@ -831,12 +851,12 @@ class OmniStreamingVideoOutputHandler:
         progress.touch()
 
     async def _run_encoder_call(self, call: Callable[[], Any]) -> Any:
-        """Run blocking codec work off the event loop.
+        """Run blocking codec work off the event loop under the shared ceiling.
 
         Cancellation waits for the worker instead of abandoning it, so the
         encoder is never closed while PyAV is still using it.
         """
-        return await anyio.to_thread.run_sync(call, abandon_on_cancel=False)
+        return await anyio.to_thread.run_sync(call, abandon_on_cancel=False, limiter=_encoder_limiter())
 
     async def _stream_video_bytes(
         self,

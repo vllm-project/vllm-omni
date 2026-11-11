@@ -221,6 +221,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
         self._cpu_offload = False
+        self._vae_offloaded = False
         root = Path(od_config.model)
         text_encoder_override = (od_config.custom_pipeline_args or {}).get("text_encoder")
         if not root.is_dir():
@@ -373,11 +374,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             offload_encoder_modules=selected,
         )
         self._cpu_offload = True
+        # Only the all-components profile stages the VAE; naming dit/text_encoder
+        # leaves it resident even though the pipeline as a whole is "offloaded".
+        self._vae_offloaded = offload_components is None
 
     def disable_omni_model_cpu_offload(self) -> None:
         if self._cpu_offload:
             remove_sequential_offload([self.transformer, self.text_encoder, self.vae])
             self._cpu_offload = False
+            self._vae_offloaded = False
 
     def _encode_prompt(self, prompt: str) -> dict[str, torch.Tensor | None]:
         with self._component_context(self.text_encoder):
@@ -538,10 +543,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                # Offloaded components own no resident decode budget, so fall
-                # back to the host-side decode there and keep device-resident
-                # decoding for the resident profiles.
-                self.vae.create_streaming_decode_session(to_cpu=not self._cpu_offload) if bound is not None else None,
+                # A staged VAE has no resident budget for the decoder's rolling
+                # buffers, so it keeps the host-side decode; a resident VAE gets
+                # device-side quantization and pinned staging.
+                self.vae.create_streaming_decode_session(to_cpu=not self._vae_offloaded) if bound is not None else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:

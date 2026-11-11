@@ -105,6 +105,7 @@ class PipelineWithCPUComponents(HyNomasPipeline):
         self.device = torch.device("cpu")
         self.sp_size = 1
         self._cpu_offload = False
+        self._vae_offloaded = False
 
     def _encode_prompt(self, text, *args, **kwargs):
         self.encoded.append(text)
