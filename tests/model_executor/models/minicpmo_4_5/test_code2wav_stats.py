@@ -56,11 +56,7 @@ def test_duty_uses_solve_durations_not_inter_record_gaps(
     """
     monkeypatch.setenv(CODE2WAV_STATS_ENV, "1")
     clock = iter([0.0, 1.0, 1.1, 2.0])
-    monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.code2wav_stats.time.perf_counter",
-        lambda: next(clock),
-    )
-    stats = Code2WavSolveStats(flush_every=3)
+    stats = Code2WavSolveStats(flush_every=3, clock=lambda: next(clock))
 
     with caplog.at_level(logging.INFO):
         stats.record("cfm", batch=4, frames=32, duration=0.2)  # busy 0.0-0.2, idle to 1.0
@@ -88,11 +84,7 @@ def test_duty_stays_bounded_for_back_to_back_solves(
     """
     monkeypatch.setenv(CODE2WAV_STATS_ENV, "1")
     clock = iter([0.1, 0.2, 0.3])
-    monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.code2wav_stats.time.perf_counter",
-        lambda: next(clock),
-    )
-    stats = Code2WavSolveStats(flush_every=3)
+    stats = Code2WavSolveStats(flush_every=3, clock=lambda: next(clock))
 
     with caplog.at_level(logging.INFO):
         # Three 0.1 s solves back to back; record runs at their ends.

@@ -900,6 +900,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         row_offsets: bool = False,
         cross_reference: bool = False,
         npu_same_shape: bool = False,
+        npu_mixed_history: bool = False,
     ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
@@ -921,35 +922,51 @@ class MiniCPMO45Code2Wav(nn.Module):
             # from reference identity or from normalized audio duration.
             cache_signature = (
                 "npu_same_shape",
-                cache_signature,
-                tuple(item.tokens.shape),
+                (row_offset_signature(item.previous.token2wav) if item.previous is not None else ("uninitialized",))
+                if npu_mixed_history
+                else cache_signature,
+                None if npu_mixed_history else tuple(item.tokens.shape),
                 str(item.tokens.dtype),
                 str(item.tokens.device),
-                item.last_chunk,
+                None if npu_mixed_history else item.last_chunk,
             )
         prompt = (None, None) if cross_reference or npu_same_shape else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
 
+    def _npu_cross_reference_inactive_reason(self) -> str | None:
+        """Share admission conditions with initialization diagnostics."""
+        if not getattr(self, "_npu_cross_reference_batching", False):
+            return "configuration switch is disabled"
+        if self.backend is None:
+            return "backend is unavailable"
+        if getattr(self, "_min_batch_size", 1) != 1:
+            return "code2wav_min_batch_size must be 1"
+        wrapper = self.backend._whole_euler_graph_wrapper
+        if wrapper is None:
+            return "Whole-Euler wrapper is unavailable"
+        if not wrapper.enabled:
+            return "Whole-Euler graph is disabled"
+        if wrapper.ragged_body is None:
+            return "ragged Whole-Euler body is unavailable"
+        if not self.backend._whole_euler_ragged_active():
+            return "Whole-Euler ragged execution is inactive"
+        if wrapper.device.type != "npu":
+            return "wrapper device must be NPU"
+        if getattr(wrapper, "dtype", None) != torch.float32:
+            return "wrapper dtype must be FP32"
+        if getattr(wrapper, "att_slots", 0) != 0:
+            return "attention slot pool must be disabled"
+        if not getattr(self.backend, "_ragged_fused_body", False):
+            return "fused ragged body is required"
+        if getattr(self.backend, "_estimator_att_cache_dtype", None) != torch.float32:
+            return "attention cache dtype must be FP32"
+        return None
+
     def _npu_cross_reference_active(self) -> bool:
         """Admit only the already-supported FP32 fused Whole-Euler arena."""
-        if not getattr(self, "_npu_cross_reference_batching", False) or self.backend is None:
-            return False
-        if getattr(self, "_min_batch_size", 1) != 1:
-            # Post-setup shape splitting can create singleton groups. Preserve
-            # the existing strict minimum-bucket contract for such profiles.
-            return False
-        if not self.backend._whole_euler_ragged_active():
-            return False
-        wrapper = self.backend._whole_euler_graph_wrapper
-        return (
-            wrapper.device.type == "npu"
-            and getattr(wrapper, "dtype", None) == torch.float32
-            and getattr(wrapper, "att_slots", 0) == 0
-            and getattr(self.backend, "_ragged_fused_body", False)
-            and getattr(self.backend, "_estimator_att_cache_dtype", None) == torch.float32
-        )
+        return self._npu_cross_reference_inactive_reason() is None
 
     @staticmethod
     def _npu_same_shape_groups(
@@ -958,29 +975,43 @@ class MiniCPMO45Code2Wav(nn.Module):
         features: PromptFeatures | list[PromptFeatures],
         *,
         cross_turn: bool,
+        mixed_history: bool = False,
     ) -> list[list[int]]:
         """Partition prepared rows without reading tensor values or mixing histories."""
         groups: dict[tuple[Any, ...], list[int]] = {}
         for row, (item, state) in enumerate(zip(items, states, strict=True)):
             feature = features[row] if isinstance(features, list) else features
-            # Full shapes include prompt/history lengths. Full device strings
-            # additionally prevent combining rows from different NPU indices.
-            caches = tuple(
-                (kind, name, tuple(value.shape), str(value.dtype), str(value.device))
-                for kind, cache in (("flow", state.flow_cache), ("hift", state.hift_cache))
-                for name, value in sorted(cache.items())
+            # Match CUDA's row-offset compatibility: encoder attention histories
+            # may differ, but CNN and HiFT cache shapes must remain compatible.
+            caches = row_offset_signature(state) if mixed_history else state_shape_signature(state)
+            devices = tuple(
+                str(value.device)
+                for cache in (state.flow_cache, state.hift_cache)
+                for _, value in sorted(cache.items())
             )
             conditioning = tuple(
                 (tuple(value.shape), str(value.dtype), str(value.device))
                 for value in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
             )
+            if mixed_history:
+                conditioning = tuple(
+                    (
+                        tuple(value.shape[:1]) + (None,) + tuple(value.shape[2:])
+                        if index in (0, 2)
+                        else tuple(value.shape),
+                        str(value.dtype),
+                        str(value.device),
+                    )
+                    for index, value in enumerate((feature.speech_tokens, feature.speaker_embedding, feature.mels))
+                )
             signature = (
                 caches,
+                devices,
                 conditioning,
-                tuple(item.tokens.shape),
+                None if mixed_history else tuple(item.tokens.shape),
                 str(item.tokens.dtype),
                 str(item.tokens.device),
-                item.last_chunk,
+                None if mixed_history else item.last_chunk,
                 None if cross_turn else item.cache_epoch,
             )
             groups.setdefault(signature, []).append(row)
@@ -1062,13 +1093,15 @@ class MiniCPMO45Code2Wav(nn.Module):
         last_chunks = [item.last_chunk for item in items]
         if len(items) > 1 and self._npu_cross_reference_active():
             groups = self._npu_same_shape_groups(
-                items, states, features, cross_turn=getattr(self, "_cross_turn_buckets", False)
+                items,
+                states,
+                features,
+                cross_turn=getattr(self, "_cross_turn_buckets", False),
+                mixed_history=getattr(self, "_npu_cross_reference_batching", False),
             )
             if len(groups) != 1:
                 raise _batch_error("npu_cross_reference_shape_mismatch")
-            # Keep uniform padding and fallback policy; conditions and caches
-            # remain per request. Mixed-history NPU guards are unchanged.
-            return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1283,6 +1316,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         # original keys and dispatch without inspecting NPU capability.
         npu_same_shape = len(compute_items) > 1 and self._npu_cross_reference_active()
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
+        mixed_history_options = (
+            {"npu_mixed_history": True}
+            if npu_same_shape and getattr(self, "_npu_cross_reference_batching", False)
+            else {}
+        )
         for item in compute_items:
             key = self._bucket_key(
                 item,
@@ -1290,6 +1328,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 row_offsets=row_offsets,
                 cross_reference=cross_reference,
                 npu_same_shape=npu_same_shape,
+                **mixed_history_options,
             )
             buckets.setdefault(key, []).append(item)
         undersized = [
@@ -1428,7 +1467,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
                 if npu_same_shape and batch_size > 1:
-                    row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
+                    row_groups = self._npu_same_shape_groups(
+                        bucket,
+                        states,
+                        features,
+                        cross_turn=cross_turn,
+                        mixed_history=getattr(self, "_npu_cross_reference_batching", False),
+                    )
                 elif merged_ragged and len(bucket) > 1:
                     # Keep the merged rows in one solve: re-splitting by cache
                     # signature is exactly what the merge removed.
@@ -1881,6 +1926,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
+        wrapper = self.backend._whole_euler_graph_wrapper
+        inactive_reason = self._npu_cross_reference_inactive_reason()
+        if wrapper is not None:
+            wrapper.npu_mixed_history = inactive_reason is None
+        if self._npu_cross_reference_batching and (wrapper is None or not wrapper.npu_mixed_history):
+            logger.warning(
+                "NPU cross-reference CFM batching is inactive: requires NPU FP32 fused Whole-Euler, "
+                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
+                inactive_reason,
+            )
         # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
         # runners without that hook, the first chunk that needs a graph. Capturing
         # under vLLM's weight load held GiBs, so the sweep must not run here.

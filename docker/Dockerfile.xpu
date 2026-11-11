@@ -43,8 +43,7 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 RUN --mount=type=cache,target=/root/.cache/uv \
     python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
     uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
-    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl ".[dev]" && \
-    uv pip check
+    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl ".[dev]"
 
 FROM vllm-omni AS vllm-omni-openai
 

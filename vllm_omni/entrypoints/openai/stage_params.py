@@ -40,6 +40,16 @@ def get_default_sampling_params_list(engine_client: Any) -> list[OmniSamplingPar
     return []
 
 
+def resolve_diffusion_sampling_params(
+    default_sampling_params_list: list[OmniSamplingParams],
+) -> OmniDiffusionSamplingParams:
+    """Copy the diffusion defaults before applying request-specific overrides."""
+    for params in default_sampling_params_list:
+        if isinstance(params, OmniDiffusionSamplingParams):
+            return copy.deepcopy(params)
+    return OmniDiffusionSamplingParams()
+
+
 def resolve_stage_sampling_params(
     stage_cfg: Any,
     stage_index: int,
