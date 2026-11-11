@@ -141,7 +141,7 @@ def _scan_logs_for_preemption(omni_server) -> None:
     assert not hits, f"preemption mentioned in stage logs: {hits}"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 @pytest.mark.parametrize("response_format", ["wav", "pcm"])
 def test_text_to_audio_basic(omni_server, online_client, response_format: str, run_level: str) -> None:
@@ -176,7 +176,7 @@ def test_text_to_audio_basic(omni_server, online_client, response_format: str, r
         assert 0.5 < duration < 30.0, f"implausible duration {duration:.2f}s"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_seed_determinism(omni_server, online_client) -> None:
     text = "Hello, this is Gepard speaking."
@@ -187,7 +187,7 @@ def test_seed_determinism(omni_server, online_client) -> None:
     assert a.audio_bytes != c.audio_bytes
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_streaming_pcm_incremental(omni_server, online_client) -> None:
     text = "Hello, this is Gepard speaking."
@@ -225,7 +225,7 @@ def test_streaming_pcm_incremental(omni_server, online_client) -> None:
     assert bytes(streamed) == non_stream.audio_bytes
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_seeded_streaming_stops(omni_server) -> None:
     url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
@@ -245,7 +245,7 @@ def test_seeded_streaming_stops(omni_server) -> None:
     assert duration < 30.0, f"seeded stream ran {duration:.1f}s — stop constraint dropped?"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_sse_stream_emits_delta_then_done(omni_server) -> None:
     url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
@@ -266,7 +266,7 @@ def test_sse_stream_emits_delta_then_done(omni_server) -> None:
     assert "speech.audio.done" in body
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_concurrent_requests_stay_isolated(omni_server, online_client, run_level: str) -> None:
     def _one(text: str):
@@ -344,7 +344,7 @@ def _capture_stream(
     return _StreamCapture(bytes(pcm), arrivals)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_concurrent_streaming_stays_isolated(omni_server, run_level: str) -> None:
     url = _speech_url(omni_server)
@@ -371,7 +371,7 @@ def test_concurrent_streaming_stays_isolated(omni_server, run_level: str) -> Non
     _scan_logs_for_preemption(omni_server)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_slow_client_still_completes(omni_server, online_client) -> None:
     """Slow reader must finish, and seed=7 must match a prior non-stream.
@@ -403,7 +403,7 @@ def test_slow_client_still_completes(omni_server, online_client) -> None:
     assert after.audio_bytes == baseline.audio_bytes
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_client_disconnect_releases_capacity(omni_server, online_client) -> None:
     """A follow-up request must complete after in-flight streams are closed.
@@ -453,7 +453,7 @@ def test_client_disconnect_releases_capacity(omni_server, online_client) -> None
     _pcm16_diag("disconnect-followup-vs-prior", follow.content, baseline.audio_bytes)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_mixed_stream_and_nonstream_isolated(omni_server, online_client, run_level: str) -> None:
     url = _speech_url(omni_server)
@@ -485,7 +485,7 @@ def test_mixed_stream_and_nonstream_isolated(omni_server, online_client, run_lev
     _scan_logs_for_preemption(omni_server)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_max_new_tokens_caps_whole_frames(omni_server) -> None:
     frames = 16

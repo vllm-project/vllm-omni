@@ -1131,6 +1131,42 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/breeze_tts_2.py
     - vllm_omni/outputs/
 
+  tts_gepard_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/offline_inference/test_gepard_tts.py
+    - tests/e2e/online_serving/test_gepard_tts.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/gepard.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/gepard.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/gepard/
+    - vllm_omni/outputs/
+
+  tts_kokoro_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/offline_inference/test_kokoro.py
+    - tests/e2e/online_serving/test_kokoro.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/kokoro.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/kokoro.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/kokoro/
+    - vllm_omni/outputs/
+
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *cosyvoice3
