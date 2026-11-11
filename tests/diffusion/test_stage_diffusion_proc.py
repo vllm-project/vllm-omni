@@ -502,6 +502,26 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_proc_lora_inventory_merges_worker_rank_records():
+    proc = object.__new__(StageDiffusionProc)
+    proc._engine = SimpleNamespace(
+        collective_rpc=lambda *_args: [
+            [{"id": 7, "name": "style-a"}],
+            [{"id": 7, "name": "style-a"}, {"id": 8, "name": None}],
+        ]
+    )
+    proc._executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        result = await proc._handle_collective_rpc("list_lora_adapters", 1.0, (), {})
+        assert result == [
+            {"id": 7, "name": "style-a"},
+            {"id": 8, "name": None},
+        ]
+    finally:
+        proc._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
 async def test_proc_shutdown_cancels_waiting_rpc_before_closing_sockets(proc_control_loop, monkeypatch):
     proc, submit, outgoing, request_socket, response_socket, _context = proc_control_loop
     entered = asyncio.Event()

@@ -143,6 +143,54 @@ def test_collective_rpc_non_control_method_still_returns_error_dict():
 
 
 @pytest.mark.cpu
+def test_lora_inventory_rpc_keeps_stage_and_replica_context(mocker):
+    async def run() -> None:
+        rpc = mocker.AsyncMock(return_value=[{"id": 7, "name": "style-a"}])
+        pool, _client = _make_pool(collective_rpc_async=rpc)
+
+        result = await pool.collective_rpc(0, "list_lora_adapters")
+
+        assert result == {
+            "stage_id": 0,
+            "replica_id": 0,
+            "result": [{"id": 7, "name": "style-a"}],
+        }
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_lora_inventory_rpc_serializes_replica_failure(mocker):
+    async def run() -> None:
+        rpc = mocker.AsyncMock(side_effect=RuntimeError("worker unavailable"))
+        pool, _client = _make_pool(collective_rpc_async=rpc)
+
+        result = await pool.collective_rpc(0, "list_lora_adapters")
+
+        assert result["stage_id"] == 0
+        assert result["replica_id"] == 0
+        assert result["result"]["supported"] is False
+        assert "worker unavailable" in result["result"]["error"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_lora_inventory_rpc_serializes_unattached_replica():
+    async def run() -> None:
+        pool, _client = _make_pool()
+        pool.clients[0] = None
+
+        result = await pool.collective_rpc(0, "list_lora_adapters")
+
+        assert result["stage_id"] == 0
+        assert result["replica_id"] == 0
+        assert result["result"]["supported"] is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
     async def run() -> None:
         class RecordingOutputProcessor:

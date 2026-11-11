@@ -127,6 +127,7 @@ from vllm_omni.entrypoints.openai.diffusion import (
 from vllm_omni.entrypoints.openai.errors import (
     InvalidPresetVoiceReferenceError,
     InvalidVoiceReferenceError,
+    _create_lora_inventory_error_json_response,
     _create_speech_error_json_response,
     _error_response_to_json_response,
 )
@@ -165,6 +166,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ResponseFormat,
     SegmentationMaskFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.loras import LoRAInventoryResponse
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
@@ -2192,6 +2194,26 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         models = await handler.show_available_models()
         return JSONResponse(content=models.model_dump())
     return JSONResponse(content={"object": "list", "data": []})
+
+
+@router.get(
+    "/v1/omni/loras",
+    response_model=LoRAInventoryResponse,
+    responses={HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse}},
+)
+async def show_lora_inventory(raw_request: Request) -> LoRAInventoryResponse | JSONResponse:
+    """Return the current runtime LoRA cache grouped by stage and replica."""
+    engine_client = getattr(raw_request.app.state, "engine_client", None) or getattr(
+        raw_request.app.state, "diffusion_engine", None
+    )
+    get_inventory = getattr(engine_client, "get_lora_inventory", None)
+    if not callable(get_inventory):
+        return _create_lora_inventory_error_json_response()
+    try:
+        return LoRAInventoryResponse(data=await get_inventory())
+    except Exception:
+        logger.exception("LoRA inventory query failed")
+        return _create_lora_inventory_error_json_response()
 
 
 # Image generation API endpoints

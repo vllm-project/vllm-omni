@@ -96,6 +96,12 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+The read-only `GET /v1/omni/loras` route exposes a runtime-cache snapshot
+grouped by logical stage and physical replica. It is an Omni extension rather
+than blanket OpenAI compatibility: it returns stable stage/replica records,
+uses empty adapter lists for stages without a runtime LoRA manager, and
+renders inventory RPC failures as `503` without changing generation state.
+
 The serving composition removes inherited `/tokenize`, `/detokenize`, and
 optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent

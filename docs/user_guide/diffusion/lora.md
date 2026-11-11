@@ -21,6 +21,42 @@ not supported by this generic path.
 For adapter-only RL updates and memory/validation requirements, see
 [engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
 
+## Runtime inventory
+
+Online servers expose the current runtime LoRA cache through:
+
+```http
+GET /v1/omni/loras
+```
+
+The response is grouped by logical stage and physical replica:
+
+```json
+{
+  "object": "omni.lora_inventory",
+  "data": [
+    {
+      "stage_id": 0,
+      "model_stage": "thinker",
+      "replicas": [
+        {
+          "replica_id": 0,
+          "adapters": [{"id": 17, "name": "style-a"}]
+        }
+      ]
+    }
+  ]
+}
+```
+
+This is a snapshot of adapters currently registered in the runtime cache. A
+stage without a LoRA manager returns an empty adapter list. Adapter names may
+be `null` when the backend does not expose them. Fused distillation adapters
+are not listed because they are not request-selectable runtime adapters.
+The endpoint is read-only and does not load, remove, or pin adapters. RPC
+failures return `503` for the inventory request and do not change generation
+behavior.
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)

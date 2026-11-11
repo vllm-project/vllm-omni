@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.lora.inventory import LoRAAdapterInfo
 
 
 class OmniWorkerMixin:
@@ -24,6 +27,21 @@ class OmniWorkerMixin:
             from vllm_omni.diffusion.diffusion_kv.kv_connector import install_mooncake_cfg_fanout
 
             install_mooncake_cfg_fanout(get_kv_transfer_group())
+
+    def list_lora_adapters(self) -> list[LoRAAdapterInfo]:
+        """Return runtime adapter identities for AR worker inventory queries."""
+        engine = getattr(self, "weight_transfer_engine", None)
+        manager = getattr(engine, "lora_manager", None)
+        if manager is not None:
+            list_metadata = getattr(manager, "list_adapter_metadata", None)
+            if callable(list_metadata):
+                return list_metadata()
+        if getattr(getattr(self, "vllm_config", None), "lora_config", None) is None:
+            return []
+        list_loras = getattr(self, "list_loras", None)
+        if not callable(list_loras):
+            return []
+        return [{"id": adapter_id, "name": None} for adapter_id in sorted(list_loras())]
 
 
 def maybe_unpad_input_ids(model, input_ids, num_tokens_unpadded):

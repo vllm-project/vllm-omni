@@ -217,6 +217,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/realtime/sessions/{session_id}/status"),
     ("GET", "/health"),
     ("GET", "/v1/models"),
+    ("GET", "/v1/omni/loras"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
     ("POST", "/v1/images/segmentations"),

@@ -39,6 +39,7 @@ from vllm_omni.engine.stage_client import (
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
+from vllm_omni.lora.inventory import LORA_ADAPTERS_RPC
 from vllm_omni.metrics import (
     count_audio_frames,
     count_image_pixels,
@@ -1808,9 +1809,16 @@ class StagePool:
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
+            error = f"stage {self.stage_id} replica {replica_id} is not attached"
+            if method == LORA_ADAPTERS_RPC:
+                return {
+                    "stage_id": self.stage_id,
+                    "replica_id": replica_id,
+                    "result": {"supported": False, "error": error},
+                }
             return {
                 "supported": False,
-                "error": f"stage {self.stage_id} replica {replica_id} is not attached",
+                "error": error,
             }
         try:
             if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
@@ -1823,12 +1831,19 @@ class StagePool:
                 if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
-            return await client.collective_rpc_async(
+            result = await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
                 args=args,
                 kwargs=kwargs,
             )
+            if method == LORA_ADAPTERS_RPC:
+                return {
+                    "stage_id": self.stage_id,
+                    "replica_id": replica_id,
+                    "result": result,
+                }
+            return result
         except Exception as exc:
             logger.exception(
                 "[StagePool] collective_rpc failed: stage=%s replica=%s method=%s",
@@ -1842,6 +1857,12 @@ class StagePool:
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:
                 error = str(exc) or repr(exc)
+            if method == LORA_ADAPTERS_RPC:
+                return {
+                    "stage_id": self.stage_id,
+                    "replica_id": replica_id,
+                    "result": {"supported": False, "error": error},
+                }
             return {
                 "supported": False,
                 "error": error,

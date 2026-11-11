@@ -66,6 +66,21 @@ def test_inline_client_implements_shared_prompt_hook_protocol(client):
 
 
 @pytest.mark.asyncio
+async def test_inline_lora_inventory_merges_worker_rank_records(client, mock_engine):
+    mock_engine.collective_rpc.return_value = [
+        [{"id": 7, "name": "style-a"}],
+        [{"id": 7, "name": "style-a"}, {"id": 8, "name": None}],
+    ]
+
+    result = await client.collective_rpc_async("list_lora_adapters")
+
+    assert result == [
+        {"id": 7, "name": "style-a"},
+        {"id": 8, "name": None},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_inline_dispatch_request_success(client, mock_engine):
     mock_result = OmniRequestOutput.from_diffusion(request_id="req-1", images=[MagicMock()])
 

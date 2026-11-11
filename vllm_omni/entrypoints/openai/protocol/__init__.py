@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.images import (
@@ -11,6 +11,12 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationRequest,
     ImageGenerationResponse,
     ResponseFormat,
+)
+from vllm_omni.entrypoints.openai.protocol.loras import (
+    LoRAAdapterInfo,
+    LoRAInventoryResponse,
+    LoRAReplicaInventory,
+    LoRAStageInventory,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -27,6 +33,10 @@ __all__ = [
     "ImageEditStreamResponse",
     "ImageGenerationRequest",
     "ImageGenerationResponse",
+    "LoRAAdapterInfo",
+    "LoRAInventoryResponse",
+    "LoRAReplicaInventory",
+    "LoRAStageInventory",
     "ResponseFormat",
     "VideoAction",
     "VideoData",

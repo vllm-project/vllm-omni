@@ -59,3 +59,15 @@ def _create_speech_error_json_response(
         status_code=status_code,
     )
     return _error_response_to_json_response(err, status_code=status_code)
+
+
+def _create_lora_inventory_error_json_response(
+    message: str = "LoRA inventory is temporarily unavailable.",
+) -> JSONResponse:
+    """Return a sanitized service-unavailable response for inventory queries."""
+    err = create_error_response(
+        message=message,
+        err_type="ServiceUnavailableError",
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+    return _error_response_to_json_response(err, status_code=HTTPStatus.SERVICE_UNAVAILABLE)

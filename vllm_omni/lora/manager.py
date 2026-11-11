@@ -32,6 +32,7 @@ from vllm_omni.lora.binding import (
     from_layer,
     moe_lora_kernel_requires_context,
 )
+from vllm_omni.lora.inventory import LoRAAdapterInfo
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -165,6 +166,7 @@ class LoRAManager:
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras
         self._registered_adapters: dict[int, LoRAModel] = {}  # adapter_id -> LoRAModel
+        self._adapter_names: dict[int, str] = {}
         self._active_adapter_id: int | None = None
         self._active_scale = 1.0
         self._adapter_scales: dict[int, float] = {}  # adapter_id -> external scale
@@ -269,6 +271,7 @@ class LoRAManager:
         self._merged_adapters.clear()
         self._lora_modules.clear()
         self._registered_adapters.clear()
+        self._adapter_names.clear()
         self._adapter_scales.clear()
         self._adapter_access_order.clear()
         self._pinned_adapters.clear()
@@ -1513,6 +1516,8 @@ class LoRAManager:
         self._touch_adapter_info(adapter_id)
 
         self._registered_adapters[adapter_id] = lora_model
+        if lora_request.lora_name:
+            self._adapter_names.setdefault(adapter_id, str(lora_request.lora_name))
 
         self._replace_layers_with_lora(peft_helper)
 
@@ -1547,6 +1552,7 @@ class LoRAManager:
             bank.close()
 
         del self._registered_adapters[adapter_id]
+        self._adapter_names.pop(adapter_id, None)
         self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
@@ -1561,6 +1567,15 @@ class LoRAManager:
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
         return list(self._registered_adapters.keys())
+
+    def list_adapter_metadata(self) -> list[LoRAAdapterInfo]:
+        """Return sorted identities for request-selectable runtime adapters."""
+        if self.lora_application != "runtime" or self._fixed_adapter:
+            return []
+        return [
+            {"id": adapter_id, "name": self._adapter_names.get(adapter_id)}
+            for adapter_id in sorted(self._registered_adapters)
+        ]
 
     def pin_adapter(self, adapter_id: int) -> bool:
         """Mark an adapter as pinned so it will not be evicted."""

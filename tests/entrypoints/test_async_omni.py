@@ -24,6 +24,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.inventory import merge_lora_adapter_records
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -97,6 +98,104 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._process_orchestrator_results = fake_process_results
     omni._log_summary_and_cleanup = lambda request_id: omni.request_states.pop(request_id, None)
     return omni
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_get_lora_inventory_preserves_stage_and_replica_ownership():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_id=0, model_stage="thinker"),
+            SimpleNamespace(stage_id=1, model_stage="denoise"),
+        ],
+        stage_metadata=[],
+    )
+
+    async def rpc(**kwargs):
+        assert kwargs == {"method": "list_lora_adapters", "timeout": 5.0}
+        return [
+            {
+                "stage_id": 1,
+                "replica_id": 0,
+                "result": [{"id": 4, "name": None}],
+            },
+            {
+                "stage_id": 0,
+                "replica_id": 1,
+                "result": [{"id": 8, "name": "style-b"}],
+            },
+            {
+                "stage_id": 0,
+                "replica_id": 0,
+                "result": [{"id": 7, "name": "style-a"}],
+            },
+        ]
+
+    omni.collective_rpc = rpc
+    assert await omni.get_lora_inventory() == [
+        {
+            "stage_id": 0,
+            "model_stage": "thinker",
+            "replicas": [
+                {"replica_id": 0, "adapters": [{"id": 7, "name": "style-a"}]},
+                {"replica_id": 1, "adapters": [{"id": 8, "name": "style-b"}]},
+            ],
+        },
+        {
+            "stage_id": 1,
+            "model_stage": "denoise",
+            "replicas": [{"replica_id": 0, "adapters": [{"id": 4, "name": None}]}],
+        },
+    ]
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_get_lora_inventory_rejects_failed_replica_query():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_id=0, model_stage="thinker")],
+        stage_metadata=[],
+    )
+
+    async def rpc(**_kwargs):
+        return [
+            {
+                "stage_id": 0,
+                "replica_id": 0,
+                "result": {"supported": False, "error": "worker unavailable"},
+            }
+        ]
+
+    omni.collective_rpc = rpc
+    with pytest.raises(RuntimeError, match="LoRA inventory RPC failed"):
+        await omni.get_lora_inventory()
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_get_lora_inventory_rejects_malformed_replica_envelope():
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_id=0, model_stage="thinker")],
+        stage_metadata=[],
+    )
+
+    async def rpc(**_kwargs):
+        return [{"stage_id": 0, "replica_id": 0}]
+
+    omni.collective_rpc = rpc
+    with pytest.raises(RuntimeError, match="invalid stage result envelope"):
+        await omni.get_lora_inventory()
+
+
+@pytest.mark.cpu
+def test_lora_inventory_record_normalization_deduplicates_conflicting_ranks():
+    assert merge_lora_adapter_records([[{"id": 3, "name": "first"}], [{"id": 3, "name": "second"}, 5]]) == [
+        {"id": 3, "name": None},
+        {"id": 5, "name": None},
+    ]
 
 
 @pytest.mark.cpu
