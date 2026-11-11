@@ -43,6 +43,15 @@ def _cfg_parallel_world_size() -> int:
     return get_classifier_free_guidance_world_size()
 
 
+def _separate_cfg_on_this_rank(runs_cfg: bool) -> bool:
+    """Return whether this rank runs both CFG branches, i.e. two transformer calls per step.
+
+    Shared by ``resolve_has_separate_cfg`` (CFG declared per model) and ``set_separate_cfg``
+    (CFG decided per request) so the two cannot drift apart.
+    """
+    return runs_cfg and _cfg_parallel_world_size() == 1
+
+
 def resolve_has_separate_cfg(has_separate_cfg: bool) -> bool:
     """Return the ``has_separate_cfg`` value to hand Cache-DiT on this rank.
 
@@ -57,15 +66,13 @@ def resolve_has_separate_cfg(has_separate_cfg: bool) -> bool:
     ``CFGParallelMixin`` rejects that topology while Cache-DiT is active (see
     ``_cache_dit_one_call_per_cfg_rank``).
     """
-    if not has_separate_cfg:
-        return False
-    cfg_world_size = _cfg_parallel_world_size()
-    if cfg_world_size == 1:
+    if _separate_cfg_on_this_rank(has_separate_cfg):
         return True
-    logger.info(
-        "CFG parallel (size %d) runs one branch per rank: Cache-DiT uses has_separate_cfg=False",
-        cfg_world_size,
-    )
+    if has_separate_cfg:
+        logger.info(
+            "CFG parallel (size %d) runs one branch per rank: Cache-DiT uses has_separate_cfg=False",
+            _cfg_parallel_world_size(),
+        )
     return False
 
 
@@ -137,11 +144,12 @@ def set_separate_cfg(transformer: nn.Module, do_true_cfg: bool) -> None:
     """
     if not BlockAdapter.is_cached(transformer):
         return
-    # Same rule as resolve_has_separate_cfg, without its log line: this runs once per request.
-    enable_separate_cfg = do_true_cfg and _cfg_parallel_world_size() == 1
+    # This runs once per request, so keep the rebuilt context out of the log. verbose=False is
+    # cache-dit's default; it is passed explicitly so a change of default cannot make it noisy.
     cache_dit.refresh_context(
         transformer,
-        cache_config=DBCacheConfig().reset(enable_separate_cfg=enable_separate_cfg),
+        cache_config=DBCacheConfig().reset(enable_separate_cfg=_separate_cfg_on_this_rank(do_true_cfg)),
+        verbose=False,
     )
 
 
