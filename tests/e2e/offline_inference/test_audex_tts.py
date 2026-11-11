@@ -13,6 +13,7 @@ import os
 
 import numpy as np
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import concat_audio
@@ -139,7 +140,7 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
+def test_audex_offline_cfg_disabled_matches_baseline(omni_runner: OmniRunner, run_level: str) -> None:
     """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""
     prompt = build_cond_prompt(SYNTH_TEXTS[1])
 
@@ -158,4 +159,10 @@ def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, r
     assert base_audio.shape == disabled_audio.shape, (
         f"cfg_scale=1.0 changed output length: {base_audio.shape} vs {disabled_audio.shape}"
     )
-    np.testing.assert_array_equal(base_audio, disabled_audio)
+    if current_platform.is_rocm():
+        # Repeated ROCm decoding can differ by a few float32 rounding units.
+        # Keep the bound far below an audible amplitude while preserving the
+        # byte-identical CUDA contract.
+        np.testing.assert_allclose(base_audio, disabled_audio, rtol=0.0, atol=5e-7)
+    else:
+        np.testing.assert_array_equal(base_audio, disabled_audio)
