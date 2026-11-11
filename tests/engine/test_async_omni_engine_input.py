@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from transformers import LlamaConfig
+from vllm.config import ModelConfig, VllmConfig
+from vllm.inputs.engine import tokens_input
+from vllm.pooling_params import PoolingParams
+from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
@@ -16,6 +24,8 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.messages import AddCompanionRequestMessage, StageSubmissionMessage
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -131,6 +141,32 @@ def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+def test_build_add_request_message_normalizes_watermark_opt_out():
+    """Ensure disabling watermark is handled consistently across multistage pipelines."""
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+        StageRuntimeInfo(final_output=True, final_output_type="audio", stage_type="diffusion"),
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+    ]
+    params = [SamplingParams(watermarking=False), OmniDiffusionSamplingParams(watermarking=True), PoolingParams()]
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=_make_engine_core_request(),
+        sampling_params_list=params,
+        final_stage_id=1,
+    )
+
+    # Since we disabled watermarking on one stage, all stages should disabled watermark, but the
+    # original request params should not be mutated, since doing so could mutate model default
+    # sampling params and leak into future requests. Pooling stages never watermark.
+    llm_params, diffusion_params, pooling_params = msg.sampling_params_list
+    assert not llm_params.watermarking and not diffusion_params.watermarking
+    assert pooling_params is params[2]
+    assert [params[0].watermarking, params[1].watermarking] == [False, True]
 
 
 def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
@@ -377,6 +413,43 @@ def _replica(input_addr: str) -> ReplicaInfo:
     )
 
 
+@pytest.mark.parametrize(
+    ("stage1_vllm_config", "returns_payload"),
+    [
+        (None, False),  # Currently this is the case for diffusion
+        (SimpleNamespace(model_config=SimpleNamespace(stage_id=1, requires_full_payload_input=True)), True),
+    ],
+)
+def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_stage(
+    mocker: MockerFixture, stage1_vllm_config: SimpleNamespace | None, returns_payload: bool
+):
+    """Ensure a run request's entry stage returns its payload only when the next stage takes a full payload."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params, params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [
+        StagePool(0, [_FakeStageClient()]),
+        StagePool(1, [_FakeStageClient()], stage_vllm_config=stage1_vllm_config),
+    ]
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1, 1, 1]},
+        sampling_params_list=[params, params],
+        final_stage_id=1,
+        yield_stage_id=0,
+        requested_replica_id=0,
+    )
+
+    assert returns_stage_payload(msg.prompt.additional_information) is returns_payload
+    assert msg.requested_replica_id == 0
+
+
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
@@ -411,6 +484,62 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
+
+
+def test_explicit_replica_scopes_mm_uuids_without_frontend_reservation(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    pool = engine.stage_pools[0]
+    select_replica = mocker.patch.object(
+        pool,
+        "select_replica_id",
+        side_effect=AssertionError("explicit routing must not run frontend replica selection"),
+    )
+
+    msg = engine._build_add_request_message(
+        request_id="req-explicit",
+        prompt={"prompt": "describe", "multi_modal_data": {"image": "image-a"}},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        requested_replica_id=1,
+    )
+
+    assert msg.requested_replica_id == 1
+    assert len(seen_uuids) == 1
+    assert seen_uuids[0].startswith("stage0:rep1:")
+    select_replica.assert_not_called()
+    assert pool._requested_replica_ids == {}
+    assert pool.get_bound_replica_id("req-explicit") is None
+
+
+@pytest.mark.parametrize("requested_replica_id", [99, 1])
+def test_invalid_explicit_replica_rejected_before_multimodal_preprocess(
+    mocker: MockerFixture,
+    requested_replica_id: int,
+):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    pool = engine.stage_pools[0]
+    if requested_replica_id == 1:
+        pool.mark_replica_unavailable(1)
+    prompt = {"prompt": "describe", "multi_modal_data": {"image": "image-a"}}
+
+    with pytest.raises(
+        OmniClientError,
+        match=rf"replica_id {requested_replica_id} does not exist or is not available",
+    ):
+        engine._build_add_request_message(
+            request_id="req-invalid-explicit",
+            prompt=prompt,
+            sampling_params_list=[params],
+            final_stage_id=0,
+            requested_replica_id=requested_replica_id,
+        )
+
+    engine.input_processor.process_inputs.assert_not_called()
+    assert seen_uuids == []
+    assert "multi_modal_uuids" not in prompt
+    assert pool._requested_replica_ids == {}
 
 
 def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
@@ -820,3 +949,23 @@ def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):
         == []
     )
     engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_input_processor_preserves_request_id(tmp_path: Path):
+    """Ensure stage requests keep the orchestrator request id; this ensures that requests
+    going through paths hitting vLLM's process_inputs, e.g., _build_next_stage_request,
+    don't change the request ID, which is important for keeping the orchestrator and engine
+    request IDs aligned.
+    """
+    req_id = "req-1"
+    LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(tmp_path)
+    vllm_config = VllmConfig(model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True))
+    processor = InputProcessor(vllm_config, renderer_from_config(vllm_config))
+    request = processor.process_inputs(
+        req_id,
+        tokens_input([1, 2, 3]),
+        SamplingParams(max_tokens=1),
+        ("generate",),
+    )
+
+    assert request.request_id == req_id

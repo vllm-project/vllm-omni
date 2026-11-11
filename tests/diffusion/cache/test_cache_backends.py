@@ -27,6 +27,8 @@ from vllm_omni.diffusion.cache.cachedit import (
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache.backend import enable_ming_image_teacache
+from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -480,6 +482,35 @@ class TestTeaCacheBackend:
 
         TeaCacheBackend(DiffusionCacheConfig()).enable(pipeline)
         assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.2
+
+    @pytest.mark.parametrize(
+        "is_layer_decomposition, default_threshold, coefficient_key",
+        [
+            (False, 0.3, "MingImageTransformer2DModel"),
+            (True, 0.13, "MingImageTransformer2DModel:Design-Layer"),
+        ],
+        ids=["design", "design_layer"],
+    )
+    @pytest.mark.parametrize("threshold", [None, 0.25], ids=["default_threshold", "explicit_threshold"])
+    @pytest.mark.parametrize(
+        "coefficients",
+        [None, [1.0, 2.0, 3.0, 4.0, 5.0]],
+        ids=["default_coefficients", "custom_coefficients"],
+    )
+    def test_ming_image_enabler_resolves_variant_config(
+        self, mocker, is_layer_decomposition, default_threshold, coefficient_key, threshold, coefficients
+    ):
+        pipeline = SimpleNamespace(transformer=object(), is_layer_decomposition=is_layer_decomposition)
+        apply_hook = mocker.patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+        config = DiffusionCacheConfig(rel_l1_thresh=threshold, coefficients=coefficients)
+
+        enable_ming_image_teacache(pipeline, config)
+
+        resolved_config = apply_hook.call_args.args[1]
+        assert resolved_config.rel_l1_thresh == (default_threshold if threshold is None else threshold)
+        assert resolved_config.coefficients == (
+            _MODEL_COEFFICIENTS[coefficient_key] if coefficients is None else coefficients
+        )
 
     @pytest.mark.parametrize("partition", ["fl2va", "combined"])
     @pytest.mark.parametrize(

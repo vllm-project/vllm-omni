@@ -12,7 +12,25 @@ steps:
     steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
+        env:
+          QWEN3_OMNI_PROCESSOR_REQUIRED: "1"
         commands:
+          # Cache only the pinned processor/tokenizer; pytest stays local-only.
+          - |
+            python - <<'PY'
+            from transformers import AutoProcessor
+            from tests.model_executor.models.qwen3_omni.test_duplex_context_view_processor import (
+                PROCESSOR_MODEL,
+                PROCESSOR_REVISION,
+            )
+
+            AutoProcessor.from_pretrained(
+                PROCESSOR_MODEL,
+                revision=PROCESSOR_REVISION,
+                local_files_only=False,
+                trust_remote_code=False,
+            )
+            PY
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
@@ -23,7 +41,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 25
         commands:
           - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
@@ -34,6 +52,15 @@ steps:
           - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
+      # AMD READY R2-01 is non-blocking, so fail the change that moves its
+      # pinned collection here. Some parametrizations need a visible GPU.
+      - label: "Simple · ROCm R2-01 Collection Count"
+        timeout_in_minutes: 10
+        source_file_dependencies: amd_ready_r2_01_collection
+        commands:
+          - "python3 .buildkite/amd/scripts/run_collection_guard.py .buildkite/amd/test-amd-ready.yml 'ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t'"
+        mirror_hardwares: l4_1
+
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-ready-pipeline
     steps:
@@ -41,6 +68,8 @@ steps:
       - label: "Diffusion · FlashAttention Test"
         timeout_in_minutes: 20
         commands:
+          - uv pip install --system --no-deps 'fastvideo-kernel==0.3.4'
+          - python3 -c 'from fastvideo_kernel.block_sparse_attn import block_sparse_attn_triton'
           - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
@@ -127,6 +156,18 @@ steps:
         "
     mirror_hardwares: l4_1
 
+  - label: "CUDA IPC Weight Sharing · 2-GPU"
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 15
+    source_file_dependencies:
+      - "vllm_omni/distributed/weight_sharing/"
+      - "tests/distributed/weight_sharing/"
+      - "tests/helpers/mark.py"
+      - ".buildkite/cuda/test-ready.yml"
+    commands:
+      - pytest -sv tests/distributed/weight_sharing/test_cuda_ipc_pairing.py -m 'core_model and cuda and L4 and cards_2' --run-level 'core_model'
+    mirror_hardwares: l4_2
+
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
     # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
@@ -165,10 +206,11 @@ steps:
 
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function
+        timeout_in_minutes: 40
         commands:
           - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py -m 'core_model' --run-level 'core_model'
+            timeout 35m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_2
 
@@ -190,12 +232,13 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      # The live client waits for a learned turn terminator; use real weights.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         commands:
           - |
             timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
 
@@ -223,6 +266,13 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "TTS · CosyVoice3 DSpark Test"
+        source_file_dependencies: tts_cosyvoice3_function
+        timeout_in_minutes: 30
+        commands:
+          - timeout 25m pytest -s -v tests/e2e/online_serving/test_cosyvoice3_dspark.py -m 'advanced_model and cuda' --run-level advanced_model
+        mirror_hardwares: l4_1
+
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
         commands:
@@ -243,16 +293,6 @@ steps:
             "
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · Cosmos3 Test"
-        source_file_dependencies: diffusion_cosmos3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_cosmos3.py -m 'core_model' --run-level 'core_model'
-            "
-        mirror_hardwares: h100_1
-
       - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
         timeout_in_minutes: 90
         source_file_dependencies: diffusion_minimax_h3_function
@@ -266,11 +306,12 @@ steps:
 
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
+        timeout_in_minutes: 55
         commands:
           - |
-            timeout 40m bash -c "
+            timeout 50m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_qwen_image.py tests/e2e/features/rlhf_test/test_qwen_image_merged_lora.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
 
@@ -291,5 +332,40 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
+      # the model is available in CI (no public HF repo yet).
+      - label: "Diffusion · Flux3 Test (T2I, L4)"
+        source_file_dependencies: diffusion_flux3_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
+            "
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
+      # the model is available in CI (no public HF repo yet).
+      - label: "Diffusion · Flux3 Test (T2I, H100)"
+        source_file_dependencies: diffusion_flux3_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

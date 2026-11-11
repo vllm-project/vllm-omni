@@ -33,6 +33,57 @@ The bundled Qwen3-Omni setup explicitly sets `moe_backend: triton` for the Think
 both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashInfer CUTLASS unquantized MoE path on
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
+On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled on CUDA; NPU keeps it disabled by default (set `enable_prefix_caching: true` on stage 0 to opt in). Talker and Code2Wav keep it disabled.
+The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
+XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
+
+On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
+automatically runs Code2Wav in FP32 when its configured precision resolves to
+BF16 or FP16. This avoids incorrect low-precision convolutions that can make
+streaming audio quiet or distorted at certain decode window lengths
+([#8935](https://github.com/vllm-project/vllm-omni/issues/8935)). The fallback
+also covers the optional first-frame decoder inside the Talker; Thinker and
+Talker generation retain their configured precision. It takes effect before
+weight loading and CUDA Graph capture, and logs a warning at startup.
+
+The automatic guard matches **exactly cuDNN 9.20.0** (runtime version `92000`),
+the version reported in the issue. Other versions retain the configured
+precision; this is not a claim that all other versions are unaffected. The
+issue reports successful tests with 9.21.0.82 and 9.24.0.43, but NVIDIA's
+[9.21 release notes](https://docs.nvidia.com/deeplearning/cudnn/backend/v9.21.0/release-notes.html)
+do not explicitly identify this Conv1d numerical issue as fixed.
+
+The fallback also overrides an **explicit** BF16/FP16 stage dtype. To retain
+the requested precision, set the boolean `codec_cudnn_fp32_fallback: false`
+in the connector's `extra` settings. For example, save this as `deploy.yaml`
+and launch with `--deploy-config deploy.yaml`:
+
+```yaml
+base_config: /absolute/path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      codec_cudnn_fp32_fallback: false
+```
+
+Use the MRv2 deployment as `base_config` if that is your existing profile.
+The bundled profiles share this connector definition, so the setting reaches
+both the Code2Wav stage and the Talker's optional decoder copy. For custom
+profiles with different connectors, set it on the incoming connector used by
+each of those stages. Disabling the fallback can reintroduce the reported
+audio corruption; only do so after validating your stack and decode windows.
+
+FP32 increases Code2Wav memory use; latency depends on the selected kernels.
+The Instruct checkpoint's 216,016,577 Code2Wav parameters occupy about 412 MiB
+in BF16/FP16 and 824 MiB in FP32, an increase of 412 MiB **per decoder copy**.
+The default profile loads one copy. Profiles enabling Talker first-frame audio
+load a second copy, adding another 412 MiB to the Talker process. Activations,
+cuDNN workspace and CUDA Graph pools need additional memory; these weight-only
+figures do not establish the peak memory or that a deployment fits its budgets.
+
+For releases without this automatic fallback, the default separate Code2Wav
+stage can be run in FP32 with
+`--stage-overrides '{"2": {"dtype": "float32"}}'`.
 
 For Thinker pipeline parallelism, configure `pipeline_parallel_size` and `devices`
 on the Thinker stage. Keep Talker and Code2Wav at `pipeline_parallel_size: 1`. The
@@ -56,6 +107,23 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
+
+### Thinking checkpoint chat template
+
+Serving `Qwen/Qwen3-Omni-30B-A3B-Thinking` with function tools through
+`/v1/chat/completions` or the turn-based `/v1/realtime` endpoint requires the
+compatibility chat template bundled with vLLM-Omni. From a source checkout:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/qwen3_omni_thinking.jinja \
+    --reasoning-parser qwen3 \
+    --tool-call-parser hermes \
+    --enable-auto-tool-choice
+```
+
+For an installed package, substitute the path to `qwen3_omni_thinking.jinja`
+inside its `vllm_omni/transformers_utils/chat_templates` directory.
 
 ### Launch individual stages (stage-based CLI)
 
@@ -261,7 +329,10 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 This Web UI demo allows users to interact with the model through a web browser.
 

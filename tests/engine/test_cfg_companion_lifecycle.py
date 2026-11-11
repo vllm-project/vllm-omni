@@ -81,6 +81,7 @@ class _FakePool:
     def __init__(self, stage_type: str = "diffusion") -> None:
         self.stage_type = stage_type
         self.final_output = False
+        self.stage_vllm_config = None
         self.stage_client = SimpleNamespace(requires_multimodal_data=False, custom_process_input_func=None)
         self.aborted: list[list[str]] = []
         self.submitted: list[str] = []
@@ -122,13 +123,14 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
 def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         final_stage_id=final_stage_id,
+        yield_stage_id=None,
         stage_submit_ts={},
         sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
         streaming=SimpleNamespace(enabled=False, segment_finished=False),
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
-        duplex_identity=None,
+        trace=None,
     )
 
 

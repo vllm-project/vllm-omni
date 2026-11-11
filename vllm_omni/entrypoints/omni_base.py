@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.config.profiler import validate_profile_iteration_bounds
+from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -170,8 +173,11 @@ class OmniBase(PDDisaggregationMixin):
     def __init__(
         self,
         model: str,
+        watermark_config: WatermarkConfig | None = None,
         **kwargs: Any,
     ) -> None:
+        if watermark_config is not None and not isinstance(watermark_config, WatermarkConfig):
+            raise TypeError("watermark_config must be a WatermarkConfig; use --watermark-config for CLI JSON")
         if "engine_args" in kwargs:
             logger.warning(
                 "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
@@ -222,6 +228,7 @@ class OmniBase(PDDisaggregationMixin):
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
             collect_stage_metrics=collect_stage_metrics,
+            watermark_config=watermark_config,
             **kwargs,
         )
         self._shutdown_called = False
@@ -509,10 +516,13 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
+            if msg.request_id is not None and msg.request_id not in self.request_states:
+                # Ignore queued errors from completed or cancelled requests.
+                return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
-            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
+            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, getattr(msg, "type"))
             return True, None, None, None
 
         req_id = msg.request_id
@@ -547,6 +557,8 @@ class OmniBase(PDDisaggregationMixin):
 
     def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
         """Raise the exception for a non-fatal, request-scoped error message."""
+        if msg.mm_cache_miss_hashes and msg.status_code == 503 and msg.error_type == "ServiceUnavailableError":
+            raise RetryableRequestError(msg.error)
         raise_client_error_or(
             msg.error,
             status_code=msg.status_code,
@@ -783,6 +795,10 @@ class OmniBase(PDDisaggregationMixin):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -791,11 +807,34 @@ class OmniBase(PDDisaggregationMixin):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Returns:
             List of results from each stage.
         """
-        return self.engine.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        kwargs: dict[str, Any] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
+        # Omit kwargs when unset so existing profile RPC call shapes stay stable.
+        if kwargs:
+            return self.engine.collective_rpc(
+                method="profile",
+                args=(True, profile_prefix),
+                kwargs=kwargs,
+                stage_ids=stages,
+            )
+        return self.engine.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            stage_ids=stages,
+        )
 
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.

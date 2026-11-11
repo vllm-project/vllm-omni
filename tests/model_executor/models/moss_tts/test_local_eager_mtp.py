@@ -20,7 +20,7 @@ pytestmark = pytest.mark.core_model
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ]
 )
 def device(request):
@@ -124,7 +124,6 @@ def test_unmarked_decode_row_ignores_stale_slot_state(device):
 def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatch, mocker):
     """The Local config must not enable the parent's incompatible eager hook."""
     from vllm_omni.worker_v2 import omni_ar_model_runner as runner_module
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
@@ -135,8 +134,8 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     def initialize_parent(state, *args):
         state.__dict__.update(template.__dict__)
-        state._eager_mtp, state._eager_rows = False, None
-        state._eager_state = EagerMTPState(state)
+        state._has_mtp = False
+        state._mtp_state.owner = state
 
     monkeypatch.setattr(OmniModelState, "__init__", initialize_parent)
     state = MossLocalModelState(SimpleNamespace(), model, None, device)
@@ -146,7 +145,7 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
     computed, prompt = np.zeros(5, dtype=np.int32), np.zeros(5, dtype=np.int32)
     prompt[0] = 2
     _step(state, batch, SimpleNamespace(prompt_len=prompt, num_computed_tokens=computed))
-    hook = mocker.spy(state, "run_eager_mtp")
+    hook = mocker.spy(state, "post_sample")
 
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.execute_model_state = SimpleNamespace(
@@ -187,5 +186,5 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     assert runner.sample_tokens(None) is mock_out
     hook.assert_called_once()
-    assert state._eager_mtp is False and state._eager_rows is None
+    assert state._has_mtp is False
     assert state._local_eager_mtp is True

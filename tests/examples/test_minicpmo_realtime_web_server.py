@@ -56,6 +56,13 @@ def test_build_app_serves_health_and_injected_client_config():
     assert "__FULL_DUPLEX_CONFIG__" not in index.text
 
 
+def test_qwen_semantic_vad_mode_is_injected_and_restricted_to_qwen():
+    client = TestClient(build_app(profile="qwen3-turn", turn_mode="semantic_vad"))
+    assert '"turnMode": "semantic_vad"' in client.get("/").text
+    with pytest.raises(ValueError, match="requires --profile qwen3-turn"):
+        build_app(profile="minicpm-native", turn_mode="semantic_vad")
+
+
 def test_build_app_injects_public_realtime_url():
     public_realtime_url = "wss://proxy.example.test/backend/v1/realtime"
     app = build_app(

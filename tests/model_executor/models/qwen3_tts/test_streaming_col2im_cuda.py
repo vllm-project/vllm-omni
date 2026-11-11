@@ -12,7 +12,7 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch,frames,channels,rate", [(1, 1, 5, 2), (3, 3, 129, 3), (9, 1, 64, 4)])
 def test_col2im_partial_tiles_and_reordered_slot_state(batch: int, frames: int, channels: int, rate: int):
     torch.manual_seed(23)
