@@ -12,7 +12,25 @@ steps:
     steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
+        env:
+          QWEN3_OMNI_PROCESSOR_REQUIRED: "1"
         commands:
+          # Cache only the pinned processor/tokenizer; pytest stays local-only.
+          - |
+            python - <<'PY'
+            from transformers import AutoProcessor
+            from tests.model_executor.models.qwen3_omni.test_duplex_context_view_processor import (
+                PROCESSOR_MODEL,
+                PROCESSOR_REVISION,
+            )
+
+            AutoProcessor.from_pretrained(
+                PROCESSOR_MODEL,
+                revision=PROCESSOR_REVISION,
+                local_files_only=False,
+                trust_remote_code=False,
+            )
+            PY
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
@@ -32,6 +50,15 @@ steps:
         timeout_in_minutes: 20
         commands:
           - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
+        mirror_hardwares: l4_1
+
+      # AMD READY R2-01 is non-blocking, so fail the change that moves its
+      # pinned collection here. Some parametrizations need a visible GPU.
+      - label: "Simple · ROCm R2-01 Collection Count"
+        timeout_in_minutes: 10
+        source_file_dependencies: amd_ready_r2_01_collection
+        commands:
+          - "python3 .buildkite/amd/scripts/run_collection_guard.py .buildkite/amd/test-amd-ready.yml 'ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t'"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
@@ -298,5 +325,40 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
+      # the model is available in CI (no public HF repo yet).
+      - label: "Diffusion · Flux3 Test (T2I, L4)"
+        source_file_dependencies: diffusion_flux3_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
+            "
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
+      # the model is available in CI (no public HF repo yet).
+      - label: "Diffusion · Flux3 Test (T2I, H100)"
+        source_file_dependencies: diffusion_flux3_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

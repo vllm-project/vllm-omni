@@ -54,6 +54,7 @@ from vllm_omni.worker_v2.warmup import is_warmup_request
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
 logger = init_logger(__name__)
@@ -373,6 +374,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return plane.attach_omni_connector_output(output)
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
+        # Shared weights allow only one load attempt per worker lifetime.
+        # Reload requires full sharing-group teardown and worker recreation.
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A weight-sharing load was already attempted; tear down the sharing group before retrying."
+            )
         import vllm.v1.worker.gpu.model_runner as _mr_module
 
         def _init_model_state(vllm_config: Any, model: Any, encoder_cache: Any, device: Any) -> Any:
@@ -414,6 +421,74 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ):
             self.supports_mm_inputs = False
             self.encoder_cache = None
+
+        self._publish_shared_backbone_if_configured()
+        # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
+        # V2 does not use the V1 MoE annotate/select hooks, so this is the
+        # fail-fast for Mammoth FULL + use_v2_model_runner mismatches (#9911).
+        from vllm_omni.cudagraph.moe_routing_compat import (
+            ensure_moe_specialty_runner_compatible,
+        )
+
+        ensure_moe_specialty_runner_compatible(self)
+
+    def reload_weights(self, *args: Any, **kwargs: Any) -> None:
+        """Preserve upstream reload arguments, but reject updates to shared weights."""
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A weight-sharing load was already attempted; "
+                "weight updates require full sharing-group teardown and worker recreation."
+            )
+        super().reload_weights(*args, **kwargs)
+
+    def _publish_shared_backbone_if_configured(self) -> None:
+        """Publish finalized AR backbone weights when this rank is a provider.
+
+        The startup layer attaches a ``SharedWeightGroupConfig`` to
+        ``self.vllm_config`` as ``weight_sharing`` before model load.  This hook
+        runs after the model and all post-load transforms are complete and keeps
+        both the backend and the ``ExportSession`` alive for step-3 lifecycle.
+
+        Provider publishing is wired only on the Model Runner V2 path
+        (:class:`OmniGPUModelRunner`); an AR stage must run on MRv2 to publish.
+        """
+        group = getattr(self.vllm_config, "weight_sharing", None)
+        if group is None or getattr(group, "role", None) != "provider":
+            return
+        if getattr(self, "_weight_share_session", None) is not None:
+            return  # Already published; step-3 owns teardown, do not re-export.
+        if getattr(self, "_weight_share_backend", None) is not None:
+            raise RuntimeError(
+                "A previous weight-sharing publish attempt did not complete; "
+                "tear down the sharing group before retrying."
+            )
+        get_adapter = getattr(self.model, "get_weight_sharing_adapter", None)
+        if not callable(get_adapter):
+            raise ValueError(
+                f"weight sharing requested for a provider rank, but {type(self.model).__name__} "
+                "has no get_weight_sharing_adapter hook"
+            )
+        adapter: WeightSharingAdapter = get_adapter()
+        from vllm_omni.distributed.weight_sharing import TorchIpcBackend
+        from vllm_omni.platforms import current_omni_platform
+
+        device_index = current_omni_platform.current_device()
+        expected_device = current_omni_platform.get_torch_device(device_index)
+        if self.device.type not in ("cpu", "meta") and (
+            self.device.type != expected_device.type or self.device.index not in (None, device_index)
+        ):
+            raise ValueError(
+                f"Weight-sharing target device {self.device} does not match current device {expected_device}"
+            )
+        backend = TorchIpcBackend()
+        # Retain partial exports and their diagnostics if publish raises. The
+        # session ID remains queryable once the backend registers the session.
+        self._weight_share_backend = backend
+        self._weight_share_session_id = group.session_id
+        self._weight_share_session = adapter.publish_backbone(
+            backend, self.model, group=group, device_index=device_index
+        )
+        logger.info("Published shared backbone weights for sharing group %s", getattr(group, "group_id", None))
 
     def _adopt_model_logits_vocab(self, model: Any) -> None:
         vocab = getattr(model, "logits_vocab_size", None)
