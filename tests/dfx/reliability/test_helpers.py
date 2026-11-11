@@ -400,6 +400,76 @@ float16 = object()
     assert completed.stdout.rstrip().endswith("DONE")
 
 
+def test_sidecar_accepts_small_reported_residual_without_allocator_rejection(tmp_path: Path) -> None:
+    (tmp_path / "torch.py").write_text(
+        """
+_MIB = 1024 * 1024
+
+
+class _DeviceProperties:
+    total_memory = 1024 * _MIB
+
+
+class _Chunk:
+    def __init__(self, elements):
+        self._elements = elements
+
+    def numel(self):
+        return self._elements
+
+
+class _Cuda:
+    initial_free = 800 * _MIB
+    allocated = 0
+
+    @staticmethod
+    def init():
+        pass
+
+    @staticmethod
+    def set_device(device):
+        pass
+
+    @staticmethod
+    def get_device_properties(device):
+        return _DeviceProperties()
+
+    @staticmethod
+    def mem_get_info(device):
+        reporting_reserve = 2 * _MIB if _Cuda.allocated else 0
+        return _Cuda.initial_free - _Cuda.allocated + reporting_reserve, 1024 * _MIB
+
+
+def empty(shape, **kwargs):
+    requested = shape[0] * 2
+    _Cuda.allocated += requested
+    return _Chunk(shape[0])
+
+
+cuda = _Cuda()
+float16 = object()
+""",
+        encoding="utf-8",
+    )
+    command = helpers._build_sidecar_cmd(0, 0.95, 1, False, 32 * 1024 * 1024)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(path for path in (str(tmp_path), env.get("PYTHONPATH", "")) if path)
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "free_after=35651584" in completed.stdout
+    assert "READY:" in completed.stdout
+    assert completed.stdout.rstrip().endswith("DONE")
+
+
 def test_stage_config_device_spec_uses_inherited_platform_devices(tmp_path: Path) -> None:
     pytest.importorskip("vllm")
     base = tmp_path / "base.yaml"

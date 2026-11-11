@@ -309,13 +309,14 @@ if strict and not rejected:
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-# A full device is readiness, even when the byte target was not met. Once the
-# allocator rejects the smallest tail allocation, allow a few MiB of reported
-# allocator reserve above an explicit ceiling.
+# A full device is readiness, even when the byte target was not met. Allow a
+# few MiB of reported allocator reserve above an explicit ceiling. This can
+# remain after an exact target allocation even when non-strict callers do not
+# probe until allocator rejection.
 if max_free_bytes is None:
     residual_floor = 64 * 1024 * 1024
 else:
-    residual_floor = max_free_bytes + (_OOM_RESIDUAL_SLACK_BYTES if rejected else 0)
+    residual_floor = max_free_bytes + _OOM_RESIDUAL_SLACK_BYTES
 allocator_full = rejected and int(free_after) <= residual_floor
 ratio_target_missed = strict and allocated < ratio_target_bytes and not allocator_full
 free_ceiling_missed = max_free_bytes is not None and int(free_after) > residual_floor
