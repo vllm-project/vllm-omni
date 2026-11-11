@@ -556,7 +556,7 @@ The optimizations stacked by the recommended configurations above:
    kernel selected through `MINDIE_SD_FA_TYPE`, carried by the FLASH_ATTN
    backend with a mask-free packed varlen path and K/V prefix slicing driven
    by the packed `cu_seqlens` metadata.
-2. Ascend-friendly fused operators: RMSNorm, AddRMSNorm, GQA, SwiGLU, and
+2. Ascend-friendly fused operators: RMSNorm, opt-in AddRMSNorm, GQA, SwiGLU, and
    rotary position embedding from MindIE-SD.
 3. RainFusion block-sparse attention, optionally with EQBSA mixed INT8/FP8
    precision — see
@@ -566,6 +566,23 @@ The optimizations stacked by the recommended configurations above:
 5. Parallelism: USP, text-encoder TP, and native VAE `tile` patch
    parallelism, plus distributed layerwise offload.
 6. Post-training: few-step distillation via the FlashGen online LoRA.
+
+### Text-encoder RMSNorm precision
+
+`enable_fused_add_norm` is an NPU `RMSNorm.forward_npu` argument in model code,
+not a serving CLI flag:
+
+| Value | Behavior | Median text-encoder latency |
+| --- | --- | ---: |
+| `False` (default) | BF16 residual add, then RMSNorm; preserves reference rounding | 39.63 ms |
+| `True` | Fused AddRMSNorm; can change BF16 rounding and generated video output | 39.54 ms |
+
+Keep `False` for reference consistency; validate output quality before using
+`True`. The reported timings use one Ascend 950PR, BF16, TP=1, and 30 tokens,
+with 20 interleaved pairs after three warmups per mode. The paired increase
+with `False` was 0.083 ms (+0.21%); its 95% interval was -0.24 to +0.39 ms,
+so this run showed no clear latency difference. Timing excludes tokenization,
+model loading, and video generation. See [measurement details](https://github.com/vllm-project/vllm-omni/pull/10141).
 
 ## Benchmarks (Atlas 800I A2 / A3)
 
