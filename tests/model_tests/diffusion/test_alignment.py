@@ -147,6 +147,9 @@ EXCLUDED_MODELS = [
     # tests/e2e/online_serving/test_flux3.py (FLUX3_MODEL_PATH) instead of the
     # common tiny-model suite.
     "Flux3Pipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
+    "PAN2ModularPipeline",
 ]
 
 
