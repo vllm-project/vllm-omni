@@ -14,7 +14,11 @@ from vllm.config import VllmConfig
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.schedule import AttentionSchedule, select_attention_profile
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    require_attention_schedule_fits,
+    select_attention_profile,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
@@ -55,6 +59,8 @@ class ForwardContext:
     # Bound request schedule. None means unbound. () disables. A non-empty tuple
     # selects prepared profiles while a denoise step is published.
     attention_schedule: AttentionSchedule | None = None
+    # Whether the bound schedule is the request's own rather than an inherited service default.
+    attention_schedule_from_request: bool = False
     # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
     # every scheduled layer in one step reads it instead of selecting again.
     _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
@@ -302,16 +308,20 @@ def override_paged_kv_adapter(adapter: Any | None):
 
 
 @contextmanager
-def bind_attention_schedule(schedule: AttentionSchedule | None):
-    """Install one request schedule and restore the previous one on any exit."""
+def bind_attention_schedule(schedule: AttentionSchedule | None, *, from_request: bool = False):
+    """Install one request schedule and restore the previous one on any exit.
+
+    ``from_request`` marks ranges the request sent itself; begin_scheduled_denoise checks only those.
+    """
     if _forward_context is None:
         raise RuntimeError("bind_attention_schedule requires an active forward context")
-    previous = _forward_context.attention_schedule
+    previous = _forward_context.attention_schedule, _forward_context.attention_schedule_from_request
     _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_schedule_from_request = from_request
     try:
         yield
     finally:
-        _forward_context.attention_schedule = previous
+        _forward_context.attention_schedule, _forward_context.attention_schedule_from_request = previous
 
 
 def get_attention_schedule_profile() -> str | None:
@@ -344,6 +354,42 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
+
+
+def begin_scheduled_denoise(total_steps: int) -> int | None:
+    """Check the request's own bound schedule against one denoise sequence before its first forward.
+
+    An inherited service default is not checked: it serves requests of any length, and a range that
+    ends after this sequence applies up to its last step.
+    Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
+    publishes a total only for schedules passes the result through, so an unscheduled run
+    keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
+    Call it once per sequence that restarts at step 0.
+    """
+    if _forward_context is None or not _forward_context.attention_schedule:
+        return None
+    if _forward_context.attention_schedule_from_request:
+        require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    return total_steps
+
+
+@contextmanager
+def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
+    """Clear the step, timestep and total a scheduled denoise loop published, on any exit of the loop.
+
+    ``total_steps`` is the result of ``begin_scheduled_denoise``. Work after the loop, such as VAE
+    decode, runs outside the denoise schedule, and a forward that raises mid-loop leaves no step
+    published either. Without a schedule (None) the context is left as the loop left it.
+    Unlike HunyuanImage-3.0's ``_clear_denoise_progress_on_exit``, which restores the timestep and
+    total on every run, this keeps unscheduled Wan2.2 runs unchanged; do not merge the two.
+    """
+    try:
+        yield
+    finally:
+        if total_steps is not None and _forward_context is not None:
+            set_forward_context_denoise_step_idx(None)
+            set_forward_context_denoise_timestep(None)
+            set_forward_context_denoise_total_steps(None)
 
 
 @contextmanager
