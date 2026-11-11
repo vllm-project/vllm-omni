@@ -52,6 +52,8 @@ steps:
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         source_file_dependencies: omni_qwen3_omni_doc
         timeout_in_minutes: 90
+        artifact_paths:
+          - qwen3-omni-doc-artifacts/**/*
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
@@ -443,6 +445,18 @@ steps:
             VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
               pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and H100 and B200 and cuda and cards_1" --run-level "full_model"
 
+      - label: ":full_moon: Diffusion Image · Flux3 Single-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cpu_offload or cache_dit" -m "full_model and diffusion" --run-level "full_model"
+        mirror_hardwares: h100_1
+      - label: ":full_moon: Diffusion Image · Flux3 Multi-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cfg_parallel or tp_2 or hsdp" -m "full_model and diffusion" --run-level "full_model"
+        mirror_hardwares: h100_1
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
         timeout_in_minutes: 180
