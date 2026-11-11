@@ -2,9 +2,9 @@ meta:
   title: "Sophon-Realtime-32B-Tag"
   slug: "sophon-realtime-32b-tag"
   provider: "Adventists AI"
-  description: "Open full-duplex voice model that hears your tone and speaks with one: listens while you talk, takes interruptions, and laughs, sighs or stresses words when the conversation calls for it. One vLLM-Omni model (thinker -> expressive talker -> vocoder) on a single 80 GB GPU, with an OpenAI-Realtime-style full-duplex WebSocket and /v1/chat/completions (audio in, text + audio out)."
+  description: "Open full-duplex voice model that hears your tone and speaks with one: listens while you talk, takes interruptions, and laughs, sighs or stresses words when the conversation calls for it. Zero-shot voice cloning from a 3-10 s clip. One vLLM-Omni model (thinker -> expressive talker -> vocoder) on a single 80 GB GPU, with an OpenAI-Realtime-style full-duplex WebSocket and /v1/chat/completions (audio in, text + audio out)."
   date_added: 2026-11-09
-  date_updated: 2026-11-10
+  date_updated: 2026-11-11
   difficulty: intermediate
   tasks:
     - omni
@@ -43,8 +43,8 @@ omni:
           }'
 
 dependencies:
-  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config."
-    command: "uv pip install sophon-realtime"
+  - note: "Out-of-tree model: launch with `sophon-realtime serve`, not `vllm serve`. The Sophon-Realtime plugin pins vLLM 0.30.0 and vLLM-Omni 0.30.0 exactly (newer versions are not supported yet), registers the model, and `sophon-realtime serve` downloads the weights and starts the server with the right deploy config. Keep the `[trt]` extra: it installs TensorRT for the talker, which the latency below depends on."
+    command: "uv pip install \"sophon-realtime[trt]\""
 
 features: {}
 opt_in_features: []
@@ -83,11 +83,19 @@ guide: |
 
   ```bash
   uv venv --python 3.12 && source .venv/bin/activate
-  uv pip install sophon-realtime
-  sophon-realtime serve --port 8000     # downloads the weights (~42 GB) on first run
+  uv pip install "sophon-realtime[trt]"   # [trt] = TensorRT for the talker; without it the talker is ~3x slower under load
+  sophon-realtime serve --port 8000       # downloads the weights (~42 GB) on first run
   ```
 
-  First start builds kernels and TensorRT engines (15–20 min); later starts take 5–8 min.
+  `sophon-realtime serve` starts a CUDA MPS daemon for its GPU by default (`SOPHON_MPS=0` turns it off). First start
+  builds kernels and TensorRT engines (about 8 min on H100); later starts take 4–6 min.
+
+  ## Zero-shot voice cloning
+
+  Put a 3–10 s clip of one speaker at `<model dir>/voices/<name>.wav` (wav or flac, any sample rate; or point
+  `SOPHON_VOICES` at another folder) and set
+  `"voice": "<name>"` in the realtime session or the chat request. No fine-tuning or restart; new clips are picked up
+  on the next request. Only clone your own voice or voices you have permission to use.
 
   ## Client usage
 
@@ -104,7 +112,6 @@ guide: |
   | 1 | 0.67 s |
   | 8 | 0.61 / 0.76 s |
   | 16 | 0.75 / 1.07 s |
-
 
   ## References
 
