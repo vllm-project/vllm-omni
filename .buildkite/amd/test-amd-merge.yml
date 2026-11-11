@@ -12,7 +12,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - entrypoints_function
@@ -1006,7 +1006,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - tts_drama_3_function
@@ -1183,7 +1183,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 90
       source_file_dependencies:
         - omni_minicpmo_4_5_duplex_function
