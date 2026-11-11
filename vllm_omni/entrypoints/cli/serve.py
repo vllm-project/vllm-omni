@@ -15,15 +15,18 @@ import json
 import math
 import os
 import signal
+from collections.abc import Mapping
 from types import FrameType
 from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.watermarking import WATERMARK_CONFIG_EXAMPLE, WatermarkConfig
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
 from vllm_omni.entrypoints.api_server_shared_dir import (
@@ -63,6 +66,8 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+_WATERMARK_CONFIG_HELP = f"JSON watermark configuration. Example: {WATERMARK_CONFIG_EXAMPLE}."
 
 
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
@@ -109,6 +114,20 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("must be a JSON object")
     return parsed
+
+
+def _parse_watermark_config(value: str) -> WatermarkConfig:
+    """Parse a watermark config from the CLI."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP) from exc
+    if not isinstance(config, Mapping):
+        raise argparse.ArgumentTypeError(_WATERMARK_CONFIG_HELP)
+    try:
+        return WatermarkConfig.from_dict(config)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _ensure_vllm_platform():
@@ -345,7 +364,7 @@ class OmniServeCommand(CLISubcommand):
             return
         validate_parsed_serve_args(args)
 
-    def subparser_init(self, subparsers: argparse._SubParsersAction) -> TrackingArgumentParser:
+    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,
@@ -354,6 +373,8 @@ class OmniServeCommand(CLISubcommand):
 
         _ensure_vllm_platform()
         serve_parser = make_arg_parser(serve_parser)
+        if not isinstance(serve_parser, TrackingArgumentParser):
+            raise TypeError("Omni serve requires a TrackingArgumentParser")
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
 
         # Create OmniConfig argument group for omni-related parameters
@@ -366,6 +387,13 @@ class OmniServeCommand(CLISubcommand):
             "--omni",
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
+        )
+        serve_parser.maybe_override_argument(
+            omni_config_group,
+            "--watermark-config",
+            argument_type=_parse_watermark_config,
+            default=None,
+            help=_WATERMARK_CONFIG_HELP,
         )
 
         try:
@@ -474,12 +502,6 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=600,
             help="The timeout for initializing the stages.",
-        )
-        omni_config_group.add_argument(
-            "--shm-threshold-bytes",
-            type=int,
-            default=65536,
-            help="The threshold for the shared memory size.",
         )
         omni_config_group.add_argument(
             "--log-stats",
@@ -604,6 +626,12 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--controlnet-model-path",
+            type=str,
+            default=None,
+            help="Local original MiniMax H3 Fun ControlNet Union safetensors checkpoint.",
+        )
+        omni_config_group.add_argument(
             "--hsdp-weight-load-strategy",
             choices=["full", "pre_sharded"],
             default=None,
@@ -633,10 +661,22 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-application",
+            choices=["runtime", "merged"],
+            default=None,
+            help="Apply diffusion LoRA per request, or merge one global policy into dense weights.",
+        )
+        omni_config_group.add_argument(
             "--lora-scale",
             type=float,
             default=None,
-            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+            help=(
+                "Multiplier on top of a startup PEFT LoRA's own alpha/rank scaling; "
+                "effective strength = lora_scale * lora_alpha / r. Pass the same "
+                "value the reference framework uses (e.g. LightX2V's --lora-scale), "
+                "not the pre-multiplied scale * alpha / rank. Distilled LoRAs are "
+                "fused at their checkpoint scale."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
@@ -645,7 +685,8 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, layerwise offload, and "
+                "--diffusion-attention-schedule profiles."
             ),
         )
         omni_config_group.add_argument(
@@ -665,6 +706,16 @@ class OmniServeCommand(CLISubcommand):
                 "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
                 "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
                 "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
             ),
         )
         omni_config_group.add_argument(
@@ -734,8 +785,11 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
-                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+                "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
+                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, "
+                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
@@ -827,6 +881,17 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
+        )
+
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
+            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
+            "with null end meaning the actual sequence end. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters
@@ -1001,6 +1066,13 @@ class OmniServeCommand(CLISubcommand):
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
         )
         omni_config_group.add_argument(
+            "--dlo-chunk-size-mb",
+            type=int,
+            default=64,
+            help="Full-chunk target size in MiB for distributed layerwise offload "
+            "(each chunk is one host-to-device copy + AllGather unit).",
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",
@@ -1135,13 +1207,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
@@ -1516,6 +1588,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_connector_spec=stage_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
+        watermark_config=args.watermark_config,
     )
     parallel_config = vllm_config.parallel_config
 

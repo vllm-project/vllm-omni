@@ -30,6 +30,7 @@ def _legacy_distributed_offload_config() -> SimpleNamespace:
 
 def test_no_allgather_example_selects_distributed_backend():
     from examples.offline_inference.minimax_h3.dlo_lifecycle import engine_kwargs
+    from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
     from vllm_omni.diffusion.offloader.base import OffloadConfig
     from vllm_omni.diffusion.offloader.config import OffloadStrategy
 
@@ -42,21 +43,11 @@ def test_no_allgather_example_selects_distributed_backend():
         init_timeout=1800.0,
     )
     kwargs = engine_kwargs(args)
-    od_config = SimpleNamespace(
-        diffusion_offload_config=None,
-        enable_cpu_offload=False,
-        enable_layerwise_offload=False,
+    od_config = OmniDiffusionConfig(
         enable_distributed_layerwise_offload=kwargs["enable_distributed_layerwise_offload"],
         dlo_use_allgather=kwargs["dlo_use_allgather"],
         dlo_resident_layers=kwargs["dlo_resident_layers"],
-        dlo_host_registration_limit_gib=0.0,
-        host_weight_runtime_mode="disabled",
-        pin_cpu_memory=True,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=kwargs["data_parallel_size"],
-            sequence_parallel_size=1,
-            use_hsdp=False,
-        ),
+        parallel_config=DiffusionParallelConfig(data_parallel_size=kwargs["data_parallel_size"]),
     )
 
     config = OffloadConfig.from_od_config(od_config)
@@ -64,6 +55,7 @@ def test_no_allgather_example_selects_distributed_backend():
     assert config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
     assert config.dlo_resident_layers == 0
     assert not config.uses_allgather("dit")
+    assert config.chunk_size_bytes == 64 * 1024 * 1024
 
 
 def test_encoder_non_block_children_use_one_shared_snapshot_stager(monkeypatch, mocker):
