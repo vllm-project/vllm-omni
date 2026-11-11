@@ -840,6 +840,12 @@ class _MiniMaxH3FakeAttention(nn.Module):
         self.attn_backend = self.FakeBackend
         self.use_ring = False
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
+    def effective_attention(self):
+        return self, self.attn_backend, None
+
     def forward(self, q, k, v, metadata=None):
         del k, v, metadata
         return q

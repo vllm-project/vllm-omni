@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,13 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# AMD build 15260 already auto-prefetched its 65.68 GiB NFS checkpoint;
+# sibling SHM stages spent about 578s loading weights near the 600s deadline.
+# Start with a bounded 900s stage allowance. Direct/online test paths use a
+# 1200s overall bound; offline OmniRunner tests retain their 1800s default.
+# These are ROCm Qwen3-Omni test settings, pending cold-storage qualification.
+QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S = 900
+QWEN3_OMNI_COLD_INIT_TIMEOUT_S = 1200
 # Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
 # and signal escalation. Keep their tracker alive while the API owns teardown.
 SERVER_SHUTDOWN_TIMEOUT_S = 60
@@ -198,6 +206,9 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
+        # Bounded ring buffer of child stderr for early-exit diagnostics.
+        self._server_error_lines: deque[str] = deque(maxlen=100)
+        self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -266,11 +277,34 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
+        # Inherit stdout (INFO still shows in CI); capture stderr only for the
+        # exited-before-ready RuntimeError message. errors=replace keeps the
+        # reader alive on undecodable bytes so a full pipe cannot hang serve.
+        self._server_error_lines = deque(maxlen=100)
+        self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        stderr = getattr(self.proc, "stderr", None)
+        # Test doubles may omit a pipe; skip capture rather than asserting.
+        if stderr is not None:
+            error_lines = self._server_error_lines
+
+            def _drain_stderr() -> None:
+                try:
+                    for line in stderr:
+                        error_lines.append(line)
+                except Exception:
+                    pass
+
+            self._server_log_thread = threading.Thread(target=_drain_stderr, name="omni-server-stderr", daemon=True)
+            self._server_log_thread.start()
 
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
@@ -278,13 +312,17 @@ class OmniServer:
         while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                raise RuntimeError(
+                    f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
+                )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
                     ret = self.proc.poll()
                     if ret is not None:
-                        raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                        raise RuntimeError(
+                            f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
+                        )
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(
@@ -293,7 +331,7 @@ class OmniServer:
                         )
                     return
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
+        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -433,6 +471,32 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
+    def _server_error_tail(self) -> str:
+        if self._server_log_thread is not None:
+            self._server_log_thread.join(timeout=2)
+        if not self._server_error_lines:
+            return ""
+        return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
+
+    def _stop_stderr_reader(self) -> None:
+        """Join the drain thread; close stderr only if the reader has stopped.
+
+        Closing the pipe from this thread while the reader is blocked in
+        ``readline`` can hang (e.g. a descendant still holds the write end).
+        Prefer abandoning a stuck daemon reader over blocking ``__exit__``.
+        """
+        thread = self._server_log_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        if thread is None or not thread.is_alive():
+            stderr = getattr(self.proc, "stderr", None) if self.proc is not None else None
+            if stderr is not None:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
+        self._server_log_thread = None
+
     def __enter__(self):
         try:
             self._start_server()
@@ -448,6 +512,7 @@ class OmniServer:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
+            self._stop_stderr_reader()
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
