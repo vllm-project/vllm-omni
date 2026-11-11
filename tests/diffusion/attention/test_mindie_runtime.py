@@ -267,6 +267,7 @@ def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_ST
     layer.attention = flash(head_size=head_size, quant=quant)
     layer.attn_backend = flash_attn.FlashAttentionBackend
     layer.attn_spec = AttentionSpec(backend="FLASH_ATTN", quant=quant)
+    layer._schedule_candidates = {}
     layer._disable_kv_quant = False
     layer.layer_idx = 3
     cfg = SimpleNamespace(
@@ -344,6 +345,7 @@ def test_spec_precision_tracks_active_schedule(runtime, monkeypatch, mocker, bas
         layer._schedule_candidates[name] = layer_mod.ScheduleCandidate(
             backend_cls=flash_attn.FlashAttentionBackend, spec=spec, impl=impl, backend_explicit=True
         )
+    layer._init_kv_cache_quantization(SimpleNamespace(diffusion_kv_cache_dtype=None))
     query = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
     float_attention = mocker.patch.object(flash_attn.FlashAttentionImpl, "forward_fa_npu", return_value=query)
     source = video_metadata(kv_cache_dtype="mxfp8")
@@ -365,10 +367,18 @@ def test_spec_precision_rejects_unsupported_platform(runtime, monkeypatch):
         make_layer(runtime, monkeypatch, method=None, quant={"precision": "mxfp4"})
 
 
-@pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
-def test_global_quant_method_is_published_per_forward(runtime, monkeypatch, method):
-    layer = make_layer(runtime, monkeypatch, method=method, skip_steps=None)
-    assert layer._with_kv_cache_dtype(None).extra["kv_cache_dtype"] == method
+@pytest.mark.parametrize("method", [None, "auto", "float", "fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("quant", [None, {"fp8_fa_mode": "C8V16_TILING512"}])
+def test_global_quant_method_keeps_original_policy(runtime, monkeypatch, mocker, method, quant):
+    layer = make_layer(runtime, monkeypatch, method=method, skip_steps=None, quant=quant)
+    mocker.patch.object(
+        layer, "effective_attention", side_effect=AssertionError("global policy must not resolve a profile")
+    )
+    source = video_metadata(kv_cache_dtype="mxfp4")
+    metadata = layer._with_kv_cache_dtype(source)
+    assert metadata.extra.get("kv_cache_dtype") == (None if method in (None, "auto", "float") else method)
+    assert metadata.video_layout is source.video_layout
+    assert source.extra["kv_cache_dtype"] == "mxfp4"
 
 
 @pytest.mark.parametrize("method", [None, "auto", "float"])
