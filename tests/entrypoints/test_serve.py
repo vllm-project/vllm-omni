@@ -196,6 +196,32 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+@pytest.mark.parametrize("option,value", [("vae_tile_size", 384), ("vae_tile_overlap", 32)])
+def test_serve_parser_tracks_explicit_vae_tile_geometry(option: str, value: int) -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni"])
+    assert getattr(args, option) is None
+    assert option not in args.get_explicit_kwargs_dict()
+
+    flag = "--" + option.replace("_", "-")
+    args = _parse_serve_args(["serve", "fake-model", "--omni", flag, str(value)])
+    assert getattr(args, option) == value
+    assert args.get_explicit_kwargs_dict()[option] == value
+    assert args.vae_use_tiling is False
+
+
+@pytest.mark.parametrize("flag", ["--vae-tile-size", "--vae-tile-overlap"])
+@pytest.mark.parametrize("value", ["abc", "1.5", "true"])
+def test_serve_parser_rejects_non_integer_vae_tile_geometry(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit):
+        _parse_serve_args(["serve", "fake-model", "--omni", flag, value])
+
+
+def test_serve_parser_accepts_combined_vae_tile_geometry() -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--vae-tile-size", "64", "--vae-tile-overlap", "0"])
+    assert args.get_explicit_kwargs_dict()["vae_tile_size"] == 64
+    assert args.get_explicit_kwargs_dict()["vae_tile_overlap"] == 0
+
+
 @pytest.mark.parametrize(
     "flags",
     [
