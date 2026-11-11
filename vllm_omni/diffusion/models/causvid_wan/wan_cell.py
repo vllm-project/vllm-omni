@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""One schedule cell on Wan DiT: ``embed → block → unembed`` (+ Euler)."""
+"""One schedule cell on Wan DiT: ``embed → block → unembed`` (+ Euler).
+
+A tick can carry several compatible requests. They then run through one batched
+tensor forward: the transformer sees a single ``B = len(members)`` activation,
+while conditioning, seed, sampler, KV owner and the returned activation rows
+stay per member.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -13,6 +20,212 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
+
+
+@dataclass(frozen=True)
+class _CellRow:
+    """One member's slice of a cell tick."""
+
+    req: str
+    chunk: int
+    step: int
+    block: int
+    step_key: int
+    timestep: torch.Tensor
+    latent: torch.Tensor
+    tokens: torch.Tensor | None
+    kv_ctx: Any | None
+
+
+def _kv_view(kv_contexts: Sequence[Any] | None, index: int) -> Any | None:
+    """This row's KV view; a member's per-layer views collapse to its own layer."""
+    if kv_contexts is None or index >= len(kv_contexts):
+        return None
+    view = kv_contexts[index]
+    return view[0] if isinstance(view, list) else view
+
+
+def _previous_row(
+    previous: Mapping[tuple[str, int, int, int], dict[str, torch.Tensor]] | None,
+    hidden: Any,
+    *,
+    req: str,
+    chunk: int,
+    step: int,
+    block: int,
+    n_tasks: int,
+) -> Any:
+    """Same member's previous-block activation, when this tick carries one."""
+    if isinstance(hidden, torch.Tensor):
+        # Batched payload: ``_resolve_latent_hidden`` slices the row itself.
+        return hidden
+    if isinstance(hidden, dict):
+        if previous:
+            return previous.get((req, chunk, step, block - 1))
+        return hidden if n_tasks == 1 else None
+    return None
+
+
+def _stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+
+
+def _cell_rows(
+    cells: Mapping[str, WanCell],
+    tasks: Sequence[tuple[str, Any]],
+    kv_contexts: Sequence[Any] | None,
+    *,
+    previous: Mapping[tuple[str, int, int, int], dict[str, torch.Tensor]] | None,
+    hidden: Any,
+    index_offset: int,
+    n_tasks: int,
+) -> list[_CellRow]:
+    rows: list[_CellRow] = []
+    for offset, (req, cell) in enumerate(tasks):
+        chunk, step, block = cell
+        member = cells[req]
+        member._last_meta = (req, chunk, step)
+        live = member._live.setdefault(req, {})
+        latent, tokens = member._resolve_latent_hidden(
+            req=req,
+            chunk=chunk,
+            step=step,
+            index=index_offset + offset,
+            n_tasks=n_tasks,
+            hidden=_previous_row(previous, hidden, req=req, chunk=chunk, step=step, block=block, n_tasks=n_tasks),
+            live=live,
+        )
+        noisy = step < member.num_denoise_steps
+        rows.append(
+            _CellRow(
+                req=req,
+                chunk=chunk,
+                step=step,
+                block=block,
+                step_key=step if noisy else member.num_denoise_steps,
+                timestep=member._timesteps[step] if noisy else member._timestep_clean,
+                latent=latent,
+                tokens=tokens,
+                kv_ctx=_kv_view(kv_contexts, offset),
+            )
+        )
+    return rows
+
+
+def _block_input(tf: Any, rows: Sequence[_CellRow], latents: torch.Tensor) -> torch.Tensor:
+    """First-stage rows embed the latent; later stages reuse the previous block's tokens."""
+    if rows[0].block == tf.start_layer and tf.is_layer_group_first:
+        return tf.embed(latents)
+    missing = [row.req for row in rows if row.tokens is None]
+    if missing:
+        raise RuntimeError(f"cell {(rows[0].chunk, rows[0].step, rows[0].block)} missing hidden_states for {missing}")
+    return _stack([row.tokens for row in rows if row.tokens is not None])
+
+
+def _advance_rows(cells: Mapping[str, WanCell], rows: Sequence[_CellRow], pred: torch.Tensor) -> list[torch.Tensor]:
+    """Advance every member with its own sampler and record its finished chunk."""
+    advanced: list[torch.Tensor] = []
+    for index, row in enumerate(rows):
+        member = cells[row.req]
+        latent = row.latent
+        if row.step < member.num_denoise_steps:
+            latent = member.sampler.advance(pred[index : index + 1], latent, row.step)
+            if row.step == member.num_denoise_steps - 1:
+                member.finished.setdefault(row.req, {})[row.chunk] = latent.detach()
+                if member.on_finished is not None:
+                    member.on_finished(row.chunk, latent)
+        else:
+            member.finished.setdefault(row.req, {})[row.chunk] = latent.detach()
+        member._live[row.req][row.chunk] = latent
+        advanced.append(latent)
+    return advanced
+
+
+def _run_rows(
+    cells: Mapping[str, WanCell],
+    tasks: Sequence[tuple[str, Any]],
+    kv_contexts: Sequence[Any] | None,
+    *,
+    previous: Mapping[tuple[str, int, int, int], dict[str, torch.Tensor]] | None = None,
+    hidden: Any = None,
+    index_offset: int = 0,
+    n_tasks: int = 1,
+) -> dict[str, torch.Tensor]:
+    """One tensor forward for every row, then per-member sampler bookkeeping.
+
+    State is committed only after the forward succeeds: a failing member leaves
+    every member's live latent, finished chunks and stashed activation untouched.
+    """
+    snapshots = {req: (dict(cell._stash), dict(cell._live)) for req, cell in cells.items()}
+    try:
+        rows = _cell_rows(
+            cells,
+            tasks,
+            kv_contexts,
+            previous=previous,
+            hidden=hidden,
+            index_offset=index_offset,
+            n_tasks=n_tasks,
+        )
+        tf = next(iter(cells.values())).transformer
+        blocks = {row.block for row in rows}
+        if len(blocks) != 1:
+            raise ValueError(f"one cell tick runs one block, got {sorted(blocks)}")
+        members = tuple(row.req for row in rows)
+        tf.prepare_cell({req: cells[req].prompt_embeds for req in members}, members=members)
+        latents = _stack([row.latent for row in rows])
+        tokens = _block_input(tf, rows, latents)
+        if len(rows) == 1:
+            row = rows[0]
+            tokens = tf.block(
+                row.block,
+                tokens,
+                chunk=row.chunk,
+                step=row.step_key,
+                latent=row.latent,
+                timestep=row.timestep,
+                kv_ctx=row.kv_ctx,
+                member=row.req,
+            )
+        else:
+            tokens = tf.block_batch(
+                rows[0].block,
+                tokens,
+                members=members,
+                chunks=tuple(row.chunk for row in rows),
+                steps=tuple(row.step_key for row in rows),
+                latents=tuple(row.latent for row in rows),
+                timesteps=tuple(row.timestep for row in rows),
+                kv_ctxs=tuple(row.kv_ctx for row in rows),
+            )
+        if not (rows[0].block == tf.end_layer - 1 and tf.is_layer_group_last):
+            for row in rows:
+                cells[row.req]._live[row.req][row.chunk] = row.latent
+            return {"latent": latents, "hidden_states": tokens}
+        if len(rows) == 1:
+            row = rows[0]
+            pred = tf.unembed(
+                tokens,
+                chunk=row.chunk,
+                step=row.step_key,
+                latent=row.latent,
+                timestep=row.timestep,
+                member=row.req,
+            )
+        else:
+            pred = tf.unembed_batch(
+                tokens,
+                members=members,
+                steps=tuple(row.step_key for row in rows),
+                timesteps=tuple(row.timestep for row in rows),
+                latent=latents,
+            )
+        return {"latent": _stack(_advance_rows(cells, rows, pred))}
+    except BaseException:
+        for req, (stash, live) in snapshots.items():
+            cells[req]._stash = stash
+            cells[req]._live = live
+        raise
 
 
 class WanCell(CellAdapter):
@@ -99,40 +312,18 @@ class WanCell(CellAdapter):
         if not tasks:
             return hidden
         outs: list[dict[str, torch.Tensor]] = []
-        tf = self.transformer
-        tf.prepare_cell(self.prompt_embeds)
-        for i, (req, cell) in enumerate(tasks):
-            chunk, step, block = cell
-            self._last_meta = (req, chunk, step)
-            ctx_list = kv_contexts[i] if i < len(kv_contexts) else None
-            kv_ctx = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
-            live = self._live.setdefault(req, {})
-            latent, tokens = self._resolve_latent_hidden(
-                req=req, chunk=chunk, step=step, index=i, n_tasks=len(tasks), hidden=hidden, live=live
+        for index, (req, cell) in enumerate(tasks):
+            views = [kv_contexts[index]] if kv_contexts is not None and index < len(kv_contexts) else None
+            outs.append(
+                _run_rows(
+                    {req: self},
+                    ((req, cell),),
+                    views,
+                    hidden=hidden,
+                    index_offset=index,
+                    n_tasks=len(tasks),
+                )
             )
-            t = self._timesteps[step] if step < self.num_denoise_steps else self._timestep_clean
-            step_key = step if step < self.num_denoise_steps else self.num_denoise_steps
-
-            if block == tf.start_layer and tf.is_layer_group_first:
-                tokens = tf.embed(latent)
-            elif tokens is None:
-                raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
-            tokens = tf.block(block, tokens, chunk=chunk, step=step_key, latent=latent, timestep=t, kv_ctx=kv_ctx)
-            if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
-                live[chunk] = latent
-                outs.append({"latent": latent, "hidden_states": tokens})
-                continue
-            pred = tf.unembed(tokens, chunk=chunk, step=step_key, latent=latent, timestep=t)
-            if step < self.num_denoise_steps:
-                latent = self.sampler.advance(pred, latent, step)
-                if step == self.num_denoise_steps - 1:
-                    self.finished.setdefault(req, {})[chunk] = latent.detach()
-                    if self.on_finished is not None:
-                        self.on_finished(chunk, latent)
-            else:
-                self.finished.setdefault(req, {})[chunk] = latent.detach()
-            live[chunk] = latent
-            outs.append({"latent": latent})
         if len(outs) == 1:
             return outs[0]
         keys = outs[0].keys()
@@ -163,7 +354,11 @@ class WanCell(CellAdapter):
 
 
 class WanCellBatch(CellAdapter):
-    """Request dispatcher carrying explicit member/cell metadata per row."""
+    """Fused dispatcher: one tensor forward per tick carrying explicit member rows.
+
+    Members keep their own conditioning, seed, sampler, KV owner and output row;
+    only the transformer compute is shared.
+    """
 
     _META = "wan_cell_rows"
 
@@ -178,6 +373,8 @@ class WanCellBatch(CellAdapter):
         schema = first.activation_spec(batch=1, include_hidden=True)
         if any(cell.activation_spec(batch=1, include_hidden=True) != schema for cell in cells.values()):
             raise ValueError("incompatible WanCell activation shapes or dtypes")
+        if len({id(cell.transformer) for cell in cells.values()}) != 1:
+            raise ValueError("WanCellBatch members must share one transformer")
 
     def _rows(self, payload):
         if not isinstance(payload, dict) or self._META not in payload:
@@ -193,16 +390,20 @@ class WanCellBatch(CellAdapter):
     def forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
             return hidden
-        previous = self._rows(hidden)
-        outputs = []
-        for index, (req, cell) in enumerate(tasks):
-            chunk, step, block = cell
-            row_hidden = previous.get((req, chunk, step, block - 1))
-            outputs.append(self.cells[req].forward(((req, cell),), [kv_contexts[index]], hidden=row_hidden))
-        keys = outputs[0].keys()
-        if any(output.keys() != keys for output in outputs):
-            raise RuntimeError("batched Wan cells produced incompatible activation fields")
-        result = {key: torch.cat([output[key] for output in outputs], dim=0) for key in keys}
+        members: dict[str, WanCell] = {}
+        for req, _cell in tasks:
+            member = self.cells.get(req)
+            if member is None:
+                raise KeyError(f"WanCellBatch has no member {req!r}")
+            members[req] = member
+        result = _run_rows(
+            members,
+            tasks,
+            kv_contexts,
+            previous=self._rows(hidden),
+            hidden=hidden,
+            n_tasks=len(tasks),
+        )
         result[self._META] = torch.tensor(
             [(self._indices[req], *cell) for req, cell in tasks], dtype=torch.int64, device=self.device
         )

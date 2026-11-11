@@ -83,10 +83,22 @@ current protocols cannot safely multiplex members. Output order matches input
 request order. Failure visits all created decode jobs and touched owners,
 without discarding unrelated history.
 
-This member dispatch is not a claim of fused multi-member model kernels.
-Within a Cell batch, the current Wan adapter still computes members separately.
-Neither Request batching nor the common member interface supplies dynamic
-in-forward admission or Request intermediate video delivery.
+Each compatible Wan group now executes one transformer tensor forward per Cell
+tick. Latent embedding, conditioning projection, RoPE, QKV projection, attention
+normalization, block MLP and output projection process the member batch together.
+Each member still owns its own sampler, seed, latent progress, KV view and output
+row. Paged KV reads and writes remain per member because each request owns a
+different physical pool; no cache layout conversion or pool copying is done.
+Different activation shapes, schedules or topologies remain serialized, and
+Same-Step and remote stream-decode groups remain serialized where their current
+protocols cannot safely multiplex members. Output order matches input request
+order. Failure visits all created decode jobs and touched owners without
+discarding unrelated history.
+
+This is static within-request-batch fusion for compatible members, not dynamic
+in-forward admission or intermediate video delivery. CUDA validation on the
+available A100 pair confirmed a real B=2 CausVid forward; the default four-rank
+Latest-KV topology was not available during validation.
 
 ## Scope and verification
 

@@ -746,9 +746,12 @@ class CausVidWanPipeline(nn.Module):
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Run compatible within-call request groups through one Cell executor.
 
-        Session reset/release remain runner-owned. Different activation shapes or
-        schedule structures execute serially; can_admit still governs overlap
-        within a group. Outputs retain the original request order.
+        A group is dispatched as one ``WanCellBatch``, which runs a single
+        batched tensor forward per cell tick while conditioning, seed, sampler
+        and KV ownership stay per request. Session reset/release remain
+        runner-owned. Different activation shapes or schedule structures execute
+        serially; can_admit still governs overlap within a group. Outputs retain
+        the original request order.
         """
         ctx = self._execution_context()
         if ctx.pending or ctx.inflight:
