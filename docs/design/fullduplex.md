@@ -839,6 +839,10 @@ up to 16 held turn ends per turn. Sentence-ending punctuation releases the
 hold immediately. An accepted turn end or explicit force-listen clears the
 continuation state. Stage 0 and the Talker handoff share the sentence-end
 predicate; the Talker still receives an accepted `<|turn_eos|>` unchanged.
+If holding EOS leaves a speech unit with no text, its chunk boundary still
+travels through Talker's empty-condition path. That path emits no audio but
+preserves the TTS segment-end notification needed to schedule the next silence
+unit; an empty speech chunk must not be dropped as if it were a listen unit.
 
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change

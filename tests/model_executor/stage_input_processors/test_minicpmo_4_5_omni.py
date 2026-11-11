@@ -438,6 +438,24 @@ def test_native_duplex_ledger_without_forwarded_terminator() -> None:
     assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
 
 
+@pytest.mark.parametrize("boundary", [9308, 9309])
+def test_native_duplex_empty_speech_chunk_preserves_segment_boundary(boundary: int) -> None:
+    # Holding turn_eos can leave only the speak decision and chunk terminator.
+    # Dropping this handoff loses the TTS boundary that drives silence continuation.
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, boundary],
+        row_ids=[101, 102, 9304],
+    )
+    info = _native_handoff(source)
+    assert info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
+    assert info["meta"]["segment_end"] is True
+    assert info["meta"]["turn_end"] is False
+    assert info["meta"]["next_stage_prompt_len"] == 2
+    assert info["meta"]["streaming_condition_seq"] == 0
+
+
 def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
     """<|turn_eos|> is forwarded (it is not a stop token) and the model keeps
     sampling until a chunk terminator; the Talker gets the turn_eos row and

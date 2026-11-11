@@ -1165,6 +1165,15 @@ def llm2tts(
                         slice_end=out_end - unit_start,
                         request_id=str(llm_output.request_id),
                     )
+                elif native_segment_end:
+                    # A held turn_eos can leave just speak + chunk_eos. This
+                    # still owns a segment boundary: dropping it would leave
+                    # the runtime waiting for TTS before the next silence unit.
+                    # Talker's empty-condition path emits no audio and closes
+                    # the segment through the normal downstream transport.
+                    tts_token_ids_slice = torch.empty(0, dtype=torch.long)
+                    tts_hidden_slice = thinker_hidden_states[:0]
+                    thinker_text = ""
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
@@ -1230,7 +1239,7 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
-            if not handoff_ids:
+            if handoff_ids is None:
                 continue
         set_tts_handoff(
             model_intermediate_buffer,
@@ -1256,9 +1265,10 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             # The condition ends with <audio_bos>; offline and closed turn-end
             # conditions put <text_eos> before it.
-            if is_native_duplex_handoff:
+            if is_native_duplex_handoff and handoff_ids:
                 condition_suffix_length = 2 if turn_text_ends_sentence else 1
             else:
+                # Empty conditions use Talker's two boundary embeddings.
                 condition_suffix_length = 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
             # Dummy ids only reserve scheduler slots; prefill overwrites the
