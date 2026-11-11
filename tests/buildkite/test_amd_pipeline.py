@@ -1394,13 +1394,40 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     group = weekly["steps"][0]
     jobs = {
-        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
-        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
-        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
+        "Reliability Test · qwen3-omni": (
+            "mi300_2",
+            "slow and rocm and MI325 and cards_2",
+            "tests/dfx/reliability/test_qwen3_omni.py",
+        ),
+        "Reliability Test · wan22": (
+            "mi300_1",
+            "slow and rocm and MI325 and cards_1",
+            "tests/dfx/reliability/test_wan22.py",
+        ),
+        "Reliability Test · hunyuan-image": (
+            "mi300_4",
+            "slow and rocm and MI325 and cards_4",
+            "tests/dfx/reliability/test_hunyuan_image.py",
+        ),
+        "Reliability Test · minicpmo-4.5": (
+            "mi300_1",
+            "slow and rocm and MI325 and cards_1",
+            "tests/dfx/reliability/test_minicpmo_4_5.py",
+        ),
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU": (
+            "mi300_1",
+            "slow and rocm and MI325 and H100 and cards_1",
+            "tests/dfx/reliability/invalid_param_test/",
+        ),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
-            "cards_2",
+            "slow and rocm and MI325 and H100 and cards_2",
             "test_invalid_omni_chat.py",
+        ),
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": (
+            "mi300_1",
+            "slow and rocm and MI325 and L4 and cards_1",
+            "tests/dfx/reliability/invalid_param_test/",
         ),
     }
 
@@ -1408,13 +1435,13 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "if" not in group
     assert [step["label"] for step in group["steps"]] == list(jobs)
     for step in group["steps"]:
-        pool, cards, filename = jobs[step["label"]]
+        pool, marker, filename = jobs[step["label"]]
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
         assert step["grade"] == "NonBlocking"
         assert step["depends_on"] == "amd-build"
-        assert "slow and rocm and MI325 and " + cards in command
+        assert marker in command
         assert filename in command
         assert filename not in nightly
     assert "tests/dfx/reliability/" not in nightly
@@ -1442,6 +1469,24 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "collection_message": "Expected exactly 17 Wan2.2 reliability nodes",
             "junit_message": "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
         },
+        "Reliability Test · minicpmo-4.5": {
+            "artifact_path": "artifacts/rocm-minicpmo-reliability/**/*",
+            "artifact_env": "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
+            "expected_nodes": 3,
+            "expected_skipped": 0,
+            "timeout": "165m",
+            "collection_message": "Expected exactly 3 MiniCPM-o 4.5 reliability nodes",
+            "junit_message": "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+        },
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU": {
+            "artifact_path": "artifacts/rocm-invalid-parameters-single/**/*",
+            "artifact_env": "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
+            "expected_nodes": 76,
+            "expected_skipped": 5,
+            "timeout": "75m",
+            "collection_message": "Expected exactly 76 single-GPU invalid-parameter nodes",
+            "junit_message": "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+        },
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": {
             "artifact_path": "artifacts/rocm-invalid-parameters-reliability/**/*",
             "artifact_env": "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
@@ -1450,6 +1495,15 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "timeout": "75m",
             "collection_message": "Expected exactly 24 invalid-parameter reliability nodes",
             "junit_message": "Expected exactly 24 executed invalid-parameter reliability tests",
+        },
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU": {
+            "artifact_path": "artifacts/rocm-invalid-parameters-audio/**/*",
+            "artifact_env": "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
+            "expected_nodes": 127,
+            "expected_skipped": 26,
+            "timeout": "105m",
+            "collection_message": "Expected exactly 127 audio invalid-parameter nodes",
+            "junit_message": "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
         },
     }
     for label, expected in guarded_jobs.items():
@@ -1472,6 +1526,28 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         assert 'exit "$${PIPESTATUS[0]}"' in command
         assert junit_message in command
         assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
+
+
+def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
+    group = _find_group("Reliability Test", AMD_WEEKLY_PIPELINE)
+    affected_labels = {
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+    }
+    expected_env = {
+        "VLLM_ROCM_USE_AITER": "0",
+        "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+    }
+
+    invalid_parameter_steps = {step["label"]: step for step in group["steps"] if "Invalid parameters" in step["label"]}
+    assert affected_labels < invalid_parameter_steps.keys()
+    for label, step in invalid_parameter_steps.items():
+        if label in affected_labels:
+            assert step["env"] == expected_env
+        else:
+            env = step.get("env", {})
+            assert "VLLM_ROCM_USE_AITER" not in env
+            assert "DIFFUSION_ATTENTION_BACKEND" not in env
 
 
 @pytest.mark.parametrize(
@@ -1505,6 +1581,22 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             "Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips",
         ),
         (
+            "Reliability Test · minicpmo-4.5",
+            "ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR",
+            "minicpmo-reliability-guard",
+            3,
+            0,
+            "Expected exactly 3 executed MiniCPM-o 4.5 reliability tests",
+        ),
+        (
+            "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+            "ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR",
+            "invalid-parameters-single-reliability-guard",
+            76,
+            5,
+            "Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips",
+        ),
+        (
             "Reliability Test · Invalid parameters · MI300 · 2-GPU",
             "ROCM_INVALID_PARAMETERS_ARTIFACT_DIR",
             "invalid-parameters-reliability-guard",
@@ -1512,8 +1604,16 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
             0,
             "Expected exactly 24 executed invalid-parameter reliability tests",
         ),
+        (
+            "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+            "ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR",
+            "invalid-parameters-audio-reliability-guard",
+            127,
+            26,
+            "Expected exactly 127 audio invalid-parameter tests with 26 known skips",
+        ),
     ),
-    ids=("qwen3-omni", "wan22", "invalid-parameters"),
+    ids=("qwen3-omni", "wan22", "minicpmo", "invalid-parameters-single", "invalid-parameters-2gpu", "audio"),
 )
 def test_weekly_reliability_executes_junit_guard_before_exit(
     tmp_path: Path,
@@ -1647,6 +1747,17 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "omni_mimo_audio_function",
             "Expected exactly one executed MiMo-Audio test",
         ),
+        "Covo-Audio · 1-GPU": (
+            "mi300_1",
+            180,
+            "cards_1",
+            "tests/e2e/online_serving/test_covo_audio_expansion.py",
+            ("test_audio_to_audio_001", "test_audio_to_audio"),
+            "artifacts/rocm-covo-audio-weekly/**/*",
+            "Expected exactly two Covo-Audio ROCm nodes",
+            "omni_covo_audio_function",
+            "Expected exactly two executed Covo-Audio tests",
+        ),
         "Ming-flash-omni offline · 4-GPU": (
             "mi300_4",
             180,
@@ -1720,7 +1831,22 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     mimo_command = "\n".join(_find_step("MiMo-Audio · 1-GPU", AMD_WEEKLY_PIPELINE)["commands"])
     assert "test_audio_to_text_audio_001" not in mimo_command
     assert "tests/e2e/online_serving/test_ming_flash_omni_expansion.py" not in weekly_text
-    assert "test_covo_audio_expansion.py" not in weekly_text
+    covo_deps = dependencies["omni_covo_audio_function"]
+    for dependency in (
+        "tests/e2e/online_serving/test_covo_audio_expansion.py",
+        "tests/e2e/offline_inference/test_covo_audio_expansion.py",
+        "vllm_omni/deploy/covo_audio.yaml",
+        "vllm_omni/model_executor/models/covo_audio/",
+        "vllm_omni/model_executor/stage_input_processors/covo_audio.py",
+    ):
+        assert dependency in covo_deps
+    for test_file in (
+        "tests/e2e/online_serving/test_covo_audio_expansion.py",
+        "tests/e2e/offline_inference/test_covo_audio_expansion.py",
+    ):
+        covo_source = Path(test_file).read_text(encoding="utf-8")
+        assert 'res={"cuda": "H100", "rocm": "MI325"}' in covo_source
+        assert "num_cards=1" in covo_source
     qwen_deps = dependencies["omni_qwen2_5_omni_expansion"]
     for dependency in (
         "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py",
@@ -1780,6 +1906,41 @@ def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
         expected_message="Expected exactly seven executed Qwen2.5-Omni weekly tests",
         artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
         job_id_prefix="qwen25-omni-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 2, 0, None, 0),
+        (0, 2, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 2, 0, None, 1),
+        (0, 2, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_covo_audio_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Covo-Audio · 1-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly two executed Covo-Audio tests",
+        artifact_env="ROCM_COVO_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="covo-audio-weekly-guard",
         pytest_status=pytest_status,
         tests=tests,
         skipped=skipped,
@@ -4475,7 +4636,7 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 40
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
-    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900" in command
+    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200" in command
     assert "VLLM_ROCM_USE_AITER=0" not in command
     assert _marker_expressions(step) == [
         _PAUSE_KEEP_READY_MARKER,

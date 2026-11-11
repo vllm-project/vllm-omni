@@ -446,6 +446,9 @@ class Wan22Pipeline(
     SupportsComponentDiscovery,
     WanLoraLoaderMixin,
 ):
+    # Both CFG branches share latents, timestep and the active expert; UMT5
+    # prompts are zero-padded back to max_sequence_length.
+    supports_cfg_batching = True
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
