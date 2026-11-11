@@ -23,6 +23,7 @@ from vllm_omni.benchmarks.patch.patch import (
     set_fail_fast_on_timeout,
     set_print_stage,
     set_request_timeout_s,
+    set_save_detailed,
     should_request_stage_metrics,
 )
 
@@ -88,6 +89,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
     _validate_fail_fast_on_timeout(args)
     set_fail_fast_on_timeout(getattr(args, "omni_fail_fast_on_timeout", False))
     set_print_stage(getattr(args, "print_stage", False))
+    set_save_detailed(getattr(args, "save_detailed", False))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
