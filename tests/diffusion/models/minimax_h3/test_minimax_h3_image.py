@@ -499,3 +499,11 @@ def test_offloaded_text_encoder_is_released_after_the_encode(monkeypatch, offloa
 
     assert hidden.shape == (3, 4)
     assert pipe.text_encoder.calls == (["load", "encode", "offload"] if offloaded else ["load", "encode"])
+
+
+def test_reference_limit_matches_model_metadata():
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    assert h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES == 16
+    metadata = get_diffusion_model_metadata("MiniMaxH3ImagePipeline")
+    assert metadata.max_multimodal_image_inputs == h3i.MINIMAX_H3_IMAGE_MAX_REFERENCES

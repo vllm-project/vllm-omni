@@ -131,7 +131,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     # ("Picture i"); it shares H3's packed layout and padding document.
     "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=9,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
         final_output_type="image",
         attention_mask_free=True,
     ),

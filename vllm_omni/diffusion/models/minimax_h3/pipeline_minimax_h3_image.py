@@ -87,6 +87,9 @@ MINIMAX_H3_IMAGE_DEFAULT_SIZE = 1024
 # would otherwise become a 1024x524288 input). The output size is bounded by the
 # server's --max-generated-image-size.
 MINIMAX_H3_IMAGE_MAX_REFERENCE_ASPECT = 8
+# Edit accepts up to 16 ordered references ("Picture 1" .. "Picture 16"); keep
+# model_metadata's max_multimodal_image_inputs in sync.
+MINIMAX_H3_IMAGE_MAX_REFERENCES = 16
 # Edit references are resized per consumer so that their short edge lies in
 # [min, max] (a short edge already inside keeps the original pixels).
 MINIMAX_H3_IMAGE_QWEN_SHORT_EDGE = (1024, 1024)
@@ -576,6 +579,11 @@ class MiniMaxH3ImagePipeline(
         if task not in self.supported_tasks:
             raise OmniClientError(
                 f"task {task!r} is not served by this release; declared {sorted(self.supported_tasks)}"
+            )
+        if len(images) > MINIMAX_H3_IMAGE_MAX_REFERENCES:
+            raise OmniClientError(
+                f"MiniMax-H3-Image accepts at most {MINIMAX_H3_IMAGE_MAX_REFERENCES} reference images, "
+                f"got {len(images)}"
             )
         references = [_load_reference(image) for image in images]
         width = sampling.width if not getattr(sampling, "width_not_provided", False) else None
