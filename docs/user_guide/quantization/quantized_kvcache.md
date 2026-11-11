@@ -44,6 +44,13 @@ conversions, and kernel launches, so enabling it can increase latency,
 especially for short sequences. Faster generation or lower peak memory use
 is not guaranteed.
 
+On Ascend, FP8/MXFP8 also accept the single-document suffix-padding metadata
+emitted by MiniMax-H3. The backend trims the valid Q and K/V prefixes
+independently before quantization and restores the padded query shape afterwards.
+Arbitrary packed documents and caller masks remain unsupported; MXFP4 does not
+use this path. H3 end-to-end quality and performance still require validation
+on the target NPU.
+
 If `diffusion_kv_cache_dtype` is not set, attention runs in the native dtype.
 
 ## Hardware Support

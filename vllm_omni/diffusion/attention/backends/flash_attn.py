@@ -1070,10 +1070,20 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None,
     ) -> None:
         extra = attn_metadata.extra if attn_metadata else {}
+        packed = attn_metadata.packed_padding if attn_metadata else None
+        has_varlen_metadata = (
+            packed is not None
+            or any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k"))
+            or extra.get("npu_attn_varlen")
+        )
+        # Only producer-validated [real, pad] inputs can become dense.
+        # MXFP4 currently includes its internal alignment padding in softmax.
+        supports_packed_padding = packed is not None and method in ("fp8", "mxfp8")
+
         reason = None
         if self.causal:
             reason = "causal quantized FA is not supported"
-        elif any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+        elif has_varlen_metadata and not supports_packed_padding:
             reason = "packed/varlen metadata requires the float attention path"
         elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             reason = "piecewise attention requires the float attention path"
@@ -1083,6 +1093,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
         ):
             reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+        elif packed is not None and (self.qkv_layout not in (None, "BSND") or query.shape[0] != 1):
+            reason = "packed padding requires a single BSND sequence"
         if reason is not None:
             raise ValueError(
                 f"NPU attention precision {method!r} is unavailable: {reason}. "
@@ -1101,6 +1113,17 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         method = extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
         self._validate_quant_request(method, query, attn_metadata)
+        query_padding = None
+        packed = attn_metadata.packed_padding if attn_metadata else None
+        if packed is not None:
+            q_length, kv_length = packed.q_length, packed.kv_length
+            if not (0 < q_length <= query.shape[1] and 0 < kv_length <= key.shape[1]):
+                raise ValueError("NPU quantized attention packed padding lengths must be within the Q/KV sequences.")
+            # Ulysses and reference-KV restoration have already run. Trim before
+            # quantization so padding cannot affect either scales or softmax.
+            if q_length < query.shape[1]:
+                query_padding = query[:, q_length:]
+            query, key, value = query[:, :q_length], key[:, :kv_length], value[:, :kv_length]
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
@@ -1119,7 +1142,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             kwargs.update(q_rot=rotation, k_rot=rotation)
         logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
         # Execution errors propagate. Never retry with another precision.
-        return runtime(query, key, value, **kwargs)
+        out = runtime(query, key, value, **kwargs)
+        # Restore the Q shape before the reverse Ulysses exchange by reusing the
+        # query suffix; pad rows are outside the real document and are not consumed.
+        return torch.cat((out, query_padding), dim=1) if query_padding is not None else out
 
     @staticmethod
     def _npu_fusion_attention(

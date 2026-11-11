@@ -11,7 +11,7 @@ import torch
 
 from vllm_omni.diffusion.attention import layer as layer_mod
 from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, VideoTokenLayout
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 _DEFAULT_SKIP_STEPS = frozenset({0, 1, 38, 39})
@@ -37,10 +37,10 @@ def runtime(monkeypatch):
     supports_precision.cache_clear()
 
 
-def flash(layout="BSND"):
+def flash(layout="BSND", head_size=64):
     return flash_attn.FlashAttentionImpl(
         num_heads=2,
-        head_size=64,
+        head_size=head_size,
         softmax_scale=0.37,
         qkv_layout=layout,
     )
@@ -110,6 +110,99 @@ def test_packed_metadata_never_reaches_quant_runtime(runtime):
     metadata = AttentionMetadata(extra={"kv_cache_dtype": "mxfp8", "cu_seqlens_q": torch.tensor([0, 64, 128])})
     with pytest.raises(ValueError, match="packed/varlen"):
         flash().forward_npu(q, q, q, metadata)
+    runtime.quant_attention.assert_not_called()
+
+
+def packed_metadata(q_length, kv_length, total_q, total_kv, method="mxfp8"):
+    cu_q = torch.tensor([0, q_length, total_q], dtype=torch.int32)
+    cu_k = torch.tensor([0, kv_length, total_kv], dtype=torch.int32)
+    return AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(q_length, kv_length, cu_q[:2], cu_k[:2]),
+        extra={
+            "kv_cache_dtype": method,
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_k,
+            "max_seqlen_q": q_length,
+            "max_seqlen_k": kv_length,
+            "valid_kv_length": kv_length,
+            "npu_attn_varlen": True,
+        },
+    )
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp8"])
+@pytest.mark.parametrize("q_length,kv_length,q_pad,kv_pad", [(5, 5, 3, 3), (8, 8, 0, 0), (3, 7, 2, 2), (5, 7, 0, 3)])
+def test_quant_packed_padding_matches_masked_attention(runtime, method, q_length, kv_length, q_pad, kv_pad):
+    query = torch.randn(1, q_length + q_pad, 2, 128, dtype=torch.bfloat16)
+    key = torch.randn(1, kv_length + kv_pad, 2, 128, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    metadata = packed_metadata(q_length, kv_length, query.shape[1], key.shape[1], method)
+    impl = flash(head_size=128)
+
+    def dense_attention(q, k, v, *, precision, layout, scale, q_rot, k_rot):
+        assert precision == method and layout == "BSND"
+        assert q.shape[1] == q_length and k.shape[1] == v.shape[1] == kv_length
+        assert q_rot is k_rot
+        return (
+            torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float(), scale=scale
+            )
+            .transpose(1, 2)
+            .to(q.dtype)
+        )
+
+    # Exercise prefix isolation with real floating attention; vendor quantization
+    # accuracy requires separate NPU validation.
+    runtime.quant_attention.side_effect = dense_attention
+    expected = (
+        torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2).float(),
+            key.transpose(1, 2).float(),
+            value.transpose(1, 2).float(),
+            attn_mask=(torch.arange(key.shape[1]) < kv_length)[None, None, None, :],
+            scale=impl.softmax_scale,
+        )
+        .transpose(1, 2)
+        .to(query.dtype)
+    )
+    output = impl.forward_npu(query, key, value, metadata)
+    assert output.shape == query.shape and output.dtype == query.dtype
+    torch.testing.assert_close(output[:, :q_length], expected[:, :q_length])
+    torch.testing.assert_close(output[:, q_length:], query[:, q_length:])
+
+    # Padding must never affect valid attention outputs or quantization scales.
+    query[:, q_length:] = 1000
+    key[:, kv_length:] = -1000
+    value[:, kv_length:] = 1000
+    updated_output = impl.forward_npu(query, key, value, metadata)
+    torch.testing.assert_close(updated_output[:, :q_length], output[:, :q_length])
+    torch.testing.assert_close(updated_output[:, q_length:], query[:, q_length:])
+    assert metadata.extra["cu_seqlens_q"].tolist() == [0, q_length, query.shape[1]]
+    assert metadata.packed_padding.q_length == q_length
+
+
+@pytest.mark.parametrize("q_length,kv_length", [(0, 5), (5, 0), (9, 5), (5, 9)])
+def test_quant_packed_padding_rejects_out_of_bounds_lengths(runtime, q_length, kv_length):
+    query = torch.randn(1, 8, 2, 64, dtype=torch.bfloat16)
+    metadata = packed_metadata(q_length, kv_length, 8, 8)
+    with pytest.raises(ValueError, match="packed padding lengths"):
+        flash().forward_npu(query, query, query, metadata)
+    runtime.quant_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["mxfp4", "mask", "causal", "layout", "batch"])
+def test_quant_packed_padding_preserves_unsupported_requests(runtime, case):
+    query = torch.randn(2 if case == "batch" else 1, 8, 2, 64, dtype=torch.bfloat16)
+    metadata = packed_metadata(5, 5, 8, 8, "mxfp4" if case == "mxfp4" else "fp8")
+    impl = flash("BNSD" if case == "layout" else "BSND")
+    if case == "mask":
+        metadata.attn_mask = torch.ones(1, 8, dtype=torch.bool)
+    elif case == "causal":
+        impl.causal = True
+    elif case == "layout":
+        query = query.transpose(1, 2)
+    with pytest.raises(ValueError):
+        impl.forward_npu(query, query, query, metadata)
     runtime.quant_attention.assert_not_called()
 
 
