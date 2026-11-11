@@ -2638,6 +2638,73 @@ async def test_explicit_replica_cfg_companion_inherits_parent_affinity() -> None
     assert output_queue.empty()
 
 
+@pytest.mark.asyncio
+async def test_parent_output_before_companion_messages_waits_for_complete_bundle(mocker: MockerFixture) -> None:
+    pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient(final_output=True)]])
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    params = [_sampling_params(), _sampling_params()]
+    parent_output = _build_request_output("parent")
+    forward = mocker.patch.object(orchestrator, "_forward_to_next_stage", new_callable=mocker.AsyncMock)
+    submit_initial = pools[0].submit_initial
+
+    async def finish_parent_during_submission(*args, **kwargs):
+        await submit_initial(*args, **kwargs)
+        await orchestrator._route_output(0, 0, parent_output, orchestrator.request_states["parent"], None)
+
+    mocker.patch.object(pools[0], "submit_initial", side_effect=finish_parent_during_submission)
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="parent",
+            prompt=FakePromptRequest("parent", [1], resumable=False),
+            original_prompt={"prompt": "positive"},
+            output_prompt_text=None,
+            sampling_params_list=params,
+            final_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            cfg_companion_ids={"text": "parent-text", "image": "parent-image"},
+        )
+    )
+    forward.assert_not_awaited()
+    assert "parent-text" not in orchestrator.request_states
+    assert "parent-image" not in orchestrator.request_states
+
+    mocker.patch.object(pools[0], "submit_initial", side_effect=submit_initial)
+    for role in ("text", "image"):
+        companion_id = f"parent-{role}"
+        await orchestrator._handle_add_companion(
+            AddCompanionRequestMessage(
+                companion_id=companion_id,
+                parent_id="parent",
+                role=role,
+                prompt=FakePromptRequest(companion_id, [2], resumable=False),
+                companion_prompt_text=None,
+                sampling_params_list=params,
+            )
+        )
+        await orchestrator._route_output(
+            0, 0, _build_request_output(companion_id), orchestrator.request_states[companion_id], None
+        )
+        assert forward.await_count == (1 if role == "image" else 0)
+
+    assert [output.request_id for output in orchestrator._cfg_tracker.get_companion_outputs("parent")] == [
+        "parent-text",
+        "parent-image",
+    ]
+    assert forward.await_args.args[:3] == ("parent", 0, parent_output)
+    assert orchestrator._cfg_tracker.pop_pending_parent("parent") is None
+    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["parent"]))
+    assert not orchestrator.request_states
+    assert not orchestrator._cfg_tracker.has_companions("parent")
+
+
 def test_stage_pool_requested_replica_supports_sparse_stable_ids() -> None:
     client0 = FakeStageClient()
     client0.client_addresses = {"input_address": "tcp://replica-0"}

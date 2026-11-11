@@ -4,6 +4,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import janus
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -21,6 +22,7 @@ from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import AddCompanionRequestMessage, StageSubmissionMessage
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import OmniClientError
@@ -893,6 +895,57 @@ def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerF
     assert companions[0].companion_id == "req__cfg_text"
     assert companions[0].parent_id == "req"
     engine.request_queue.sync_q.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("roles", [(), ("cfg_text", "cfg_image")], ids=["unguided", "guided"])
+async def test_add_request_announces_cfg_companions_before_enqueue(mocker: MockerFixture, asynchronous, roles):
+    engine = object.__new__(AsyncOmniEngine)
+    parent = StageSubmissionMessage(
+        type="add_request",
+        request_id="req",
+        prompt=_make_engine_core_request("req"),
+        original_prompt={"prompt": "positive"},
+        output_prompt_text=None,
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+        final_stage_id=1,
+        preprocess_ms=0,
+        request_timestamp=0,
+        enqueue_ts=0,
+    )
+    companions = [
+        AddCompanionRequestMessage(
+            companion_id=f"req__{role}",
+            parent_id="req",
+            role=role,
+            prompt=_make_engine_core_request(f"req__{role}"),
+            companion_prompt_text=None,
+            sampling_params_list=parent.sampling_params_list,
+        )
+        for role in roles
+    ]
+    expected_ids = {companion.role: companion.companion_id for companion in companions} or None
+    engine.prompt_expand_func = mocker.Mock()
+    mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
+    mocker.patch.object(engine, "_build_cfg_companions", return_value=companions)
+    engine.request_queue = janus.Queue()
+    try:
+        prepared, prepared_companions = engine._prepare_add_request("req", {}, final_stage_id=1)
+        assert prepared is parent
+        assert prepared_companions == companions
+        assert prepared.cfg_companion_ids == expected_ids
+
+        if asynchronous:
+            await engine.add_request_async("req", {}, final_stage_id=1)
+        else:
+            engine.add_request("req", {}, final_stage_id=1)
+        queued = [engine.request_queue.sync_q.get_nowait() for _ in range(1 + len(companions))]
+        assert queued == [parent, *companions]
+        assert queued[0].cfg_companion_ids == expected_ids
+    finally:
+        engine.request_queue.close()
+        await engine.request_queue.wait_closed()
 
 
 def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):
