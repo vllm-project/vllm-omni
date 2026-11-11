@@ -249,6 +249,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
+    shutdown_timeout: float
     additional_config: dict[str, Any]
     distributed_executor_backend: Any
     worker_cls: str
@@ -638,6 +639,8 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
+    shutdown_timeout: float | None = Field(default=None, ge=0)
+
     cuda_mps: bool = False
 
     # LLM backend extensions; diffusion owns these in its config projection.
@@ -880,6 +883,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
