@@ -941,13 +941,14 @@ def _fake_model_root(pipeline, tmp_path):
     return str(root)
 
 
+def _resolve_test_model_path(model, engine_args):
+    engine_args.pop("model_path_resolver", None)
+    return model
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path, monkeypatch):
     # Compare argument schemas without materializing model-specific checkpoints.
-    def _resolve_test_model_path(model, engine_args):
-        engine_args.pop("model_path_resolver", None)
-        return model
-
     monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
@@ -1012,11 +1013,6 @@ def test_skip_tokenizer_init_deploy_configs_do_not_pin_unrelated_hub_tokenizer_o
     assert pipeline is not None
     deploy = load_deploy_config(_DEPLOY_DIR / deploy_yaml)
     model_dir = _fake_model_root(pipeline, tmp_path)
-
-    def _resolve_test_model_path(model, engine_args):
-        engine_args.pop("model_path_resolver", None)
-        return model
-
     monkeypatch.setattr(stage_init_utils, "_resolve_model_path", _resolve_test_model_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model=model_dir)
 
