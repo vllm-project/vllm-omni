@@ -22,6 +22,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
 )
 from vllm_omni.diffusion.models.abot_world.taew2_2 import TAEW2Decoder
 from vllm_omni.diffusion.models.interface import SupportsInteractionApply
+from vllm_omni.diffusion.offloader import sequential_backend
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -373,3 +374,55 @@ def test_request_mode_rejects_ar_diffusion_session_binding() -> None:
     request = OmniDiffusionRequest(prompt="p", sampling_params=OmniDiffusionSamplingParams(), request_id="r")
     with pytest.raises(ValueError, match="enable step execution"):
         pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+
+class _RecordingTextCache:
+    """Stands in for the runner-owned KV state; records where projection ran."""
+
+    def __init__(self, moves: list) -> None:
+        self._moves = moves
+        self.moves_at_projection: list = []
+        self._layers: list = []
+
+    def is_cross_attention_populated(self, kv_branch: str, cache_name: str) -> bool:
+        return bool(self._layers)
+
+    def populate_cross_attention(self, kv_branch: str, cache_name: str, layer_kv) -> None:
+        self._layers = [{"k": key, "v": value} for key, value in layer_kv]
+        self.moves_at_projection = list(self._moves)
+
+    def get_cross_attention_kv(self, kv_branch: str, cache_name: str) -> list:
+        return self._layers
+
+
+@pytest.mark.parametrize("module_offload", [True, False])
+def test_text_cache_projection_activates_the_offloaded_transformer(monkeypatch, module_offload) -> None:
+    transformer = _tiny_transformer()
+    text_encoder = torch.nn.Linear(2, 2)
+    names = {id(transformer): "transformer", id(text_encoder): "text_encoder"}
+    moves: list = []
+
+    def move_params(module, target_device, **kwargs):
+        moves.append((names[id(module)], target_device.type))
+        return False
+
+    monkeypatch.setattr(sequential_backend.SequentialOffloadHook, "_move_params", staticmethod(move_params))
+    monkeypatch.setattr(sequential_backend.current_omni_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(sequential_backend.current_omni_platform, "get_free_memory", lambda: 0)
+    sequential_backend.apply_sequential_offload(
+        dit_modules=[transformer],
+        encoder_modules=[text_encoder],
+        device=torch.device("cuda:0"),
+        pin_memory=False,
+    )
+    cache = _RecordingTextCache(moves)
+    pipeline = _bare_pipeline(transformer=transformer, _ar_diffusion_kv_state=cache, _module_offload=module_offload)
+
+    caches = pipeline._ar_text_caches(torch.zeros(1, 4, 16), invalidate=False)
+
+    assert len(caches) == 1
+    if module_offload:
+        assert cache.moves_at_projection == [("text_encoder", "cpu"), ("transformer", "cuda")]
+        assert moves[2:] == [("transformer", "cpu")]
+    else:
+        assert moves == []

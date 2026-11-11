@@ -8,7 +8,7 @@ import math
 import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -32,7 +32,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
-from vllm_omni.diffusion.offloader.config import offload_enabled
+from vllm_omni.diffusion.offloader import sequential_offload_component
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, offload_enabled, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -438,6 +439,7 @@ class ABotWorldCausalPipeline(
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _module_offload: bool = False
     _vae_modules: ClassVar[list[str]] = ["vae"]
     dummy_run_num_frames: ClassVar[int] = 0
     _AR_BRANCH = "main"
@@ -463,6 +465,7 @@ class ABotWorldCausalPipeline(
         self._vae_backend = model_config.get("abot_vae", "wan")
         _validate_local_model_files(model_path, vae_backend=self._vae_backend)
         managed_offload = offload_enabled(od_config)
+        self._module_offload = resolve_offload(od_config).strategy is OffloadStrategy.MODEL_LEVEL
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -1047,22 +1050,25 @@ class ABotWorldCausalPipeline(
         if invalidate:
             state.clear_cross_attention()
         if not state.is_cross_attention_populated(self._AR_BRANCH, self._AR_TEXT_CACHE):
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload hook.
+            residency = sequential_offload_component(self.transformer) if self._module_offload else nullcontext()
+            with residency:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
-                        2,
-                        (cross_attention.num_local_heads, cross_attention.head_dim),
-                    )
-                    value = cross_attention.v(projected_text).unflatten(
-                        2,
-                        (cross_attention.num_local_heads, cross_attention.head_dim),
-                    )
-                    yield key, value
+                def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+                    for block in self.transformer.blocks:
+                        cross_attention = block.cross_attn
+                        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
+                            2,
+                            (cross_attention.num_local_heads, cross_attention.head_dim),
+                        )
+                        value = cross_attention.v(projected_text).unflatten(
+                            2,
+                            (cross_attention.num_local_heads, cross_attention.head_dim),
+                        )
+                        yield key, value
 
-            state.populate_cross_attention(self._AR_BRANCH, self._AR_TEXT_CACHE, layer_kv())
+                state.populate_cross_attention(self._AR_BRANCH, self._AR_TEXT_CACHE, layer_kv())
         return [
             ABotAttentionCache(
                 key=layer["k"],

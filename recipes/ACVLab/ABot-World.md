@@ -99,6 +99,12 @@ Clients use the generic WebSocket protocol in
 `width: 832`, `height: 512` and `num_frames: 12k - 3`; each AR block arrives as
 a binary video chunk.
 
+On a GPU that cannot hold the UMT5 encoder and the DiT together, add
+`--diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'`.
+The two then take turns on the GPU. The swap holds both in host RAM at once,
+about 22 GB, and adds a few seconds to the start of each session. Output is
+unchanged.
+
 Mid-generation camera keys go in `session.interaction` under
 `event.multi_modal_data.camera` and apply at the next chunk boundary. ABot
 conditions on W/A/S/D/I/J/K/L key actions, not SE3 poses. In `state` mode each
