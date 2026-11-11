@@ -33,8 +33,13 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
+from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
+from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
+from vllm_omni.diffusion.models.physis.wan.pipeline_config import PHYSIS_WAN_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
+from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -83,6 +88,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
 from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.kokoro.pipeline import KOKORO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lfm3_omni.pipeline import LFM3_OMNI_PIPELINE, LFM3_OMNI_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
@@ -151,6 +157,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
     "arktts": AUDIO8_TTS_PIPELINE,
     "audex_s2s": AUDEX_S2S_PIPELINE,
     "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
@@ -193,6 +200,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "kimi_audio": KIMI_AUDIO_PIPELINE,
     "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
+    "lfm3_omni": LFM3_OMNI_PIPELINE,
+    "lfm3_omni_text": LFM3_OMNI_TEXT_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     # Public Ming-3.0-tts-tiny still serializes the former config name.
     "lingv3_tts": MING3_TTS_PIPELINE,
@@ -212,6 +221,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
+    "moss_image": MOSS_IMAGE_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
@@ -227,6 +237,9 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "nemotron_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
+    "physis_h3": PHYSIS_H3_PIPELINE,
+    "physis_ltx": PHYSIS_LTX_PIPELINE,
+    "physis_wan": PHYSIS_WAN_PIPELINE,
     "pi0": PI0_PIPELINE,
     "pi05": PI05_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,

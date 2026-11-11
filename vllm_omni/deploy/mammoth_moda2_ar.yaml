@@ -1,4 +1,10 @@
 # MammothModa2 AR-only (image/video understanding and summarization).
+#
+# Keep enforce_eager: true (default). PIECEWISE capture of MoE still records
+# both experts (#9764). FULL uniform understanding batches can replay the
+# all-und graph (#9865); leave this preset eager until that path is
+# remeasured. For intentional FULL t2i AR graphs see
+# mammoth_moda2_ar_graph_full.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2_ar

@@ -166,6 +166,13 @@ def _ensure_thinker_architecture(config: PretrainedConfig) -> None:
         config.architectures = [_THINKER_ARCHITECTURE]
 
 
+# Eager ViT attention runs one temporal chunk at a time. Frames do not attend
+# to each other, so this matches a single full-video forward. 8192 patches keeps
+# the FlashAttention workspace inside the activation headroom left after KV cache
+# (a 60x22x40 video is 52800 patches and does not).
+_MAX_EAGER_VISION_TOKENS = 8192
+
+
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
     """Subclass that fixes Qwen2_5_VisionAttention.forward() compatibility.
 
@@ -224,12 +231,53 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
             metadata["sequence_lengths"] = sequence_lengths
         return metadata
 
+    @staticmethod
+    def _eager_vision_chunks(grid_thw: torch.Tensor, max_tokens: int) -> list[tuple[int, int, int, int, int]]:
+        """Patch spans ``(offset, count, frames, height, width)`` along time.
+
+        A span never crosses a video, and never splits a frame. One frame that
+        is already larger than ``max_tokens`` is returned as its own span.
+        """
+        chunks: list[tuple[int, int, int, int, int]] = []
+        offset = 0
+        for raw_t, raw_h, raw_w in grid_thw.detach().to(device="cpu", dtype=torch.int64).tolist():
+            frames, height, width = int(raw_t), int(raw_h), int(raw_w)
+            frame_tokens = height * width
+            if frames <= 0 or frame_tokens <= 0:
+                continue
+            frames_per_chunk = max(1, max_tokens // frame_tokens)
+            for start in range(0, frames, frames_per_chunk):
+                taken = min(frames_per_chunk, frames - start)
+                count = taken * frame_tokens
+                chunks.append((offset, count, taken, height, width))
+                offset += count
+        return chunks
+
     def forward(
         self, x: torch.Tensor, grid_thw, *, encoder_metadata: dict[str, torch.Tensor] | None = None
     ) -> torch.Tensor:
-        if encoder_metadata is None:
-            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
-        return self.forward_with_encoder_metadata(x, encoder_metadata)
+        # CUDA-graph replay passes metadata for one captured budget. Chunk only
+        # the eager path, whose videos are not bounded by that budget.
+        if encoder_metadata is not None:
+            return self.forward_with_encoder_metadata(x, encoder_metadata)
+        if not isinstance(grid_thw, torch.Tensor):
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int32)
+        chunks = self._eager_vision_chunks(grid_thw, _MAX_EAGER_VISION_TOKENS)
+        covered = sum(count for _, count, _, _, _ in chunks)
+        if covered != x.shape[0]:
+            raise RuntimeError(f"vision grid covers {covered} patches, input has {x.shape[0]}")
+        if len(chunks) <= 1:
+            return self.forward_with_encoder_metadata(x, self.prepare_encoder_metadata(grid_thw))
+        outputs = []
+        for offset, count, frames, height, width in chunks:
+            grid = torch.tensor([[frames, height, width]], dtype=torch.int32)
+            outputs.append(
+                self.forward_with_encoder_metadata(
+                    x[offset : offset + count],
+                    self.prepare_encoder_metadata(grid),
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def forward_with_encoder_metadata(self, x: torch.Tensor, metadata: dict[str, torch.Tensor]) -> torch.Tensor:
         """Run patch embedding, vision blocks and all DeepStack mergers."""

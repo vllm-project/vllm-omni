@@ -118,6 +118,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     indextts2,
     kimi_audio,
     kokoro,
+    lfm3_omni,
     ming3_audio_tts,
     ming3_tts,
     ming_flash_omni_tts,

@@ -51,6 +51,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     InvalidResumeTokenError,
     ResumeToken,
 )
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex.websocket import (
     MAX_EVENT_BYTES,
     SendJson,
@@ -177,6 +178,9 @@ class OmniDuplexSessionHandler:
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
+        # Complete the transport handshake before holding session admission;
+        # cold warmup can exceed the client's WebSocket opening timeout.
+        await wait_for_duplex_warmup(websocket)
         envelope = RealtimeEnvelope.from_query_params(websocket.query_params)
 
         async def send_json(payload: Mapping[str, object]) -> None:

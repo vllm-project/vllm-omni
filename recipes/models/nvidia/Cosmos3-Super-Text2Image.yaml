@@ -85,7 +85,10 @@ guide: |
 
   - 8× H100 for the documented full-node profile (4×H200 / 4×GB200 alternative below)
   - The release-tested `vllm/vllm-omni:cosmos3` container, or vLLM-Omni installed
-    on top of `vllm==0.21.0`
+    on top of final `vllm==0.33.0` for this source checkout. The published
+    Cosmos3 container and its historical results use an older runtime and do
+    not qualify the current source. The separate Reasoner environment below,
+    where present, retains its own plugin/runtime requirements.
 
   ## Launch command (vLLM-Omni)
 
