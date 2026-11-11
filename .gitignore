@@ -253,6 +253,7 @@ datasets/
 !tests/e2e/accuracy/omni_duplex_eval/*.json
 !tests/e2e/accuracy/sensenova_u1_reference.json
 !tests/e2e/accuracy/qwen_image_21/thresholds.json
+!tests/e2e/accuracy/qwen3_omni/nightly_baselines.json
 *.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
 !tests/assets/hunyuan_image3/it2i.jsonl

@@ -142,13 +142,15 @@ def _iter_omni_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         return
 
     for entry in sorted(os.listdir(input_dir)):
-        if not entry.endswith(".json") or not entry.startswith(_RESULT_JSON_PREFIX):
+        if not entry.endswith(".json") or not entry.startswith((_RESULT_JSON_PREFIX, "result_acc_")):
             continue
         full_path = os.path.join(input_dir, entry)
         if not os.path.isfile(full_path):
             continue
         data = _load_json_file(full_path)
         if data is None:
+            continue
+        if entry.startswith("result_acc_") and data.get("nightly_suite") != "qwen3-omni-non-duplex":
             continue
 
         record: dict[str, Any] = dict(data)

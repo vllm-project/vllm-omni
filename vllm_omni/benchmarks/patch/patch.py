@@ -3687,6 +3687,14 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # and drops unknown fields; multimodal processor caches are not keyed by it.
 CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
 
+_ISOLATE_PREFIX_CACHE = False
+
+
+def set_isolate_prefix_cache(enabled: bool) -> None:
+    global _ISOLATE_PREFIX_CACHE
+    _ISOLATE_PREFIX_CACHE = enabled
+
+
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
@@ -3844,6 +3852,15 @@ async def benchmark(
     except KeyError:
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
+    if _ISOLATE_PREFIX_CACHE:
+        if endpoint_type not in CACHE_SALT_BACKENDS:
+            raise ValueError("--omni-isolate-prefix-cache requires a chat/completions backend")
+        if (extra_body or {}).get("cache_salt") is not None or any(
+            (request.request_overrides or {}).get("cache_salt") is not None for request in input_requests
+        ):
+            raise ValueError("--omni-isolate-prefix-cache cannot be combined with an explicit cache_salt")
+    measurement_salt = uuid.uuid4().hex if _ISOLATE_PREFIX_CACHE else None
+
     # Reuses connections across requests to reduce TLS handshake overhead.
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     session = _build_benchmark_session(max_concurrency, ssl_setting)
@@ -3919,7 +3936,10 @@ async def benchmark(
             warmup_input = _salted_copy(test_input, warmup_scope and f"{warmup_scope}-{i}")
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
+        if _ISOLATE_PREFIX_CACHE and not all(output.success for output in warmup_outputs):
+            await session.close()
+            raise ValueError("Warmup requests failed; refusing to measure an unprepared workload")
 
         if warmup_pbar is not None:
             warmup_pbar.close()
@@ -4031,6 +4051,8 @@ async def benchmark(
             request.request_id,
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
+        if measurement_salt is not None:
+            per_request_extra_body = {**(per_request_extra_body or {}), "cache_salt": measurement_salt}
         req_model_id, req_model_name = model_id, model_name
         if lora_iter is not None:
             req_lora_module = next(lora_iter)
@@ -4259,6 +4281,10 @@ async def benchmark(
         if (accuracy := duplex_eval_summary.get("accuracy")) is not None:
             print("\nOmni-DuplexEval accuracy:")
             print(json.dumps(accuracy, indent=2))
+
+    from vllm_omni.benchmarks.validation import request_coverage
+
+    result.update(request_coverage(outputs))
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

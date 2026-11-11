@@ -2391,9 +2391,13 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
     ("endpoint_type", "speech_extra"),
     [("openai-chat-omni", None), ("openai-chat-omni", {"ref_audio": "x"}), ("openai-audio-speech", {"ref_audio": "x"})],
 )
-async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type, speech_extra):
+@pytest.mark.parametrize("isolate", [False, True])
+async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type, speech_extra, isolate):
     """The ready check and each warmup carry a private cache_salt; measured requests and dataset fields are unchanged."""
     sent = []
+    if isolate and endpoint_type not in patch.CACHE_SALT_BACKENDS:
+        pytest.skip("This backend does not accept cache_salt")
+    monkeypatch.setattr(patch, "_ISOLATE_PREFIX_CACHE", isolate)
 
     async def request_func(request_func_input, session, pbar=None):
         sent.append((request_func_input.request_id, request_func_input.extra_body or {}))
@@ -2441,7 +2445,12 @@ async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_
     warmup_salts = [body.get("cache_salt") for request_id, body in sent if not request_id]
     measured = [body for request_id, body in sent if request_id]
     assert len(warmup_salts) == 4 and len(measured) == 2
-    assert all("cache_salt" not in body for body in measured)
+    if isolate:
+        salts = {body["cache_salt"] for body in measured}
+        assert len(salts) == 1
+        assert salts.isdisjoint(warmup_salts)
+    else:
+        assert all("cache_salt" not in body for body in measured)
     if speech_extra:
         assert all(body["ref_audio"] == "x" for _, body in sent)
     if endpoint_type in patch.CACHE_SALT_BACKENDS:

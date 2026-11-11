@@ -309,9 +309,19 @@ def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) 
     if acc is None:
         errs.append("Missing daily_omni_accuracy (wrong dataset or no gold-evaluated rows).")
         return errs
+    if not math.isfinite(float(acc)):
+        return ["daily_omni_accuracy must be finite"]
     ev = int(result.get("daily_omni_evaluated_ok", 0) or 0)
     if ev <= 0:
         errs.append("daily_omni_evaluated_ok is 0; no successful MCQ rows to score.")
+    for key in (
+        "daily_omni_request_failed",
+        "daily_omni_no_gold",
+        "timed_out_requests",
+        "cancelled_after_timeout_requests",
+    ):
+        if result.get(key, 0):
+            errs.append(f"{key}={result[key]}; Daily-Omni accuracy excludes these rows, so coverage is incomplete.")
     if min_accuracy is not None and float(acc) + 1e-12 < float(min_accuracy):
         errs.append(f"daily_omni_accuracy={acc:.6f} < --min-daily-omni-accuracy={min_accuracy}")
     return errs
@@ -361,6 +371,9 @@ def _validate_seed_tts(
     min_mean_utmos: float | None,
 ) -> list[str]:
     errs: list[str] = []
+    for key in ("seed_tts_request_failed", "seed_tts_no_pcm", "seed_tts_asr_failed", "seed_tts_empty_audio"):
+        if result.get(key, 0):
+            errs.append(f"{key}={result[key]}; Seed-TTS accuracy coverage is incomplete.")
     setup = result.get("seed_tts_eval_setup_error")
     if setup:
         errs.append(f"Seed-TTS eval setup failed: {setup}")
