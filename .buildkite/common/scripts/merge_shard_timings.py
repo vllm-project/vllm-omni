@@ -594,5 +594,5 @@ def prepare_profile_from_history(
         builds=len(per_build),
         build_ids=build_ids,
         step_queues=queues,
-        incomplete_steps=merge_incomplete_steps(list(zip(per_build, per_incomplete, strict=True))),
+        incomplete_steps=merge_incomplete_steps(list(zip(per_build, per_incomplete))),
     )
