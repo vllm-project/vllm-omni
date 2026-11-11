@@ -263,6 +263,7 @@ class DuplexEngineSession:
     perf: SessionPerfLedger | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        self.config = self.config.with_output_capabilities(self.capabilities)
         if self.accepted_fence is None:
             self.accepted_fence = self.fence
         else:
@@ -1012,6 +1013,10 @@ class DuplexEngineSession:
             self._response.active_response_awaits_input_commit = False
 
     def reserve_response_options(self, options: ResponseCreateOptions) -> None:
+        candidate = copy.copy(self.config)
+        candidate.extra_body = dict(self.config.extra_body)
+        options.apply_to(candidate)
+        candidate.with_output_capabilities(self.capabilities)
         if self._response.active_response_id is not None:
             raise RuntimeError("response options cannot be reserved while a response is active")
         if self._response.pending_options is not None:
@@ -1109,6 +1114,10 @@ class DuplexEngineSession:
             self.perf.bind_response(
                 epoch=self.epoch, turn_id=self._response.active_response_turn_id, response_id=response_id
             )
+        if "audio" not in self.capabilities.supported_output_modalities:
+            # Input may continue while text is emitted. Reserve its position
+            # before a later user commit, without waiting for playback.
+            self.reserve_history_item(f"item_{response_id}")
         return response_id
 
     def _clear_response_metrics(self) -> None:
@@ -1622,7 +1631,9 @@ class DuplexEngineSession:
         if response_input_commit_seq is None:
             response_input_commit_seq = self.input_commit_seq
         response_history_is_late = self.input_commit_seq > response_input_commit_seq
-        assistant_text = "".join(self._response.assistant_text_buffer).strip()
+        assistant_text = "".join(self._response.assistant_text_buffer)
+        if "audio" in self.capabilities.supported_output_modalities:
+            assistant_text = assistant_text.strip()
         message: dict[str, object] | None = None
         if assistant_text and response_id is not None:
             self._conversation.assistant_response_snapshots[response_id] = (
@@ -1630,7 +1641,11 @@ class DuplexEngineSession:
                 tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
                 response_input_commit_seq,
             )
-        if commit_text and assistant_text and not response_history_is_late:
+        text_slot = (
+            "audio" not in self.capabilities.supported_output_modalities
+            and f"item_{response_id}" in self._conversation.history_item_placeholders
+        )
+        if commit_text and assistant_text and (not response_history_is_late or text_slot):
             committed_text = self._playback_committed_text(
                 assistant_text,
                 playback_commit_policy=playback_commit_policy,
@@ -1982,6 +1997,13 @@ class DuplexEngineSession:
         *,
         playback_commit_policy: str | None = None,
     ) -> str:
+        if (
+            "audio" not in (self.response_config.modalities or ())
+            and max(self.playback.sent_ms, self.playback.generated_ms) <= 0
+        ):
+            # Text was emitted to the response stream. Playback policy and
+            # audio alignment cannot gate a text-only reply, including cancel.
+            return assistant_text
         sent_ms = max(self.playback.sent_ms, self.playback.generated_ms)
         committed_ms = self.playback.committed_ms
         policy = playback_commit_policy or self.config.playback_commit_policy
@@ -2140,7 +2162,7 @@ class DuplexEngineSession:
             "active_response_id": self.active_response_id,
             "active_response_turn_id": self.active_response_turn_id,
             "model": self.config.model,
-            "modalities": list(self.config.modalities),
+            "modalities": list(self.config.modalities or ()),
             "instructions": self.config.instructions,
             "voice": self.config.voice,
             "response_format": self.config.response_format,

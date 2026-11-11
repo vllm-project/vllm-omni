@@ -225,7 +225,7 @@ class ModelChannel:
             "session_id": session.session_id,
             "response_id": response_id,
             "epoch": epoch,
-            "modalities": list(response_config.modalities),
+            "modalities": list(response_config.modalities or ()),
         }
         if request_id is not None:
             payload["request_id"] = request_id
@@ -439,7 +439,7 @@ class ModelChannel:
                 # as read-only; only the session writes authoritative history.
                 "conversation": list(history),
                 "conversation_item_ids": item_ids,
-                "modalities": list(session.response_config.modalities),
+                "modalities": list(session.response_config.modalities or ()),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
@@ -654,7 +654,7 @@ class ModelChannel:
             auto_responds=self._out.auto_responds(),
             response_format=response_config.response_format,
             speed=response_config.speed,
-            modalities=tuple(response_config.modalities),
+            modalities=tuple(response_config.modalities or ()),
         )
 
     # ------------------------------------------------------------------ #
@@ -1491,7 +1491,21 @@ class ModelChannel:
             stage_metrics=response_stage_metrics,
             response_request_metrics=response_request_metrics,
         )
-        self._out.emit(payload)
+        if "audio" not in session.capabilities.supported_output_modalities:
+            # The data plane supplies text and native turn boundaries. Reuse
+            # the existing text projector without synthesizing audio events.
+            if has_text:
+                self._out.emit(
+                    {
+                        "type": "response.text.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": session.epoch,
+                        "delta": text,
+                    }
+                )
+        else:
+            self._out.emit(payload)
         if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
             session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)
         if self._ctx.run.closing:
