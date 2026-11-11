@@ -1,0 +1,26 @@
+Soprano decoder and text frontend adaptation
+
+Source: https://github.com/ekwek1/soprano
+Revision: 12fac06eb8fa53bad8b3941d3cb11e9c869477c4
+Files: soprano/vocos/decoder.py, models.py, modules.py, heads.py, spectral_ops.py
+Text: soprano/utils/text_normalizer.py, text_splitter.py; soprano/tts.py
+License: Apache License, Version 2.0 (see LICENSE in this directory).
+
+The upstream ConvNeXt block describes its adaptation from
+https://github.com/facebookresearch/ConvNeXt to 1D audio.
+This adaptation retains only the Soprano-1.1-80M checkpoint architecture:
+kernel-3 ConvNeXt, kernel-1 input projection, and center ISTFT with DC/Nyquist
+removal. Unused same-padding ISTFT and alternate decoder configurations were
+not copied. All tensor state names and the inference arithmetic are retained.
+PyTorch provides the convolutions, normalization, interpolation and ISTFT.
+
+The upstream text utilities attribute their normalization/splitting to
+https://github.com/neonbjb/tortoise-tts (tortoise/utils/tokenizer.py and text.py).
+The frontend retains upstream cleaning order, sentence lengths and short-unit
+merging; regex replaces the stdlib re import to follow repository policy.
+Optional text dependencies are loaded when normalization is requested.
+
+Bounded streaming windows are validated against SopranoTTS.infer_stream in
+soprano/tts.py at the revision above. The implementation emits sample deltas
+and deliberately keeps the native offline predictor-state sequence rather
+than adopting the reference HF backend's different consumed-token sequence.

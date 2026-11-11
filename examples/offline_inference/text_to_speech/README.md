@@ -3,8 +3,9 @@
 vLLM-Omni supports several autoregressive TTS models. They share a mostly
 common CLI shape (`--text`, `--ref-audio`, `--ref-text`, plus an
 output-path flag — `--output-dir` for most, `--output` for OmniVoice) and
-live together in this hub. Each model has its own subdirectory containing
-a single `end2end.py` script; this README is the single doc entry point.
+live together in this hub. Existing model subdirectories contain legacy
+`end2end.py` scripts; newer integrations reuse public entrypoints and production
+frontends, with runnable commands in recipes linked below.
 
 For online serving, see [`examples/online_serving/text_to_speech/`](../../online_serving/text_to_speech/README.md). For the full
 list of supported architectures across all modalities, see
@@ -28,6 +29,7 @@ list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
+| Soprano-1.1-80M | `ekwek/Soprano-1.1-80M` | 2 (native AR + decoder) | — | ✓ (online) | English fixed voice, eager FP32; explicit deploy | 32 kHz |
 | VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | offline only; no example script (use `vllm_omni.model_executor.models.vibevoice.prompt`) | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
@@ -35,6 +37,12 @@ list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
 ## Common Quick Start
+
+For Soprano, use the public `Omni` engine and production `synthesize` frontend
+in the [RTX 4090 Laptop recipe](../../../recipes/ekwek/Soprano-1.1-80M-RTX4090-Laptop.md#offline-wav).
+It handles official English normalization, sentence splitting and output
+validation. No model-specific example script is needed; the diffusion-only
+`text_to_audio.py` runner does not implement offline AR-TTS.
 
 Most models share this invocation shape:
 

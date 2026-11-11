@@ -10,6 +10,8 @@ from vllm.model_executor.models.registry import (
 
 _OMNI_MODELS = {
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
+    "SopranoForCausalLM": ("soprano", "soprano_ar", "SopranoForCausalLM"),
+    "SopranoDecoderForGeneration": ("soprano", "soprano_decoder", "SopranoDecoderForGeneration"),
     "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
     "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),
     "Lfm3AudioForConditionalGeneration": ("lfm3_audio", "model", "Lfm3AudioForConditionalGeneration"),

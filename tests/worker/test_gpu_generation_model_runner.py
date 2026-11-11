@@ -3,15 +3,21 @@
 
 import contextlib
 import inspect
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.config import CacheConfig, CUDAGraphMode
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.model_executor.models.soprano.soprano_decoder import SopranoDecoderForGeneration
+from vllm_omni.model_executor.models.soprano.streaming import DecoderWindow
 from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
@@ -199,6 +205,73 @@ def test_unchanged_idle_poll_preserves_connector_and_prefetch_work(monkeypatch):
     runner.recv_full_payload_inputs.assert_called_once_with(scheduled)
     runner.model.on_requests_added.assert_called_once_with(["new-input"])
     runner.model.run_idle_prefetch.assert_called_once_with()
+
+
+@pytest.mark.parametrize("parked", [False, True], ids=["running", "streaming-wait"])
+@pytest.mark.parametrize(
+    "finished_status",
+    ["FINISHED_STOPPED", "FINISHED_ABORTED", "FINISHED_ERROR"],
+    ids=["finish", "abort", "error"],
+)
+def test_terminal_requests_clear_soprano_failures_before_idle_return(monkeypatch, parked, finished_status):
+    # Resolve these types after vllm_omni's request/status patch is imported.
+    from vllm.v1.request import Request, RequestStatus
+
+    terminal_status = RequestStatus[finished_status]
+    # Run the real scheduler finish/free path and the runner's zero-token
+    # execute path. Only memory allocation and device work are CPU stubs.
+    requests = {
+        rid: Request(
+            request_id=rid, prompt_token_ids=[1], sampling_params=SamplingParams(max_tokens=2), pooling_params=None
+        )
+        for rid in ["failed", "active"]
+    }
+    for request in requests.values():
+        request.status = RequestStatus.WAITING_FOR_STREAMING_REQ if parked else RequestStatus.RUNNING
+    # __new__ skips constructor setup. These fields mirror the state read by
+    # OmniSchedulerMixin.finish_requests (queue cleanup) and vLLM Scheduler's
+    # _free_request/_free_request_blocks. If those paths gain a field dependency,
+    # update this CPU fixture; an AttributeError here can mean missing setup.
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.requests = requests.copy()
+    scheduler.running = [] if parked else list(requests.values())
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set(requests.values()) if parked else set()
+    scheduler.num_waiting_for_streaming_input = len(requests) if parked else 0
+    scheduler._outputs_awaiting_stage_payload = {}
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = None
+    scheduler._inflight_prefills = set()
+    scheduler._kv_fetch_stages = None
+    scheduler.connector = scheduler.ec_connector = scheduler.aux_output_connector = None
+    scheduler.encoder_cache_manager = Mock(spec=["free"])
+    scheduler._pending_encoder_input_ids = {}
+    scheduler.kv_cache_manager = Mock(spec=["free"])
+    scheduler.defer_block_free = False
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = defaultdict(set)
+
+    finished = scheduler.finish_requests(requests, terminal_status)
+    assert {request.request_id for request in finished} == set(requests)
+    assert all(request.status == terminal_status for request in finished)
+    assert scheduler.finished_req_ids == set(requests)
+    assert not scheduler.requests and not scheduler.running and not scheduler.deferred_waiting
+    assert scheduler.num_waiting_for_streaming_input == 0
+    assert scheduler.kv_cache_manager.free.call_count == len(requests)
+
+    model = object.__new__(SopranoDecoderForGeneration)
+    torch.nn.Module.__init__(model)
+    peer = DecoderWindow(4)
+    model._streams = {"active": DecoderWindow(4), "peer": peer}
+    model._failed_streams = {"failed"}
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    runner.model = model
+    scheduled.finished_req_ids = scheduler.finished_req_ids
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    assert not model._failed_streams
+    assert model._streams == {"peer": peer}
 
 
 @pytest.mark.parametrize(

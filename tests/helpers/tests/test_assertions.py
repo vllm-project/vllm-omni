@@ -371,7 +371,7 @@ def test_failed_pcm_capture_preserves_bytes_rate_and_original_hnr_failure(monkey
         pytest.param(np.full(12_000, 3_000, dtype="<i2").tobytes(), id="constant_signal"),
     ],
 )
-@pytest.mark.parametrize("min_hnr_db", [0, -1, -5])
+@pytest.mark.parametrize("min_hnr_db", [0.5, 0, -1, -5])
 def test_pcm_unvoiced_audio_fails_even_when_the_hnr_floor_is_lowered(pcm_bytes, min_hnr_db):
     with pytest.raises(AssertionError, match="HNR"):
         assert_audio_speech_response(
@@ -381,15 +381,16 @@ def test_pcm_unvoiced_audio_fails_even_when_the_hnr_floor_is_lowered(pcm_bytes, 
         )
 
 
-@pytest.mark.parametrize("min_hnr_db", [1.0, -1.0])
-def test_pcm_white_noise_fails_the_speech_hnr_gate(min_hnr_db):
+@pytest.mark.parametrize("min_hnr_db", [1.0, 0.5, -1.0])
+@pytest.mark.parametrize("sample_rate", [24000, 32000])
+def test_pcm_white_noise_fails_the_speech_hnr_gate(min_hnr_db, sample_rate):
     rng = np.random.default_rng(0)
-    noise = rng.integers(np.iinfo(np.int16).min, np.iinfo(np.int16).max, 24_000, dtype=np.int16).astype("<i2")
+    noise = rng.integers(np.iinfo(np.int16).min, np.iinfo(np.int16).max, sample_rate, dtype=np.int16).astype("<i2")
 
     with pytest.raises(AssertionError, match="HNR"):
         assert_audio_speech_response(
             OmniResponse(success=True, audio_bytes=noise.tobytes(), audio_format="audio/pcm"),
-            {"response_format": "pcm", "min_hnr_db": min_hnr_db},
+            {"response_format": "pcm", "min_hnr_db": min_hnr_db, "expected_sample_rate": sample_rate},
             "advanced_model",
         )
 

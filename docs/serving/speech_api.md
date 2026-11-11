@@ -8,6 +8,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 - **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
+- **Soprano-1.1-80M** (`ekwek/Soprano-1.1-80M`) -- native eager FP32, English, one fixed voice, 32 kHz mono. Requires an explicit Soprano deploy pipeline; see [Soprano](#soprano-11-80m).
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
@@ -135,7 +136,7 @@ Content-Type: application/json
 | ----------- | ------ | --------- | ------------- |
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
+| `voice` | string | model-specific | Speaker selection; Qwen3-TTS presets include vivian, ryan and aiden. Soprano accepts only its fixed `default` voice. |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
 | `speed` | float | 1.0 | Playback speed (0.25-4.0) |
 
@@ -927,6 +928,31 @@ The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch
 The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only the first audio chunk early for lower TTFA, then returns to the normal `codec_chunk_frames` window so Code2Wav does not repeatedly decode tiny overlapping chunks.
 
 ## Supported Models
+
+### Soprano-1.1-80M
+
+Use the [RTX 4090 Laptop recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ekwek/Soprano-1.1-80M-RTX4090-Laptop.md)
+for pinned weights, hardware, shared runner commands and qualification limits.
+`soprano.yaml` provides complete WAV; `soprano_streaming.yaml` adds incremental
+PCM/WAV bytes and SSE. Both require explicit `--deploy-config`; the checkpoint's
+ordinary Qwen3 architecture does not identify a speech pipeline. The JSON `model`
+must match `--served-model-name` when that alias is set.
+
+| Request field | Soprano contract |
+| --- | --- |
+| `input` | One English synthesis unit, 1–256 prompt tokens after official preprocessing; split multi-unit sources before HTTP requests |
+| `voice`, `language` | Omitted or `default`; language omitted, `en` or `English` |
+| `sample_rate`, `speed` | 32000 Hz only; speed omitted or 1.0 |
+| `response_format` | Complete response: WAV; streaming deploy: PCM/WAV, `stream_format=audio` or `sse` |
+| `seed`, `max_new_tokens` | Nonnegative seed; generation limit 1–512 |
+| `extra_params` | Only `temperature`, `top_p`, `top_k`, `repetition_penalty`; defaults come from deploy YAML |
+| Clone/style/task controls | Reference audio/text, embeddings, other voices, instructions, Qwen `task_type` and word timestamps are rejected |
+
+Raw PCM is signed little-endian 16-bit mono, 64000 bytes per audio second.
+Honor `X-Audio-Sample-Rate` and `X-Audio-Channels`; SSE `audio` deltas need
+base64 decoding and a successful terminal event. Stream completion, output
+length and audible continuity are separate checks. See the
+[implementation notes](../models/soprano.md) for failure and lifecycle contracts.
 
 ### Qwen3-TTS
 

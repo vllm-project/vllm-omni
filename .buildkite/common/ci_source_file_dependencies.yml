@@ -830,6 +830,25 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py
     - tests/worker_v2/
 
+  tts_soprano_function:
+    - vllm_omni/model_executor/models/soprano/
+    - vllm_omni/model_executor/stage_input_processors/soprano.py
+    - vllm_omni/deploy/soprano.yaml
+    - vllm_omni/deploy/soprano_streaming.yaml
+    - vllm_omni/entrypoints/openai/tts_adapters/soprano.py
+    - vllm_omni/entrypoints/openai/tts_adapters/__init__.py
+    - vllm_omni/entrypoints/openai/tts_adapters/base.py
+    - vllm_omni/entrypoints/openai/serving_speech.py
+    - vllm_omni/config/pipeline_registry.py
+    - tests/entrypoints/openai_api/test_soprano_adapter.py
+    - tests/e2e/online_serving/test_soprano_1_1.py
+    - tests/e2e/offline_inference/test_soprano_1_1.py
+    - tests/model_executor/models/soprano/
+    - tests/helpers/assertions.py
+    - tests/helpers/mark.py
+    - tests/helpers/client.py
+    - tests/helpers/runtime.py
+    - pyproject.toml
   tts_qwen3_tts_function:
     - tests/helpers/assertions.py
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
@@ -1180,6 +1199,10 @@ source_file_dependencies:
     - tests/dfx/reliability/invalid_param_test/
 
   reliability_invalid_param_l4:
+    - vllm_omni/model_executor/models/soprano/
+    - vllm_omni/model_executor/stage_input_processors/soprano.py
+    - vllm_omni/entrypoints/openai/tts_adapters/soprano.py
+    - vllm_omni/deploy/soprano.yaml
     - *qwen3_tts
     - *stable_audio
     - tests/dfx/reliability/invalid_param_test/

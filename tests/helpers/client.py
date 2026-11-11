@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from tests.helpers.assertions import (
     SuccessRateGate,
     assert_audio_speech_response,
+    assert_cancelled_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
     assert_images_generations_response,
@@ -103,6 +104,9 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
+    audio_chunk_arrivals_s: list[float] | None = None
+    audio_chunk_sizes: list[int] | None = None
+    cancelled: bool = False
     word_timestamps: list[dict[str, str | int]] | None = None
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
@@ -1430,12 +1434,50 @@ class OnlineOmniClient:
         try:
             # Aggregate all audio bytes from the streaming response.
             data = bytearray()
+            arrivals: list[float] = []
+            sizes: list[int] = []
+            result.audio_chunk_arrivals_s = arrivals
+            result.audio_chunk_sizes = sizes
+            http_response = getattr(response, "http_response", None)
+            if http_response is None:
+                http_response = getattr(response, "response", None)
+            content_type = http_response.headers.get("content-type", "") if http_response is not None else ""
+            is_sse = content_type.startswith("text/event-stream")
+            pending = bytearray()
+            saw_done = False
+
+            def consume(chunk: bytes) -> None:
+                nonlocal saw_done
+                if not chunk:
+                    return
+                if is_sse:
+                    pending.extend(chunk)
+                    while b"\n\n" in pending:
+                        entry, _, tail = pending.partition(b"\n\n")
+                        pending[:] = tail
+                        lines = [line[6:] for line in entry.splitlines() if line.startswith(b"data: ")]
+                        if not lines:
+                            continue
+                        event = json.loads(b"\n".join(lines))
+                        if event.get("type") == "speech.audio.delta":
+                            append_audio(base64.b64decode(event["audio"], validate=True))
+                        elif event.get("type") == "speech.audio.done":
+                            saw_done = True
+                        elif event.get("type") == "error" or "error" in event:
+                            raise ValueError(f"Speech SSE failed: {event}")
+                else:
+                    append_audio(chunk)
+
+            def append_audio(chunk: bytes) -> None:
+                if chunk:
+                    data.extend(chunk)
+                    arrivals.append(time.perf_counter() - wall_start)
+                    sizes.append(len(chunk))
 
             # Preferred OpenAI helper.
             if hasattr(response, "iter_bytes") and callable(getattr(response, "iter_bytes")):
                 for chunk in response.iter_bytes():
-                    if chunk:
-                        data.extend(chunk)
+                    consume(chunk)
             else:
                 # Generic iterable-of-bytes fallback (e.g., generator or list of chunks).
                 try:
@@ -1448,15 +1490,18 @@ class OnlineOmniClient:
                         if not chunk:
                             continue
                         if isinstance(chunk, (bytes, bytearray)):
-                            data.extend(chunk)
+                            consume(chunk)
                         elif hasattr(chunk, "data"):
-                            data.extend(chunk.data)  # type: ignore[arg-type]
+                            consume(chunk.data)
                         elif hasattr(chunk, "content"):
-                            data.extend(chunk.content)  # type: ignore[arg-type]
+                            consume(chunk.content)
                         else:
                             raise TypeError(f"Unsupported stream chunk type: {type(chunk)}")
                 else:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
+
+            if is_sse and (pending.strip() or not saw_done):
+                raise ValueError("Speech SSE ended without a complete speech.audio.done event")
 
             raw_bytes = bytes(data)
 
@@ -1464,9 +1509,9 @@ class OnlineOmniClient:
             result.audio_bytes = raw_bytes
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
-            result.audio_format = getattr(response, "response", None)
-            if result.audio_format is not None:
-                result.audio_format = result.audio_format.headers.get("content-type", "")
+            result.audio_format = content_type or None
+            if is_sse:
+                result.audio_format = f"audio/{response_format or 'pcm'}"
 
         except Exception as e:
             msg = f"Audio speech stream processing error: {str(e)}"
@@ -1508,6 +1553,60 @@ class OnlineOmniClient:
             msg = f"Audio speech non-stream processing error: {str(e)}"
             print(f"Error: {msg}")
 
+        return result
+
+    def send_audio_speech_cancel_request(self, request_config: dict[str, Any]) -> OmniResponse:
+        """Close a raw PCM speech response after bounded, complete int16 frames.
+
+        ``json`` contains the endpoint payload; local controls are ``timeout``
+        and ``cancel_after_audio_bytes``. This is cancellation evidence, never
+        a successful complete inference result. Transport reads are not model
+        audio chunks. The response context closes even on errors.
+        """
+        payload = request_config["json"]
+        if not (
+            payload.get("stream")
+            and payload.get("stream_format") == "audio"
+            and payload.get("response_format") == "pcm"
+        ):
+            raise ValueError("Cancellation probe requires stream=true, stream_format=audio, response_format=pcm")
+        limit = request_config.get("cancel_after_audio_bytes", 4096)
+        if type(limit) is not int or not 2 <= limit <= 1024 * 1024:
+            raise ValueError("cancel_after_audio_bytes must be an integer between 2 and 1048576")
+        data = bytearray()
+        sizes, arrivals = [], []
+        start = time.perf_counter()
+        with requests.post(
+            f"{self.base_url}/v1/audio/speech",
+            json=payload,
+            stream=True,
+            timeout=request_config.get("timeout", 120),
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.startswith("audio/pcm"):
+                raise ValueError(f"Expected audio/pcm, got {content_type!r}")
+            cancelled = False
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                data.extend(chunk)
+                sizes.append(len(chunk))
+                arrivals.append(time.perf_counter() - start)
+                if len(data) >= limit:
+                    cancelled = True
+                    break
+        # A network read can end mid-sample. Keep complete frames for prefix
+        # comparison; intentional cancellation makes no complete-EOF claim.
+        result = OmniResponse(
+            audio_bytes=bytes(data[: len(data) // 2 * 2]),
+            audio_format=content_type,
+            audio_chunk_sizes=sizes,
+            audio_chunk_arrivals_s=arrivals,
+            e2e_latency=time.perf_counter() - start,
+            cancelled=cancelled,
+        )
+        assert_cancelled_audio_speech_response(result)
         return result
 
     def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
@@ -2067,6 +2166,27 @@ class OfflineOmniClient:
         # [TODO] Add audio processing when tests are introduced
         result.success = True
         return result
+
+    def send_worker_probe_request(self, request_config: dict[str, Any]) -> dict[str, Any]:
+        """Run real inference between existing worker-extension RPC probes.
+
+        The test owns the extension and fixed-token schedule. The harness owns
+        invocation and restoration, including inference failures. No model
+        identity, hidden-state convention or numeric tolerance lives here.
+        """
+        rpc = self.runner.omni.engine.collective_rpc
+        method = request_config["probe_method"]
+        try:
+            rpc(method, args=(True, request_config["probe_config"]), timeout=request_config.get("probe_timeout", 60))
+            outputs = list(
+                self.runner.generate(
+                    request_config["prompt"], sampling_params_list=request_config["sampling_params_list"]
+                )
+            )
+        finally:
+            observations = rpc(method, args=(False, {}), timeout=request_config.get("probe_timeout", 60))
+        assert outputs, "Real inference returned no pipeline output"
+        return {"outputs": outputs, "worker_observations": observations}
 
     def send_omni_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
         if request_config is None:

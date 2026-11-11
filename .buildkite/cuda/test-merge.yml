@@ -74,6 +74,14 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline
     steps:
+      - label: "TTS · Soprano WAV and Streaming Smoke"
+        source_file_dependencies: tts_soprano_function
+        timeout_in_minutes: 15
+        commands:
+          - "uv pip install --system --python \"$(command -v python3)\" 'inflect>=7.6.0,<8' 'Unidecode>=1.4.0,<2'"
+          - "python3 -m pytest -sv tests/e2e/offline_inference/test_soprano_1_1.py tests/e2e/online_serving/test_soprano_1_1.py -m 'advanced_model and tts and cuda and L4 and cards_1' --run-level advanced_model"
+        mirror_hardwares: l4_1
+
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
         commands:

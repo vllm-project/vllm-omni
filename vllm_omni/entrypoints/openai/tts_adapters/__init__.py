@@ -126,6 +126,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     moss_tts,
     omnivoice,
     qwen3_tts,
+    soprano,
     step_audio2,
     voxcpm2,
     voxtral,

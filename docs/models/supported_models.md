@@ -119,6 +119,7 @@ th {
 | `HiggsAudioV2ForConditionalGeneration` | Higgs-Audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✅︎ | | | | — |
 | `HiggsMultimodalQwen3ForConditionalGeneration` | Higgs-Audio v3 (TTS) | `bosonai/higgs-audio-v3-tts-4b` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b) |
 | `VibeVoiceForConditionalGeneration` | VibeVoice-1.5B (offline, eager, single speaker, optional voice clone) | `vibevoice/VibeVoice-1.5B-hf` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Microsoft/VibeVoice-1.5B-H100.md) |
+| `SopranoForCausalLM` + `SopranoDecoderForGeneration` | Soprano-1.1-80M (English fixed voice, eager, explicit deploy) | `ekwek/Soprano-1.1-80M` | ✅︎ | | | | [RTX 4090 Laptop](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ekwek/Soprano-1.1-80M-RTX4090-Laptop.md) |
 | `IndexTTS2TalkerForConditionalGeneration` | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✅︎ | | | | — |
 | `IndexTTS25TalkerForConditionalGeneration` | IndexTTS-2.5 | native `checkpoints/` bundle | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md) |
 | `NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` | ✅︎ | ✅︎ | | ✅︎ | — |

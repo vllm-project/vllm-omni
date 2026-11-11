@@ -634,6 +634,9 @@ async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture)
         # Older servers send no headers: the env (default 24 kHz mono) applies.
         ({}, {}, 4.0),
         ({}, {"rate": "48000", "channels": "2"}, 1.0),
+        # Soprano: 192000 bytes are 3 s at 32 kHz mono, not 4 s at 24 kHz.
+        ({"X-Audio-Sample-Rate": "32000", "X-Audio-Channels": "1"}, {}, 3.0),
+        ({}, {"rate": "32000", "channels": "1"}, 3.0),
     ],
 )
 async def test_audio_speech_stream_uses_server_pcm_format(
