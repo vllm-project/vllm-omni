@@ -99,7 +99,10 @@ def _validate_native_edit_inputs(
 
 
 def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
-    od_config = _get_diffusion_od_config(raw_request, engine_client)
+    return _max_edit_input_images_from_config(_get_diffusion_od_config(raw_request, engine_client))
+
+
+def _max_edit_input_images_from_config(od_config: object | None) -> int | None:
     if od_config is None:
         # Preserve the existing compatibility behavior when the diffusion
         # config is not exposed on the serving surface.

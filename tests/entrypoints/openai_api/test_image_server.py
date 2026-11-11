@@ -30,6 +30,7 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.config.stage_config import StageConfig, StageType
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -38,11 +39,60 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 )
 from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("path", ["/v1/images/generations", "/v1/images/edits"])
+@pytest.mark.parametrize(
+    "fixture,condition,error",
+    [
+        ("test_client", "ready", None),
+        ("test_client", "no_engine", "Multi-stage engine not initialized"),
+        ("test_client", "no_stages", "Stage configs not found"),
+        ("test_client", "text_stages", "No image generation stage found"),
+        ("async_omni_test_client", "ready", None),
+        ("async_omni_test_client", "missing_chat", "openai_serving_chat is not initialized"),
+        ("async_omni_test_client", "engine_only", None),
+        ("async_omni_test_client", "text_stages", "No image generation stage found"),
+    ],
+)
+def test_image_exposure_matches_real_route_guards(request, fixture, condition, error, path):
+    client = request.getfixturevalue(fixture)
+    state = client.app.state
+    engine = state.engine_client
+    if condition == "no_engine":
+        state.engine_client = None
+    elif condition in {"no_stages", "engine_only"}:
+        state.stage_configs = []
+    elif condition == "text_stages":
+        # App-stage compatibility data takes priority even when the engine
+        # declares diffusion stages. Discovery must match the actual request.
+        state.stage_configs = [StageConfig(0, "text", stage_type=StageType.LLM).to_omegaconf()]
+    elif condition == "missing_chat":
+        state.openai_serving_chat = None
+    state.omni_serving_capabilities = OmniServingCapabilities(client.app, engine)
+    body = client.get("/v1/omni/capabilities").json()
+    route = next(r for r in body["routes"] if r["path"] == path and r["method"] == "POST")
+    if path.endswith("/edits"):
+        response = client.post(path, data={"prompt": "edit", "size": "64x64"}, files={"image": make_test_image_bytes()})
+    else:
+        response = client.post(path, json={"prompt": "draw", "size": "64x64"})
+    if error is not None:
+        assert route["exposure"] == "disabled"
+        assert response.status_code == 503, response.text
+        assert error in response.json()["detail"]
+        assert engine.captured_prompt is None
+    else:
+        assert route["exposure"] == "enabled"
+        assert response.status_code == 200, response.text
+        output = Image.open(io.BytesIO(base64.b64decode(response.json()["data"][0]["b64_json"])))
+        assert output.size == (64, 64)
+        assert engine.captured_prompt is not None
 
 
 @pytest.fixture

@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import torch
 import uvloop
@@ -190,6 +190,14 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_policy import (
+    duplex_admission_error,
+    get_ming3_chat_handler,
+    get_route_handler,
+    image_edit_error,
+    requires_image_chat,
+    single_api_exposure,
+)
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -237,6 +245,7 @@ from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
     render_video_segmentation_response,
     supports_video_segmentation,
 )
+from vllm_omni.entrypoints.openai.video_stream_base import OmniStreamingVideoHandler
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
@@ -1738,13 +1747,13 @@ def _resolve_api_server_count(args: Namespace, client_config: OmniClientConfig |
 
 def _reject_process_local_state_with_multiple_api_workers(raw_request: Request, operation: str) -> None:
     """Reject access to frontend state that is not shared across API workers."""
-    api_server_count = getattr(raw_request.app.state, "api_server_count", None)
-    if type(api_server_count) is not int or api_server_count < 1:
+    exposure = single_api_exposure(raw_request.app.state)
+    if exposure == "unknown":
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             detail="API worker topology is not initialized.",
         )
-    if api_server_count > 1:
+    if exposure == "disabled":
         raise HTTPException(
             status_code=HTTPStatus.CONFLICT.value,
             detail=(
@@ -1909,7 +1918,7 @@ async def streaming_speech(websocket: WebSocket):
     input.done, which flushes without closing the connection. See
     serving_speech_stream.py for protocol.
     """
-    handler = getattr(websocket.app.state, "openai_streaming_speech", None)
+    handler = cast(OmniStreamingSpeechHandler | None, get_route_handler(websocket.app.state, "/v1/audio/speech/stream"))
     if handler is None:
         await websocket.accept()
         await websocket.send_json(
@@ -1926,7 +1935,7 @@ async def streaming_speech(websocket: WebSocket):
 @router.websocket("/v1/video/chat/stream")
 async def streaming_video_chat(websocket: WebSocket):
     """WebSocket endpoint for streaming video input chat."""
-    handler = getattr(websocket.app.state, "openai_streaming_video", None)
+    handler = cast(OmniStreamingVideoHandler | None, get_route_handler(websocket.app.state, "/v1/video/chat/stream"))
     if handler is None:
         await websocket.accept()
         await websocket.send_json(
@@ -1943,7 +1952,7 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime/video")
 async def streaming_video_output(websocket: WebSocket):
     """WebSocket endpoint for streaming generated video output chunks."""
-    handler = getattr(websocket.app.state, "openai_streaming_video_output", None)
+    handler = cast(OmniStreamingVideoOutputHandler | None, get_route_handler(websocket.app.state, "/v1/realtime/video"))
     if handler is None:
         await websocket.accept()
         await websocket.send_json(
@@ -1960,7 +1969,7 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    duplex_handler = cast(OmniDuplexSessionHandler | None, get_route_handler(websocket.app.state, "/v1/duplex"))
     duplex_query = websocket.query_params.get("duplex")
     use_duplex_realtime = duplex_handler is not None and (
         duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
@@ -1977,14 +1986,14 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    chat = getattr(websocket.app.state, "openai_serving_chat", None)
-    if chat is not None and getattr(chat, "_ming3_speech_service", None) is not None:
+    chat = cast(OmniOpenAIServingChat | None, get_ming3_chat_handler(websocket.app.state))
+    if chat is not None:
         from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
 
         await Ming3RealtimeConnection(websocket, chat).handle_connection()
         return
 
-    realtime_handler = getattr(websocket.app.state, "openai_realtime_handler", None)
+    realtime_handler = cast(OpenAIRealtimeHandler | None, get_route_handler(websocket.app.state, "/v1/realtime"))
     if realtime_handler is None:
         await _reject_unavailable_realtime_websocket(websocket)
         return
@@ -1997,7 +2006,7 @@ async def duplex_websocket(websocket: WebSocket):
     """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
     if await _reject_multi_api_duplex(websocket):
         return
-    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    handler = cast(OmniDuplexSessionHandler | None, get_route_handler(websocket.app.state, "/v1/duplex"))
     if handler is None:
         await websocket.accept()
         await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
@@ -2013,7 +2022,9 @@ async def realtime_robot_openpi(websocket: WebSocket):
         RobotRealtimeConnection,
     )
 
-    serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
+    serving = cast(
+        ServingRealtimeRobotOpenPI | None, get_route_handler(websocket.app.state, "/v1/realtime/robot/openpi")
+    )
     if serving is None:
         logger.warning(
             "Rejecting robot OpenPI WebSocket: policy serving is disabled. "
@@ -2037,22 +2048,9 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 
 async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
-    count = getattr(websocket.app.state, "api_server_count", None)
-    if count is None or (type(count) is int and count == 1):
+    error = duplex_admission_error(websocket.app.state)
+    if error is None:
         return False
-    error = "Duplex sessions require initialized API worker topology."
-    if type(count) is int and count > 1:
-        engine_client = getattr(websocket.app.state, "engine_client", None)
-        config = getattr(engine_client, "duplex_session_config", None)
-        capabilities = getattr(engine_client, "duplex_capabilities", None)
-        if getattr(config, "replica_policy", None) != "least_sessions":
-            error = "Duplex sessions with multiple API workers require replica_policy=least_sessions."
-        elif getattr(capabilities, "supports_session_resume", None) is not False:
-            # Session credentials and replay state are local to each frontend;
-            # the shared socket cannot route reconnects back to their owner.
-            error = "Duplex session resume routing across API workers is not supported."
-        else:
-            return False
     await websocket.accept()
     await websocket.send_json(
         {
@@ -2318,8 +2316,8 @@ async def generate_images(
         height: int | None = None
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
-        if len(stage_configs) > 1:
-            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+        if requires_image_chat(stage_configs):
+            chat_handler = Omnichat(raw_request)
             if chat_handler is None:
                 logger.warning("openai_serving_chat is not initialized for multi-stage /v1/images/generations")
                 raise HTTPException(
@@ -2382,6 +2380,8 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
+            # This call uses stream=False, so a successful result is final.
+            assert isinstance(generation_result, tuple)
             flat_images, stage_durations, peak_memory_mb, _, response_metrics = generation_result
             return _build_image_generation_response(
                 images=flat_images,
@@ -2659,10 +2659,11 @@ async def edit_images(
         # Image edits (img2img) remain gated to classical diffusion stages;
         # MammothModa2 is rejected at route level by its pipeline's endpoint
         # restrictions (test_mammoth_moda2_shared_runtime.py).
-        if not any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):
+        edit_error = image_edit_error(stage_configs)
+        if edit_error is not None:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="No diffusion stage found in multi-stage pipeline.",
+                detail=edit_error,
             )
         gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(engine_client))
         app_state_args = getattr(raw_request.app.state, "args", None)
@@ -2758,11 +2759,11 @@ async def edit_images(
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
         logger.debug(f"Generating {n} image(s) {size_str}")
 
-        if len(stage_configs) > 1:
+        if requires_image_chat(stage_configs):
             # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
             # the chat handler so the AR stage gets correct max_tokens and
             # target_h/w (same path as /v1/images/generations).
-            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+            chat_handler = Omnichat(raw_request)
             if chat_handler is None:
                 raise HTTPException(
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -2844,6 +2845,8 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
+            # The streaming branch has already returned above.
+            assert isinstance(generation_result, tuple)
             images, stage_durations, peak_memory_mb, cot_output, response_metrics = generation_result
         else:
             # Single-stage diffusion: use the direct path.

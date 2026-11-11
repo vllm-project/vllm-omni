@@ -8,13 +8,17 @@ No model weights or tokenizer downloads are needed.
 """
 
 import asyncio
+import io
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI, WebSocket
+from fastapi import Depends, FastAPI, Request, WebSocket
 from fastapi.testclient import TestClient
+from PIL import Image
+from starlette.datastructures import State
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -174,6 +178,12 @@ def test_image_edit_route_requires_its_actual_diffusion_stage_guard():
     ]
     with TestClient(_app(engine)) as client:
         routes = _routes(client.get("/v1/omni/capabilities").json())
+        source = io.BytesIO()
+        Image.new("RGB", (16, 16)).save(source, format="PNG")
+        response = client.post("/v1/images/edits", data={"prompt": "edit"}, files={"image": source.getvalue()})
+        assert response.status_code == 503
+        assert response.json()["detail"] == "No diffusion stage found in multi-stage pipeline."
+    engine.generate.assert_not_called()
     assert routes[("http", "POST", "/v1/images/generations")] == "enabled"
     assert routes[("http", "POST", "/v1/images/edits")] == "disabled"
 
@@ -344,6 +354,165 @@ def test_projection_does_not_reparse_configuration_on_queries():
     assert len(first["stages"]) == 2
     assert first["models"][0]["operations"]["image_generation"]["support"] == "supported"
     assert second["observed_at"] >= first["observed_at"]
+
+
+@dataclass
+class _EditConfigView:
+    supports_multimodal_inputs: object = True
+    max_multimodal_image_inputs: object = 3
+
+
+@dataclass
+class _ConfigEngine:
+    od_config: object
+
+    def get_diffusion_od_config(self):
+        return self.od_config
+
+
+@pytest.mark.parametrize(
+    "config,maximum",
+    [
+        (None, None),
+        (_EditConfigView(None, 3), None),
+        (_EditConfigView(False, 3), 1),
+        (_EditConfigView(True, 3), 3),
+        (_EditConfigView(True, None), None),
+        (_EditConfigView(True, True), None),
+        (_EditConfigView(True, "3"), None),
+        (_EditConfigView(True, 0), None),
+    ],
+)
+def test_startup_config_reading_needs_no_request(monkeypatch, config, maximum):
+    from vllm_omni.entrypoints.openai import app_state
+    from vllm_omni.entrypoints.openai.images import helpers
+
+    engine = _engine(get_diffusion_model_metadata("Flux2KleinPipeline").serving_capabilities)
+    engine.engine.stage_configs = [
+        StageConfig(0, "diffusion", stage_type=StageType.DIFFUSION, final_output=True, final_output_type="image")
+    ]
+    app = _app(engine)
+    app.state.diffusion_engine = _ConfigEngine(config)
+    assert app_state._get_diffusion_od_config_from_state(app.state, engine) is config
+    assert helpers._max_edit_input_images_from_config(config) == maximum
+    request = Request({"type": "http", "app": app})
+    assert helpers._get_max_edit_input_images(request, engine) == maximum
+    with monkeypatch.context() as patch:
+        patch.setattr(Request, "__init__", lambda *a, **kw: pytest.fail("startup must not create a Request"))
+        app.state.omni_serving_capabilities = OmniServingCapabilities(app, engine)
+    # Later queries read captured configuration, never these accessors again.
+    monkeypatch.setattr(
+        app_state, "_get_diffusion_od_config_from_state", lambda *a: pytest.fail("query must not read config")
+    )
+    with TestClient(app) as client:
+        body = client.get("/v1/omni/capabilities").json()
+    profile = body["models"][0]["operations"]["image_edit"]["profiles"][0]
+    route = next(r for r in profile["routes"] if r["path"] == "/v1/images/edits")
+    # Klein declares four sources; an initialized handler can tighten the limit.
+    assert route["request"]["inputs"]["image"]["max_count"] == (maximum if maximum is not None else 4)
+    engine.generate.assert_not_called()
+    engine.wake_up.assert_not_called()
+
+
+def test_diffusion_config_source_priority():
+    from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config_from_state
+
+    engine_config = _EditConfigView(True, 4)
+    app_config = _EditConfigView(False, 1)
+    engine = _ConfigEngine(engine_config)
+    state = State()
+    assert _get_diffusion_od_config_from_state(state, engine) is engine_config
+    state.diffusion_engine = _ConfigEngine(app_config)
+    assert _get_diffusion_od_config_from_state(state, engine) is app_config
+    # A legacy engine exposes only the initialized attribute; a getter, when
+    # present, takes priority even if it returns unknown.
+    state.diffusion_engine = State({"od_config": app_config})
+    assert _get_diffusion_od_config_from_state(state, engine) is app_config
+    state.diffusion_engine.get_diffusion_od_config = lambda: None
+    assert _get_diffusion_od_config_from_state(state, engine) is None
+
+
+@pytest.mark.parametrize(
+    "count,exposure,status",
+    [(None, "unknown", 503), (True, "unknown", 503), (0, "unknown", 503), (1, "enabled", 200), (2, "disabled", 409)],
+)
+def test_video_store_exposure_matches_real_dependency(count, exposure, status):
+    app = _app(_engine(), count=count)
+
+    @app.post("/v1/extension", dependencies=[Depends(api_server._require_single_api_video_store)])
+    async def extension():
+        return {}
+
+    app.state.omni_serving_capabilities = OmniServingCapabilities(
+        app, app.state.engine_client, single_api_dependencies=(api_server._require_single_api_video_store,)
+    )
+    with TestClient(app) as client:
+        routes = _routes(client.get("/v1/omni/capabilities").json())
+        assert routes[("http", "POST", "/v1/videos")] == exposure
+        # An unknown extension does not become known just because its worker
+        # topology is valid.
+        assert routes[("http", "POST", "/v1/extension")] == ("unknown" if count == 1 else exposure)
+        response = client.post("/v1/extension")
+        assert response.status_code == status
+        if status == 503:
+            assert response.json()["detail"] == "API worker topology is not initialized."
+        elif status == 409:
+            assert "Asynchronous video jobs is not supported" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,attribute,payload,message",
+    [
+        (
+            "/v1/chat/completions",
+            "openai_serving_chat",
+            {"model": "public-primary", "messages": [{"role": "user", "content": "hello"}]},
+            "Chat Completions API",
+        ),
+        ("/v1/audio/speech", "openai_serving_speech", {"input": "hello"}, "Speech API"),
+        ("/v1/audio/generate", "openai_serving_audio_generate", {"input": "ocean"}, "Audio Generate API"),
+    ],
+)
+async def test_missing_handlers_match_actual_http_rejection(monkeypatch, tmp_path, path, attribute, payload, message):
+    app, engine = await build_initialized_test_app(monkeypatch, tmp_path)
+    setattr(app.state, attribute, None)
+    app.state.omni_serving_capabilities = OmniServingCapabilities(app, engine)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            routes = _routes((await client.get("/v1/omni/capabilities")).json())
+            assert routes[("http", "POST", path)] == "disabled"
+            response = await client.post(path, json=payload)
+            assert response.status_code == 404, response.text
+            assert message in response.text
+    finally:
+        app.state.openai_serving_video.shutdown()
+    engine.generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "path,attribute,message",
+    [
+        ("/v1/audio/speech/stream", "openai_streaming_speech", "Streaming speech is not available"),
+        ("/v1/video/chat/stream", "openai_streaming_video", "Streaming video chat is not available"),
+        ("/v1/realtime/video", "openai_streaming_video_output", "Streaming video generation is not available"),
+        ("/v1/duplex", "openai_serving_duplex", "Duplex API is not available"),
+        ("/v1/realtime/robot/openpi", "openai_serving_realtime_robot", "Robot policy not available"),
+    ],
+)
+def test_missing_handlers_match_actual_websocket_rejection(path, attribute, message):
+    engine = _engine()
+    app = _app(engine)
+    setattr(app.state, attribute, None)
+    app.state.omni_serving_capabilities = OmniServingCapabilities(app, engine)
+    with TestClient(app) as client:
+        routes = _routes(client.get("/v1/omni/capabilities").json())
+        assert routes[("websocket", "WEBSOCKET", path)] == "disabled"
+        with client.websocket_connect(path) as socket:
+            error = socket.receive_json()
+            assert error["type"] == "error"
+            assert error.get("message", error.get("error")) == message
+    engine.generate.assert_not_called()
 
 
 def test_uninitialized_service_returns_503_instead_of_resolving_models():

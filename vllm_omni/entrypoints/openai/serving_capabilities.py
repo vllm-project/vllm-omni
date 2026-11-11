@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Literal, cast
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from vllm.logger import init_logger
 
@@ -27,7 +27,19 @@ from vllm_omni.entrypoints.openai.protocol.capabilities import (
     Exposure,
     OmniCapabilitiesResponse,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, is_image_generation_stage, is_video_generation_pipeline
+from vllm_omni.entrypoints.openai.serving_policy import (
+    duplex_admission_error,
+    get_image_stage_configs,
+    get_ming3_chat_handler,
+    get_route_handler,
+    get_video_stage_configs,
+    handler_exposure,
+    image_edit_error,
+    image_generation_error,
+    requires_image_chat,
+    single_api_exposure,
+    video_generation_error,
+)
 from vllm_omni.request_capabilities import (
     ImageGeometry,
     InputConstraint,
@@ -53,21 +65,6 @@ _OPERATION_ROUTES: dict[OperationId, tuple[RouteKey, ...]] = {
     ),
     "speech": (("http", "POST", "/v1/audio/speech"),),
     "audio_generation": (("http", "POST", "/v1/audio/generate"),),
-}
-
-_ROUTE_HANDLERS = {
-    "/v1/chat/completions": "openai_serving_chat",
-    "/v1/chat/completions/batch": "openai_serving_chat_batch",
-    "/v1/audio/speech": "openai_serving_speech",
-    "/v1/audio/generate": "openai_serving_audio_generate",
-    "/v1/videos": "openai_serving_video",
-    "/v1/videos/sync": "openai_serving_video",
-    "/v1/realtime/video": "openai_streaming_video_output",
-    "/v1/audio/speech/batch": "openai_serving_speech",
-    "/v1/audio/speech/stream": "openai_streaming_speech",
-    "/v1/video/chat/stream": "openai_streaming_video",
-    "/v1/duplex": "openai_serving_duplex",
-    "/v1/realtime/robot/openpi": "openai_serving_realtime_robot",
 }
 
 
@@ -234,6 +231,7 @@ class OmniServingCapabilities:
         serving_models = getattr(state, "openai_serving_models", None)
         self._model_ids = tuple(path.name for path in getattr(serving_models, "base_model_paths", ()))
         stages = list(getattr(engine_client, "stage_configs", ()) or ())
+        image_stages = get_image_stage_configs(state, engine_client)
         self._stages = _stage_projection(stages)
         engine = getattr(engine_client, "engine", None)
         declaration = getattr(engine, "serving_capabilities", None)
@@ -244,7 +242,7 @@ class OmniServingCapabilities:
         # Duplex chat uses session admission, not AsyncOmni.generate's gate.
         self._observer = (
             cast(Callable[[], Awaitable[ExecutionState]], observer)
-            if callable(observer) and getattr(state, "openai_serving_duplex", None) is None
+            if callable(observer) and get_route_handler(state, "/v1/duplex") is None
             else None
         )
         disabled = {
@@ -266,46 +264,44 @@ class OmniServingCapabilities:
                 key = (transport, method, path)
                 # Unknown extension routes may have their own admission rules.
                 # Registration alone does not establish their availability.
-                exposure: Exposure = "unknown"
-                handler_name = _ROUTE_HANDLERS.get(path)
-                if handler_name is not None:
-                    exposure = "enabled" if getattr(state, handler_name, None) is not None else "disabled"
+                exposure = handler_exposure(state, path)
                 if path in {"/v1/models", "/v1/omni/capabilities"}:
                     exposure = "enabled"
                 if path in {"/v1/images/generations", "/v1/images/edits"}:
-                    exposure = "enabled" if any(is_image_generation_stage(stage) for stage in stages) else "disabled"
-                    if path.endswith("/edits") and not any(get_stage_type(stage) == "diffusion" for stage in stages):
+                    exposure = "enabled" if image_generation_error(image_stages) is None else "disabled"
+                    if getattr(state, "engine_client", None) is None:
                         exposure = "disabled"
-                    if len(stages) > 1 and getattr(state, "openai_serving_chat", None) is None:
+                    if path.endswith("/edits") and image_edit_error(image_stages) is not None:
+                        exposure = "disabled"
+                    if requires_image_chat(image_stages) and get_route_handler(state, "/v1/chat/completions") is None:
                         exposure = "disabled"
                 if path in {"/v1/videos", "/v1/videos/sync", "/v1/realtime/video"}:
-                    if not is_video_generation_pipeline(stages):
+                    handler = get_route_handler(state, path)
+                    video_stages = getattr(handler, "_stage_configs", None)
+                    if path != "/v1/realtime/video":
+                        # The HTTP form parser supplies app stages when the
+                        # handler has none. WebSocket handlers use their engine.
+                        video_stages = video_stages or getattr(state, "stage_configs", None)
+                    video_stages = get_video_stage_configs(video_stages, engine_client)
+                    if video_generation_error(video_stages) is not None:
                         exposure = "disabled"
-                if path == "/v1/duplex" and count is not None:
-                    if type(count) is not int or count < 1:
-                        exposure = "disabled"
-                    elif count > 1:
-                        config = getattr(engine_client, "duplex_session_config", None)
-                        capabilities = getattr(engine_client, "duplex_capabilities", None)
-                        if getattr(config, "replica_policy", None) != "least_sessions" or (
-                            getattr(capabilities, "supports_session_resume", None) is not False
-                        ):
-                            exposure = "disabled"
+                if path == "/v1/duplex" and duplex_admission_error(state) is not None:
+                    exposure = "disabled"
                 if path == "/v1/realtime":
-                    duplex = getattr(state, "openai_serving_duplex", None)
-                    realtime = getattr(state, "openai_realtime_handler", None)
-                    chat = getattr(state, "openai_serving_chat", None)
-                    ming3 = getattr(chat, "_ming3_speech_service", None)
+                    duplex = get_route_handler(state, "/v1/duplex")
+                    realtime = get_route_handler(state, path)
+                    ming3 = get_ming3_chat_handler(state)
                     if duplex is None:
                         exposure = "enabled" if realtime is not None or ming3 is not None else "disabled"
+                    else:
+                        exposure = "unknown"
                     # Query parameters choose duplex vs turn-based sessions.
                     # Their mixed policies cannot be represented by one bool.
                 dependencies = route.dependant.dependencies
                 if any(dependency.call in single_api_dependencies for dependency in dependencies):
-                    if (type(count) is not int or count < 1) and exposure != "disabled":
-                        exposure = "unknown"
-                    elif type(count) is int and count > 1:
-                        exposure = "disabled"
+                    worker_exposure = single_api_exposure(state)
+                    if exposure != "disabled" and worker_exposure != "enabled":
+                        exposure = worker_exposure
                 if key in disabled:
                     exposure = "disabled"
                 routes[key] = CapabilityRoute(
@@ -324,12 +320,11 @@ class OmniServingCapabilities:
                     )
         self._routes = routes
         from vllm_omni.diffusion.data import uses_diffusers_adapter
-        from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
-        from vllm_omni.entrypoints.openai.images.helpers import _get_max_edit_input_images
+        from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config_from_state
+        from vllm_omni.entrypoints.openai.images.helpers import _max_edit_input_images_from_config
 
-        startup_request = Request({"type": "http", "app": app})
-        image_limit = _get_max_edit_input_images(startup_request, engine_client)
-        diffusion_config = _get_diffusion_od_config(startup_request, engine_client)
+        diffusion_config = _get_diffusion_od_config_from_state(state, engine_client)
+        image_limit = _max_edit_input_images_from_config(diffusion_config)
         native_diffusion = not uses_diffusers_adapter(diffusion_config)
         self._engine = engine
         geometry = _initialized_image_geometry(engine)
@@ -352,7 +347,7 @@ class OmniServingCapabilities:
                             request=_route_request(
                                 profile,
                                 route.path,
-                                stage_count=len(stages),
+                                stage_count=len(image_stages) if route.path.startswith("/v1/images/") else len(stages),
                                 state=state,
                                 geometry=geometry,
                                 image_limit=image_limit,

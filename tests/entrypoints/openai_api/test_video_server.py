@@ -38,6 +38,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
@@ -689,6 +690,58 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
             return last_payload
         time.sleep(0.02)
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
+
+
+@pytest.mark.parametrize("path", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("condition", ["ready", "missing_handler", "missing_stages", "image_stages", "app_stages"])
+def test_video_exposure_matches_rejection_phase(test_client, mocker, path, condition):
+    from vllm_omni.config.stage_config import StageConfig, StageType
+
+    state = test_client.app.state
+    handler = state.openai_serving_video
+    engine = handler._engine_client
+    state.engine_client = engine
+    if condition == "missing_handler":
+        state.openai_serving_video = None
+    elif condition == "missing_stages":
+        engine.stage_configs = []
+    elif condition in {"image_stages", "app_stages"}:
+        image_stages = [
+            StageConfig(0, "diffusion", stage_type=StageType.DIFFUSION, final_output=True, final_output_type="image")
+        ]
+        if condition == "app_stages":
+            state.stage_configs = image_stages
+        else:
+            handler.set_stage_configs_if_missing(image_stages)
+    state.omni_serving_capabilities = OmniServingCapabilities(
+        test_client.app, engine, single_api_dependencies=(api_server._require_single_api_video_store,)
+    )
+    body = test_client.get("/v1/omni/capabilities").json()
+    route = next(r for r in body["routes"] if r["path"] == path and r["method"] == "POST")
+    assert route["exposure"] == ("enabled" if condition == "ready" else "disabled")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"encoded-video")
+    response = test_client.post(path, data={"prompt": "video"})
+    if condition == "missing_handler":
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Video generation handler not initialized."
+    elif condition == "ready":
+        assert response.status_code == 200, response.text
+        if path == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], "completed")
+        assert engine.captured_prompt is not None
+    else:
+        error = "Stage configs not found" if condition == "missing_stages" else "No final video output stage found"
+        if path == "/v1/videos":
+            # Keep asynchronous acceptance: the existing generation guard
+            # reports its error through the stored job, not the POST response.
+            assert response.status_code == 200, response.text
+            job = _wait_for_status(test_client, response.json()["id"], "failed")
+            assert error in job["error"]["message"]
+        else:
+            assert response.status_code == 503, response.text
+            assert error in response.json()["detail"]
+    if condition != "ready":
+        assert engine.captured_prompt is None
 
 
 def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
