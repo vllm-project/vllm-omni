@@ -6,8 +6,11 @@
 unless this step's own timings show its measured files would miss
 ``timeout_in_minutes``. It then packs those files with a greedy
 longest-processing-time assignment, never more than ``MAX_AUTOMATIC_SHARDS``,
-and each shard runs only the files in its bin. The packing is not the smallest
-possible. Unmeasured files add no weight, so a missing profile stays one job.
+and each shard runs only the files in its bin. Pytest still receives the
+original directories, so a directory ``conftest.py`` loads with those tests;
+the timings plugin then drops every file that is not in the bin. The packing
+is not the smallest possible. Unmeasured files add no weight, so a missing
+profile stays one job.
 A finished session's unmeasured files were filtered by ``-m`` and stay at
 weight 0; they are still placed in a bin so a new file keeps running.
 
@@ -38,8 +41,7 @@ PYTHONPATH_EXPORT = f'export PYTHONPATH="{SCRIPTS_DIR}$${{PYTHONPATH:+:$$PYTHONP
 ARTIFACT_PATHS = ["timings/jobs/*.json"]
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _SHELL_EXPAND_ARG = re.compile(r"^(?:--(?:num-shards|shard-id)=)?\${1,2}[A-Za-z_][A-Za-z0-9_]*$")
-# Buildkite runs commands with /bin/sh (dash on the CI image): no mapfile or arrays.
-_SHARD_FILE_ARG = '"$$@"'
+FILE_SHARD_ENV = "VLLM_OMNI_FILE_SHARD_LIST"
 FILE_SHARD_ROOT = Path("timings/file-shards")
 _VALUE_OPTIONS = {
     "-m",
@@ -377,39 +379,23 @@ def _write_file_shards(root: Path, slug: str, bins: list[list[str]]) -> None:
 
 
 def _file_shard_command(command: str, slug: str) -> str:
-    """Run one packed bin. ``$$`` survives Buildkite interpolation."""
-    argv = _pytest_argv(command)
-    if argv is None:
+    """Run one packed bin. ``$$`` survives Buildkite interpolation.
+
+    The pytest command keeps its directory targets. Passing the bin as file
+    arguments collects those modules without the directory ``conftest.py``.
+    ``pytest_file_timings`` reads ``VLLM_OMNI_FILE_SHARD_LIST`` and drops every
+    other file after collection.
+    """
+    if _pytest_argv(command) is None:
         return command
-    kept = [argv[0]]
-    index = 1
-    while index < len(argv):
-        arg = argv[index]
-        if arg in _VALUE_OPTIONS:
-            if index + 1 < len(argv):
-                kept.extend((arg, argv[index + 1]))
-            else:
-                kept.append(arg)
-            index += 2
-            continue
-        if arg.startswith("-"):
-            kept.append(arg)
-            index += 1
-            continue
-        index += 1
-    kept.append(_SHARD_FILE_ARG)
-    pytest_line = _shell_join(kept)
     return "\n".join(
         (
             "set -eu",
             f'shard_list="{FILE_SHARD_ROOT.as_posix()}/{slug}/$${{BUILDKITE_PARALLEL_JOB:-0}}.txt"',
             'buildkite-agent artifact download "$$shard_list" .',
             'test -s "$$shard_list"',
-            # Paths hold no whitespace or glob characters; -f keeps them literal.
-            "set -f",
-            'set -- $$(cat "$$shard_list")',
-            "set +f",
-            pytest_line,
+            f'export {FILE_SHARD_ENV}="$$shard_list"',
+            command,
         )
     )
 
@@ -423,7 +409,7 @@ def _shell_join(argv: list[str]) -> str:
     """
     parts: list[str] = []
     for arg in argv:
-        if arg == _SHARD_FILE_ARG or _SHELL_EXPAND_ARG.fullmatch(arg):
+        if _SHELL_EXPAND_ARG.fullmatch(arg):
             parts.append(arg)
         else:
             parts.append(shlex.quote(arg))

@@ -19,6 +19,8 @@ import signal
 import time
 from pathlib import Path
 
+import pytest
+
 OUTPUT_DIR = Path("timings/jobs")
 SCHEMA = "vllm_omni.shard_timings.job.v1"
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -90,7 +92,34 @@ def pytest_configure(config) -> None:
             continue
 
 
-def pytest_collection_modifyitems(items) -> None:
+def _shard_allowlist() -> set[str] | None:
+    raw = os.environ.get("VLLM_OMNI_FILE_SHARD_LIST", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_file():
+        raise pytest.UsageError(f"VLLM_OMNI_FILE_SHARD_LIST does not exist: {raw}")
+    return {line.strip().replace("\\", "/") for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items) -> None:
+    # Directory collection loads each directory's conftest.py. The allowlist
+    # then keeps only this bin; passing those paths as pytest arguments does not.
+    allowed = _shard_allowlist()
+    if allowed is not None:
+        kept = []
+        dropped = []
+        for item in items:
+            nodeid = getattr(item, "nodeid", "")
+            file = nodeid.split("::", 1)[0].replace("\\", "/")
+            if file in allowed:
+                kept.append(item)
+            else:
+                dropped.append(item)
+        items[:] = kept
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
     # TEMPORARY: delete with the killed-session estimate.
     for item in items:
         nodeid = getattr(item, "nodeid", "")

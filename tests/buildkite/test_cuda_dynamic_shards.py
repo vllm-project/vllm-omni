@@ -11,6 +11,7 @@ file list, and sets ``parallelism``. A shard runs only its list.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -600,7 +601,12 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     shard_dir.mkdir(parents=True)
     (shard_dir / "1.txt").write_text("tests/b_test.py\n", encoding="utf-8")
     dumper = tmp_path / "dump_argv.py"
-    dumper.write_text("import sys\nprint('\\n'.join(sys.argv[1:]))\n", encoding="utf-8")
+    dumper.write_text(
+        "import os, sys\n"
+        "print('\\n'.join(sys.argv[1:]))\n"
+        "print('SHARD=' + os.environ.get('VLLM_OMNI_FILE_SHARD_LIST', ''))\n",
+        encoding="utf-8",
+    )
     interpreter = _shell_python(bash)
     dumper_arg = _bash_command(dumper, bash=bash)
     rendered = _inject_plugin(_file_shard_command("pytest -sv tests/ -m 'core_model and cpu'", slug))
@@ -608,9 +614,9 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
     assert SHARD_ID not in rendered
     assert "'$" not in rendered
     assert PLUGIN_MODULE in rendered
-    # Buildkite runs commands with /bin/sh. dash has no mapfile and no arrays.
-    assert "mapfile" not in rendered
-    assert "[@]" not in rendered
+    assert "VLLM_OMNI_FILE_SHARD_LIST" in rendered
+    # Directory targets stay so each directory conftest.py is collected.
+    assert "pytest -p pytest_file_timings -sv tests/ -m 'core_model and cpu'" in rendered
     expanded = rendered.replace("$$", "$").replace("pytest ", f"{interpreter} {dumper_arg} ", 1)
     if sys.platform == "win32" and "system32" in bash.lower():
         expanded = expanded.replace("$", r"\$")
@@ -625,9 +631,43 @@ def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
         check=False,
     )
     argv = completed.stdout.splitlines()
-    assert "tests/b_test.py" in argv, completed.stderr
-    assert "tests/" not in argv, completed.stderr
+    assert "tests/" in argv, completed.stderr
+    assert "tests/b_test.py" not in argv, completed.stderr
+    assert any(line.startswith("SHARD=") and line.endswith("1.txt") for line in argv), completed.stderr
     assert "pytest_file_timings" in argv
+
+
+def test_shard_list_keeps_directory_conftest_and_drops_other_files(tmp_path: Path) -> None:
+    proj = tmp_path / "proj"
+    pkg = proj / "tests" / "pkg"
+    pkg.mkdir(parents=True)
+    (proj / "pyproject.toml").write_text("[tool.pytest.ini_options]\naddopts = []\n", encoding="utf-8")
+    (pkg / "conftest.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef contracts():\n    return 1\n",
+        encoding="utf-8",
+    )
+    (pkg / "test_one.py").write_text("def test_one(contracts):\n    assert contracts == 1\n", encoding="utf-8")
+    (pkg / "test_two.py").write_text("def test_two(contracts):\n    assert contracts == 1\n", encoding="utf-8")
+    shard = proj / "0.txt"
+    shard.write_text("tests/pkg/test_one.py\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["VLLM_OMNI_FILE_SHARD_LIST"] = str(shard)
+    scripts = Path(".buildkite/common/scripts").resolve()
+    env["PYTHONPATH"] = str(scripts) + os.pathsep + env.get("PYTHONPATH", "")
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-o", "addopts=", "-p", "pytest_file_timings", "-q", "tests/pkg"],
+        cwd=proj,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "1 passed" in output
+    assert "1 deselected" in output
 
 
 def test_legacy_killed_simple_test_is_incomplete_and_a_finished_job_is_not(tmp_path: Path) -> None:
@@ -697,7 +737,7 @@ def test_timing_plugin_records_completion_and_selected_files(tmp_path: Path, mon
         nodeid = "tests/a_test.py::test_one"
 
     try:
-        pytest_file_timings.pytest_collection_modifyitems([_Item(), _Item()])
+        pytest_file_timings.pytest_collection_modifyitems(None, [_Item(), _Item()])
         pytest_file_timings.pytest_runtest_logstart("tests/a_test.py::test_one", None)
         pytest_file_timings.pytest_runtest_logfinish("tests/a_test.py::test_one", None)
         pytest_file_timings._interrupted = True
