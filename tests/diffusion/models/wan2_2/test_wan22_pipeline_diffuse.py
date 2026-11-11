@@ -901,6 +901,7 @@ def test_runner_rejects_wan_schedule_past_actual_total_before_denoise(monkeypatc
 
 class _StubDMDScheduler:
     def __init__(self) -> None:
+        self.config = SimpleNamespace(num_train_timesteps=1000)
         self.predict_clean_calls: list[tuple[float, float, float]] = []
         self.add_noise_calls: list[tuple[float, float, float]] = []
 

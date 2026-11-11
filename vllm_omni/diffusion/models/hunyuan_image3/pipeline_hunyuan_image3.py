@@ -2494,7 +2494,7 @@ class HunyuanImage3Pipeline(
                 f"scheduled HunyuanImage-3.0 request {state.request_id} needs a current timestep and a "
                 f"flow-matching scheduler; got {type(current_timestep).__name__} and {type(scheduler).__name__}"
             )
-        timestep = float(current_timestep) / scheduler.config.num_train_timesteps
+        timestep = current_timestep.item() / scheduler.config.num_train_timesteps
         sigma = None
         if get_forward_context().attention_sigma_schedule:
             sigma = denoise_sigma(state.step_index, scheduler.sigmas)

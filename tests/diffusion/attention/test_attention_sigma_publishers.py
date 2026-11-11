@@ -78,17 +78,21 @@ def test_sigma_is_published_as_is_not_relative_to_the_first_sigma():
     assert denoise_sigma(3, sigmas) is None
 
 
-@pytest.mark.parametrize("sigmas", [[1.0, 0.5, 0.0], (1.0, 0.5, 0.0), torch.ones(2, 2)])
-def test_scheduler_sigmas_must_be_a_1d_tensor(sigmas):
-    with pytest.raises(TypeError, match="1-D torch.Tensor"):
+@pytest.mark.parametrize("sigmas", [[1.0, 0.5, 0.0], (1.0, 0.5, 0.0), torch.ones(2, 2), torch.tensor([1, 0])])
+def test_scheduler_sigmas_must_be_a_1d_float_tensor(sigmas):
+    match = "1-D floating-point torch.Tensor"
+    with pytest.raises(TypeError, match=match):
         denoise_sigma(0, sigmas)
-    with set_forward_context(), bind_attention_schedule(None, _ALL), pytest.raises(TypeError, match="1-D torch.Tensor"):
+    with set_forward_context(), bind_attention_schedule(None, _ALL), pytest.raises(TypeError, match=match):
         check_scheduler_sigmas(sigmas)
 
 
 def test_explicit_flow_sigma_does_not_use_scheduler_index():
     with set_forward_context(), bind_attention_schedule(None, _ALL):
-        DenoiseProgressMixin().record_denoise_step(2, 750.0, sigma=0.75)
+        scheduler = SimpleNamespace(
+            sigmas=torch.tensor([1.0, 0.9, 0.1]), config=SimpleNamespace(num_train_timesteps=1000)
+        )
+        DenoiseProgressMixin().record_denoise_step(2, 750.0, scheduler=scheduler, sigma=0.75)
         assert get_forward_context().denoise_sigma == 0.75
         minimax_h3_publish_denoise_progress(1, 0.25, 4)
         assert get_forward_context().denoise_sigma == 0.25
@@ -126,7 +130,7 @@ def test_scheduler_sigma_check_covers_the_whole_ladder_and_only_under_sigma_wind
         check_scheduler_sigmas(torch.tensor([float("nan"), 0.5, 0.0]), sigma_scheduled=True)
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True, 1])
 def test_noise_publisher_rejects_invalid_sigmas(value):
     with set_forward_context(), bind_attention_schedule(None, _ALL), pytest.raises((ValueError, TypeError)):
         set_forward_context_denoise_sigma(value)

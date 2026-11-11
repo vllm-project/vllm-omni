@@ -6,7 +6,7 @@
 import numbers
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from vllm_omni.diffusion.models.interface import role_loads_component
 from vllm_omni.errors import OmniClientError
@@ -245,17 +245,19 @@ _SIGMA_FIELDS = frozenset({"low", "high", "profile"})
 _SIGMA_ROUNDING_TOLERANCE = 1e-6
 
 
-def _validate_sigma(value: float, name: str) -> float:
-    """Check one window bound is a real number in [0, 1] and return it as a JSON-like number."""
+def _validate_window_bound(value: numbers.Real, name: str) -> float:
+    """Check a user-given window bound is a real number in [0, 1] and return it as a float.
+
+    Unlike checked_sigma, this takes any real (JSON ints, numpy scalars) and allows no rounding.
+    """
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(f"attention_sigma_schedule {name} must be a number, got {value!r}")
-    # Compare without float(): an int too large for a float would raise OverflowError, not a client error.
+    # Compare before float(): an int too large for a float would raise OverflowError, not a client error.
     if not 0 <= value <= 1:  # also rejects NaN and infinities
         raise ValueError(f"attention_sigma_schedule {name} must be in [0, 1], got {value!r}")
-    # Store other reals, such as numpy scalars, as float so windows serialize like parsed JSON. Only float64
-    # or exactly representable values compare equal to the JSON window: float(np.float32(0.1)) is
+    # Only float64 or exactly representable values match the JSON window: float(np.float32(0.1)) is
     # 0.10000000149011612, not 0.1, so such a window lands in a different (still correct) batch key.
-    return value if type(value) in (int, float) else float(value)
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -267,8 +269,8 @@ class AttentionSigmaWindow:
     profile: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "low", _validate_sigma(self.low, "low"))
-        object.__setattr__(self, "high", _validate_sigma(self.high, "high"))
+        object.__setattr__(self, "low", _validate_window_bound(self.low, "low"))
+        object.__setattr__(self, "high", _validate_window_bound(self.high, "high"))
         if self.high <= self.low:
             raise ValueError("attention_sigma_schedule high must be greater than low")
         validate_attention_profile_name(self.profile)
@@ -302,36 +304,41 @@ def parse_attention_sigma_schedule(value: object) -> AttentionSigmaSchedule | No
 def validate_attention_sigma_schedule(
     schedule: AttentionSigmaSchedule,
     *,
-    profiles: Collection[str] | None = None,
+    profiles: Collection[str],
 ) -> None:
     """Reject windows that name a profile outside ``profiles``."""
-    if profiles is not None:
-        unknown = sorted({entry.profile for entry in schedule if entry.profile not in profiles})
-        if unknown:
-            raise ValueError(f"attention_sigma_schedule references unknown profile(s): {unknown}")
+    unknown = sorted({entry.profile for entry in schedule if entry.profile not in profiles})
+    if unknown:
+        raise ValueError(f"attention_sigma_schedule references unknown profile(s): {unknown}")
 
 
 def resolve_attention_sigma_schedule(
-    request_schedule: object,
-    default_schedule: object,
+    request_schedule: "AttentionSigmaSchedule | list[dict[str, Any]] | None",
+    default_schedule: AttentionSigmaSchedule,
     *,
     profiles: Collection[str],
 ) -> AttentionSigmaSchedule:
     """Parse the request's windows, or the default when the request sends None, and check their profiles."""
-    effective = parse_attention_sigma_schedule(default_schedule if request_schedule is None else request_schedule)
-    schedule = () if effective is None else effective
+    if request_schedule is None:
+        schedule = default_schedule
+    else:
+        parsed = parse_attention_sigma_schedule(request_schedule)
+        assert parsed is not None  # only None parses to None
+        schedule = parsed
     validate_attention_sigma_schedule(schedule, profiles=profiles)
     return schedule
 
 
 def checked_sigma(sigma: float) -> float:
-    """Return a scheduler sigma in [0, 1], clamping the float32 rounding of the end points."""
-    if isinstance(sigma, bool):
-        raise TypeError("scheduler sigma must be a number")
-    value = float(sigma)
-    if not -_SIGMA_ROUNDING_TOLERANCE <= value <= 1.0 + _SIGMA_ROUNDING_TOLERANCE:
-        raise ValueError(f"scheduler sigma must be in [0, 1], got {value!r}")
-    return min(max(value, 0.0), 1.0)
+    """Return a scheduler sigma in [0, 1], clamping the float32 rounding of the end points.
+
+    Unlike a window bound, this is a scheduler's float, which may land a few ulps outside [0, 1].
+    """
+    if not isinstance(sigma, float):
+        raise TypeError(f"scheduler sigma must be a float, got {type(sigma).__name__}")
+    if not -_SIGMA_ROUNDING_TOLERANCE <= sigma <= 1.0 + _SIGMA_ROUNDING_TOLERANCE:
+        raise ValueError(f"scheduler sigma must be in [0, 1], got {sigma!r}")
+    return min(max(sigma, 0.0), 1.0)
 
 
 def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: float) -> str | None:
@@ -340,7 +347,7 @@ def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: f
     The windows were validated at admission; ``sigma`` comes from checked_sigma.
     """
     for entry in schedule:
-        if entry.low <= float(sigma) < entry.high or entry.high == sigma == 1.0:
+        if entry.low <= sigma < entry.high or entry.high == sigma == 1.0:
             return entry.profile
     return None
 

@@ -741,7 +741,7 @@ class Wan22Pipeline(
                     # DMD bypasses set_timesteps and steps its fixed timesteps with the grid
                     # sigma nearest to each one, so publish that sigma.
                     sigma=(
-                        float(self.scheduler.sigma_for_timestep(t, device="cpu"))
+                        self.scheduler.sigma_for_timestep(t, device="cpu").item()
                         if self.is_dmd and sigma_scheduled
                         else None
                     ),

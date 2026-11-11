@@ -934,6 +934,7 @@ class _ThreeStepS2VScheduler:
     def __init__(self) -> None:
         self.timesteps = torch.tensor([900, 500, 100])
         self.sigmas = torch.tensor([0.9, 0.5, 0.1, 0.0])
+        self.config = SimpleNamespace(num_train_timesteps=1000)
 
     def set_timesteps(self, num_steps, device=None, shift=None) -> None:
         del num_steps, device, shift

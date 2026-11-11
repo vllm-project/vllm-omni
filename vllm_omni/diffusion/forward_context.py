@@ -534,7 +534,8 @@ def check_scheduler_sigmas(sigmas: torch.Tensor, *, sigma_scheduled: bool | None
     if not sigma_scheduled:
         return
     # One host copy of the whole ladder instead of a device sync per step.
-    for value in _require_sigma_tensor(sigmas).tolist():
+    _check_sigma_tensor(sigmas)
+    for value in sigmas.tolist():
         _checked_scheduler_sigma(value)
 
 
@@ -543,19 +544,18 @@ def denoise_sigma(step_idx: int, sigmas: torch.Tensor) -> float | None:
 
     A step without a sigma publishes None, and the attention layer rejects it.
     """
-    sigmas = _require_sigma_tensor(sigmas)
+    _check_sigma_tensor(sigmas)
     if step_idx >= len(sigmas):
         return None
     # Pipelines raise this before their first forward through check_scheduler_sigmas; this repeats
     # the check for any other caller.
-    return _checked_scheduler_sigma(float(sigmas[step_idx]))
+    return _checked_scheduler_sigma(sigmas[step_idx].item())
 
 
-def _require_sigma_tensor(sigmas: torch.Tensor) -> torch.Tensor:
-    # Every scheduler a sigma-publishing pipeline uses keeps its sigmas in a 1-D tensor.
-    if not isinstance(sigmas, torch.Tensor) or sigmas.dim() != 1:
-        raise TypeError(f"scheduler sigmas must be a 1-D torch.Tensor, got {type(sigmas).__name__}")
-    return sigmas
+def _check_sigma_tensor(sigmas: torch.Tensor) -> None:
+    # Every scheduler a sigma-publishing pipeline uses keeps its sigmas in a 1-D floating-point tensor.
+    if not isinstance(sigmas, torch.Tensor) or sigmas.dim() != 1 or not sigmas.is_floating_point():
+        raise TypeError(f"scheduler sigmas must be a 1-D floating-point torch.Tensor, got {type(sigmas).__name__}")
 
 
 def _checked_scheduler_sigma(sigma: float) -> float:
@@ -603,15 +603,13 @@ class DenoiseProgressMixin:
     ) -> None:
         """Publish one denoise step's progress.
 
-        ``sigma`` is the noise level the step uses; without it, sigma windows read
-        ``scheduler.sigmas[step_idx]``.
+        ``scheduler`` defaults to ``self.scheduler``; it is read only for a ``timestep`` to normalize, or
+        for sigma windows without an explicit ``sigma``, which then read ``scheduler.sigmas[step_idx]``.
         """
         set_forward_context_denoise_step_idx(step_idx)
-        if _forward_context is not None:
-            _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
-        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
+        _forward_context.total_denoise_steps = total_steps
         if _forward_context.attention_sigma_schedule:
             # Only sigma windows read the noise level, so unscheduled runs never compute it.
             if step_idx is None:
@@ -619,14 +617,15 @@ class DenoiseProgressMixin:
             elif sigma is not None:
                 _forward_context.denoise_sigma = checked_sigma(sigma)
             else:
-                _forward_context.denoise_sigma = denoise_sigma(step_idx, scheduler.sigmas)
+                active = self.scheduler if scheduler is None else scheduler
+                _forward_context.denoise_sigma = denoise_sigma(step_idx, active.sigmas)
         if normalized_timestep is not None:
             _forward_context.denoise_timestep = float(normalized_timestep)
             return
         if timestep is None:
             return
-        ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
-        _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
+        active = self.scheduler if scheduler is None else scheduler
+        _forward_context.denoise_timestep = float(timestep) / active.config.num_train_timesteps
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
