@@ -245,7 +245,7 @@ vllm_omni/
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
 │   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
-│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
+│   │   ├── warmup.py                startup warmup probe; holds native session admission after WebSocket acceptance
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
@@ -358,8 +358,10 @@ Every non-placeholder history insertion must call `_track_history_message`,
 and removal must call `_forget_history_message`, keeping the source map complete
 for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
 
-The prompt path uses `session.history` for Qwen retained-PCM identity. Unlike
-`snapshot.messages`, it copies only top-level message dictionaries; nested
+The default prompt path uses `session.history_for_prompt()` to capture aligned
+history and item IDs while preserving Qwen retained-PCM identity. Like
+`session.history` and unlike `snapshot.messages`, it copies only top-level
+message dictionaries; nested
 protocol/media containers and payloads remain shared with authoritative history
 and must be treated as read-only by prompt consumers.
 
@@ -549,8 +551,8 @@ through the deployment-owned `context_auxiliary_budget`. Summary work then uses
 measured token IDs and records its attempted identity only after resource
 admission. A temporary allowance shortage leaves that work eligible for the
 next window. Legacy summary preparation retains its existing contract when no
-common account is configured. Final card prompt consumption remains a separate
-integration; the L1 view policy below does not enable memory extraction.
+common account is configured. Card prompt consumption is controlled separately;
+the L1 view policy below does not enable memory extraction.
 
 Qwen's memory codec renders captured text as quoted JSON data with local
 evidence and barrier handles. Its strict output schema accepts upsert/retract
@@ -975,6 +977,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+MiniCPM-o native duplex treats `max_speak_chars_per_chunk` (default 28) as a
+soft target. It keeps the complete sampled token that reaches or crosses the
+target, then closes the chunk before another draw once the accepted prefix
+reaches the target. A decoded prefix ending in U+FFFD may continue to complete
+its UTF-8 bytes. Hard token and request caps retain priority; explicit
+`force_listen` bypasses only the soft character target.
+
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change
 scene descriptions during long video sessions. Turn-mode and non-CUDA vision
@@ -1000,6 +1009,13 @@ standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
 profiles. Talker and NPU attention settings are unchanged. This aligns the
 Thinker backend selection; it does not establish accuracy or performance parity
 across GPU types and layouts.
+
+The inherited CUDA duplex profile uses upstream `vllm_c` RMSNorm and fused
+add-RMSNorm, `silu_and_mul`, and QK-normalization/RoPE fusion for Thinker stage 0.
+The checkpoint's model and head dtypes are retained. The turn profile resets
+`kernel_config` and `compilation_config` to upstream defaults, including its
+MRv2 derivatives. Other platforms and Talker keep their existing settings;
+explicit engine overrides retain precedence.
 
 Tool result conversion is preparation until the session's final deadline/epoch
 check and admission. `runtime_config_for_function_output` receives an isolated

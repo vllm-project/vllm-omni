@@ -61,6 +61,25 @@ async def wait_auxiliary(h, count=1):
     return submissions(h, auxiliary=True)[count - 1]
 
 
+async def observe(h, *commands):
+    # Observations are created asynchronously after a commit; CI stalls can
+    # outrun the deliberately tight settle() budget that command() uses, so
+    # poll for the new submission instead of reading the port immediately.
+    before = len(submissions(h, auxiliary=False))
+    for value in commands:
+        h.submit(value)
+        await settle(h)
+
+    async def wait():
+        while len(submissions(h, auxiliary=False)) <= before:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(wait(), timeout=2)
+    observations = submissions(h, auxiliary=False)
+    assert len(observations) == before + 1
+    return observations[-1]
+
+
 async def silence(h, submission):
     assert h.deliver(
         tts_output(submission.context.request_id, text="</silence>", finished=True),
@@ -71,12 +90,7 @@ async def silence(h, submission):
 
 
 async def camera(h, color="red"):
-    before = len(submissions(h, auxiliary=False))
-    await command(h, AppendAudio(video_frames=(frame(color),)))
-    await command(h, Commit(final=True, create_response=True))
-    observations = submissions(h, auxiliary=False)
-    assert len(observations) == before + 1
-    submission = observations[-1]
+    submission = await observe(h, AppendAudio(video_frames=(frame(color),)), Commit(final=True, create_response=True))
     await silence(h, submission)
     return submission
 
@@ -244,9 +258,9 @@ async def test_closed_source_survives_cancel_failure_and_retry_without_reappeari
         assert state.closed_frame_id == 1 and tuple(memory.pending) == original
 
         # A text-only observation must not rehydrate the legacy last-four cache.
-        await command(h, user_item("q1", [{"type": "input_text", "text": "What do you see?"}]))
-        await command(h, CreateResponse())
-        observation = submissions(h, auxiliary=False)[-1]
+        observation = await observe(
+            h, user_item("q1", [{"type": "input_text", "text": "What do you see?"}]), CreateResponse()
+        )
         assert observation.prompt["multi_modal_data"] == {}
         await silence(h, observation)
         await camera(h, "green")
@@ -272,11 +286,14 @@ async def test_deleting_conversation_image_revokes_visual_memory_without_new_app
         memory = h.runner.model_state.visual_memory
         memory.chunk_frames = 1
         memory.mid_group = 2
-        await command(
-            h, user_item("picture", [{"type": "input_image", "image_url": "data:image/png;base64," + frame()}])
+        await silence(
+            h,
+            await observe(
+                h,
+                user_item("picture", [{"type": "input_image", "image_url": "data:image/png;base64," + frame()}]),
+                CreateResponse(),
+            ),
         )
-        await command(h, CreateResponse())
-        await silence(h, submissions(h, auxiliary=False)[-1])
         first = await wait_auxiliary(h)
         if phase != "inflight":
             await finish_summary(h, first, "A red cup is on the table.")
@@ -314,9 +331,10 @@ async def test_delayed_question_keeps_early_unsummarized_image_beyond_four_frame
         for color in ("red", "blue", "blue", "blue", "blue"):
             await camera(h, color)
         assert not submissions(h, auxiliary=True)
-        await command(h, user_item("question", [{"type": "input_text", "text": "What was the first color?"}]))
-        await command(h, CreateResponse())
-        prompt = submissions(h, auxiliary=False)[-1].prompt
+        question = await observe(
+            h, user_item("question", [{"type": "input_text", "text": "What was the first color?"}]), CreateResponse()
+        )
+        prompt = question.prompt
         assert "What was the first color?" in prompt["prompt"]
         images = prompt["multi_modal_data"]["image"]
         assert len(images) == 5
@@ -347,10 +365,13 @@ async def test_full_visual_memory_rejects_frame_but_next_text_request_still_runs
         assert tuple(memory.pending) == before
         assert len(submissions(h, auxiliary=False)) == count
         assert not h.runner.closing
-        await command(h, user_item("question", [{"type": "input_text", "text": "Describe the earlier objects."}]))
-        await command(h, CreateResponse())
+        followup = await observe(
+            h,
+            user_item("question", [{"type": "input_text", "text": "Describe the earlier objects."}]),
+            CreateResponse(),
+        )
         assert len(submissions(h, auxiliary=False)) == count + 1
-        assert "Describe the earlier objects." in submissions(h, auxiliary=False)[-1].prompt["prompt"]
+        assert "Describe the earlier objects." in followup.prompt["prompt"]
     finally:
         await h.manager.shutdown()
 
@@ -621,10 +642,12 @@ async def test_real_runner_keeps_text_only_qa_between_visual_observations(mocker
     h = await open_joyai(modalities=("text",))
     template = mocker.spy(h.runner.plugin.processor, "apply_chat_template")
     try:
-        await command(h, user_item("q1", [{"type": "input_text", "text": "What color?"}]))
-        await command(h, AppendAudio(video_frames=(frame("red"),)))
-        await command(h, Commit(final=True, create_response=True))
-        first = submissions(h, auxiliary=False)[-1]
+        first = await observe(
+            h,
+            user_item("q1", [{"type": "input_text", "text": "What color?"}]),
+            AppendAudio(video_frames=(frame("red"),)),
+            Commit(final=True, create_response=True),
+        )
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(first.context.request_id, text="</response> Red.", finished=True),
@@ -633,9 +656,9 @@ async def test_real_runner_keeps_text_only_qa_between_visual_observations(mocker
         )
         state = h.runner.model_state
         assert state.observations[0].response_item_id == f"item_{response_id}"
-        await command(h, user_item("q2", [{"type": "input_text", "text": "What was before your answer?"}]))
-        await command(h, CreateResponse())
-        second = submissions(h, auxiliary=False)[-1]
+        second = await observe(
+            h, user_item("q2", [{"type": "input_text", "text": "What was before your answer?"}]), CreateResponse()
+        )
         await h.deliver_and_settle(
             tts_output(second.context.request_id, text="</response> The red card.", finished=True),
             stage_id=0,
@@ -695,9 +718,9 @@ async def test_initial_user_text_survives_its_spoken_answer_and_later_camera(moc
     template = mocker.spy(h.runner.plugin.processor, "apply_chat_template")
     try:
         h.session.replace_runtime_config({**h.session.runtime_config, "initial_user_text": "Watch the card color."})
-        await command(h, AppendAudio(video_frames=(frame(),)))
-        await command(h, Commit(final=True, create_response=True))
-        request_id = submissions(h, auxiliary=False)[-1].context.request_id
+        request_id = (
+            await observe(h, AppendAudio(video_frames=(frame(),)), Commit(final=True, create_response=True))
+        ).context.request_id
         await h.deliver_and_settle(
             tts_output(request_id, text="</response> Red.", finished=True), stage_id=0, segment_finished=True
         )
@@ -719,10 +742,14 @@ async def test_visual_response_reference_uses_only_current_playback_committed_te
     plugin = h.runner.plugin
     template = mocker.spy(plugin.processor, "apply_chat_template")
     try:
-        await command(h, user_item("q1", [{"type": "input_text", "text": "Describe the card."}]))
-        await command(h, AppendAudio(video_frames=(frame(),)))
-        await command(h, Commit(final=True, create_response=True))
-        request_id = submissions(h, auxiliary=False)[-1].context.request_id
+        request_id = (
+            await observe(
+                h,
+                user_item("q1", [{"type": "input_text", "text": "Describe the card."}]),
+                AppendAudio(video_frames=(frame(),)),
+                Commit(final=True, create_response=True),
+            )
+        ).context.request_id
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(request_id, text="</response> Red card.", finished=True), stage_id=0, segment_finished=True

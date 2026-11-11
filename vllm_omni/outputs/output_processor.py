@@ -20,7 +20,7 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
-from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.data_entry_keys import flatten_payload, unflatten_payload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
@@ -112,6 +112,26 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
         # was observed.
         metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
     return metrics
+
+
+def _warn_on_dropped_pooling_keys(pooling_output: Any, mm_output: Any) -> None:
+    """Flag pooling-only keys, which the authoritative multimodal field drops.
+
+    Every in-tree producer mirrors one payload on both channels or sets only
+    one, so a difference means a producer broke that contract and the next
+    stage loses data. Only missing keys are flagged: a key on both channels
+    with different values still resolves to ``multimodal_output`` silently,
+    so this is not a full mirror-consistency check. The warning repeats once
+    per distinct set of dropped keys.
+    """
+    if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
+        return
+    dropped = flatten_payload(pooling_output).keys() - flatten_payload(mm_output).keys()
+    if dropped:
+        logger.warning_once(
+            "Dropping pooling_output keys not carried by multimodal_output: %s",
+            ", ".join(sorted(dropped)),
+        )
 
 
 class OmniRequestState(RequestState):
@@ -710,6 +730,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        weight_version: str | None = None,
     ) -> OutputProcessorOutput:
         default_mm_type = _modality_to_type_string(self.output_modality)
 
@@ -718,10 +739,38 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        admission_outputs: list[OmniRequestOutput] = []
+        admission_aborts: list[str] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
+                continue
+
+            # Paused-engine and other pre-execution failures ship RequestError
+            # and nothing was run. StagePool registers queue=None, so upstream's
+            # queue.put short-circuit does not run here or in super(). Key on
+            # error, not finish_reason: pooling cache misses use ERROR with
+            # error is None and must stay on the normal path. weight_version is
+            # forwarded only into super(), which is the detokenizer path.
+            error = getattr(eco, "error", None)
+            if error is not None:
+                if req_state.queue is not None:
+                    req_state.queue.put(error.to_exception())
+                else:
+                    message = getattr(error, "message", None)
+                    code = getattr(error, "code", None)
+                    external_id = getattr(req_state, "external_req_id", None) or eco.request_id
+                    admission_outputs.append(
+                        OmniRequestOutput.from_error(
+                            external_id,
+                            message if isinstance(message, str) and message else str(error),
+                            error_type=code if isinstance(code, str) else None,
+                        )
+                    )
+                if req_state.streaming_input:
+                    admission_aborts.append(eco.request_id)
+                self._finish_request(req_state)
                 continue
 
             # Accumulate multimodal tensors regardless of path.
@@ -736,7 +785,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # pooling_output. Preserve the payload, then clear the field so
                 # upstream still runs the normal detokenization path.
                 if eco.pooling_output is not None and req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    # MRV2 can expose the same AR payload through both fields.
+                    # The explicit multimodal field is authoritative; pooling
+                    # is only its compatibility carrier, not a second chunk.
+                    if mm_output is None:
+                        req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    else:
+                        _warn_on_dropped_pooling_keys(eco.pooling_output, mm_output)
                     eco.pooling_output = None
 
             # Native pooling cache-miss errors carry no tensor. Upstream
@@ -766,10 +821,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+            weight_version=weight_version,
         )
         return OutputProcessorOutput(
-            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
-            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+            request_outputs=admission_outputs + mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=admission_aborts + mm_reqs_to_abort + upstream_processed.reqs_to_abort,
         )
 
     def _process_mm_only_outputs(

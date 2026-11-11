@@ -8,12 +8,15 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from opentelemetry.trace import get_tracer
 from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_memory_card_retrieval import _card
 from tests.engine.test_duplex_orchestrator import SESSION_ID, _build, _open, _stage0_request_id
 from tests.engine.test_orchestrator import FakeRunningCounter, FakeStageClient, _build_stage_pools, _processed_request
 from vllm_omni.engine.duplex.contracts import DuplexStageRequestContext, DuplexStageSubmission
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
+from vllm_omni.tracing import RequestTrace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.asyncio]
 
@@ -33,13 +36,43 @@ class _Transport(FakeStageClient):
         await self.release.wait()
 
 
+@pytest.mark.parametrize("valid", [False, True])
+async def test_admission_guard_precedes_native_stage_trace(valid):
+    client = _Transport()
+    pool = _build_stage_pools([[client]])[0]
+    request = _processed_request("traced-guard", SamplingParams(max_tokens=1))
+    trace = RequestTrace(get_tracer(__name__), request.request_id, None)
+    state = OrchestratorRequestState(
+        request_id=request.request_id, sampling_params_list=[request.sampling_params], trace=trace
+    )
+
+    def guard(materialized):
+        assert materialized is request
+        assert not trace.stages
+        if not valid:
+            raise ValueError("stale_selection")
+
+    try:
+        if valid:
+            assert await pool.submit_initial(request.request_id, state, request, before_accept=guard) == 0
+            assert set(trace.stages) == {0}
+        else:
+            with pytest.raises(ValueError, match="stale_selection"):
+                await pool.submit_initial(request.request_id, state, request, before_accept=guard)
+            assert not trace.stages
+            assert not pool.output_processor.add_request_calls
+            assert not client.add_request_calls
+    finally:
+        trace.end("success" if valid else "cancelled")
+
+
 @pytest.mark.parametrize("update", [False, True])
 @pytest.mark.parametrize("valid", [False, True])
 async def test_guard_runs_after_routing_and_before_output_registration_or_send(monkeypatch, update, valid):
     client = _Transport()
     pool = _build_stage_pools([[client]])[0]
     request = _processed_request("guard", SamplingParams(max_tokens=1))
-    state = SimpleNamespace(sampling_params_list=[request.sampling_params])
+    state = OrchestratorRequestState(request_id=request.request_id, sampling_params_list=[request.sampling_params])
     started, release = asyncio.Event(), asyncio.Event()
     eligibility = {"current": True}
     calls: list[object] = []
@@ -80,7 +113,7 @@ async def test_changes_after_local_acceptance_use_existing_transport_lifecycle()
     client.release.clear()
     pool = _build_stage_pools([[client]])[0]
     request = _processed_request("accepted", SamplingParams(max_tokens=1))
-    state = SimpleNamespace(sampling_params_list=[request.sampling_params])
+    state = OrchestratorRequestState(request_id=request.request_id, sampling_params_list=[request.sampling_params])
     current = {"valid": True}
     accepted: list[str] = []
 
@@ -100,7 +133,7 @@ async def test_async_guard_is_rejected_without_running_or_leaking_a_coroutine():
     client = _Transport()
     pool = _build_stage_pools([[client]])[0]
     request = _processed_request("async-guard", SamplingParams(max_tokens=1))
-    state = SimpleNamespace(sampling_params_list=[request.sampling_params])
+    state = OrchestratorRequestState(request_id=request.request_id, sampling_params_list=[request.sampling_params])
 
     async def guard(request):
         pytest.fail("an async admission guard ran")

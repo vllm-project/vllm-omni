@@ -451,6 +451,8 @@ class ModelChannel:
                 # Keep the prompt accessor's nested content identity: Qwen
                 # binds retained PCM to those containers. History and IDs
                 # are captured synchronously on the owner loop.
+                # Consumers must treat shared nested containers and payloads
+                # as read-only; only the session writes authoritative history.
                 "conversation": list(history),
                 "conversation_item_ids": item_ids,
                 "modalities": list(session.response_config.modalities),
@@ -1130,13 +1132,19 @@ class ModelChannel:
         self._out.emit(payload)
         return True
 
-    async def _release_ephemeral_request(self, request_id: object, *, whole_turn: bool = False) -> None:
+    async def _release_ephemeral_request(
+        self, request_id: object, *, whole_turn: bool = False, abort_prewarmed: bool = False
+    ) -> None:
         """Drop orchestrator state for a finished non-resumable stage request.
 
         Resident Stage0 stays bound. Intermediate text must not call this;
         only a completed turn (final stage, silent short-circuit, or a
         draining TTS request) does. ``whole_turn`` also drops the other stage
         ids of this turn. A request still marked draining is left registered.
+        ``abort_prewarmed`` is for a turn that skipped its downstream stages:
+        their async-chunk prewarmed requests never get a chunk. Every released
+        id of the turn is aborted; for the already finished ones that is a
+        no-op, and the prewarmed ones stop waiting for the input-wait deadline.
         """
         if not isinstance(request_id, str) or not request_id:
             return
@@ -1144,6 +1152,8 @@ class ModelChannel:
         if session.capabilities.supports_core_resumable_request:
             return
         if session.is_draining_request(request_id):
+            # A draining request is still feeding its TTS stages, so nothing it
+            # prewarmed is idle. Only sessions with concurrent turn requests drain.
             await self._ctx.stage_port.cleanup([request_id])
             return
         release_ids = [request_id]
@@ -1155,7 +1165,11 @@ class ModelChannel:
         session.release_resources_for_request_ids(release_ids)
         if self._ctx.run.stream_request_id in release_ids:
             self._ctx.run.stream_request_id = None
-        await self._ctx.stage_port.cleanup(release_ids)
+        try:
+            if abort_prewarmed:
+                await self._abort_request(release_ids, notify=False)
+        finally:
+            await self._ctx.stage_port.cleanup(release_ids)
 
     def _terminal_listen_turn_id(
         self,
@@ -1388,7 +1402,11 @@ class ModelChannel:
                     model_turn_id=coerce_int(model_result.get("model_turn_id")),
                     data_plane_request_id=data_plane_request_id,
                 )
-                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+                await self._release_ephemeral_request(
+                    data_plane_request_id,
+                    whole_turn=True,
+                    abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+                )
             return close_reason, True
         function_call = _recognized_function_call(self._ctx.plugin, model_result)
         if function_call is _INVALID_FUNCTION_CALL:
@@ -1485,7 +1503,11 @@ class ModelChannel:
                 model_turn_id=model_turn_id,
                 data_plane_request_id=data_plane_request_id,
             )
-            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+            await self._release_ephemeral_request(
+                data_plane_request_id,
+                whole_turn=True,
+                abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+            )
             return close_reason, emitted_response
         if (
             draining_response_id is None
@@ -1509,8 +1531,15 @@ class ModelChannel:
             return close_reason, emitted_response
         emitted_response = True
         response_created = False
+        # Draining output keeps its request's existing response ownership;
+        # it does not reserve a future response or advance the append fence.
         response_id = draining_response_id or session.active_response_id
         if response_id is None:
+            if model_turn_id is not None and model_turn_id > session.turn_id:
+                # Appends fence on the active response turn, so the session
+                # turn must not trail it, even with auto_response disabled.
+                # Close superseded turns' timing before binding the new one.
+                session.complete_model_turn(model_turn_id - 1)
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
         response_request_metrics = session.mark_response_first_outputs(
@@ -1713,7 +1742,11 @@ class ModelChannel:
                     "playback": session.playback.as_dict(),
                 }
             )
-            await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
+            await self._release_ephemeral_request(
+                data_plane_request_id,
+                whole_turn=True,
+                abort_prewarmed=model_result.get("abort_data_plane_request") is True,
+            )
         return close_reason, emitted_response
 
     def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:

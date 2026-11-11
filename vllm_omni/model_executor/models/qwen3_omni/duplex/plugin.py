@@ -17,6 +17,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pybase64 as base64
@@ -58,6 +59,9 @@ from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 
 logger = init_logger(__name__)
 

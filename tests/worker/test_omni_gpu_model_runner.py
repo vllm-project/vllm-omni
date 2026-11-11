@@ -13,6 +13,8 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import MoERoutingKey
+from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import MammothGPUARModelRunner
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
@@ -433,6 +435,69 @@ def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
     assert received["req_ids"] == ["request-a", "request-b"]
 
 
+def test_model_forward_passes_runtime_additional_information_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runtime = [{"generated_len": 64, "omni_task": ["t2i"]}]
+    runner._build_model_kwargs_extra = lambda: {
+        "runtime_additional_information": runtime,
+        "model_intermediate_buffer": runtime,
+    }
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert received["runtime_additional_information"] is runtime
+    assert received["model_intermediate_buffer"] is runtime
+
+
+def test_model_forward_clears_decode_metadata_when_runtime_info_absent(monkeypatch):
+    """FULL-replay steps with no runtime payload must clear, not skip, the cache."""
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(1, dtype=torch.long))
+
+    assert "runtime_additional_information" in received
+    assert received["runtime_additional_information"] is None
+    assert "model_intermediate_buffer" in received
+    assert received["model_intermediate_buffer"] is None
+
+
+def test_prepare_mm_inputs_keeps_input_ids_when_requires_raw_input_tokens():
+    """MammothModa2's flag must keep input_ids on the mm graph path (dummy + live)."""
+    runner = object.__new__(GPUModelRunner)
+    ids_buf = torch.arange(8, dtype=torch.long)
+    emb_buf = torch.zeros(8, 4)
+    runner.input_ids = SimpleNamespace(gpu=ids_buf)
+    runner.inputs_embeds = SimpleNamespace(gpu=emb_buf)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=True)
+    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is not None
+    assert input_ids.data_ptr() == ids_buf.data_ptr()
+    assert tuple(input_ids.shape) == (5,)
+    assert tuple(inputs_embeds.shape) == (5, 4)
+
+    runner.model = SimpleNamespace(requires_raw_input_tokens=False)
+    input_ids, _ = GPUModelRunner._prepare_mm_inputs(runner, 5)
+    assert input_ids is None
+
+
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
     """Dummy model whose class name must exactly match the production check."""
 
@@ -547,6 +612,7 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
 )
 def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected):
     runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
     runner.model = model
     runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
     runner._init_talker_mtp = mocker.Mock()
@@ -1661,6 +1727,7 @@ def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_b
 
 class BatchFilledRowsModel:
     has_preprocess = True
+    preprocess_batch_requires_stable_decode = False
 
     def __init__(self, filled, *, fills_rows=True):
         self.filled = set(filled)
@@ -2226,3 +2293,53 @@ def test_take_restored_mm_removes_only_the_requested_ids():
 def test_take_restored_mm_is_empty_without_lmcache():
     runner = object.__new__(LMCacheHiddenStateMixin)
     assert runner._take_restored_mm(["r1"]) == {}
+
+
+@pytest.mark.parametrize("changed", ["new", "resumed", "stable"])
+def test_decode_only_batch_hook_keeps_admission_and_resume_on_generic_path(monkeypatch, changed):
+    runner, scheduled, _, _ = _make_phase_runner(
+        monkeypatch, [("live-a", 5, 5, 1), ("live-b", 6, 6, 1)], batched_decode=False
+    )
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a", "live-b"})
+    model.preprocess_batch_requires_stable_decode = True
+    runner.model = model
+    scheduled.scheduled_new_reqs = [SimpleNamespace(req_id="live-a")] if changed == "new" else []
+    scheduled.scheduled_cached_reqs = SimpleNamespace(resumed_req_ids={"live-a"} if changed == "resumed" else set())
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    if changed == "stable":
+        assert not model.calls
+        assert "inputs_embeds" in model.batch_kwargs
+    else:
+        assert model.calls == ["live-a", "live-b"]
+        assert "inputs_embeds" not in model.batch_kwargs
+
+
+@pytest.mark.parametrize(
+    "key",
+    [MoERoutingKey.BLEND, MoERoutingKey.ALL_UND, MoERoutingKey.ALL_GEN],
+    ids=["blend", "all_und", "all_gen"],
+)
+def test_warmup_capture_forces_moe_routing_key_when_specializing(monkeypatch, key):
+    """#9911 follow-up P1: Mammoth ``_warmup_and_capture`` must forward
+    ``force_moe_routing_key`` for every captured key — BLEND included.
+    Dropping BLEND lets the resolver reclassify a uniform dummy buffer as
+    ALL_UND/ALL_GEN and store the BLEND graph under the wrong cache key.
+    """
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    runner = object.__new__(MammothGPUARModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=True)
+    calls: list[tuple[int, dict]] = []
+
+    def _dummy_run(num_tokens, **kwargs):
+        calls.append((num_tokens, kwargs))
+        return torch.zeros(1), None
+
+    runner._dummy_run = _dummy_run
+    desc = SimpleNamespace(num_tokens=4, uniform=False, num_active_loras=0, moe_routing_key=int(key))
+
+    MammothGPUARModelRunner._warmup_and_capture(runner, desc, CUDAGraphMode.FULL, num_warmups=1)
+
+    assert len(calls) == 2  # one warmup + one capture
+    for _, kwargs in calls:
+        assert kwargs["force_moe_routing_key"] == int(key)
