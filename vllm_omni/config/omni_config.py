@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
@@ -248,6 +249,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
+    shutdown_timeout: float
     additional_config: dict[str, Any]
     distributed_executor_backend: Any
     worker_cls: str
@@ -637,6 +639,8 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
+    shutdown_timeout: float | None = Field(default=None, ge=0)
+
     cuda_mps: bool = False
 
     # LLM backend extensions; diffusion owns these in its config projection.
@@ -879,6 +883,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
@@ -2428,6 +2434,33 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
+        sampling_defaults = cli_overrides.get("default_sampling_params")
+        if isinstance(sampling_defaults, str):
+            sampling_defaults = json.loads(sampling_defaults)
+        for stage_key, overrides in (sampling_defaults or {}).items():
+            try:
+                stage_id = int(stage_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
+                ) from exc
+            if stage_id not in pipeline_stage_ids:
+                logger.warning(
+                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
+                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
+                )
+                continue
+            if stage_id not in deploy_by_id:
+                stage_deploy = StageDeployConfig(stage_id=stage_id)
+                deploy.stages.append(stage_deploy)
+                deploy_by_id[stage_id] = stage_deploy
+            stage_deploy = deploy_by_id[stage_id]
+            defaults = stage_deploy.default_sampling_params or {}
+            merged = {**defaults, **overrides}
+            if "extra_args" in overrides:
+                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
+            stage_deploy.default_sampling_params = merged
         update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 

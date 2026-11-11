@@ -20,12 +20,18 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    clear_scheduled_denoise_step_on_exit,
+)
+from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -658,6 +664,17 @@ class Wan22Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+        self._denoise_graph_runner = self._build_denoise_graph_runner(od_config)
+
+    def _build_denoise_graph_runner(self, od_config: OmniDiffusionConfig) -> GraphedForward | None:
+        return build_denoise_graph_runner(
+            od_config,
+            self._denoise_graph_forward,
+            "Wan DiT",
+            refusal=None
+            if type(self) is Wan22Pipeline
+            else f"{type(self).__name__} is not validated with denoise graphs",
+        )
 
     def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
@@ -704,10 +721,13 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
+        # length; None without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -1477,6 +1497,7 @@ class Wan22Pipeline(
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
+        release_denoise_graphs_after_denoise(self.od_config, getattr(self, "_denoise_graph_runner", None))
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
@@ -1587,8 +1608,15 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        if getattr(self, "_denoise_graph_runner", None) is not None:
+            # By name: the graph keys on primitive values, and each expert gets its own graph.
+            component = "transformer_2" if current_model is self.transformer_2 else "transformer"
+            return self._denoise_graph_runner(component=component, **kwargs)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def _denoise_graph_forward(self, component: str, **kwargs: Any) -> torch.Tensor:
+        return getattr(self, component)(**kwargs)[0]
 
     def encode_prompt(
         self,
