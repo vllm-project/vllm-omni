@@ -4562,7 +4562,7 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 40
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
-    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900" in command
+    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200" in command
     assert "VLLM_ROCM_USE_AITER=0" not in command
     assert _marker_expressions(step) == [
         _PAUSE_KEEP_READY_MARKER,
