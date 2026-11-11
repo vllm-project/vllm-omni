@@ -121,15 +121,15 @@ steps:
 #          - pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
 #        mirror_hardwares: l4_1
 #
-#  - group: ":card_index_dividers: Engine&Model Executor&Work Test"
-#    depends_on: upload-ready-pipeline
-#    steps:
-#      - label: "Engine&Model Executor&Work Test · L4"
-#        timeout_in_minutes: 15
-#        automatic_shard: true
-#        commands:
-#          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
-#        mirror_hardwares: l4_1
+  - group: ":card_index_dividers: Engine&Model Executor&Work Test"
+    depends_on: upload-ready-pipeline
+    steps:
+     - label: "Engine&Model Executor&Work Test · L4"
+       timeout_in_minutes: 15
+       automatic_shard: true
+       commands:
+         - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
+       mirror_hardwares: l4_1
 #
 #      - label: "Engine&Model Executor&Work Test · H100"
 #        timeout_in_minutes: 15
