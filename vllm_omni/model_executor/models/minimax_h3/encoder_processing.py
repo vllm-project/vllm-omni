@@ -41,10 +41,12 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
     load_audio_file,
+    load_prepared_rgb_frames,
     load_video_audio,
     load_video_frames,
     prepare_edit_video,
     prepare_reference_videos,
+    reference_video_transcode_rgb_reuse_enabled,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
@@ -783,7 +785,12 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        full_frames = load_video_frames(item["prepared_path"])
+                        reuse_transcode_rgb = reference_video_transcode_rgb_reuse_enabled()
+                        full_frames = (
+                            load_prepared_rgb_frames(item)
+                            if reuse_transcode_rgb
+                            else load_video_frames(item["prepared_path"])
+                        )
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))
                         sampled = sample_reference_video_frames(
                             item["prepared_path"],
