@@ -30,7 +30,13 @@ TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            server_args=["--deploy-config", DEPLOY_CONFIG, "--trust-remote-code", "--chat-template", str(CHAT_TEMPLATE)],
+            server_args=[
+                "--deploy-config",
+                DEPLOY_CONFIG,
+                "--trust-remote-code",
+                "--chat-template",
+                str(CHAT_TEMPLATE),
+            ],
             env_dict={"VLLM_IMAGE_FETCH_TIMEOUT": "60"},
         ),
         id="step_audio2",
