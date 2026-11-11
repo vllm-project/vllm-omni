@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import vllm.v1.engine as _vllm_engine_module
 import vllm.v1.engine.core_client as _vllm_core_client_module
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient, MPClient
@@ -176,7 +177,6 @@ class StageEngineCoreClientBase(StageClientBase):
         self.client_addresses = dict(client_addresses or {})
         self.vllm_config = vllm_config
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
-        self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
@@ -469,8 +469,10 @@ class StageEngineCoreClientBase(StageClientBase):
         """Set engine outputs (called by orchestrator)."""
         self.engine_outputs = engine_outputs
 
+    @staticmethod
     def process_engine_inputs(
-        self,
+        metadata: StageMetadata,
+        vllm_config: VllmConfig,
         source_outputs: list[Any],
         prompt: Any = None,
         streaming_context: Any | None = None,
@@ -480,21 +482,25 @@ class StageEngineCoreClientBase(StageClientBase):
         Transition planning is expressed in terms of the upstream outputs
         and the original prompt.
         """
-        if self.custom_process_input_func is not None:
-            return self._call_custom_process_input(source_outputs, prompt, streaming_context)
+        if metadata.custom_process_input_func is not None:
+            return StageEngineCoreClientBase._call_custom_process_input(
+                metadata, vllm_config, source_outputs, prompt, streaming_context
+            )
 
-        if not self.engine_input_source:
-            raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
-        return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
+        if not metadata.engine_input_source:
+            raise ValueError(f"engine_input_source empty for stage {metadata.stage_id}")
+        return _default_process_engine_inputs(source_outputs, prompt, metadata.requires_multimodal_data)
 
+    @staticmethod
     def _call_custom_process_input(
-        self,
+        metadata: StageMetadata,
+        vllm_config: VllmConfig,
         source_outputs: list[Any],
         prompt: Any,
         streaming_context: Any | None,
     ) -> list[OmniTokensPrompt]:
         """Call a stage input processor with its explicitly requested context."""
-        processor = self.custom_process_input_func
+        processor = metadata.custom_process_input_func
         assert processor is not None
         signature = inspect.signature(processor)
         extra_kwargs: dict[str, Any] = {}
@@ -502,14 +508,14 @@ class StageEngineCoreClientBase(StageClientBase):
             # Let a processor size the next stage's prompt from that
             # stage's model config (e.g. a talker whose engine positions
             # must cover a speaker-prompt prefill).
-            extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+            extra_kwargs["next_stage_hf_config"] = vllm_config.model_config.hf_config
         target_model_config = signature.parameters.get("target_model_config")
         if target_model_config is not None:
             # The JoyAI bridge needs the Talker tokenizer and model config
             # to calculate the exact prompt length.
             if target_model_config.kind is not inspect.Parameter.KEYWORD_ONLY:
                 raise TypeError("target_model_config must be a keyword-only parameter")
-            extra_kwargs["target_model_config"] = self.vllm_config.model_config
+            extra_kwargs["target_model_config"] = vllm_config.model_config
         # Match the context parameter by name, including the
         # underscore-prefixed spelling some processors use (e.g.
         # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
@@ -518,14 +524,14 @@ class StageEngineCoreClientBase(StageClientBase):
             return processor(
                 source_outputs,
                 prompt,
-                self.requires_multimodal_data,
+                metadata.requires_multimodal_data,
                 streaming_context,
                 **extra_kwargs,
             )
         return processor(
             source_outputs,
             prompt,
-            self.requires_multimodal_data,
+            metadata.requires_multimodal_data,
             **extra_kwargs,
         )
 

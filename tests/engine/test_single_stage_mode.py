@@ -467,6 +467,8 @@ class TestSingleStageModeDetection:
             mocker,
             stage_cfgs=[_make_stage_cfg(0), _make_stage_cfg(1)],
             stage_id=stage_id,
+            omni_master_address="127.0.0.1",
+            omni_master_port=20002,
         )
         assert engine._single_stage_id_filter == stage_id
 
@@ -499,6 +501,49 @@ class TestSingleStageModeDetection:
             )
 
         assert {replica.launch_mode for plan in stage_plans for replica in plan.replicas} == {"remote"}
+
+    def test_stage_id_without_master_plans_only_that_stage(self, mocker: MockerFixture):
+        """Ensure that launching one stage without a master plans no replicas for the other stages."""
+        stage_plans = []
+
+        def capture_plans_and_stop(runtime, plans):
+            stage_plans.extend(plans)
+            raise RuntimeError("stage plans captured")
+
+        mocker.patch.object(
+            StageRuntime, "_before_initialize_stage_replicas", autospec=True, side_effect=capture_plans_and_stop
+        )
+        with pytest.raises(RuntimeError, match="stage plans captured"):
+            AsyncOmniEngine(model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", stage_id=1)
+
+        # Since we have no master, we should only have plans for the selected stage id.
+        assert [[replica.launch_mode for replica in plan.replicas] for plan in stage_plans] == [[], ["local"]]
+
+    def test_stage_id_without_master_ignores_inactive_stage_device_layout(self, mocker: MockerFixture):
+        """Ensure an inactive replicated stage's device layout does not block starting the selected stage."""
+        stage_plans = []
+
+        def capture_plans_and_stop(runtime, plans):
+            stage_plans.extend(plans)
+            raise RuntimeError("stage plans captured")
+
+        mocker.patch.object(
+            StageRuntime, "_before_initialize_stage_replicas", autospec=True, side_effect=capture_plans_and_stop
+        )
+        with pytest.raises(RuntimeError, match="stage plans captured"):
+            AsyncOmniEngine(
+                model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                stage_id=0,
+                # The replicas / devices here are forced to 0 since we are only running stage 1
+                stage_overrides={"1": {"num_replicas": 2, "devices": "0,0"}},
+            )
+
+        assert [[replica.launch_mode for replica in plan.replicas] for plan in stage_plans] == [["local"], []]
+        # Stage 1 runs nowhere on this server, so it keeps no placement.
+        stage1_runtime = stage_plans[1].metadata.runtime_cfg
+        assert stage1_runtime.num_replicas == 0
+        assert stage1_runtime.devices is None
+        assert stage_plans[1].stage_vllm_config is not None
 
     def test_no_stage_id_no_single_stage_mode(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(mocker)

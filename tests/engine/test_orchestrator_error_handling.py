@@ -25,6 +25,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from tests.helpers.stage_metadata import stage_metadata_for_client
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
@@ -577,6 +578,9 @@ def _build_bare_orchestrator(stage_pools) -> tuple[Orchestrator, tuple[janus.Que
         output_async_queue=queues[1].async_q,
         rpc_async_queue=queues[2].async_q,
         stage_pools=stage_pools,
+        stage_metadata=[
+            stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
+        ],
     )
     return orchestrator, queues
 
@@ -990,13 +994,15 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 async def test_joyai_asr_invalid_context_fails_only_its_request(orchestrator_factory, monkeypatch) -> None:
     monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda _: None)
 
-    class JoyAIStage(FakeStageClient):
-        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-            self.bridge_inputs = joyai_bridge.asr_to_joyai(source_outputs, prompt)
-            return self.bridge_inputs
+    last_bridge_output: list[dict] | None = None
+
+    def asr_spy_bridge(source_outputs, prompt, requires_multimodal_data):
+        nonlocal last_bridge_output
+        last_bridge_output = joyai_bridge.asr_to_joyai(source_outputs, prompt)
+        return last_bridge_output
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = JoyAIStage(stage_type="llm", final_output=True)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, custom_process_input_func=asr_spy_bridge)
     proc0, proc1 = FakeOutputProcessor(), FakeOutputProcessor()
     fixture = orchestrator_factory([stage0, stage1], output_processors=[proc0, proc1])
     fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
@@ -1024,7 +1030,7 @@ async def test_joyai_asr_invalid_context_fails_only_its_request(orchestrator_fac
         else:
             await _wait_for(lambda: bool(stage1.add_request_calls) or fixture.result_future.done())
             assert not fixture.result_future.done()
-            assert "Hello." in stage1.bridge_inputs[0]["prompt"]
+            assert "Hello." in last_bridge_output[0]["prompt"]
             proc1.request_outputs = [_build_request_output(request_id, text="Completed.")]
             stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-joyai", float(index)))
             output = await _get_output_message(fixture)
@@ -1057,15 +1063,18 @@ async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     monkeypatch.setattr(joyai_bridge, "cached_tokenizer_from_config", lambda _: FakeTokenizer())
 
     # Use the real bridge so speaker validation is part of the test.
-    class JoyAITalkerStage(FakeStageClient):
-        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-            self.bridge_inputs = joyai_bridge.joyai_action_to_tts(
-                source_outputs, prompt, self.requires_multimodal_data, target_model_config=talker_model_config
-            )
-            return self.bridge_inputs
+    last_bridge_output: list[dict] | None = None
+
+    # target_model_config comes from stage 1's vllm_config, as in a real stage.
+    def talker_spy_bridge(source_outputs, prompt, requires_multimodal_data, *, target_model_config):
+        nonlocal last_bridge_output
+        last_bridge_output = joyai_bridge.joyai_action_to_tts(
+            source_outputs, prompt, requires_multimodal_data, target_model_config=target_model_config
+        )
+        return last_bridge_output
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = JoyAITalkerStage(stage_type="llm", final_output=True)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, custom_process_input_func=talker_spy_bridge)
     stage0_processor, stage1_processor = FakeOutputProcessor(), FakeOutputProcessor()
     fixture = orchestrator_factory(
         [stage0, stage1],
@@ -1107,7 +1116,7 @@ async def test_joyai_tts_request_validation_keeps_orchestrator_running(
             await _wait_for(lambda: len(stage1.add_request_calls) == talker_submissions or fixture.result_future.done())
             assert not fixture.result_future.done()
             assert stage1.add_request_calls[-1][0].request_id == request_id
-            metadata = stage1.bridge_inputs[0]["additional_information"]
+            metadata = last_bridge_output[0]["additional_information"]
             assert metadata["task_type"] == ["CustomVoice"]
             assert metadata["speaker"] == [first_speaker if request_id == "first" else "Vivian"]
             # Finish the valid request and check its final output.
@@ -1129,14 +1138,12 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
     """Do not send a second update after the first one fails and clears the request."""
     processor_calls = []
 
-    class FailingStage(FakeStageClient):
-        def process_engine_inputs(self, *args, **kwargs):
-            processor_calls.append((args, kwargs))
-            raise OmniClientError("Input rejected")
+    def reject_input(*args, **kwargs):
+        processor_calls.append((args, kwargs))
+        raise OmniClientError("Input rejected")
 
-    orchestrator, queues = _build_bare_orchestrator(
-        _build_stage_pools([[FakeStageClient()], [FailingStage(final_output=True)]])
-    )
+    failing_stage = FakeStageClient(final_output=True, custom_process_input_func=reject_input)
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [failing_stage]]))
     state = OrchestratorRequestState(
         request_id="bad-stream",
         prompt={"prompt_token_ids": [1]},

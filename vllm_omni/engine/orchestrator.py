@@ -80,6 +80,8 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_client import DiffusionSubmitKwargs
+from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
+from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
@@ -405,6 +407,7 @@ class OrchestratorBase:
         rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
+        stage_metadata: list[StageMetadata],
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
@@ -426,6 +429,7 @@ class OrchestratorBase:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self.stage_metadata = stage_metadata
         self.log_stats = log_stats
         if log_stats and not collect_stage_metrics:
             raise ValueError("log_stats=True requires collect_stage_metrics=True")
@@ -2882,20 +2886,20 @@ class OrchestratorBase:
         if pinned_replica_id is not None:
             next_pool.bind_request_to_replica(req_id, pinned_replica_id)
         route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
-        if not next_pool.live_replica_ids():
-            # The downstream stage lost all of its replicas before this in-flight
-            # request could be forwarded.
+        # Fail the request if the next stage has no live replica to forward to (i.e., they died
+        # while it was in flight), unless it yields here instead, as /v1/run calls do.
+        if req_state.yield_stage_id != src_stage_id and not next_pool.live_replica_ids():
             await self._fail_request_dead_stage(req_id, next_logical)
             return
-        next_client = next_pool.stage_client
+        next_metadata = self.stage_metadata[next_logical]
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
-        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        requires_multimodal_data = next_metadata.requires_multimodal_data
         _t_submit_start = _time.perf_counter()
 
-        if next_pool.stage_type == "diffusion":
+        if next_metadata.stage_type == "diffusion":
             # Gate: never dispatch with an incomplete CFG bundle. Checked
             # non-destructively BEFORE popping — a pop-then-redefer would lose
             # the partial outputs. all_companions_done is trustworthy here
@@ -2940,9 +2944,9 @@ class OrchestratorBase:
                 )
                 return
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client is not None and next_client.custom_process_input_func is not None:
+            if next_metadata.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
-                _fn = next_client.custom_process_input_func
+                _fn = next_metadata.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
                 # TODO: replace signature probe with explicit kwarg contract.
                 try:
@@ -3025,7 +3029,7 @@ class OrchestratorBase:
             else:
                 diffusion_prompt = req_state.prompt
 
-            submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_client, req_state, output)
+            submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_metadata, req_state, output)
             payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id, req_state=req_state)
             if payload_sender_info is not None:
                 submit_kwargs["payload_sender_info"] = payload_sender_info
@@ -3105,9 +3109,9 @@ class OrchestratorBase:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            assert next_client is not None
-            process_inputs = getattr(next_client, "process_engine_inputs")
-            next_inputs = process_inputs(
+            next_inputs = StageEngineCoreClientBase.process_engine_inputs(
+                next_metadata,
+                next_pool.stage_vllm_config,
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
@@ -3146,7 +3150,7 @@ class OrchestratorBase:
 
             final_stage_id = req_state.final_stage_id
             final_pool = self.stage_pools[final_stage_id]
-            final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
+            final_output_type = self.stage_metadata[final_stage_id].final_output_type
             terminal_output = _build_terminal_empty_output(
                 req_id,
                 final_output_type=final_output_type,
@@ -3439,7 +3443,7 @@ class OrchestratorBase:
                 submit_kwargs = self._diffusion_submit_kwargs(
                     request_id,
                     next_stage_id - 1,
-                    next_pool.stage_client,
+                    self.stage_metadata[next_stage_id],
                     req_state,
                 )
                 submitted = await self._dispatch_or_fail_request(
@@ -3584,7 +3588,7 @@ class OrchestratorBase:
         config = getattr(self.stage_pools[source_stage_id].stage_vllm_config, "kv_transfer_config", None)
         if getattr(config, "kv_role", None) != "kv_producer":
             return
-        if self.stage_pools[source_stage_id + 1].stage_type != "diffusion":
+        if self.stage_metadata[source_stage_id + 1].stage_type != "diffusion":
             return
 
         from vllm_omni.diffusion.diffusion_kv.kv_connector import build_source_kv_transfer_params, mint_transfer_id
@@ -3603,11 +3607,11 @@ class OrchestratorBase:
         self,
         request_id: str,
         source_stage_id: int,
-        next_client: Any,
+        next_metadata: StageMetadata,
         req_state: OrchestratorRequestState,
         output: Any = None,
     ) -> DiffusionSubmitKwargs:
-        source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [source_stage_id])
+        source_stage_ids = list(next_metadata.engine_input_source or [source_stage_id])
         if req_state.native_kv_transfer_id is None:
             return {"kv_sender_info": self._build_kv_sender_info(source_stage_ids, request_id=request_id)}
         if output is None:
@@ -3777,7 +3781,7 @@ class Orchestrator(OrchestratorBase):
         req_id = msg.request_id
         receiver_stage_id = msg.receiver_stage_id
         try:
-            msg.ensure_valid([pool.stage_type for pool in self.stage_pools])
+            msg.ensure_valid([metadata.stage_type for metadata in self.stage_metadata])
         except ValueError as exc:
             await self._fail_request_client_error(req_id, receiver_stage_id, str(exc))
             return

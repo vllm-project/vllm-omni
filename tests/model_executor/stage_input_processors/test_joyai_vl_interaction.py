@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     DEFAULT_SYSTEM_PROMPT,
@@ -34,10 +35,10 @@ def test_asr_to_joyai_preserves_cache_salt(salt):
 
 def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
     """The cleaned transcript becomes JoyAI's user query, followed by the deferred visuals."""
-    client = object.__new__(StageEngineCoreClient)
-    client.custom_process_input_func = joyai_bridge.asr_to_joyai
-    client.requires_multimodal_data = True
-    client.vllm_config = SimpleNamespace(model_config=None)
+    stage_metadata = make_stage_metadata(
+        custom_process_input_func=joyai_bridge.asr_to_joyai, requires_multimodal_data=True
+    )
+    vllm_config = SimpleNamespace(model_config=None)
 
     def joyai_prompt(system_prompt: str, user_turn: str) -> str:
         return (
@@ -76,7 +77,10 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
         ),
     ]
     for completion, prompt, expected in cases:
-        assert client.process_engine_inputs([SimpleNamespace(outputs=[completion])], prompt=prompt) == [expected]
+        actual_res = StageEngineCoreClient.process_engine_inputs(
+            stage_metadata, vllm_config, [SimpleNamespace(outputs=[completion])], prompt=prompt
+        )
+        assert actual_res == [expected]
 
 
 def test_asr_handoff_preserves_session_prompt_and_checks_final_budget(monkeypatch):
@@ -175,10 +179,8 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
         compute_prompt_length,
     )
 
-    client = object.__new__(StageEngineCoreClient)
-    client.custom_process_input_func = joyai_bridge.joyai_action_to_tts
-    client.requires_multimodal_data = False
-    client.vllm_config = SimpleNamespace(model_config=target_model_config)
+    stage_metadata = make_stage_metadata(custom_process_input_func=joyai_bridge.joyai_action_to_tts)
+    vllm_config = SimpleNamespace(model_config=target_model_config)
 
     cases = [
         (
@@ -220,7 +222,9 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
             completion.cumulative_text = cumulative_text
 
         call_count = len(prompt_length_calls)
-        talker_inputs = client.process_engine_inputs(
+        talker_inputs = StageEngineCoreClient.process_engine_inputs(
+            stage_metadata,
+            vllm_config,
             [SimpleNamespace(outputs=[completion])],
             prompt={"additional_information": additional_information},
         )

@@ -16,7 +16,6 @@ if TYPE_CHECKING:
         OmniDiffusionSamplingParams,
         OmniInteractionPrompt,
         OmniPromptType,
-        OmniTokensPrompt,
     )
     from vllm_omni.outputs import OmniRequestOutput
 
@@ -83,13 +82,6 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
     async def get_output_async(self) -> EngineCoreOutputs: ...
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...
-
-    def process_engine_inputs(
-        self,
-        source_outputs: list[Any],
-        prompt: Any = None,
-        streaming_context: Any | None = None,
-    ) -> list[OmniTokensPrompt]: ...
 
     def get_kv_sender_info(
         self,

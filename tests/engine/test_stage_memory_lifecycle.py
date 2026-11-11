@@ -11,6 +11,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from tests.helpers.stage_metadata import make_stage_metadata
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -93,6 +94,7 @@ def lifecycle(monkeypatch):
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[pool],
+        stage_metadata=[make_stage_metadata()],
         membership_controller=controller,
     )
 

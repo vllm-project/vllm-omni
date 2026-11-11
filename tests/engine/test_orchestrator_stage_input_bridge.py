@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -14,6 +15,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from tests.helpers.stage_metadata import stage_metadata_for_client
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -29,7 +31,7 @@ class FakeStageClient:
     def __init__(
         self,
         *,
-        next_inputs: list[dict[str, Any]] | None = None,
+        custom_process_input_func: Callable[..., list[dict[str, Any]]] | None = None,
         final_output: bool = False,
     ) -> None:
         self.stage_id = 0
@@ -42,10 +44,8 @@ class FakeStageClient:
         self.engine_input_source = [0]
         self.is_comprehension = False
         self.model_stage = None
-        self.custom_process_input_func = None
-        self.next_inputs = list(next_inputs or [])
+        self.custom_process_input_func = custom_process_input_func
         self.add_request_calls: list[tuple[Any, ...]] = []
-        self.decoded_source_tokens: str | None = None
         self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
@@ -59,12 +59,6 @@ class FakeStageClient:
 
     def get_payload_sender_info(self) -> dict[str, Any] | None:
         return None
-
-    def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
-        decoder = getattr(streaming_context, "source_token_decoder", None)
-        if callable(decoder):
-            self.decoded_source_tokens = decoder([11, 12], skip_special_tokens=True)
-        return list(self.next_inputs)
 
     async def abort_requests_async(self, _request_ids: list[str]) -> None:
         return None
@@ -161,11 +155,15 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
             assert skip_special_tokens is True
             return ":".join(str(token_id) for token_id in token_ids)
 
+    decoded_source_tokens: str | None = None
+
+    def process_input(source_outputs, prompt, requires_multimodal_data, streaming_context):
+        nonlocal decoded_source_tokens
+        decoded_source_tokens = streaming_context.source_token_decoder([11, 12], skip_special_tokens=True)
+        return [{"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}]
+
     stage0 = FakeStageClient(final_output=True)
-    stage1 = FakeStageClient(
-        final_output=True,
-        next_inputs=[{"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}],
-    )
+    stage1 = FakeStageClient(final_output=True, custom_process_input_func=process_input)
     stage_pools = [
         StagePool(
             0,
@@ -188,6 +186,9 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         output_async_queue=output_q.async_q,
         rpc_async_queue=rpc_q.async_q,
         stage_pools=stage_pools,
+        stage_metadata=[
+            stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
+        ],
         async_chunk=False,
     )
     input_processor = FakeInputProcessor()
@@ -204,7 +205,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 
     assert input_processor.calls
     assert input_processor.calls[0]["prompt"] == {"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}
-    assert stage1.decoded_source_tokens == "11:12"
+    assert decoded_source_tokens == "11:12"
     assert req_state.streaming.source_token_decoder is None
     assert stage1.add_request_calls
     submitted_request = stage1.add_request_calls[0][0]
