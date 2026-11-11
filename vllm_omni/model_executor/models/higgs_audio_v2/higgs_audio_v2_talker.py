@@ -985,6 +985,11 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             if row < 0 or row + 1 >= len(q_start_cpu):
                 # Past the padded tail or an empty span: no owning request.
                 continue
+            # Audio feedback belongs to one-token decode rows. Multi-token
+            # prefill rows use reference-audio substitution; applying a stale
+            # V1 row state here would overwrite a new request's prompt audio.
+            if q_start_cpu[row + 1] - q_start_cpu[row] != 1:
+                continue
             req_state = state.get(int(row))
             if req_state is None:
                 continue

@@ -460,20 +460,22 @@ def test_audio_feedback_resolves_owner_row_in_mixed_step():
     assert not torch.equal(out[2], out[3])
 
 
-def test_audio_feedback_owner_walk_works_under_v1_row_keys():
-    """The same walk must resolve through plain batch-row keys (V1 keying)."""
+def test_audio_feedback_skips_prefill_under_v1_row_keys():
+    """Stale V1 row state must not overwrite a new request's audio prefill."""
     t = _feedback_talker()
     frame_b = torch.full((8, 1), 1, dtype=torch.long)
     frame_c = torch.full((8, 1), 2, dtype=torch.long)
-    # V1 keys the state dict by batch row directly; no view is published.
+    # V1 keys the state dict by batch row directly; row 0 still has the
+    # previous request's frame when the new request starts its prefill.
     t._audio_state = {0: {"audio_out_ids": frame_b}, 1: {"audio_out_ids": frame_c}}
     t._last_step_query_start_loc = torch.tensor([0, 2, 3])
     hidden = torch.zeros(3, 4)
-    # b prefills 2 tokens (placeholder first), c decodes 1.
+    # b prefills 2 tokens (placeholder first), c decodes 1. The prefill
+    # placeholder must remain untouched; c must still receive its own frame.
     input_ids = torch.tensor([7, 5, 7])
 
     out = t._maybe_apply_audio_feedback(hidden, input_ids)
-    assert torch.equal(out[0], t.embed_audio_codes(frame_b)[0])
+    assert torch.equal(out[0], hidden[0])
     assert torch.equal(out[1], hidden[1])
     assert torch.equal(out[2], t.embed_audio_codes(frame_c)[0]), "c's token at pos 2 must map to row 1"
 
