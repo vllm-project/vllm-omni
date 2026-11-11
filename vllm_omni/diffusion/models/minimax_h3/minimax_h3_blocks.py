@@ -424,6 +424,29 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
+        if qkv.device.type == "npu" and rope_table is not None:
+            try:
+                from mindiesd.layers._custom_ops import eagle_split_norm_rope_concat
+            except ImportError:
+                pass
+            else:
+                # H3 packs half-width cos and sin side by side; Eagle takes contiguous halves.
+                cos, sin = rope_table.reshape(total, 2, self.rot_dim // 2).transpose(0, 1).contiguous().unbind(0)
+                q, k, v = eagle_split_norm_rope_concat(
+                    qkv.view(total, self.num_heads + 2 * self.num_kv_heads, self.head_dim).contiguous(),
+                    self.q_norm.weight.contiguous(),
+                    self.k_norm.weight.contiguous(),
+                    cos,
+                    sin,
+                    [self.num_heads, self.num_kv_heads, self.num_kv_heads],
+                    norm_type=3,  # weighted RMSNorm
+                    rope_type=1,  # HALF (NeoX)
+                    rotary_dim=self.rot_dim,
+                    eps=self.q_norm.variance_epsilon,
+                    output_bnsd=False,  # preserve [local tokens, local heads, head_dim]
+                )
+                return q, k, v, q_raw, k_raw
+
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -120,6 +124,72 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
+
+
+def _qkv_inputs():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3Attention
+
+    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = attention.num_kv_heads = 2
+    attention.head_dim = 128
+    attention.rot_dim = 96
+    attention.vdn = None
+    attention.qkv_proj = lambda x: (x, None)
+    generator = torch.Generator().manual_seed(37)
+    for name in ("q_norm", "k_norm"):
+        norm = nn.RMSNorm(128, eps=1e-6, dtype=torch.bfloat16)
+        norm.variance_epsilon = norm.eps
+        setattr(attention, name, norm)
+    packed = torch.randn(7, 3 * 2 * 128, generator=generator, dtype=torch.bfloat16)
+    angles = torch.randn(7, 48, generator=generator)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1).to(packed.dtype)
+    return attention, packed, table
+
+
+def test_project_qkv_calls_eagle_with_local_rope_halves(monkeypatch):
+    attention, packed, table = _qkv_inputs()
+    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
+    q, k, _ = packed.view(7, 6, 128).split(2, dim=1)
+    outputs = (object(), object(), object())
+    op = Mock(return_value=outputs)
+    monkeypatch.setitem(sys.modules, "mindiesd.layers._custom_ops", SimpleNamespace(eagle_split_norm_rope_concat=op))
+
+    actual_q, actual_k, actual_v, raw_q, raw_k = attention._project_qkv(packed, table)
+
+    op.assert_called_once()
+    qkv, qw, kw, cos, sin, heads = op.call_args.args
+    assert qkv.is_contiguous() and list(heads) == [2, 2, 2]
+    torch.testing.assert_close(qkv, packed.view(7, 6, 128), atol=0, rtol=0)
+    assert qw is attention.q_norm.weight and kw is attention.k_norm.weight
+    assert cos.is_contiguous() and sin.is_contiguous()
+    torch.testing.assert_close(cos, table[:, :48], atol=0, rtol=0)
+    torch.testing.assert_close(sin, table[:, 48:], atol=0, rtol=0)
+    assert op.call_args.kwargs == dict(norm_type=3, rope_type=1, rotary_dim=96, eps=1e-6, output_bnsd=False)
+    assert (actual_q, actual_k, actual_v) == outputs
+    for actual, expected in ((raw_q, q), (raw_k, k)):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", ["missing_op", "no_rope"])
+def test_project_qkv_preserves_fallback(monkeypatch, mode):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
+
+    attention, packed, table = _qkv_inputs()
+    attention.qkv_proj = lambda x: (Mock(wraps=x, device=SimpleNamespace(type="npu")), None)
+    op = Mock()
+    interface = SimpleNamespace() if mode == "missing_op" else SimpleNamespace(eagle_split_norm_rope_concat=op)
+    monkeypatch.setitem(sys.modules, "mindiesd.layers._custom_ops", interface)
+    q, k, v = packed.view(packed.shape[0], 6, 128).split(2, dim=1)
+    if mode == "no_rope":
+        table = None
+        expected = attention.q_norm(q), attention.k_norm(k)
+    else:
+        expected = blocks.fused_qk_norm_rope(q, k, attention.q_norm.weight, attention.k_norm.weight, table, 1e-6)
+    actual = attention._project_qkv(packed, table)
+    for value, reference in zip(actual, (*expected, v, q, k)):
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    op.assert_not_called()
 
 
 def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():
