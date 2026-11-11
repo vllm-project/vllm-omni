@@ -154,6 +154,7 @@ def test_hunyuan_ar_platform_runner_defaults(platform, runner, deploy_name, pipe
     stages = merge_pipeline_deploy(pipeline, deploy)
     assert stages[0].yaml_engine_args["use_v2_model_runner"] is (runner == "v2")
     assert stages[0].yaml_engine_args["supports_native_mrv2_data_plane"] is True
+    assert stages[0].yaml_engine_args.get("disable_chunked_mm_input", False) is (platform == "npu")
 
 
 @pytest.mark.parametrize("pending", [False, True])

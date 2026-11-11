@@ -7,9 +7,12 @@ from typing import Any, NamedTuple
 
 import torch
 import torch_npu
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention import Attention
+from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backends.utils import compute_mm_prefix_ranges
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendMetadata
@@ -40,9 +43,15 @@ def _prefix_queries(
         for left, right in intervals:
             if left >= right:
                 continue
-            # Upstream ranges have inclusive ends. Intersect with this chunk.
+            # Upstream ranges have inclusive ends. Cached image prefixes may
+            # start before this chunk, but the whole image must be available.
             first, end = max(left, computed), min(right + 1, seq_length)
             if first < end:
+                if right + 1 > seq_length:
+                    raise ValueError(
+                        "HunyuanImage3 NPU image prefix was split across prefill chunks. "
+                        "Set disable_chunked_mm_input=True."
+                    )
                 queries.append(
                     _PrefixQuery(
                         req_index,
@@ -72,8 +81,6 @@ class NPUHunyuanImage3AttentionImpl(AscendAttentionBackendImpl):
         if not prefix_queries:
             return output
         keys, values, block_size, block_table, _ = self._get_fia_params(key, value, attn_metadata, kv_cache)
-        if keys.dtype != query.dtype or values.dtype != query.dtype:
-            raise NotImplementedError("HunyuanImage3 NPU image-prefix attention requires unquantized KV")
         for span in prefix_queries:
             selected_keys, selected_values = keys, values
             selected_table = None if block_table is None else block_table[span.req_index : span.req_index + 1]
@@ -108,6 +115,37 @@ class NPUHunyuanImage3ModelState(OmniModelState, AscendModelState):
     """Use Ascend attention metadata while preserving Omni inputs and sampling."""
 
     uses_ascend_attn_metadata = True
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: torch.nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        if not vllm_config.model_config.enforce_eager:
+            raise ValueError("HunyuanImage3 NPU image-prefix attention requires enforce_eager=True")
+        parallel = vllm_config.parallel_config
+        if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+            raise ValueError("HunyuanImage3 NPU image-prefix attention requires PCP/DCP=1")
+        model_dtype = vllm_config.model_config.dtype
+        if get_kv_cache_torch_dtype(vllm_config.cache_config.cache_dtype, model_dtype) != model_dtype:
+            raise ValueError(
+                "HunyuanImage3 NPU image-prefix attention requires unquantized KV matching the model dtype"
+            )
+        scheduler = vllm_config.scheduler_config
+        if scheduler.enable_chunked_prefill and not scheduler.disable_chunked_mm_input:
+            raise ValueError("HunyuanImage3 NPU chunked prefill requires disable_chunked_mm_input=True")
+
+        layers = get_layers_from_vllm_config(vllm_config, Attention)
+        for layer in layers.values():
+            if type(layer.impl) not in (AscendAttentionBackendImpl, NPUHunyuanImage3AttentionImpl):
+                raise ValueError("HunyuanImage3 NPU image-prefix attention requires the standard Ascend backend")
+        super().__init__(vllm_config, model, encoder_cache, device)
+        # Model-state initialization follows attention construction and weight
+        # loading. Bind once here, preserving initialized Ascend backend state.
+        for layer in layers.values():
+            layer.impl.__class__ = NPUHunyuanImage3AttentionImpl
 
     def prepare_attn(
         self,
@@ -149,20 +187,6 @@ class NPUHunyuanImage3ModelState(OmniModelState, AscendModelState):
                 input_batch.seq_lens_np[: input_batch.num_reqs].tolist(),
                 ranges,
             )
-        if queries and (
-            cudagraph_mode != CUDAGraphMode.NONE
-            or self.pcp_context is not None
-            or self.vllm_config.parallel_config.decode_context_parallel_size != 1
-        ):
-            raise NotImplementedError("HunyuanImage3 NPU image-prefix prefill requires eager execution and PCP/DCP=1")
-        for layer_name, layer_metadata in metadata.items():
+        for layer_metadata in metadata.values():
             layer_metadata._omni_prefix_queries = queries
-            if queries:
-                impl = self.vllm_config.compilation_config.static_forward_context[layer_name].impl
-                if type(impl) is AscendAttentionBackendImpl:
-                    # Preserve the initialized cache/backend state. Ascend's
-                    # quantized KV adapters use the same per-instance seam.
-                    impl.__class__ = NPUHunyuanImage3AttentionImpl
-                elif not isinstance(impl, NPUHunyuanImage3AttentionImpl):
-                    raise NotImplementedError("HunyuanImage3 NPU image-prefix attention requires the standard backend")
         return metadata

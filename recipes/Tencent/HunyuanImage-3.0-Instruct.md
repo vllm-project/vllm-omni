@@ -83,7 +83,10 @@ token history. Speculative decoding must be disabled for this stage.
 On NPU, the model state uses Ascend attention metadata and restores
 bidirectional attention within each input-image span. Image-prefix prefill
 requires eager execution, PCP/DCP sizes of one, and unquantized KV caches.
-The supplied NPU profiles use eager BF16 execution.
+The supplied NPU profiles use eager BF16 execution and
+`disable_chunked_mm_input: true` so prefill chunks keep each image intact.
+Unsupported execution, cache and attention-backend configurations fail during
+model-state initialization.
 
 ### Shared T2I/IT2I offline examples
 

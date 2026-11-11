@@ -11,6 +11,7 @@ pytest.importorskip("torch_npu")
 
 import torch_npu
 from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention import Attention
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -32,12 +33,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("npu", [False, True])
 def test_factory_selects_platform_state(monkeypatch, mocker, npu):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: npu)
-    init = mocker.patch.object(OmniModelState, "__init__", return_value=None)
+    state_type = NPUHunyuanImage3ModelState if npu else OmniModelState
+    init = mocker.patch.object(state_type, "__init__", return_value=None)
     model = HunyuanImage3ForConditionalGeneration.__new__(HunyuanImage3ForConditionalGeneration)
     config, cache = object(), object()
     device = torch.device("cpu")
     state = init_omni_model_state(config, model, cache, device)
-    assert type(state) is (NPUHunyuanImage3ModelState if npu else OmniModelState)
+    assert type(state) is state_type
     init.assert_called_once_with(config, model, cache, device)
 
 
@@ -58,7 +60,6 @@ def test_ascend_attention_preserves_omni_inputs_and_sampler(mocker):
     [
         ([0, 8], [8], {0: [(2, 4)]}, [(0, 0, 2, 5, 5)]),
         ([0, 4], [8], {0: [(2, 6)]}, [(0, 0, 0, 3, 7)]),
-        ([0, 4], [4], {0: [(2, 6)]}, [(0, 0, 2, 4, 4)]),
         ([0, 4], [8], {0: [(0, 3), (8, 10)]}, []),
         ([0, 8], [8], {0: [(1, 1)]}, []),
         ([0, 4, 7], [8, 6], {0: [(2, 6)], 1: [(3, 4)]}, [(0, 0, 0, 3, 7), (1, 4, 4, 6, 5)]),
@@ -67,6 +68,80 @@ def test_ascend_attention_preserves_omni_inputs_and_sampler(mocker):
 )
 def test_prefix_queries_preserve_inclusive_ranges_and_chunk_offsets(starts, lengths, ranges, expected):
     assert _prefix_queries(starts, lengths, ranges) == expected
+
+
+@pytest.mark.parametrize(("starts", "lengths"), [([0, 4], [4]), ([0, 2], [5])])
+def test_prefix_queries_reject_incomplete_images(starts, lengths):
+    with pytest.raises(ValueError, match="split across prefill chunks"):
+        _prefix_queries(starts, lengths, {0: [(2, 6)]})
+
+
+@pytest.fixture
+def state_config(mocker):
+    config = mocker.Mock()
+    config.model_config = mocker.Mock(enforce_eager=True, dtype=torch.bfloat16)
+    config.parallel_config = mocker.Mock(prefill_context_parallel_size=1, decode_context_parallel_size=1)
+    config.cache_config = mocker.Mock(cache_dtype="auto")
+    config.scheduler_config = mocker.Mock(enable_chunked_prefill=True, disable_chunked_mm_input=True)
+    layer = mocker.Mock(spec=Attention)
+    layer.impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    config.compilation_config.static_forward_context = {"attention": layer, "other": object()}
+    return config
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16"])
+def test_init_binds_attention_once_after_parent_init(mocker, state_config, cache_dtype):
+    state_config.cache_config.cache_dtype = cache_dtype
+    layer = state_config.compilation_config.static_forward_context["attention"]
+    original_impl = layer.impl
+
+    def initialize(*args):
+        assert type(layer.impl) is AscendAttentionBackendImpl
+
+    parent = mocker.patch.object(OmniModelState, "__init__", side_effect=initialize)
+    model, device = mocker.Mock(spec=torch.nn.Module), torch.device("cpu")
+    NPUHunyuanImage3ModelState(state_config, model, None, device)
+    parent.assert_called_once_with(state_config, model, None, device)
+    assert layer.impl is original_impl
+    assert type(layer.impl) is NPUHunyuanImage3AttentionImpl
+
+
+@pytest.mark.parametrize(
+    ("section", "attribute", "value", "message"),
+    [
+        ("model_config", "enforce_eager", False, "enforce_eager=True"),
+        ("parallel_config", "prefill_context_parallel_size", 2, "PCP/DCP=1"),
+        ("parallel_config", "decode_context_parallel_size", 2, "PCP/DCP=1"),
+        ("cache_config", "cache_dtype", "fp8", "unquantized KV"),
+        ("cache_config", "cache_dtype", "float16", "matching the model dtype"),
+        ("scheduler_config", "disable_chunked_mm_input", False, "disable_chunked_mm_input=True"),
+    ],
+)
+def test_init_rejects_unsupported_config_before_parent_init(mocker, state_config, section, attribute, value, message):
+    setattr(getattr(state_config, section), attribute, value)
+    parent = mocker.patch.object(OmniModelState, "__init__")
+    with pytest.raises(ValueError, match=message):
+        NPUHunyuanImage3ModelState(state_config, mocker.Mock(spec=torch.nn.Module), None, torch.device("cpu"))
+    parent.assert_not_called()
+    assert type(state_config.compilation_config.static_forward_context["attention"].impl) is AscendAttentionBackendImpl
+
+
+def test_init_allows_unchunked_prefill(mocker, state_config):
+    state_config.scheduler_config.enable_chunked_prefill = False
+    state_config.scheduler_config.disable_chunked_mm_input = False
+    mocker.patch.object(OmniModelState, "__init__", return_value=None)
+    NPUHunyuanImage3ModelState(state_config, mocker.Mock(spec=torch.nn.Module), None, torch.device("cpu"))
+
+
+def test_init_rejects_other_backends_before_mutating_layers(mocker, state_config):
+    layer = state_config.compilation_config.static_forward_context["attention"]
+    unsupported = mocker.Mock(spec=Attention, impl=object())
+    state_config.compilation_config.static_forward_context["unsupported"] = unsupported
+    parent = mocker.patch.object(OmniModelState, "__init__")
+    with pytest.raises(ValueError, match="standard Ascend backend"):
+        NPUHunyuanImage3ModelState(state_config, mocker.Mock(spec=torch.nn.Module), None, torch.device("cpu"))
+    parent.assert_not_called()
+    assert type(layer.impl) is AscendAttentionBackendImpl
 
 
 def _attention(query, key, value, allowed):
@@ -142,16 +217,11 @@ def test_prefix_attention_delegates_plain_decode(mocker):
     fia.assert_not_called()
 
 
-def test_prepare_attn_binds_local_backend_and_clears_prefix_queries_for_decode(mocker):
+def test_prepare_attn_clears_prefix_queries_for_decode(mocker):
     state = NPUHunyuanImage3ModelState.__new__(NPUHunyuanImage3ModelState)
     state.encoder_cache = mocker.Mock(mm_features={"request": [mocker.sentinel.image]})
     state.model_config = mocker.Mock()
     state.model_config.get_sliding_window.return_value = None
-    state.vllm_config = mocker.Mock()
-    state.vllm_config.parallel_config.decode_context_parallel_size = 1
-    state.pcp_context = None
-    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
-    state.vllm_config.compilation_config.static_forward_context = {"attention": mocker.Mock(impl=impl)}
     batch = mocker.Mock(spec=AscendInputBatch)
     batch.is_dummy, batch.has_prefill, batch.num_reqs = False, True, 1
     batch.req_ids = ["request"]
@@ -162,7 +232,6 @@ def test_prepare_attn_binds_local_backend_and_clears_prefix_queries_for_decode(m
     ranges = mocker.patch.object(hunyuan_image3_model_state, "compute_mm_prefix_ranges", return_value={0: [(1, 3)]})
     args = (batch, CUDAGraphMode.NONE, (), None, mocker.sentinel.attn_groups, None)
     state.prepare_attn(*args)
-    assert type(impl) is NPUHunyuanImage3AttentionImpl
     assert metadata._omni_prefix_queries == [(0, 0, 1, 4, 4)]
     ranges.assert_called_once_with([[mocker.sentinel.image]], sliding_window=None)
     batch.has_prefill = False
