@@ -766,12 +766,17 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
     # Any draft method is refused at load where draft codes can't be verified.
-    for session, k_step in (("duplex", 0), ("turn", 2)):
+    # duplex K=0 hits the shared fail-closed raise; turn K>0 hits the
+    # K-step-specific raise pointing at session_mode: duplex.
+    for session, k_step, pattern in (
+        ("duplex", 0, "turn sessions only"),
+        ("turn", 2, "K-step frames require session_mode: duplex"),
+    ):
         talker.vllm_config = SimpleNamespace(
             speculative_config=spec_config, model_config=SimpleNamespace(session_mode=session)
         )
         talker._k_step_frames = k_step
-        with pytest.raises(NotImplementedError, match="turn sessions only"):
+        with pytest.raises(NotImplementedError, match=pattern):
             talker.mrv2_custom_sampler(sampler)
 
 
