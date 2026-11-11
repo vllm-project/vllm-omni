@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6,6 +9,7 @@ import pytest
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi.serving import PolicyServerConfig
+from vllm_omni.protocol import numpy_msgpack
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +51,7 @@ def _serving_mock():
         }
     )
     serving.infer = AsyncMock(return_value=[0.0])
+    serving.close_sessions = AsyncMock()
     return serving
 
 
@@ -80,7 +85,7 @@ def test_unpack_accepts_vllm_native_marker_dicts():
         }
     }
 
-    decoded = openpi_connection._unpack_numpy(payload)
+    decoded = numpy_msgpack._unpack_numpy(payload)
 
     np.testing.assert_allclose(decoded[b"actions"], action)
     assert decoded[b"actions"].flags.writeable is True
@@ -100,14 +105,14 @@ def test_unpack_accepts_msgpack_numpy_marker_dicts():
         }
     }
 
-    decoded = openpi_connection._unpack_numpy(payload)
+    decoded = numpy_msgpack._unpack_numpy(payload)
 
     np.testing.assert_allclose(decoded[b"actions"], action)
     assert decoded[b"actions"].dtype == np.float32
 
 
 def test_unpack_rejects_msgpack_numpy_structured_array_markers():
-    values = np.zeros(2, dtype=[("a", "<i4"), ("b", "<f4")])
+    values: np.ndarray = np.zeros(2, dtype=[("a", "<i4"), ("b", "<f4")])
     payload = {
         b"nd": True,
         b"type": values.dtype.descr,
@@ -117,12 +122,12 @@ def test_unpack_rejects_msgpack_numpy_structured_array_markers():
     }
 
     with pytest.raises(ValueError, match="Unsupported dtype"):
-        openpi_connection._unpack_numpy(payload)
+        numpy_msgpack._unpack_numpy(payload)
 
 
 def test_unpack_msgpack_numpy_packed_observation():
     msgpack_numpy = pytest.importorskip("msgpack_numpy")
-    obs = {
+    obs: dict[str, np.ndarray] = {
         "observation/exterior_image_0_left": np.zeros((180, 320, 3), dtype=np.uint8),
         "observation/joint_position": np.arange(7, dtype=np.float32),
     }
@@ -141,7 +146,7 @@ def test_unpack_msgpack_numpy_packed_observation():
 
 
 def test_unpack_accepts_openpi_client_ndarray_markers():
-    image = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    image: np.ndarray = np.arange(6, dtype=np.uint8).reshape(2, 3)
     payload = {
         "observation/exterior_image_0_left": {
             b"__ndarray__": True,
@@ -151,7 +156,7 @@ def test_unpack_accepts_openpi_client_ndarray_markers():
         }
     }
 
-    decoded = openpi_connection._unpack_numpy(payload)
+    decoded = numpy_msgpack._unpack_numpy(payload)
 
     np.testing.assert_array_equal(decoded["observation/exterior_image_0_left"], image)
     assert decoded["observation/exterior_image_0_left"].dtype == np.uint8
@@ -176,7 +181,7 @@ def _cross_check_installed_openpi_client(payload: object, packed: bytes) -> None
 def test_unpack_openpi_client_packed_observation():
     from tests.helpers import openpi_msgpack
 
-    image = np.zeros((180, 320, 3), dtype=np.uint8)
+    image: np.ndarray = np.zeros((180, 320, 3), dtype=np.uint8)
     obs = {
         "observation/exterior_image_0_left": image,
         "observation/joint_position": np.zeros(7, dtype=np.float32),
@@ -213,7 +218,7 @@ def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():
         }
     }
 
-    decoded = openpi_connection._unpack_numpy(payload)
+    decoded = numpy_msgpack._unpack_numpy(payload)
 
     assert decoded == payload
 
@@ -232,7 +237,7 @@ def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypa
             {"type": "websocket.disconnect"},
         ]
     )
-    serving = MagicMock()
+    serving = _serving_mock()
     connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
 
     asyncio.run(connection.handle_connection())
@@ -245,11 +250,9 @@ def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypa
     serving.reset.assert_not_called()
 
 
-def test_handle_connection_rejects_oversized_payload_before_unpack(monkeypatch):
-    unpack_mock = MagicMock(side_effect=AssertionError("_unpack should not be called"))
+def test_handle_connection_rejects_oversized_payload(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    monkeypatch.setattr(openpi_connection, "_unpack", unpack_mock)
-    monkeypatch.setattr(openpi_connection, "MAX_OPENPI_PAYLOAD_BYTES", 4)
+    monkeypatch.setattr(numpy_msgpack, "MAX_PAYLOAD_BYTES", 4)
 
     websocket = FakeWebSocket(
         [
@@ -257,13 +260,12 @@ def test_handle_connection_rejects_oversized_payload_before_unpack(monkeypatch):
             {"type": "websocket.disconnect"},
         ]
     )
-    serving = MagicMock()
+    serving = _serving_mock()
     connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
 
     asyncio.run(connection.handle_connection())
 
     assert websocket.sent_bytes[1] == {"type": "error", "message": "Invalid request payload"}
-    unpack_mock.assert_not_called()
     serving.infer.assert_not_called()
     serving.reset.assert_not_called()
 
@@ -273,7 +275,7 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
     monkeypatch.setattr(
         openpi_connection,
         "_unpack",
-        lambda _data: {"prompt": "pick up the object"},
+        lambda _data: {"prompt": "pick up the object", "session_id": "episode"},
     )
 
     websocket = FakeWebSocket(
@@ -282,7 +284,7 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
             {"type": "websocket.disconnect"},
         ]
     )
-    serving = MagicMock()
+    serving = _serving_mock()
     serving.infer = AsyncMock(side_effect=RuntimeError("secret traceback text"))
     connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
 
@@ -291,11 +293,11 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
     assert websocket.sent_bytes[1] == {"type": "error", "message": "Internal inference error"}
     assert "secret traceback text" not in str(websocket.sent_bytes[1])
     assert websocket.sent_texts == []
-    serving.infer.assert_awaited_once_with(
-        {"prompt": "pick up the object"},
-        session_id="default",
-        reset=True,
-    )
+    serving.infer.assert_awaited_once()
+    call = serving.infer.await_args
+    assert call is not None
+    assert call.args == ({"prompt": "pick up the object", "session_id": "episode"},)
+    assert call.kwargs["session_id"].endswith(":episode") and call.kwargs["reset"]
 
 
 def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
@@ -306,8 +308,8 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     async def never_receives():
         await asyncio.sleep(1)
 
-    websocket.receive = never_receives
-    serving = MagicMock()
+    monkeypatch.setattr(websocket, "receive", never_receives)
+    serving = _serving_mock()
     serving.policy_server_config = PolicyServerConfig(
         {
             "image_resolution": (180, 320),
@@ -384,9 +386,18 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket_b, serving).handle_connection())
 
     calls = serving.infer.await_args_list
-    assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
-    assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
-    assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+    assert {**calls[0].kwargs, "session_id": calls[0].kwargs["session_id"].split(":", 1)[-1]} == {
+        "session_id": "session-a",
+        "reset": True,
+    }
+    assert {**calls[1].kwargs, "session_id": calls[1].kwargs["session_id"].split(":", 1)[-1]} == {
+        "session_id": "session-a",
+        "reset": False,
+    }
+    assert {**calls[2].kwargs, "session_id": calls[2].kwargs["session_id"].split(":", 1)[-1]} == {
+        "session_id": "session-b",
+        "reset": True,
+    }
 
 
 def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch):
@@ -406,7 +417,10 @@ def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch)
 
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
 
-    assert [call.kwargs for call in serving.infer.await_args_list] == [
+    assert [
+        {**call.kwargs, "session_id": call.kwargs["session_id"].split(":", 1)[-1]}
+        for call in serving.infer.await_args_list
+    ] == [
         {"session_id": "session-a", "reset": True},
         {"session_id": "session-b", "reset": True},
         {"session_id": "session-a", "reset": False},
@@ -446,7 +460,7 @@ def test_handle_connection_bounds_tracked_sessions_without_resetting_live_ones(m
 
     resets_by_session: dict[str, list[bool]] = {}
     for call in serving.infer.await_args_list:
-        resets_by_session.setdefault(call.kwargs["session_id"], []).append(call.kwargs["reset"])
+        resets_by_session.setdefault(call.kwargs["session_id"].split(":", 1)[-1], []).append(call.kwargs["reset"])
 
     # Each new episode resets exactly once, on its first observation.
     for episode in range(episodes):
@@ -480,3 +494,75 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        list(range(4097)),
+        {str(i): i for i in range(257)},
+        "x" * 65537,
+        [[{}] * 128] * 128,
+        [[[]] * 128] * 128,
+        b"\x82\xa1k\x01\xa1k\x02",
+    ],
+)
+def test_msgpack_container_limits_apply_during_decode(payload):
+    import msgspec
+
+    with pytest.raises(ValueError):
+        openpi_connection._unpack(payload if isinstance(payload, bytes) else msgspec.msgpack.encode(payload))
+
+
+@pytest.mark.asyncio
+async def test_openpi_decodes_off_event_loop(monkeypatch):
+    import threading
+
+    socket = FakeWebSocket(
+        [{"bytes": openpi_connection._pack({"endpoint": "reset"})}, {"type": "websocket.disconnect"}]
+    )
+    connection = openpi_connection.RobotRealtimeConnection(socket, _serving_mock(), idle_timeout=None)
+    original, event_thread = connection._unpack_request, threading.get_ident()
+
+    def decode(data):
+        assert threading.get_ident() != event_thread
+        return original(data)
+
+    monkeypatch.setattr(connection, "_unpack_request", decode)
+    await connection.handle_connection()
+
+
+def test_optional_session_id_retains_current_episode():
+    serving = _serving_mock()
+    serving.policy_server_config.values["needs_session_id"] = False
+    socket = FakeWebSocket(
+        [{"bytes": openpi_connection._pack(obs)} for obs in ({"session_id": "episode"}, {}, {"endpoint": "reset"}, {})]
+        + [{"type": "websocket.disconnect"}]
+    )
+    asyncio.run(openpi_connection.RobotRealtimeConnection(socket, serving, idle_timeout=None).handle_connection())
+    ids = [call.kwargs["session_id"] for call in serving.infer.await_args_list]
+    assert ids[0] == ids[1] and ids[2] != ids[0] and ids[2].endswith(":default")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["websocket.receive", "websocket.disconnect"])
+async def test_inflight_policy_cancels_on_early_message_or_disconnect(message_type):
+    started = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await asyncio.Future()
+
+    work = asyncio.create_task(operation())
+    await started.wait()
+    receive = asyncio.create_task(asyncio.sleep(0, result={"type": message_type}))
+    websocket = MagicMock(spec=openpi_connection.WebSocket)
+    with pytest.raises(openpi_connection.WebSocketDisconnect):
+        await openpi_connection.await_policy(work, receive, websocket)
+    assert work.cancelled()
+    if message_type == "websocket.receive":
+        websocket.close.assert_awaited_once_with(
+            code=1008, reason="Wait for the policy reply before sending another request"
+        )
+    else:
+        websocket.close.assert_not_awaited()
