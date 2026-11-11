@@ -26,7 +26,7 @@ def get_question():
 
 @pytest.mark.slow
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_audio(omni_runner, offline_client) -> None:
     """

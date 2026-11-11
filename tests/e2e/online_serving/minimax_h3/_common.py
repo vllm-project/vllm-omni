@@ -235,6 +235,12 @@ def run_dlo_wave(
 
 
 def dlo_params(task_type: str) -> OmniServerParams:
+    """Build the two-card DP2 + DLO server for one MiniMax-H3 startup partition.
+
+    ``task_type="combined"`` loads the FL2VA and Ref2VA DiTs in one process.
+    Request ``extra_params.task`` still selects the task. ``fl2va`` or
+    ``ref2va`` downloads only that partition and cannot serve the other task.
+    """
     return OmniServerParams(
         model=MODEL,
         server_args=[*DLO_SERVER_ARGS, "--task-type", task_type],
