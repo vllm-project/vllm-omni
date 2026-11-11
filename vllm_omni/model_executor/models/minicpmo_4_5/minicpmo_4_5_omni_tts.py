@@ -2880,14 +2880,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # sampler owns the eos/stop/limit transition, so no pending
                 # row is queued; the delta and state commit immediately.
                 host_id, host_finished, host_emit = self._sample_audio_code_host(
-                    hidden[end - 1 : end],
-                    codes,
-                    request_id,
-                    state,
-                    step,
-                    min_tokens,
-                    max_tokens,
-                    eos_window_masked,
+                    hidden_state=hidden[end - 1 : end],
+                    history=codes,
+                    request_id=request_id,
+                    request_state=state,
+                    step=step,
+                    min_tokens=min_tokens,
+                    max_tokens=max_tokens,
+                    eos_window_masked=eos_window_masked,
                     lg_dev=frame_logits.reshape(-1),
                 )
                 sampled = torch.tensor(host_id, dtype=torch.long, device=hidden.device).reshape(())
@@ -3726,6 +3726,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_histories.pop(request_id, None)
             if isinstance(request_generators, dict):
                 request_generators.pop(request_id, None)
+            host_codec_states = getattr(self, "_request_host_codec_states", None)
+            if isinstance(host_codec_states, dict):
+                host_codec_states.pop(request_id, None)
+            host_codec_generators = getattr(self, "_request_host_codec_generators", None)
+            if isinstance(host_codec_generators, dict):
+                host_codec_generators.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
             getattr(self, "_cuda_kstep_request_bank", {}).pop(request_id, None)
             bindings = getattr(self, "_cuda_kstep_rng_bindings", {})
