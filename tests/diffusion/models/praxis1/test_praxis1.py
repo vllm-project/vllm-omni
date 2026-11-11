@@ -33,8 +33,8 @@ from vllm_omni.model_extras.praxis1 import PraxisSessionOptions, SamplerSettings
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def minimal_config() -> dict:
-    """The smallest config ``validate_config`` accepts."""
+def minimal_config(embodiment: str = "single_arm") -> dict:
+    """The smallest config ``validate_config`` accepts for one embodiment."""
     config: dict = {}
     for path, value in _REQUIRED_VALUES.items():
         node = config
@@ -42,7 +42,7 @@ def minimal_config() -> dict:
         for parent in parents:
             node = node.setdefault(parent, {})
         node[key] = value
-    dim = 10
+    dim = 20 if embodiment == "bimanual" else 10
     config["text_encoder"]["blank_caption"] = " "
     config["normalization"] = {
         "action_q01": [0.0] * dim,
@@ -50,6 +50,11 @@ def minimal_config() -> dict:
         "proprio_mean": [0.0] * dim,
         "proprio_std": [1.0] * dim,
     }
+    if embodiment == "bimanual":
+        config.update(embodiment="bimanual", pose_frame="rig")
+        config["video"].update(width=1248, height=256, tile_height=256, views=["top_left", "wrist_left", "wrist_right"])
+        config["action_space"]["dim"] = 20
+        config["action_expert"].update(action_patch_dim=80, proprio_patch_dim=20)
     return config
 
 
@@ -73,17 +78,19 @@ def _worker(transformer=None):
     return worker
 
 
-def test_checkpoint_config_contract():
-    config = minimal_config()
+@pytest.mark.parametrize("embodiment", ["single_arm", "bimanual"])
+def test_checkpoint_config_contract(embodiment):
+    config = minimal_config(embodiment)
     validate_config(config)
-    config["video"].update(height=256, tile_height=256, antialias=False)
-    with pytest.raises(CheckpointError, match="video"):
-        validate_config(config)
-    other = minimal_config()
-    other["embodiment"] = "bimanual"
-    with pytest.raises(CheckpointError, match="embodiment"):
-        validate_config(other)
-    bad = minimal_config()
+    config["video"].update(height=256, tile_height=256, antialias=False) if embodiment == "single_arm" else None
+    if embodiment == "single_arm":
+        with pytest.raises(CheckpointError, match="video"):
+            validate_config(config)
+    else:
+        config["action_expert"]["action_patch_dim"] = 40
+        with pytest.raises(CheckpointError, match="action_patch_dim"):
+            validate_config(config)
+    bad = minimal_config(embodiment)
     bad["normalization"]["proprio_std"][0] = 0.0
     with pytest.raises(CheckpointError, match="proprio_std"):
         validate_config(bad)
@@ -458,9 +465,11 @@ def test_failed_inference_discards_episode_context():
     assert not worker._sessions
 
 
+@pytest.mark.parametrize("embodiment,width", [("single_arm", 13), ("bimanual", 26)])
 @pytest.mark.parametrize("session_id", ["a", "missing"])
-def test_worker_cleanup_releases_only_named_session_without_inference(session_id):
+def test_worker_cleanup_releases_only_named_session_without_inference(session_id, embodiment, width):
     worker = _worker()
+    worker.embodiment = embodiment
     worker.max_sessions = 2
     worker._sessions = {"a": Mock(spec=pipeline_praxis1.Session), "b": Mock(spec=pipeline_praxis1.Session)}
     request = OmniDiffusionRequest(
@@ -470,7 +479,7 @@ def test_worker_cleanup_releases_only_named_session_without_inference(session_id
     )
     output = worker._forward(DiffusionRequestBatch(requests=[request]))
     assert set(worker._sessions) == ({"b"} if session_id == "a" else {"a", "b"})
-    assert output.output["payload"]["actions"].shape == (0, 13)
+    assert output.output["payload"]["actions"].shape == (0, width)
     worker._forward(DiffusionRequestBatch(requests=[request]))  # idempotent
     worker._sessions["b"].step.assert_not_called()
     worker.drop_session_state("b")
