@@ -263,22 +263,32 @@ class VoxtralTTSForConditionalGeneration(
         if input_ids.numel() != len(req_infos):
             raise ValueError(f"Expected one decode token per request, got {input_ids.numel()} for {len(req_infos)}")
         self.post_process_idx = 0
-        frames = []
-        for info in req_infos:
+        frames: list[torch.Tensor] = []
+        rows: list[int] = []
+        for row, info in enumerate(req_infos):
             codes = info.get("codes")
             frame = codes.get("audio") if isinstance(codes, Mapping) else None
-            if frame is None:
-                # Same legacy top-level fallback as tts_preprocess.
-                frame = info.get("audio")
-            if not isinstance(frame, torch.Tensor):
-                raise ValueError("Voxtral TTS decode requires the previous step's audio frame")
-            frames.append(frame.reshape(1, -1))
-        audio_codes = torch.cat(frames).to(input_ids.device)  # (B, num_codebooks)
+            if isinstance(frame, torch.Tensor):
+                frames.append(frame.reshape(1, -1))
+                rows.append(row)
+        embeds = self.model.embed_input_ids(input_ids)
+        if len(rows) < len(req_infos):
+            # Like tts_preprocess, a row without a frame keeps its token embedding
+            # instead of failing the whole batch.
+            logger.warning_once("Voxtral TTS decode row without a previous audio frame; using its token embedding")
+        if not rows:
+            return input_ids, embeds, [{} for _ in req_infos]
+
+        audio_codes = torch.cat(frames).to(input_ids.device)  # (rows, num_codebooks)
         audio_embeds = self.model.audio_tokenizer.encode_tokens([audio_codes.unsqueeze(-1)])[0]
-        audio_embeds = audio_embeds.reshape(len(req_infos), -1)
-        text_embeds = self.model.embed_input_ids(input_ids)
-        is_audio = (input_ids == self._audio_token_id).unsqueeze(-1)
-        embeds = torch.where(is_audio, audio_embeds.to(text_embeds.dtype), text_embeds)
+        audio_embeds = audio_embeds.reshape(len(rows), -1).to(embeds.dtype)
+        if len(rows) == len(req_infos):
+            is_audio = (input_ids == self._audio_token_id).unsqueeze(-1)
+            embeds = torch.where(is_audio, audio_embeds, embeds)
+        else:
+            index = torch.tensor(rows, device=input_ids.device)
+            is_audio = (input_ids[index] == self._audio_token_id).unsqueeze(-1)
+            embeds = embeds.index_copy(0, index, torch.where(is_audio, audio_embeds, embeds[index]))
         return input_ids, embeds, [{} for _ in req_infos]
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):

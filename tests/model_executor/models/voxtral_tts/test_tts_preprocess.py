@@ -157,8 +157,7 @@ def test_preprocess_decode_batch_matches_per_row_tts_preprocess():
     torch.manual_seed(0)
     model, codebook_sizes = _make_voxtral_tts_model_with_real_embeddings()
     input_ids = torch.tensor([model._audio_token_id] * 4)
-    frames = [_random_frame(codebook_sizes) for _ in range(4)]
-    req_infos = [{"codes": {"audio": frame}} for frame in frames[:3]] + [{"audio": frames[3]}]
+    req_infos = [{"codes": {"audio": _random_frame(codebook_sizes)}} for _ in range(4)]
 
     with torch.no_grad():
         expected = torch.cat(
@@ -178,7 +177,22 @@ def test_preprocess_decode_batch_matches_per_row_tts_preprocess():
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
 
 
-def test_preprocess_decode_batch_requires_previous_audio_frame():
-    model, _ = _make_voxtral_tts_model_with_real_embeddings()
-    with pytest.raises(ValueError, match="previous step's audio frame"):
-        model.preprocess_decode_batch(input_ids=torch.tensor([model._audio_token_id]), req_infos=[{}])
+def test_preprocess_decode_batch_row_without_frame_keeps_token_embedding():
+    torch.manual_seed(0)
+    model, codebook_sizes = _make_voxtral_tts_model_with_real_embeddings()
+    input_ids = torch.tensor([model._audio_token_id] * 3)
+    req_infos = [
+        {"codes": {"audio": _random_frame(codebook_sizes)}},
+        {},
+        {"codes": {"audio": _random_frame(codebook_sizes)}},
+    ]
+
+    with torch.no_grad():
+        _, embeds, updates = model.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+        for row in (0, 2):
+            _, expected, _ = model.tts_preprocess(
+                input_ids[row : row + 1], model.model.embed_input_ids(input_ids[row : row + 1]), **dict(req_infos[row])
+            )
+            torch.testing.assert_close(embeds[row : row + 1], expected.reshape(1, -1), rtol=0, atol=0)
+        torch.testing.assert_close(embeds[1], model.model.embed_input_ids(input_ids[1:2])[0], rtol=0, atol=0)
+    assert updates == [{}, {}, {}]
