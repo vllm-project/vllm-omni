@@ -107,7 +107,7 @@ def _assert_valid_omnivoice_wav_responses(responses: Sequence[OmniResponse]) -> 
 class TestOmniVoiceTTS:
     """E2E tests for OmniVoice TTS model."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice(self, omni_server, online_client) -> None:
         """Test auto voice TTS generation (text only, no reference audio)."""
         request_config = {
@@ -119,7 +119,7 @@ class TestOmniVoiceTTS:
         }
         online_client.send_audio_speech_request(request_config)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_batch(self, omni_server, openai_client) -> None:
         """Test concurrent request-batch TTS generation."""
         batch_request_config = {
@@ -138,7 +138,7 @@ class TestOmniVoiceTTS:
 class TestOmniVoiceStepExecution:
     """E2E tests for OmniVoice TTS model."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_step_execution(self, omni_server, openai_client) -> None:
         """Test auto voice TTS generation (text only, no reference audio)."""
         request_config = {
@@ -153,7 +153,7 @@ class TestOmniVoiceStepExecution:
         }
         openai_client.send_audio_speech_request(request_config)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_batch_step_execution(self, omni_server, openai_client) -> None:
         """Test concurrent step-execution TTS generation."""
         batch_request_config = {
@@ -175,7 +175,7 @@ class TestOmniVoiceStepExecution:
 class TestOmniVoiceSeed:
     """E2E tests for OmniVoice Seed Params."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_seed_deterministic(self, omni_server, online_client) -> None:
         cfg = {
             "model": omni_server.model,
@@ -191,7 +191,7 @@ class TestOmniVoiceSeed:
         assert r2.audio_bytes is not None
         assert r1.audio_bytes == r2.audio_bytes
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_seed_non_deterministic(self, omni_server, online_client) -> None:
         cfg = {
             "model": omni_server.model,
@@ -213,7 +213,7 @@ class TestOmniVoiceSeed:
 class TestOmniVoiceVoiceCloning:
     """E2E tests for OmniVoice voice cloning functionality."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_ref_audio_only(self, omni_server, online_client) -> None:
         """Test automatic reference transcription with ref_audio only."""
         request_config = {
@@ -246,7 +246,7 @@ class TestOmniVoiceVoiceCloning:
         assert repeated_audio.shape == audio.shape
         np.testing.assert_allclose(repeated_audio, audio, rtol=1e-5, atol=1e-4)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_voice_clone_ref_audio_and_text(self, omni_server, online_client) -> None:
         """Test voice cloning with ref_audio and ref_text (in-context mode)."""
         request_config = {
@@ -266,7 +266,7 @@ class TestOmniVoiceVoiceCloning:
 class TestOmniVoiceInstructions:
     """E2E tests for OmniVoice instructions."""
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_english_instruction(self, omni_server, openai_client) -> None:
         """Test valid english instruction"""
         request_config = {
@@ -279,7 +279,7 @@ class TestOmniVoiceInstructions:
         }
         openai_client.send_audio_speech_request(request_config)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_chinese_instruction(self, omni_server, openai_client) -> None:
         """Test valid chinese instruction"""
         request_config = {
@@ -292,7 +292,7 @@ class TestOmniVoiceInstructions:
         }
         openai_client.send_audio_speech_request(request_config)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_free_form_instruction(self, omni_server, openai_client) -> None:
         """Test free form instruction rejected"""
         request_config = {
@@ -309,7 +309,7 @@ class TestOmniVoiceInstructions:
 
         assert exc_info.value.status_code == 400
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_conflicting_instruction(self, omni_server, openai_client) -> None:
         """Test conflicting instructs from the same category"""
         request_config = {
@@ -328,7 +328,7 @@ class TestOmniVoiceInstructions:
 
         assert exc_info.value.status_code == 400
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_non_existent_instruction_english(self, omni_server, openai_client) -> None:
         """Test non existent instruct rejected"""
         request_config = {
@@ -345,7 +345,7 @@ class TestOmniVoiceInstructions:
 
         assert exc_info.value.status_code == 400
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_non_existent_instruction_chinese(self, omni_server, openai_client) -> None:
         """Test non existent instruct rejected"""
         request_config = {
@@ -362,7 +362,7 @@ class TestOmniVoiceInstructions:
 
         assert exc_info.value.status_code == 400
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_mixed_dialect_accent_instruction(self, omni_server, openai_client) -> None:
         """Test conflicting chinese dialect and english accent is handled"""
         request_config = {
@@ -380,7 +380,7 @@ class TestOmniVoiceInstructions:
         assert exc_info.value.status_code == 400
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 @pytest.mark.parametrize("voice", [_DEFAULT_VOICE_NAME, {"id": _DEFAULT_VOICE_NAME}])
 def test_speech_with_voice_param_accepted(omni_server, online_client, voice) -> None:
@@ -398,7 +398,7 @@ def test_speech_with_voice_param_accepted(omni_server, online_client, voice) -> 
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_voice_request_before_and_after_clone_registration(omni_server, online_client) -> None:
     """The default voice should always be listed and usable, even after
@@ -439,7 +439,7 @@ def test_voice_request_before_and_after_clone_registration(omni_server, online_c
     online_client.send_audio_speech_request(speech_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_registered_default_voice_overrides_placeholder(omni_server, online_client) -> None:
     """When a real voice is uploaded under the default name, it should be

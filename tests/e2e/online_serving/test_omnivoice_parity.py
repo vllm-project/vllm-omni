@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cross-mode full-model parity tests for OmniVoice."""
 
 import os
@@ -74,7 +74,7 @@ def _common_args() -> list[str]:
     ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_request_mode_and_step_execution_b1_parity_without_graph() -> None:
     """B=1 eager request and step modes must produce identical seeded WAV bytes."""
     common_args = _common_args()
@@ -85,7 +85,7 @@ def test_request_mode_and_step_execution_b1_parity_without_graph() -> None:
     assert request_audio == step_audio
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_request_mode_and_step_execution_b1_parity_with_graph() -> None:
     """B=1 Graph request and step modes must produce identical seeded WAV bytes."""
     common_args = _common_args()

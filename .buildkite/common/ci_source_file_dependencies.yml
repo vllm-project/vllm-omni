@@ -1001,6 +1001,62 @@ source_file_dependencies:
     - vllm_omni/outputs/
     - vllm_omni/transformers_utils/configs/higgs_audio_v3.py
 
+  tts_omnivoice_offline_parity_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/offline_inference/test_omnivoice_expansion.py
+    - tests/e2e/online_serving/test_omnivoice_parity.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/omnivoice.yaml
+    - vllm_omni/diffusion/models/omnivoice/
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/omnivoice.py
+    - vllm_omni/inputs/
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/omnivoice/
+    - vllm_omni/outputs/
+    - vllm_omni/transformers_utils/configs/omnivoice.py
+
+  tts_omnivoice_online_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/online_serving/test_omnivoice_expansion.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/omnivoice.yaml
+    - vllm_omni/diffusion/models/omnivoice/
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/
+    - vllm_omni/inputs/
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/omnivoice/
+    - vllm_omni/outputs/
+    - vllm_omni/transformers_utils/configs/omnivoice.py
+
+  tts_step_audio2_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_step_audio2_expansion.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/step_audio2_ci.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/step_audio2/
+    - vllm_omni/model_executor/stage_input_processors/step_audio2.py
+    - vllm_omni/outputs/
+
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *cosyvoice3

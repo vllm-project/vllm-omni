@@ -42,7 +42,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_omnivoice_text_to_audio(omni_runner: OmniRunner) -> None:
     """
     Test OmniVoice text-to-audio generation via offline Omni runner.
@@ -77,7 +77,7 @@ def test_omnivoice_text_to_audio(omni_runner: OmniRunner) -> None:
     print(f"Generated audio: {len(audio_np) / 24000:.2f}s, rms={rms:.4f}")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_omnivoice_ref_audio_without_ref_text(omni_runner: OmniRunner, tmp_path) -> None:
     """Reference audio without a transcript is transcribed before cloning."""
     ref_audio_path = get_asset_path("qwen3_tts/clone_2.wav")
