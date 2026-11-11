@@ -204,6 +204,9 @@ def test_profiler_endpoints_detect_typed_stage_config():
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
+    ("GET", "/api/v1/models"),
+    ("WEBSOCKET", "/api/v1/session"),
+    ("WEBSOCKET", "/api/v1/session/{model_id:path}"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/chat/completions/batch"),
     ("POST", "/v1/audio/speech"),
