@@ -236,6 +236,8 @@ def run_step_audio2(args) -> None:
     # For TTS/S2ST, use continue_final_message so <tts_start> in the
     # assistant turn is not followed by <|im_end|>.
     extra_body: dict = {"sampling_params_list": sampling_params_list}
+    if args.query_type == "audio_to_text":
+        extra_body["modalities"] = ["text"]
     if args.query_type in ("text_to_audio", "audio_to_audio"):
         extra_body["continue_final_message"] = True
         extra_body["add_generation_prompt"] = False

@@ -9,6 +9,7 @@ set -euo pipefail
 
 QUERY_TYPE="${1:-audio_to_text}"
 API_BASE="${API_BASE:-http://localhost:8092}"
+MODALITIES=null
 
 # Validate query type
 if [[ ! "$QUERY_TYPE" =~ ^(audio_to_text|text_to_audio|audio_to_audio)$ ]]; then
@@ -47,6 +48,7 @@ token2wav_sampling_params='{
 # Build request based on query type
 case "$QUERY_TYPE" in
   audio_to_text)
+    MODALITIES='["text"]'
     system_content='[{"type": "text", "text": "You are a speech recognition assistant. Transcribe the audio accurately."}]'
     user_content='[
       {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
@@ -111,6 +113,7 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
     -d @- <<EOF
 {
   "model": "stepfun-ai/Step-Audio-2-mini",
+  "modalities": $MODALITIES,
   "sampling_params_list": $sampling_params_list,
   "messages": [
     {
