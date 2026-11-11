@@ -696,8 +696,8 @@ def test_equal_step_requests_publish_their_own_scheduler_noise(monkeypatch):
     pipeline = _recording_step_pipeline(monkeypatch, records)
     low = _scheduled_state("req-low", 1, 4, 1.0)
     high = _scheduled_state("req-high", 1, 4, 2.0)
-    low.scheduler.sigmas = [1.0, 0.2, 0.0]
-    high.scheduler.sigmas = [1.0, 0.8, 0.0]
+    low.scheduler.sigmas = torch.tensor([1.0, 0.2, 0.0], dtype=torch.float64)
+    high.scheduler.sigmas = torch.tensor([1.0, 0.8, 0.0], dtype=torch.float64)
     windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
 
     def capture(images, first_step):
@@ -721,6 +721,9 @@ def test_equal_step_requests_publish_their_own_scheduler_noise(monkeypatch):
 class _FakeFlowScheduler:
     order = 1
     config = SimpleNamespace(num_train_timesteps=1000)
+
+    def __init__(self) -> None:
+        self.sigmas = torch.linspace(1.0, 0.0, 9)
 
     def step(self, model_output, timestep, sample, return_dict=False):
         del model_output, timestep, return_dict
@@ -812,7 +815,7 @@ def test_request_loop_publishes_scheduler_noise_independently_of_timestep(monkey
     events: list = []
     published: list = []
     pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
-    pipe.scheduler.sigmas = [1.0, 0.8, 0.2, 0.0]
+    pipe.scheduler.sigmas = torch.tensor([1.0, 0.8, 0.2, 0.0], dtype=torch.float64)
     windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
 
     def capture(images, first_step):
@@ -852,7 +855,7 @@ def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monk
     assert events == []
 
 
-# Sigmas that cannot be normalized into [0, 1]: a NaN first sigma, and a later sigma above or below it.
+# Sigmas outside [0, 1]: a NaN first sigma, and a later sigma above or below the range.
 _UNUSABLE_SIGMAS = [[float("nan"), 0.5, 0.25, 0.0], [1.0, 1.5, 0.25, 0.0], [1.0, -0.5, 0.25, 0.0]]
 
 
@@ -860,7 +863,7 @@ _UNUSABLE_SIGMAS = [[float("nan"), 0.5, 0.25, 0.0], [1.0, 1.5, 0.25, 0.0], [1.0,
 def test_request_loop_rejects_unusable_scheduler_sigmas_before_any_forward(monkeypatch, sigmas):
     events: list = []
     pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
-    pipe.scheduler.sigmas = sigmas
+    pipe.scheduler.sigmas = torch.tensor(sigmas)
     windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
 
     with (
@@ -896,7 +899,7 @@ def test_prepare_encode_rejects_unusable_scheduler_sigmas_before_latents(monkeyp
         "batch_gen_image_info": [image_info],
         "generator": None,
     }
-    pipeline.scheduler = SimpleNamespace(sigmas=[1.0, 1.5, 0.25, 0.0])
+    pipeline.scheduler = SimpleNamespace(sigmas=torch.tensor([1.0, 1.5, 0.25, 0.0]))
     # prepare_encode reads the latent channel count before it calls prepare_latents.
     pipeline.config = hy3_transformer_module.HunyuanImage3Config(
         cfg_distilled=False, use_meanflow=False, vae={"latent_channels": 1}
@@ -952,18 +955,24 @@ def _capture_hy3_log(caplog, monkeypatch):
     monkeypatch.setattr(hy3_module.logger, "propagate", False)
 
 
+_COVERS_ONE = parse_attention_sigma_schedule([{"low": 0.5, "high": 1.0, "profile": "approx"}])
+_BELOW_ONE = parse_attention_sigma_schedule([{"low": 0.0, "high": 0.5, "profile": "approx"}])
+
+
 @pytest.mark.parametrize(
-    ("default", "logged"),
+    ("default", "sigma", "logged"),
     [
-        ((AttentionScheduleRange(start=0, end=2, profile="approx"),), True),
-        ((AttentionScheduleRange(start=2, end=None, profile="approx"),), False),
-        ((), False),
+        ((AttentionScheduleRange(start=0, end=2, profile="approx"),), (), True),
+        ((AttentionScheduleRange(start=2, end=None, profile="approx"),), (), False),
+        ((), _COVERS_ONE, True),
+        ((), _BELOW_ONE, False),
+        ((), (), False),
     ],
-    ids=["covers-step-0", "starts-later", "empty"],
+    ids=["covers-step-0", "starts-later", "window-covers-sigma-1", "windows-below-1", "empty"],
 )
-def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, caplog, monkeypatch):
+def test_startup_notes_a_default_schedule_that_covers_step_0(default, sigma, logged, caplog, monkeypatch):
     _capture_hy3_log(caplog, monkeypatch)
-    schedule = SimpleNamespace(default=default)
+    schedule = SimpleNamespace(default=default, sigma=sigma)
     with caplog.at_level("INFO", logger=hy3_module.logger.name):
         hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
         hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=None))
@@ -975,7 +984,7 @@ def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, ca
 def test_startup_step_0_note_logs_only_on_rank_0(caplog, monkeypatch):
     _capture_hy3_log(caplog, monkeypatch)
     monkeypatch.setattr(hy3_module, "_is_rank_zero", lambda: False)
-    schedule = SimpleNamespace(default=(AttentionScheduleRange(start=0, end=2, profile="approx"),))
+    schedule = SimpleNamespace(default=(AttentionScheduleRange(start=0, end=2, profile="approx"),), sigma=())
     with caplog.at_level("INFO", logger=hy3_module.logger.name):
         hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
     assert "step-0 prompt K/V" not in caplog.text

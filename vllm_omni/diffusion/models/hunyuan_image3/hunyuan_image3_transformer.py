@@ -3312,7 +3312,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
         scheduled_total = begin_scheduled_denoise(len(timesteps))
         # Bound sigma windows read these scheduler sigmas at every step; reject unusable ones here too.
-        check_scheduler_sigmas(self.scheduler, len(timesteps))
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         # Prepare latent variables
         latents = self.prepare_latents(

@@ -717,7 +717,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
-        check_scheduler_sigmas(self.scheduler, len(timesteps))
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         # MoE boundary: only the two-expert checkpoints (Wan2.2 A14B) have a
         # transformer_2 to switch to. For single-expert VACE (e.g. Wan2.1) this

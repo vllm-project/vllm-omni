@@ -38,7 +38,12 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context,
 )
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    FASTWAN_DMD_SCHEDULER_SHIFT,
+    FASTWAN_DMD_TIMESTEPS,
+    Wan22Pipeline,
+    build_wan_scheduler,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -87,6 +92,8 @@ class _StubVae(nn.Module):
 class _StubScheduler:
     def __init__(self, timesteps: list[int]) -> None:
         self.timesteps = torch.tensor(timesteps, dtype=torch.int64)
+        # Pipelines read the sigma ladder after set_timesteps.
+        self.sigmas = torch.linspace(1.0, 0.0, len(timesteps) + 1)
         self.config = SimpleNamespace(num_train_timesteps=1000)
         self.set_timesteps_calls: list[tuple[int, torch.device, float | None]] = []
 
@@ -551,7 +558,7 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
 @pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
 def test_diffuse_clears_the_scheduled_step_on_any_exit(fail, kind) -> None:
     pipeline = _make_pipeline()
-    pipeline.scheduler.sigmas = [1.0, 0.5, 0.25, 0.0]  # type: ignore[attr-defined]
+    pipeline.scheduler.sigmas = torch.tensor([1.0, 0.5, 0.25, 0.0])
     latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
     seen: list[tuple[int | None, float | None, int | None]] = []
     sigmas_seen: list[float | None] = []
@@ -905,16 +912,16 @@ class _StubDMDScheduler:
         self.add_noise_calls.append((float(clean_sample.mean()), float(noise.mean()), float(timestep)))
         return clean_sample + 10.0
 
+    def sigma_for_timestep(self, timestep, *, device=None):
+        # Off t / 1000 on purpose, so the test sees that the pipeline publishes this value.
+        return torch.tensor(float(timestep) / 1000 - 0.01, device=device)
+
 
 @pytest.mark.parametrize("scope", ["no-context", "unbound", "disabled", "step-only", "sigma"])
 def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scope) -> None:
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()
-    # Only sigma scheduling needs a training-time scale. All other paths must
-    # publish no sigma with this scheduler, which deliberately has no config.
-    if scope == "sigma":
-        pipeline.scheduler.config = SimpleNamespace(num_train_timesteps=1000)  # type: ignore[attr-defined]
     latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
     timesteps = torch.tensor([1000.0, 757.0, 522.0])
 
@@ -950,8 +957,10 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scop
             attention_kwargs={},
             generator=torch.Generator(device="cpu").manual_seed(1),
         )
-    expected_sigmas: list[float | None] = [1.0, 0.757, 0.522] if scope == "sigma" else [None] * 3
-    assert published == expected_sigmas
+    if scope == "sigma":
+        assert published == pytest.approx([0.99, 0.747, 0.512])
+    else:
+        assert published == [None] * 3
 
     assert pipeline.scheduler.predict_clean_calls == [
         (1.0, 0.0, 1000.0),
@@ -963,6 +972,46 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scop
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def test_diffuse_dmd_publishes_the_grid_sigma_each_real_scheduler_step_uses(monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = build_wan_scheduler("euler", FASTWAN_DMD_SCHEDULER_SHIFT)
+    used: dict[float, float] = {}
+    sigma_for_timestep = pipeline.scheduler.sigma_for_timestep
+
+    def record(timestep, **kwargs):
+        sigma = sigma_for_timestep(timestep, **kwargs)
+        used[float(timestep)] = float(sigma)
+        return sigma
+
+    pipeline.scheduler.sigma_for_timestep = record  # type: ignore[method-assign]
+    latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
+    published = []
+
+    def predict(**kwargs):
+        published.append(get_forward_context().denoise_sigma)
+        return torch.ones_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = predict  # type: ignore[method-assign]
+    with set_forward_context(), bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),)):
+        pipeline.diffuse(
+            latents=latents,
+            timesteps=torch.tensor(FASTWAN_DMD_TIMESTEPS),
+            prompt_embeds=torch.zeros(1, 8),
+            negative_prompt_embeds=None,
+            guidance_low=1.0,
+            guidance_high=1.0,
+            boundary_timestep=None,
+            dtype=torch.float32,
+            attention_kwargs={},
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+    assert published == [used[t] for t in FASTWAN_DMD_TIMESTEPS]
+    # The grid sigma stays within 3e-4 of t / 1000, the value the earlier version published.
+    for t, sigma in zip(FASTWAN_DMD_TIMESTEPS, published):
+        assert abs(sigma - t / 1000) < 3e-4
 
 
 def _denoise_progress():

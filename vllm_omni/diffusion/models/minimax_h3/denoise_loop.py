@@ -50,7 +50,7 @@ def minimax_h3_publish_denoise_progress(
     video sigma selects the profile when sigma windows are bound.
     """
     set_forward_context_denoise_step_idx(step)
-    # H3's shifted rectified-flow video sigma is already normalized noise; only bound sigma windows read it.
+    # H3 publishes its shifted rectified-flow video sigma; only bound sigma windows read it.
     set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)

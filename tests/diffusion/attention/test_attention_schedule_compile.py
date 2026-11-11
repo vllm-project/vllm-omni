@@ -264,7 +264,7 @@ class _ToyPipeline(DenoiseProgressMixin):
                     step_idx,
                     timestep,
                     total_steps=total,
-                    normalized_sigma=None if sigmas is None else sigmas[step_idx],
+                    sigma=None if sigmas is None else sigmas[step_idx],
                 )
                 trace_start = len(_TRACE)
                 before = list(self.counter.executions)

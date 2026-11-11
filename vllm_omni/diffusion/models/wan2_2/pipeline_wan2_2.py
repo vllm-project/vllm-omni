@@ -738,11 +738,10 @@ class Wan22Pipeline(
                     step_idx,
                     t,
                     total_steps=total_steps,
-                    # DMD bypasses set_timesteps, and its fixed timesteps are not on the
-                    # scheduler's sigma grid. Publish t / num_train_timesteps; the grid sigma
-                    # the step uses differs from it by less than 3e-4.
-                    normalized_sigma=(
-                        float(t) / self.scheduler.config.num_train_timesteps
+                    # DMD bypasses set_timesteps and steps its fixed timesteps with the grid
+                    # sigma nearest to each one, so publish that sigma.
+                    sigma=(
+                        float(self.scheduler.sigma_for_timestep(t, device="cpu"))
                         if self.is_dmd and sigma_scheduled
                         else None
                     ),
@@ -1413,7 +1412,7 @@ class Wan22Pipeline(
                 self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
             # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
-            check_scheduler_sigmas(self.scheduler, len(timesteps))
+            check_scheduler_sigmas(self.scheduler.sigmas)
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:

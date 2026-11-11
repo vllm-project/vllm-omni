@@ -50,7 +50,7 @@ class _SigmaRequestPipeline(DenoiseProgressMixin):
     def forward(self, batch):
         self.selected.append(("encode", self.layer.effective_attention()[0]))
         for i, sigma in enumerate([1.0, 0.3, 0.2]):
-            self.record_denoise_step(i, normalized_sigma=sigma, total_steps=3)
+            self.record_denoise_step(i, sigma=sigma, total_steps=3)
             self.selected.append((i, self.layer.effective_attention()[0]))
         self.record_denoise_step(None)
         self.selected.append(("decode", self.layer.effective_attention()[0]))

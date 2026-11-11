@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Immutable step and normalized-noise schedules, independent of torch backends."""
+"""Immutable step and sigma schedules, independent of torch backends."""
 
-import math
 import numbers
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
@@ -247,6 +246,7 @@ _SIGMA_ROUNDING_TOLERANCE = 1e-6
 
 
 def _validate_sigma(value: float, name: str) -> float:
+    """Check one window bound is a real number in [0, 1] and return it as a JSON-like number."""
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(f"attention_sigma_schedule {name} must be a number, got {value!r}")
     # Compare without float(): an int too large for a float would raise OverflowError, not a client error.
@@ -317,29 +317,27 @@ def resolve_attention_sigma_schedule(
     *,
     profiles: Collection[str],
 ) -> AttentionSigmaSchedule:
+    """Parse the request's windows, or the default when the request sends None, and check their profiles."""
     effective = parse_attention_sigma_schedule(default_schedule if request_schedule is None else request_schedule)
     schedule = () if effective is None else effective
     validate_attention_sigma_schedule(schedule, profiles=profiles)
     return schedule
 
 
-def normalized_sigma(current: float, reference: float = 1.0) -> float:
-    """Normalize scheduler noise; flow-matching sigma already uses reference=1."""
-    if isinstance(current, bool) or isinstance(reference, bool):
-        raise TypeError("normalized sigma inputs must be numbers")
-    current, reference = float(current), float(reference)
-    if not math.isfinite(reference) or reference <= 0:
-        raise ValueError("normalized sigma reference must be finite and positive")
-    value = current / reference
+def checked_sigma(sigma: float) -> float:
+    """Return a scheduler sigma in [0, 1], clamping the float32 rounding of the end points."""
+    if isinstance(sigma, bool):
+        raise TypeError("scheduler sigma must be a number")
+    value = float(sigma)
     if not -_SIGMA_ROUNDING_TOLERANCE <= value <= 1.0 + _SIGMA_ROUNDING_TOLERANCE:
-        raise ValueError(f"normalized scheduler sigma must be in [0, 1], got {value!r} ({current!r} / {reference!r})")
+        raise ValueError(f"scheduler sigma must be in [0, 1], got {value!r}")
     return min(max(value, 0.0), 1.0)
 
 
 def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: float) -> str | None:
-    """Return the selected name, or None when the normalized sigma is in a gap.
+    """Return the selected name, or None when the sigma is in a gap.
 
-    The windows were validated at admission; ``sigma`` comes from normalized_sigma.
+    The windows were validated at admission; ``sigma`` comes from checked_sigma.
     """
     for entry in schedule:
         if entry.low <= float(sigma) < entry.high or entry.high == sigma == 1.0:

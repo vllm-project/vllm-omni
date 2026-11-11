@@ -25,7 +25,7 @@ def test_sigma_schedule_inherits_disables_and_replaces():
     assert resolve_attention_sigma_schedule(replaced, default, profiles={"sparse"})[0].low == 0.7
 
 
-def test_sigma_selection_uses_normalized_noise_and_gaps():
+def test_sigma_selection_uses_scheduler_noise_and_gaps():
     schedule = parse_attention_sigma_schedule([{"low": 0.0, "high": 0.3, "profile": "sparse"}])
     assert select_attention_profile_by_sigma(schedule, 0.0) == "sparse"
     assert select_attention_profile_by_sigma(schedule, 0.3) is None

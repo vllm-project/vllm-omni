@@ -889,8 +889,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
             "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
-            "[start, end), with null end meaning the actual sequence end. Sigma windows use normalized "
-            "[low, high) noise in [0, 1]; a high of 1 includes 1. Non-empty default and sigma lists "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use scheduler "
+            "sigma in [0, 1] as [low, high); a high of 1 includes 1. Non-empty default and sigma lists "
             "are mutually exclusive. "
             'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
             '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'. Sigma example: '

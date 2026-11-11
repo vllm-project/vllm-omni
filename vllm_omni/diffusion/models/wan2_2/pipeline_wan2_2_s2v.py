@@ -1414,7 +1414,7 @@ class Wan22S2VPipeline(
                 timesteps = self.scheduler.timesteps
                 self._num_timesteps = len(timesteps)
                 # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
-                check_scheduler_sigmas(self.scheduler, len(timesteps))
+                check_scheduler_sigmas(self.scheduler.sigmas)
 
                 # -- Slice audio for this clip --
                 left_idx = r * infer_frames

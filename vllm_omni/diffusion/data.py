@@ -2529,7 +2529,7 @@ class AttentionConfig:
 
 @dataclass
 class AttentionScheduleConfig:
-    """Startup-owned profiles with default integer-step ranges or normalized-noise windows.
+    """Startup-owned profiles with default integer-step ranges or sigma windows.
 
     Profiles resolve their own roles, without merging the baseline or its
     environment fallback. Candidate construction and hardware validation happen

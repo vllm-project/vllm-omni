@@ -652,7 +652,7 @@ class Wan22I2VPipeline(
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
-        check_scheduler_sigmas(self.scheduler, len(timesteps))
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         boundary_timestep = None
         if boundary_ratio is not None:

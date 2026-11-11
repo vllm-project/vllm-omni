@@ -18,7 +18,7 @@ from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
     AttentionSigmaSchedule,
     InvalidAttentionScheduleError,
-    normalized_sigma,
+    checked_sigma,
     require_attention_schedule_fits,
     select_attention_profile,
     select_attention_profile_by_sigma,
@@ -26,8 +26,6 @@ from vllm_omni.diffusion.attention.schedule import (
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
-    import torch
-
     from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
 
 
@@ -77,7 +75,7 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
-    # Normalized scheduler noise in [0, 1], published only while sigma windows are bound.
+    # The step's scheduler sigma in [0, 1], published only while sigma windows are bound.
     denoise_sigma: float | None = None
     total_denoise_steps: int | None = None
     # Bound request schedules. None means unbound. () disables. A non-empty tuple
@@ -514,16 +512,16 @@ def paged_kv_prefill(sequence_id: int, num_tokens: int):
 
 
 def set_forward_context_denoise_sigma(sigma: float | None) -> None:
-    """Publish normalized scheduler noise in [0, 1] for bound sigma windows.
+    """Publish the scheduler sigma in [0, 1] for bound sigma windows.
 
     Without bound windows nothing reads the noise level, so the value is neither checked nor stored.
     """
     if _forward_context is not None and _forward_context.attention_sigma_schedule:
-        _forward_context.denoise_sigma = None if sigma is None else normalized_sigma(sigma)
+        _forward_context.denoise_sigma = None if sigma is None else checked_sigma(sigma)
 
 
-def check_scheduler_sigmas(scheduler: object, num_steps: int, *, sigma_scheduled: bool | None = None) -> None:
-    """Normalize the sigma of each of the first ``num_steps`` steps once, right after set_timesteps.
+def check_scheduler_sigmas(sigmas: torch.Tensor, *, sigma_scheduled: bool | None = None) -> None:
+    """Check every sigma of a scheduler's ladder once, right after set_timesteps.
 
     Sigma windows read these sigmas at every step. Checking them first raises the client error the
     step would raise before any forward: in request mode it fails this request's batch, whose
@@ -533,14 +531,43 @@ def check_scheduler_sigmas(scheduler: object, num_steps: int, *, sigma_scheduled
     """
     if sigma_scheduled is None:
         sigma_scheduled = _forward_context is not None and bool(_forward_context.attention_sigma_schedule)
-    sigmas = getattr(scheduler, "sigmas", None)
-    if not sigma_scheduled or sigmas is None or num_steps <= 0 or len(sigmas) == 0:
+    if not sigma_scheduled:
         return
-    # One host copy instead of a device sync per step; a step past the ladder is not checked, as in _denoise_sigma.
-    head = sigmas[:num_steps]
-    values = head.tolist() if hasattr(head, "tolist") else list(head)
-    for value in values:
-        DenoiseProgressMixin._normalize_scheduler_sigma(float(value), float(values[0]))
+    # One host copy of the whole ladder instead of a device sync per step.
+    for value in _require_sigma_tensor(sigmas).tolist():
+        _checked_scheduler_sigma(value)
+
+
+def denoise_sigma(step_idx: int, sigmas: torch.Tensor) -> float | None:
+    """The sigma a scheduler uses at ``step_idx``, or None past the end of its ladder.
+
+    A step without a sigma publishes None, and the attention layer rejects it.
+    """
+    sigmas = _require_sigma_tensor(sigmas)
+    if step_idx >= len(sigmas):
+        return None
+    # Pipelines raise this before their first forward through check_scheduler_sigmas; this repeats
+    # the check for any other caller.
+    return _checked_scheduler_sigma(float(sigmas[step_idx]))
+
+
+def _require_sigma_tensor(sigmas: torch.Tensor) -> torch.Tensor:
+    # Every scheduler a sigma-publishing pipeline uses keeps its sigmas in a 1-D tensor.
+    if not isinstance(sigmas, torch.Tensor) or sigmas.dim() != 1:
+        raise TypeError(f"scheduler sigmas must be a 1-D torch.Tensor, got {type(sigmas).__name__}")
+    return sigmas
+
+
+def _checked_scheduler_sigma(sigma: float) -> float:
+    try:
+        return checked_sigma(sigma)
+    except ValueError as exc:
+        # Wan2.2 T2V, TI2V and I2V build these sigmas from the request's flow_shift, so sigmas
+        # outside [0, 1] are a client error.
+        raise InvalidAttentionScheduleError(
+            "attention sigma windows cannot select a profile from this request's scheduler sigmas; "
+            f"check flow_shift: {exc}"
+        ) from exc
 
 
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
@@ -572,8 +599,13 @@ class DenoiseProgressMixin:
         scheduler=None,
         normalized_timestep: float | None = None,
         total_steps: int | None = None,
-        normalized_sigma: float | None = None,
+        sigma: float | None = None,
     ) -> None:
+        """Publish one denoise step's progress.
+
+        ``sigma`` is the noise level the step uses; without it, sigma windows read
+        ``scheduler.sigmas[step_idx]``.
+        """
         set_forward_context_denoise_step_idx(step_idx)
         if _forward_context is not None:
             _forward_context.total_denoise_steps = total_steps
@@ -582,7 +614,12 @@ class DenoiseProgressMixin:
         scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         if _forward_context.attention_sigma_schedule:
             # Only sigma windows read the noise level, so unscheduled runs never compute it.
-            _forward_context.denoise_sigma = self._denoise_sigma(step_idx, scheduler, normalized_sigma)
+            if step_idx is None:
+                _forward_context.denoise_sigma = None
+            elif sigma is not None:
+                _forward_context.denoise_sigma = checked_sigma(sigma)
+            else:
+                _forward_context.denoise_sigma = denoise_sigma(step_idx, scheduler.sigmas)
         if normalized_timestep is not None:
             _forward_context.denoise_timestep = float(normalized_timestep)
             return
@@ -590,36 +627,6 @@ class DenoiseProgressMixin:
             return
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
         _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
-
-    @staticmethod
-    def _denoise_sigma(step_idx: int | None, scheduler: object, sigma: float | None) -> float | None:
-        """The caller's normalized sigma, else ``scheduler.sigmas[step_idx]`` relative to the first sigma.
-
-        A raw model timestep is never read as noise; without either source the sigma stays None and
-        the attention layer rejects the step.
-        """
-        if step_idx is None:
-            return None
-        if sigma is not None:
-            return normalized_sigma(sigma)
-        sigmas = getattr(scheduler, "sigmas", None)
-        if sigmas is None or step_idx >= len(sigmas):
-            return None
-        # Pipelines raise this before their first forward through check_scheduler_sigmas; this repeats
-        # the check for any other caller.
-        return DenoiseProgressMixin._normalize_scheduler_sigma(float(sigmas[step_idx]), float(sigmas[0]))
-
-    @staticmethod
-    def _normalize_scheduler_sigma(current: float, reference: float) -> float:
-        try:
-            return normalized_sigma(current, reference)
-        except ValueError as exc:
-            # Wan2.2 T2V, TI2V and I2V build these sigmas from the request's flow_shift, so sigmas that
-            # cannot be normalized into [0, 1] are a client error.
-            raise InvalidAttentionScheduleError(
-                "attention sigma windows cannot select a profile from this request's scheduler sigmas; "
-                f"check flow_shift: {exc}"
-            ) from exc
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
