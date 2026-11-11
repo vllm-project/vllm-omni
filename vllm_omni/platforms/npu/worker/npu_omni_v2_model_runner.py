@@ -249,6 +249,10 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 from vllm_omni.platforms.npu.attention import static_shape_decode
 
                 static_shape_decode.install_into_ascend_backend()
+                logger.info(
+                    "[minicpmo] v2 static-shape decode backend installed (arch=%s)",
+                    architectures,
+                )
             except Exception:
                 logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
         super().__init__(*args, **kwargs)

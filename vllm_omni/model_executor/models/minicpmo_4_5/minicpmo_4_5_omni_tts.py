@@ -2034,12 +2034,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         if spec_config is None:
             return talker_sampler, None
-        if self._mrv2_turn_drafts():
+        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+        if self._mrv2_turn_drafts(session_mode):
             # DSpark turn-session draft verification: verification reuses the
             # stock sampler, whose penalty stage is the codec window.
             return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
         if self._k_step_frames > 0:
-            session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
             if session_mode == "duplex":
                 # Duplex with a stage-1 speculative_config is how the K-step count
                 # reaches the Talker (K > 0): the frame loop drives draft booking
@@ -2051,6 +2051,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # booking lives in the duplex runner), so its draft codes would be
             # sampled without verification -- fail closed like any other draft
             # method.
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 Talker (model_runner: v2) K-step frames require "
+                "session_mode: duplex; remove the stage-1 speculative_config "
+                "from turn sessions"
+            )
         # Any other stage-1 draft method would verify draft rows without the
         # Talker's codec-window penalty and forced EOS (the same hazard
         # _check_v1_draft_method guards for the V1 runner): fail closed.
@@ -2060,14 +2065,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "duplex sessions without the K-step frame loop"
         )
 
-    def _mrv2_turn_drafts(self) -> bool:
+    def _mrv2_turn_drafts(self, session_mode: str | None = None) -> bool:
         """Whether this Talker can verify draft codes: turn sessions without the K-step loop.
 
         ``session_mode`` is the stage model config's (set from the deploy for
         every stage), the same field the MiniCPM-o model picks its duplex path
-        from.
+        from. Callers that already read it may pass it in to avoid a second
+        attribute lookup.
         """
-        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+        if session_mode is None:
+            session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
         return session_mode != "duplex" and self._k_step_frames == 0
 
     def get_language_model(self) -> Any:
