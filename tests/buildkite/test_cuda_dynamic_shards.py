@@ -29,11 +29,11 @@ import upload_pipeline as upload_pipeline_mod  # noqa: E402
 from merge_shard_timings import (  # noqa: E402
     HISTORY_LOOKUP_BUDGET_SECONDS,
     MAX_CONSECUTIVE_MISSES,
-    build_step_observations,
+    build_step_details,
+    details_from_download,
     list_recent_build_ids,
+    merge_build_details,
     merge_build_observations,
-    merge_step_observations,
-    observations_from_download,
     percentile,
     prepare_profile_from_history,
     write_merged_profile,
@@ -255,7 +255,7 @@ def test_different_jobs_take_the_max_per_file(tmp_path: Path) -> None:
         json.dumps({"job_id": "b", "label": "Simple Test", "file_seconds": {"tests/a_test.py": 9}}),
         encoding="utf-8",
     )
-    assert build_step_observations([a, b]) == {"Simple Test": {"tests/a_test.py": 9}}
+    assert build_step_details([a, b]) == {"Simple Test": ({"tests/a_test.py": 9}, "")}
 
 
 def test_hash_shards_sum_slices_and_retries_keep_the_max(tmp_path: Path) -> None:
@@ -278,9 +278,9 @@ def test_hash_shards_sum_slices_and_retries_keep_the_max(tmp_path: Path) -> None
     _job_timing(
         tmp_path / "s1.json", job_id="s1", label="Simple Test", file_seconds=files, parallel_job=1, queue="l4-k8s"
     )
-    observed = build_step_observations(sorted(tmp_path.glob("*.json")))
-    assert observed["Simple Test"] == {name: 1000 for name in files}
-    assert plan_shard_count(list(observed["Simple Test"].values()), budget_seconds=1500) == 2
+    observed, _queue = build_step_details(sorted(tmp_path.glob("*.json")))["Simple Test"]
+    assert observed == {name: 1000 for name in files}
+    assert plan_shard_count(list(observed.values()), budget_seconds=1500) == 2
 
 
 def test_two_invocations_in_one_job_keep_both_measurements(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,8 +298,7 @@ def test_two_invocations_in_one_job_keep_both_measurements(tmp_path: Path, monke
 
     written = sorted((tmp_path / "timings" / "jobs").glob("*.json"))
     assert [path.name for path in written] == ["job-1-111.json", "job-1-222.json"]
-    observed = build_step_observations(written)
-    assert observed == {"Entrypoints Test": {"tests/entrypoints/test_async_omni.py": 7}}
+    assert build_step_details(written) == {"Entrypoints Test": ({"tests/entrypoints/test_async_omni.py": 7}, "")}
 
 
 def test_profile_uses_raw_job_files_not_a_previous_merged_profile(tmp_path: Path) -> None:
@@ -324,11 +323,11 @@ def test_profile_uses_raw_job_files_not_a_previous_merged_profile(tmp_path: Path
 
     build(tmp_path / "b1", 10, 100)
     build(tmp_path / "b2", 30, 100)
-    per_build = [observations_from_download(tmp_path / "b1"), observations_from_download(tmp_path / "b2")]
+    per_build = [details_from_download(tmp_path / "b1"), details_from_download(tmp_path / "b2")]
     assert None not in per_build
-    merged = merge_step_observations([item for item in per_build if item is not None])
-    assert merged["Simple Test"]["tests/a_test.py"] == round(percentile([10, 30], 0.8), 3)
-    assert merged["Simple Test"]["tests/a_test.py"] != 100
+    steps, _queues = merge_build_details([item for item in per_build if item is not None])
+    assert steps["Simple Test"]["tests/a_test.py"] == round(percentile([10, 30], 0.8), 3)
+    assert steps["Simple Test"]["tests/a_test.py"] != 100
 
 
 def test_public_history_keeps_only_successful_builds(monkeypatch: pytest.MonkeyPatch) -> None:

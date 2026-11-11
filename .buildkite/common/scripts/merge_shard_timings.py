@@ -174,33 +174,12 @@ def build_step_details(job_files: list[Path]) -> dict[str, tuple[dict[str, float
     return details
 
 
-def build_step_observations(job_files: list[Path]) -> dict[str, dict[str, float]]:
-    """One build's per-step file seconds from raw job files."""
-    return {label: files for label, (files, _queue) in build_step_details(job_files).items()}
-
-
 def merge_build_observations(per_build: list[dict[str, float]], *, q: float = 0.8) -> dict[str, float]:
     by_file: dict[str, list[float]] = defaultdict(list)
     for observed in per_build:
         for file, seconds in observed.items():
             by_file[file].append(float(seconds))
     return {file: round(percentile(values, q), 3) for file, values in sorted(by_file.items())}
-
-
-def merge_step_observations(
-    per_build: list[dict[str, dict[str, float]]],
-    *,
-    q: float = 0.8,
-) -> dict[str, dict[str, float]]:
-    by_step: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    for observed in per_build:
-        for label, files in observed.items():
-            for file, seconds in files.items():
-                by_step[label][file].append(float(seconds))
-    return {
-        label: {file: round(percentile(values, q), 3) for file, values in sorted(files.items())}
-        for label, files in sorted(by_step.items())
-    }
 
 
 def merge_build_details(
@@ -406,15 +385,6 @@ def download_build_timings(build_id: str, dest: Path, *, timeout: int = 180) -> 
 def _job_files(root: Path) -> list[Path]:
     jobs_dir = root / "timings" / "jobs"
     return sorted(jobs_dir.glob("*.json")) if jobs_dir.is_dir() else []
-
-
-def observations_from_download(root: Path) -> dict[str, dict[str, float]] | None:
-    """Read one build's raw job files. A previous ``merged.json`` is not an observation."""
-    job_files = _job_files(root)
-    if not job_files:
-        return None
-    observed = build_step_observations(job_files)
-    return observed or None
 
 
 def details_from_download(root: Path) -> dict[str, tuple[dict[str, float], str]] | None:
