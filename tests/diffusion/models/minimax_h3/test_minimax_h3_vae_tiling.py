@@ -274,3 +274,16 @@ def test_control_encode_restores_state_after_error(parallel_size):
     assert seen["parallel_tiling"] is False
     assert state == saved_state
     assert vae.model.parallel_tiling is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_opt_in_preserves_real_group_for_request_local_planning(enabled):
+    vae, state, seen = _dispatch_vae(4)
+    vae.enable_temporal_scheduling = enabled
+    vae._temporal_scheduling_available = True
+    original_state = dict(state)
+    for h, w in [(16, 16), (48, 84), (24, 32), (16, 16)]:
+        vae.decode_latent(_latent(h, w))
+        assert seen["sp_size"] == (1 if not enabled and h == w == 16 else 4)
+        assert state == original_state
+        assert vae.model.parallel_tiling is True
