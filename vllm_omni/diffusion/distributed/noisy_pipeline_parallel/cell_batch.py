@@ -129,3 +129,116 @@ def _single_kv_view(ctx_list: Any) -> Any:
     if isinstance(ctx_list, list):
         return ctx_list[0] if ctx_list else None
     return ctx_list
+
+
+# Pack one compatible CellComputeBatch into model tensors and split-ready outputs.
+CellBatchPackFn = Callable[..., Mapping[str, torch.Tensor]]
+
+
+class BatchedCellAdapter:
+    """Framework multi-member CellAdapter: organize Batches, delegate pack to the model.
+
+    Members are per-request adapters (``run_one`` for B=1). ``pack_batch`` is the
+    model backend that packs a ``CellComputeBatch`` (B>1) and returns batch-axis
+    tensors for ``split_outputs``.
+    """
+
+    def __init__(
+        self,
+        members: Mapping[str, Any],
+        *,
+        max_batch_size: int,
+        compatibility_of: Callable[[str, Cell], Hashable],
+        pack_batch: CellBatchPackFn,
+    ) -> None:
+        if not members:
+            raise ValueError("BatchedCellAdapter requires at least one member")
+        if max_batch_size < 1:
+            raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
+        self.members = dict(members)
+        self.max_batch_size = int(max_batch_size)
+        self._compatibility_of = compatibility_of
+        self._pack_batch = pack_batch
+        first = next(iter(self.members.values()))
+        self.device = getattr(first, "device", None)
+        self.dtype = getattr(first, "dtype", None)
+        self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        self._last_meta: tuple[str, int, int] | None = None
+        self.last_batches: list[CellComputeBatch] = []
+        self.block_call_members: list[int] = []
+
+    def stash_activation(
+        self,
+        payload: dict,
+        *,
+        handles: list | None = None,
+        meta: tuple[str, int, int] | None = None,
+    ) -> None:
+        del handles
+        tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
+        key = meta or self._last_meta
+        if key is None:
+            raise RuntimeError("stash_activation needs meta")
+        self._stash[key] = tensors
+
+    def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
+        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
+
+    def pack_activation(self, output: Any) -> dict:
+        return next(iter(self.members.values())).pack_activation(output)
+
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        return next(iter(self.members.values())).activation_spec(batch=batch, include_hidden=include_hidden)
+
+    def unpack_activation(self, payload: dict) -> Any:
+        return payload
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        if not tasks:
+            return hidden
+        batches = organize_cell_batches(
+            tasks,
+            kv_contexts,
+            compatibility_of=self._compatibility_of,
+            max_batch_size=self.max_batch_size,
+        )
+        self.last_batches = batches
+        self.block_call_members = []
+        outs: list[dict[str, torch.Tensor] | None] = [None] * len(tasks)
+        for batch in batches:
+            chunk, step, _block = batch.cell
+            if batch.size == 1:
+                member_ref = batch.members[0]
+                member = self.members[member_ref.request_id]
+                self._last_meta = (member_ref.request_id, chunk, step)
+                self.block_call_members.append(1)
+                outs[member_ref.task_index] = member.run_one(
+                    member_ref.request_id,
+                    member_ref.cell,
+                    batch.kv_views[0],
+                    index=member_ref.task_index,
+                    n_tasks=len(tasks),
+                    hidden=hidden,
+                    stash_take=self.take_stashed_activation,
+                    bind_text=True,
+                )
+                continue
+            self._last_meta = ("", chunk, step)
+            self.block_call_members.append(batch.size)
+            packed = dict(
+                self._pack_batch(
+                    batch,
+                    members=[self.members[m.request_id] for m in batch.members],
+                    tasks=tasks,
+                    hidden=hidden,
+                    stash_take=self.take_stashed_activation,
+                )
+            )
+            for local_i, per_member in enumerate(batch.split_outputs(packed)):
+                outs[batch.members[local_i].task_index] = per_member
+        assert all(item is not None for item in outs)
+        typed_outs = [item for item in outs if item is not None]
+        if len(typed_outs) == 1:
+            return typed_outs[0]
+        keys = typed_outs[0].keys()
+        return {k: torch.cat([o[k] for o in typed_outs], dim=0) for k in keys}

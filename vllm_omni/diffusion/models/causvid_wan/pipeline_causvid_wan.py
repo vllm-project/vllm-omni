@@ -49,7 +49,8 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellBatch
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import BatchedCellAdapter
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
     load_causvid_generator_state,
@@ -752,14 +753,20 @@ class CausVidWanPipeline(nn.Module):
                 members[kv_id] = adapter
                 order.append((kv_id, adapter, stream_job))
                 stream_jobs.append(stream_job)
-            batch_adapter: WanCell | WanCellBatch
+            batch_adapter: WanCell | BatchedCellAdapter
             if len(members) == 1:
                 batch_adapter = next(iter(members.values()))
             else:
                 max_batch = getattr(getattr(ctx, "spec", None), "max_batch_size", None)
-                batch_adapter = WanCellBatch(
+                batch_adapter = BatchedCellAdapter(
                     members,
                     max_batch_size=max_batch if max_batch is not None else len(members),
+                    compatibility_of=lambda req, cell: (
+                        cell,
+                        members[req].latent_shape,
+                        members[req].num_denoise_steps,
+                    ),
+                    pack_batch=WanCell.pack_compute_batch,
                 )
             try:
                 run_cell_pipeline(ctx=ctx, adapter=batch_adapter)

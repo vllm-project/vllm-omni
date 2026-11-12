@@ -8,6 +8,7 @@ runner), same pattern as stepwise ``SupportsStepExecution``.
 """
 
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import (
+    BatchedCellAdapter,
     CellComputeBatch,
     CellMemberRef,
     organize_cell_batches,
@@ -31,6 +32,7 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan impor
 
 __all__ = [
     "ARDiffusionCellContext",
+    "BatchedCellAdapter",
     "CellAdapter",
     "CellComputeBatch",
     "CellMemberRef",

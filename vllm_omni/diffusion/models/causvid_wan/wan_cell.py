@@ -4,16 +4,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import (
-    CellComputeBatch,
-    organize_cell_batches,
-)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import CellComputeBatch
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Cell
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
@@ -120,7 +117,7 @@ class WanCell(CellAdapter):
         stash_take: Callable[[str, int, int], Any] | None = None,
         bind_text: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """Run one member cell; used by ``WanCellBatch`` for the B=1 fallback path."""
+        """Run one member cell; used by ``BatchedCellAdapter`` for the B=1 path."""
         chunk, step, block = cell
         self._last_meta = (req, chunk, step)
         tf = self.transformer
@@ -159,6 +156,86 @@ class WanCell(CellAdapter):
             self.finished.setdefault(req, {})[chunk] = latent.detach()
         live[chunk] = latent
         return {"latent": latent}
+
+    @staticmethod
+    def pack_compute_batch(
+        batch: CellComputeBatch,
+        members: Sequence["WanCell"],
+        *,
+        tasks: Sequence[tuple[str, Cell]],
+        hidden: Any,
+        stash_take: Callable[[str, int, int], Any],
+    ) -> dict[str, torch.Tensor]:
+        """Wan DiT packer for one ``CellComputeBatch`` (model backend only)."""
+        if len(members) != batch.size:
+            raise ValueError(f"members length {len(members)} != batch size {batch.size}")
+        chunk, step, block = batch.cell
+        tf = members[0].transformer
+        text = torch.cat([m.prompt_embeds for m in members], dim=0)
+        tf.prepare_cell(text)
+
+        latents: list[torch.Tensor] = []
+        tokens_list: list[torch.Tensor | None] = []
+        for local_i, member_ref in enumerate(batch.members):
+            member = members[local_i]
+            live = member._live.setdefault(member_ref.request_id, {})
+            latent, tokens = member._resolve_latent_hidden(
+                req=member_ref.request_id,
+                chunk=chunk,
+                step=step,
+                index=member_ref.task_index,
+                n_tasks=len(tasks),
+                hidden=hidden,
+                live=live,
+                stash_take=stash_take,
+            )
+            latents.append(latent)
+            tokens_list.append(tokens)
+
+        latent_b = torch.cat(latents, dim=0)
+        first = members[0]
+        t = first._timesteps[step] if step < first.num_denoise_steps else first._timestep_clean
+        step_key = step if step < first.num_denoise_steps else first.num_denoise_steps
+
+        if block == tf.start_layer and tf.is_layer_group_first:
+            tokens_b = tf.embed(latent_b)
+        else:
+            if any(tok is None for tok in tokens_list):
+                raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
+            tokens_b = torch.cat([tok for tok in tokens_list if tok is not None], dim=0)
+
+        tokens_b = tf.block(
+            block,
+            tokens_b,
+            chunk=chunk,
+            step=step_key,
+            latent=latent_b,
+            timestep=t,
+            kv_ctx=list(batch.kv_views),
+        )
+        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
+            for local_i, member_ref in enumerate(batch.members):
+                members[local_i]._live.setdefault(member_ref.request_id, {})[chunk] = latents[local_i]
+            return {"latent": latent_b, "hidden_states": tokens_b}
+
+        pred_b = tf.unembed(tokens_b, chunk=chunk, step=step_key, latent=latent_b, timestep=t)
+        out_latents: list[torch.Tensor] = []
+        for local_i, member_ref in enumerate(batch.members):
+            member = members[local_i]
+            req = member_ref.request_id
+            latent = latents[local_i]
+            pred = pred_b[batch.row_slice(local_i)]
+            if step < member.num_denoise_steps:
+                latent = member.sampler.advance(pred, latent, step)
+                if step == member.num_denoise_steps - 1:
+                    member.finished.setdefault(req, {})[chunk] = latent.detach()
+                    if member.on_finished is not None:
+                        member.on_finished(chunk, latent)
+            else:
+                member.finished.setdefault(req, {})[chunk] = latent.detach()
+            member._live.setdefault(req, {})[chunk] = latent
+            out_latents.append(latent)
+        return {"latent": torch.cat(out_latents, dim=0)}
 
     def forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
@@ -205,195 +282,3 @@ class WanCell(CellAdapter):
 
     def unpack_activation(self, payload: dict):
         return payload
-
-
-class WanCellBatch(CellAdapter):
-    """Run compatible same-cell members from several requests in one DiT call.
-
-    Organizes slot tasks into ``CellComputeBatch`` groups (shared cell + shape +
-    denoise config, capped by ``max_batch_size``). Compatible members pack on the
-    batch axis for embed / block / unembed; attention still uses each request's
-    paged-KV view. Member prompt / sampler / seed stay on the per-request
-    ``WanCell``.
-    """
-
-    def __init__(
-        self,
-        members: Mapping[str, WanCell],
-        *,
-        max_batch_size: int | None = None,
-    ) -> None:
-        if not members:
-            raise ValueError("WanCellBatch requires at least one member")
-        self.members = dict(members)
-        first = next(iter(self.members.values()))
-        shapes = {m.latent_shape for m in self.members.values()}
-        if len(shapes) != 1:
-            raise ValueError(f"WanCellBatch members must share latent_shape, got {shapes}")
-        steps = {m.num_denoise_steps for m in self.members.values()}
-        if len(steps) != 1:
-            raise ValueError(f"WanCellBatch members must share denoise steps, got {steps}")
-        self.transformer = first.transformer
-        self.device = first.device
-        self.dtype = first.dtype
-        self.latent_shape = first.latent_shape
-        self.max_batch_size = max(1, int(max_batch_size or len(self.members)))
-        self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
-        self._last_meta: tuple[str, int, int] | None = None
-        self.last_batches: list[CellComputeBatch] = []
-        self.block_call_members: list[int] = []
-
-    @property
-    def finished(self) -> dict[str, dict[int, torch.Tensor]]:
-        merged: dict[str, dict[int, torch.Tensor]] = {}
-        for member in self.members.values():
-            merged.update(member.finished)
-        return merged
-
-    def compatibility_of(self, req: str, cell: Cell) -> Hashable:
-        member = self.members[req]
-        return (cell, member.latent_shape, member.num_denoise_steps)
-
-    def stash_activation(
-        self,
-        payload: dict,
-        *,
-        handles: list | None = None,
-        meta: tuple[str, int, int] | None = None,
-    ) -> None:
-        del handles
-        tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
-        key = meta or self._last_meta
-        if key is None:
-            raise RuntimeError("stash_activation needs meta")
-        self._stash[key] = tensors
-
-    def take_stashed_activation(self, req: str, chunk: int, step: int):
-        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
-
-    def pack_activation(self, output):
-        return next(iter(self.members.values())).pack_activation(output)
-
-    def activation_spec(self, *, batch: int, include_hidden: bool):
-        return next(iter(self.members.values())).activation_spec(batch=batch, include_hidden=include_hidden)
-
-    def unpack_activation(self, payload: dict):
-        return payload
-
-    def forward(self, tasks, kv_contexts, *, hidden):
-        if not tasks:
-            return hidden
-        batches = organize_cell_batches(
-            tasks,
-            kv_contexts,
-            compatibility_of=self.compatibility_of,
-            max_batch_size=self.max_batch_size,
-        )
-        self.last_batches = batches
-        self.block_call_members = []
-        outs: list[dict[str, torch.Tensor] | None] = [None] * len(tasks)
-        for batch in batches:
-            if batch.size == 1:
-                member_ref = batch.members[0]
-                member = self.members[member_ref.request_id]
-                cell = member_ref.cell
-                self._last_meta = (member_ref.request_id, cell[0], cell[1])
-                self.block_call_members.append(1)
-                outs[member_ref.task_index] = member.run_one(
-                    member_ref.request_id,
-                    cell,
-                    batch.kv_views[0],
-                    index=member_ref.task_index,
-                    n_tasks=len(tasks),
-                    hidden=hidden,
-                    stash_take=self.take_stashed_activation,
-                    bind_text=True,
-                )
-                continue
-            packed = self._forward_fused(batch, tasks=tasks, hidden=hidden)
-            for local_i, per_member in enumerate(batch.split_outputs(packed)):
-                outs[batch.members[local_i].task_index] = per_member
-        assert all(item is not None for item in outs)
-        typed_outs = [item for item in outs if item is not None]
-        if len(typed_outs) == 1:
-            return typed_outs[0]
-        keys = typed_outs[0].keys()
-        return {k: torch.cat([o[k] for o in typed_outs], dim=0) for k in keys}
-
-    def _forward_fused(
-        self,
-        batch: CellComputeBatch,
-        *,
-        tasks: Sequence[tuple[str, Cell]],
-        hidden: Any,
-    ) -> dict[str, torch.Tensor]:
-        chunk, step, block = batch.cell
-        members = [self.members[m.request_id] for m in batch.members]
-        tf = self.transformer
-        text = torch.cat([m.prompt_embeds for m in members], dim=0)
-        tf.prepare_cell(text)
-
-        latents: list[torch.Tensor] = []
-        tokens_list: list[torch.Tensor | None] = []
-        for local_i, member_ref in enumerate(batch.members):
-            member = members[local_i]
-            live = member._live.setdefault(member_ref.request_id, {})
-            latent, tokens = member._resolve_latent_hidden(
-                req=member_ref.request_id,
-                chunk=chunk,
-                step=step,
-                index=member_ref.task_index,
-                n_tasks=len(tasks),
-                hidden=hidden,
-                live=live,
-                stash_take=self.take_stashed_activation,
-            )
-            latents.append(latent)
-            tokens_list.append(tokens)
-
-        latent_b = torch.cat(latents, dim=0)
-        self._last_meta = ("", chunk, step)
-        first = members[0]
-        t = first._timesteps[step] if step < first.num_denoise_steps else first._timestep_clean
-        step_key = step if step < first.num_denoise_steps else first.num_denoise_steps
-
-        if block == tf.start_layer and tf.is_layer_group_first:
-            tokens_b = tf.embed(latent_b)
-        else:
-            if any(tok is None for tok in tokens_list):
-                raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
-            tokens_b = torch.cat([tok for tok in tokens_list if tok is not None], dim=0)
-
-        self.block_call_members.append(batch.size)
-        tokens_b = tf.block(
-            block,
-            tokens_b,
-            chunk=chunk,
-            step=step_key,
-            latent=latent_b,
-            timestep=t,
-            kv_ctx=list(batch.kv_views),
-        )
-        if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
-            for local_i, member_ref in enumerate(batch.members):
-                members[local_i]._live.setdefault(member_ref.request_id, {})[chunk] = latents[local_i]
-            return {"latent": latent_b, "hidden_states": tokens_b}
-
-        pred_b = tf.unembed(tokens_b, chunk=chunk, step=step_key, latent=latent_b, timestep=t)
-        out_latents: list[torch.Tensor] = []
-        for local_i, member_ref in enumerate(batch.members):
-            member = members[local_i]
-            req = member_ref.request_id
-            latent = latents[local_i]
-            pred = pred_b[batch.row_slice(local_i)]
-            if step < member.num_denoise_steps:
-                latent = member.sampler.advance(pred, latent, step)
-                if step == member.num_denoise_steps - 1:
-                    member.finished.setdefault(req, {})[chunk] = latent.detach()
-                    if member.on_finished is not None:
-                        member.on_finished(chunk, latent)
-            else:
-                member.finished.setdefault(req, {})[chunk] = latent.detach()
-            member._live.setdefault(req, {})[chunk] = latent
-            out_latents.append(latent)
-        return {"latent": torch.cat(out_latents, dim=0)}

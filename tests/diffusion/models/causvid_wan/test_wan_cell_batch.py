@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""WanCellBatch packs compatible same-cell members into one DiT call."""
+"""WanCell.pack_compute_batch via framework BatchedCellAdapter."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellBatch
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import BatchedCellAdapter
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -76,11 +77,24 @@ def _member(tf, *, seed: int, prompt: torch.Tensor | None = None) -> WanCell:
     return cell
 
 
-def test_wancell_batch_fuses_same_cell_into_one_embed_block():
+def _batched(members: dict[str, WanCell], *, max_batch_size: int) -> BatchedCellAdapter:
+    return BatchedCellAdapter(
+        members,
+        max_batch_size=max_batch_size,
+        compatibility_of=lambda req, cell: (
+            cell,
+            members[req].latent_shape,
+            members[req].num_denoise_steps,
+        ),
+        pack_batch=WanCell.pack_compute_batch,
+    )
+
+
+def test_batched_adapter_fuses_same_cell_into_one_embed_block():
     tf = _FakeTransformer()
     a = _member(tf, seed=1, prompt=torch.ones(1, 3, 4))
     b = _member(tf, seed=2, prompt=torch.ones(1, 3, 4) * 2)
-    batch = WanCellBatch({"A": a, "B": b}, max_batch_size=2)
+    batch = _batched({"A": a, "B": b}, max_batch_size=2)
     cell = (0, 0, 0)
     kv = [SimpleNamespace(name="ka"), SimpleNamespace(name="kb")]
     out = batch.forward(
@@ -100,11 +114,11 @@ def test_wancell_batch_fuses_same_cell_into_one_embed_block():
     assert 0 in a.finished["A"] and 0 in b.finished["B"]
 
 
-def test_wancell_batch_falls_back_per_member_when_cells_differ():
+def test_batched_adapter_falls_back_per_member_when_cells_differ():
     tf = _FakeTransformer()
     a = _member(tf, seed=1)
     b = _member(tf, seed=2)
-    batch = WanCellBatch({"A": a, "B": b}, max_batch_size=2)
+    batch = _batched({"A": a, "B": b}, max_batch_size=2)
     out = batch.forward(
         [("A", (0, 0, 0)), ("B", (1, 0, 0))],
         [[object()], [object()]],
@@ -116,7 +130,7 @@ def test_wancell_batch_falls_back_per_member_when_cells_differ():
     assert batch.block_call_members == [1, 1]
 
 
-def test_wancell_batch_matches_serial_within_tolerance():
+def test_batched_adapter_matches_serial_within_tolerance():
     """Fused B=2 output matches independent B=1 runs (design §5.3 acceptance)."""
     cell = (0, 0, 0)
     prompts = {
@@ -136,7 +150,7 @@ def test_wancell_batch_matches_serial_within_tolerance():
     fused_members = {
         req: _member(tf_fused, seed=seeds[req], prompt=prompts[req].clone()) for req in ("A", "B")
     }
-    batch = WanCellBatch(fused_members, max_batch_size=2)
+    batch = _batched(fused_members, max_batch_size=2)
     batch.forward(
         [("A", cell), ("B", cell)],
         [[SimpleNamespace(name="A")], [SimpleNamespace(name="B")]],
@@ -153,10 +167,10 @@ def test_wancell_batch_matches_serial_within_tolerance():
         )
 
 
-def test_wancell_batch_respects_max_batch_size_split():
+def test_batched_adapter_respects_max_batch_size_split():
     tf = _FakeTransformer()
     members = {rid: _member(tf, seed=i + 1) for i, rid in enumerate(("A", "B", "C"))}
-    batch = WanCellBatch(members, max_batch_size=2)
+    batch = _batched(members, max_batch_size=2)
     cell = (0, 0, 0)
     batch.forward(
         [(rid, cell) for rid in ("A", "B", "C")],

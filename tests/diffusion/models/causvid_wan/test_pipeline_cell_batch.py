@@ -10,8 +10,9 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import BatchedCellAdapter
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellBatch
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -84,7 +85,8 @@ def test_pipeline_forward_runs_one_cell_pipeline_for_batch(monkeypatch):
     )
     outs = pipeline.forward(batch)
     assert len(calls) == 1
-    assert isinstance(calls[0], WanCellBatch)
+    assert isinstance(calls[0], BatchedCellAdapter)
     assert set(calls[0].members) == {"A", "B"}
+    assert calls[0]._pack_batch is WanCell.pack_compute_batch
     assert emitted == ["A", "B"]
     assert len(outs) == 2
