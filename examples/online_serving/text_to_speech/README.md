@@ -2,9 +2,9 @@
 
 vLLM-Omni exposes TTS models through the OpenAI-compatible
 [`POST /v1/audio/speech`](../../../docs/serving/speech_api.md) endpoint,
-launched with `vllm serve <model> --omni`. Each TTS model has its own
-subdirectory containing client snippets, gradio demos, and helper
-scripts; this README is the single doc entry point for all of them.
+launched with `vllm serve <model> --omni`. This hub links shared protocol
+commands, model recipes and existing client/demo subdirectories. A model does
+not need its own Python client example.
 
 For offline inference, see [`examples/offline_inference/text_to_speech`](../../offline_inference/text_to_speech/README.md).
 For the full list of supported architectures across all modalities, see
@@ -28,12 +28,19 @@ For the full list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
+| Soprano-1.1-80M | `ekwek/Soprano-1.1-80M` | — | ✓ (PCM/SSE; explicit streaming deploy) | `default` only, English | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
 ## Common Quick Start
+
+Soprano requires explicit `--deploy-config` selection: see the
+[RTX 4090 Laptop recipe](../../../recipes/ekwek/Soprano-1.1-80M-RTX4090-Laptop.md#online-wav-raw-pcm-and-sse)
+for the validated shared server, WAV/PCM/SSE, playback and benchmark commands.
+Set the request `model` to the `--served-model-name` alias. The checkpoint's
+ordinary Qwen3 metadata does not automatically select a speech pipeline.
 
 Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
 
@@ -98,7 +105,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
 
-Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
+Adjust the player's sample rate to match the response headers (32 kHz for Soprano, 44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for Gepard and IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
 

@@ -4063,3 +4063,23 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+def test_soprano_pending_predictors_follow_sender_cleanup_and_id_reuse(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.soprano import ar_to_decoder_async_chunk
+
+    adapter, _ = build_adapter(stage_id=0, connector_extra={"soprano_chunk_size": 4})
+    request = _req("soprano-old", RequestStatus.RUNNING, external_req_id="same-external")
+    request.output_token_ids = [21]
+    first = torch.arange(512, dtype=torch.float32).reshape(1, 512) + 1
+    assert ar_to_decoder_async_chunk(adapter, {"hidden": first}, request, new_token_ids=(21,)) is None
+    assert adapter.request_payload[request.external_req_id]["soprano"]["pending"]
+    adapter.cleanup_sender(request.external_req_id)
+    assert request.external_req_id not in adapter.request_payload
+    replacement = _req("soprano-new", RequestStatus.FINISHED_LENGTH_CAPPED, external_req_id="same-external")
+    replacement.output_token_ids = [22]
+    second = -first
+    result = ar_to_decoder_async_chunk(adapter, {"hidden": second}, replacement, new_token_ids=(22,))
+    assert torch.equal(result.hidden_states.output, second)
+    adapter.cleanup_sender(replacement.external_req_id)
+    assert replacement.external_req_id not in adapter.request_payload
