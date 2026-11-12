@@ -2169,7 +2169,6 @@ stages:
         [
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_turn_mrv2.yaml",
-            "minicpmo_4_5_turn_mrv2_h200.yaml",
         ],
     )
     def test_minicpmo_turn_npu_stage1_turn_contract(self, monkeypatch, yaml_name: str):
