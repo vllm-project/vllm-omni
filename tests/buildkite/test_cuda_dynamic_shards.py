@@ -141,7 +141,8 @@ def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.M
     assert lists == bins
     listed = {path for group in lists for path in group}
     assert listed == set(matching) | set(rejected)
-    assert [path for group in lists for path in group if path in rejected] == rejected
+    assert rejected[0] in lists[0]
+    assert rejected[1] in lists[1]
     for group in lists:
         assert any(_file_matches_marker(suite / path, "core_model and cpu") is True for path in group)
     assert "automatic_shard" not in step
@@ -803,7 +804,8 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     assert lists == fallback_file_bins(SIMPLE_TEST_COMMAND, suite)
     listed = {path for group in lists for path in group}
     assert listed == set(matching) | set(rejected)
-    assert [path for group in lists for path in group if path in set(rejected)] == rejected
+    assert rejected[0] in lists[0]
+    assert rejected[1] in lists[1]
     assert set(timed) != listed
 
 
