@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -210,6 +211,7 @@ def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     wrapper.max_lazy_graphs = 1
     wrapper.max_serial_batch = 8
     wrapper._eager_fallbacks = {}
+    wrapper._eager_fallback_total = 0
     wrapper.width_pad_bucket = 0
     wrapper.decode_fn = Mock(return_value=(torch.tensor([[99.0]]), torch.tensor([[[98.0]]])))
     wrapper.finalize_fn = lambda magnitude, phase: magnitude + phase
@@ -274,6 +276,46 @@ def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -
     for _ in range(100):
         wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
     assert wrapper.eager_fallback_counts() == {(1, 11, 0): 101, (16, 7, 0): 1}
+
+
+def test_eager_fallback_census_is_logged_on_the_summary_boundary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The aggregate census INFO fires exactly at multiples of the interval.
+
+    Each shape's one-time WARNING is separate; the census line appears after
+    the 100th cumulative fallback and only there, so a deployment sees a
+    recurring aggregate signal rather than per-call noise.
+    """
+    wrapper = _fake_wrapper(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        for _ in range(99):
+            wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
+        assert [r for r in caplog.records if "census" in r.getMessage()] == []
+        wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
+        census = [r for r in caplog.records if "census" in r.getMessage()]
+    assert len(census) == 1
+    assert census[0].levelno == logging.INFO
+    assert "(100 total)" in census[0].getMessage()
+
+
+def test_padded_replay_fallback_is_counted_under_the_request_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback on the width-padding path counts the request's width, not the padded replay's.
+
+    A width-11 request pads up to the 16-frame bucket for the replay; if the
+    lazy limit then rejects it, the census must attribute the miss to
+    ``(1, 11, 0)`` -- the same key the unpadded bucket-miss path would use --
+    so a request width does not split its misses across two census keys.
+    """
+    wrapper = _fake_wrapper(monkeypatch)
+    wrapper._legit_shapes = {(7, 0), (9, 0), (16, 0)}
+    wrapper.width_pad_bucket = 8
+    wrapper.lazy_graph_count = wrapper.max_lazy_graphs  # force the lazy-limit fallback
+    wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
+    wrapper._capture.assert_not_called()
+    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1}
 
 
 def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPatch) -> None:
