@@ -59,7 +59,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     doc = yaml.safe_load(CUDA_READY_YAML.read_text())
     step = next(step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test")
     # Build 19334 runs the workload under /bin/sh. Exercise that entrypoint,
-    # including tee, without starting a real server or loading model weights.
+    # without starting a real server or loading model weights.
     calls_path = tmp_path / "pytest-call.json"
     executable = tmp_path / "pytest"
     executable.write_text(
@@ -86,9 +86,8 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     args = json.loads(calls_path.read_text())
     assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
     assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
-    log = tmp_path / "tests/e2e/online_serving/results/minicpmo_duplex/server.log"
-    assert "pytest-stdout" in log.read_text()
-    assert "pytest-stderr" in log.read_text()
+    assert "pytest-stdout" in result.stdout
+    assert "pytest-stderr" in result.stderr
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
