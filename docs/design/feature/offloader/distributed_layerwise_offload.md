@@ -227,7 +227,7 @@ measurement does not establish memory headroom for another workload, device,
 or resident-layer count. See the
 [user guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md#minimax-h3-image-exact-adaln-staging)
 for configuration and the
-[recipe](../../../../recipes/MiniMaxAI/MiniMax-H3-Image-RTX3090.md)
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-RTX3090.md)
 for its validation limits.
 
 ### Component allocator-cache retention
