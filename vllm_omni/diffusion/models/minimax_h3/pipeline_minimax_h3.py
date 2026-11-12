@@ -212,6 +212,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .vae_tile_balance import resolve_video_tile_balance_max_tasks
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -1322,6 +1323,7 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                encode_tile_balance_max_tasks=resolve_video_tile_balance_max_tasks(od_config.additional_config),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),

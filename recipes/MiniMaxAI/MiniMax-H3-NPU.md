@@ -221,6 +221,23 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### Balanced reference-video encode tiles (experimental)
+
+For Ref2VA inputs that span multiple temporal clips, opt in to cross-clip
+round-robin scheduling by adding:
+
+```bash
+  --additional-config '{"h3_vae_encode_tile_balance_max_tasks":168}'
+```
+
+The positive integer bounds each gather window in complete temporal clips; a
+single clip may exceed it. `168` holds two clips for the common 84-tile grid;
+larger windows can improve balance at the cost of retaining more encoded tiles
+until the gather. The encoder stage consumes this setting. The scheduler keeps
+the checkpoint's spatial blend and temporal order, applies only to NPU
+reference-video encoding, and leaves control-latent encoding and VAE decode
+unchanged. Omit the key to retain the checkpoint scheduler.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the
