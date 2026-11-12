@@ -158,7 +158,8 @@ def rms_norm_fastpath(
         out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
-    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias)
+    # A fast-path binding: its output must be bitwise ``off``, so the norm reduction is probed.
+    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias, probe_reduction=True)
 
 
 def rms_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -296,6 +297,8 @@ def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) 
     return out.normal_(0.0, std, generator=generator)
 
 
+# Process-global and written without a lock, like the verdict caches below: a VAE is driven by one thread per
+# process, and a race would at worst miscount or repeat a probe, never change a convolution's result.
 # First-use probe outcomes since the last reset_probe_stats(): "equal" / "not_equal" verdicts recorded,
 # "declined_memory" (not run: too little free memory) and "declined_oom" (ran out of memory while probing).
 _PROBE_STATS: Counter[str] = Counter()

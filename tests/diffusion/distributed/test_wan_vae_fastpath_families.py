@@ -344,16 +344,16 @@ def test_fp32_channel_norm_is_the_upcast_reduction_and_probes_once(monkeypatch) 
 
     monkeypatch.setattr(vrn, "_fp32_norm_probe", counting_probe)
     for _ in range(2):
-        assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+        assert torch.equal(vrn.fp32_channel_norm(x, probe=True).view(torch.int32), expected.view(torch.int32))
     assert len(probes) == 1  # one verdict per (device, dtype, shape, layout)
 
     # A backend whose direct reduction differs keeps the upcast; a probe that does not fit records nothing.
     monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
     monkeypatch.setattr(vrn, "_fp32_norm_probe", lambda t: False)
-    assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(vrn.fp32_channel_norm(x, probe=True).view(torch.int32), expected.view(torch.int32))
     monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
     monkeypatch.setattr(vrn, "_fp32_norm_probe", lambda t: None)
-    assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(vrn.fp32_channel_norm(x, probe=True).view(torch.int32), expected.view(torch.int32))
     assert not vrn._FP32_NORM_VERDICTS
 
 
@@ -363,7 +363,7 @@ def test_fp32_channel_norm_traces_under_fullgraph_compile(monkeypatch) -> None:
     monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})  # a shape no eager call has probed
     x = torch.randn(1, 96, 2, 5, 7).to(torch.bfloat16)
     compiled = torch.compile(vrn.fp32_channel_norm, fullgraph=True, backend="eager")
-    out = compiled(x)
+    out = compiled(x, probe=True)
     assert torch.equal(out.view(torch.int32), x.float().norm(2, 1, keepdim=True).view(torch.int32))
     assert not vrn._FP32_NORM_VERDICTS  # nothing probed while tracing
 
@@ -385,3 +385,55 @@ assert names() == ["qwen_image", "qwen_image_21", "wan"], names()
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_reference_norm_keeps_its_reduction_and_never_probes(monkeypatch) -> None:
+    """Without the fast path, ``rms_norm_fastpath`` must read the reduction it always read: no probe, no upcast."""
+    from vllm_omni.diffusion.layers import vae_rms_norm as vrn
+
+    monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
+    monkeypatch.setattr(vrn, "_fp32_norm_probe", lambda t: pytest.fail("a reference forward must not probe"))
+    x = torch.randn(1, 96, 2, 5, 7).to(torch.bfloat16)
+    direct = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32)
+    assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), direct.view(torch.int32))
+
+    # The model's own forward (e.g. QwenImage21RMS_norm) calls the shared helper without the fast path.
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    norm = WanRMS_norm(96, images=False).eval()
+    with torch.no_grad():
+        norm.gamma.uniform_(0.5, 1.5)
+        reference = vrn.rms_norm_fastpath(norm, x)
+        probed = vrn.rms_norm_fastpath(norm, x, probe_reduction=True)
+    assert reference is not None and probed is not None
+    # Same bits here (this backend's reductions agree); only the reference path is pinned to the old expression.
+    assert torch.equal(reference.view(torch.int16), probed.view(torch.int16))
+    assert not vrn._FP32_NORM_VERDICTS  # nothing probed on the reference path
+
+
+@pytest.mark.parametrize("name", sorted(BUILDERS))
+def test_probes_never_run_on_an_assembled_tensor(name: str, monkeypatch) -> None:
+    """Every first-use probe during a decode runs on a ``meta`` template, so a declined probe frees nothing.
+
+    This is the invariant behind "a declined probe never needs more memory than ``off``": if no probe ever sees a
+    real assembled input, no fallback can be reached while that input is alive.
+    """
+    monkeypatch.setattr(fp, "_kernels_allowed", lambda x: not torch.is_grad_enabled())
+    reference, candidate = _build_pair(name, torch.float32)
+    assert install_wan_vae_fastpath(candidate, level="lossless").installed
+    probed_devices = []
+    original = fp._equal_on_random_operands
+
+    def recording(x, weight, *args, **kwargs):
+        probed_devices.append(x.device.type)
+        return original(x, weight, *args, **kwargs)
+
+    monkeypatch.setattr(fp, "_equal_on_random_operands", recording)
+    _, channels, compression, latent_frames = BUILDERS[name]
+    latents = torch.randn(1, 4, latent_frames, 6, 8)
+    with torch.no_grad():
+        expected = reference.decode(latents, return_dict=False)[0]
+        actual = candidate.decode(latents, return_dict=False)[0]
+    assert probed_devices, "the decode should have probed at least one shape"
+    assert set(probed_devices) == {"meta"}, f"a probe ran on a real tensor: {sorted(set(probed_devices))}"
+    assert torch.equal(actual, expected)

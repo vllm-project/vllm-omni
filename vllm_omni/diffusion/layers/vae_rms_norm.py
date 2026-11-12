@@ -17,6 +17,8 @@ from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 _NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
+# Process-global, written without a lock: a VAE is driven by one thread per process, and a race would at worst
+# repeat a probe or drop a cached verdict, never change a result.
 # {(device, dtype, shape, strides): the norm reduction read from the input dtype is bitwise the one over its fp32
 # copy}. The reduction kernel depends on device, dtype and layout, never on values, so one probe on random data
 # per key decides it.
@@ -50,16 +52,19 @@ def _fp32_norm_probe(x: torch.Tensor) -> bool | None:
         raise
 
 
-def fp32_channel_norm(x: torch.Tensor) -> torch.Tensor:
-    """``x.float().norm(2, dim=1, keepdim=True)`` bitwise, without the fp32 copy where a probe shows it is the same.
+def fp32_channel_norm(x: torch.Tensor, *, probe: bool = False) -> torch.Tensor:
+    """The channel norm of ``x`` in fp32, read from ``x`` itself rather than from an fp32 copy.
 
-    Reading the low-precision tensor directly (``vector_norm(..., dtype=float32)``) skips materializing an fp32
-    copy. That is only exact if the backend runs the same reduction for both, so the first call per (device,
-    dtype, shape, layout) checks it on random data and otherwise keeps the upcast. Under ``torch.compile`` it
-    is always the upcast.
+    Without ``probe`` this is ``vector_norm(x, dim=1, dtype=float32)``, the reduction every caller used before
+    the fast path existed; reference forwards keep it so their output does not depend on this module.
+
+    ``probe`` is for the fast-path bindings, whose contract is to be bitwise ``off``: reading the low-precision
+    tensor directly is only exact if the backend runs the same reduction as ``F.normalize(x.float(), dim=1)``,
+    so the first call per (device, dtype, shape, layout) checks that on random data and otherwise keeps the
+    upcast. Under ``torch.compile`` it is always the upcast (the probe cannot be traced).
     """
-    if x.dtype is torch.float32:
-        return torch.linalg.vector_norm(x, dim=1, keepdim=True)
+    if not probe or x.dtype is torch.float32:
+        return torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32)
     if torch.compiler.is_compiling():
         # The probe (generator, memory query, host sync) cannot be traced; the reference expression can.
         return x.float().norm(2, 1, keepdim=True)
@@ -119,7 +124,12 @@ def _as_rows(
 
 
 def rms_norm_fastpath(
-    norm: nn.Module, x: torch.Tensor, *, silu: bool = False, bias: torch.Tensor | None = None
+    norm: nn.Module,
+    x: torch.Tensor,
+    *,
+    silu: bool = False,
+    bias: torch.Tensor | None = None,
+    probe_reduction: bool = False,
 ) -> torch.Tensor | None:
     """``WanRMS_norm(x + bias)`` (optionally followed by SiLU) with fewer passes, or ``None``.
 
@@ -128,6 +138,9 @@ def rms_norm_fastpath(
     first with ATen's rounding. ``None`` means the caller must run the reference
     forward (autograd, tensor bias, channel-last norm, unsupported dtype,
     gamma/activation dtype mismatch) and is responsible for adding ``bias`` itself.
+
+    ``probe_reduction`` is set by the Wan fast-path bindings, whose output must be bitwise ``off``; see
+    :func:`fp32_channel_norm`. A model's own forward leaves it off and keeps the reduction it always used.
     """
     if torch.is_grad_enabled():
         return None
@@ -145,9 +158,7 @@ def rms_norm_fastpath(
     if bias is not None:
         x = _add_channel_bias(x, bias)
 
-    # The reduction ``F.normalize(x.float(), dim=1)`` runs, read from the
-    # low-precision tensor where a probe shows the bits are the same.
-    denom = fp32_channel_norm(x).clamp_min_(1e-12)
+    denom = fp32_channel_norm(x, probe=probe_reduction).clamp_min_(1e-12)
 
     if kernels_allowed(x):
         rows = _as_rows(x, denom)
