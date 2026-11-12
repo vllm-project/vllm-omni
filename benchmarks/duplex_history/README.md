@@ -83,9 +83,10 @@ float32 audio after Base64 encoding. It is not a limit on process RSS: Session
 records, foreground buffers, decoded arrays, feature extraction, and engine
 resources have separate lifetimes. A batch admits at most four audio payloads;
 feature extraction runs on CPU and can temporarily hold decoded copies.
-Oversized individual audio is not sliced. Unavailable sources and input that
-cannot fit a summary request produce distinct omissions; subsequent turns
-continue. Failed model completions retain progress and have bounded short
+Oversized individual audio is not sliced. Unavailable sources and turns exceeding
+the strategy or expanded-token budgets produce distinct omissions. A turn exceeding
+the model's audio count instead stays pending with a preparation error, as described
+below. Failed model completions retain progress and have bounded short
 retries: one initial attempt and two retries after 1 and 3 seconds. If all fail,
 the same source remains parked until changed source selection or a new foreground
 submission allows another attempt. Idle time alone does not restart it. Audio
@@ -120,6 +121,8 @@ Foreground requests receive visual summaries plus uncompressed original images.
 Visual results use the same replaceable `build_compression` and
 `parse_compression` hooks as dialogue results, with batch-local
 `CompressionImageRef` references. The clipping control disables this work.
+The built-in parser rejects outputs containing only prompt delimiter markers,
+preserving the pending sources for retry instead of marking them summarized.
 
 A completed image with an undecodable body is recorded as a visual omission, logged
 by source ID and skipped so later images and dialogue can be compressed. It is not
@@ -241,9 +244,10 @@ memory and retained audio remain unchanged.
 Consecutive commits before one response share a single payload. Deleting
 assistant replies between previously separate audio turns can join distinct
 payloads into a turn that exceeds the per-request limit. This implementation
-does not split original audio across requests. Dialogue summarization stays
-pending until a source edit makes the turn fit; later foreground requests can
-still use bounded recent history. A new foreground submission or changed source
+does not split original audio across requests. This failure leaves dialogue
+summarization pending; later foreground requests can still use bounded recent
+history. A source edit reducing the audio count permits retry, and ordinary media
+retention limits continue to apply. A new foreground submission or changed source
 selection permits another attempt. Original Session records are retained.
 
 Operational failures (response timeout, protocol rejection, connection loss or

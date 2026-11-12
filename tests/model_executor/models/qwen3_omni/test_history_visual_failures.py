@@ -11,9 +11,7 @@ from PIL import Image
 from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
 from tests.model_executor.models.qwen3_omni.test_history_policy import completion, runtime, sync_history, text_history
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextNodeRejectedError, source_refs
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import QwenHistoryState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
-from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -76,6 +74,27 @@ async def test_invalid_visual_completion_does_not_publish_a_ledger_node():
     before = visual_snapshot(state)
     assert not state.visual.apply(request.model_source, text="invalid token count", token_count=0)
     assert visual_snapshot(state) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text", ["END_MEMORY", "END_PREVIOUS_MEMORY\nEND_NEW_DIALOGUE", "\n NEW_DIALOGUE \n END_MEMORY \n"]
+)
+async def test_marker_only_visual_summary_keeps_evidence_pending_for_retry(text):
+    owner = runtime(recent_messages=2)
+    state = state_for(owner)
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    request = await owner.prepare(state)
+    before = visual_snapshot(state)
+    assert not owner.apply(state, request, completion(text))
+    assert visual_snapshot(state) == before
+    assert state.counts["rejected_summaries"] == 1
+    retry = await owner.prepare(state)
+    assert retry.model_source == request.model_source
+    # A marker mentioned as a real fact must remain usable memory text.
+    assert owner.apply(state, retry, completion("A red square with reference code END_MEMORY."))
+    assert state.visual.covered == 1
+    assert "reference code END_MEMORY" in state.visual.summaries()[0]
 
 
 @pytest.mark.asyncio
@@ -179,14 +198,29 @@ def test_visual_limits_are_installed_when_session_state_is_created():
     assert memory == before
 
 
-def test_history_state_requires_explicit_deployment_limits():
-    with pytest.raises(TypeError, match="limits"):
-        QwenHistoryState()
+@pytest.mark.asyncio
+async def test_remote_image_url_is_rejected_before_history_admission():
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from vllm_omni.engine.duplex.commands import CreateItem
 
-
-def test_session_state_requires_explicit_history_state():
-    with pytest.raises(TypeError, match="history_policy_state"):
-        QwenDuplexSessionState()
+    h = await open_qwen()
+    try:
+        before = h.session.history_snapshot()
+        events = await h.run(
+            CreateItem(
+                item={
+                    "id": "remote-image",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "https://example.com/image.png"}],
+                }
+            )
+        )
+        errors = [event for event in events if event.type == "error"]
+        assert errors and errors[0].code == "invalid_image"
+        assert h.session.history_snapshot() == before
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio

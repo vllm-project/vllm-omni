@@ -510,8 +510,19 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
         return CompressionPrompt(instructions, tuple(parts))
 
     def parse_compression(self, text: str) -> str | None:
-        """The built-in compressor returns plain complete memory text."""
-        return text.strip() or None
+        """Reject source delimiters without memory instead of retiring evidence."""
+        memory = text.strip()
+        markers = {
+            "PREVIOUS_MEMORY",
+            "END_PREVIOUS_MEMORY",
+            "NEW_DIALOGUE",
+            "END_NEW_DIALOGUE",
+            "END_SOURCE_MESSAGE",
+            "END_MEMORY",
+        }
+        if not memory or all(line.strip() in markers for line in memory.splitlines() if line.strip()):
+            return None
+        return memory
 
 
 def load_history_policy(name: str) -> QwenHistoryPolicy | None:

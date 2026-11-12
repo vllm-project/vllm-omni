@@ -530,6 +530,8 @@ class QwenHistoryRuntime:
         images = []
         encoded_bytes = pixel_bytes = 0
         for item in work.inputs[work.start : work.end]:
+            # Realtime input_image admission requires JPEG/PNG data URLs;
+            # a non-data URL here is an internal contract violation.
             try:
                 image = decode_image(item.url)
             except (Base64DecodeError, OSError, SyntaxError):
@@ -688,31 +690,35 @@ class QwenHistoryRuntime:
                         continue
                     state.advance(candidate, omission="source_unavailable")
                     break
+                # Check the model limit before any capacity-omission path.
+                # Deleting replies can join many separately answered inputs.
+                if len(group.audio) > self.max_audio:
+                    if len(boundaries) > 1:
+                        boundaries.pop()
+                        continue
+                    logger.warning(
+                        "Qwen history turn [%d, %d) remains pending: %d audio payloads exceed request limit %d",
+                        candidate.start,
+                        candidate.end,
+                        len(group.audio),
+                        self.max_audio,
+                    )
+                    raise RuntimeError(
+                        f"Qwen history turn [{candidate.start}, {candidate.end}) has {len(group.audio)} "
+                        f"audio payloads exceeding request limit {self.max_audio}; "
+                        "history remains pending until the turn fits"
+                    )
                 if group.audio and candidate.end - candidate.start > self.limits.chunk_messages:
                     state.advance(candidate, omission="summary_capacity")
                     break
                 unique_audio = {id(value): value for value in group.audio}
                 if (
-                    len(group.audio) > self.max_audio
-                    or len(unique_audio) > self.limits.max_audio_items
+                    len(unique_audio) > self.limits.max_audio_items
                     or sum(map(len, unique_audio.values())) > self.limits.max_audio_bytes
                 ):
                     if len(boundaries) > 1:
                         boundaries.pop()
                         continue
-                    if len(group.audio) > self.max_audio:
-                        logger.warning(
-                            "Qwen history turn [%d, %d) remains pending: %d audio payloads exceed request limit %d",
-                            candidate.start,
-                            candidate.end,
-                            len(group.audio),
-                            self.max_audio,
-                        )
-                        raise DuplexRuntimeConfigError(
-                            f"Qwen history turn [{candidate.start}, {candidate.end}) has {len(group.audio)} "
-                            f"audio payloads exceeding request limit {self.max_audio}; "
-                            "history remains pending until the turn fits"
-                        )
                     state.advance(candidate, omission="summary_capacity")
                     break
                 # Foreground-cache fallback also consumes strategy capacity.

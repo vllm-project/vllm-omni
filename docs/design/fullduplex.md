@@ -186,6 +186,10 @@ text (including serialized JSON), inserted as reference data in foreground
 input. The interface uses the same Qwen Thinker; it does not support external
 summarization services, arbitrary retrieval stores or mid-session switching.
 
+The built-in incremental parser also rejects output containing only source
+delimiter markers. Such an output supplies no memory and must leave the source
+pending for retry. Marker words inside actual memory facts remain valid text.
+
 The server-owned configuration field is `duplex_session.model_custom_options`.
 Default `recent` behavior is unchanged.
 

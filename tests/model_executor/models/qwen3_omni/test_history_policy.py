@@ -722,7 +722,8 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
 
 
 @pytest.mark.asyncio
-async def test_over_limit_audio_turn_preserves_sources_until_history_is_repaired():
+@pytest.mark.parametrize("turns", [5, 10])
+async def test_over_limit_audio_turn_preserves_sources_until_history_is_repaired(turns):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import AckPlayback, Commit, DeleteItem
@@ -732,7 +733,7 @@ async def test_over_limit_audio_turn_preserves_sources_until_history_is_repaired
         owner = runtime(recent_messages=1)
         h.runner.plugin._history_runtime = owner
         responses = []
-        for i in range(5):
+        for i in range(turns):
             await h.run(append_audio(value=0.1 * (i + 1)))
             await h.run(Commit(final=True, create_response=True))
             submission = h.port.submissions[-1]
@@ -747,18 +748,19 @@ async def test_over_limit_audio_turn_preserves_sources_until_history_is_repaired
             await h.run(DeleteItem(item_id=f"item_{response_id}"))
         memory = h.runner.model_state.history_policy_state
         sync_history(memory, h.session.history, session=h.session)
-        assert len(memory.audio) == 5
-        assert len(h.session.history) == 6
+        assert len(memory.audio) == turns
+        assert len(h.session.history) == turns + 1
         retained = tuple(memory.audio)
-        with pytest.raises(DuplexRuntimeConfigError, match="5 audio payloads.*limit 4"):
+        with pytest.raises(RuntimeError, match=rf"{turns} audio payloads.*limit 4"):
             await owner.prepare(memory)
         assert memory.processed == 0 and not memory.summary
         assert not memory.omissions and not memory.preparing
         assert tuple(memory.audio) == retained
-        assert len(h.session.history) == 6
+        assert len(h.session.history) == turns + 1
         # An explicit source edit makes the pending turn retryable. Only the
         # user's deletion may discard a source, not failed summary preparation.
-        await h.run(DeleteItem(item_id=h.session.history_snapshot().item_ids[0]))
+        for _ in range(turns - 4):
+            await h.run(DeleteItem(item_id=h.session.history_snapshot().item_ids[0]))
         sync_history(memory, h.session.history, session=h.session)
         request = await owner.prepare(memory)
         assert request is not None
