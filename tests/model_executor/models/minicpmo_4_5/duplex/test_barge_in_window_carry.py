@@ -211,8 +211,12 @@ def test_window_mode_off_drops_the_carried_window() -> None:
 
     sched._update_request_as_session(session, update)
 
-    assert "stage0_window" not in update.model_intermediate_buffer["duplex"]
+    # The segment boundary still goes to the worker without a window. The worker
+    # drops its carried units at that plan, so the scheduler must count it as one.
+    window = update.model_intermediate_buffer["duplex"]["stage0_window"]
+    assert window == {"completed_token_ids": [40]}
     assert session._minicpmo45_carried_window is None
+    assert session._minicpmo45_window_planned is True
 
 
 @pytest.mark.parametrize(("scheduled", "kept"), [(False, [5, 6]), (True, [9])])
