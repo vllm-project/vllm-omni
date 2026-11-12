@@ -306,8 +306,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 # Keep every ``test_params`` case (id ``async_chunk``) in one contiguous block
 # before Talker DSpark. ``turn_async_chunk`` is a different deploy
 # (``session_mode: turn``); it stays the second parameter of
-# ``test_text_to_text_001``, after this block. The CPU lock covers only that
-# Merge marker, not Ready or nightly.
+# ``test_text_to_text_001``, after this block.
 
 
 @pytest.mark.advanced_model
