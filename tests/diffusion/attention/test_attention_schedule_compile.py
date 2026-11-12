@@ -279,6 +279,9 @@ class _ToyPipeline(DenoiseProgressMixin):
 
 @pytest.fixture
 def compile_env(monkeypatch):
+    # The toy selector requires a platform-default baseline, regardless of the test environment.
+    monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
+    monkeypatch.delenv("DIFFUSION_ATTENTION_QUANT", raising=False)
     monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _DenseImpl))
     monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
     monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", lambda **kwargs: _resolve(**kwargs))

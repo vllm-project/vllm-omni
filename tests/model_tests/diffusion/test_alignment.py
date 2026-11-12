@@ -61,6 +61,9 @@ EXCLUDED_MODELS = [
     "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Needs the full MiniMax-H3-Image checkpoint (126 GiB); covered by
+    # tests/diffusion/models/minimax_h3/test_minimax_h3_image*.py.
+    "MiniMaxH3ImagePipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
@@ -144,6 +147,9 @@ EXCLUDED_MODELS = [
     # tests/e2e/online_serving/test_flux3.py (FLUX3_MODEL_PATH) instead of the
     # common tiny-model suite.
     "Flux3Pipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # with a tiny modular checkpoint. Real-checkpoint parity is checked after merge.
+    "PAN2ModularPipeline",
 ]
 
 
