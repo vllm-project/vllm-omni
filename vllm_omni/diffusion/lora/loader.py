@@ -138,6 +138,8 @@ def _shard_lora_delta(delta: torch.Tensor, layer: torch.nn.Module, is_bias: bool
         return delta
 
     if isinstance(layer, RowParallelLinear):
+        if delta.shape[0] != layer.output_size:
+            raise ValueError(f"LoRA output size {delta.shape[0]} does not match layer output size {layer.output_size}.")
         # Row-parallel biases are replicated; only the weight's input is split.
         if is_bias:
             return delta
@@ -164,8 +166,13 @@ def _shard_lora_delta(delta: torch.Tensor, layer: torch.nn.Module, is_bias: bool
         shard_sizes = layer.output_partition_sizes
         shard_ranks = [layer.tp_rank] * len(output_sizes)
 
+    output_size = sum(output_sizes)
+    if delta.shape[0] != output_size:
+        raise ValueError(f"LoRA output size {delta.shape[0]} does not match layer output size {output_size}.")
+    if not is_bias and delta.shape[1] != layer.input_size:
+        raise ValueError(f"LoRA input size {delta.shape[1]} does not match layer input size {layer.input_size}.")
+
     # Packed projections must be sharded separately, then repacked locally.
-    # split() also rejects incompatible full output sizes instead of cropping.
     shards = [
         part.narrow(0, rank * size, size)
         for part, rank, size in zip(delta.split(output_sizes, dim=0), shard_ranks, shard_sizes, strict=True)

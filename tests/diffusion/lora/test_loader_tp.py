@@ -87,23 +87,32 @@ def test_fused_lora_matches_checkpoint_sharding(monkeypatch, layer_cls, layer_ar
         torch.testing.assert_close(layer.bias, original_bias, rtol=0, atol=0)
 
 
-def test_fused_lora_rejects_incompatible_input_size(monkeypatch):
-    """Do not silently crop an incompatible adapter into a valid local shape."""
+@pytest.mark.parametrize(
+    ("layer_cls", "delta_shape", "error_match"),
+    [
+        pytest.param(linear.RowParallelLinear, (16, 9), "LoRA input size", id="row-input"),
+        pytest.param(linear.RowParallelLinear, (1, 8), "LoRA output size", id="row-output-broadcast"),
+        pytest.param(linear.ColumnParallelLinear, (17, 8), "LoRA output size", id="column-output"),
+        pytest.param(linear.ColumnParallelLinear, (16, 1), "LoRA input size", id="column-input-broadcast"),
+    ],
+)
+def test_fused_lora_rejects_incompatible_size(monkeypatch, layer_cls, delta_shape, error_match):
+    """Reject incompatible adapters before cropping, broadcasting, or mutation."""
     monkeypatch.setattr("vllm_omni.diffusion.lora.loader._resolve_lora_compute_device", lambda: None)
     monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
     with set_current_vllm_config(VllmConfig()):
-        layer = linear.RowParallelLinear(8, 16, bias=False, params_dtype=torch.float32)
+        layer = layer_cls(8, 16, bias=False, params_dtype=torch.float32)
     with torch.no_grad():
         layer.weight.zero_()
     module = torch.nn.Module()
     module.proj = layer
     state_dict = {
-        "transformer.proj.lora_A.weight": torch.ones(2, 9),
-        "transformer.proj.lora_B.weight": torch.ones(16, 2),
+        "transformer.proj.lora_A.weight": torch.ones(2, delta_shape[1]),
+        "transformer.proj.lora_B.weight": torch.ones(delta_shape[0], 2),
     }
-    with pytest.raises(ValueError, match="LoRA input size"):
+    with pytest.raises(ValueError, match=error_match):
         LoraLoaderMixin.load_lora_into_module(state_dict, module)
     assert torch.count_nonzero(layer.weight) == 0
