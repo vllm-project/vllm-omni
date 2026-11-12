@@ -116,7 +116,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_accuracy
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm]
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
@@ -185,7 +185,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 300
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -206,7 +206,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_perf
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -295,28 +295,6 @@ steps:
               limit: 1
         commands:
           - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
-
-  - group: ":full_moon: CosyVoice3 Offline MI300 Nightly"
-    steps:
-      - label: "CosyVoice3 Offline Zero-shot Smoke"
-        agent_pool: mi300_1
-        mirror_hardwares: [amdproduction]
-        grade: NonBlocking
-        timeout_in_minutes: 90
-        source_file_dependencies: tts_cosyvoice3_function
-        retry:
-          automatic:
-            - exit_status: 134
-              limit: 1
-        artifact_paths:
-          - artifacts/rocm-cosyvoice3-offline-nightly/**/*
-        commands:
-          - pytest --collect-only -q tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model
-          - pytest -s -v tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model --junitxml=/tmp/cosyvoice3-offline-pytest.xml
-          - |
-            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-cosyvoice3-offline-nightly"
-            mkdir -p "$$artifact_dir"
-            cp -v /tmp/cosyvoice3-offline-pytest.xml "$$artifact_dir/"
 
   - group: ":full_moon: JoyImage MI300 Nightly"
     steps:

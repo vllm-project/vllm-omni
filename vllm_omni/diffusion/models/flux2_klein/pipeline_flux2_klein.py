@@ -192,6 +192,9 @@ class Flux2KleinPipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    # Both CFG branches share latents and timestep; prompts are padded to a
+    # fixed length and the position ids are batched like the latents.
+    supports_cfg_batching = True
     support_image_input = True
 
     def __init__(
