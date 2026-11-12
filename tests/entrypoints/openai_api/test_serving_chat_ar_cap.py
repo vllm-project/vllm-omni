@@ -133,9 +133,6 @@ def _build_chat(monkeypatch, engine):
         lambda messages: ("a cat", []),
     )
     monkeypatch.setattr(chat, "_resolve_height_width_from_extra_body", lambda extra_body: (None, None))
-    monkeypatch.setattr(
-        chat, "_build_sampling_params_list_from_request", lambda request: list(engine.default_sampling_params_list)
-    )
     monkeypatch.setattr(chat, "_apply_text_chat_ar_task_mode", lambda params, request: None)
     monkeypatch.setattr(chat, "_get_diffusion_extra_body_params", lambda: frozenset())
     monkeypatch.setattr(chat, "create_error_response", lambda e: e)
@@ -150,6 +147,23 @@ async def _async_preprocess(*args, **kwargs):
     return (None, [])
 
 
+def _chat_request(modalities: list[str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="req-1",
+        messages=[{"role": "user", "content": "a cat"}],
+        modalities=modalities,
+        stream=False,
+        tool_choice=None,
+        tools=None,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        add_special_tokens=False,
+        chat_template=None,
+        chat_template_kwargs={},
+        watermarking=None,
+    )
+
+
 def test_sizeless_chat_request_caps_ar_stage(monkeypatch):
     """Driving the real chat handler: the AR stage keeps its grid budget.
 
@@ -162,23 +176,57 @@ def test_sizeless_chat_request_caps_ar_stage(monkeypatch):
     captured: dict[str, Any] = {}
     engine = _EngineStub(captured)
     chat = _build_chat(monkeypatch, engine)
-    request = SimpleNamespace(
-        request_id="req-1",
-        messages=[{"role": "user", "content": "a cat"}],
-        modalities=["image"],
-        stream=False,
-        tool_choice=None,
-        tools=None,
-        add_generation_prompt=True,
-        continue_final_message=False,
-        add_special_tokens=False,
-        chat_template=None,
-        chat_template_kwargs={},
-        watermarking=None,
+    monkeypatch.setattr(
+        chat, "_build_sampling_params_list_from_request", lambda request: list(engine.default_sampling_params_list)
     )
 
-    result = asyncio.run(chat._create_chat_completion(request, None))
+    result = asyncio.run(chat._create_chat_completion(_chat_request(["image"]), None))
 
     assert isinstance(result, ValueError)  # the sentinel error response
     ar_params = captured["params"][0]
     assert ar_params.max_tokens == 1281
+
+
+@pytest.mark.parametrize(
+    "stage_configs",
+    [
+        [
+            SimpleNamespace(stage_id=0, stage_type="llm", is_comprehension=False, model_arch="Thinker"),
+            SimpleNamespace(stage_id=1, stage_type="llm", is_comprehension=False, model_arch="Talker"),
+        ],
+        [
+            {"engine_args": {"model_arch": "Thinker", "model_stage": "thinker"}},
+            {"engine_args": {"model_arch": "Talker", "model_stage": "talker"}},
+        ],
+    ],
+    ids=["stage-objects", "stage-dicts"],
+)
+def test_chat_request_without_comprehension_stage_completes(monkeypatch, stage_configs):
+    """A multi-stage pipeline that marks no comprehension stage still serves chat.
+
+    Runs the real sampling-params builder and AR-cap lookup. Before 8bf6505f
+    the AR-cap lookup raised "No comprehension stage", and on 8bf6505f the
+    builder still did; both returned that ValueError as an error response
+    before generate() ran. Every stage must keep its configured max_tokens.
+    """
+    captured: dict[str, Any] = {}
+    engine = _EngineStub(captured)
+    engine.stage_configs = stage_configs
+    engine.output_modalities = ["text"]
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=2048), SamplingParams(max_tokens=4096)]
+    chat = _build_chat(monkeypatch, engine)
+    completed = object()
+
+    async def _preprocess_one_prompt(*args, **kwargs):
+        return (None, [{"prompt": "a cat"}])
+
+    async def _full_generator(*args, **kwargs):
+        return completed
+
+    monkeypatch.setattr(chat, "_preprocess_chat", _preprocess_one_prompt)
+    monkeypatch.setattr(chat, "chat_completion_full_generator", _full_generator)
+
+    result = asyncio.run(chat._create_chat_completion(_chat_request(["text"]), None))
+
+    assert result is completed
+    assert [sp.max_tokens for sp in captured["params"]] == [2048, 4096]

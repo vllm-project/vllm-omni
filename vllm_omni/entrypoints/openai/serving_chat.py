@@ -987,15 +987,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # requests still cap their AR budget — the registered
                 # builder resolves the absent size to the model's default
                 # grid. Single-stage engines have no AR stage to cap.
-                # Missing comprehension stages must not fail the request:
-                # the AR cap is a no-op when the index is None (Ming3-Audio
-                # and other multi-stage pipelines that do not mark one).
-                comprehension_idx = None
-                if not is_single_stage_diffusion(self.engine_client):
-                    try:
-                        comprehension_idx = self._get_comprehension_stage_index()
-                    except ValueError:
-                        comprehension_idx = None
+                # Multi-stage pipelines that mark no comprehension stage get
+                # None, which the AR cap treats as a no-op.
+                comprehension_idx = (
+                    None
+                    if is_single_stage_diffusion(self.engine_client)
+                    else self._find_comprehension_stage_index(self.engine_client.stage_configs)
+                )
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -1494,14 +1492,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_configs):
+    @staticmethod
+    def _find_comprehension_stage_index(stage_configs: Sequence[Any]) -> int | None:
+        """Return the first ``is_comprehension`` stage index, or None if no stage is marked."""
+        for idx, stage in enumerate(stage_configs):
             is_comprehension = (
                 stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
             )
             if is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return None
+
+    def _get_comprehension_stage_index(self) -> int:
+        idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
+        if idx is None:
+            raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return idx
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -1617,7 +1623,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             List of SamplingParams, one for each stage.
         """
         default_params_list = self.engine_client.default_sampling_params_list
-        comprehension_idx = self._get_comprehension_stage_index()
+        # Without a comprehension stage every stage keeps its YAML defaults.
+        comprehension_idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
@@ -3429,11 +3436,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
 
-        comprehension_idx = None
-        for idx, stage in enumerate(stage_configs):
-            if getattr(stage, "is_comprehension", False):
-                comprehension_idx = idx
-                break
+        comprehension_idx = self._find_comprehension_stage_index(stage_configs)
 
         sampling_params_list = build_stage_sampling_params_list(
             stage_configs,
