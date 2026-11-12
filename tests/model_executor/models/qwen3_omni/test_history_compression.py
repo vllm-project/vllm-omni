@@ -22,7 +22,6 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     CompressionPrompt,
     IncrementalHistoryPolicy,
     QwenHistoryPolicy,
-    QwenHistoryState,
     load_history_policy,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
@@ -74,7 +73,7 @@ async def test_external_compressor_config_to_prompt_to_stored_memory():
     owner = plugin._history_runtime
     reference = runtime()
     owner.processor, owner.max_model_len = reference.processor, reference.max_model_len
-    state = QwenHistoryState()
+    state = owner.create_state()
     sync_history(state, text_history())
     request = await owner.prepare(state)
     assert "JSON object" in request.prompt["prompt"]

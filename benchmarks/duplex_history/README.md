@@ -235,14 +235,16 @@ selected sources are charged to the strategy limit until feature preparation
 finishes, including cancellation. If a source exists but cannot fit that limit,
 the omission reason is `summary_capacity`, not `source_unavailable`.
 
-An indivisible turn with too many distinct audio payloads records
-`summary_audio_capacity` and logs the count/limit before advancing past it.
+An indivisible turn with too many distinct audio payloads raises a preparation
+error reporting the count and request limit. Its processed cursor, published
+memory and retained audio remain unchanged.
 Consecutive commits before one response share a single payload. Deleting
 assistant replies between previously separate audio turns can join distinct
-payloads into a turn that exceeds the per-request limit. Such a turn is omitted
-without a summary; this prototype does not split original audio across requests.
-The omission allows later turns to progress but cannot preserve the omitted
-turn's facts in memory.
+payloads into a turn that exceeds the per-request limit. This implementation
+does not split original audio across requests. Dialogue summarization stays
+pending until a source edit makes the turn fit; later foreground requests can
+still use bounded recent history. A new foreground submission or changed source
+selection permits another attempt. Original Session records are retained.
 
 Operational failures (response timeout, protocol rejection, connection loss or
 an ended response iterator) are written as `run_error` rows before the next

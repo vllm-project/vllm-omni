@@ -6,11 +6,14 @@ from dataclasses import replace
 
 import pybase64
 import pytest
+from PIL import Image
 
 from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
 from tests.model_executor.models.qwen3_omni.test_history_policy import completion, runtime, sync_history, text_history
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextNodeRejectedError, source_refs
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import QwenHistoryState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -174,6 +177,38 @@ def test_visual_limits_are_installed_when_session_state_is_created():
     sync_history(state, text_history(4))
     owner.policy_for(state, state.history, state.snapshot.history_revision)
     assert memory == before
+
+
+def test_history_state_requires_explicit_deployment_limits():
+    with pytest.raises(TypeError, match="limits"):
+        QwenHistoryState()
+
+
+def test_session_state_requires_explicit_history_state():
+    with pytest.raises(TypeError, match="history_policy_state"):
+        QwenDuplexSessionState()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [MemoryError, Image.DecompressionBombError, RuntimeError, ValueError])
+async def test_visual_resource_and_programming_errors_preserve_retryable_sources(monkeypatch, error):
+    owner = runtime(recent_messages=2)
+    state = state_for(owner)
+    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    before = visual_snapshot(state)
+
+    def fail_decode(url):
+        raise error("decoder failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime.decode_image", fail_decode)
+        with pytest.raises(error, match="decoder failed"):
+            await owner.prepare(state)
+    assert visual_snapshot(state) == before
+    assert not state.counts["visual_omissions"]
+    request = await owner.prepare(state)
+    assert len(request.prompt["multi_modal_data"]["image"]) == 1
+    assert owner.apply(state, request, completion("red square"))
 
 
 @pytest.mark.asyncio

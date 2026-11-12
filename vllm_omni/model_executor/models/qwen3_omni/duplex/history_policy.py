@@ -193,7 +193,7 @@ class QwenHistoryState:
     policy_cache_key: tuple[object, int, int, int] | None = None
     cached_work: HistoryWork | VisualWork | None = None
     partial: HistoryFold | None = None
-    limits: InitVar[HistoryLimits] = HistoryLimits()
+    limits: InitVar[HistoryLimits] = field(kw_only=True)
     visual: QwenVisualHistory = field(init=False)
 
     def __post_init__(self, limits: HistoryLimits) -> None:

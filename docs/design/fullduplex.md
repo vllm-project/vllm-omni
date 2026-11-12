@@ -228,13 +228,16 @@ visual output is limited by `summary_tokens`, default 512. Oldest long-term
 summaries are retired beyond this bound. Source message positions label visual
 evidence; they are not video timestamps. Qwen installs visual limits when the
 Session model state is constructed; planning does not rewrite live limits.
+Both the history state and its deployment limits are required constructor
+arguments, so callers cannot silently fall back to default visual limits.
 
 An admitted JPEG/PNG can have a valid header but an undecodable body. For completed
 history, the preparation worker identifies that source as unavailable. After
 rechecking its identity on the owner loop, Qwen records a visual omission, advances
 past it and continues with valid images or dialogue. The failed image is not
-included in a visual summary's source dependencies. Resource/programming errors
-still fail the request. Original Session records remain intact, and an undecodable
+included in a visual summary's source dependencies. Resource errors, including
+Pillow decompression-bomb protection, and programming errors still fail
+preparation without advancing visual progress. Original Session records remain intact, and an undecodable
 current input still fails foreground preparation rather than being silently omitted.
 
 Visual summaries are separate from dialogue memory. Source images remain

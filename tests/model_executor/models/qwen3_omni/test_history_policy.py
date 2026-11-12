@@ -25,7 +25,6 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
-from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -152,7 +151,7 @@ def test_current_mixed_input_survives_too_small_history_media_pool():
     plugin._history_runtime = runtime("bounded_recent", max_audio_bytes=100)
     message, payload = audio_message(0)
     message["content"].append({"type": "text", "text": "current budget is 5000"})
-    state = QwenDuplexSessionState()
+    state = plugin.create_session_state()
     bind_history(state.history_policy_state, [message])
     config = plugin.prepare_prompt_config({"conversation": [message]}, state=state, payload=payload)
     prompt = plugin._history_runtime.build_foreground(config[HISTORY_PROMPT], {}, 128)
@@ -170,7 +169,7 @@ async def test_configured_media_capacity_triggers_before_sources_are_lost(limit)
     if limit == "bytes_between_item_sizes":
         limits["max_audio_bytes"] = 3 * len(payload["audio"]) // 2
     plugin._history_runtime = runtime(recent_messages=100, **limits)
-    state, history = QwenDuplexSessionState(), []
+    state, history = plugin.create_session_state(), []
     planned = []
     for index in range(6):
         message, payload = audio_message(index)
@@ -194,7 +193,7 @@ async def test_configured_media_capacity_triggers_before_sources_are_lost(limit)
 async def test_background_uses_available_foreground_source_within_media_limits():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin._history_runtime = runtime(recent_messages=2, max_audio_items=1)
-    state = QwenDuplexSessionState()
+    state = plugin.create_session_state()
     first, payload = audio_message(0)
     later, later_payload = audio_message(1)
     history = [
@@ -219,7 +218,8 @@ async def test_background_uses_available_foreground_source_within_media_limits()
 
 
 def test_readding_old_cached_audio_does_not_change_eviction_order():
-    state, limits = QwenHistoryState(), HistoryLimits(max_audio_items=2)
+    limits = HistoryLimits(max_audio_items=2)
+    state = QwenHistoryState(limits=limits)
     entries, history = [], []
     for i in range(4):
         message, payload = audio_message(i)
@@ -238,7 +238,7 @@ def test_readding_old_cached_audio_does_not_change_eviction_order():
 async def test_unchanged_revision_skips_history_work_but_edits_and_progress_recompute(mocker):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin._history_runtime = runtime()
-    state, history = QwenDuplexSessionState(), text_history()
+    state, history = plugin.create_session_state(), text_history()
     owner = plugin._history_runtime
     bind_history(state.history_policy_state, history)
     initial = plugin.auxiliary_policy(state=state, history_revision=1, history=history)
@@ -263,7 +263,7 @@ async def test_unchanged_revision_skips_history_work_but_edits_and_progress_reco
 def test_no_pending_work_is_cached_and_new_runtime_revalidates(mocker):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin._history_runtime = runtime()
-    state, history = QwenDuplexSessionState(), text_history(6)
+    state, history = plugin.create_session_state(), text_history(6)
     bind_history(state.history_policy_state, history)
     assert plugin.auxiliary_policy(state=state, history_revision=1, history=history) is None
     reconcile = mocker.spy(state.history_policy_state, "reconcile")
@@ -282,7 +282,7 @@ def test_unchanged_history_reconsiders_new_media_pressure():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     _, payload = audio_message(0)
     plugin._history_runtime = runtime(recent_messages=100, max_audio_bytes=len(payload["audio"]))
-    state = QwenDuplexSessionState()
+    state = plugin.create_session_state()
     message, payload = audio_message(0)
     history = [message, {"role": "assistant", "content": "heard"}]
     bind_history(state.history_policy_state, history)
@@ -421,7 +421,8 @@ async def test_source_edits_reject_late_results_and_invalidate_derived_memory(ed
 
 
 def test_media_pool_deduplicates_bindings_and_enforces_single_item_limit():
-    state, limits = QwenHistoryState(), HistoryLimits(max_audio_bytes=1500, max_audio_items=2)
+    limits = HistoryLimits(max_audio_bytes=1500, max_audio_items=2)
+    state = QwenHistoryState(limits=limits)
     for i in range(4):
         m, p = audio_message(i)
         state.retain([((m["content"],), p)] * 2, limits)
@@ -624,10 +625,10 @@ def test_identical_pcm_in_distinct_turns_is_not_confused_with_current_input():
 
 
 def test_rebinding_audio_counts_source_still_held_by_preparation():
-    state = QwenHistoryState()
     message, payload = audio_message(0)
     _, replacement = audio_message(1)
     limits = HistoryLimits(max_audio_items=1, max_audio_bytes=len(payload["audio"]))
+    state = QwenHistoryState(limits=limits)
     sync_history(state, [message])
     state.retain([((message["content"],), payload)], limits)
     original = state.audio[0]
@@ -674,7 +675,7 @@ async def test_audio_trigger_uses_bound_model_limit():
 )
 def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, expected):
     owner = runtime(recent_messages=100, audio_summary_trigger_bytes=trigger_bytes, max_audio_bytes=pool_bytes)
-    state, history, retained = QwenHistoryState(), [], []
+    state, history, retained = owner.create_state(), [], []
     for i in range(2):
         message, payload = audio_message(i)
         payload["audio"] = chr(65 + i) * (3 * 1024**2)
@@ -721,7 +722,7 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
 
 
 @pytest.mark.asyncio
-async def test_deleting_assistant_boundaries_can_exceed_single_turn_audio_capacity(caplog):
+async def test_over_limit_audio_turn_preserves_sources_until_history_is_repaired():
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import AckPlayback, Commit, DeleteItem
@@ -748,10 +749,22 @@ async def test_deleting_assistant_boundaries_can_exceed_single_turn_audio_capaci
         sync_history(memory, h.session.history, session=h.session)
         assert len(memory.audio) == 5
         assert len(h.session.history) == 6
+        retained = tuple(memory.audio)
+        with pytest.raises(DuplexRuntimeConfigError, match="5 audio payloads.*limit 4"):
+            await owner.prepare(memory)
+        assert memory.processed == 0 and not memory.summary
+        assert not memory.omissions and not memory.preparing
+        assert tuple(memory.audio) == retained
+        assert len(h.session.history) == 6
+        # An explicit source edit makes the pending turn retryable. Only the
+        # user's deletion may discard a source, not failed summary preparation.
+        await h.run(DeleteItem(item_id=h.session.history_snapshot().item_ids[0]))
+        sync_history(memory, h.session.history, session=h.session)
         request = await owner.prepare(memory)
-        assert request is None
-        assert list(memory.omissions) == [(0, 6, "summary_audio_capacity")]
-        assert "5 audio payloads exceed request limit 4" in caplog.text
-        assert memory.processed == 6 and not memory.summary
+        assert request is not None
+        assert len(request.prompt["multi_modal_data"]["audio"]) == 4
+        assert owner.apply(memory, request, completion("all remaining audio facts"))
+        assert memory.processed == 5 and memory.summary == "all remaining audio facts"
+        assert not memory.omissions
     finally:
         await h.manager.shutdown()

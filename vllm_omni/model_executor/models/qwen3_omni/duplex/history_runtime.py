@@ -5,13 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+from binascii import Error as Base64DecodeError
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import numpy as np
 import pybase64
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -532,7 +532,7 @@ class QwenHistoryRuntime:
         for item in work.inputs[work.start : work.end]:
             try:
                 image = decode_image(item.url)
-            except (ValueError, OSError, SyntaxError, Image.DecompressionBombError):
+            except (Base64DecodeError, OSError, SyntaxError):
                 # An admitted image can have valid magic bytes but a corrupt
                 # body. Record only source failure; resource/programming errors
                 # must still fail the request rather than silently lose evidence.
@@ -700,17 +700,20 @@ class QwenHistoryRuntime:
                     if len(boundaries) > 1:
                         boundaries.pop()
                         continue
-                    reason = "summary_capacity"
                     if len(group.audio) > self.max_audio:
-                        reason = "summary_audio_capacity"
                         logger.warning(
-                            "Qwen history omitted whole turn [%d, %d): %d audio payloads exceed request limit %d",
+                            "Qwen history turn [%d, %d) remains pending: %d audio payloads exceed request limit %d",
                             candidate.start,
                             candidate.end,
                             len(group.audio),
                             self.max_audio,
                         )
-                    state.advance(candidate, omission=reason)
+                        raise DuplexRuntimeConfigError(
+                            f"Qwen history turn [{candidate.start}, {candidate.end}) has {len(group.audio)} "
+                            f"audio payloads exceeding request limit {self.max_audio}; "
+                            "history remains pending until the turn fits"
+                        )
+                    state.advance(candidate, omission="summary_capacity")
                     break
                 # Foreground-cache fallback also consumes strategy capacity.
                 # These worker-only references do not create new source bindings.
