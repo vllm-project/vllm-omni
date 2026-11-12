@@ -3,8 +3,11 @@
 
 """Caller-text entry for the shared DRVEXO Talker, including reference voices."""
 
+from vllm_omni.entrypoints.openai.drvexo_speech import load_speech_tokenizer
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.model_executor.models.drvexo_speech_8b.lexical import fixed_text_ids
 
 
 @register_tts_adapter
@@ -14,6 +17,25 @@ class DRVEXOTTSAdapter(Qwen3TTSAdapter):
     model_archs = frozenset({"DRVEXOSpeech8BTalker", "DRVEXOUnifiedTalker"})
     detect_priority = 90
     entry_stage_id = 1
+
+    def _load_text_tokenizer(self) -> None:
+        server = self.ctx.server
+        if server._tts_tokenizer is None:
+            assert self.ctx.engine_client is not None
+            # The root tokenizer belongs to Thinker. Match the native Talker's
+            # local tokenizer for both admission and placeholder length/IDs.
+            server._tts_tokenizer = load_speech_tokenizer(self.ctx.engine_client.model_config.model)
+
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        error = super().validate(request)
+        if error is not None:
+            return error
+        self._load_text_tokenizer()
+        try:
+            fixed_text_ids(request.input, self.ctx.server._tts_tokenizer)
+        except ValueError as exc:
+            return str(exc)
+        return None
 
     def apply_sampling_overrides(self, sampling_params_list, request, prompt=None, request_id=None):
         # Serving passes all stages indexed from zero, not an entry-stage slice.
