@@ -40,10 +40,24 @@ steps:
           - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
-      - label: "Simple · Engine&Entrypoints&Diffusion Test"
+      # Split the CPU sweep so neither half approaches the step timeout
+      # (#9847). The merged step collected 11540 tests and ran pytest for
+      # 19m47s (build 18720); the halves below collect roughly half of that
+      # each and keep the same per-step timeout budget.
+      # `-n 4 --dist loadgroup` also runs each half on four workers, the flags
+      # the nightly CPU coverage job already runs for this selection on the
+      # same hardware (#9392). `--dist loadgroup` is required: the collection
+      # hook gives every `cpu` module its own group and pins unmarked tests.
+      - label: "Simple · Engine&Entrypoints Test"
         timeout_in_minutes: 25
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' -n 4 --dist loadgroup"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Diffusion Test"
+        timeout_in_minutes: 25
+        commands:
+          - "pytest -sv tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu' -n 4 --dist loadgroup"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"

@@ -637,8 +637,15 @@ def test_cuda_ready_retains_full_model_executor_coverage() -> None:
     assert "@pytest.mark.slow" not in test_source
 
 
-def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
-    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
+@pytest.mark.parametrize(
+    ("label", "paths"),
+    [
+        ("Simple · Engine&Entrypoints Test", ["tests/entrypoints", "tests/engine"]),
+        ("Simple · Diffusion Test", ["tests/diffusion", "--ignore=tests/diffusion/models"]),
+    ],
+)
+def test_cuda_ready_cpu_sweep_halves_have_cleanup_headroom(label: str, paths: list[str]) -> None:
+    step = _find_step(label, CUDA_READY_PIPELINE)
     assert step["timeout_in_minutes"] == 25
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
@@ -646,13 +653,35 @@ def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
     assert argv == [
         "pytest",
         "-sv",
-        "tests/entrypoints",
-        "tests/engine",
-        "tests/diffusion",
-        "--ignore=tests/diffusion/models",
+        *paths,
         "-m",
         "core_model and cpu",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
     ]
+
+
+def test_cuda_ready_cpu_sweep_halves_partition_the_merged_selection() -> None:
+    """The split halves must keep the merged step's selection: no overlap, no gap."""
+    merged_paths = ["tests/entrypoints", "tests/engine", "tests/diffusion"]
+    merged_ignores = ["--ignore=tests/diffusion/models"]
+
+    halves = ("Simple · Engine&Entrypoints Test", "Simple · Diffusion Test")
+    owned: list[str] = []
+    ignored: list[str] = []
+    for label in halves:
+        step = _find_step(label, CUDA_READY_PIPELINE)
+        pytest_command = next(command for command in step["commands"] if "pytest" in command)
+        for arg in split(pytest_command):
+            if arg.startswith("--ignore="):
+                ignored.append(arg)
+            elif arg.startswith("tests/"):
+                owned.append(arg)
+
+    assert sorted(owned) == sorted(merged_paths)
+    assert sorted(ignored) == sorted(merged_ignores)
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
