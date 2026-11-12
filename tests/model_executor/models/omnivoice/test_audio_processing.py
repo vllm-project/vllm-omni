@@ -313,7 +313,9 @@ def _build_fake_pipeline(monkeypatch, prepared_waveform, *, asr_text="reference 
     model = pipeline_omnivoice.OmniVoicePipeline.__new__(pipeline_omnivoice.OmniVoicePipeline)
     torch.nn.Module.__init__(model)
     model.device = torch.device("cpu")
-    model.config = SimpleNamespace(num_audio_codebook=2, audio_mask_id=-1)
+    model.config = SimpleNamespace(
+        num_audio_codebook=2, audio_mask_id=-1, frame_rate=25, audio_chunk_duration=15.0, audio_chunk_threshold=30.0
+    )
     model.audio_tokenizer = SimpleNamespace(config=SimpleNamespace(sample_rate=_SAMPLE_RATE, hop_length=_HOP_LENGTH))
     model.tokenizer = SimpleNamespace(encode=lambda text: SimpleNamespace(ids=[1, 2]))
     model.generator = _FakeGenerator(num_codebooks=2)
@@ -383,7 +385,8 @@ def test_pipeline_uses_one_prepared_waveform_for_asr_and_tokenizer(monkeypatch):
     assert len(encoded_calls) == 1
     torch.testing.assert_close(encoded_calls[0][0], torch.from_numpy(prepared))
     assert encoded_calls[0][1] == _SAMPLE_RATE
-    assert model.duration_estimator.calls == [("hello", "reference transcript.", 3)]
+    # Estimate the full text for chunk admission, then the selected chunk.
+    assert model.duration_estimator.calls == [("hello", "reference transcript.", 3)] * 2
 
 
 def test_pipeline_explicit_reference_text_prepares_audio_without_asr(monkeypatch):
@@ -404,7 +407,8 @@ def test_pipeline_explicit_reference_text_prepares_audio_without_asr(monkeypatch
     assert model._asr_pipeline.inputs == []
     assert prepare_calls[0][2]["trim_long"] is False
     assert len(encoded_calls) == 1
-    assert model.duration_estimator.calls == [("hello", "caller supplied transcript.", 3)]
+    # Estimate the full text for chunk admission, then the selected chunk.
+    assert model.duration_estimator.calls == [("hello", "caller supplied transcript.", 3)] * 2
 
 
 def test_pipeline_text_only_skips_reference_audio_processing(monkeypatch):
@@ -420,7 +424,8 @@ def test_pipeline_text_only_skips_reference_audio_processing(monkeypatch):
     assert prepare_calls == []
     assert encoded_calls == []
     assert model._asr_pipeline.inputs == []
-    assert model.duration_estimator.calls == [("hello", "Nice to meet you.", 25)]
+    # Estimate the full text for chunk admission, then the selected chunk.
+    assert model.duration_estimator.calls == [("hello", "Nice to meet you.", 25)] * 2
 
 
 def test_pipeline_text_only_bypasses_audio_postprocessing(monkeypatch):
@@ -600,10 +605,10 @@ def test_step_execution_preserves_reference_postprocessing(monkeypatch, clone):
 
     assert output.error is None
     if clone:
-        assert state.extra["reference_rms"] == 0.07
+        assert state.extra["prepared"].reference_rms == 0.07
         assert output.output.shape == (1, 1, 14800)
         assert output.output[0, 0, 5000].item() == pytest.approx(0.14, abs=1e-5)
     else:
-        assert state.extra["reference_rms"] is None
+        assert state.extra["prepared"].reference_rms is None
         assert prepare_calls == []
         torch.testing.assert_close(output.output, torch.full((1, 1, 10000), 0.2))

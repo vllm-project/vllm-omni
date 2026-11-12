@@ -1312,6 +1312,9 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
     )
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_cnn_cache"].shape[2] == 4
     assert stacked["estimator_att_cache"].shape[2] == 4
     restored = adapter._split_flow_cache(stacked, 2)
@@ -1375,6 +1378,9 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     assert states[0] is states[1]
 
     stacked = adapter._stack_flow_cache(states)
+    stacked["estimator_att_cache"] = adapter._stack_estimator_att(
+        [state.flow_cache["estimator_att_cache"] for state in states]
+    )
     assert stacked["estimator_att_cache"].dtype == torch.bfloat16
     restored = adapter._split_flow_cache(stacked, 2)
     for original, round_tripped in zip(states, restored, strict=True):
@@ -1488,6 +1494,8 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         segment_text_utf8,
     )
     assert payload["meta.tts_is_last_chunk"][0].item() is True
+    assert payload["meta.duplex_audio_cache_epoch"][0].item() == final["meta"]["cache_epoch"]
+    assert payload["meta.duplex_audio_chunk_seq"][0].item() == 1
     assert payload["meta.turn_end"][0].item() is True
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
@@ -2087,6 +2095,10 @@ def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():
     assert torch.count_nonzero(att[..., mel_frames : mel_frames + pad_frames, :]) == 0
     # This tail becomes the next chunk's CNN left context.
     assert torch.count_nonzero(cnn[..., -pad_frames:]) == 0
+    # Per-request history must preserve the same masked padding for later chunks.
+    with torch.no_grad():
+        _, _, rows = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=[att[..., :0, :]])
+    assert torch.equal(rows[0], att)
 
 
 def test_padding_does_not_change_the_valid_frames():
@@ -2380,6 +2392,7 @@ def test_cfm_padding_mask_is_deferred_until_graph_fallback(monkeypatch, graph_hi
 @pytest.mark.parametrize("offsets", [None, (2, 2), (1, 3)])
 def test_ragged_cfm_mask_preserves_query_and_cache_validity(offsets):
     adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter.flow.decoder.rand_noise = torch.arange(100, dtype=torch.float32).reshape(1, 1, 100)
     lengths = [3, 1]
     cache = None if offsets is None else [torch.zeros(1, 1, 2, 1, n, 2) for n in offsets]
     seen = []
@@ -2387,6 +2400,11 @@ def test_ragged_cfm_mask_preserves_query_and_cache_validity(offsets):
     def replay(**kwargs):
         mask = kwargs["attn_mask"]
         cache_lengths = offsets or (0, 0)
+        # Whole-Euler replay receives B noise rows but a 2B CFG mask.
+        # The Euler loop duplicates each request's noise for both CFG branches.
+        assert kwargs["x"].shape[0] == len(cache_lengths)
+        for row, start in enumerate(cache_lengths):
+            torch.testing.assert_close(kwargs["x"][row, 0], torch.arange(start, start + 3, dtype=torch.float32))
         expected = torch.zeros(4, 3, 3 + max(cache_lengths), dtype=torch.bool)
         for row in range(4):
             length, cached = lengths[row % 2], cache_lengths[row % 2]
@@ -2459,3 +2477,23 @@ def test_estimator_step_preserves_precomputed_time_embedding(monkeypatch):
         time_embedding=supplied,
     )
     assert seen[0] is supplied
+
+
+def test_eager_per_request_history_matches_stacked_history():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    mu = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4)
+    speakers, cond = torch.ones(2, 1), torch.zeros_like(mu)
+    _, cnn, previous = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+    rows = [torch.cat((previous[:, :, row : row + 1], previous[:, :, 2 + row : 3 + row]), dim=2) for row in range(2)]
+    expected, expected_cnn, expected_att = adapter._decode_cfm(mu, speakers, cond, cnn_cache=cnn, att_cache=previous)
+    actual, actual_cnn, actual_rows = adapter._decode_cfm(
+        mu, speakers, cond, cnn_cache=cnn, att_cache=rows, att_keep=(2, 2)
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_cnn, expected_cnn)
+    trimmed = torch.cat((expected_att[..., :2, :], expected_att[..., -2:, :]), dim=-2)
+    assert torch.equal(adapter._stack_estimator_att(actual_rows), trimmed)
+    # New row caches are independently owned; updating one cannot corrupt a peer.
+    peer = actual_rows[1].clone()
+    actual_rows[0].zero_()
+    assert torch.equal(actual_rows[1], peer)

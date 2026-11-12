@@ -4,6 +4,7 @@
 import copy
 import logging
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -20,16 +21,20 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.attention.schedule import require_request_attention_schedule_fits
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
     get_forward_context,
     is_forward_context_available,
+    request_denoise_progress,
     set_forward_context_denoise_step_idx,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -61,6 +66,7 @@ from .request_layout import HunyuanPreparedLayout
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +89,24 @@ def _config_flag(config: Any, name: str) -> bool:
     """Read an optional Hunyuan config flag with legacy-safe defaults."""
 
     return bool(getattr(config, name, False))
+
+
+def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
+    """Note at startup that a default schedule's step-0 profile also shapes every later step.
+
+    Later steps reuse the prompt K/V computed in the step-0 forward, and deeper layers' prompt K/V
+    depend on earlier layers' attention outputs. Ranges are ordered, so only the first can cover
+    step 0. A request's own schedule is not known at startup. Every TP/SP rank builds the pipeline,
+    so only rank 0 logs.
+    """
+    schedule_config = od_config.diffusion_attention_schedule
+    default = schedule_config.default if schedule_config is not None else ()
+    if default and default[0].start == 0 and _is_rank_zero():
+        logger.info(
+            "HunyuanImage-3.0 reuses the step-0 prompt K/V on every later step, so profile %r, which the "
+            "default attention schedule selects at step 0, also affects the steps it does not cover.",
+            default[0].profile,
+        )
 
 
 class HunyuanImage3FlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
@@ -184,11 +208,17 @@ def _shift_full_attn_spans(
 
 
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
-    hf_config = get_config(od_config.model, trust_remote_code=True)
+    hf_config = get_config(od_config.model, trust_remote_code=True, revision=od_config.revision)
     image_processor = HunyuanImage3ImageProcessor(hf_config)
     prepare_diffusion_kv_layout = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-    tokenizer_wrapper = TokenizerWrapper(od_config.model) if prepare_diffusion_kv_layout else None
-    generation_config = GenerationConfig.from_pretrained(od_config.model) if prepare_diffusion_kv_layout else None
+    tokenizer_wrapper = (
+        TokenizerWrapper(od_config.model, revision=od_config.revision) if prepare_diffusion_kv_layout else None
+    )
+    generation_config = (
+        GenerationConfig.from_pretrained(od_config.model, revision=od_config.revision)
+        if prepare_diffusion_kv_layout
+        else None
+    )
     vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
     vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
     vit_patch_size = getattr(image_processor.vision_encoder_processor, "patch_size", 1)
@@ -342,6 +372,7 @@ class HunyuanImage3Pipeline(
     SupportImageInput,
     SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
+    DenoiseProgressMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
@@ -373,14 +404,15 @@ class HunyuanImage3Pipeline(
         "final_layer.forward",
     ]
 
-    def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        self.hf_config = get_config(od_config.model, trust_remote_code=True)
+    def __init__(self, od_config: OmniDiffusionConfig, backbone_meta: bool = False) -> None:
+        self.hf_config = get_config(od_config.model, trust_remote_code=True, revision=od_config.revision)
         self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
         self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
         super().__init__(self.hf_config)
         # update diffusion config
-        self.generation_config = GenerationConfig.from_pretrained(od_config.model)
+        self.generation_config = GenerationConfig.from_pretrained(od_config.model, revision=od_config.revision)
         self.od_config = od_config
+        _log_step0_profile_reuse(od_config)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -391,7 +423,29 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        shared_group = getattr(od_config, "weight_sharing", None)
+        # The AR adapter's router contract is FP32; ordinary DiT stays unchanged.
+        shared_router_dtype = torch.float32 if shared_group is not None and shared_group.role == "consumer" else None
+        if backbone_meta:
+            from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
+
+            validate_supported_layout(self.hf_config)
+            # Shared loading currently assumes TP only, with EP disabled.
+            # RoPE caches are private and must be created on the execution device.
+            rope_device = get_local_device()
+            # Only the shared backbone is constructed on meta; private
+            # components below are built on the worker's target device.
+            with torch.device("meta"):
+                self.model = HunyuanImage3Model(
+                    self.hf_config,
+                    quant_config=quant_config,
+                    shared_router_dtype=shared_router_dtype,
+                    rope_device=rope_device,
+                )
+        else:
+            self.model = HunyuanImage3Model(
+                self.hf_config, quant_config=quant_config, shared_router_dtype=shared_router_dtype
+            )
         self.transformer = self.model
         # Lazy import to break circular dependency:
         # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan
@@ -402,7 +456,7 @@ class HunyuanImage3Pipeline(
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(od_config.model)
+        self._tkwrapper = TokenizerWrapper(od_config.model, revision=od_config.revision)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
@@ -503,6 +557,13 @@ class HunyuanImage3Pipeline(
         return loader.load_weights(
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
+
+    @staticmethod
+    def get_weight_sharing_adapter() -> "WeightSharingAdapter":
+        """Return the model-specific shared-weight operations used by the loader."""
+        from vllm_omni.distributed.weight_sharing.adapters import hunyuan_image3
+
+        return hunyuan_image3
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -2085,6 +2146,11 @@ class HunyuanImage3Pipeline(
             None,
             None,
         )
+        # Check the request's schedule against the sequence built here, before prepare_latents and the
+        # AR-reuse prefill below. The runner has not opened the forward context yet.
+        require_request_attention_schedule_fits(
+            state.sampling, self.od_config.diffusion_attention_schedule, len(timesteps)
+        )
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
         if hasattr(req_scheduler, "set_begin_index"):
@@ -2336,6 +2402,7 @@ class HunyuanImage3Pipeline(
         pred = pred.to(dtype=torch.float32)
 
         if first_step:
+            # Later steps reuse this prompt K/V, computed at step 0 under whatever profile step 0 selected.
             self._capture_prompt_kv_cache(states, row_state_indexes, row_branches)
         if cfg_factor > 1:
             pred_cond, pred_uncond = pred.chunk(2)
@@ -2372,13 +2439,39 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
-        self._ensure_grouped_attention_backend_supported(len(states))
+        # A bound schedule selects attention from each request's own step and total, so requests
+        # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
+        scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
+        if scheduled:
+            groups = [[state] for state in states]
+        else:
+            self._ensure_grouped_attention_backend_supported(len(states))
+            groups = self._split_step_groups(states)
         outputs: dict[str, torch.Tensor] = {}
-        for group in self._split_step_groups(states):
-            pred = self._denoise_step_group(group)
+        for group in groups:
+            with self._scheduled_request_progress(group[0]) if scheduled else nullcontext():
+                pred = self._denoise_step_group(group)
             for state, state_pred in zip(group, pred):
                 outputs[state.request_id] = state_pred.unsqueeze(0)
         return torch.cat([outputs[state.request_id] for state in states], dim=0)
+
+    @staticmethod
+    def _scheduled_request_progress(state: "StepRequestState"):
+        """Publish one scheduled request's step, actual total and normalized timestep around its group.
+
+        _denoise_step_group republishes the same step and clears it after its forward; the returned
+        context manager restores the step, timestep and total on any exit.
+        """
+        timestep = state.current_timestep
+        scheduler = state.scheduler
+        if timestep is None or not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
+            raise RuntimeError(
+                f"scheduled HunyuanImage-3.0 request {state.request_id} needs a current timestep and a "
+                f"flow-matching scheduler; got {type(timestep).__name__} and {type(scheduler).__name__}"
+            )
+        return request_denoise_progress(
+            state.step_index, state.total_steps, float(timestep) / scheduler.config.num_train_timesteps
+        )
 
     def step_scheduler(
         self,

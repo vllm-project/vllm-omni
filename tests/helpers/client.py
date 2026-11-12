@@ -272,8 +272,11 @@ class OpenPIWebSocketSession:
             raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
         try:
             from openpi_client import msgpack_numpy
-        except ImportError as exc:  # pragma: no cover - optional e2e dependency
-            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        except ImportError:
+            # Prefer the real library when it is installed. Otherwise use the
+            # standalone OpenPI codec. Do not call connection._pack/_unpack here:
+            # that round-trip accepts a wrong wire format.
+            from tests.helpers import openpi_msgpack as msgpack_numpy
         return websockets_client, msgpack_numpy
 
     def __init__(

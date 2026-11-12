@@ -119,6 +119,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     session.num_in_flight_tokens = 1
 
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._first_chunk_express = False
     sched._express_min_slack_s = 0.0
     sched.requests = {session.request_id: session}
@@ -190,6 +191,7 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
     session.num_in_flight_tokens = 1
 
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._first_chunk_express = False
     sched._express_min_slack_s = 0.0
     sched.requests = {session.request_id: session}

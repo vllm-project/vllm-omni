@@ -4,6 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -59,7 +60,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
@@ -76,6 +77,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
     get_forward_context,
     get_paged_kv_computed_tokens,
     is_forward_context_available,
@@ -890,6 +892,28 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
+
+    The dense path sends a 4D attention mask with ``full_attn_spans`` on every forward. A backend that honors
+    the spans or declares dense 4D mask support runs it only if it also takes the mask. Any other backend
+    raises at the first dense forward that selects the profile if the profile names it; if the role uses the
+    platform default, that forward falls back to SDPA as outside a schedule, so the check accepts it. The
+    paged path sends no mask; there, startup validation already requires every candidate to match the
+    baseline paged backend.
+    """
+    backend_cls = record.backend_cls
+    if backend_cls.supports_piecewise_spans or backend_cls.supports_dense_4d_mask(record.spec):
+        if backend_cls.supports_attention_mask(record.spec):
+            return None
+    elif record.spec is None:
+        return None
+    return (
+        "HunyuanImage3 image attention sends a 4D attention mask with full_attn_spans on every dense "
+        "forward, so the backend must take the mask and either honor full_attn_spans or consume a dense 4D mask"
+    )
+
+
 class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -936,6 +960,9 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
+        # The dense image attention path always sends a 4D mask together with full_attn_spans.
+        # Startup validation runs this check only with a schedule.
+        self.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     @staticmethod
     def _get_current_starts(
@@ -1655,6 +1682,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         layer_id: int = -1,
         prefix: str = "",
         enable_eplb: bool = False,
+        shared_router_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1686,11 +1714,14 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
+        # None preserves the ordinary model dtype and autocast behavior.
+        self._shared_router_dtype = shared_router_dtype
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
             quant_config=quant_config,
+            params_dtype=shared_router_dtype,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1735,8 +1766,12 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        # Only shared routers override the ordinary dtype/autocast contract.
+        if self._shared_router_dtype is not None:
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                router_logits, _ = self.gate(hidden_states.to(dtype=self._shared_router_dtype))
+        else:
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         return final_hidden_states.view(orig_shape)
@@ -1757,6 +1792,7 @@ class HunYuanAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         layer_id: int = -1,
+        rope_device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1813,12 +1849,19 @@ class HunYuanAttention(nn.Module):
         if rope_scaling is not None:
             # for t2t, fallback rotary_emb type from 'custom' to default.
             rope_scaling["rope_type"] = "default"
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=rope_scaling,
-            is_neox_style=True,
-        )
+        # Shared weights stay on meta until attach; private RoPE caches need real data.
+        with rope_device if rope_device is not None else nullcontext():
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters=rope_scaling,
+                is_neox_style=True,
+            )
+        # get_rope may return a cached module without observing rope_device.
+        if rope_device is not None and self.rotary_emb.cos_sin_cache.is_meta:
+            raise ValueError(
+                "Shared-backbone loading received a cached meta RoPE; a materialized RoPE cache is required."
+            )
         # which attention, from vllm or omni?
         # try use Atten from diffusion
         self.attn = Attention(
@@ -1899,7 +1942,13 @@ class HunYuanAttention(nn.Module):
 
 class HunyuanImage3DecoderLayer(nn.Module):
     def __init__(
-        self, config: HunyuanImage3Config, quant_config: QuantizationConfig | None, layer_idx: int, prefix: str = ""
+        self,
+        config: HunyuanImage3Config,
+        quant_config: QuantizationConfig | None,
+        layer_idx: int,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1934,6 +1983,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 cache_config=None,
                 prefix=f"{prefix}.self_attn",
                 layer_id=layer_idx,
+                rope_device=rope_device,
             )
         else:
             raise RuntimeError(f"Unsupported attention type: {attention_type}")
@@ -1943,7 +1993,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
             or (isinstance(config.num_experts, list) and max(config.num_experts) > 1)
         ) and layer_idx >= config.moe_layer_num_skipped:
             self.mlp = HunYuanSparseMoeBlock(
-                config, quant_config=quant_config, layer_id=layer_idx, prefix=f"{prefix}.mlp"
+                config,
+                quant_config=quant_config,
+                layer_id=layer_idx,
+                prefix=f"{prefix}.mlp",
+                shared_router_dtype=shared_router_dtype,
             )
         else:
             self.mlp = HunYuanMLP(
@@ -2131,7 +2185,14 @@ class HunyuanImage3Model(nn.Module):
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
+    def __init__(
+        self,
+        config: HunyuanImage3Config,
+        quant_config=None,
+        prefix: str = "",
+        shared_router_dtype: torch.dtype | None = None,
+        rope_device: torch.device | None = None,
+    ):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
@@ -2161,6 +2222,8 @@ class HunyuanImage3Model(nn.Module):
                 quant_config=quant_config,
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
+                shared_router_dtype=shared_router_dtype,
+                rope_device=rope_device,
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )
@@ -2656,6 +2719,23 @@ class ClassifierFreeGuidance:
 @dataclass
 class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
     samples: list[Any] | np.ndarray
+
+
+@contextmanager
+def _clear_denoise_progress_on_exit():
+    """Clear the published denoise step on any exit and restore the timestep and total seen on entry.
+
+    The denoise loop publishes a timestep and total only when a schedule is bound; without one, the
+    restore assigns the values those fields already hold.
+    """
+    ctx = get_forward_context() if is_forward_context_available() else None
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    try:
+        yield
+    finally:
+        set_forward_context_denoise_step_idx(None)
+        if ctx is not None:
+            ctx.denoise_timestep, ctx.total_denoise_steps = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -3225,6 +3305,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             timesteps,
             sigmas,
         )
+        # Check a bound schedule against the sequence this call runs, before any forward below, including
+        # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
+        scheduled_total = begin_scheduled_denoise(len(timesteps))
 
         # Prepare latent variables
         latents = self.prepare_latents(
@@ -3301,9 +3384,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             tc_prev_pred = None
             tc_cnt = 0
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
-                set_forward_context_denoise_step_idx(i)
+                if scheduled_total is None:
+                    set_forward_context_denoise_step_idx(i)
+                else:
+                    self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3353,6 +3439,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         **model_kwargs,
                     )
 
+                    # Later steps reuse the prompt K/V computed at step 0 under whatever profile step 0 selected.
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
@@ -3406,8 +3493,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor

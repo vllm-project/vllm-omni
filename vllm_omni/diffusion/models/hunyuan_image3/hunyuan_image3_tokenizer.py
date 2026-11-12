@@ -46,9 +46,9 @@ class Conversation:
 
 
 class TokenizerWrapper:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, revision: str | None = None):
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, revision=revision)
         else:
             self.tokenizer = tokenizer
 

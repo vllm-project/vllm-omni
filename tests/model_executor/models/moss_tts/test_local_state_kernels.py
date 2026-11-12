@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 H, NVQ, CAP, PAD = 2560, 12, 128, 1024
 
