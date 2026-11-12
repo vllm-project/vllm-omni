@@ -462,6 +462,33 @@ def test_batched_postprocess_gpu_snapshot_writeback(owned):
         assert first.untyped_storage().data_ptr() != produced[0].untyped_storage().data_ptr()
 
 
+def test_scalar_postprocess_receives_declared_multimodal_outputs():
+    state = _make_state(max_num_reqs=2, has_postprocess=True)
+    state.model.postprocess_requires_multimodal_outputs = True
+    _fill_buffers(state, "r0", "r1")
+    batch = _DummyInputBatch([1, 0])
+    batch.num_scheduled_tokens = [1, 1]
+    batch.query_start_loc_np = [0, 1]
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+    multimodal_outputs = {"codes": {"audio": frames}}
+    calls: list[tuple[torch.Tensor, object]] = []
+
+    def postprocess(hidden_states, *, multimodal_outputs, **_info):
+        index = len(calls)
+        calls.append((hidden_states.clone(), multimodal_outputs))
+        return {"codes": {"audio": multimodal_outputs["codes"]["audio"][index]}}
+
+    state.model.postprocess = postprocess
+    hidden = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
+    state.run_postprocess(hidden, batch, multimodal_outputs)
+
+    assert [call[1] for call in calls] == [multimodal_outputs, multimodal_outputs]
+    torch.testing.assert_close(calls[0][0], hidden[0:1])
+    torch.testing.assert_close(calls[1][0], hidden[1:2])
+    torch.testing.assert_close(state.intermediate_buffer.buffers[1]["codes"]["audio"], frames[0])
+    torch.testing.assert_close(state.intermediate_buffer.buffers[0]["codes"]["audio"], frames[1])
+
+
 def test_seed_independence_resolve_once_and_sampling_kwargs():
     state = _make_state(max_num_reqs=2)
     # vLLM sampling seed must not produce a talker generator.

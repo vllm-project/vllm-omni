@@ -109,6 +109,7 @@ class VoxtralTTSForConditionalGeneration(
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self.postprocess_requires_multimodal_outputs = False
         self.config = config
         self.repo_id = vllm_config.model_config.model
         self.is_hf_model = not Path(self.repo_id).is_dir()
@@ -116,6 +117,9 @@ class VoxtralTTSForConditionalGeneration(
         if self.model_stage == "audio_generation":
             self.has_preprocess = True
             self.has_postprocess = True
+            # compute_mm_logits() creates the feedback frame in
+            # make_omni_output(), after the raw forward returns.
+            self.postprocess_requires_multimodal_outputs = True
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
             self.set_custom_postprocess(self.tts_postprocess)

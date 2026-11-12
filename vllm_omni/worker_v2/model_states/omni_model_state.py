@@ -936,11 +936,18 @@ class OmniModelState(DefaultModelState):
     # Post-forward: per-request postprocess
     # ------------------------------------------------------------------
 
-    def run_postprocess(self, hidden_states: torch.Tensor, input_batch: InputBatch) -> None:
+    def run_postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        multimodal_outputs: Any | None = None,
+    ) -> None:
         """Per-request postprocess after model forward.
 
         Extracts per-request updates from hidden_states and writes them
         back to the intermediate buffer (e.g. ``last_talker_hidden``).
+        Models that declare ``postprocess_requires_multimodal_outputs`` also
+        receive the current step's structured output.
         """
         if not self.has_postprocess:
             return
@@ -1015,6 +1022,8 @@ class OmniModelState(DefaultModelState):
             n_tok = int(input_batch.num_scheduled_tokens[i])
             h_slice = hidden_states[start : start + n_tok]
             info = {key: value for key, value in buf.items() if isinstance(key, str) and key != "hidden_states"}
+            if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+                info["multimodal_outputs"] = multimodal_outputs
             updates = self.model.postprocess(h_slice, **info)
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
