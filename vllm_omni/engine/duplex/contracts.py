@@ -33,8 +33,17 @@ class DuplexOutputAction(str, Enum):
 
 
 @dataclass(frozen=True)
+class DuplexInputCapacity:
+    """Model-selected context allowance checked on the engine's expanded input."""
+
+    max_context_tokens: int
+    reserved_output_tokens: int
+
+
+@dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    input_capacity: DuplexInputCapacity | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +99,7 @@ class DuplexStageSubmission:
     resume_from_full_prompt: bool = False
     # Delta eligibility must remain valid through asynchronous input processing.
     history_revision: int | None = None
+    input_capacity: DuplexInputCapacity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))

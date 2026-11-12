@@ -427,12 +427,19 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            # View policy is deployment-owned; request runtime config below
+            # contains the plugin's per-request state (for example tool turns).
+            view_policy = self._ctx.plugin.context_view_policy(
+                stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
+            )
             history_cursor = session.history_storage_length
             history_revision = session.history_revision
             tail = session.append_history_tail() if turn_continuation and already_submitted else None
             use_delta = False
             if (
-                tail is not None
+                view_policy is None
+                and not self._ctx.plugin.uses_history_context
+                and tail is not None
                 and self._append_request_id == request_id
                 and self._ctx.plugin.can_prepare_turn_delta(
                     state=self._ctx.model_state,
@@ -446,23 +453,44 @@ class ModelChannel:
                 use_delta = await self._ctx.stage_port.can_append_turn(request_id, tail[0])
                 # The eligibility check yields; never use a stale history view.
                 use_delta = use_delta and session.history_revision == history_revision
-            conversation_item_ids: tuple[str | None, ...]
+            snapshot = None
+            item_ids: tuple[str | None, ...]
             if use_delta:
                 assert tail is not None
-                conversation, conversation_item_ids = tail[1], ()
+                history, item_ids = tail[1], ()
             else:
-                conversation, conversation_item_ids = session.history_snapshot()
+                if view_policy is None and not self._ctx.plugin.uses_history_context:
+                    history, item_ids = session.history_for_prompt()
+                else:
+                    snapshot = session.history_snapshot()
+                    history, item_ids = session.history, snapshot.item_ids
                 history_cursor = session.history_storage_length
                 history_revision = session.history_revision
             prompt_session = {
                 **request_context.session_config,
-                "conversation": list(conversation),
-                "conversation_item_ids": conversation_item_ids,
+                # Keep the prompt accessor's nested content identity: Qwen
+                # binds retained PCM to those containers. History and IDs
+                # are captured synchronously on the owner loop.
+                # Consumers must treat shared nested containers and payloads
+                # as read-only; only the session writes authoritative history.
+                "conversation": list(history),
+                "conversation_item_ids": item_ids,
                 "modalities": list(session.response_config.modalities),
                 DUPLEX_TURN_DELTA_KEY: use_delta,
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
             prompt_session["stage_sampling_params"] = request_context.sampling_params
+            if view_policy is not None:
+                assert snapshot is not None
+                prompt_session["conversation_view"] = list(
+                    session.render_history_view(view_policy, snapshot=snapshot).messages
+                )
+            if self._ctx.plugin.uses_history_context:
+                assert snapshot is not None
+                session.context_ledger.refresh(snapshot)
+                self._ctx.plugin.bind_history_context(
+                    state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
+                )
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
@@ -509,6 +537,7 @@ class ModelChannel:
                     resumable=resumable,
                     resume_from_full_prompt=turn_continuation,
                     history_revision=history_revision if use_delta else None,
+                    input_capacity=append_plan.input_capacity,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input

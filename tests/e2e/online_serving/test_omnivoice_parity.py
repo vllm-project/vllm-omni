@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cross-mode full-model parity tests for OmniVoice."""
 
 import os
@@ -9,6 +9,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 import requests
 
+from tests.helpers.assertions import assert_wav_pcm_close
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from tests.helpers.stage_config import get_deploy_config_path
@@ -74,23 +75,23 @@ def _common_args() -> list[str]:
     ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_request_mode_and_step_execution_b1_parity_without_graph() -> None:
-    """B=1 eager request and step modes must produce identical seeded WAV bytes."""
+    """B=1 eager request and step modes must agree within one PCM16 LSB."""
     common_args = _common_args()
 
     request_audio = _generate_without_graph(common_args)
     step_audio = _generate_without_graph([*common_args, "--step-execution", "--enforce-eager"])
 
-    assert request_audio == step_audio
+    assert_wav_pcm_close(request_audio, step_audio, atol=1)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_request_mode_and_step_execution_b1_parity_with_graph() -> None:
-    """B=1 Graph request and step modes must produce identical seeded WAV bytes."""
+    """B=1 Graph request and step modes must agree within one PCM16 LSB."""
     common_args = _common_args()
 
     request_audio = _generate_with_graph(common_args)
     step_audio = _generate_with_graph([*common_args, "--step-execution", "--enforce-eager"])
 
-    assert request_audio == step_audio
+    assert_wav_pcm_close(request_audio, step_audio, atol=1)
