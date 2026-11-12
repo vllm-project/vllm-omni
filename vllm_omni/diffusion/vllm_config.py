@@ -248,8 +248,6 @@ def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     """Return whether the model uses online MXFP4 MoE on a native backend."""
     if not od_config.is_moe:
         return False
-    if _uses_explicit_lora_capable_moe_backend(od_config):
-        return False
 
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
@@ -265,9 +263,6 @@ def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
 
 def _is_native_modelopt_nvfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     """Return whether the model uses ModelOpt NVFP4 MoE on a native backend."""
-    if _uses_explicit_lora_capable_moe_backend(od_config):
-        return False
-
     from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig, ModelOptNvFp4Config
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import cutlass_fp4_supported
 
@@ -317,6 +312,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     if (
         moe_lora_enabled
         and not getattr(od_config, "lora_path", None)
+        and not _uses_explicit_lora_capable_moe_backend(od_config)
         and (_is_accelerator_online_mxfp4_moe(od_config) or _is_native_modelopt_nvfp4_moe(od_config))
     ):
         # vLLM rejects native MXFP4/NVFP4 MoE kernels while LoRA is enabled.
