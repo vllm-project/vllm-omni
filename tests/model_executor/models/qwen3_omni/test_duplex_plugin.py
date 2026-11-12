@@ -2484,15 +2484,16 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view"])
+@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view", "initial_text"])
 async def test_committed_turns_preserve_lifecycle_and_process_only_required_history(mocker, mode):
     resumable = mode != "ephemeral"
-    h = await open_qwen(resumable=resumable)
+    initial_text = "Read this once" if mode == "initial_text" else None
+    h = await open_qwen(resumable=resumable, initial_user_text=initial_text)
     if mode == "context_view":
         h.manager.runtime_config = replace(h.manager.runtime_config, context_keep_media_turns=10)
 
     async def can_append(request_id, text):
-        return mode in {"delta", "context_view"} and text == "hello"
+        return mode in {"delta", "context_view", "initial_text"} and text == "hello"
 
     h.port.can_append_turn = can_append
     h.manager.plugin.processor.apply_chat_template = (
@@ -2520,6 +2521,8 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
             assert h.port.submissions[-1].resume_from_full_prompt is resumable
             assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
             assert h.session.active_request_id == request_id
+            if initial_text:
+                assert h.port.submissions[-1].prompt["prompt"].count(initial_text) == 1
             use_delta = mode == "delta" and 0 < i < 4
             expected_audio = 1 if use_delta else min(i + 1, 4)
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio

@@ -805,7 +805,11 @@ user messages and sends their processed tokens and media to
 EngineCore; resident feature data is reused there, never replayed from frontend
 cache handles. The engine validates the expected prefix length, a digest of
 its token content and the salt without comparing history hashes. APC and hidden-state prefix replay remain enabled.
-History edits and incompatible boundaries use the full-snapshot fallback.
+History edits, incompatible boundaries and nonempty `initial_user_text` use the
+full-snapshot fallback. When runnable waiting work makes no progress, the
+scheduler can reclaim a drained idle turn's KV while retaining its logical token
+history and media. A later continuation recovers through APC or recomputation;
+the session still owns its request slot.
 The ledger follows the request epoch, and cancellation joins input preparation
 before releasing the submission guard. `DuplexStagePort.finish_turn` releases only downstream turn
 state; its EngineCore acknowledgement completes from the save thread without

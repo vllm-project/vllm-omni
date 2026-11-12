@@ -20,6 +20,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
 
@@ -76,6 +77,7 @@ def test_schedule_sweeps_kv_holding_waiting_before_upstream_selection(
     scheduler.chunk_transfer_adapter = None
     scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
+    scheduler._pause_state = PauseState.UNPAUSED
     scheduler.input_coordinator = None
     scheduler.num_waiting_for_streaming_input = 0
     scheduler._process_pending_omni_inputs = lambda model_mode: None
@@ -86,7 +88,7 @@ def test_schedule_sweeps_kv_holding_waiting_before_upstream_selection(
     scheduler.get_finished_requests_needing_kv_transfer = lambda: {}
     scheduler._wrap_omni_scheduler_output = lambda output, **kwargs: output
 
-    sentinel = SimpleNamespace(scheduled_new_reqs=[])
+    sentinel = SimpleNamespace(scheduled_new_reqs=[], num_scheduled_tokens={})
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         assert list(scheduler.kv_holding_waiting) == []

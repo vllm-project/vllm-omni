@@ -100,6 +100,8 @@ block tail is recomputed. A missing or stale resident fails only that request.
 Changed/pruned history, playback-truncated text, or an unsupported completion
 boundary falls back to full-snapshot processing. Tool turns, changed prompt
 settings and the existing message/audio window limits also use that fallback.
+Nonempty `initial_user_text` uses full snapshots because it belongs only to the
+current audio turn; appending would retain previous turns' injected text.
 Fallback snapshots are tokenized in full without a rendered-text prefix cache.
 The scheduler releases the resident allocation and rebuilds from the current
 prompt; ordinary prefix caching re-matches every unchanged block. Block hashes
@@ -122,12 +124,13 @@ Commit, VAD interruption and playback acknowledgement retain their turn-based
 semantics. Cancellation advances the epoch and aborts the resident request;
 the next turn rebuilds it. Closing or expiring a session releases its resident
 resources. New audio may buffer during a response, but another generation must
-wait for that response to complete or be cancelled. Idle sessions retain KV
-until teardown, which must be included in
-deployment memory and session-capacity planning. Upstream preemption selects
-only running requests, so it never reclaims an idle resident; under KV pressure
-active turns are preempted first. Releasing idle residents' KV is not yet
-implemented.
+wait for that response to complete or be cancelled. Idle sessions normally
+retain KV. If runnable waiting work makes no progress, the scheduler releases
+one idle turn's KV after its in-flight outputs have drained, then retries
+admission on the next scheduling pass. The session keeps its token history and
+materialized media; a later continuation recovers through APC or recomputation.
+This does not release the session's request slot, so deployment session-capacity
+limits still apply. Upstream preemption continues to select running requests.
 
 Any stage failure during a resident turn closes the session. The Thinker
 request shares its ID with that turn's Talker and Code2Wav requests, so failure

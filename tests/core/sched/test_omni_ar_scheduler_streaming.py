@@ -186,7 +186,7 @@ def _run_continuation_output(sched, session, *, num_scheduled: int, token: int):
     return sched.update_from_output(scheduler_output, model_output)
 
 
-@pytest.mark.parametrize("change", ["append", "delta", "tokens", "audio", "salt", "shrink"])
+@pytest.mark.parametrize("change", ["append", "delta", "reclaimed_delta", "tokens", "audio", "salt", "shrink"])
 def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, mocker):
     from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
     from vllm.utils.hashing import get_hash_fn_by_name
@@ -216,6 +216,8 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     )
     session.append_output_token_ids([33, 34, 999])
     session.num_computed_tokens = 35  # 999 is sampled but has no KV.
+    if change == "reclaimed_delta":
+        session.num_computed_tokens = 0
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     tokens = list(range(64))
     features = [
@@ -240,7 +242,7 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     )
     fresh.resume_from_full_prompt = True
     update = StreamingUpdate.from_request(fresh)
-    if change == "delta":
+    if change in {"delta", "reclaimed_delta"}:
         update.append_prefix_length = 35
         update.append_prefix_digest = token_prefix_digest(tokens[:35])
         update.prompt_token_ids = tokens[35:]
@@ -263,7 +265,7 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     sched.num_waiting_for_streaming_input = 1
     sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
-    sched.kv_holding_waiting.add_request(session)
+    sched._enqueue_waiting_request(session)
     sched.deferred_waiting.add(session)
     sched.log_stats = True
     sched._update_request_as_session(session, update)
@@ -288,7 +290,7 @@ def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, moc
     assert all(a is not b for a, b in zip(delta.mm_features, features[-len(delta.mm_features) :]))
     assert sched.num_waiting_for_streaming_input == 0
     assert session.status == RequestStatus.WAITING
-    assert sched._free_request_blocks.call_count == (0 if retained else 1)
+    assert sched._free_request_blocks.call_count == (0 if change in {"delta", "reclaimed_delta"} else 1)
     assert session not in sched.deferred_waiting
     assert list(sched.kv_holding_waiting) == ([session] if retained else [])
     assert list(sched.waiting) == ([] if retained else [session])
@@ -1936,6 +1938,7 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 @pytest.mark.parametrize("native", [True, False])
 def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, native) -> None:
     sched = _make_scheduler(stage_id=1)
+    sched._pause_state = PauseState.UNPAUSED
     parked = SimpleNamespace(request_id="parked")
     sched.requests = {"parked": parked}
     sched.waiting = []
@@ -1970,7 +1973,7 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     def fake_schedule(self, _throttle_prefills=False):
         observed_limits.append(self.max_num_active_reqs)
-        return SimpleNamespace(scheduled_new_reqs=[])
+        return SimpleNamespace(scheduled_new_reqs=[], num_scheduled_tokens={})
 
     monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
 

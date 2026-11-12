@@ -892,6 +892,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def can_prepare_turn_delta(
         self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
     ) -> bool:
+        # This text is injected only into the current audio turn, not stored in
+        # conversation history. A snapshot removes the previous injection;
+        # appending would retain it and add another copy on every turn.
+        if runtime_config.get("initial_user_text"):
+            return False
         if any(
             runtime_config.get(key) != previous_runtime_config.get(key) for key in ("instructions", "initial_user_text")
         ):

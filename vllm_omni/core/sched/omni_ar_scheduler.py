@@ -14,6 +14,7 @@ import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -894,6 +895,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
+        if (
+            not scheduler_output.num_scheduled_tokens
+            and not throttle_prefills
+            and original_wait_queues is None
+            and self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_active_reqs - reserved_running_slots
+        ):
+            self._reclaim_idle_turn_kv()
+
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
         # booking paths the rewrite already ran ahead of the booking and this
@@ -918,6 +929,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _reclaim_idle_turn_kv(self) -> None:
+        """Let stalled admissions reclaim one drained turn's resident KV.
+
+        Upstream preemption only selects running requests. A completed turn
+        waiting for input can otherwise pin the blocks needed by every other
+        session. Keep its logical history and streaming wait state so a later
+        continuation can recover through APC or recomputation.
+        """
+        if not any(
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED) and request.num_in_flight_tokens == 0
+            for queue in (self.waiting, self.kv_holding_waiting)
+            for request in queue
+        ):
+            return
+        for request in self.requests.values():
+            if (
+                not getattr(request, "resume_from_full_prompt", False)
+                or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+                or request.num_in_flight_tokens > 0
+                or request.num_computed_tokens == 0
+            ):
+                continue
+            self._release_replaced_streaming_prompt_cache(request)
+            request.num_computed_tokens = 0
+            if request in self.kv_holding_waiting:
+                self.kv_holding_waiting.remove_requests((request,))
+                self._enqueue_waiting_request(request)
+            logger.debug("Reclaimed idle turn KV request=%s", request.request_id)
+            # The next scheduling pass retries admission with the freed space.
+            return
 
     def update_from_output(
         self,
@@ -1834,35 +1876,41 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _resume_from_turn_delta(self, session: Request, update: StreamingUpdate) -> None:
         """Append to the actual resident sequence without comparing history hashes."""
+        # The final sampled token is uncomputed and belongs to the delta. KV
+        # may have been reclaimed while idle; validate against logical history,
+        # independently of how much of that history still has physical blocks.
+        prefix_length = len(session._all_token_ids) - 1
         confirmed = self._get_confirmed_num_computed_tokens(session)
         # The frontend ledger also feeds output processing and downstream
         # prewarm; equal length alone would hide a diverged token history.
         if (
-            update.append_prefix_length != confirmed
+            update.append_prefix_length != prefix_length
             or update.cache_salt != session.cache_salt
-            or update.append_prefix_digest != token_prefix_digest(session._all_token_ids[:confirmed])
+            or update.append_prefix_digest != token_prefix_digest(session._all_token_ids[:prefix_length])
         ):
             self._reject_turn_delta(session, "Resident turn prefix changed; restart the session")
             return
         features = list(session.mm_features or ())
         features.extend(
-            replace(feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset + confirmed))
+            replace(
+                feature, mm_position=replace(feature.mm_position, offset=feature.mm_position.offset + prefix_length)
+            )
             for feature in update.mm_features or ()
         )
-        retained = confirmed // self.cache_config.block_size * self.cache_config.block_size
-        # Replay the partial block for the stage-output cache. Full blocks and
-        # their hashes stay owned by this resident request; only new blocks are
-        # hashed by upstream when it extends the sequence.
+        retained = min(prefix_length, confirmed) // self.cache_config.block_size * self.cache_config.block_size
+        # Retain only complete blocks that still have physical KV. Replay the
+        # partial block for the stage-output cache; after reclamation, ordinary
+        # scheduling and APC recover the entire logical prefix instead.
         snapshot = replace(
             update,
-            prompt_token_ids=session._all_token_ids[:confirmed] + (update.prompt_token_ids or []),
+            prompt_token_ids=session._all_token_ids[:prefix_length] + (update.prompt_token_ids or []),
             mm_features=features,
         )
         self._resume_from_full_prompt(session, snapshot, retained_prefix=retained)
         logger.debug(
             "Resident turn delta request=%s prefix=%d appended=%d retained=%d",
             session.request_id,
-            confirmed,
+            prefix_length,
             len(update.prompt_token_ids or ()),
             retained,
         )
