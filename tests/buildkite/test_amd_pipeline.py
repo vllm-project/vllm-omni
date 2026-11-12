@@ -2197,7 +2197,7 @@ def test_moss_tts_weekly_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None:
+def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -2236,6 +2236,36 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
             "dependency": "tts_qwen3_tts_function",
             "files": ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",),
         },
+        "VoxCPM2 TTS · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 9,
+            "artifact_name": "rocm-voxcpm2-tts-weekly",
+            "dependency": "tts_voxcpm2_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_lora.py",
+            ),
+        },
+        "Voxtral TTS · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 10,
+            "artifact_name": "rocm-voxtral-tts-weekly",
+            "dependency": "tts_voxtral_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
+            ),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2261,7 +2291,7 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         assert step["grade"] == "NonBlocking"
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == dependency
-        assert step["env"] == expected_env
+        assert step["env"] == expected_env | cast(dict[str, str], expected.get("env", {}))
         assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
         assert "retry" not in step
         assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
@@ -2284,16 +2314,21 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
-    rocm_decorator = '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)'
     marker_counts = {
         "tests/e2e/offline_inference/test_audex_tts.py": 3,
         "tests/e2e/offline_inference/test_audex_s2t.py": 1,
         "tests/e2e/offline_inference/test_audex_tta.py": 1,
         "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
         "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
+        "tests/e2e/offline_inference/test_voxcpm2_tts.py": 3,
+        "tests/e2e/online_serving/test_voxcpm2_tts.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
+        "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
     }
     for path, expected_count in marker_counts.items():
-        assert Path(path).read_text(encoding="utf-8").count(rocm_decorator) == expected_count
+        assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source
