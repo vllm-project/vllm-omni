@@ -12,24 +12,25 @@ def pytest_addoption(parser):
     group = parser.getgroup("lingbot-world")
     group.addoption("--lingbot-profile", type=Path, help="Accuracy workload JSON")
     group.addoption("--lingbot-output", type=Path, default=Path("lingbot-artifacts/accuracy"))
-    group.addoption("--lingbot-reference-root", type=Path, help="Checkout at profile.reference_revision")
+    group.addoption("--lingbot-record-only", action="store_true", help="Record accuracy data; comparison is pending")
     group.addoption("--lingbot-generation", type=Path, help="Previously captured accuracy data, e.g. NPU outputs")
 
 
 @pytest.fixture(scope="session")
 def lingbot_settings(request):
-    from benchmarks.lingbot_world.regression import RegressionError
     from tests.e2e.accuracy.lingbot_world.runner import load_settings
+    from vllm_omni.benchmarks.realtime_video.metrics import RegressionError
 
     profile = request.config.getoption("--lingbot-profile")
     if profile is None:
         if os.environ.get("BUILDKITE") == "true":
             raise RegressionError("Selected LingBot accuracy tests require --lingbot-profile")
         pytest.skip("Opt in with --lingbot-profile")
+    if not request.config.getoption("--lingbot-record-only"):
+        raise RegressionError("Temporary LingBot accuracy CI requires explicit --lingbot-record-only; baseline pending")
     return load_settings(
         profile,
         request.config.getoption("--lingbot-output"),
-        reference_root=request.config.getoption("--lingbot-reference-root"),
         generation=request.config.getoption("--lingbot-generation"),
     )
 

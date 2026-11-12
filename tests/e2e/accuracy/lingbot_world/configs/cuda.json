@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "reference_revision": "e96e3beeb6fa0842ad5f4a74b4d409edca39a0d5",
   "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
   "height": 480,
   "width": 832,
@@ -13,8 +12,6 @@
   "precision_timeout_s": 600,
   "first_chunk_timeout_s": 900,
   "chunk_timeout_s": 120,
-  "precision_atol": 0.0,
-  "precision_rtol": 0.0,
   "cases": [
     {
       "id": "boardwalk-42",
@@ -43,6 +40,5 @@
   "dies": 2,
   "deploy_config": "benchmarks/lingbot_world/configs/usp2_compiled.yaml",
   "warmup_num_chunks": 8,
-  "reference_repository": "https://github.com/vllm-project/vllm-omni.git",
   "hardware": "H100"
 }

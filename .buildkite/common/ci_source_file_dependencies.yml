@@ -433,6 +433,7 @@ source_file_dependencies:
     - vllm_omni/diffusion/distributed/autoencoders/
   lingbot_world_accuracy:
     - tests/e2e/accuracy/lingbot_world/
+    - pyproject.toml
     - benchmarks/lingbot_world/
     - requirements/lingbot-quality.txt
     - requirements/lingbot-quality.in
@@ -442,6 +443,7 @@ source_file_dependencies:
     - vllm_omni/entrypoints/cli/benchmark/cli_args.py
     - vllm_omni/entrypoints/cli/benchmark/serve.py
     - tests/benchmarks/test_realtime_video_serve.py
+    - tests/benchmarks/test_realtime_video_eval.py
     - tests/benchmarks/test_serve_cli.py
     - tests/benchmarks/test_lingbot_world_cases.py
     - tests/benchmarks/test_lingbot_world_ci.py

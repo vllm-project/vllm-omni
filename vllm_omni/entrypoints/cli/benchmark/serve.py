@@ -45,5 +45,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
 
         preprocess_serve_args(args)
         result = main(args)
-        if args.backend == "realtime-video" and not result["realtime_video"]["passed"]:
-            raise RuntimeError(f"Realtime video benchmark failed: {result['realtime_video']['errors']}")
+        if args.backend == "realtime-video":
+            report = result["realtime_video_evaluation"] if args.realtime_video_evaluate else result["realtime_video"]
+            if not report["passed"]:
+                raise RuntimeError(f"Realtime video benchmark failed: {report['errors']}")

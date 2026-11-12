@@ -432,7 +432,7 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-      - label: ":full_moon: Diffusion X2V · Perf Test · LingBot World · A2 4-NPU"
+      - label: ":full_moon: Diffusion X2V · LingBot World Perf Recording · A2 4-NPU · Baseline Pending"
         key: lingbot-npu-nightly-performance
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_perf
@@ -452,17 +452,17 @@ steps:
           queue: medium_cpu_queue_premerge
         commands:
           - bash .buildkite/cuda/scripts/build-ci-image.sh
-      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy · NPU Data"
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Recording · NPU Data"
         key: lingbot-npu-nightly-accuracy-data
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_accuracy
-        timeout_in_minutes: 240
+        timeout_in_minutes: 120
         mirror_hardwares: a2b3_npu_4
         artifact_paths:
           - "lingbot-artifacts/npu-accuracy/**/*"
         commands:
-          - python -m tests.e2e.accuracy.lingbot_world.prepare capture --profile tests/e2e/accuracy/lingbot_world/configs/npu.json --output lingbot-artifacts/npu-accuracy
-      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test · NPU Outputs"
+          - python -m tests.e2e.accuracy.lingbot_world.prepare capture --profile tests/e2e/accuracy/lingbot_world/configs/npu.json --output lingbot-artifacts/npu-accuracy --record-only
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Recording · NPU Outputs · Baseline Pending"
         key: lingbot-npu-nightly-accuracy
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_accuracy
@@ -470,10 +470,10 @@ steps:
           - step: lingbot-npu-nightly-accuracy-data
             allow_failure: true
           - lingbot-npu-accuracy-ci-image
-        timeout_in_minutes: 480
+        timeout_in_minutes: 120
         mirror_hardwares: h100_2
         artifact_paths:
           - "lingbot-artifacts/npu-accuracy-results/**/*"
         commands:
           - buildkite-agent artifact download "lingbot-artifacts/npu-accuracy/**" . --step lingbot-npu-nightly-accuracy-data || echo "Accuracy data download failed; each test will validate its required inputs"
-          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json --lingbot-generation=lingbot-artifacts/npu-accuracy --lingbot-output=lingbot-artifacts/npu-accuracy-results --run-level full_model
+          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json --lingbot-generation=lingbot-artifacts/npu-accuracy --lingbot-output=lingbot-artifacts/npu-accuracy-results --lingbot-record-only --run-level full_model

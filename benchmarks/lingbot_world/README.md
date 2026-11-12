@@ -150,13 +150,24 @@ Performance uses the existing [`tests/dfx/perf`](../../tests/dfx/perf) JSON
 configuration and recorded hardware baseline workflow with this common backend.
 It runs the candidate without live A/B calibration or a separate scheduler.
 A missing recorded hardware baseline is reported as unavailable, not a fabricated
-regression pass. Twelve FPS remains a playback/SLO basis, not an absolute gate.
+regression pass. The new LingBot World recipe currently has no measured baseline;
+its CI labels explicitly identify performance recording with a baseline pending.
+Twelve FPS remains a playback/SLO basis, not an absolute gate.
 
 The [accuracy tests](../../tests/e2e/accuracy/lingbot_world/README.md) keep
-numerical precision, WBench and VBench as separate tests. Their shared real
-reference inputs serve only the numerical and semantic comparisons. CUDA uses
-two H100 GPUs; NPU capture uses the existing four-device A2 configuration before
-CUDA-based quality evaluation. Long-stability tests are not included.
+numerical precision, WBench and VBench as separate tests. This PR temporarily
+uses explicit **record-only** CI: one candidate server lifetime captures the
+fixed VAE inputs and one video per case, then the packaged `vllm bench serve
+--omni` evaluation path records measurements after that server exits. Each test
+prints its measured values and saves its own accuracy JSON alongside the raw
+tensors, videos and evaluator outputs. Successful recording validates complete,
+finite generation and scoring; it does not establish an accuracy regression
+pass. A follow-up PR will fill in reviewed baseline values from real CI output.
+
+CUDA uses two H100 GPUs; NPU capture uses the existing four-device A2
+configuration before CUDA-based quality evaluation. Each accuracy job has a
+120-minute timeout; this is a configured bound, not a measured runtime.
+Long-stability tests are not included.
 
 CPU tests under `tests/benchmarks/test_lingbot_world_*.py` exercise raw metrics,
 scripted WebSocket transport, argument compatibility, malformed inputs and

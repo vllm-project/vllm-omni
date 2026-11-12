@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Prepare the pinned code/input fixtures and isolated native quality evaluators."""
+"""Prepare candidate inputs and isolated native quality evaluators."""
 
 from __future__ import annotations
 
@@ -12,16 +12,15 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.request
-from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 import regex as re
 from packaging.version import Version
 
-from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, verify_environment, write_json
 from tests.e2e.accuracy.lingbot_world.opencv_provider import PROVIDER, validate_opencv_provider_record
+from vllm_omni.benchmarks.realtime_video.eval import read_json, sha256, verify_environment, write_json
+from vllm_omni.benchmarks.realtime_video.metrics import RegressionError
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -133,7 +132,7 @@ def prepare_npu_allocation(settings: dict, output: Path) -> str:
 
 def evaluator_cache_key(root: Path = ROOT) -> str:
     files = (
-        root / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json",
+        root / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json",
         root / "requirements/lingbot-quality.txt",
         root / "tests/e2e/accuracy/lingbot_world/opencv_provider.py",
     )
@@ -161,31 +160,30 @@ def checkout(path: Path, url: str, revision: str, *, submodules: bool = False) -
         )
 
 
-def verify_source_imports(reference: Path) -> None:
-    """Exercise both serving entrypoints before downloading or loading weights."""
+def verify_source_imports() -> None:
+    """Exercise the candidate entrypoint before downloading or loading weights."""
     from tests.e2e.accuracy.lingbot_world.runner import server_environment
 
-    for role, source in (("reference", reference.resolve()), ("candidate", ROOT)):
-        print(f"Checking {role} serving imports: {source}", flush=True)
-        try:
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import sys; from pathlib import Path; import vllm_omni; "
-                    "assert Path(vllm_omni.__file__).resolve().parent == Path(sys.argv[1]) / 'vllm_omni'; "
-                    "import vllm_omni.diffusion.models.lingbot_world.pipeline; "
-                    "from vllm_omni.entrypoints.cli.main import main; "
-                    "sys.argv = ['vllm', 'serve', '--omni', '--help']; main()",
-                    str(source),
-                ],
-                cwd=source,
-                env={**os.environ, **server_environment(source)},
-                check=True,
-                timeout=180,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            raise RegressionError(f"{role} serving import preflight failed: {source}") from error
+    print(f"Checking candidate serving imports: {ROOT}", flush=True)
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from pathlib import Path; import vllm_omni; "
+                "assert Path(vllm_omni.__file__).resolve().parent == Path(sys.argv[1]) / 'vllm_omni'; "
+                "import vllm_omni.diffusion.models.lingbot_world.pipeline; "
+                "from vllm_omni.entrypoints.cli.main import main; "
+                "sys.argv = ['vllm', 'serve', '--omni', '--help']; main()",
+                str(ROOT),
+            ],
+            cwd=ROOT,
+            env={**os.environ, **server_environment(ROOT)},
+            check=True,
+            timeout=180,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RegressionError(f"candidate serving import preflight failed: {ROOT}") from error
 
 
 def _prepare_evaluators(root: Path) -> Path:
@@ -195,7 +193,7 @@ def _prepare_evaluators(root: Path) -> Path:
         raise RegressionError(
             "Evaluator locks changed; use a fresh evaluator root instead of mutating a live environment"
         )
-    lock = read_json(ROOT / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json")
+    lock = read_json(ROOT / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json")
     for name, repository in lock["repositories"].items():
         checkout(root / name, repository["url"], repository["revision"], submodules=name in {"wbench", "vbench"})
     cached_weights = os.environ.get("LINGBOT_EVALUATOR_CACHE")
@@ -330,7 +328,7 @@ def prepare_evaluators(root: Path) -> Path:
 
 
 def prepare_capture(settings):
-    """Prepare one genuine reference/candidate data run, without semantic gates."""
+    """Prepare one candidate recording, without a regression acceptance gate."""
     from tests.e2e.accuracy.lingbot_world.runner import collect_measurements
 
     output = settings["output"]
@@ -339,56 +337,43 @@ def prepare_capture(settings):
     variable = "ASCEND_RT_VISIBLE_DEVICES" if settings["platform"] == "npu" else "CUDA_VISIBLE_DEVICES"
     os.environ[variable] = visible
     runtime = verify_inference_runtime(settings["platform"])
-    reference = settings.get("reference_root")
-    # Only auto-created temporary checkouts are ours to remove. An explicit
-    # caller-provided checkout is reusable and must survive failures.
-    context: AbstractContextManager[str | Path]
-    if reference is None:
-        context = tempfile.TemporaryDirectory(prefix="lingbot-accuracy-reference-")
-    else:
-        context = nullcontext(reference)
-    with context as reference_path:
-        reference = Path(reference_path).resolve()
-        checkout(reference, settings["reference_repository"], settings["reference_revision"])
-        verify_source_imports(reference)
-        settings["reference_root"] = reference
-        model = os.environ.get("LINGBOT_MODEL_PATH")
-        if model is None:
-            lock = read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")
-            model = (
-                subprocess.check_output(
-                    ["hf", "download", lock["model_id"], "--revision", lock["model_revision"], "--quiet"],
-                    text=True,
-                    timeout=7200,
-                    env={**os.environ, "HF_HUB_OFFLINE": "0"},
-                )
-                .strip()
-                .splitlines()[-1]
+    verify_source_imports()
+    model = os.environ.get("LINGBOT_MODEL_PATH")
+    if model is None:
+        lock = read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")
+        model = (
+            subprocess.check_output(
+                ["hf", "download", lock["model_id"], "--revision", lock["model_revision"], "--quiet"],
+                text=True,
+                timeout=7200,
+                env={**os.environ, "HF_HUB_OFFLINE": "0"},
             )
-        os.environ["LINGBOT_MODEL_PATH"] = str(Path(model).resolve())
-        write_json(
-            output / "model.json", {"model_path": os.environ["LINGBOT_MODEL_PATH"], "inference_runtime": runtime}
+            .strip()
+            .splitlines()[-1]
         )
-        return collect_measurements(settings)
+    os.environ["LINGBOT_MODEL_PATH"] = str(Path(model).resolve())
+    write_json(output / "model.json", {"model_path": os.environ["LINGBOT_MODEL_PATH"], "inference_runtime": runtime})
+    return collect_measurements(settings)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("capture", "evaluators"))
     parser.add_argument("--profile", type=Path)
-    parser.add_argument("--root", type=Path, help="Reference checkout or evaluator cache")
+    parser.add_argument("--root", type=Path, help="Evaluator cache")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--record-only", action="store_true", help="Record real inputs; baseline comparison is pending")
     args = parser.parse_args()
     if args.stage == "evaluators":
         if args.root is None:
             parser.error("--root is required for evaluators")
         print(prepare_evaluators(args.root.resolve()))
         return
-    if args.profile is None or args.output is None:
-        parser.error("capture requires --profile and --output")
+    if args.profile is None or args.output is None or not args.record_only:
+        parser.error("capture requires --profile, --output and explicit --record-only (baseline comparison pending)")
     from tests.e2e.accuracy.lingbot_world.runner import load_settings
 
-    report = prepare_capture(load_settings(args.profile, args.output, reference_root=args.root))
+    report = prepare_capture(load_settings(args.profile, args.output))
     if not report["complete"]:
         raise SystemExit("Accuracy generation incomplete; preserved data remain available to independent tests")
 
