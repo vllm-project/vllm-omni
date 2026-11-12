@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,48 @@ SOUND_TOKENIZER_CHECKPOINT_NAME = "diffusion_pytorch_model.safetensors"
 
 def _pipeline_args(od_config: OmniDiffusionConfig) -> dict[str, Any]:
     return dict(getattr(od_config, "custom_pipeline_args", None) or {})
+
+
+@dataclass(frozen=True)
+class Cosmos3SoundTokenizerPaths:
+    """Explicit locations of the AVAE sound tokenizer checkpoint and config.
+
+    Both are optional. When unset, the tokenizer is looked up under
+    ``sound_tokenizer/`` in the model path.
+    """
+
+    checkpoint_path: str | None = None
+    config_path: str | None = None
+
+    @classmethod
+    def from_config(cls, od_config: OmniDiffusionConfig) -> Cosmos3SoundTokenizerPaths:
+        """Read the paths from ``custom_pipeline_args``.
+
+        Precedence: ``custom_pipeline_args`` > environment variable.
+        """
+        args = _pipeline_args(od_config)
+        checkpoint_path = _path_arg(args, ("sound_tokenizer_path", "avae_path", "cosmos3_avae_path"))
+        if checkpoint_path is None:
+            checkpoint_path = _env_path("COSMOS3_SOUND_TOKENIZER_PATH")
+        config_path = _path_arg(args, ("sound_tokenizer_config_path",))
+        if config_path is None:
+            config_path = _env_path("COSMOS3_SOUND_TOKENIZER_CONFIG_PATH")
+        return cls(checkpoint_path=checkpoint_path, config_path=config_path)
+
+
+def _path_arg(args: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = args.get(key)
+        if not value:
+            continue
+        if not isinstance(value, str | os.PathLike):
+            raise TypeError(f"custom_pipeline_args[{key!r}] must be a path string, got {type(value).__name__}.")
+        return os.fspath(value)
+    return None
+
+
+def _env_path(env_name: str) -> str | None:
+    return os.environ.get(env_name) or None
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -326,15 +369,9 @@ class Cosmos3SoundTokenizer:
     def from_config(cls, od_config: OmniDiffusionConfig) -> Cosmos3SoundTokenizer:
         args = _pipeline_args(od_config)
         model_path = getattr(od_config, "model", None)
-        explicit_avae_path = (
-            args.get("sound_tokenizer_path")
-            or args.get("avae_path")
-            or args.get("cosmos3_avae_path")
-            or os.environ.get("COSMOS3_SOUND_TOKENIZER_PATH")
-        )
-        explicit_config_path = args.get("sound_tokenizer_config_path") or os.environ.get(
-            "COSMOS3_SOUND_TOKENIZER_CONFIG_PATH"
-        )
+        paths = Cosmos3SoundTokenizerPaths.from_config(od_config)
+        explicit_avae_path = paths.checkpoint_path
+        explicit_config_path = paths.config_path
 
         model_root = str(model_path) if model_path and os.path.isdir(model_path) else None
         if model_root is None and model_path and not explicit_avae_path:
@@ -360,8 +397,7 @@ class Cosmos3SoundTokenizer:
             raise ValueError(
                 "Cosmos3 sound generation was requested, but no AVAE sound "
                 "tokenizer checkpoint was provided. Set "
-                "custom_pipeline_args['sound_tokenizer_path'] or "
-                "COSMOS3_SOUND_TOKENIZER_PATH, or include "
+                "custom_pipeline_args['sound_tokenizer_path'], or include "
                 f"{SOUND_TOKENIZER_COMPONENT_NAME}/{SOUND_TOKENIZER_CHECKPOINT_NAME} under the model path."
             )
 
