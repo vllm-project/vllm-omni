@@ -1013,6 +1013,12 @@ class OrchestratorBase:
                 )
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
+            if req_state is None and getattr(eco, "finish_reason", None) == FinishReason.ERROR:
+                # A failed sample of an n > 1 request fails the request, through the error branch below.
+                parent_id = pool.parallel_sample_parent_id(request_id) if request_id is not None else None
+                req_state = self.request_states.get(parent_id) if parent_id is not None else None
+                if req_state is not None and (getattr(eco, "is_segment_finished", False) or req_state.session_owned):
+                    req_state = None
             if req_state is None:
                 # Stage 0's sender lives on the frontend. Deliver its cache
                 # feedback even after cancellation; consumers may drop the error
@@ -1045,13 +1051,14 @@ class OrchestratorBase:
                     reason = "Multi-modal processor cache miss. Please retry the request."
                     error_type = None
                 if error_type is None:
-                    await self._handle_stage_error(stage_id, eco, error=reason)
+                    await self._handle_stage_error(stage_id, eco, error=reason, request_id=req_state.request_id)
                 else:
                     await self._handle_stage_error(
                         stage_id,
                         eco,
                         error=reason,
                         error_type=error_type,
+                        request_id=req_state.request_id,
                     )
                 continue
 
@@ -1614,12 +1621,17 @@ class OrchestratorBase:
         *,
         error: str | None = None,
         error_type: str | None = None,
+        request_id: str | None = None,
     ) -> None:
-        """Emit a frontend-visible error and clean up request state."""
-        if self._cfg_tracker.is_companion(output.request_id):
-            parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
+        """Emit a frontend-visible error and clean up request state.
+
+        ``request_id`` overrides ``output.request_id``, e.g. the request of a failed n > 1 sample.
+        """
+        request_id = request_id or output.request_id
+        if self._cfg_tracker.is_companion(request_id):
+            parent_id = self._cfg_tracker.get_parent_id(request_id) or request_id
         else:
-            parent_id = output.request_id
+            parent_id = request_id
         resolved_error_type: str | None
         if getattr(output, "mm_cache_miss_hashes", None):
             resolved_error_type = "ServiceUnavailableError"
@@ -2395,8 +2407,12 @@ class OrchestratorBase:
     ) -> EngineCoreRequest:
         prompt_embeds = getattr(request, "prompt_embeds", None)
         additional_information = None
+        model_intermediate_buffer = None
 
         if isinstance(raw_prompt, dict):
+            raw_buffer = raw_prompt.get("model_intermediate_buffer")
+            if isinstance(raw_buffer, dict):
+                model_intermediate_buffer = raw_buffer
             if prompt_embeds is None:
                 raw_prompt_embeds = raw_prompt.get("prompt_embeds")
                 if isinstance(raw_prompt_embeds, torch.Tensor):
@@ -2412,13 +2428,14 @@ class OrchestratorBase:
                 log_prefix="Orchestrator stage input",
             )
 
-        if prompt_embeds is None and additional_information is None:
+        if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
             return request
 
         return OmniEngineCoreRequest.from_request(
             request,
             prompt_embeds=prompt_embeds,
             additional_information=additional_information,
+            model_intermediate_buffer=model_intermediate_buffer,
         )
 
     async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
@@ -3878,6 +3895,35 @@ class Orchestrator(OrchestratorBase):
                     "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
                     "for that stage",
                 )
+                return
+
+        # The stage pool fans out n > 1 on any LLM stage, but only the entry stage's samples have a consumer.
+        for later_stage_id in range(stage_id + 1, min(final_stage_id, len(sampling_params_list) - 1) + 1):
+            later_n = getattr(sampling_params_list[later_stage_id], "n", 1) or 1
+            if later_n > 1:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    f"n > 1 is supported only on the entry stage {stage_id}; stage {later_stage_id} has n={later_n}",
+                )
+                return
+        entry_params = sampling_params_list[stage_id]
+        if (getattr(entry_params, "n", 1) or 1) > 1:
+            reason = None
+            # An LLM stage returns its n samples as one output; later stages cannot take one input per sample.
+            if final_stage_id != stage_id:
+                reason = (
+                    f"n > 1 is supported only when stage {stage_id} gives the final output; this request continues "
+                    f"to stage {final_stage_id}"
+                )
+            # Streaming-input errors take the segment path, which does not resolve samples to their request.
+            elif getattr(prompt, "resumable", False):
+                reason = "n > 1 is not supported for streaming (resumable) input"
+            # Output watermarking tracks the request, not its samples.
+            elif self.stage_pools[stage_id].will_watermark(entry_params):
+                reason = f"n > 1 is not supported with output watermarking on stage {stage_id}"
+            if reason is not None:
+                await self._fail_request_client_error(request_id, stage_id, reason)
                 return
 
         logger.debug(

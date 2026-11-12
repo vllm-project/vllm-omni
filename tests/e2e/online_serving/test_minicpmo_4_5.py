@@ -58,6 +58,12 @@ _PROMPT_LOGGING_CONFIG["loggers"]["vllm_omni.model_executor.models.minicpmo_4_5.
     "level": "DEBUG",
     "propagate": True,
 }
+# The Talker logs once when it verifies draft codes.
+_PROMPT_LOGGING_CONFIG["loggers"]["vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts"] = {
+    "handlers": ["minicpmo_prompt_selection"],
+    "level": "DEBUG",
+    "propagate": True,
+}
 _PROMPT_LOGGING_CONFIG_PATH.write_text(json.dumps(_PROMPT_LOGGING_CONFIG), encoding="utf-8")
 
 test_params = [
@@ -87,7 +93,19 @@ turn_test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
-            stage_config_path=modify_stage_config(_CI_DEPLOY, updates={"session_mode": "turn"}),
+            stage_config_path=modify_stage_config(
+                _CI_DEPLOY,
+                updates={"session_mode": "turn"},
+                # The K-step frames are booked by the duplex frame loop only;
+                # the Talker fails closed at load otherwise ("remove the
+                # stage-1 speculative_config from turn sessions"), so a turn
+                # session must not inherit the platform blocks' stage-1
+                # speculative_config.
+                deletes={
+                    "platforms.npu.stages.1.speculative_config": None,
+                    "platforms.cuda.stages.1.speculative_config": None,
+                },
+            ),
             use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
@@ -101,6 +119,110 @@ turn_test_params = [
         id="turn_async_chunk",
     ),
 ]
+
+
+# Talker DSpark draft, a test checkpoint only (its model card states no license).
+# It keeps the DSpark fields under ``dflash_config`` and ships no codec embedding
+# or head, so ``minicpmo_talker_draft`` writes a loadable copy before the server starts.
+_TALKER_DRAFT = "Qun1023/MiniCPM-o-4_5-talker-DSpark"
+_TALKER_DRAFT_REVISION = "0457ffd6980c2d1f19ebd3f1775f49764fa821af"
+_TALKER_DRAFT_DIR = Path(_PROMPT_LOG_TEMP_DIR.name) / "talker-draft"
+_TALKER_DRAFT_TOP_LEVEL_FIELDS = (
+    "markov_rank",
+    "markov_head_type",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "confidence_head_alpha",
+    "mask_token_id",
+    "target_layer_ids",
+)
+talker_dspark_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=modify_stage_config(
+                get_deploy_config_path("minicpmo_4_5_turn_mrv2.yaml"),
+                updates={
+                    # The temporary overlay lives outside deploy/, so anchor its parent.
+                    "base_config": get_deploy_config_path("minicpmo_4_5_turn.yaml"),
+                    # The CUDA block owns stage 1's speculative_config (index 0 is stage 1).
+                    "platforms.cuda.stages.0.speculative_config": {
+                        "method": "dspark",
+                        "model": str(_TALKER_DRAFT_DIR),
+                        "num_speculative_tokens": 7,
+                        "draft_sample_method": "probabilistic",
+                    },
+                    "stages": {0: {"default_sampling_params.max_tokens": 64}},
+                },
+            ),
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                str(_NATIVE_CHAT_TEMPLATE),
+                "--chat-template-content-format",
+                "openai",
+            ],
+            env_dict={
+                "VLLM_CONFIGURE_LOGGING": "1",
+                "VLLM_LOGGING_CONFIG_PATH": str(_PROMPT_LOGGING_CONFIG_PATH),
+            },
+        ),
+        id="turn_mrv2_talker_dspark",
+    ),
+]
+
+
+def _repo_file(repo: str, filename: str, revision: str | None = None) -> Path:
+    """A file of ``repo`` from the ``MODEL_PREFIX`` mirror when it has one, else the Hub."""
+    from huggingface_hub import hf_hub_download
+
+    from tests.helpers.runtime import get_model_prefix
+
+    local = Path(get_model_prefix() + repo) / filename
+    if get_model_prefix() and local.exists():
+        return local
+    return Path(hf_hub_download(repo, filename, revision=revision))
+
+
+@pytest.fixture(scope="session")
+def minicpmo_talker_draft() -> Path:
+    """Write a copy of the Talker draft that vLLM can load, before its server starts.
+
+    Qwen3DSparkModel reads the DSpark fields from the top level of the config.
+    The Talker stage reports the text vocabulary, so vLLM does not share the
+    Talker's codec embedding and head with this draft: they are added here.
+    """
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    if (_TALKER_DRAFT_DIR / "model.safetensors").exists():
+        return _TALKER_DRAFT_DIR
+    config = json.loads(_repo_file(_TALKER_DRAFT, "config.json", _TALKER_DRAFT_REVISION).read_text())
+    for key in _TALKER_DRAFT_TOP_LEVEL_FIELDS:
+        config.setdefault(key, config["dflash_config"][key])
+    weights = load_file(_repo_file(_TALKER_DRAFT, "model.safetensors", _TALKER_DRAFT_REVISION))
+
+    weight_map = json.loads(_repo_file(_MODEL, "model.safetensors.index.json").read_text())["weight_map"]
+    embed, head_g, head_v = (
+        "tts.emb_code.0.weight",
+        "tts.head_code.0.parametrizations.weight.original0",
+        "tts.head_code.0.parametrizations.weight.original1",
+    )
+    talker = {}
+    for name in (embed, head_g, head_v):
+        with safe_open(_repo_file(_MODEL, weight_map[name]), framework="pt") as f:
+            talker[name] = f.get_tensor(name)
+    weights["embed_tokens.weight"] = talker[embed].to(torch.bfloat16).contiguous()
+    # The head is weight-normed (dim 0); restore it as the Talker does at load.
+    head = torch._weight_norm(talker[head_v], talker[head_g], dim=0)
+    weights["lm_head.weight"] = head.to(torch.bfloat16).contiguous()
+
+    _TALKER_DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    (_TALKER_DRAFT_DIR / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    save_file(weights, _TALKER_DRAFT_DIR / "model.safetensors", metadata={"format": "pt"})
+    return _TALKER_DRAFT_DIR
 
 
 def get_system_prompt():
@@ -248,6 +370,35 @@ def test_text_to_audio_with_default_reference(omni_server, openai_client) -> Non
 
     assert responses[0].success
     assert responses[0].audio_bytes
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.usefixtures("minicpmo_talker_draft")
+@pytest.mark.parametrize("omni_server", talker_dspark_params, indirect=True)
+def test_text_to_audio_talker_dspark(omni_server, openai_client) -> None:
+    """
+    Test the MRv2 Talker verifying DSpark draft codes in turn sessions.
+    Deploy Setting: turn MRv2 profile, DSpark draft on stage 1
+    Input Modal: text
+    Output Modal: text + audio
+    Input Setting: stream=True
+    """
+    request_config = {
+        "model": omni_server.model,
+        "messages": dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt()),
+        "stream": True,
+        "modalities": ["text", "audio"],
+        "key_words": {"audio": ["Beijing"]},
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+
+    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+    assert all(response.success and response.audio_bytes for response in responses)
+    # Only stage 1 with a loaded draft verifies codes. Read from the start: the line is logged once.
+    assert "MiniCPM-o 4.5 Talker is verifying draft codes" in _read_prompt_selection_log(0)
 
 
 @pytest.mark.full_model

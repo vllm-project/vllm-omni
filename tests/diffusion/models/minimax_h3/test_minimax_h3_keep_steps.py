@@ -318,7 +318,7 @@ def _run_loop(
         base=base,
         keep_steps=keep_steps,
         base_cond_rows=_base_cond_rows() if base is not None else None,
-        on_step=on_step,
+        update_progress=on_step,
     )
 
 

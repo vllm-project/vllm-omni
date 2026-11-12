@@ -6,7 +6,7 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 | ---------- | ------ | ------------------ |
 | Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` in `mark`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
-| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, … |
+| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_bagel_vllm_omni.json`, … |
 | Diffusion (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) | `run_benchmark.py` | `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_lingbot_video_vllm_omni.json`, … |
 
 #### How runners pick cases
