@@ -557,7 +557,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # Keep this broad integration/determinism matrix on the reference
       # backend. Existing READY diffusion jobs cover the ROCm default/AITER
       # path without making two cold JIT builds dominate this serial lane.
@@ -615,6 +615,28 @@ steps:
             -m "core_model and diffusion and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --junitxml="$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml"
+          # Pytest includes subtests in the suite total; compare the parent node ids.
+          python -c 'import sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          from pathlib import Path
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          expected = Counter()
+          for node in Path(sys.argv[2]).read_text().splitlines():
+              module, name = node.split("::", 1)
+              expected[(module.removesuffix(".py").replace("/", "."), name)] += 1
+          actual = Counter((case.get("classname"), case.get("name")) for case in root.iter("testcase"))
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          bad_results = any(int(suite.get(key, "0")) != 0
+                            for suite in suites for key in ("skipped", "failures", "errors"))
+          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("skipped", "failure", "error"))
+          if actual != expected or bad_results:
+              print("Expected every pinned tiny-diffusion READY node to execute without skips or failures; "
+                    f"missing={expected - actual}, unexpected={actual - expected}, bad_results={bad_results}",
+                    file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml" /tmp/tiny-diffusion-base-ready-expected.txt
           TINY_DIFFUSION_BASE_READY
 
 
