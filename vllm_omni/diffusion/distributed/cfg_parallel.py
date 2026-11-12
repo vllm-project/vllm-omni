@@ -74,6 +74,40 @@ def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
     return assignments
 
 
+class _NotBatchableError(Exception):
+    """The positive and negative kwargs cannot be merged into one batch."""
+
+
+def _batch_cfg_value(pos: Any, neg: Any, n_pos: int, n_neg: int) -> Any:
+    """Merge one positive/negative argument pair into the batched call's argument.
+
+    Tensors whose dim 0 is the branch batch size (``n_pos`` / ``n_neg``) are
+    concatenated and must agree in every other dim, dtype and device. Any
+    other value -- unbatched tensors such as Flux's ``[L, 3]`` position ids,
+    objects, ``None`` -- must be the very same object in both branches, or an
+    equal plain scalar, and is passed through. Dicts, lists and tuples are
+    merged element by element. Raises :class:`_NotBatchableError` otherwise.
+    """
+    if isinstance(pos, torch.Tensor) and isinstance(neg, torch.Tensor):
+        if pos.dim() > 0 and neg.dim() > 0 and pos.shape[0] == n_pos and neg.shape[0] == n_neg:
+            if pos.shape[1:] != neg.shape[1:] or pos.dtype != neg.dtype or pos.device != neg.device:
+                raise _NotBatchableError
+            return torch.cat([pos, neg])
+    elif isinstance(pos, dict) and isinstance(neg, dict):
+        if pos.keys() != neg.keys():
+            raise _NotBatchableError
+        return {k: _batch_cfg_value(pos[k], neg[k], n_pos, n_neg) for k in pos}
+    elif isinstance(pos, (list, tuple)) and isinstance(neg, (list, tuple)):
+        if type(pos) is not type(neg) or len(pos) != len(neg):
+            raise _NotBatchableError
+        return type(pos)(_batch_cfg_value(p, n, n_pos, n_neg) for p, n in zip(pos, neg))
+    if pos is neg:
+        return pos
+    if isinstance(pos, (bool, int, float, str)) and type(pos) is type(neg) and pos == neg:
+        return pos
+    raise _NotBatchableError
+
+
 class CFGParallelMixin(metaclass=ABCMeta):
     """
     Base Mixin class for Diffusion pipelines providing shared CFG methods.
@@ -94,6 +128,88 @@ class CFGParallelMixin(metaclass=ABCMeta):
     """
 
     transformer: torch.nn.Module
+
+    # Pipelines whose predict_noise() accepts the positive and negative branch
+    # concatenated along the batch dimension set this to True; with
+    # enable_cfg_batching on and a single CFG rank, both branches then run as
+    # one call. Leave it False when the branches can differ in shape (prompt
+    # lengths, masks) or the denoiser keeps per-branch state.
+    supports_cfg_batching: bool = False
+    # predict_noise kwarg whose dim 0 is the batch size of a branch.
+    cfg_batching_batch_kwarg: str = "hidden_states"
+    # predict_noise kwargs that are not batched and are equal in both branches
+    # but may be distinct objects (e.g. per-branch ``[L, 3]`` text position
+    # ids); the positive value is passed to the batched call unchecked.
+    cfg_batching_shared_kwargs: frozenset[str] = frozenset()
+
+    def _use_cfg_batching(self) -> bool:
+        if not self.supports_cfg_batching:
+            return False
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or not getattr(od_config, "enable_cfg_batching", False):
+            return False
+        # Non-last pipeline-parallel stages return IntermediateTensors, which
+        # cannot be split back into branches.
+        parallel_config = getattr(od_config, "parallel_config", None)
+        if getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
+            return False
+        # Step caches (TeaCache, ...) keep one state per CFG branch, keyed on
+        # transformer.cfg_branch; one merged call has no single branch.
+        return getattr(od_config, "cache_backend", None) in (None, "none")
+
+    def merge_cfg_branch_kwargs(
+        self, positive_kwargs: dict[str, Any], negative_kwargs: dict[str, Any]
+    ) -> tuple[dict[str, Any], int, int] | None:
+        """Merge both branches' predict_noise kwargs into one batch.
+
+        Returns the merged kwargs and the positive / negative batch sizes, or
+        None to run the branches sequentially. Tensors batched like
+        ``cfg_batching_batch_kwarg`` are concatenated on dim 0; kwargs in
+        ``cfg_batching_shared_kwargs`` take the positive value; everything else
+        must be the same object or an equal scalar in both branches (see
+        ``_batch_cfg_value``). Pipelines that need more (e.g. per-branch masks)
+        can override this.
+        """
+        if positive_kwargs.keys() != negative_kwargs.keys():
+            return None
+        key = self.cfg_batching_batch_kwarg
+        pos_batch, neg_batch = positive_kwargs.get(key), negative_kwargs.get(key)
+        if not (isinstance(pos_batch, torch.Tensor) and isinstance(neg_batch, torch.Tensor)):
+            return None
+        if pos_batch.dim() == 0 or neg_batch.dim() == 0:
+            return None
+        n_pos, n_neg = pos_batch.shape[0], neg_batch.shape[0]
+        shared = self.cfg_batching_shared_kwargs
+        try:
+            merged = {
+                k: positive_kwargs[k] if k in shared else _batch_cfg_value(v, negative_kwargs[k], n_pos, n_neg)
+                for k, v in positive_kwargs.items()
+            }
+        except _NotBatchableError:
+            return None
+        return merged, n_pos, n_neg
+
+    def _predict_noise_batched_cfg(
+        self, positive_kwargs: dict[str, Any], negative_kwargs: dict[str, Any]
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]] | None:
+        """Both branches in one predict_noise call, or None to run them sequentially."""
+        merged = self.merge_cfg_branch_kwargs(positive_kwargs, negative_kwargs)
+        if merged is None:
+            logger.warning_once(
+                "CFG batching: %s branch arguments do not merge into one batch; running them sequentially",
+                type(self).__name__,
+            )
+            return None
+        batched, n_pos, n_neg = merged
+        # Deliberately not stamped with transformer.cfg_branch: the call covers
+        # both branches, and per-branch caches are excluded above.
+        pred = _wrap(self.predict_noise(**batched))
+        if not all(isinstance(p, torch.Tensor) and p.dim() > 0 and p.shape[0] == n_pos + n_neg for p in pred):
+            raise RuntimeError(
+                f"{type(self).__name__} sets supports_cfg_batching, but predict_noise did not return "
+                f"outputs batched as {n_pos} positive + {n_neg} negative rows"
+            )
+        return tuple(p[:n_pos] for p in pred), tuple(p[n_pos:] for p in pred)
 
     def _set_transformer_do_true_cfg(self, do_true_cfg: bool) -> None:
         transformer = getattr(self, "transformer", None)
@@ -137,6 +253,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
             branch and reads the stamp instead of guessing the branch from how
             many forwards it has seen, which goes wrong once non-CFG forwards
             run in between (e.g. under step execution).
+
+            With one CFG rank and ``enable_cfg_batching`` on (default off),
+            pipelines that set ``supports_cfg_batching`` run both branches as
+            one ``predict_noise`` call on the concatenated batch (see
+            ``merge_cfg_branch_kwargs``), unless a cache backend is configured.
         """
         self._set_transformer_do_true_cfg(do_true_cfg)
 
@@ -175,9 +296,16 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     **({} if kwargs is None else {"kwargs": kwargs}),
                 )
             else:
-                # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
-                negative_noise_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
+                batched = None
+                if self._use_cfg_batching():
+                    batched = self._predict_noise_batched_cfg(positive_kwargs, negative_kwargs)
+                if batched is not None:
+                    # Batched CFG: both branches in one call.
+                    positive_noise_pred, negative_noise_pred = batched
+                else:
+                    # Sequential CFG: compute both positive and negative
+                    positive_noise_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
+                    negative_noise_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)

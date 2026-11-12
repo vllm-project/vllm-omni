@@ -645,6 +645,7 @@ class StageDeployConfig:
     diffusion_use_graph: bool | None = None
     diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     video_output_transport: dict[str, Any] | None = None

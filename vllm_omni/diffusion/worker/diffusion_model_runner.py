@@ -60,6 +60,7 @@ from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
+    SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
@@ -425,7 +426,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "prepare_encode(), denoise_step(), post_decode(), and either "
+                "step_scheduler() or denoise_step_updates_state=True; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -1565,7 +1567,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ):
                 current_omni_platform.reset_peak_memory_stats()
             states, input_batch, runner_output_list = self._prepare_batch_inputs(
-                states, new_request_ids, scheduler_output.use_mixfusion
+                states, new_request_ids, getattr(scheduler_output, "use_mixfusion", False)
             )
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
@@ -1583,12 +1585,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 clear_pipeline_stage_durations(pipeline)
                 with _attention_schedule_scope(attention_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
-                    if input_batch.use_mixfusion and driver is None:
+                    if getattr(input_batch, "use_mixfusion", False) and driver is None:
                         raise RuntimeError("Scheduler requested MixFusion without an installed driver")
+                    sample_results = None
                     if driver is not None:
                         # The driver forwards dense batches to the same
                         # ``denoise_step`` and arms the approved packed path.
                         noise_pred = driver.run(input_batch, states, pipeline.denoise_step)
+                    elif isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state:
+                        sample_results = pipeline.denoise_step(input_batch, states=states)
+                        if set(sample_results) != {state.request_id for state in states}:
+                            raise ValueError("denoise_step must return a result for every active request")
+                        noise_pred = None
                     else:
                         noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
@@ -1617,13 +1625,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            if isinstance(noise_pred, list):
-                                req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
+                            if sample_results is not None:
+                                error = sample_results[req.request_id]
+                                if error is not None:
+                                    raise error
                             else:
-                                req_noise_pred = (
-                                    noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                                )
-                            pipeline.step_scheduler(req, req_noise_pred)
+                                if isinstance(noise_pred, list):
+                                    req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
+                                else:
+                                    req_noise_pred = (
+                                        noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                    )
+                                pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:

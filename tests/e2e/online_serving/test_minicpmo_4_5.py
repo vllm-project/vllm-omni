@@ -93,7 +93,19 @@ turn_test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
-            stage_config_path=modify_stage_config(_CI_DEPLOY, updates={"session_mode": "turn"}),
+            stage_config_path=modify_stage_config(
+                _CI_DEPLOY,
+                updates={"session_mode": "turn"},
+                # The K-step frames are booked by the duplex frame loop only;
+                # the Talker fails closed at load otherwise ("remove the
+                # stage-1 speculative_config from turn sessions"), so a turn
+                # session must not inherit the platform blocks' stage-1
+                # speculative_config.
+                deletes={
+                    "platforms.npu.stages.1.speculative_config": None,
+                    "platforms.cuda.stages.1.speculative_config": None,
+                },
+            ),
             use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
