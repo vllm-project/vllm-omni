@@ -91,8 +91,24 @@ Both standard `/v1/audio/speech` and sentence-speech admission use the local
 submission. Standard speech prompt-length estimation and precomputed text IDs
 use the same tokenizer; the root Thinker vocabulary can segment text differently.
 The API startup shares the tokenizer loaded off the event loop across these
-routes. CPU regressions cover rejection followed by a healthy request and both
-streaming and non-streaming prompt modes for both Talker architectures.
+routes. Standard speech keeps parameter validation synchronous, but performs
+lexical validation in its asynchronous adapter build, before inherited
+reference-audio resolution. Both the fallback tokenizer disk load and the text
+check run in a worker thread. A per-adapter load lock coalesces concurrent cold
+requests, publishes only a successful tokenizer, and releases after a failure;
+this path does not depend on startup ordering or router installation.
+
+Strict caller-text rejection is intentional for both speech APIs. With
+`ids = tokenizer.encode(text, add_special_tokens=False)`, require nonempty
+non-control IDs and `tokenizer.decode(ids, skip_special_tokens=False) == text`.
+Do not trim or normalize input to make it pass. Thus consecutive spaces or
+Unicode forms are rejected if the tokenizer normalizes them; callers must
+explicitly submit their intended canonical text. Generated-token provenance
+and exact lexical checks remain unchanged. CPU regressions cover concurrent
+cold-load event-loop progress, cache reuse, failed-load recovery, control and
+normalizable-text rejection before audio/engine work followed by a healthy
+request, and both streaming and non-streaming prompt modes for both Talker
+architectures.
 
 ## Acceptance
 
