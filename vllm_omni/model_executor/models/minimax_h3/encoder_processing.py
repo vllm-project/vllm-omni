@@ -46,7 +46,6 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     load_video_frames,
     prepare_edit_video,
     prepare_reference_videos,
-    reference_video_transcode_rgb_reuse_enabled,
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
@@ -785,10 +784,10 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        reuse_transcode_rgb = reference_video_transcode_rgb_reuse_enabled()
+                        # Reused descriptors may come from a producer with a different switch setting.
                         full_frames = (
                             load_prepared_rgb_frames(item)
-                            if reuse_transcode_rgb
+                            if "rgb_path" in item
                             else load_video_frames(item["prepared_path"])
                         )
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))

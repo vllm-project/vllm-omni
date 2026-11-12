@@ -1,48 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import ast
 import json
-import math
-import os
+import shutil
 import subprocess
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
+
+from vllm_omni.errors import OmniClientError
+from vllm_omni.model_executor.models.minimax_h3 import encoder_processing, reference_video
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
-ROOT = Path(__file__).resolve().parents[4]
-
-
-class OmniClientError(ValueError):
-    pass
-
-
-def load_module() -> ModuleType:
-    path = ROOT / "vllm_omni/model_executor/models/minimax_h3/reference_video.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
-    module = ModuleType("reference_video_under_test")
-    module.__dict__.update(
-        Any=Any,
-        OmniClientError=OmniClientError,
-        Path=Path,
-        json=json,
-        math=math,
-        np=np,
-        os=os,
-        subprocess=subprocess,
-        torch=torch,
-    )
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), module.__dict__)
-    return module
-
-
-reference_video = load_module()
 
 
 def _descriptor_item(tmp_path):
@@ -94,20 +65,104 @@ def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
         reference_video.load_prepared_rgb_frames(item)
 
 
-def test_transcode_can_emit_video_and_raw_rgb(monkeypatch, tmp_path):
-    calls = []
-    monkeypatch.setattr(reference_video.subprocess, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+@pytest.mark.parametrize("enabled", ["0", "1", "true"])
+@pytest.mark.parametrize("has_sidecar", [False, True])
+def test_reused_descriptor_selects_frames_independently_of_consumer_env(monkeypatch, tmp_path, enabled, has_sidecar):
+    """Old descriptors remain usable; an existing sidecar is always consumed."""
+    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", enabled)
+    item = _descriptor_item(tmp_path)
+    item["prepared_path"] = str(tmp_path / "prepared.mp4")
+    Path(item["prepared_path"]).touch()
+    rgb = np.arange(24, dtype=np.uint8).reshape(2, 2, 2, 3)
+    decoded = np.full_like(rgb, 123)
+    if has_sidecar:
+        rgb.tofile(item["rgb_path"])
+    else:
+        del item["rgb_path"], item["frame_count"]
+    monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: decoded)
+    monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (32, 32, 96, 27, 160))
+    result = encoder_processing.prepare_encoder_inputs(
+        {"prompt": "reference clip", "multi_modal_data": {"video": "source.mp4"}},
+        SimpleNamespace(extra_args={"task": "ref2va"}),
+        prepared_reference_videos=[item],
+    )
+    expected = rgb if has_sidecar else decoded
+    np.testing.assert_array_equal(result.media.videos[0].numpy(), expected)
+    np.testing.assert_array_equal(result.qwen_videos[0][0], expected[:1])
+    assert result.video_timestamps == [[0.0]]
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypatch, tmp_path, enabled):
+    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", enabled)
+    item = _descriptor_item(tmp_path)
+    item["prepared_path"] = str(tmp_path / "prepared.mp4")
+    Path(item["prepared_path"]).touch()
+    Path(item["rgb_path"]).write_bytes(b"truncated")
+    monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: np.zeros((2, 2, 2, 3), dtype=np.uint8))
+    monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (32, 32, 96, 27, 160))
+    with pytest.raises(OmniClientError, match="expected 24"):
+        encoder_processing.prepare_encoder_inputs(
+            {"prompt": "reference clip", "multi_modal_data": {"video": "source.mp4"}},
+            SimpleNamespace(extra_args={"task": "ref2va"}),
+            prepared_reference_videos=[item],
+        )
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+@pytest.mark.parametrize(
+    ("target_frames", "duration", "start", "pad", "expected_count"),
+    [(6, None, 0.0, False, 6), (0, 0.25, 0.125, False, 6), (20, None, 0.0, True, 20), (0, None, 0.0, False, 12)],
+)
+def test_transcode_sidecar_matches_prepared_video_pixels(tmp_path, target_frames, duration, start, pad, expected_count):
+    """Catch divergence in RGB conversion, trimming, seeking or last-frame padding."""
+    source = str(tmp_path / "source.mp4")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=32x32:rate=24",
+            "-frames:v",
+            "12",
+            "-c:v",
+            "libx264rgb",
+            "-crf",
+            "0",
+            source,
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+    )
     rgb_path = str(tmp_path / "prepared.rgb")
-    reference_video._transcode_reference_video(
-        "source.mp4",
+    prepared = reference_video._transcode_reference_video(
+        source,
         target_width=32,
         target_height=32,
-        target_frame_count=4,
+        target_frame_count=target_frames,
         workdir=str(tmp_path),
+        start_time_seconds=start,
+        duration_seconds=duration,
+        pad_last_frame=pad,
         rgb_output_path=rgb_path,
     )
-    command, kwargs = calls[0]
-    assert "-filter_complex" in command
-    assert "split=2[prepared][rgb]" in command[command.index("-filter_complex") + 1]
-    assert command[-1] == rgb_path
-    assert kwargs["stdin"] is reference_video.subprocess.DEVNULL
+    rgb = reference_video.load_prepared_rgb_frames(
+        {"rgb_path": rgb_path, "frame_count": expected_count, "width": 32, "height": 32}
+    )
+    try:
+        decoded = reference_video._decode_video_frames_ffmpeg(prepared, frame_count=expected_count, width=32, height=32)
+        np.testing.assert_array_equal(rgb, decoded)
+        sidecar_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=rgb)
+        decoded_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=decoded)
+        np.testing.assert_array_equal(sidecar_sample["frames"], decoded_sample["frames"])
+        assert sidecar_sample["block_timestamps"] == decoded_sample["block_timestamps"]
+        np.testing.assert_array_equal(
+            encoder_processing._frames_to_tensor(rgb).numpy(), encoder_processing._frames_to_tensor(decoded).numpy()
+        )
+    finally:
+        rgb._mmap.close()
