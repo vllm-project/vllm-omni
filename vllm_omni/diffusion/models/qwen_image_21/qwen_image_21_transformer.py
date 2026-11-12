@@ -142,7 +142,12 @@ def _apply_qwen_image21_rotary_emb_native(x: torch.Tensor, freqs: torch.Tensor) 
 
     Algebraically identical to the complex multiplication, computed in fp32:
     (x1 + i x2)(cos + i sin) interleaved back as [x1 cos - x2 sin, x1 sin + x2 cos, ...].
+    MUSA tensors take a Triton kernel with the same rounding.
     """
+    if x.device.type == "musa":
+        fused = rotary(x, freqs)
+        if fused is not None:
+            return fused
     cos = torch.real(freqs).float().unsqueeze(1)
     sin = torch.imag(freqs).float().unsqueeze(1)
     x_pairs = x.float().unflatten(-1, (-1, 2))
