@@ -339,7 +339,13 @@ class ARDiffusionCellContext:
 
 
 class CellAdapter:
-    """Model-side cell step: one block per request on this rank."""
+    """Model-side cell step on this rank.
+
+    Receives the slot's plan-allowed tasks and KV views. Compatible members may
+    be organized into ``CellComputeBatch`` groups inside the adapter (or a
+    shared organizer) for one tensor-packed model call; scheduling order stays
+    with CellPlan.
+    """
 
     def forward(
         self,

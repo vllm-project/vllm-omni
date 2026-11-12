@@ -4,14 +4,18 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import (
+    CellComputeBatch,
+    organize_cell_batches,
+)
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import CellAdapter
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Cell
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
@@ -206,12 +210,19 @@ class WanCell(CellAdapter):
 class WanCellBatch(CellAdapter):
     """Run compatible same-cell members from several requests in one DiT call.
 
-    Members that share ``(chunk, step, block)`` and ``latent_shape`` are packed on
-    the batch axis. Attention still uses each request's paged-KV context; FFN /
-    embed / unembed run as one batched tensor op.
+    Organizes slot tasks into ``CellComputeBatch`` groups (shared cell + shape +
+    denoise config, capped by ``max_batch_size``). Compatible members pack on the
+    batch axis for embed / block / unembed; attention still uses each request's
+    paged-KV view. Member prompt / sampler / seed stay on the per-request
+    ``WanCell``.
     """
 
-    def __init__(self, members: Mapping[str, WanCell]) -> None:
+    def __init__(
+        self,
+        members: Mapping[str, WanCell],
+        *,
+        max_batch_size: int | None = None,
+    ) -> None:
         if not members:
             raise ValueError("WanCellBatch requires at least one member")
         self.members = dict(members)
@@ -226,8 +237,11 @@ class WanCellBatch(CellAdapter):
         self.device = first.device
         self.dtype = first.dtype
         self.latent_shape = first.latent_shape
+        self.max_batch_size = max(1, int(max_batch_size or len(self.members)))
         self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
         self._last_meta: tuple[str, int, int] | None = None
+        self.last_batches: list[CellComputeBatch] = []
+        self.block_call_members: list[int] = []
 
     @property
     def finished(self) -> dict[str, dict[int, torch.Tensor]]:
@@ -235,6 +249,10 @@ class WanCellBatch(CellAdapter):
         for member in self.members.values():
             merged.update(member.finished)
         return merged
+
+    def compatibility_of(self, req: str, cell: Cell) -> Hashable:
+        member = self.members[req]
+        return (cell, member.latent_shape, member.num_denoise_steps)
 
     def stash_activation(
         self,
@@ -265,33 +283,36 @@ class WanCellBatch(CellAdapter):
     def forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
             return hidden
-        groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-        for i, (_req, cell) in enumerate(tasks):
-            groups[cell].append(i)
-        # Preserve original task order when concatenating group outputs.
+        batches = organize_cell_batches(
+            tasks,
+            kv_contexts,
+            compatibility_of=self.compatibility_of,
+            max_batch_size=self.max_batch_size,
+        )
+        self.last_batches = batches
+        self.block_call_members = []
         outs: list[dict[str, torch.Tensor] | None] = [None] * len(tasks)
-        for cell, indices in groups.items():
-            if len(indices) == 1:
-                i = indices[0]
-                req, _cell = tasks[i]
-                member = self.members[req]
-                ctx_list = kv_contexts[i] if i < len(kv_contexts) else None
-                kv_ctx = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
-                self._last_meta = (req, cell[0], cell[1])
-                outs[i] = member.run_one(
-                    req,
+        for batch in batches:
+            if batch.size == 1:
+                member_ref = batch.members[0]
+                member = self.members[member_ref.request_id]
+                cell = member_ref.cell
+                self._last_meta = (member_ref.request_id, cell[0], cell[1])
+                self.block_call_members.append(1)
+                outs[member_ref.task_index] = member.run_one(
+                    member_ref.request_id,
                     cell,
-                    kv_ctx,
-                    index=i,
+                    batch.kv_views[0],
+                    index=member_ref.task_index,
                     n_tasks=len(tasks),
                     hidden=hidden,
                     stash_take=self.take_stashed_activation,
                     bind_text=True,
                 )
                 continue
-            group_out = self._forward_fused(tasks, kv_contexts, hidden=hidden, indices=indices, cell=cell)
-            for local_i, task_i in enumerate(indices):
-                outs[task_i] = {k: v[local_i : local_i + 1] for k, v in group_out.items()}
+            packed = self._forward_fused(batch, tasks=tasks, hidden=hidden)
+            for local_i, per_member in enumerate(batch.split_outputs(packed)):
+                outs[batch.members[local_i].task_index] = per_member
         assert all(item is not None for item in outs)
         typed_outs = [item for item in outs if item is not None]
         if len(typed_outs) == 1:
@@ -301,34 +322,27 @@ class WanCellBatch(CellAdapter):
 
     def _forward_fused(
         self,
-        tasks: Sequence[tuple[str, tuple[int, int, int]]],
-        kv_contexts: Sequence[Any],
+        batch: CellComputeBatch,
         *,
+        tasks: Sequence[tuple[str, Cell]],
         hidden: Any,
-        indices: Sequence[int],
-        cell: tuple[int, int, int],
     ) -> dict[str, torch.Tensor]:
-        chunk, step, block = cell
-        members = [self.members[tasks[i][0]] for i in indices]
+        chunk, step, block = batch.cell
+        members = [self.members[m.request_id] for m in batch.members]
         tf = self.transformer
         text = torch.cat([m.prompt_embeds for m in members], dim=0)
         tf.prepare_cell(text)
 
         latents: list[torch.Tensor] = []
         tokens_list: list[torch.Tensor | None] = []
-        kv_list: list[Any] = []
-        for local_i, task_i in enumerate(indices):
-            req, _cell = tasks[task_i]
+        for local_i, member_ref in enumerate(batch.members):
             member = members[local_i]
-            ctx_list = kv_contexts[task_i] if task_i < len(kv_contexts) else None
-            kv_ctx = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
-            kv_list.append(kv_ctx)
-            live = member._live.setdefault(req, {})
+            live = member._live.setdefault(member_ref.request_id, {})
             latent, tokens = member._resolve_latent_hidden(
-                req=req,
+                req=member_ref.request_id,
                 chunk=chunk,
                 step=step,
-                index=task_i,
+                index=member_ref.task_index,
                 n_tasks=len(tasks),
                 hidden=hidden,
                 live=live,
@@ -350,6 +364,7 @@ class WanCellBatch(CellAdapter):
                 raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
             tokens_b = torch.cat([tok for tok in tokens_list if tok is not None], dim=0)
 
+        self.block_call_members.append(batch.size)
         tokens_b = tf.block(
             block,
             tokens_b,
@@ -357,21 +372,20 @@ class WanCellBatch(CellAdapter):
             step=step_key,
             latent=latent_b,
             timestep=t,
-            kv_ctx=kv_list,
+            kv_ctx=list(batch.kv_views),
         )
         if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
-            for local_i, task_i in enumerate(indices):
-                req, _ = tasks[task_i]
-                members[local_i]._live.setdefault(req, {})[chunk] = latents[local_i]
+            for local_i, member_ref in enumerate(batch.members):
+                members[local_i]._live.setdefault(member_ref.request_id, {})[chunk] = latents[local_i]
             return {"latent": latent_b, "hidden_states": tokens_b}
 
         pred_b = tf.unembed(tokens_b, chunk=chunk, step=step_key, latent=latent_b, timestep=t)
         out_latents: list[torch.Tensor] = []
-        for local_i, task_i in enumerate(indices):
-            req, _ = tasks[task_i]
+        for local_i, member_ref in enumerate(batch.members):
             member = members[local_i]
+            req = member_ref.request_id
             latent = latents[local_i]
-            pred = pred_b[local_i : local_i + 1]
+            pred = pred_b[batch.row_slice(local_i)]
             if step < member.num_denoise_steps:
                 latent = member.sampler.advance(pred, latent, step)
                 if step == member.num_denoise_steps - 1:

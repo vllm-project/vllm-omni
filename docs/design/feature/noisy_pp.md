@@ -286,11 +286,25 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).
-- Micro-batch packing (`R`): varlen vs pad for attention contexts (DiT FFN/embed
-  already pack compatible same-cell members via ``WanCellBatch`` when
-  ``max_batch_size>1``).
+- Micro-batch packing (`R`): attention still loops per-member paged-KV views;
+  DiT FFN/embed/unembed pack via ``CellComputeBatch`` + ``WanCellBatch`` when
+  ``max_batch_size>1``. Varlen / pad merge and Legacy step Batch remain open.
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
+
+## Cell Batch (Noisy KV)
+
+Batch is a Noisy PP execution contract, not a model feature. Compatible
+plan-allowed Cells in one slot form a ``CellComputeBatch``: ordered member
+identity, per-member KV views, and batch-row → member result mapping (same
+member contract as step ``InputBatch``, Cell granularity).
+``organize_cell_batches`` groups by compatibility and splits on
+``max_batch_size`` without deferring Cells to a later plan slot.
+
+Model adapters only pack tensors and split outputs for a ``CellComputeBatch``.
+CausVid's ``WanCellBatch`` is the first backend: embed / block / unembed on the
+batch axis, per-member prompt / sampler / seed / finished / paged-KV. Other
+Noisy PP models should reuse the same organizer and implement their own packer.
 
 ## Related
 
@@ -298,5 +312,5 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - [AR-Diffusion pipeline capability](../ar_diffusion_pipeline_capability.md)
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
-- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{noisy_pp_plan,noisy_pp_executor}.py`;
+- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{cell_batch,noisy_pp_plan,noisy_pp_executor}.py`;
   NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`

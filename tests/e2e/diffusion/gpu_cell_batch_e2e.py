@@ -88,29 +88,27 @@ def main() -> None:
     omni = Omni(model="/data/models/Wan2.1-T2V-1.3B-Diffusers", deploy_config=str(deploy))
     print(f"[e2e] loaded {time.perf_counter() - t_load:.1f}s", flush=True)
 
-    params = [
-        OmniDiffusionSamplingParams(
-            height=480,
-            width=832,
-            num_frames=13,
-            seed=i,
-            extra_args={
-                "session_id": f"batch-{i}",
-                "chunk_base": 0,
-                "num_chunks": 1,
-                "num_denoise_steps": DENOISE,
-                "kv_history_chunks": HISTORY,
-                "cell_schedule": "latest_kv",
-                "shift": 8.0,
-                "seed": i,
-                "latent_shape": LATENT_SHAPE,
-                "reset": True,
-                "close_session": True,
-                "stream_decode": False,
-            },
-        )
-        for i in range(len(PROMPTS))
-    ]
+    # Stage-0 Omni expects one sampling-params object (or len==num_stages), not
+    # one entry per prompt. Distinct request_ids still isolate NoisyKV members.
+    params = OmniDiffusionSamplingParams(
+        height=480,
+        width=832,
+        num_frames=13,
+        seed=0,
+        extra_args={
+            "chunk_base": 0,
+            "num_chunks": 1,
+            "num_denoise_steps": DENOISE,
+            "kv_history_chunks": HISTORY,
+            "cell_schedule": "latest_kv",
+            "shift": 8.0,
+            "seed": 0,
+            "latent_shape": LATENT_SHAPE,
+            "reset": True,
+            "close_session": True,
+            "stream_decode": False,
+        },
+    )
 
     failures: list[str] = []
     t0 = time.perf_counter()

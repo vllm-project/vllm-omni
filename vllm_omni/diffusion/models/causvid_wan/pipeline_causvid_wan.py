@@ -756,7 +756,11 @@ class CausVidWanPipeline(nn.Module):
             if len(members) == 1:
                 batch_adapter = next(iter(members.values()))
             else:
-                batch_adapter = WanCellBatch(members)
+                max_batch = getattr(getattr(ctx, "spec", None), "max_batch_size", None)
+                batch_adapter = WanCellBatch(
+                    members,
+                    max_batch_size=max_batch if max_batch is not None else len(members),
+                )
             try:
                 run_cell_pipeline(ctx=ctx, adapter=batch_adapter)
             except Exception:
