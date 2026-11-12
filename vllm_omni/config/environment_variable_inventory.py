@@ -233,6 +233,9 @@ _MODEL_PROMOTE = (
     "H3_VAE_COMPILE",
     "H3_VAE_FP16_WEIGHTS",
     "H3_VAE_XEFMHA",
+    # MiniMax-H3 Ascend decoder optimization controls.
+    "H3_VAE_OPERATOR_FIR_C16_INSTALL",
+    "H3_VAE_OPERATOR_FIR_C16",
 )
 
 _MODEL_REQUEST_SCOPE = (

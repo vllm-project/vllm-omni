@@ -91,6 +91,11 @@ def install(model: torch.nn.Module) -> int:
         name = type(module).__name__
         if name not in ("UpSample1d", "LowPassFilter1d") or hasattr(module, "_h3_dense_fir"):
             continue
+        filter_ = getattr(module, "filter", None)
+        if not isinstance(filter_, torch.Tensor) or filter_.numel() != 12:
+            continue
+        if name == "UpSample1d" and (module.stride != 2 or module.ratio != 2):
+            continue
         module.register_buffer(
             "_h3_dense_fir",
             _diagonal_filter(module.filter, _DEFAULT_WIDTH),
