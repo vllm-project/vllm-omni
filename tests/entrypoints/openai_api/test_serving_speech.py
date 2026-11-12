@@ -1704,7 +1704,7 @@ class TestTTSMethods:
         assert batch_resp.succeeded == 0
 
         with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
-            async for _ in speech_server._generate_audio_stream(
+            async for _ in speech_server._generate_audio_chunks(
                 generator=mock_generate(),
                 request_id="speech-stream-synth-err",
                 response_format="pcm",
