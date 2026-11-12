@@ -274,6 +274,7 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         "h100_2",
         "h100_3",
         "h100_4",
+        "h100_weight_sharing_tp4",
         "b200_1",
         "b200_2",
         "b200_3",

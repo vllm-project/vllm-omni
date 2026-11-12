@@ -1832,7 +1832,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
@@ -1893,20 +1895,26 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif device_spk:
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
             # back to the CPU onnxruntime path (accuracy triage).
-            if device_spk:
+            flow_parameter = next(token2wav.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
-                logger.info(
-                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false)"
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
                 )
+        else:
+            logger.info(
+                "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                "(token2wav_device_spk=false)"
+            )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
             token2wav.enable_speaker_cuda_graph(self.vllm_config)
             logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
