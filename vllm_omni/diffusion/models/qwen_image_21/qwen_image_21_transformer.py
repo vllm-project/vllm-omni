@@ -1368,7 +1368,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type in {"cuda", "npu", "musa"}
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
