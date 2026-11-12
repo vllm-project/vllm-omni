@@ -339,11 +339,7 @@ class DuplexSessionRunner:
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
         self.memory = SessionMemoryRuntime(self.ctx, post=self._post_memory_event, wake=self._wake_memory)
-        calibration = (
-            plugin.history_calibrator(manager.runtime_config)
-            if "audio" in session.capabilities.supported_output_modalities
-            else None
-        )
+        calibration = plugin.history_calibrator(manager.runtime_config) if session.capabilities.emits_audio else None
         if calibration is not None:
             self.ctx.history_calibration = HistoryCalibration(
                 session,
@@ -1282,12 +1278,7 @@ class DuplexSessionRunner:
                         self.plugin.on_history_item_deleted(state=self.model_state, item_id=command.item_id)
                     )
         elif isinstance(command, TruncateItem):
-            if "audio" not in session.capabilities.supported_output_modalities:
-                self._emit_error(
-                    "unsupported_operation",
-                    "Text-only output cannot be truncated at an audio position",
-                    event_id=command.event_id,
-                )
+            if not self.control.check_audio_truncate_support(event_id=command.event_id):
                 return
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
