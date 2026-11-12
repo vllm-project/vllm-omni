@@ -1482,7 +1482,7 @@ steps:
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            2 20 45m rocm-diffusion-collectives-2gpu
+            2 21 45m rocm-diffusion-collectives-2gpu
             tests/diffusion/distributed/test_comm.py
             tests/diffusion/distributed/test_cfg_parallel.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_2"
@@ -1499,8 +1499,9 @@ steps:
         commands:
           - >-
             bash .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-            4 10 45m rocm-diffusion-collectives-4gpu
+            4 12 45m rocm-diffusion-collectives-4gpu
             tests/diffusion/distributed/test_comm.py
+            tests/diffusion/distributed/test_fused_qkv_pack.py
             -m "full_model and diffusion and parallel and rocm and MI325 and cards_4"
 
       # There is no three-GPU pool. Reserve four devices explicitly; each test
