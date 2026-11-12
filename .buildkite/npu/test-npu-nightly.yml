@@ -158,7 +158,7 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":sound: TTS · VoxCPM2 Test (A3)"
+      - label: ":sound: TTS · VoxCPM2 Test - A3"
         key: nightly-tts-voxcpm2-npu
         source_file_dependencies: tts_voxcpm2_function
         mirror_hardwares: a3_npu_2
