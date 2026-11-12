@@ -132,8 +132,21 @@ HTTP listener for it. Standard chat/audio, sentence speech and decisions do
 not use this internal HTTP hop. Both speech routes validate caller text with
 the bundle's Talker tokenizer before starting synthesis. Empty text, control
 tokens and failed exact encode/decode round trips return 400 without submitting
-an engine request. The tokenizer is loaded once at API bootstrap; a deployment
-without all three stages returns 503 for sentence speech. Sentence streaming
+an engine request. Strict rejection is intentional: encode with
+`add_special_tokens=False`, reject any special/control IDs, and require
+`decode(ids, skip_special_tokens=False)` to equal the original input. No text
+is trimmed or silently normalized. If the tokenizer collapses `"hello  world"`
+to `"hello world"`, that input returns 400 with
+`Fixed speech tokenization changed the reply`; the caller must explicitly
+submit the canonical text they intend to synthesize. Unicode normalization or
+decoding cleanup that changes text also fails this check. See the
+[4B caller-text contract](drvexo_unified_4b.md#requests) for the current primary model.
+
+API bootstrap shares the tokenizer when available. Standard speech also has an
+off-event-loop fallback: concurrent cold requests share one successful load,
+then lexical validation completes before any reference-audio resolution or
+engine submission. Failed loads propagate and do not poison the cache. A
+deployment without all three stages returns 503 for sentence speech. Sentence streaming
 accepts an omitted or null `n`
 as one response, and rejects multiple choices.
 
