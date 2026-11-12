@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/mimo_audio>.
 
-
 ## 🛠️ Installation
 
 Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
@@ -10,6 +9,7 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 ## Run examples (MiMo-Audio)
 
 ### Launch the Server
+
 ```bash
 export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"
 
@@ -18,19 +18,26 @@ vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
     --port 18091 \
     --chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
 ```
+
 > ⚠️ **Important**  
 > **MiMo-Audio is not compatible with the default chat template.**  
 > The provided `chat_template.jinja` implements MiMo-specific role, audio token, and instruction formatting and **must be used for all inference**.
 
-
 ### Send Multi-modal Request
 
+MiMo samples local speech codes with temperature `0.9` and top-p `0.95`, including
+when the text sampling temperature is `0`. Set the stage-0 `seed` in
+`sampling_params_list` for repeatable speech generation with the same serving
+configuration. A fixed seed does not guarantee identical audio across different
+batch shapes, hardware, or numerical precision.
+
 Get into the example folder
+
 ```bash
 cd examples/online_serving/mimo_audio
 ```
 
-####  Send request via python
+#### Send request via python
 
 ```bash
 # Audio dialogue task
@@ -42,15 +49,14 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 The Python client supports the following command-line arguments:
 
 - `--query-type` (or `-q`): Query type (default: `multi_audios`)
-  - Options: `multi_audios`, `text`
+    - Options: `multi_audios`, `text`
 - `--message-json` (or `-m`): Path to `base64` multi rounds audio messages json file
-  - Do not pass any value for "text" query type
-  - Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs, only for "Are these two audio clips the same?" task
-  - Example: `---message-json ./examples/offline_inference/mimo_audio/message_base64_wav.json`
+    - Do not pass any value for "text" query type
+    - Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs, only for "Are these two audio clips the same?" task
+    - Example: `---message-json ./examples/offline_inference/mimo_audio/message_base64_wav.json`
 - `--prompt` (or `-p`): Custom text prompt/question, only for query type is "text"(TTS task)
-  - Attention! Do not pass any value for "multi_audios" query type
-  - Example: `--prompt "What are the main activities shown in this video?"`
-
+    - Attention! Do not pass any value for "multi_audios" query type
+    - Example: `--prompt "What are the main activities shown in this video?"`
 
 For example, to use multi rounds audios with local files:
 

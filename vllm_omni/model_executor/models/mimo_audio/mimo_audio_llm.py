@@ -112,16 +112,32 @@ class MiMoSampler:
         return torch.argmax(scores, dim=-1)
 
 
+def _sample_with_uniform(scores: torch.Tensor, uniform: torch.Tensor) -> torch.Tensor:
+    """Draw from filtered logits; a negative uniform selects the greedy path."""
+    cdf = scores.softmax(dim=-1).cumsum(dim=-1)
+    # Normalize the last entry to one so rounding cannot select past the vocab.
+    cdf = cdf / cdf[:, -1:]
+    sampled = (cdf <= uniform.unsqueeze(-1)).sum(dim=-1)
+    return torch.where(uniform < 0, scores.argmax(dim=-1), sampled)
+
+
 class MiMoLocalSampler(MiMoSampler):
     """Match the graph sampler without changing global-token sampling."""
 
-    def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        scores: torch.Tensor,
+        removed_tokens: list[int] | None = None,
+        uniform: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Match the graph's FP32 tensor parameters; BF16 division can create ties.
         scores = scores.to(dtype=torch.float32, copy=bool(removed_tokens))
         if removed_tokens:
             # Preserve caller logits and exclude before top-k/top-p filtering.
             for t in removed_tokens:
                 scores[:, t] = float("-inf")
+        if uniform is not None:
+            return _sample_with_uniform(self.process(scores), uniform)
         return super().sample(scores)
 
 
@@ -155,13 +171,20 @@ class MiMoLocalSamplerTensor:
 
         return scores
 
-    def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
-        if removed_tokens is not None and len(removed_tokens) > 0:
-            scores = scores.clone()
+    def sample(
+        self,
+        scores: torch.Tensor,
+        removed_tokens: list[int] | None = None,
+        uniform: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        scores = scores.to(dtype=torch.float32, copy=bool(removed_tokens))
+        if removed_tokens:
             for t in removed_tokens:
                 scores[:, t] = float("-inf")
 
         scores = self.process(scores)
+        if uniform is not None:
+            return _sample_with_uniform(scores, uniform)
         return torch.argmax(scores, dim=-1)
 
 
@@ -174,6 +197,9 @@ class MiMoLocalDecodeBuffer:
         hidden_size = model.local_config.hidden_size
 
         self.input_tensor = torch.zeros((max_batch_size, 1, hidden_size), dtype=dtype, device=device)
+        self.sampling_uniforms = torch.full(
+            (max_batch_size, model.group_size * model.audio_channels), -1.0, dtype=torch.float32, device=device
+        )
         self.sampler = MiMoLocalSamplerTensor(
             temperature=torch.ones(max_batch_size, dtype=torch.float32, device=device),
             top_k=torch.full((max_batch_size,), -1, dtype=torch.int64, device=device),
@@ -189,7 +215,12 @@ class MiMoLocalDecodeBuffer:
         )
         return self.input_tensor[:batch_size], sampler
 
-    def prepare(self, input_tensor: torch.Tensor, sampler: MiMoLocalSampler | MiMoLocalSamplerTensor):
+    def prepare(
+        self,
+        input_tensor: torch.Tensor,
+        sampler: MiMoLocalSampler | MiMoLocalSamplerTensor,
+        sampling_uniforms: torch.Tensor | None = None,
+    ) -> None:
         b = input_tensor.shape[0]
         assert b <= self.max_batch_size, f"Expected batch size <= {self.max_batch_size}, got {b}"
 
@@ -197,6 +228,10 @@ class MiMoLocalDecodeBuffer:
         if input_tensor.ndim != self.input_tensor.ndim:
             input_tensor = input_tensor.reshape(self.input_tensor[:b].shape)
         self.input_tensor[:b].copy_(input_tensor)
+        # Random values are request-owned inputs, not graph-owned RNG state.
+        self.sampling_uniforms.fill_(-1.0)
+        if sampling_uniforms is not None:
+            self.sampling_uniforms[:b].copy_(sampling_uniforms)
 
         # When replaying a fixed-batch CUDA graph with b < max_batch_size, we must
         # sanitize the tail to avoid stale values affecting computation.
@@ -249,12 +284,15 @@ class MiMoLocalDecodeCudaGraph:
         eager_run_first: bool = True,
     ) -> "MiMoLocalDecodeCudaGraph":
         input_tensor, sampler = buffer.inputs(batch_size)
+        sampling_uniforms = buffer.sampling_uniforms[:batch_size]
 
         cuda_graph = torch.cuda.CUDAGraph()
         if eager_run_first:
-            model.base_local_forward(input_tensor, local_sampler=sampler)
+            model.base_local_forward(input_tensor, local_sampler=sampler, sampling_uniforms=sampling_uniforms)
         with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
-            output_tensor = model.base_local_forward(input_tensor, local_sampler=sampler)
+            output_tensor = model.base_local_forward(
+                input_tensor, local_sampler=sampler, sampling_uniforms=sampling_uniforms
+            )
 
         return cls(
             cuda_graph=cuda_graph,
@@ -264,12 +302,15 @@ class MiMoLocalDecodeCudaGraph:
         )
 
     def forward(
-        self, local_embeds: torch.Tensor, local_sampler: MiMoLocalSampler | MiMoLocalSamplerTensor
+        self,
+        local_embeds: torch.Tensor,
+        local_sampler: MiMoLocalSampler | MiMoLocalSamplerTensor,
+        sampling_uniforms: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b = local_embeds.shape[0]
         assert b <= self.batch_size, f"Expected batch size <= {self.batch_size}, got {b}"
         with self.buffer.lock:
-            self.buffer.prepare(local_embeds, local_sampler)
+            self.buffer.prepare(local_embeds, local_sampler, sampling_uniforms)
 
             self.cuda_graph.replay()
 
@@ -564,17 +605,11 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # do_sample=True here without also routing vLLM's sampled token back into
         # this gate check would cause the two to diverge and corrupt KV-cache state.
         self.global_sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.95)
-        # local_sampler drives audio-code generation inside local_forward.  Keep
-        # it greedy (do_sample=False) so the CUDA-graph path (use_cg gate in
-        # local_forward) stays active AND so the audio codes — and therefore the
-        # `new_audio_emb` written into `_cached_new_audio_emb_by_req` — are
-        # deterministic.  That cache is fed back into `inputs_embeds` on the next
-        # decode step (see `_prepare_multimodal_embeddings_with_cache`), so any
-        # stochasticity here propagates into subsequent *text* logits via the
-        # audio-embedding feedback path and destabilises text continuations even
-        # though `global_sampler` is greedy.  Voice diversity must be tackled in
-        # the codec/vocoder path (stage-1), not by randomising local_sampler.
-        self.local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
+        # The reference model samples speech codes: greedy codec decoding can
+        # feed the same audio embedding back indefinitely. Each request owns
+        # its random stream, and graph replay receives the same draws as eager.
+        self.local_sampler = MiMoLocalSampler(do_sample=True, temperature=0.9, top_p=0.95)
+        self._local_generators: dict[str, torch.Generator] = {}
         self.removed_tokens = None
 
         self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
@@ -892,6 +927,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else "cpu"
         ),
         local_sampler: MiMoLocalSampler | MiMoLocalSamplerTensor | None = None,
+        sampling_uniforms: torch.Tensor | None = None,
     ):
         B = local_embeds.shape[0]
         delay_iters = self.group_size + max(self.delay_pattern)
@@ -905,6 +941,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         past_key_values = DynamicCache()
+        sample_index = 0
         for t in range(delay_iters):
             output = self.local_transformer(
                 inputs_embeds=local_embeds,
@@ -927,7 +964,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                     cur_token = local_sampler.sample(
                         cur_scores,
                         [cur_empty],
+                        uniform=None if sampling_uniforms is None else sampling_uniforms[:, sample_index],
                     )
+                    sample_index += 1
 
                     local_tokens[:, t - cur_start, idx] = cur_token
                     cur_input_embed = self.speech_embeddings[idx](cur_token.unsqueeze(1))
@@ -948,14 +987,13 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else "cpu"
         ),
         local_sampler: MiMoLocalSampler | None = None,
+        sampling_uniforms: torch.Tensor | None = None,
     ):
         if local_sampler is None:
             local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         b = int(local_embeds.shape[0])
-        use_cg = (local_sampler.do_sample is None or local_sampler.do_sample is False) and bool(
-            self.local_forward_cg_by_bs
-        )
+        use_cg = (not local_sampler.do_sample or sampling_uniforms is not None) and bool(self.local_forward_cg_by_bs)
         if use_cg:
             # Pick the smallest bucket >= b.
             chosen_bs = None
@@ -965,14 +1003,47 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                     break
             if chosen_bs is not None:
                 logger.debug(f"Using CUDA graph for local_forward (b={b}, bucket={chosen_bs}).")
-                return self.local_forward_cg_by_bs[chosen_bs].forward(local_embeds, local_sampler)
+                return self.local_forward_cg_by_bs[chosen_bs].forward(local_embeds, local_sampler, sampling_uniforms)
 
         return self.base_local_forward(
             local_embeds=local_embeds,
             tokens_dtype=tokens_dtype,
             tokens_device=tokens_device,
             local_sampler=local_sampler,
+            sampling_uniforms=sampling_uniforms,
         )
+
+    def _draw_local_sampling_uniforms(
+        self,
+        request_ids: Sequence[str],
+        seeds: Sequence[int | None],
+        valid_mask: Sequence[bool],
+        device: torch.device,
+    ) -> torch.Tensor:
+        # Draw only for audio-producing requests. CPU generators keep the draws
+        # independent of CUDA graph buckets, batch positions and padding rows.
+        uniforms = torch.full(
+            (len(request_ids), self.group_size * self.audio_channels), -1.0, dtype=torch.float32, device="cpu"
+        )
+        for row, (req_id, seed, valid) in enumerate(zip(request_ids, seeds, valid_mask, strict=True)):
+            if not valid:
+                continue
+            generator = self._local_generators.get(req_id)
+            if generator is None:
+                generator = torch.Generator(device="cpu")
+                if seed is None:
+                    generator.seed()
+                else:
+                    generator.manual_seed(seed)
+                self._local_generators[req_id] = generator
+            torch.rand(uniforms.shape[1], generator=generator, out=uniforms[row])
+        # One small transfer per audio step; no request RNG runs inside a graph.
+        return uniforms.to(device=device)
+
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        for req_id in finished_req_ids:
+            self._local_generators.pop(req_id, None)
+            self._cached_new_audio_emb_by_req.pop(req_id, None)
 
     def _collect_merge_mm_embedding_info(
         self,
@@ -1061,6 +1132,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
     def _generate_speech_tokens_and_audio_embeddings(
         self,
         hidden_states: torch.Tensor,
+        sampling_uniforms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         B = hidden_states.shape[0]
         next_speech_tokens = None
@@ -1071,6 +1143,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         next_speech_tokens = self.local_forward(
             local_embeds=hs_downsampled,
             local_sampler=self.local_sampler,
+            sampling_uniforms=sampling_uniforms,
         )
 
         # 4,8,4096 - Use pre-allocated buffer and zero it to avoid dynamic allocation
@@ -1192,8 +1265,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                     batch_hs_list.append(hs_req)
 
                 batch_hs = torch.stack(batch_hs_list, dim=0)
+                sampling_uniforms = None
+                if self.local_sampler.do_sample:
+                    seeds = (
+                        [info.get("_omni_seed") for info in runtime_additional_information]
+                        if runtime_additional_information
+                        else [None] * num_reqs
+                    )
+                    sampling_uniforms = self._draw_local_sampling_uniforms(
+                        request_ids, seeds, valid_mask, batch_hs.device
+                    )
                 batch_next_speech_tokens, batch_new_audio_emb = self._generate_speech_tokens_and_audio_embeddings(
-                    batch_hs
+                    batch_hs, sampling_uniforms
                 )
 
                 for req_idx, is_valid in enumerate(valid_mask):
