@@ -58,3 +58,14 @@ class OmniCodecRegistry:
 
     def lookup_tag(self, tag: str) -> OmniCodec | None:
         return self.codecs_by_tag.get(tag)
+
+    def lookup_marker(self, payload: dict[str, Any]) -> OmniCodec | None:
+        """Return the codec whose registered tag marks ``payload``.
+
+        Decoding walks the registry instead of a fixed list of built-in
+        markers, so a newly registered leaf type is restored by its own codec.
+        """
+        for tag, codec in self.codecs_by_tag.items():
+            if payload.get(tag):
+                return codec
+        return None

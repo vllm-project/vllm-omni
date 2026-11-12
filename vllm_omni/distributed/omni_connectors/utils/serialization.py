@@ -210,18 +210,9 @@ class OmniMsgpackDecoder:
     def _post_process(self, obj: Any) -> Any:
         """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
-            marker = next(
-                (candidate for candidate in (_TENSOR_MARKER, _NDARRAY_MARKER, _PIL_IMAGE_MARKER) if obj.get(candidate)),
-                None,
-            )
-            if marker is not None:
-                codec = self.codec_registry.lookup_tag(marker)
-                if codec is not None and codec.decode is not None:
-                    return codec.decode(obj)
-                else:
-                    pass
-            else:
-                pass
+            codec = self.codec_registry.lookup_marker(obj)
+            if codec is not None and codec.decode is not None:
+                return codec.decode(obj)
 
             # Process values recursively first
             processed = {k: self._post_process(v) for k, v in obj.items()}
