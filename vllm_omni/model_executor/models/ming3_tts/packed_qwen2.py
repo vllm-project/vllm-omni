@@ -16,12 +16,18 @@ to the attention kernel's accumulation order.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm import _custom_ops as ops
+
+# vllm_xpu_kernels reads VLLM_XPU_SPEC_DECODE_MAX_QLEN once at import (default 16)
+# and sends uniform paged queries in (1, cutoff] through a split-K decode kernel.
+# That kernel has no "not compiled" fallback; the ordinary varlen path does.
+_XPU_SPEC_DECODE_MAX_QLEN_DEFAULT = 16
 
 
 @dataclass
@@ -36,30 +42,64 @@ class PagedKV:
     max_seqlen_k: int
 
 
+def _xpu_spec_decode_max_qlen() -> int:
+    """Cutoff above which XPU keeps a paged query on the varlen kernel."""
+    try:
+        return int(os.environ.get("VLLM_XPU_SPEC_DECODE_MAX_QLEN", str(_XPU_SPEC_DECODE_MAX_QLEN_DEFAULT)))
+    except ValueError:
+        return _XPU_SPEC_DECODE_MAX_QLEN_DEFAULT
+
+
+def _decode_queries_for_xpu(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
+    """Present a short uniform chunk as one q_len=1 sequence per token.
+
+    AudioVAE steps are not speculative decode, but their query length falls in
+    the XPU spec-decode window. Each token keeps the parent block table and a
+    causal key length of ``seqused_k - (q_len - 1 - position)``, which is the
+    same mask the chunk would have used, on the varlen path that can fall back.
+    """
+    batch = cu_seqlens.shape[0] - 1
+    q_len = max_seqlen
+    if batch <= 0 or q_len <= 1 or q_len > _xpu_spec_decode_max_qlen() or q.shape[0] != batch * q_len:
+        return q, cu_seqlens, max_seqlen, seqused_k, block_table
+    total = q.shape[0]
+    position = torch.arange(q_len, device=seqused_k.device)
+    seqused = (
+        (seqused_k.reshape(batch, 1) - (q_len - 1 - position).reshape(1, q_len))
+        .clamp_min(1)
+        .reshape(total)
+        .to(torch.int32)
+    )
+    cu_seqlens_q = torch.arange(total + 1, device=q.device, dtype=torch.int32)
+    return q, cu_seqlens_q, 1, seqused, block_table.repeat_interleave(q_len, dim=0)
+
+
 class PackedQwen2:
     """Causal (sliding-window) Qwen2 forward over packed sequences."""
 
     def __init__(self, model: nn.Module, max_positions: int):
         from vllm.platforms import current_platform
 
+        # XPU's wrapper takes cu_seqlens_q before max_seqlen_q; CUDA's dispatcher
+        # is the other way around. Callers pass keywords, as diffusion flash
+        # attention does. fa_version is only a CUDA dispatcher argument.
         if current_platform.is_xpu():
             from vllm._xpu_ops import xpu_ops
 
-            try:
-                import vllm_xpu_kernels.flash_attn_interface as _xfa
-
-                # The split-K spec-decode fast path has no "not compiled" fallback; the regular varlen path does.
-                if getattr(_xfa, "_SPEC_DECODE_MAX_QLEN", 1) > 1:
-                    _xfa._SPEC_DECODE_MAX_QLEN = 1
-            except ImportError:
-                pass
-
             flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
-            fa_version = 2
+            attn_kwargs: dict[str, int] = {}
+            self._xpu = True
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 
-            fa_version = 3 if is_fa_version_supported(3) else 2
+            attn_kwargs = {"fa_version": 3 if is_fa_version_supported(3) else 2}
+            self._xpu = False
 
         cfg = model.config
         self.model = model
@@ -100,7 +140,7 @@ class PackedQwen2:
         self.cos_sin_cache = torch.cat([cos[0, :, :half], sin[0, :, :half]], dim=-1).contiguous()
         self._unit_scale = torch.ones((), device=param.device, dtype=torch.float32)
         self._attn = flash_attn_varlen_func
-        self._fa_version = fa_version
+        self._attn_kwargs = attn_kwargs
 
     def new_paged_caches(self, blocks: int, block_size: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         param = next(self.model.parameters())
@@ -142,28 +182,33 @@ class PackedQwen2:
                     softmax_scale=scale,
                     causal=True,
                     window_size=self.windows[index],
-                    fa_version=self._fa_version,
+                    **self._attn_kwargs,
                 )
             else:
                 key_cache, value_cache = kv.key_caches[index], kv.value_caches[index]
                 ops.reshape_and_cache_flash(
                     k, v, key_cache, value_cache, kv.slot_mapping, "auto", self._unit_scale, self._unit_scale
                 )
+                query, cu_query, query_len, seqused_k, block_table = (
+                    _decode_queries_for_xpu(q, cu_seqlens, max_seqlen, kv.seqused_k, kv.block_table)
+                    if self._xpu
+                    else (q, cu_seqlens, max_seqlen, kv.seqused_k, kv.block_table)
+                )
                 attn = self._attn(
-                    q=q,
+                    q=query,
                     k=key_cache,
                     v=value_cache,
-                    max_seqlen_q=max_seqlen,
-                    cu_seqlens_q=cu_seqlens,
+                    max_seqlen_q=query_len,
+                    cu_seqlens_q=cu_query,
                     max_seqlen_k=kv.max_seqlen_k,
-                    seqused_k=kv.seqused_k,
-                    block_table=kv.block_table,
+                    seqused_k=seqused_k,
+                    block_table=block_table,
                     softmax_scale=scale,
                     causal=True,
                     window_size=self.windows[index],
-                    fa_version=self._fa_version,
                     # max_seqlen_k bounds the stream, not the window it reads; no split-KV.
                     num_splits=1,
+                    **self._attn_kwargs,
                 )
             x = F.linear(attn.view(tokens, self.q_size), o_w)
             ops.fused_add_rms_norm(x, residual, post_norm.weight, post_norm.variance_epsilon)
