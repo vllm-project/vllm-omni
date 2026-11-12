@@ -29,6 +29,7 @@ import upload_pipeline as upload_pipeline_mod  # noqa: E402
 from merge_shard_timings import (  # noqa: E402
     HISTORY_LOOKUP_BUDGET_SECONDS,
     MAX_CONSECUTIVE_MISSES,
+    MAX_PUBLIC_PAGES,
     build_step_details,
     details_from_download,
     list_recent_build_ids,
@@ -410,6 +411,102 @@ def test_public_history_keeps_only_successful_builds(monkeypatch: pytest.MonkeyP
     assert list_recent_build_ids(branch="main", limit=20, fetch=fetch) == [("passed-id", "1")]
 
 
+def test_public_history_follows_the_html_next_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
+    monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
+    monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
+    monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
+    pages = {
+        "https://buildkite.com/vllm/vllm-omni/builds?branch=main": (
+            'href="/vllm/vllm-omni/builds/3" '
+            '<a class="btn btn-default" rel="next" href="/vllm/vllm-omni/builds?branch=main&amp;page=2">'
+        ),
+        "https://buildkite.com/vllm/vllm-omni/builds?branch=main&page=2": (
+            'href="/vllm/vllm-omni/builds/1" <a rel="next" href="/vllm/vllm-omni/builds?branch=main&page=3">'
+        ),
+    }
+    details = {
+        "3": {"id": "failed-id", "branch_name": "main", "state": "failed"},
+        "1": {"id": "passed-id", "branch_name": "main", "state": "passed"},
+    }
+    seen: list[str] = []
+
+    def fetch(url: str, token: str | None = None) -> tuple[str, str | None]:
+        del token
+        seen.append(url)
+        if url in pages:
+            return pages[url], None
+        number = url.rsplit("/", 1)[-1].removesuffix(".json")
+        return json.dumps(details[number]), None
+
+    assert list_recent_build_ids(branch="main", limit=1, fetch=fetch) == [("passed-id", "1")]
+    assert seen == [
+        "https://buildkite.com/vllm/vllm-omni/builds?branch=main",
+        "https://buildkite.com/vllm/vllm-omni/builds/3.json",
+        "https://buildkite.com/vllm/vllm-omni/builds?branch=main&page=2",
+        "https://buildkite.com/vllm/vllm-omni/builds/1.json",
+    ]
+
+
+def test_public_history_stops_at_the_page_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
+    monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
+    monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
+    monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
+    seen: list[str] = []
+
+    def fetch(url: str, token: str | None = None) -> tuple[str, str | None]:
+        del token
+        seen.append(url)
+        if url.endswith(".json"):
+            return json.dumps({"id": "failed-id", "branch_name": "topic", "state": "failed"}), None
+        page = 1
+        query = url.split("?", 1)[1] if "?" in url else ""
+        for part in query.split("&"):
+            if part.startswith("page="):
+                page = int(part.removeprefix("page="))
+        body = f'href="/vllm/vllm-omni/builds/{page}" <a rel="next" href="/vllm/vllm-omni/builds?page={page + 1}">'
+        return body, None
+
+    assert list_recent_build_ids(branch="", limit=20, fetch=fetch) == []
+    listings = [url for url in seen if not url.endswith(".json")]
+    assert listings[0] == "https://buildkite.com/vllm/vllm-omni/builds"
+    assert listings[1] == "https://buildkite.com/vllm/vllm-omni/builds?page=2"
+    assert len(listings) == MAX_PUBLIC_PAGES
+    assert f"stopped public list after {MAX_PUBLIC_PAGES} pages" in capsys.readouterr().err
+
+
+def test_public_history_leaves_time_for_an_artifact_download(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
+    monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
+    monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
+    monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
+    phase = {"fetched_json": False}
+
+    def monotonic() -> float:
+        return 1_000.0 if phase["fetched_json"] else 0.0
+
+    monkeypatch.setattr("merge_shard_timings.time.monotonic", monotonic)
+    seen: list[str] = []
+
+    def fetch(url: str, token: str | None = None) -> tuple[str, str | None]:
+        del token
+        seen.append(url)
+        if url.endswith(".json"):
+            phase["fetched_json"] = True
+            return json.dumps({"id": "passed-id", "branch_name": "main", "state": "passed"}), None
+        listing = 'href="/vllm/vllm-omni/builds/8" <a rel="next" href="/vllm/vllm-omni/builds?branch=main&page=2">'
+        return listing, None
+
+    assert list_recent_build_ids(branch="main", limit=20, deadline=100.0, fetch=fetch) == [("passed-id", "8")]
+    assert all("page=2" not in url for url in seen)
+    assert "leave download time" in capsys.readouterr().err
+
+
 def test_api_history_rejects_a_non_passed_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BUILDKITE_ORGANIZATION_SLUG", "vllm")
     monkeypatch.setenv("BUILDKITE_PIPELINE_SLUG", "vllm-omni")
@@ -584,6 +681,9 @@ def test_ready_plans_simple_test_from_non_main_history(
 
     def download(build_id: str, dest: Path, timeout: int = 180) -> None:
         del timeout
+        # TEMP(shard-debug): prepare_profile downloads build #19345 before history.
+        if build_id == "01a1caa4-35e4-4e39-95a7-2818ebe0053f":
+            return
         assert build_id == "ready-pr"
         jobs = dest / "timings" / "jobs"
         jobs.mkdir(parents=True)

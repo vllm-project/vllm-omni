@@ -14,7 +14,9 @@ The uploader calls ``prepare_profile_from_history``, which downloads recent
 ``timings/jobs/*.json`` via ``buildkite-agent``. Ready planning excludes
 ``main`` and therefore uses other pull-request builds, whose durations include
 whatever those changes did. Merge planning stays on ``main``. The Buildkite
-builds API is read in pages of 100.
+builds API is read in pages of 100. Without a token, the public builds HTML is
+followed through its Next link, and that walk stops in time for one artifact
+download inside the lookup budget.
 The download stops after enough builds with job files, after a run of builds
 with none, or at a short time budget. Missing history is not an error: planning
 stays on one job.
@@ -50,6 +52,10 @@ HISTORY_CANDIDATE_FACTOR = 5
 # Buildkite rejects per_page above 100. Follow Link rel="next" for the rest.
 API_PAGE_SIZE = 100
 MAX_API_PAGES = 10
+# The public builds page lists about 20 builds and puts the next page on an
+# ``<a rel="next">``. Follow it until the candidate limit. The cap only stops a
+# Next link that never ends.
+MAX_PUBLIC_PAGES = 20
 # A cold window has no timing artifacts. Stop before upload issues ~100 serial lookups.
 MAX_CONSECUTIVE_MISSES = 10
 HISTORY_LOOKUP_BUDGET_SECONDS = 90
@@ -59,6 +65,11 @@ SCHEMA = "vllm_omni.shard_timings.merged.v1"
 SUCCESS_STATES = frozenset({"passed", "finished"})
 _SHARD_SUFFIX = re.compile(r" · Shard(?: %N/%t| \d+/\d+)$")
 _NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?', re.IGNORECASE)
+_HTML_NEXT_HREF = re.compile(
+    r"<a\b[^>]*\brel=[\"']next[\"'][^>]*\bhref=[\"']([^\"']+)[\"']"
+    r"|<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*\brel=[\"']next[\"']",
+    re.IGNORECASE,
+)
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -258,6 +269,56 @@ def _next_link(header: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _html_next_url(body: str, page_url: str) -> str | None:
+    """Resolve the public builds page's ``<a rel="next">`` against ``page_url``."""
+    match = _HTML_NEXT_HREF.search(body)
+    if match is None:
+        return None
+    href = (match.group(1) or match.group(2) or "").strip().replace("&amp;", "&")
+    if not href:
+        return None
+    return urllib.parse.urljoin(page_url, href)
+
+
+def _public_list_should_stop(deadline: float | None) -> bool:
+    """Leave one artifact download inside the shared lookup budget."""
+    if deadline is None:
+        return False
+    return time.monotonic() >= deadline - HISTORY_DOWNLOAD_TIMEOUT_SECONDS
+
+
+def _log_public_list_budget_stop() -> None:
+    print(
+        "merge-shard-timings: stopped public list to leave download time "
+        f"inside the {HISTORY_LOOKUP_BUDGET_SECONDS}s lookup budget",
+        file=sys.stderr,
+    )
+
+
+def _public_build_from_details(
+    details: Any,
+    *,
+    branch: str,
+    excluded: frozenset[str],
+    current_build_id: str,
+    number: str,
+) -> tuple[str, str] | None:
+    if not isinstance(details, dict):
+        return None
+    entry_branch = str(details.get("branch_name") or details.get("branch") or "")
+    if branch and entry_branch != branch:
+        return None
+    if entry_branch in excluded:
+        return None
+    state = str(details.get("state") or details.get("build_state") or "")
+    if state not in SUCCESS_STATES:
+        return None
+    build_id = str(details.get("id") or "")
+    if not build_id or build_id == current_build_id:
+        return None
+    return build_id, number
+
+
 def _fetch_page(url: str, *, token: str | None = None) -> tuple[str, str | None]:
     headers = {"User-Agent": "vllm-omni-merge-shard-timings"}
     if token:
@@ -275,11 +336,16 @@ def list_recent_build_ids(
     current_build_id: str = "",
     exclude_branches: frozenset[str] | set[str] = frozenset(),
     fetch: Callable[..., tuple[str, str | None]] = _fetch_page,
+    deadline: float | None = None,
 ) -> list[tuple[str, str]]:
     """Return ``(build_id, build_number)`` newest first, excluding the current build.
 
     ``branch=""`` lists every branch of this pipeline. ``exclude_branches`` drops
     named branches after that listing (ready planning excludes ``main``).
+
+    With an API token, pages come from the ``Link`` header. Otherwise the public
+    builds HTML is followed through ``<a rel="next">``. ``deadline`` is the shared
+    lookup budget; the public walk stops early enough to leave one artifact download.
     """
     excluded = frozenset(exclude_branches)
     token = _env("BUILDKITE_API_TOKEN") or _env("BUILDKITE_TOKEN")
@@ -320,40 +386,62 @@ def list_recent_build_ids(
     base = _pipeline_url()
     if not base:
         return []
-    listing_url = f"{base}/builds"
+    listing_url: str | None = f"{base}/builds"
     if branch:
         listing_url = f"{listing_url}?{urllib.parse.urlencode({'branch': branch})}"
-    try:
-        listing, _next = fetch(listing_url)
-    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-        print(f"merge-shard-timings: public list failed ({exc})", file=sys.stderr)
-        return []
     slug = _env("BUILDKITE_PIPELINE_SLUG")
     org = _env("BUILDKITE_ORGANIZATION_SLUG")
-    numbers = list(dict.fromkeys(re.findall(rf'href="/{re.escape(org)}/{re.escape(slug)}/builds/([0-9]+)"', listing)))
-    found = []
-    for number in numbers:
-        try:
-            details_body, _next = fetch(f"{base}/builds/{number}.json")
-            details = json.loads(details_body)
-        except (OSError, UnicodeError, ValueError, urllib.error.URLError, json.JSONDecodeError):
-            continue
-        if not isinstance(details, dict):
-            continue
-        entry_branch = str(details.get("branch_name") or details.get("branch") or "")
-        if branch and entry_branch != branch:
-            continue
-        if entry_branch in excluded:
-            continue
-        state = str(details.get("state") or details.get("build_state") or "")
-        if state not in SUCCESS_STATES:
-            continue
-        build_id = str(details.get("id") or "")
-        if not build_id or build_id == current_build_id:
-            continue
-        found.append((build_id, str(number)))
-        if len(found) >= limit:
-            break
+    number_pattern = re.compile(rf'href="/{re.escape(org)}/{re.escape(slug)}/builds/([0-9]+)"')
+    found: list[tuple[str, str]] = []
+    seen_numbers: set[str] = set()
+    seen_pages: set[str] = set()
+    pages = 0
+    try:
+        while listing_url and len(found) < limit:
+            if pages >= MAX_PUBLIC_PAGES:
+                print(
+                    f"merge-shard-timings: stopped public list after {MAX_PUBLIC_PAGES} pages",
+                    file=sys.stderr,
+                )
+                break
+            if listing_url in seen_pages:
+                break
+            if _public_list_should_stop(deadline):
+                _log_public_list_budget_stop()
+                break
+            seen_pages.add(listing_url)
+            pages += 1
+            listing, header_next = fetch(listing_url)
+            for number in dict.fromkeys(number_pattern.findall(listing)):
+                if len(found) >= limit:
+                    break
+                if number in seen_numbers:
+                    continue
+                if _public_list_should_stop(deadline):
+                    _log_public_list_budget_stop()
+                    listing_url = None
+                    break
+                seen_numbers.add(number)
+                try:
+                    details_body, _details_next = fetch(f"{base}/builds/{number}.json")
+                    details = json.loads(details_body)
+                except (OSError, UnicodeError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+                    continue
+                accepted = _public_build_from_details(
+                    details,
+                    branch=branch,
+                    excluded=excluded,
+                    current_build_id=current_build_id,
+                    number=number,
+                )
+                if accepted is not None:
+                    found.append(accepted)
+            if listing_url is None or len(found) >= limit:
+                break
+            listing_url = _html_next_url(listing, listing_url) or header_next
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
+        print(f"merge-shard-timings: public list failed ({exc})", file=sys.stderr)
+        return found
     return found
 
 
@@ -412,6 +500,25 @@ def prepare_profile_from_history(
     build_ids: list[str] = []
     current = _env("BUILDKITE_BUILD_ID")
     candidates = max(builds * HISTORY_CANDIDATE_FACTOR, builds)
+    # TEMP(shard-debug): delete this block. Build #19345 is the passed 4-shard
+    # ready run. Newer passed builds have no timings/jobs, so the miss cap stops
+    # the scan before it. Download this build first and ignore the cap.
+    if _env("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD").lower() not in {"1", "true", "yes"}:
+        pinned_id = "01a1caa4-35e4-4e39-95a7-2818ebe0053f"
+        print("merge-shard-timings: TEMP forcing download of build #19345", file=sys.stderr)
+        with tempfile.TemporaryDirectory(prefix="vllm-omni-timings-19345-") as tmp:
+            pinned_root = Path(tmp)
+            download_build_timings(pinned_id, pinned_root, timeout=HISTORY_DOWNLOAD_TIMEOUT_SECONDS)
+            pinned = details_from_download(pinned_root)
+        if pinned:
+            per_build.append(pinned)
+            build_ids.append(pinned_id)
+            print(
+                "merge-shard-timings: TEMP build #19345 steps: " + ", ".join(sorted(pinned)),
+                file=sys.stderr,
+            )
+        else:
+            print("merge-shard-timings: TEMP build #19345 has no timing artifacts", file=sys.stderr)
     deadline = time.monotonic() + HISTORY_LOOKUP_BUDGET_SECONDS
     misses = 0
     for build_id, number in list_recent_build_ids(
@@ -419,7 +526,10 @@ def prepare_profile_from_history(
         limit=candidates,
         current_build_id=current,
         exclude_branches=exclude_branches,
+        deadline=deadline,
     ):
+        if build_id in build_ids:
+            continue
         if time.monotonic() >= deadline:
             print(
                 f"merge-shard-timings: stopped history scan at the {HISTORY_LOOKUP_BUDGET_SECONDS}s lookup budget",
