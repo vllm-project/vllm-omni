@@ -53,7 +53,7 @@ def test_debug_override_takes_precedence_and_normalizes_input():
     ) == ("nightly", "merge", "ready")
 
 
-def test_debug_weekly_selects_four_unconditional_jobs():
+def test_debug_weekly_selects_seven_unconditional_reliability_jobs():
     assert SELECTOR.select_amd_test_suites(
         branch="feature",
         labels=(),
@@ -63,7 +63,15 @@ def test_debug_weekly_selects_four_unconditional_jobs():
     weekly = yaml.safe_load(WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     group = weekly["steps"][0]
     assert "if" not in group
-    assert len(group["steps"]) == 4
+    assert [step["label"] for step in group["steps"]] == [
+        "Reliability Test · qwen3-omni",
+        "Reliability Test · wan22",
+        "Reliability Test · hunyuan-image",
+        "Reliability Test · minicpmo-4.5",
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+        "Reliability Test · Invalid parameters · MI300 · 2-GPU",
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+    ]
     assert all("if" not in step for step in group["steps"])
 
 
