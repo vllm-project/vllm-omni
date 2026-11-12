@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO4
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
     MiniCPMOConfig,
+    Resampler,
     SiglipAttention,
     SiglipSdpaAttention,
     SiglipVisionConfig,
@@ -141,3 +142,43 @@ def test_packed_vision_adapter_protocol() -> None:
 )
 def test_vision_encode_paths(overrides, encoder_graphs, expected) -> None:
     assert _vision_encode_paths(SimpleNamespace(**overrides), encoder_graphs=encoder_graphs) == expected
+
+
+def test_resampler_uses_torch_mha_and_matches_packed_forward() -> None:
+    torch.manual_seed(0)
+    resampler = Resampler(num_queries=64, embed_dim=4096, num_heads=32, kv_dim=1152, adaptive=True).eval()
+    assert type(resampler.attn) is torch.nn.MultiheadAttention
+    assert resampler.supports_packed() is True
+    with torch.no_grad():
+        resampler.query.normal_(std=0.02)
+    state = {k: v.clone() for k, v in resampler.state_dict().items()}
+    assert {
+        "attn.in_proj_weight",
+        "attn.in_proj_bias",
+        "attn.out_proj.weight",
+        "attn.out_proj.bias",
+    } <= state.keys()
+    reloaded = Resampler(num_queries=64, embed_dim=4096, num_heads=32, kv_dim=1152, adaptive=True).eval()
+    reloaded.load_state_dict(state, strict=True)
+    reloaded.attn_implementation = "eager"
+
+    x_unpadded = torch.randn(2, 6, 1152)
+    tgt_unpadded = torch.tensor([[2, 3], [2, 3]], dtype=torch.int32)
+    with torch.inference_mode():
+        padded = reloaded(x_unpadded, tgt_unpadded)
+        packed = reloaded.forward_packed(x_unpadded.reshape(-1, 1152), [(2, 3, 2)])
+    torch.testing.assert_close(padded, packed, rtol=1e-5, atol=1e-5)
+
+    # Variable grid sizes exercise key_padding_mask on the padded batch path.
+    x_first = torch.randn(1, 6, 1152)
+    x_second = torch.randn(1, 2, 1152)
+    x_masked = torch.zeros(2, 6, 1152)
+    x_masked[0] = x_first[0]
+    x_masked[1, :2] = x_second[0]
+    tgt_masked = torch.tensor([[2, 3], [1, 2]], dtype=torch.int32)
+    with torch.inference_mode():
+        batched_masked = reloaded(x_masked, tgt_masked)
+        expected_first = reloaded(x_first, tgt_masked[:1])
+        expected_second = reloaded(x_second, tgt_masked[1:])
+    torch.testing.assert_close(batched_masked[:1], expected_first, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(batched_masked[1:], expected_second, rtol=1e-5, atol=1e-5)

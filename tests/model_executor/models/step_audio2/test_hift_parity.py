@@ -172,3 +172,39 @@ def test_ensure_models_loaded_folds_loaded_hift_weights(tmp_path, monkeypatch: p
     assert remaining
     assert all(name.startswith("f0_predictor.") for name in remaining)
     assert core._hift.remove_weight_norm() == 0
+    from vllm_omni.model_executor.models.common.snake_activation import Snake
+
+    snake_modules = [module for module in core._hift.modules() if isinstance(module, Snake)]
+    assert snake_modules
+    assert all(module._cached for module in snake_modules)
+
+
+def test_hift_snake_activations_precompute_exp_cache() -> None:
+    """``_precompute_hift_snake_caches`` populates Snake caches after checkpoint load and device/dtype placement."""
+    from vllm_omni.model_executor.models.common.snake_activation import Snake
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import _precompute_hift_snake_caches
+
+    hift = _build_hift().eval()
+    snake_modules = [module for module in hift.modules() if isinstance(module, Snake)]
+    assert snake_modules
+    assert all(not module._cached for module in snake_modules)
+
+    state = {name: value.detach().clone() for name, value in hift.state_dict().items()}
+    for name in state:
+        if name.endswith(".alpha"):
+            state[name] = state[name] * 2.5
+    hift.load_state_dict(state, strict=True)
+    hift.to(dtype=torch.float16)
+    hift.remove_weight_norm()
+    _precompute_hift_snake_caches(hift)
+
+    for module in snake_modules:
+        assert module._cached is True
+        assert "_exp_alpha" not in module._parameters
+        assert isinstance(module._exp_alpha, torch.Tensor)
+        assert isinstance(module._inv_beta, torch.Tensor)
+        assert module._exp_alpha.dtype == torch.float16
+        assert module._inv_beta.dtype == torch.float16
+        torch.testing.assert_close(module._exp_alpha, module.alpha, rtol=0, atol=0)
+        expected_inv_beta = (1.0 / (module.alpha + module.no_div_by_zero)).contiguous()
+        torch.testing.assert_close(module._inv_beta, expected_inv_beta, rtol=0, atol=0)

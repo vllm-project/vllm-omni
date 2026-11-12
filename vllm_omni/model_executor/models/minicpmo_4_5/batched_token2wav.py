@@ -23,7 +23,6 @@ from vllm_omni.utils.device_copy import index_to_device
 from .code2wav_stats import Code2WavSolveStats
 from .code2wav_watchdog import Code2WavWatchdog
 from .cuda_graph_wrapper import (
-    CFMGraphWrapper,
     HiFTGraphWrapper,
     ResidentAttCache,
     WholeEulerCFMGraphWrapper,
@@ -31,9 +30,7 @@ from .cuda_graph_wrapper import (
     _copy_frame_segments,
     _euler_step,
     _euler_timeline,
-    _format_memory_delta,
     _materialize_att_rows,
-    _memory_snapshot,
     _zero_padded_cnn_cache,
     empty_hift_outputs,
 )
@@ -402,21 +399,37 @@ class BatchedToken2Wav(nn.Module):
                 getattr(getattr(self.flow, "decoder", None), "estimator", None),
                 pack_convs=bool(cfm_graph_cfg.get("enabled", False) and cfm_graph_cfg.get("fused_body", False)),
             )
-        encoder_cfg = dict(chunk_encoder_graph_config or {})
+        legacy_encoder_cfg = dict(encoder_graph_config or {})
+        chunk_cfg = dict(chunk_encoder_graph_config or {})
+        encoder_cfg = {**legacy_encoder_cfg, **chunk_cfg}
+        legacy_only = bool(legacy_encoder_cfg.get("enabled", False)) and not bool(chunk_cfg.get("enabled", False))
+        if legacy_only:
+            encoder_cfg["enabled"] = True
+            for key in ("rows", "token_widths"):
+                if key in legacy_encoder_cfg:
+                    encoder_cfg[key] = legacy_encoder_cfg[key]
+            if "max_graphs" not in chunk_cfg:
+                encoder_cfg["max_graphs"] = legacy_encoder_cfg.get("max_graphs")
         connector = connector_config or {}
         left_context = int(connector.get("codec_left_context_frames", 0) or 0)
         chunk_frames = int(connector.get("codec_chunk_frames", 25) or 25)
         initial_frames = int(connector.get("initial_codec_chunk_frames", 0) or 0)
-        token_widths = {left_context + chunk_frames}
-        if initial_frames:
-            token_widths.add(left_context + initial_frames)
+        configured_widths = encoder_cfg.get("token_widths") or ()
+        if configured_widths:
+            token_widths = {int(width) for width in configured_widths}
+        else:
+            token_widths = {left_context + chunk_frames}
+            if initial_frames:
+                token_widths.add(left_context + initial_frames)
         self._chunk_encoder_token_widths = tuple(sorted(width for width in token_widths if width > 0))
+        raw_max_graphs = encoder_cfg.get("max_graphs", None if legacy_only else 8)
+        self._chunk_encoder_cap_precapture = raw_max_graphs is not None
         self._chunk_encoder_graph = (
             FlowEncoderGraphs(
                 functools.partial(self._encode_chunk_eager, last_chunk=False),
                 chunk_forward=self._encode_chunk_eager,
                 rows=encoder_cfg.get("rows", [1]),
-                max_graphs=int(encoder_cfg.get("max_graphs", 8)),
+                max_graphs=8 if raw_max_graphs is None else int(raw_max_graphs),
                 capture_after=int(encoder_cfg.get("capture_after", 2)),
                 capture_after_precapture=bool(encoder_cfg.get("capture_after_precapture", False)),
                 eager_min_batch=int(encoder_cfg.get("eager_min_batch", 8)),
@@ -430,7 +443,7 @@ class BatchedToken2Wav(nn.Module):
         encoder = getattr(self.flow, "encoder", None)
         if encoder is not None:
             _undecorate_dynamo(encoder, "forward_chunk")
-        self._encoder_graphs = self._build_encoder_graphs(encoder_graph_config or {}, connector_config or {})
+        self._encoder_graphs = self._build_encoder_graphs(encoder_cfg, connector)
         hift_parameter = next(self.hift.parameters(), None)
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
@@ -498,7 +511,7 @@ class BatchedToken2Wav(nn.Module):
                 )
                 # Captured by the first forward (``precapture_hift``): graphs
                 # captured while vLLM loads the weights hold far more memory.
-        self._cfm_graph_wrapper: CFMGraphWrapper | None = None
+        self._cfm_graph_wrapper: Any | None = None
         self._whole_euler_graph_wrapper: WholeEulerCFMGraphWrapper | None = None
         # Whether the ragged DiT body is the fused one (``dit_fused.py``).
         self._ragged_fused_body = False
@@ -608,11 +621,6 @@ class BatchedToken2Wav(nn.Module):
                     )
                 elif enable_whole_euler:
                     logger.info("Whole-Euler CFM device graph disabled because TensorRT stepper is configured")
-                self._cfm_graph_wrapper = CFMGraphWrapper(
-                    graph_fn=estimator.blocks_forward_chunk,
-                    max_graphs=max_graphs,
-                )
-                logger.info("CFM device graph enabled (max_graphs=%d)", max_graphs)
             else:
                 logger.info(
                     "CFM device graph is disabled on device type %s",
@@ -924,47 +932,30 @@ class BatchedToken2Wav(nn.Module):
     @torch.inference_mode()
     def precapture_flow_encoder(self, features: PromptFeatures) -> int:
         """Capture the encoder graphs of every continuation chunk this prompt's streams run; returns the count."""
-        graphs = self._encoder_graphs
-        if graphs is None or graphs.graphs:
-            return 0
-        (state,) = self.setup_batch(features, 1)
-        cnn, att = state.flow_cache["conformer_cnn_cache"], state.flow_cache["conformer_att_cache"]
-        prompt_len = int(features.mels.shape[1])
-        keys = graphs.keys_for(start=int(att.shape[3]), prompt_len=prompt_len, suffix=_CACHE_TRIM_SUFFIX)
-        torch.accelerator.synchronize(att.device)
-        memory_before = _memory_snapshot(att.device)
-        with self._autocast(att.device):
-            captured = graphs.capture(
-                keys,
-                cnn_shape=(int(cnn.shape[1]), int(cnn.shape[2])),
-                att_layout=(int(att.shape[0]), int(att.shape[2]), int(att.shape[4])),
-                hidden_dim=int(self.flow.encoder_proj.out_features),
-                dtype=att.dtype,
-                device=att.device,
-                cnn_dtype=cnn.dtype,
-            )
-        torch.accelerator.synchronize(att.device)
-        logger.info(
-            "Captured %d flow encoder CUDA Graphs (cache frames %s): shared buffers %.1f MiB%s",
-            captured,
-            sorted({key[2] for key in keys}),
-            graphs.storage_bytes() / 2**20,
-            _format_memory_delta(memory_before, _memory_snapshot(att.device)),
-        )
-        if captured:
-            graphs.capture_on_request = graphs.capture_after_precapture
-        return captured
+        return self.precapture_chunk_encoder(features, cap_to_max_graphs=False)
 
     @torch.inference_mode()
-    def precapture_chunk_encoder(self, features: PromptFeatures) -> int:
+    def precapture_chunk_encoder(
+        self,
+        features: PromptFeatures,
+        *,
+        cap_to_max_graphs: bool | None = None,
+    ) -> int:
         """Precapture continuation graphs into the shared FlowEncoderGraphs arena.
 
         CUDA and NPU use the same keys, storage layouts and startup admission.
         Requests replay startup shapes; optional exact-shape admission covers
         repeated tail and prompt shapes outside the shared arena.
         """
-        graph = self._chunk_encoder_graph
-        if graph is None or not self._flow_supports_graphs() or torch.version.hip is not None or not graph.max_graphs:
+        graph = getattr(self, "_chunk_encoder_graph", None) or getattr(self, "_encoder_graphs", None)
+        if cap_to_max_graphs is None:
+            cap_to_max_graphs = getattr(self, "_chunk_encoder_cap_precapture", True)
+        if (
+            graph is None
+            or not self._flow_supports_graphs()
+            or torch.version.hip is not None
+            or (cap_to_max_graphs and not graph.max_graphs)
+        ):
             return 0
         if graph.graphs:
             graph.capture_on_request = graph.capture_after_precapture
@@ -974,7 +965,8 @@ class BatchedToken2Wav(nn.Module):
         lookahead = self._pre_lookahead_len()
         if lookahead is None:
             return 0
-        widths = tuple(width for width in self._chunk_encoder_token_widths if width > lookahead)
+        configured_widths = getattr(self, "_chunk_encoder_token_widths", ()) or getattr(graph, "token_widths", ())
+        widths = tuple(width for width in configured_widths if width > lookahead)
         if not widths:
             return 0
         if not graph.rows:
@@ -990,7 +982,9 @@ class BatchedToken2Wav(nn.Module):
             start=int(att.shape[3]), prompt_len=int(features.mels.shape[1]), suffix=_CACHE_TRIM_SUFFIX
         )
         # Prefer steady-state lengths for every width before transient lengths.
-        keys = sorted(keys, key=lambda key: (-key[2], key[1]))[: graph.max_graphs]
+        keys = sorted(keys, key=lambda key: (-key[2], key[1]))
+        if cap_to_max_graphs:
+            keys = keys[: graph.max_graphs]
         probe = torch.zeros((1, max(widths)), dtype=torch.long, device=att.device)
         probe_att = torch.zeros(
             (*att.shape[:3], max(key[2] for key in keys), att.shape[4]), dtype=att.dtype, device=att.device
@@ -1455,7 +1449,7 @@ class BatchedToken2Wav(nn.Module):
                 and getattr(self._cfm_graph_wrapper, "enabled", True)
                 and self._trt_stepper is None
             )
-            or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
+            or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled and self._trt_stepper is None)
         )
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,

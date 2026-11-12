@@ -155,6 +155,18 @@ def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
     return released
 
 
+def _precompute_hift_snake_caches(hift: nn.Module) -> None:
+    """Materialize Snake exp(alpha) and 1/(exp(alpha)+eps) caches on ``hift``."""
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+
+    for module in hift.modules():
+        if isinstance(module, SnakeBeta):
+            module.precompute_exp_cache()
+            if "_exp_alpha" in module._parameters:
+                exp_alpha = module._parameters.pop("_exp_alpha").detach()
+                module.register_buffer("_exp_alpha", exp_alpha, persistent=False)
+
+
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
         sampling_rate=24000,
@@ -278,6 +290,7 @@ class StepAudio2Token2WavCore(nn.Module):
         # instance is unsupported. ``CosyVoice3Code2Wav`` already does this;
         # MiniCPM-o and StepAudio2 reach HiFT through this core.
         folded = self._hift.remove_weight_norm()
+        _precompute_hift_snake_caches(self._hift)
         if folded:
             logger.info("Folded %d HiFT weight-norm layers", folded)
         else:

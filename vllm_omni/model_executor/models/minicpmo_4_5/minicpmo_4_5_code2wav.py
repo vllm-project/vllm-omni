@@ -468,20 +468,39 @@ class MiniCPMO45Code2Wav(nn.Module):
             # The Whole-Euler arena reserves one attention cache per micro-batch
             # row, so size it for the most requests this stage ever batches.
             micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
-        encoder_rows = extra.get("code2wav_encoder_graph_rows", 1)
-        if isinstance(encoder_rows, (list, tuple)):
-            encoder_rows = sorted({int(row) for row in encoder_rows})
+        enable_encoder_graph = read_bool_flag(extra, "enable_code2wav_encoder_graph", False)
+        cfm_encoder_graph = read_bool_flag(extra, "cfm_encoder_cuda_graph", False)
+        if "code2wav_encoder_graph_rows" in extra and extra["code2wav_encoder_graph_rows"] is not None:
+            encoder_rows_raw = extra["code2wav_encoder_graph_rows"]
+            encoder_rows_key = "code2wav_encoder_graph_rows"
+        elif "cfm_encoder_graph_rows" in extra and extra["cfm_encoder_graph_rows"] is not None:
+            encoder_rows_raw = extra["cfm_encoder_graph_rows"]
+            encoder_rows_key = "cfm_encoder_graph_rows"
         else:
-            encoder_rows = list(range(1, int(encoder_rows) + 1))
+            encoder_rows_raw = 8 if (cfm_encoder_graph and not enable_encoder_graph) else 1
+            encoder_rows_key = "code2wav_encoder_graph_rows"
+        if isinstance(encoder_rows_raw, (list, tuple)):
+            encoder_rows = sorted({int(row) for row in encoder_rows_raw})
+        else:
+            encoder_rows = list(range(1, int(encoder_rows_raw) + 1))
         if not encoder_rows or any(row < 1 for row in encoder_rows):
-            raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+            raise ValueError(f"MiniCPM-o {encoder_rows_key} must be positive")
+        raw_encoder_max_graphs = extra.get("code2wav_encoder_max_graphs")
+        if raw_encoder_max_graphs is not None:
+            encoder_max_graphs: int | None = int(raw_encoder_max_graphs)
+        elif cfm_encoder_graph and not enable_encoder_graph:
+            encoder_max_graphs = None
+        else:
+            encoder_max_graphs = 8
         self._chunk_encoder_graph_config = {
-            "enabled": read_bool_flag(extra, "enable_code2wav_encoder_graph", False),
-            "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
+            "enabled": enable_encoder_graph or cfm_encoder_graph,
+            "max_graphs": encoder_max_graphs,
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
             "capture_after_precapture": read_bool_flag(extra, "code2wav_encoder_capture_after_precapture", False),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
+            "token_widths": [int(w) for w in extra.get("cfm_encoder_graph_token_widths") or ()],
         }
+        self._encoder_graph_config = self._chunk_encoder_graph_config
         self._cfm_graph_config = {
             "enabled": read_bool_flag(extra, "enable_cfm_graph", False),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
@@ -504,17 +523,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
-        }
-        # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
-        # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.
-        rows = extra.get("cfm_encoder_graph_rows", 8)
-        rows = sorted({int(r) for r in rows}) if isinstance(rows, (list, tuple)) else list(range(1, int(rows) + 1))
-        if any(r < 1 for r in rows):
-            raise ValueError("MiniCPM-o cfm_encoder_graph_rows must be positive")
-        self._encoder_graph_config = {
-            "enabled": read_bool_flag(extra, "cfm_encoder_cuda_graph", False),
-            "rows": [r for r in rows if not max_num_seqs or r <= int(max_num_seqs)],
-            "token_widths": [int(w) for w in extra.get("cfm_encoder_graph_token_widths") or ()],
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
@@ -2094,6 +2102,5 @@ class MiniCPMO45Code2Wav(nn.Module):
         except Exception:
             logger.warning("MiniCPM-o Code2Wav: default prompt failed; graphs capture lazily", exc_info=True)
             return
-        if precapture("Whole-Euler", partial(backend.precapture_whole_euler, features)):
-            precapture("flow encoder", partial(backend.precapture_flow_encoder, features))
+        precapture("Whole-Euler", partial(backend.precapture_whole_euler, features))
         precapture("chunk encoder", partial(backend.precapture_chunk_encoder, features))
