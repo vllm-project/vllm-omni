@@ -293,7 +293,7 @@ def talker2code2wav_async_chunk(
         return None
 
     if full_utterance_decode is True:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         context_length = length
     elif adaptive_enabled:
         _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
@@ -375,7 +375,7 @@ def talker2code2wav_async_chunk(
                 ),
             )
     else:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        first_chunk = request_id not in emitted_frames
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
         if use_first_chunk and length <= initial_chunk_size:
@@ -410,7 +410,6 @@ def talker2code2wav_async_chunk(
     # ICL reference codes are part of the first decoder initialization only.
     # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
-    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -440,7 +439,10 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            if emitted_chunks <= 0:
+            # Transport chunk IDs span segments. The adapter clears this watermark
+            # in OmniChunkTransferAdapter._send_single_request_for_generation
+            # when is_segment_finished is set, so the next segment re-sends reference.
+            if request_id not in emitted_frames:
                 ref_context_request_id = request_id
                 ref_frames = list(ref_context.to(device="cpu").unbind(0))
                 window_frames = ref_frames + window_frames

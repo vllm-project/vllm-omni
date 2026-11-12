@@ -532,6 +532,18 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_normalized: tuple[str, str] | None = None
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
+        self._npu_cross_reference_batching = read_bool_flag(extra, "cfm_npu_cross_reference_batching", False)
+        if self._npu_cross_reference_batching and self._min_batch_size != 1:
+            logger.warning(
+                "cfm_npu_cross_reference_batching requires code2wav_min_batch_size=1, but got %d; "
+                "NPU cross-reference batching will remain inactive and existing dispatch will be used",
+                self._min_batch_size,
+            )
+        # Merge the step's exact-shape buckets into one ragged solve: serving
+        # steps hold one chunk per request, so per-bucket decoding would run CFM
+        # once per row and never fill the wider graph buckets.
+        self._cross_bucket_merge = read_bool_flag(extra, "cfm_cross_bucket_merge", False)
+        self._cross_bucket_merge_limit = int(extra.get("cfm_cross_bucket_merge_limit", 0) or 0)
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
@@ -882,11 +894,19 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @staticmethod
     def _bucket_key(
-        item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False, cross_reference: bool = False
+        item: _WorkItem,
+        *,
+        cross_turn: bool = False,
+        row_offsets: bool = False,
+        cross_reference: bool = False,
+        npu_same_shape: bool = False,
+        npu_mixed_history: bool = False,
     ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
+        elif npu_same_shape:
+            cache_signature = state_shape_signature(item.previous.token2wav)
         elif row_offsets and _slot_resident(item):
             # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
             cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
@@ -896,10 +916,106 @@ class MiniCPMO45Code2Wav(nn.Module):
             cache_signature = row_offset_signature(item.previous.token2wav)
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
-        prompt = (None, None) if cross_reference else (item.prompt_cache_id, item.prompt_wav)
+        if npu_same_shape:
+            # Fresh references are prepared independently before a second,
+            # authoritative shape grouping. Do not infer their cache lengths
+            # from reference identity or from normalized audio duration.
+            cache_signature = (
+                "npu_same_shape",
+                (row_offset_signature(item.previous.token2wav) if item.previous is not None else ("uninitialized",))
+                if npu_mixed_history
+                else cache_signature,
+                None if npu_mixed_history else tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                None if npu_mixed_history else item.last_chunk,
+            )
+        prompt = (None, None) if cross_reference or npu_same_shape else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
+
+    def _npu_cross_reference_inactive_reason(self) -> str | None:
+        """Share admission conditions with initialization diagnostics."""
+        if not getattr(self, "_npu_cross_reference_batching", False):
+            return "configuration switch is disabled"
+        if self.backend is None:
+            return "backend is unavailable"
+        if getattr(self, "_min_batch_size", 1) != 1:
+            return "code2wav_min_batch_size must be 1"
+        wrapper = self.backend._whole_euler_graph_wrapper
+        if wrapper is None:
+            return "Whole-Euler wrapper is unavailable"
+        if not wrapper.enabled:
+            return "Whole-Euler graph is disabled"
+        if wrapper.ragged_body is None:
+            return "ragged Whole-Euler body is unavailable"
+        if not self.backend._whole_euler_ragged_active():
+            return "Whole-Euler ragged execution is inactive"
+        if wrapper.device.type != "npu":
+            return "wrapper device must be NPU"
+        if getattr(wrapper, "dtype", None) != torch.float32:
+            return "wrapper dtype must be FP32"
+        if getattr(wrapper, "att_slots", 0) != 0:
+            return "attention slot pool must be disabled"
+        if not getattr(self.backend, "_ragged_fused_body", False):
+            return "fused ragged body is required"
+        if getattr(self.backend, "_estimator_att_cache_dtype", None) != torch.float32:
+            return "attention cache dtype must be FP32"
+        return None
+
+    def _npu_cross_reference_active(self) -> bool:
+        """Admit only the already-supported FP32 fused Whole-Euler arena."""
+        return self._npu_cross_reference_inactive_reason() is None
+
+    @staticmethod
+    def _npu_same_shape_groups(
+        items: list[_WorkItem],
+        states: list[BatchedToken2WavState],
+        features: PromptFeatures | list[PromptFeatures],
+        *,
+        cross_turn: bool,
+        mixed_history: bool = False,
+    ) -> list[list[int]]:
+        """Partition prepared rows without reading tensor values or mixing histories."""
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, (item, state) in enumerate(zip(items, states, strict=True)):
+            feature = features[row] if isinstance(features, list) else features
+            # Match CUDA's row-offset compatibility: encoder attention histories
+            # may differ, but CNN and HiFT cache shapes must remain compatible.
+            caches = row_offset_signature(state) if mixed_history else state_shape_signature(state)
+            devices = tuple(
+                str(value.device)
+                for cache in (state.flow_cache, state.hift_cache)
+                for _, value in sorted(cache.items())
+            )
+            conditioning = tuple(
+                (tuple(value.shape), str(value.dtype), str(value.device))
+                for value in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
+            )
+            if mixed_history:
+                conditioning = tuple(
+                    (
+                        tuple(value.shape[:1]) + (None,) + tuple(value.shape[2:])
+                        if index in (0, 2)
+                        else tuple(value.shape),
+                        str(value.dtype),
+                        str(value.device),
+                    )
+                    for index, value in enumerate((feature.speech_tokens, feature.speaker_embedding, feature.mels))
+                )
+            signature = (
+                caches,
+                devices,
+                conditioning,
+                None if mixed_history else tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                None if mixed_history else item.last_chunk,
+                None if cross_turn else item.cache_epoch,
+            )
+            groups.setdefault(signature, []).append(row)
+        return list(groups.values())
 
     def _prepare_decode_batch(
         self, items: list[_WorkItem]
@@ -975,6 +1091,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
         tokens = [item.tokens for item in items]
         last_chunks = [item.last_chunk for item in items]
+        if len(items) > 1 and self._npu_cross_reference_active():
+            groups = self._npu_same_shape_groups(
+                items,
+                states,
+                features,
+                cross_turn=getattr(self, "_cross_turn_buckets", False),
+                mixed_history=getattr(self, "_npu_cross_reference_batching", False),
+            )
+            if len(groups) != 1:
+                raise _batch_error("npu_cross_reference_shape_mismatch")
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1185,10 +1312,23 @@ class MiniCPMO45Code2Wav(nn.Module):
             and self.backend._whole_euler_ragged_active()
             and self.backend._whole_euler_graph_wrapper.device.type == "cuda"
         )
+        # A single ready request cannot share CFM work. Keep its
+        # original keys and dispatch without inspecting NPU capability.
+        npu_same_shape = len(compute_items) > 1 and self._npu_cross_reference_active()
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
+        mixed_history_options = (
+            {"npu_mixed_history": True}
+            if npu_same_shape and getattr(self, "_npu_cross_reference_batching", False)
+            else {}
+        )
         for item in compute_items:
             key = self._bucket_key(
-                item, cross_turn=cross_turn, row_offsets=row_offsets, cross_reference=cross_reference
+                item,
+                cross_turn=cross_turn,
+                row_offsets=row_offsets,
+                cross_reference=cross_reference,
+                npu_same_shape=npu_same_shape,
+                **mixed_history_options,
             )
             buckets.setdefault(key, []).append(item)
         undersized = [
@@ -1293,6 +1433,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             decode_buckets = merged
         else:
             decode_buckets = buckets.values()
+        merged_ragged = False
+        if (
+            self._cross_bucket_merge
+            and self.backend is not None
+            and self.backend._whole_euler_ragged_active()
+            and len(buckets) > 1
+        ):
+            # One solve for the whole step: every row keeps its own caches and
+            # reference, which is what the ragged Whole-Euler path supports.
+            merge_items = [item for bucket in buckets.values() for item in bucket]
+            merge_limit = self._cross_bucket_merge_limit or int(self._cfm_graph_config.get("max_graph_batch") or 0)
+            if not merge_limit or len(merge_items) <= merge_limit:
+                decode_buckets = [merge_items]
+                merged_ragged = True
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
@@ -1312,7 +1466,19 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
-                if isinstance(features, list):
+                if npu_same_shape and batch_size > 1:
+                    row_groups = self._npu_same_shape_groups(
+                        bucket,
+                        states,
+                        features,
+                        cross_turn=cross_turn,
+                        mixed_history=getattr(self, "_npu_cross_reference_batching", False),
+                    )
+                elif merged_ragged and len(bucket) > 1:
+                    # Keep the merged rows in one solve: re-splitting by cache
+                    # signature is exactly what the merge removed.
+                    offset_mix = True
+                elif isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
                     pass
@@ -1332,8 +1498,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     audios, next_states = [None] * batch_size, [None] * batch_size
                     for rows in row_groups:
                         group_states = [states[row] for row in rows]
+                        group_features = features
+                        if isinstance(features, list):
+                            selected = [features[row] for row in rows]
+                            group_features = (
+                                selected[0] if len({feature.cache_key for feature in selected}) == 1 else selected
+                            )
                         mixed = row_offsets and len({state_shape_signature(state) for state in group_states}) > 1
-                        decoded = self._decode_rows([bucket[row] for row in rows], group_states, features, ragged=mixed)
+                        decoded = self._decode_rows(
+                            [bucket[row] for row in rows], group_states, group_features, ragged=mixed
+                        )
                         for row, audio, next_state in zip(rows, *decoded, strict=True):
                             audios[row], next_states[row] = audio, next_state
             except Exception as exc:
@@ -1658,7 +1832,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
@@ -1719,20 +1895,26 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif device_spk:
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
             # back to the CPU onnxruntime path (accuracy triage).
-            if device_spk:
+            flow_parameter = next(token2wav.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
-                logger.info(
-                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false)"
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
                 )
+        else:
+            logger.info(
+                "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                "(token2wav_device_spk=false)"
+            )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
             token2wav.enable_speaker_cuda_graph(self.vllm_config)
             logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
@@ -1750,8 +1932,85 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
-        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        wrapper = self.backend._whole_euler_graph_wrapper
+        inactive_reason = self._npu_cross_reference_inactive_reason()
+        if wrapper is not None:
+            wrapper.npu_mixed_history = inactive_reason is None
+        if self._npu_cross_reference_batching and (wrapper is None or not wrapper.npu_mixed_history):
+            logger.warning(
+                "NPU cross-reference CFM batching is inactive: requires NPU FP32 fused Whole-Euler, "
+                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
+                inactive_reason,
+            )
+        # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
+        # runners without that hook, the first chunk that needs a graph. Capturing
+        # under vLLM's weight load held GiBs, so the sweep must not run here.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm the graphs from the engine's warmup step, before the worker is ready.
+
+        ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
+        runner's own init work, i.e. weights loaded, profiling done, nothing
+        served yet. Runners that capture their own graphs (CUDA V1) already run a
+        dummy forward at that point, which fires the deferred sweep first and
+        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
+        defer the sweep to the first real request, where a C8 duplex replay
+        stalls every in-flight stream for ~1-2 s per graph while its first-wave
+        sessions time out.
+
+        Capturing here rather than in ``load_weights`` also keeps the allocator
+        layout the runner already uses: a sweep at weight-load time raises the
+        reserved footprint by ~4 GiB on CUDA (measured), which is enough to OOM
+        at concurrency 8.
+
+        ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
+        because this is where CUDA V1 already swept: the runner's own warmup has
+        run by now, so the capture reuses the allocator it warmed instead of
+        raising the reserved footprint the way a weight-load-time sweep does.
+        """
+        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+            logger.warning_once(
+                "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
+                "the startup sweep is controlled by cfm_graph_precapture_at_init"
+            )
+        if not self._startup_sweep_enabled():
+            return
+        self._precapture_before_serve()
+
+    def _startup_sweep_enabled(self) -> bool:
+        """Resolve ``cfm_graph_precapture_at_init``, on unless disabled.
+
+        The deferred sweep used to wait for a forward that stage 2 never runs, so
+        runners without a warmup forward (Model Runner V2, Ascend) paid for the
+        capture on their first real request. Only an explicit ``false`` opts out.
+        """
+        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
+
+    def _precapture_before_serve(self) -> None:
+        """Run the precapture sweep once, under the context ``forward`` uses.
+
+        Inference mode plus this stage's matmul policy, so a graph captured here
+        replays the kernels the lazy path would have recorded.
+
+        Per-graph failures are already handled inside ``_precapture_default_prompt``;
+        a poisoned wrapper still fails startup there, so this must not catch it.
+        """
+        if not getattr(self, "_precapture_pending", False) or self.backend is None:
+            return
+        try:
+            with torch.inference_mode(), _stage_matmul_policy(self._tf32_mode):
+                self._precapture_default_prompt()
+        finally:
+            if getattr(self, "_precapture_empty_cache", False):
+                try:
+                    self._release_precapture_cache()
+                except Exception:
+                    # Never mask the sweep error this ``finally`` may run for.
+                    logger.warning(
+                        "MiniCPM-o Code2Wav: releasing the precapture cache failed",
+                        exc_info=True,
+                    )
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).

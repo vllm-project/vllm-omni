@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import contextlib
+import copy
 import io
 import json
 import mimetypes
@@ -128,6 +129,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     }
 )
 _PRINT_STAGE = False
+_DUPLEX_METRIC_AGGREGATION = "session"
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -162,6 +164,14 @@ def should_request_stage_metrics(args: Any) -> bool:
     extra_body = getattr(args, "extra_body", None) or {}
     modalities = extra_body.get("modalities") if isinstance(extra_body, dict) else None
     return backend == "openai-chat-omni" and "image" in (modalities or [])
+
+
+def set_duplex_metric_aggregation(aggregation: str) -> None:
+    """Select the observation unit for duplex latency distributions."""
+    if aggregation not in {"session", "response"}:
+        raise ValueError(f"Unknown duplex metric aggregation: {aggregation}")
+    global _DUPLEX_METRIC_AGGREGATION
+    _DUPLEX_METRIC_AGGREGATION = aggregation
 
 
 def set_print_stage(enabled: bool) -> None:
@@ -254,6 +264,90 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
         "true",
         "yes",
     )
+
+
+#: A transport-level stall (no ``response.done``, socket left open) costs the
+#: sample its artifacts, so a duplex sample is retried once.
+_DUPLEX_EVAL_ATTEMPTS = 2
+
+
+def _duplex_timeout_reason(metadata: dict) -> str | None:
+    """The recorded transport timeout that stalled the session, if any."""
+    for key in ("input_timeout", "commit_timeout", "drain_timeout", "close_timeout"):
+        value = metadata.get(key)
+        if value:
+            return f"{key}: {value}"
+    return None
+
+
+def _duplex_stall_reason(result: object) -> str | None:
+    """Return why a duplex session did not complete, for diagnostics."""
+    metadata = getattr(result, "metadata", None) or {}
+    error = getattr(result, "error", "") or ""
+    reason = _duplex_timeout_reason(metadata)
+    if reason is not None:
+        return reason
+    if metadata.get("response_done") is not True and not error:
+        return "no completed response"
+    return None
+
+
+def _duplex_reported_error(result: object) -> str:
+    """Return the part of ``result.error`` that the transport timeouts do not explain.
+
+    ``generate_sample`` folds ``input_timeout``/``commit_timeout``/
+    ``drain_timeout`` and — for a session that never finished —
+    ``close_timeout`` into ``result.error``, so a merely stalled session
+    reports a non-empty error too. Drop the entries that are exactly a
+    recorded timeout: whatever is left is a failure the session reported
+    (a server error, a response that did not complete), not the stall itself.
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    error = str(getattr(result, "error", "") or "")
+    timeouts = {
+        str(metadata[key])
+        for key in ("input_timeout", "commit_timeout", "drain_timeout", "close_timeout")
+        if metadata.get(key)
+    }
+    return "; ".join(part for part in error.split("; ") if part and part not in timeouts)
+
+
+def _duplex_retryable_stall(result: object) -> str | None:
+    """Return the stall worth retrying, if any.
+
+    Only a client-side timeout that came alone is retried. Anything the session
+    reported — a ``server_errors`` entry or any other recorded failure in
+    ``result.error`` — gets exactly one attempt: it is a deterministic failure,
+    and retrying it could turn a reported error into a pass. A completed reply
+    does not establish that the whole input reached the server, so an input or
+    commit stall under one is still a recoverable transport failure and is
+    retried; only the advisory close of a finished sample is exempt.
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    if metadata.get("server_errors") or _duplex_reported_error(result):
+        return None
+    reason = _duplex_timeout_reason(metadata)
+    if reason is None:
+        return None
+    if metadata.get("response_done") is True and reason.startswith("close_timeout"):
+        return None
+    return reason
+
+
+def _duplex_retry_tally(outputs: list[RequestFuncOutput]) -> dict[str, int]:
+    """Aggregate the Omni-DuplexEval retries a run needed.
+
+    A retry hides the stall it recovered from: the second attempt lands after
+    whatever made the first one stall, so per-sample metrics (and the CI
+    ``completed == num_prompt`` guard) look clean. Count them explicitly so the
+    failure mode stays visible; deciding what a non-zero count should do to the
+    guard is a scoring-policy change, not something this tally assumes.
+    """
+    retries = [int(getattr(output, "duplex_retries", 0) or 0) for output in outputs]
+    return {
+        "duplex_retried_samples": sum(1 for count in retries if count),
+        "duplex_retry_count": sum(retries),
+    }
 
 
 _DEFAULT_REQUEST_TIMEOUT_S = 900.0
@@ -595,6 +689,55 @@ def get_samples(args, tokenizer, **kwargs):
     any upstream caller reaching this patched replacement keeps working; they are
     forwarded to the original implementation on every delegate path.
     """
+    pool_size = getattr(args, "duplex_sample_pool_size", None)
+    if pool_size is not None:
+        if args.dataset_name not in {"omniinteract", "omni-duplex-eval"}:
+            raise ValueError("--duplex-sample-pool-size requires OmniInteract or Omni-DuplexEval")
+        if getattr(args, "omniinteract_evaluate", False) or getattr(args, "duplex_eval_evaluate", False):
+            raise ValueError("--duplex-sample-pool-size is for performance runs without answer evaluation")
+        count = args.num_prompts or pool_size
+        if count > pool_size and getattr(args, "no_oversample", False):
+            raise ValueError("Repeating the duplex sample pool conflicts with --no-oversample")
+        pool_count = min(count, pool_size)
+        pool_args = argparse.Namespace(**vars(args))
+        pool_args.duplex_sample_pool_size = None
+        pool_args.num_prompts = pool_count
+        # Load the source pool once, including OmniInteract's predecoded media.
+        # Clear the option so this call cannot recurse again.
+        pool = get_samples(pool_args, tokenizer, **kwargs)
+        if len(pool) != pool_count:
+            raise ValueError(f"Requested {pool_count} distinct duplex samples, but selected {len(pool)}")
+        requests = []
+        identities = set()
+        for index in range(count):
+            cycle, offset = divmod(index, len(pool))
+            # Repeats can overlap: shared media/options must stay read-only.
+            # Prepared media is frozen bytes/tuples; stream cursors and playback
+            # state are created separately by each run_omniinteract_case call.
+            request = replace(pool[offset], request_id=f"{args.request_id_prefix or ''}{index}")
+            if isinstance(request, OmniInteractSampleRequest) and request.omniinteract_case is not None:
+                case = request.omniinteract_case
+                if cycle:
+                    relative = Path(case.video_rel)
+                    request.omniinteract_case = replace(
+                        case, video_rel=str(relative.with_name(f"{relative.stem}__repeat_{cycle}{relative.suffix}"))
+                    )
+                output_keys = [(request.omniinteract_case.subset, request.omniinteract_case.video_rel)]
+            elif isinstance(request, OmniDuplexEvalSampleRequest) and request.sample is not None:
+                if cycle:
+                    request.sample = replace(request.sample, id=f"{request.sample.id}__repeat_{cycle}")
+                output_keys = [
+                    (request.sample.split, f"{request.sample.id}{suffix}") for suffix in (".json", ".meta.json")
+                ]
+            else:
+                raise TypeError("Duplex sample pool lost its dataset identity")
+            if any(key in identities for key in output_keys):
+                raise ValueError(f"Repeated duplex output identity would collide: {output_keys}")
+            identities.update(output_keys)
+            requests.append(request)
+        args.num_prompts = len(requests)
+        return requests
+
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -1002,6 +1145,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
     duplex_session_metrics: dict[str, object] | None = None
+    #: Retries before the reported attempt. Diagnostic only: excluded from the
+    #: measured latency, but a run that needed them is not silently clean.
+    duplex_retries: int = 0
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -3042,27 +3188,71 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         # preparation off the event loop and outside this session's latency;
         # throughput still includes any client preparation stalls.
         prepared = await asyncio.to_thread(prepare_duplex_eval_sample, sample)
-        output.start_time = time.perf_counter()
         headers = _get_headers()
         _update_headers_common(headers, request)
-        result = await asyncio.wait_for(
-            generate_sample(
-                sample.sample,
-                url=request.api_url,
-                model=request.model_name or request.model,
-                ref_audio=sample.ref_audio,
-                output_root=sample.response_root,
-                fps=sample.fps,
-                mix=sample.mix,
-                prepared=prepared,
-                defer_artifacts=True,
-                turn_detection=sample.turn_detection,
-                instructions=sample.instructions,
-                additional_headers=headers or None,
-                extra_body=dict(request.extra_body or {}),
-            ),
-            timeout=_omni_request_timeout_s(),
-        )
+        result = None
+        for attempt in range(_DUPLEX_EVAL_ATTEMPTS):
+            # Restart the latency baseline every attempt: the sample measures
+            # the session that produced its artifacts, not the discarded one.
+            output.start_time = time.perf_counter()
+            try:
+                deadline = _omni_request_timeout_s()
+                result = await asyncio.wait_for(
+                    generate_sample(
+                        sample.sample,
+                        url=request.api_url,
+                        model=request.model_name or request.model,
+                        ref_audio=sample.ref_audio,
+                        output_root=sample.response_root,
+                        fps=sample.fps,
+                        mix=sample.mix,
+                        prepared=prepared,
+                        defer_artifacts=True,
+                        turn_detection=sample.turn_detection,
+                        instructions=sample.instructions,
+                        additional_headers=headers or None,
+                        extra_body=dict(request.extra_body or {}),
+                    ),
+                    timeout=deadline,
+                )
+            except asyncio.TimeoutError:
+                # A timed-out attempt leaves no result to inspect, so it is
+                # always retried once: worst case ~2x the per-request timeout.
+                # ``generate_sample`` records its own timeouts in metadata
+                # instead of raising, so one raised well before the deadline
+                # is an inner ``wait_for`` (e.g. the configure handshake)
+                # leaking, not this benchmark's timeout: log it as what it is.
+                elapsed = time.perf_counter() - output.start_time
+                inner_timeout = elapsed + 0.001 < deadline
+                if attempt + 1 >= _DUPLEX_EVAL_ATTEMPTS:
+                    raise
+                output.duplex_retries += 1
+                logger.warning(
+                    "Omni-DuplexEval sample %s %s; retrying (%d/%d)",
+                    sample.sample.id,
+                    "timed out on an inner wait before the per-request timeout"
+                    if inner_timeout
+                    else "hit the per-request timeout",
+                    attempt + 1,
+                    _DUPLEX_EVAL_ATTEMPTS,
+                )
+                continue
+            retryable = _duplex_retryable_stall(result)
+            if retryable is not None and attempt + 1 < _DUPLEX_EVAL_ATTEMPTS:
+                output.duplex_retries += 1
+                logger.warning(
+                    "Omni-DuplexEval sample %s stalled at the transport level (%s); retrying (%d/%d)",
+                    sample.sample.id,
+                    retryable,
+                    attempt + 1,
+                    _DUPLEX_EVAL_ATTEMPTS,
+                )
+                continue
+            break
+        if result is None:  # pragma: no cover - the loop either returns or raises
+            raise RuntimeError("Omni-DuplexEval produced no session result")
+        # Next to ``*.meta.json`` so CI can tell a retried sample from a clean one.
+        result.metadata["retry_count"] = output.duplex_retries
         output.generated_text = " ".join(str(row["sentence"]) for row in result.timed_sentences)
         output.output_tokens = result.output_tokens
         output.audio_frames = result.audio_bytes // 2
@@ -3080,7 +3270,10 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
             expected_output_tokens=result.output_tokens,
         )
         output.success = result.metadata.get("response_done") is True and not result.error
-        output.error = result.error
+        # Name the stall reason: an unsuccessful sample with an empty error was
+        # indistinguishable from one that never ran. A completed sample keeps
+        # its advisory timeouts (a stalled close or ack) in metadata only.
+        output.error = (result.error or (_duplex_stall_reason(result) or "")) if not output.success else ""
         # Readiness/warmups run the identical session but retain no judge files.
         if request.request_id is not None:
             setattr(output, "duplex_eval_result", result)
@@ -3220,6 +3413,73 @@ class _RealtimeTTSProbe:
         assert self._client is not None
         await self._client.close(timeout_s=timeout_s)
 
+    async def turn_session_stats(self, response_id: str, *, timeout_s: float = 5.0) -> dict[str, object]:
+        """Server-side busy RTF and stall ratio of the turn that produced ``response_id`` (RFC #8325).
+
+        Empty when the server does not collect session stats. Polls until the
+        turn's metrics are final, within one overall ``timeout_s``. The stats are
+        auxiliary: a query that times out, a closed session or a server error
+        leaves the turn's client metrics intact and reports ``server_stats_final:
+        False``, never a number.
+        """
+        from vllm_omni.benchmarks.duplex_session_metrics import session_stats_turn_metrics
+        from vllm_omni.clients.duplex import DuplexClientError
+
+        assert self._client is not None
+        capabilities = (self._client.session_info or {}).get("capabilities")
+        if not isinstance(capabilities, Mapping) or capabilities.get("supports_session_stats") is not True:
+            return {}
+        deadline = time.monotonic() + timeout_s
+        metrics: dict[str, object] = {"final": False}
+        turn: Mapping[str, object] | None = None
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                stats = await self._client.get_session_stats(timeout_s=remaining)
+            except (asyncio.TimeoutError, DuplexClientError) as exc:
+                logger.warning("Seed-TTS session stats unavailable for %s: %s", response_id, exc)
+                break
+            turns = stats.get("turns")
+            turn = next(
+                (
+                    candidate
+                    for candidate in (turns if isinstance(turns, list) else ())
+                    if isinstance(candidate, Mapping) and response_id in (candidate.get("response_ids") or ())
+                ),
+                None,
+            )
+            stages = stats.get("stages")
+            stage_ids = (
+                [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)]
+                if isinstance(stages, list)
+                else None
+            )
+            metrics = session_stats_turn_metrics(turn, stage_ids=stage_ids) if turn is not None else {"final": False}
+            if metrics.get("final") or metrics.get("missing_stage_ids"):
+                # Missing stages will not report later: the turn is already final.
+                break
+            await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        chunks = turn.get("chunks") if turn is not None else None
+        stage_ids = sorted(
+            {
+                work["stage_id"]
+                for chunk in (chunks if isinstance(chunks, list) else ())
+                for work in chunk.get("stage_work") or ()
+                if work.get("spans")
+            }
+        )
+        return {
+            "busy_rtf": metrics.get("busy_rtf"),
+            "stall_ratio": metrics.get("stall_ratio"),
+            "server_generation_ms": metrics.get("generation_ms"),
+            "server_turn_span_ms": metrics.get("turn_span_ms"),
+            "server_stall_ms": metrics.get("stall_ms"),
+            "server_audio_ms": metrics.get("audio_ms"),
+            "server_stats_final": bool(metrics.get("final")),
+            "server_missing_stage_ids": metrics.get("missing_stage_ids", []),
+            # Stages that reported work for the turn: shows the chunk id reached each stage.
+            "server_stage_ids": stage_ids,
+        }
+
 
 async def async_request_openai_realtime_duplex(
     request_func_input: RequestFuncInput,
@@ -3346,6 +3606,7 @@ async def async_request_openai_realtime_duplex(
                 )
                 if client_rtf is not None:
                     metric["client_rtf"] = client_rtf
+                metric.update(await client.turn_session_stats(response_id))
                 turn_metrics.append(metric)
                 response_audio = client.events.audio_bytes(response_id)
                 turn_pcm_bytes.append(
@@ -3377,7 +3638,9 @@ async def async_request_openai_realtime_duplex(
         output.latency = request_finished_at - output.start_time
         output.tts_turn_pcm_bytes = turn_pcm_bytes
         output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
-        if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+        if _DUPLEX_METRIC_AGGREGATION == "response" or bool(
+            (request_func_input.extra_body or {}).get("save_duplex_request_metrics")
+        ):
             output.duplex_request_metrics = turn_metrics
             output.duplex_session_metrics = session_metrics
         output.output_tokens = sum(
@@ -3479,6 +3742,11 @@ ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
 if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
+# Backends whose request body is a completions / chat completions request, the
+# protocols that accept ``cache_salt``. Speech derives its own server-side salt
+# and drops unknown fields; multimodal processor caches are not keyed by it.
+CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
+
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
@@ -3518,6 +3786,18 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     merged = dict(base or {})
     merged.update(overrides or {})
     return merged
+
+
+def _salted_copy(rfi: RequestFuncInput, salt: str | None) -> RequestFuncInput:
+    """Copy with a default ``cache_salt``; an explicit one wins.
+
+    ``copy``, not ``dataclasses.replace``: the ``_attach_*`` helpers add
+    attributes outside the dataclass fields, which ``replace`` would drop.
+    """
+    out = copy.copy(rfi)
+    if salt is not None:
+        out.extra_body = {"cache_salt": salt, **(rfi.extra_body or {})}
+    return out
 
 
 def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
@@ -3636,6 +3916,10 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    # The ready check and each warmup get a private salt, so their AR prefix-KV
+    # blocks neither hit each other (warmup then runs the measured run's prefill
+    # shapes) nor serve the measured requests. Only those blocks are isolated.
+    warmup_scope = uuid.uuid4().hex if endpoint_type in CACHE_SALT_BACKENDS else None
     test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
     test_chat_messages = input_requests[0].chat_messages
 
@@ -3666,7 +3950,7 @@ async def benchmark(
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
             request_func,
-            test_input,
+            _salted_copy(test_input, warmup_scope and f"{warmup_scope}-ready"),
             session,
             timeout_seconds=ready_check_timeout_sec,
         )
@@ -3687,12 +3971,13 @@ async def benchmark(
         warmup_semaphore = _async_limiter(max_concurrency)
         warmup_tasks = []
 
-        async def warmup_limited_request_func():
+        async def warmup_limited_request_func(warmup_input: RequestFuncInput):
             async with warmup_semaphore:
-                return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
+                return await request_func(request_func_input=warmup_input, session=session, pbar=warmup_pbar)
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
+        for i in range(num_warmups):
+            warmup_input = _salted_copy(test_input, warmup_scope and f"{warmup_scope}-{i}")
+            request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)
 
@@ -3855,6 +4140,16 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
+    if duplex_eval_summary is not None:
+        duplex_eval_summary.update(_duplex_retry_tally(outputs))
+        if duplex_eval_summary["duplex_retry_count"]:
+            logger.warning(
+                "Omni-DuplexEval retried %d sample(s) for %d attempt(s); their reported latency "
+                "covers the successful attempt only, and each count is persisted per sample as "
+                "``retry_count``. The scoring decision is unchanged.",
+                duplex_eval_summary["duplex_retried_samples"],
+                duplex_eval_summary["duplex_retry_count"],
+            )
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
     omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
     if omniinteract_summary is not None and omniinteract_evaluation is not None:
@@ -3876,6 +4171,7 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            duplex_metric_aggregation=_DUPLEX_METRIC_AGGREGATION,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -4120,6 +4416,9 @@ async def benchmark(
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+
+    if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
+        result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION
 
     if task_type == TaskType.GENERATION:
         for metric in result_percentile_metrics:
