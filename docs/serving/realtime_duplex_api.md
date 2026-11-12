@@ -41,6 +41,106 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Qwen3-Omni cross-turn Thinker KV reuse
+
+The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to resident
+Thinker KV continuation. No additional YAML or session switch is needed.
+As in upstream streaming input, the request path sets `resumable=True`;
+ordinary non-streaming requests keep upstream's `resumable=False` default.
+Talker and Code2Wav remain per-turn and do not enable prefix caching.
+
+### Resident Thinker KV continuation
+
+Continuation is selected from the resolved engine configuration: stage 0 must
+use Model Runner V1 or CUDA MRv2, prefix caching, async-chunk transport and no speculative
+decoding. The profile runs MRv2 on CUDA and V1 on other platforms. Both
+asynchronous and synchronous scheduling support continuation. At a turn boundary, only the continued
+request waits for its previous in-flight outputs to drain before resetting
+worker delivery state. Other sessions continue to run. Unsupported combinations
+retain fresh per-turn Thinker requests; startup logs the reason and the session reports
+`supports_core_resumable_request: false`. Where enabled, ordinary APC still reuses
+matching blocks in that fallback path. Disabling stage-0 prefix caching also
+disables resident continuation because Talker needs cached hidden-state rows.
+Non-CUDA profile overrides keep prefix caching disabled.
+
+Idle resident Thinker requests still occupy upstream active-request slots.
+Startup rejects continuation configurations whose per-replica session limit
+exceeds stage 0's `max_num_active_seqs` (or `max_num_seqs` when unset).
+For `least_sessions`, the limit is the smaller of `max_sessions_per_replica`
+and global `max_sessions`; otherwise it is `max_sessions`. Lower the session
+limit or increase the existing scheduler capacity to avoid accepting sessions
+that cannot run while earlier sessions remain idle.
+
+Prefix caching does not eliminate multimodal preprocessing or Talker/Code2Wav
+work. Budget host RAM for the
+[stage-output cache](../design/feature/prefix_caching.md) as well as GPU memory
+for resident KV.
+
+The Thinker request and its KV allocation survive a completed turn. Each new
+commit uses the session's append cursor to select only the new user messages.
+Mutations of already submitted history invalidate that cursor. The stage port
+checks the latest heard assistant text against the actual completed output
+before the plugin constructs a suffix-only prompt. Normal turns do not build a
+full history snapshot, render old messages, or decode old media.
+
+The request-owned input ledger retains actual accepted token IDs, not old
+message snapshots. The wire request contains only new tokens and multimodal
+features, plus the expected resident prefix length. The sampled terminator is
+re-injected exactly once because upstream discards the final uncomputed sample.
+Frontend output processing and downstream prewarm retain the complete token
+context. Old materialized media remain in EngineCore.
+
+The direct-append path validates the resident prefix length, a digest of its
+token content and the cache salt, then extends the existing request without
+comparing full-history block hashes.
+Prefix caching stays enabled: upstream still maintains block hashes for APC,
+and Omni replays complete cached hidden-state blocks for Talker. The partial
+block tail is recomputed. A missing or stale resident fails only that request.
+
+Changed/pruned history, playback-truncated text, or an unsupported completion
+boundary falls back to full-snapshot processing. Tool turns, changed prompt
+settings and the existing message/audio window limits also use that fallback.
+Nonempty `initial_user_text` uses full snapshots because it belongs only to the
+current audio turn; appending would retain previous turns' injected text.
+Fallback snapshots are tokenized in full without a rendered-text prefix cache.
+The scheduler releases the resident allocation and rebuilds from the current
+prompt; ordinary prefix caching re-matches every unchanged block. Block hashes
+include multimodal identities and cache salt, so equal audio placeholder tokens
+alone do not authorize reuse.
+
+Internally, both paths become a streaming update to vLLM's upstream resumable
+scheduler. It folds the retained token history and recomputes new block hashes,
+rebasing new multimodal features without modifying the original snapshot. This does not change the commit-triggered generation
+interface or enable audio input during the same generation.
+
+Talker and Code2Wav terminate each turn. Their next requests receive the complete
+Thinker conditioning rows, replayed from the stage-output cache where KV was
+retained. They do not inherit the Thinker's resumable lifetime. The session
+advertises `supports_core_resumable_request: true` together with
+`supports_turn_commit_only: true`: request residency does not enable native
+streaming-input turn policy. Unsupported deployments report resumability as false.
+
+Commit, VAD interruption and playback acknowledgement retain their turn-based
+semantics. Cancellation advances the epoch and aborts the resident request;
+the next turn rebuilds it. Closing or expiring a session releases its resident
+resources. New audio may buffer during a response, but another generation must
+wait for that response to complete or be cancelled. Idle sessions normally
+retain KV. If runnable waiting work makes no progress, the scheduler releases
+one idle turn's KV after its in-flight outputs have drained, then retries
+admission on the next scheduling pass. The session keeps its token history and
+materialized media; a later continuation recovers through APC or recomputation.
+This does not release the session's request slot, so deployment session-capacity
+limits still apply. Upstream preemption continues to select running requests.
+
+Any stage failure during a resident turn closes the session. The Thinker
+request shares its ID with that turn's Talker and Code2Wav requests, so failure
+cleanup also aborts the resident KV. A failure to retire the previous turn's
+transport closes the session for the same reason: the resident ID cannot be
+reused safely. Deployments that fall back to per-turn requests keep per-turn
+failure recovery. Full history rendering and
+multimodal cache processing remain; this feature does not claim a measured
+latency improvement.
+
 ### Qwen3-Omni voice selection
 
 The duplex session forwards the configured voice to the Talker as the

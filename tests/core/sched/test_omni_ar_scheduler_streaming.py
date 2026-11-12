@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
@@ -23,13 +24,14 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 import vllm.v1.engine.core as engine_core
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.engine import EngineCoreRequestType, FinishReason
+from vllm.v1.engine import EngineCoreEventType, EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.engine import token_prefix_digest
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -42,8 +44,10 @@ from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
-    sched = OmniARScheduler.__new__(OmniARScheduler)
+def _make_scheduler(
+    *, stage_id: int = 0, session_mode: str = "turn", scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
+    sched = object.__new__(scheduler_cls)
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
@@ -62,6 +66,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
     sched._outputs_awaiting_stage_payload = {}
+    sched._omits_kv_transfer_cache = {}
     return sched
 
 
@@ -84,6 +89,212 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+@pytest.mark.parametrize("delta", [True, False])
+@pytest.mark.parametrize("in_flight", [0, 1, 2])
+def test_async_full_prompt_continuation_waits_for_previous_turn(delta, in_flight):
+    """Do not reset a resident worker row while its old outputs are pending."""
+    sched = _make_live_session_scheduler(max_model_len=128, scheduler_cls=OmniARAsyncScheduler)
+    sched.cache_config = SimpleNamespace(block_size=16)
+    sched.kv_cache_manager = MagicMock()
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    session = _make_request()
+    sched.requests[session.request_id] = session
+    session.resumable = True
+    session.resume_from_full_prompt = True
+    session.prompt_token_ids = list(range(30))
+    session.num_prompt_tokens = 30
+    session._all_token_ids[:] = session.prompt_token_ids
+    session.append_output_token_ids([30, 31, 32, 33, 999])
+    session.block_hashes[:] = [b"first", b"second"]
+    session.num_computed_tokens = 34 + in_flight
+    session.num_output_placeholders = in_flight
+    session.num_in_flight_tokens = in_flight
+    session.status = RequestStatus.FINISHED_STOPPED
+    # Run the upstream stop path, including rollback and stale-output fencing.
+    assert sched._handle_stopped_request(session) is False
+    assert session.num_computed_tokens == 34
+    assert session.num_output_placeholders == 0
+    assert sched.num_waiting_for_streaming_input == 1
+
+    update = _make_update(list(range(34, 50)) if delta else list(range(50)))
+    update.resume_from_full_prompt = True
+    update.cache_salt = None
+    if delta:
+        update.append_prefix_length = 34
+        update.append_prefix_digest = token_prefix_digest(list(range(34)))
+    sched._update_request_as_session(session, update)
+
+    assert session.num_computed_tokens == (32 if delta else 0)
+    assert session.prompt_token_ids == list(range(50))
+    assert session.num_stale_output_tokens == in_flight
+    assert session.num_output_tokens == 0
+    assert sched.num_waiting_for_streaming_input == 0
+    assert sched._handle_blocked_waiting_request(session) is (in_flight == 0)
+    # A different session remains eligible while this one drains.
+    other = _make_request()
+    other.status = RequestStatus.WAITING
+    assert sched._handle_blocked_waiting_request(other)
+
+    for remaining in reversed(range(in_flight)):
+        assert not _run_continuation_output(sched, session, num_scheduled=1, token=777)
+        assert session.num_in_flight_tokens == remaining
+        assert session.num_stale_output_tokens == remaining
+        assert session.num_output_placeholders == 0
+        assert session.num_output_tokens == 0
+    assert sched._handle_blocked_waiting_request(session)
+    assert session.num_computed_tokens == (32 if delta else 0)
+    if delta:
+        sched._free_request_blocks.assert_not_called()
+    else:
+        # Upstream prefix caching re-matches unchanged snapshot blocks.
+        sched._free_request_blocks.assert_called_once_with(session)
+
+    # The first new-turn result must go through the real AsyncScheduler
+    # placeholder accounting, cache update and EngineCore output emission.
+    num_scheduled = len(session.prompt_token_ids) - session.num_computed_tokens
+    session.status = RequestStatus.RUNNING
+    session.num_computed_tokens += num_scheduled
+    session.num_in_flight_tokens = num_scheduled
+    session.num_output_placeholders = 1
+    outputs = _run_continuation_output(sched, session, num_scheduled=num_scheduled, token=888)
+    assert outputs[session.client_index].outputs[0].new_token_ids == [888]
+    assert list(session.output_token_ids) == [888]
+    assert session.num_output_placeholders == session.num_in_flight_tokens == 0
+    sched.kv_cache_manager.cache_blocks.assert_called_once_with(session, 50)
+
+
+def _run_continuation_output(sched, session, *, num_scheduled: int, token: int):
+    """Deliver one worker result without mocking stop or async token accounting."""
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={session.request_id: num_scheduled},
+        total_num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[session.request_id],
+        req_id_to_index={session.request_id: 0},
+        sampled_token_ids=[[token]],
+    )
+    return sched.update_from_output(scheduler_output, model_output)
+
+
+@pytest.mark.parametrize("change", ["append", "delta", "reclaimed_delta", "tokens", "audio", "salt", "shrink"])
+def test_full_prompt_uses_upstream_delta_with_real_multimodal_hashes(change, mocker):
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    hash_fn = get_hash_fn_by_name("sha256")
+    init_none_hash(hash_fn)
+    hasher = get_request_block_hasher(16, hash_fn)
+
+    def audio(identifier, offset, length):
+        return MultiModalFeatureSpec(
+            data=None,
+            modality="audio",
+            identifier=identifier,
+            mm_position=PlaceholderRange(offset=offset, length=length),
+        )
+
+    session = Request(
+        request_id="resident",
+        prompt_token_ids=list(range(33)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=1.0,
+        block_hasher=hasher,
+        resumable=True,
+        mm_features=[audio("history", 4, 8), audio("straddles-boundary", 30, 4)],
+    )
+    session.append_output_token_ids([33, 34, 999])
+    session.num_computed_tokens = 35  # 999 is sampled but has no KV.
+    if change == "reclaimed_delta":
+        session.num_computed_tokens = 0
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    tokens = list(range(64))
+    features = [
+        audio("changed" if change == "audio" else "history", 4, 8),
+        audio("straddles-boundary", 30, 4),
+        audio("new", 40, 8),
+    ]
+    if change == "tokens":
+        tokens[5] = 777
+    if change == "shrink":
+        tokens, features = tokens[:16], features[:1]
+    fresh = Request(
+        request_id="resident",
+        prompt_token_ids=tokens,
+        sampling_params=SamplingParams(max_tokens=16),
+        pooling_params=None,
+        arrival_time=2.0,
+        block_hasher=hasher,
+        resumable=True,
+        mm_features=features,
+        cache_salt="new-salt" if change == "salt" else None,
+    )
+    fresh.resume_from_full_prompt = True
+    update = StreamingUpdate.from_request(fresh)
+    if change in {"delta", "reclaimed_delta"}:
+        update.append_prefix_length = 35
+        update.append_prefix_digest = token_prefix_digest(tokens[:35])
+        update.prompt_token_ids = tokens[35:]
+        update.mm_features = [replace(features[-1], mm_position=replace(features[-1].mm_position, offset=5))]
+    original_offsets = [f.mm_position.offset for f in update.mm_features]
+    upstream_update = VLLMScheduler._update_request_as_session
+
+    def checked_upstream(scheduler, resident, delta):
+        # Both upstream trim conventions see the same computed prefix.
+        assert resident.num_tokens - 1 == resident.num_computed_tokens
+        assert all(f.mm_position.offset >= 0 for f in delta.mm_features)
+        return upstream_update(scheduler, resident, delta)
+
+    upstream = mocker.patch.object(
+        VLLMScheduler, "_update_request_as_session", autospec=True, side_effect=checked_upstream
+    )
+    sched = _make_scheduler()
+    sched.cache_config = SimpleNamespace(block_size=16)
+    sched.max_model_len = 128
+    sched.num_waiting_for_streaming_input = 1
+    sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    sched._enqueue_waiting_request(session)
+    sched.deferred_waiting.add(session)
+    sched.log_stats = True
+    sched._update_request_as_session(session, update)
+
+    # Only a validated delta keeps resident KV; every snapshot is rebuilt
+    # through upstream prefix caching.
+    retained = 32 if change == "delta" else 0
+    upstream.assert_called_once()
+    delta = upstream.call_args.args[2]
+    assert delta.prompt_token_ids == tokens[retained:]
+    assert session.num_computed_tokens == retained
+    assert session.prompt_token_ids == tokens
+    assert list(session.all_token_ids) == tokens
+    assert session.num_output_tokens == 0
+    assert session.max_tokens == update.max_tokens
+    assert session._reset_turn_worker_state
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+    assert session.block_hashes == fresh.block_hashes
+    assert session.mm_features == fresh.mm_features
+    assert session.cache_salt == fresh.cache_salt
+    assert [f.mm_position.offset for f in update.mm_features] == original_offsets
+    assert all(a is not b for a, b in zip(delta.mm_features, features[-len(delta.mm_features) :]))
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.status == RequestStatus.WAITING
+    assert sched._free_request_blocks.call_count == (0 if change in {"delta", "reclaimed_delta"} else 1)
+    assert session not in sched.deferred_waiting
+    assert list(sched.kv_holding_waiting) == ([session] if retained else [])
+    assert list(sched.waiting) == ([] if retained else [session])
+    assert [event.type for event in session.events] == [EngineCoreEventType.QUEUED]
 
 
 def _make_minicpm_window_update(
@@ -1303,11 +1514,13 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched._enqueue_waiting_request.assert_not_called()
 
 
-def _make_live_session_scheduler(*, max_model_len: int) -> OmniARScheduler:
+def _make_live_session_scheduler(
+    *, max_model_len: int, scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
     """A scheduler whose finish path is real: the queues, ``finish_requests``,
     ``_free_request`` and the finished-request bookkeeping that wakes an idle
     engine all run. Only block freeing and the encoder cache are mocked."""
-    sched = _make_admission_scheduler(max_model_len=max_model_len)
+    sched = _make_admission_scheduler(max_model_len=max_model_len, scheduler_cls=scheduler_cls)
     del sched._free_request  # the admission helper mocks it; run the real one
     sched._omits_kv_transfer_cache = {}
     sched.connector = None
@@ -1593,10 +1806,12 @@ def test_stage0_streaming_update_overflow_counts_an_uncomputed_prompt() -> None:
     assert "5 tokens" in sched._streaming_context_overflow[session.request_id][1]
 
 
-def _make_admission_scheduler(*, max_model_len: int) -> OmniARScheduler:
+def _make_admission_scheduler(
+    *, max_model_len: int, scheduler_cls: type[OmniARScheduler] = OmniARScheduler
+) -> OmniARScheduler:
     """A scheduler with real admission queues, so nothing about the terminal
     handling below is mocked away except block freeing."""
-    sched = _make_scheduler(stage_id=0)
+    sched = _make_scheduler(stage_id=0, scheduler_cls=scheduler_cls)
     sched.max_model_len = max_model_len
     sched.policy = SchedulingPolicy.FCFS
     sched.waiting = create_request_queue(sched.policy)
@@ -1723,6 +1938,7 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 @pytest.mark.parametrize("native", [True, False])
 def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, native) -> None:
     sched = _make_scheduler(stage_id=1)
+    sched._pause_state = PauseState.UNPAUSED
     parked = SimpleNamespace(request_id="parked")
     sched.requests = {"parked": parked}
     sched.waiting = []
@@ -1757,7 +1973,7 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     def fake_schedule(self, _throttle_prefills=False):
         observed_limits.append(self.max_num_active_reqs)
-        return SimpleNamespace(scheduled_new_reqs=[])
+        return SimpleNamespace(scheduled_new_reqs=[], num_scheduled_tokens={})
 
     monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
 

@@ -75,6 +75,10 @@ class DuplexStageRequestContext:
         return self.sampling_params[self.stage_id]
 
 
+#: Private session-config and prompt key marking a resident turn delta.
+DUPLEX_TURN_DELTA_KEY = "_duplex_turn_delta"
+
+
 @dataclass(frozen=True)
 class DuplexStageSubmission:
     context: DuplexStageRequestContext
@@ -83,6 +87,9 @@ class DuplexStageSubmission:
     # True: resume/update an existing stage0 id. False: open a new ephemeral id.
     # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
+    resume_from_full_prompt: bool = False
+    # Delta eligibility must remain valid through asynchronous input processing.
+    history_revision: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -118,6 +125,14 @@ class DuplexOutputContext:
 
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
+
+    async def can_append_turn(self, request_id: str, assistant_text: str) -> bool:
+        """Whether the resident token ledger agrees with the last heard reply."""
+        return False
+
+    async def finish_turn(self, request_id: str) -> None:
+        """Release per-turn downstream state while retaining entry-stage KV."""
+        raise NotImplementedError("This stage port does not support turn KV continuation")
 
     def reserve_session(self, session_id: str) -> None:
         """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
@@ -257,6 +272,7 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 
 
 __all__ = [
+    "DUPLEX_TURN_DELTA_KEY",
     "DuplexFence",
     "DuplexAppendPlan",
     "DuplexOutputAction",

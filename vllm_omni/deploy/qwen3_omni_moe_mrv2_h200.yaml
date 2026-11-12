@@ -5,7 +5,7 @@
 # during warmup; short-KV attention and convolution selection change rounding.
 # This is not a claim of bitwise audio or universal P99/throughput improvement.
 # Evidence: docs/design/qwen3_omni_mrv2_performance.md
-base_config: qwen3_omni_moe_mrv2.yaml
+base_config: qwen3_omni_moe.yaml
 
 connectors:
   connector_of_shared_memory:

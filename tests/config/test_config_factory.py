@@ -1706,6 +1706,11 @@ stages:
         connector = deploy.connectors["connector_of_shared_memory"]
         assert "async_chunk_batch_min_size" not in connector["extra"]
         assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
+        assert connector["extra"]["initial_codec_chunk_frames"] == 4
+        assert connector["extra"]["talker_first_audio"] is True
+        assert connector["extra"]["codec_chunk_ramp"] == [1, 2, 4, 8, 16, 25]
+        assert connector["extra"]["codec_graph_batch_sizes"] == [2, 3, 4, 6, 8, 12, 16]
+        assert connector["extra"]["codec_fused_snake"] is True
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -1734,8 +1739,8 @@ stages:
             platform=platform,
         )
         duplex_stages = merge_pipeline_deploy(pipeline, duplex)
-        assert duplex.model_runner == "v1"
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [False, False, False]
+        assert duplex.model_runner == ("v2" if expect_v2 else "v1")
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [expect_v2] * 3
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2110,9 +2115,9 @@ stages:
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
-            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
-            ("qwen3_omni_duplex.yaml", "cuda", False),
-            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_moe_mrv2_h200.yaml", "cuda", True),
+            ("qwen3_omni_duplex.yaml", "cuda", True),
+            *(("qwen3_omni_duplex.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
             *(
                 (yaml_name, platform, False)
@@ -2130,7 +2135,7 @@ stages:
         ],
     )
     def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated CUDA turn profiles.
+        """Stage-0 prefix caching is enabled only in selected CUDA profiles.
 
         Checked on the final engine args: the stage value rides in
         ``engine_extras`` and must keep winning over the pipeline-wide flag.
@@ -2150,8 +2155,11 @@ stages:
             else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         )
         assert pipeline is not None
-        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage0 = next(stage for stage in stages if stage.stage_id == 0)
         assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
+        if yaml_name == "qwen3_omni_duplex.yaml":
+            assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages if stage.stage_id > 0)
 
     @pytest.mark.parametrize("runner", ["v1", "v2"])
     @pytest.mark.parametrize("disable_prefix_cache", [False, True])

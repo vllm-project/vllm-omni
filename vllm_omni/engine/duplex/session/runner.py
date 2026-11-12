@@ -1373,11 +1373,7 @@ class DuplexSessionRunner:
                     charges[index] = charge
                 release_queued_input()
             for index, ((segment, vad_result), release) in enumerate(zip(detected, releases)):
-                if (
-                    vad_result is not None
-                    and not session.capabilities.supports_core_resumable_request
-                    and not client_force_listen
-                ):
+                if vad_result is not None and session.capabilities.commits_turns and not client_force_listen:
                     # VAD's force_listen hint controls native model decoding. Committed
                     # turn models already buffer speech; it must not suppress barge-in.
                     segment.pop("force_listen", None)
@@ -1544,9 +1540,9 @@ class DuplexSessionRunner:
                 session.release_input_bytes(-pending_delta)
             if pcm_reservation is not None:
                 pcm_reservation.commit()
-            # Fresh input for an ephemeral request is an explicit retry even
+            # Fresh input for a committed turn is an explicit retry even
             # when the buffer waits until commit to start the append.
-            if not session.capabilities.supports_core_resumable_request:
+            if session.capabilities.commits_turns:
                 self._reset_failed_append_tail()
             await self._maybe_commit_vad_turn(vad_result)
             return
@@ -1657,7 +1653,7 @@ class DuplexSessionRunner:
         if precreate_response and session.active_response_id is None:
             response_id = session.begin_response(turn_id=append_turn_id)
             self.emit(self.model.response_created_payload(response_id, epoch=append_epoch))
-        if final and not session.capabilities.supports_core_resumable_request:
+        if final and session.capabilities.commits_turns:
             logger.info(
                 "Duplex committed turn session=%s request=%s response=%s audio_bytes=%s",
                 session.session_id,

@@ -124,6 +124,41 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
 
 
+def test_turn_release_acknowledges_unlink_and_followup_cleanup_before_reuse(shm_sender):
+    adapter, connector = shm_sender
+    ext_id = f"turn_{uuid.uuid4().hex}"
+    key = f"{ext_id}_0_0"
+    assert connector.put("0", "1", key, "old turn")[0]
+    # The caller gets a pending future instead of waiting on the save thread.
+    released = adapter.release_shm_resources(ext_id, wait=True)
+    assert released is not None and not released.done()
+    # An in-flight aborted send may append this behind the release marker.
+    adapter._pending_save_reqs.append({"cleanup_shm": (f"{ext_id}_0", 1)})
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert connector.get("0", "1", key) is None
+    assert not released.done()
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    released.result(timeout=0)
+    assert connector.put("0", "1", key, "new turn")[0]
+    assert not adapter._pending_save_reqs
+    assert connector.get("0", "1", key)[0] == "new turn"
+
+
+def test_turn_release_reports_unlink_failure(shm_sender, monkeypatch):
+    adapter, connector = shm_sender
+
+    def fail(_prefix):
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(connector, "cleanup_prefix", fail)
+    released = adapter.release_shm_resources("resident", wait=True)
+    assert released is not None
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    with pytest.raises(OSError, match="unlink failed"):
+        released.result(timeout=0)
+
+
 @pytest.mark.parametrize("fail_terminal", [False, True])
 def test_shm_terminal_keeps_payload_only_after_success(shm_sender, monkeypatch, fail_terminal):
     adapter, connector = shm_sender
@@ -1373,6 +1408,24 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter, prompt_to
         ("old", prompt_token_ids, [7], prompt_token_ids + [7], True),
         ("next", prompt_token_ids + [3], [7, 8], prompt_token_ids + [7, 8], True),
     ]
+
+
+def test_resident_thinker_segment_terminates_downstream_without_finishing_thinker(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    request = Request(
+        request_id="resident-thinker",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = request.request_id
+    request.resume_from_full_prompt = True
+    adapter.save_async(request=request, is_segment_finished=True)
+    task = adapter._pending_save_reqs.popleft()
+    assert task["is_finished"] is True
+    assert task["request"].resumable is False
+    assert request.resumable is True
 
 
 def test_request_snapshot_preserves_embeddings_only_prompt():

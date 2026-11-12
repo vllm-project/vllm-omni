@@ -117,9 +117,9 @@ def test_invalid_fallback_option_fails_before_model_construction(mocker, value):
         _codec(mocker, torch.float32, device="cpu", connector={"extra": {"codec_cudnn_fp32_fallback": value}})
 
 
-@pytest.mark.parametrize("profile", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_mrv2.yaml"])
+@pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize("fallback", [False, True])
-def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, tmp_path, profile, fallback):
+def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, tmp_path, runner, fallback):
     from tests.helpers.stage_config import get_deploy_config_path
     from vllm_omni.config.stage_config import resolve_deploy_yaml
     from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
@@ -130,7 +130,7 @@ def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, 
     mocker.patch.dict("os.environ", {"VLLM_OMNI_TALKER_FIRST_AUDIO": "1"})
     overlay = tmp_path / "deploy.yaml"
     overlay.write_text(
-        f"base_config: {get_deploy_config_path(profile)}\n"
+        f"base_config: {get_deploy_config_path('qwen3_omni_moe.yaml')}\n"
         "connectors:\n  connector_of_shared_memory:\n    extra:\n"
         f"      codec_cudnn_fp32_fallback: {str(fallback).lower()}\n"
     )
@@ -156,7 +156,7 @@ def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, 
             ),
             stage_connector_spec=spec,
             async_chunk=True,
-            use_v2_model_runner=profile.endswith("mrv2.yaml"),
+            use_v2_model_runner=runner == "v2",
         ).create_model_config()
         vllm_config = VllmConfig(
             model_config=model_config,
@@ -170,7 +170,7 @@ def test_deploy_option_reaches_both_decoder_placements(mocker, blackwell_cudnn, 
                 first = Qwen3OmniMoeForConditionalGeneration._build_first_frame_decoder(
                     vllm_config, config.code2wav_config, ""
                 )
-                assert (first is not None) == profile.endswith("mrv2.yaml")
+                assert (first is not None) == (runner == "v2")
                 if first is not None:
                     decoders.append(first.code2wav)
             else:

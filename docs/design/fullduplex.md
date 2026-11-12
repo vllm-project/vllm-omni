@@ -789,6 +789,34 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
+Qwen3-Omni supports resident Thinker requests in its duplex profile on both
+V1 and CUDA MRv2, using the upstream resumable streaming-input
+request path. A continued request drains its previous turn's in-flight outputs
+before worker delivery state is reset; other sessions remain schedulable. The
+`supports_core_resumable_request` capability is resolved from engine settings;
+unsupported configurations log a reason and use per-turn requests with ordinary
+prefix caching where available. No separate deployment or session switch is
+required. Qwen also advertises `supports_turn_commit_only: true`, so only
+the entry request stays resident; commit, playback and VAD policy remain turn-based. A request-owned
+Qwen input ledger records accepted output tokens. A session-owned append cursor
+is invalidated by edits to previously submitted history. After checking the
+last heard reply against completed output, the normal path renders only new
+user messages and sends their processed tokens and media to
+EngineCore; resident feature data is reused there, never replayed from frontend
+cache handles. The engine validates the expected prefix length, a digest of
+its token content and the salt without comparing history hashes. APC and hidden-state prefix replay remain enabled.
+History edits, incompatible boundaries and nonempty `initial_user_text` use the
+full-snapshot fallback. When runnable waiting work makes no progress, the
+scheduler can reclaim a drained idle turn's KV while retaining its logical token
+history and media. A later continuation recovers through APC or recomputation;
+the session still owns its request slot.
+The ledger follows the request epoch, and cancellation joins input preparation
+before releasing the submission guard. `DuplexStagePort.finish_turn` releases only downstream turn
+state; its EngineCore acknowledgement completes from the save thread without
+blocking the engine loop, and a failed retirement closes the session. Cancel, close and expiry still clean up every owned stage, including the
+resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#resident-thinker-kv-continuation)
+for runner restrictions and fallback behavior.
+
 ## Model plugin
 
 `DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model

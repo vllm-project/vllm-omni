@@ -12,6 +12,8 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import time as _time
 from collections.abc import Coroutine
 from contextlib import nullcontext
@@ -36,7 +38,12 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
-from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
+    DuplexModelPlugin,
+    DuplexTurnContinuation,
+    validate_duplex_replica_policy,
+)
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -67,6 +74,12 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    turn_prompt_tokenizer: DuplexTurnContinuation | None = None
+    # Set only while a submission owns the stage's input-processing guard.
+    input_history_revision: int | None = None
+    turn_entry_finished: bool = False
+    turn_resources_released: bool = False
+    pending_turn_terminal: tuple[int, int, RequestOutput, StageRequestStats | None, float | None] | None = None
     # Session stats (RFC #8325): per stage, the chunks with spans since its last
     # session output, and the chunk of its latest producing step.
     pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
@@ -96,6 +109,41 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         super().__init__(*args, **kwargs)
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
+        capabilities = plugin.capabilities(max_sessions=duplex_session_config.max_sessions)
+        if capabilities.resident_turn_entry:
+            config = self.stage_pools[0].stage_vllm_config
+            unsupported = [
+                reason
+                for active, reason in (
+                    (not config.cache_config.enable_prefix_caching, "prefix caching disabled"),
+                    (not self.async_chunk, "async_chunk disabled"),
+                    (config.speculative_config is not None, "speculative decoding"),
+                )
+                if active
+            ]
+            if unsupported:
+                # Resolve the model's capability once for this deployment.
+                # Session admission and frontend discovery use the same value.
+                plugin.supports_core_resumable_request = False
+                logger.warning(
+                    "Thinker KV continuation unavailable (%s); using per-turn requests",
+                    ", ".join(unsupported),
+                )
+            else:
+                # Upstream counts WAITING_FOR_STREAMING_REQ against active
+                # slots even after a turn ends. Admission must not promise
+                # more resident sessions than one replica can keep alive.
+                scheduler = config.scheduler_config
+                capacity = scheduler.max_num_active_seqs or scheduler.max_num_seqs
+                sessions_per_replica = min(
+                    duplex_session_config.max_sessions, duplex_session_config.worker_max_sessions
+                )
+                if sessions_per_replica > capacity:
+                    raise ValueError(
+                        f"resident Thinker session limit ({sessions_per_replica} per replica) exceeds "
+                        f"stage-0 active-request capacity ({capacity}); lower duplex_session.max_sessions "
+                        "or max_sessions_per_replica, or increase stage-0 max_num_seqs/max_num_active_seqs"
+                    )
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
@@ -219,7 +267,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         stage_metrics: StageRequestStats | None,
         submit_ts: float | None,
     ) -> bool:
-        del replica_id, submit_ts
         if not isinstance(req_state, DuplexOrchestratorRequestState) or req_state.fence is None:
             return False
         request_id = output.request_id
@@ -227,12 +274,25 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if runner is None:
             # Session gone: nothing may forward or reach a client.
             return True
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
         segment = req_state.streaming.segment(stage_id)
         # A codec segment stop is not the utterance. Leave RequestOutput.finished
         # for the real stop (is_segment_finished is false on that poll).
         if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
             output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        if (
+            capabilities.resident_turn_entry
+            and stage_id > 0
+            and stage_id == req_state.final_stage_id
+            and finished
+            and not req_state.turn_entry_finished
+        ):
+            # A downstream token limit can end audio before Thinker stops.
+            # Keep the final packet until its last text has entered the session
+            # mailbox; otherwise response.done reopens a still-running ID.
+            req_state.pending_turn_terminal = (stage_id, replica_id, output, stage_metrics, submit_ts)
+            return True
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,
             output=output,
@@ -253,7 +313,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
         )
-        return runner.on_stage_output(
+        consumed = runner.on_stage_output(
             stage_id,
             output,
             stage_metrics,
@@ -262,6 +322,34 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
+        if capabilities.resident_turn_entry and stage_id == 0 and finished:
+            req_state.turn_entry_finished = True
+            pending = req_state.pending_turn_terminal
+            req_state.pending_turn_terminal = None
+            if pending is not None:
+                sid, replica, terminal, metrics, submitted = pending
+                await self._intercept_stage_output(sid, replica, terminal, req_state, metrics, submitted)
+        return consumed
+
+    async def can_append_turn(self, request_id: str, assistant_text: str) -> bool:
+        state = self.request_states.get(request_id)
+        if not isinstance(state, DuplexOrchestratorRequestState):
+            return False
+        continuation = state.turn_prompt_tokenizer
+        if continuation is None:
+            return False
+
+        def check() -> bool:
+            with self._prompt_processing_lock:
+                return continuation.can_append_turn(assistant_text)
+
+        return await asyncio.to_thread(check)
+
+    def _observe_stage_tokens(self, stage_id: int, eco: Any, req_state: OrchestratorRequestState) -> None:
+        if stage_id == 0 and isinstance(req_state, DuplexOrchestratorRequestState):
+            continuation = req_state.turn_prompt_tokenizer
+            if continuation is not None:
+                continuation.record_output(eco.new_token_ids, bool(eco.is_segment_finished))
 
     def _collect_duplex_stage_work(
         self,
@@ -318,6 +406,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
     ) -> bool:
+        """Report a terminal session error and tell the base loop it was consumed."""
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
             return False
         # Segment boundaries do not terminate a resumable request. Context
@@ -340,7 +429,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> bool:
         if not req_state.session_owned:
             return False
-        # Resumable resident Stage0: stage failure closes the session.
+        # Resumable resident Stage0: stage failure closes the session. A resident
+        # Qwen Thinker shares its ID with every downstream stage of the turn, so
+        # even a Talker/Code2Wav failure aborts its KV and closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
         close_session = (
             not duplex_is_auxiliary_request(req_id)
@@ -543,10 +634,88 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
     def _upgrade_processed_stage_request(self, request, raw_prompt):
         request = super()._upgrade_processed_stage_request(request, raw_prompt)
-        if not self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request and not isinstance(request, OmniEngineCoreRequest):
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
+        if capabilities.commits_turns and not isinstance(request, OmniEngineCoreRequest):
             request = OmniEngineCoreRequest.from_request(request)
+        return request
+
+    def _validate_turn_history(self, state: DuplexOrchestratorRequestState, revision: int | None) -> None:
+        """Reject a stale delta before committing its ledger or sending input."""
+        if revision is None:
+            return
+        session = self.session_manager.get(state.session_id) if state.session_id is not None else None
+        if session is None or session.history_revision != revision:
+            raise DuplexInputCapacityError("Conversation changed during turn preparation; retry the response")
+
+    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+        request_id = kwargs.get("request_id")
+        state = self.request_states.get(request_id) if isinstance(request_id, str) else None
+        prompt = kwargs.get("prompt")
+        complete_turn = None
+        prefix = None
+        capabilities = self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
+        if (
+            stage_id == 0
+            and capabilities.resident_turn_entry
+            and isinstance(state, DuplexOrchestratorRequestState)
+            and isinstance(prompt, dict)
+            and isinstance(prompt.get("prompt"), str)
+            and "prompt_token_ids" not in prompt
+            and not kwargs.get("tokenization_kwargs")
+        ):
+            processor = self._get_stage_input_processor(stage_id)
+            tokenizer = getattr(processor, "tokenizer", None)
+            renderer = getattr(processor, "renderer", None)
+            defaults = getattr(renderer, "default_cmpl_tok_params", None)
+            if state.turn_prompt_tokenizer is None:
+                if (
+                    tokenizer is not None
+                    and not getattr(defaults, "do_lower_case", False)
+                    and getattr(defaults, "add_special_tokens", True)
+                ):
+                    state.turn_prompt_tokenizer = self.plugin.create_turn_prompt_tokenizer(tokenizer)
+            if state.turn_prompt_tokenizer is not None:
+                prompt_tokenizer = state.turn_prompt_tokenizer
+                complete_turn = prompt_tokenizer.complete_turn
+
+                def tokenize() -> tuple[dict, list[int] | None]:
+                    # Tokenizer instances can be shared by stage processors.
+                    # Use the same worker-thread lock as upstream preprocessing.
+                    with self._prompt_processing_lock:
+                        prepared, prefix = prompt_tokenizer.prepare_turn(prompt)
+                        prepared = dict(prepared)
+                        text = prepared.pop("prompt")
+                        if defaults is not None:
+                            # Preserve upstream's character-length validation
+                            # and pre-truncation before replacing text with IDs.
+                            text = defaults.apply_pre_tokenization(tokenizer, {"prompt": text})["prompt"]
+                        prepared["prompt_token_ids"] = prompt_tokenizer.tokenize(text)
+                        return prepared, prefix
+
+                task = asyncio.create_task(asyncio.to_thread(tokenize))
+                try:
+                    prepared, prefix = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Finish updating this request-owned cache before another
+                    # append can acquire the stage's input submission guard.
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not task.cancelled():
+                        task.exception()
+                    raise
+                kwargs["prompt"] = prepared
+        request = await super()._process_stage_inputs(stage_id, **kwargs)
+        if stage_id == 0 and isinstance(state, DuplexOrchestratorRequestState):
+            self._validate_turn_history(state, state.input_history_revision)
+        if complete_turn is not None:
+            assert isinstance(prompt, dict)
+            request = OmniEngineCoreRequest.from_request(request)
+            complete_turn(prompt, request, prefix)
         return request
 
     async def _build_next_stage_request(self, req_id, next_stage_id, next_input, params, **kwargs):
@@ -568,17 +737,27 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
-        input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
+        input_guard = (
+            nullcontext()
+            if submission.resumable and not submission.resume_from_full_prompt
+            else self._stage_input_submission(context.stage_id)
+        )
         async with input_guard as mark_submitting:
             request_state = self.request_states.get(context.request_id)
             if not isinstance(request_state, DuplexOrchestratorRequestState):
                 raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+            if submission.resume_from_full_prompt:
+                if submission.already_submitted and not request_state.turn_resources_released:
+                    raise DuplexInputCapacityError("Previous Thinker turn has not finished retiring its transport")
+            self._validate_turn_history(request_state, submission.history_revision)
             pinned_replica_id = self._session_route(context.stage_id, request_state)
             if pinned_replica_id is not None:
                 self.stage_pools[context.stage_id].bind_request_to_replica(context.request_id, pinned_replica_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
+            # Record core segment boundaries even when downstream stages use
+            # fresh, non-resumable requests for each committed turn.
             request_state.streaming.enabled = submission.resumable
-            if submission.resumable:
+            if submission.resumable and not submission.resume_from_full_prompt:
                 request = build_engine_core_request_from_tokens(
                     request_id=context.request_id,
                     prompt=dict(submission.prompt),
@@ -594,16 +773,25 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 request_state.prompt = dict(submission.prompt)
                 # Use the ordinary multimodal input processor for turn-model plugins.
                 # Its CPU preprocessing runs off the session/orchestrator event loop.
-                request = await self._build_next_stage_request(
-                    context.request_id,
-                    context.stage_id,
-                    dict(submission.prompt),
-                    context.stage_sampling_params,
-                    resumable=False,
-                )
+                request_state.input_history_revision = submission.history_revision
+                try:
+                    request = await self._build_next_stage_request(
+                        context.request_id,
+                        context.stage_id,
+                        dict(submission.prompt),
+                        context.stage_sampling_params,
+                        resumable=submission.resumable,
+                    )
+                finally:
+                    request_state.input_history_revision = None
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
+            if submission.resume_from_full_prompt:
+                # A rejected delta leaves the completed turn retryable.
+                request_state.turn_entry_finished = False
+                request_state.turn_resources_released = False
             request.external_req_id = request.request_id
+            request.resume_from_full_prompt = submission.resume_from_full_prompt
             mm_features = getattr(request, "mm_features", None)
             if mm_features is not None:
                 request_state.mm_features = mm_features
@@ -614,6 +802,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if submission.already_submitted:
                     if not submission.resumable:
                         raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
+                    if submission.resume_from_full_prompt:
+                        # A complete prompt snapshot starts a fresh detokenizer
+                        # turn while the EngineCore request and its KV stay live.
+                        pool.output_processor.remove_request(context.request_id)
                     replica_id = await pool.submit_update(context.request_id, request_state, request, **route_kwargs)
                 else:
                     replica_id = await pool.submit_initial(
@@ -630,8 +822,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
-        if not submission.already_submitted and self.async_chunk and context.stage_id == 0:
-            prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)
+        if (
+            (not submission.already_submitted or submission.resume_from_full_prompt)
+            and self.async_chunk
+            and context.stage_id == 0
+        ):
+            downstream_entry = request
+            if submission.resume_from_full_prompt:
+                downstream_entry = copy.copy(request)
+                downstream_entry.resumable = False
+            prewarmed = await self._prewarm_async_chunk_stages(context.request_id, downstream_entry, request_state)
             if not prewarmed:
                 # The prewarm already failed the request, aborted it and
                 # popped its state; the runner turns this into an append
@@ -691,6 +891,43 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
         finally:
             req_state.skip_legacy_stage_forward = False
+
+    async def finish_turn(self, request_id: str) -> None:
+        """Retire this turn's transport before allowing the resident ID to reopen."""
+        state = self.request_states.get(request_id)
+        if not isinstance(state, DuplexOrchestratorRequestState):
+            return
+        state.turn_resources_released = False
+        try:
+            for stage_id, pool in enumerate(self.stage_pools[1:], 1):
+                await pool.abort_requests([request_id])
+                pool.output_processor.remove_request(request_id)
+            # Unlike final request cleanup, this must be acknowledged: a delayed
+            # best-effort prefix release could unlink the next turn's same-ID chunks.
+            for pool in self.stage_pools:
+                await pool.finish_turn(request_id)
+        except Exception as exc:
+            # The resident ID can never be reused safely after an unacknowledged
+            # retirement. Fail closed through the resident-stage failure path.
+            logger.warning("Resident turn retirement failed for %s: %s", request_id, exc)
+            if self.request_states.get(request_id) is state:
+                await self._handle_forward_failure(request_id, 0, state, exc)
+            return
+        if self.request_states.get(request_id) is not state:
+            return
+        for stage_id, pool in enumerate(self.stage_pools[1:], 1):
+            pool.release_binding(request_id)
+            state.stage_submit_ts.pop(stage_id, None)
+        state.finished_stage_ids.clear()
+        state.finished_final_output_stage_ids.clear()
+        state.pending_final_output = None
+        state.upstream_first_audio = False
+        state.pending_upstream_first_audio = None
+        state.pending_first_audio_outputs.clear()
+        state.streaming.segments.clear()
+        state.streaming.bridge_states.clear()
+        state.yield_stage_output = None
+        state.turn_resources_released = True
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

@@ -85,7 +85,10 @@ class DuplexCapabilities:
     model-owned decoder/TTS state must use ``supports_model_internal_state``.
     ``supports_core_resumable_request`` means the scheduler can resume the
     same request id across streaming updates, but it is not a KV lease by
-    itself. Realtime support means this endpoint can speak the native Realtime
+    itself. With ``supports_turn_commit_only``, only the entry request stays
+    resident across commits; downstream stages and response settlement remain
+    turn-based. Resumability alone does not select native streaming turn policy.
+    Realtime support means this endpoint can speak the native Realtime
     event schema for the supported audio duplex paths while keeping model- or
     scheduler-specific limits explicit in the capability payload.
     """
@@ -146,6 +149,16 @@ class DuplexCapabilities:
     #: (RFC #8325). Set by the engine from ``duplex_session.collect_stats``, never by
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
+
+    @property
+    def resident_turn_entry(self) -> bool:
+        """The entry-stage request and its KV stay resident across committed turns."""
+        return self.supports_core_resumable_request and self.supports_turn_commit_only
+
+    @property
+    def commits_turns(self) -> bool:
+        """Responses, downstream stages and history settle once per committed turn."""
+        return not self.supports_core_resumable_request or self.supports_turn_commit_only
 
     def as_dict(self) -> dict[str, object]:
         return {

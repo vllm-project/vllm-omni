@@ -37,6 +37,25 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_turn_history_cursor_uses_only_tail_and_invalidates_old_edits():
+    session = _session()
+    old = {"role": "user", "content": "old"}
+    session.append_history_message(old)
+    session.reserve_history_item("reply")
+    session.checkpoint_append_history(session.history_storage_length)
+    session._store_history_item_message("reply", {"role": "assistant", "content": "answer"})
+    session.append_history_message({"role": "user", "content": "new"})
+    session.reserve_history_item("next-reply")
+    assert session.append_history_tail() == ("answer", ({"role": "user", "content": "new"},))
+    # Calibration of the newest reply is checked against generated tokens by
+    # the stage port; mutation of already submitted context invalidates KV.
+    session._store_history_item_message("reply", {"role": "assistant", "content": "heard"})
+    assert session.append_history_tail()[0] == "heard"
+    session.checkpoint_append_history(session.history_storage_length)
+    session._store_history_item_message("reply", {"role": "assistant", "content": "edited"})
+    assert session.append_history_tail() is None
+
+
 def _session(
     session_id: str = "duplex-test",
     config: DuplexSessionConfig | None = None,
@@ -474,9 +493,11 @@ def test_truncate_history_item_uses_response_alignment_marks():
     item_id = f"item_{response_id}"
     session.register_history_item(item_id, committed)
 
+    session.checkpoint_append_history(session.history_storage_length)
     revision = session.history_revision
     assert session.truncate_history_item(item_id, audio_end_ms=1_000) is True
     assert session.history_revision > revision
+    assert session._conversation.append_cursor is None
 
     assert session.history[-1] == {"role": "assistant", "content": "hello"}
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}

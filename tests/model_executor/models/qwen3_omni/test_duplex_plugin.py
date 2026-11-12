@@ -91,6 +91,8 @@ def test_capabilities_advertise_image_items_not_append_frames():
     """Clients choose how to send frames from these fields; they must match the buffer's refusal."""
     caps = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA").capabilities(max_sessions=1)
     assert caps.supports_image_input
+    assert caps.supports_core_resumable_request
+    assert caps.supports_turn_commit_only
     assert not caps.accepts_input_modality("video")
     assert caps.validate_append_modalities(has_audio=True, has_video=True) == (
         "This duplex model does not accept video_frames"
@@ -105,14 +107,23 @@ async def open_qwen(
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
     requires_audio=True,
+    resumable=True,
     **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
+    # Exercise both the supported deployment and the per-turn fallback.
+    plugin.supports_core_resumable_request = resumable
     if calibrate is not None:
         plugin.history_calibrator = lambda config: HistoryCalibrationPolicy(calibrate, requires_audio=requires_audio)
         plugin.data_plane.retain_history_audio = requires_audio
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
+    if resumable:
+
+        async def finish_turn(request_id):
+            port.cleanups.append(([request_id], False))
+
+        port.finish_turn = finish_turn
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
     output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
@@ -570,35 +581,20 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
 
 
 @pytest.mark.asyncio
-async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
+async def test_default_continuation_releases_idle_thinker_on_close():
     h = await open_qwen()
     try:
-        ids = []
-        for i in range(2):
-            await h.run(append_audio())
-            assert len(h.port.submissions) == i
-            await h.run(Commit(final=True, create_response=True))
-            assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
-            request_id = h.port.submissions[-1].context.request_id
-            ids.append(request_id)
-            assert h.session.active_request_id == request_id
-            assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == i + 1
-            text = OmniRequestOutput.from_stage_output(
-                tts_output(request_id, samples=0, text="hello", finished=True),
-                request_id=request_id,
-                stage_id=None,
-            )
-            assert not h.deliver(text, stage_id=0), "Thinker output must still forward to Talker"
-            await h.settle()
-            assert text.finished, "projection must not mutate the output forwarded to Talker"
-            assert h.session.active_response_id is not None, "Thinker finished must not end the response"
-            response_id = h.session.active_response_id
-            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
-            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
-            assert h.session.active_response_id is None
-            assert h.port.cleanups[-1][0] == [request_id]
-        assert len(set(ids)) == 2
-        assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
+        assert h.session.capabilities.supports_core_resumable_request
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        assert h.port.submissions[-1].resumable
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        assert (0, request_id) in h.session.request_resources
+        await h.run(CloseSession())
+        assert any(request_id in ids and abort for ids, abort in h.port.cleanups)
+        assert not h.session.request_resources
     finally:
         await h.manager.shutdown()
 
@@ -638,7 +634,9 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
         await h.run(CreateResponse())
         assert len(h.port.submissions) == 2, [event.to_realtime() for event in h.events]
         latest = h.port.submissions[-1]
-        assert latest.context.request_id != old.request_id
+        # Fully played output preserves the resident request; truncating
+        # unplayed output invalidates its history and starts a new epoch.
+        assert (latest.context.request_id == old.request_id) is (played_ms == 1000)
         assert latest.prompt["prompt"] == repr(
             [
                 {"role": "user", "content": [{"type": "audio"}]},
@@ -718,8 +716,9 @@ async def test_audio_without_transcript_accepts_playback_ack(cancel_command, nex
 
 
 @pytest.mark.asyncio
-async def test_cancel_drops_old_output_and_accepts_next_turn():
-    h = await open_qwen()
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_cancel_drops_old_output_and_accepts_next_turn(resumable):
+    h = await open_qwen(resumable=resumable)
     try:
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
@@ -736,8 +735,9 @@ async def test_cancel_drops_old_output_and_accepts_next_turn():
 
 
 @pytest.mark.asyncio
-async def test_vad_commits_and_speech_interrupts_active_qwen_response():
-    h = await open_qwen()
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_vad_commits_and_speech_interrupts_active_qwen_response(resumable):
+    h = await open_qwen(resumable=resumable)
     try:
         h.runner.control._detector = _speech_then_stop()
         await h.run(append_audio())
@@ -1623,6 +1623,61 @@ async def test_image_limit_rejects_atomically_and_delete_reclaims_capacity():
         await h.manager.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_resident_image_replacement_rebuilds_after_admission_limit(mocker):
+    """A full image context cannot grow via deltas; deletion invalidates it."""
+    from vllm_omni.engine.duplex.commands import DeleteItem
+
+    h = await open_qwen()
+    can_append = mocker.AsyncMock(return_value=True)
+    h.port.can_append_turn = can_append
+    snapshot = mocker.spy(h.session, "history_for_prompt")
+    try:
+        for i in range(MAX_PROMPT_IMAGES):
+            await h.run(CreateItem(item=image_item(f"camera_{i}")))
+        await h.run(CreateResponse())
+        first = h.port.submissions[-1]
+        request_id = first.context.request_id
+        assert len(first.prompt["multi_modal_data"]["image"]) == MAX_PROMPT_IMAGES
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.active_response_id is None
+
+        events = await h.run(CreateItem(item=image_item("overflow")))
+        assert any(getattr(event, "code", None) == "input_backpressure" for event in events)
+        assert len(h.port.submissions) == 1
+
+        await h.run(DeleteItem(item_id="camera_0"))
+        replacement = image_item("replacement")
+        # Distinguish the replacement media from all retained red images.
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), "blue").save(buf, format="PNG")
+        replacement["content"][0]["image_url"] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        await h.run(CreateItem(item=replacement))
+        snapshot.reset_mock()
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[-1]
+        assert second.context.request_id == request_id
+        assert second.already_submitted and second.resume_from_full_prompt
+        assert "_duplex_turn_delta" not in second.prompt
+        assert snapshot.call_count == 1
+        can_append.assert_not_awaited()
+        images = second.prompt["multi_modal_data"]["image"]
+        assert len(images) == MAX_PROMPT_IMAGES
+        assert images[-1].getpixel((0, 0)) == (0, 0, 255)
+        assert all(image.getpixel((0, 0))[0] > 250 for image in images[:-1])
+        assert second.prompt["prompt"].count("{'type': 'image'}") == MAX_PROMPT_IMAGES
+    finally:
+        await h.manager.shutdown()
+
+
 def test_prompt_holds_stored_images_to_the_stage_limit():
     """The prompt is the last guard before ``limit_mm_per_prompt``.
 
@@ -1708,10 +1763,9 @@ async def test_the_bound_request_id_is_the_one_the_stage_received():
         await h.run(append_audio())
         await h.run(Commit(final=True, create_response=True))
         submitted = h.port.submissions[-1].context.request_id
-        # Qwen has no resumable core request, so every turn gets its own stage
-        # id. The runner names that id before the append runs and the model
-        # channel names it again when it submits; they have to agree.
-        assert submitted.endswith(".r.stage0-turn0"), submitted
+        # The runner prebinds the resident Thinker ID before append; the
+        # model channel must submit with the same ID.
+        assert submitted.endswith(".r.stage0"), submitted
         assert h.session.active_request_id == submitted
     finally:
         await h.manager.shutdown()
@@ -2425,5 +2479,77 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert "18C" in prompt
         assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view", "initial_text"])
+async def test_committed_turns_preserve_lifecycle_and_process_only_required_history(mocker, mode):
+    resumable = mode != "ephemeral"
+    initial_text = "Read this once" if mode == "initial_text" else None
+    h = await open_qwen(resumable=resumable, initial_user_text=initial_text)
+    if mode == "context_view":
+        h.manager.runtime_config = replace(h.manager.runtime_config, context_keep_media_turns=10)
+
+    async def can_append(request_id, text):
+        return mode in {"delta", "context_view", "initial_text"} and text == "hello"
+
+    h.port.can_append_turn = can_append
+    h.manager.plugin.processor.apply_chat_template = (
+        lambda messages, **kw: "".join(
+            "<|im_start|>" + m["role"] + "\n" + str(m.get("content", "")) + "<|im_end|>\n" for m in messages
+        )
+        + "<|im_start|>assistant\n"
+    )
+    snapshot = mocker.spy(h.session, "history_snapshot" if mode == "context_view" else "history_for_prompt")
+    decode = mocker.spy(h.manager.plugin, "_audio_content")
+    bind_request = mocker.spy(h.session, "bind_request")
+    try:
+        ids = []
+        for i in range(5 if mode == "delta" else 2):
+            bind_request.reset_mock()
+            snapshot.reset_mock()
+            decode.reset_mock()
+            await h.run(append_audio())
+            assert len(h.port.submissions) == i
+            await h.run(Commit(final=True, create_response=True))
+            assert len(h.port.submissions) == i + 1, [e.to_realtime() for e in h.events]
+            request_id = h.port.submissions[-1].context.request_id
+            assert bind_request.call_args_list[0].args == (request_id,)
+            ids.append(request_id)
+            assert h.port.submissions[-1].resume_from_full_prompt is resumable
+            assert h.port.submissions[-1].already_submitted is (resumable and i > 0)
+            assert h.session.active_request_id == request_id
+            if initial_text:
+                assert h.port.submissions[-1].prompt["prompt"].count(initial_text) == 1
+            use_delta = mode == "delta" and 0 < i < 4
+            expected_audio = 1 if use_delta else min(i + 1, 4)
+            assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio
+            assert decode.call_count == expected_audio
+            if use_delta:
+                assert snapshot.call_count == 0
+                assert h.port.submissions[-1].prompt["_duplex_turn_delta"] is True
+                assert h.port.submissions[-1].history_revision == h.session.history_revision
+            else:
+                assert snapshot.call_count == 1
+                assert "_duplex_turn_delta" not in h.port.submissions[-1].prompt
+                assert h.port.submissions[-1].history_revision is None
+            text = OmniRequestOutput.from_stage_output(
+                tts_output(request_id, samples=0, text="hello", finished=True),
+                request_id=request_id,
+                stage_id=None,
+            )
+            assert not h.deliver(text, stage_id=0), "Thinker output must still forward to Talker"
+            await h.settle()
+            assert text.finished, "projection must not mutate the output forwarded to Talker"
+            assert h.session.active_response_id is not None, "Thinker finished must not end the response"
+            response_id = h.session.active_response_id
+            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert h.session.active_response_id is None
+            assert h.port.cleanups[-1][0] == [request_id]
+        assert len(set(ids)) == (1 if resumable else 2)
+        assert h.session.capabilities.as_dict()["implementation_level"] == "turn_based_duplex"
     finally:
         await h.manager.shutdown()

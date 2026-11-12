@@ -24,6 +24,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.qwen3_omni.codec_config import qwen3_omni_codec_extra
 from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_hidden_state_rows
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
@@ -906,7 +907,7 @@ def talker2code2wav_async_chunk(
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
-    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    cfg = qwen3_omni_codec_extra(raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {})
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)

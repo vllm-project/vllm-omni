@@ -5,6 +5,9 @@
 Engine components for vLLM-Omni.
 """
 
+import hashlib
+from array import array
+from collections.abc import Sequence
 from typing import Any, TypeAlias
 
 import msgspec
@@ -18,6 +21,11 @@ from vllm.v1.engine import (
 # Where a receiver gets a request's stage payload: the sender's connector address, or the
 # serialized payload itself for a run request.
 PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
+
+
+def token_prefix_digest(token_ids: Sequence[int]) -> bytes:
+    """Content digest that lets EngineCore verify a resident prefix it is not sent."""
+    return hashlib.blake2b(array("q", token_ids).tobytes(), digest_size=16).digest()
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -87,6 +95,22 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: PayloadSenderInfo | None = None
+    resume_from_full_prompt: bool = False
+    # For turn deltas, frontend token IDs include the resident prefix for
+    # output processing/prewarm; transport sends only the suffix below.
+    # mm_features describe only that suffix and keep suffix-relative offsets.
+    append_prefix_length: int | None = None
+    append_prefix_digest: bytes | None = None
+
+    def for_engine_submission(self) -> "OmniEngineCoreRequest":
+        if self.append_prefix_length is None:
+            return self
+        if self.prompt_token_ids is None or not 0 <= self.append_prefix_length < len(self.prompt_token_ids):
+            raise ValueError("Turn append requires a valid resident prefix and non-empty token suffix")
+        request = self.from_request(self)
+        request.prompt_token_ids = self.prompt_token_ids[self.append_prefix_length :]
+        request.append_prefix_digest = token_prefix_digest(self.prompt_token_ids[: self.append_prefix_length])
+        return request
 
     @classmethod
     def from_request(
@@ -126,6 +150,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             priority=request.priority,
             trace_headers=request.trace_headers,
             resumable=request.resumable,
+            resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
+            append_prefix_length=getattr(request, "append_prefix_length", None),
+            append_prefix_digest=getattr(request, "append_prefix_digest", None),
             external_req_id=request.external_req_id,
             session_id=request.session_id,
             kv_hints=request.kv_hints,

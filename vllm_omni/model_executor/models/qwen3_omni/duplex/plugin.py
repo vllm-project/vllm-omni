@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-owned VAD/commit turns with concurrent input and interruptible output.
 
-Qwen3-Omni is a turn model: this plugin does not advertise native streaming KV
-or model-driven turn decisions. Each committed utterance is a fresh request.
+Qwen3-Omni is a turn model: it does not advertise model-driven turn decisions.
+Supported deployments retain Thinker requests across committed utterances.
 """
 
 from __future__ import annotations
@@ -23,10 +23,16 @@ import pybase64 as base64
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
+from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.contracts import (
+    DUPLEX_TURN_DELTA_KEY,
+    DuplexAppendPlan,
+    duplex_resource_request_belongs_to_session,
+)
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -47,9 +53,11 @@ logger = init_logger(__name__)
 #: the engine and this one in the deploy config; the prompt is the only place
 #: that can keep them from drifting apart into a rejected submission.
 MAX_PROMPT_IMAGES = 8
-# Same window ``prepare_prompt_config`` keeps. Anchors older than this cannot
-# still point at a message the next prompt will retain.
-_TOOL_ANCHOR_WINDOW = 16
+#: ``prepare_prompt_config``'s history window. Turn deltas and tool anchors
+#: are valid only while the next full prompt would retain the same context.
+_HISTORY_MESSAGE_WINDOW = 16
+_MAX_PROMPT_AUDIOS = 4
+_MAX_PROMPT_AUDIO_BYTES = 8 * 1024 * 1024
 
 
 def _anchored_history_len(
@@ -75,7 +83,7 @@ def _anchored_history_len(
 
 def _split_call_anchors(anchors: Mapping[str, object], *, history_len: int) -> tuple[dict[str, int], list[str]]:
     """Keep anchors inside the prompt window. The rest were published and expired."""
-    floor = history_len - _TOOL_ANCHOR_WINDOW
+    floor = history_len - _HISTORY_MESSAGE_WINDOW
     kept: dict[str, int] = {}
     expired: list[str] = []
     for key, value in anchors.items():
@@ -339,6 +347,7 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
+    supports_core_resumable_request = True
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
@@ -393,7 +402,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             supports_replace_latest_chunk=False,
             supports_reencode_context=True,
             supports_turn_commit_only=True,
-            supports_core_resumable_request=False,
+            supports_core_resumable_request=self.supports_core_resumable_request,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
             supports_multi_session=max_sessions > 1,
@@ -416,6 +425,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def create_session_state(self):
         return QwenDuplexSessionState()
+
+    def create_turn_prompt_tokenizer(self, tokenizer: TokenizerLike) -> QwenIncrementalPrompt:
+        return QwenIncrementalPrompt(tokenizer)
 
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):
@@ -877,6 +889,32 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 params[0].max_tokens = runtime_config["max_tokens"]
         return params
 
+    def can_prepare_turn_delta(
+        self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
+    ) -> bool:
+        # This text is injected only into the current audio turn, not stored in
+        # conversation history. A snapshot removes the previous injection;
+        # appending would retain it and add another copy on every turn.
+        if runtime_config.get("initial_user_text"):
+            return False
+        if any(
+            runtime_config.get(key) != previous_runtime_config.get(key) for key in ("instructions", "initial_user_text")
+        ):
+            return False
+        # Window eviction changes resident context and still requires a snapshot.
+        if any(runtime_config.get(key) for key in ("qwen_tools", "qwen_tool_turns", "qwen_tool_turns_inflight")):
+            return False
+        if extra_body.get("realtime_tools"):
+            return False
+        return history_length <= _HISTORY_MESSAGE_WINDOW and (
+            not payload.get("audio")
+            or (
+                len(state.audio_history) < _MAX_PROMPT_AUDIOS
+                and sum(len(value.get("audio", "")) for _, value in state.audio_history) + len(payload.get("audio", ""))
+                <= _MAX_PROMPT_AUDIO_BYTES
+            )
+        )
+
     def prepare_prompt_config(self, config, *, state, payload):
         history = config.get("conversation", [])
         # Formatting may read the L1 view; audio binding stays on ``history``.
@@ -936,9 +974,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             state.audio_history.append((tuple(current_contents), payload))
         # Reserve one of the four audio slots for the actual submitted input,
         # including when deferred input has no trailing user history entry.
-        history_limit = 4 if current_is_in_history or not has_audio else 3
+        history_limit = _MAX_PROMPT_AUDIOS if current_is_in_history or not has_audio else _MAX_PROMPT_AUDIOS - 1
         retained = state.audio_history[-history_limit:]
-        while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > 8 * 1024 * 1024:
+        while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > _MAX_PROMPT_AUDIO_BYTES:
             retained.pop(0)
         state.audio_history = retained
         # Match the official demo's unit of history: consecutive user items
@@ -955,7 +993,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
-            if index + len(turn) <= len(history) - 16:
+            if index + len(turn) <= len(history) - _HISTORY_MESSAGE_WINDOW:
                 continue
             if turn[0].get("role") == "assistant":
                 continue
@@ -1149,7 +1187,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if not has_audio and payload.get("type") != "conversation":
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
         messages = []
-        if runtime_config.get("instructions"):
+        is_delta = bool(session_config.get(DUPLEX_TURN_DELTA_KEY))
+        if runtime_config.get("instructions") and not is_delta:
             messages.append({"role": "system", "content": runtime_config["instructions"]})
         history = session_config.get("qwen_messages")
         if history is None and has_audio:
@@ -1207,6 +1246,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if tools:
             template_kwargs["tools"] = tools
         prompt = self.processor.apply_chat_template(messages, **template_kwargs)
+        if is_delta:
+            # Render only the new user unit; the resident already owns the
+            # system prompt and previous assistant tokens.
+            user_start = prompt.index("<|im_start|>user\n")
+            prompt = "<|im_end|>\n" + prompt[user_start:]
         mm = {"audio": audios} if audios else {}
         if images:
             mm["image"] = images
@@ -1222,7 +1266,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         debug_dir = os.environ.get("VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR")
         if debug_dir:
             try:
-                target = Path(debug_dir) / hashlib.sha256(request_id.encode()).hexdigest()[:24]
+                target = Path(debug_dir) / hashlib.sha256(f"{request_id}:{seq}".encode()).hexdigest()[:24]
                 target.mkdir(parents=True, exist_ok=True)
                 filenames = []
                 for index, image in enumerate(images):
@@ -1241,6 +1285,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             except (OSError, ValueError):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
         prompt_payload: dict[str, object] = {"prompt": prompt, "multi_modal_data": mm}
+        if is_delta:
+            prompt_payload[DUPLEX_TURN_DELTA_KEY] = True
         if remaining_tool_turns is not None:
             # Private write-back for the session after a successful submit.
             prompt_payload["_qwen_tool_turns_remaining"] = remaining_tool_turns

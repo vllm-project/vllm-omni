@@ -151,6 +151,7 @@ class HistorySource:
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     revision: int = 0
+    append_cursor: int | None = None
     next_source_id: int = 0
     # Keys are identities of live message dictionaries, never public item IDs.
     # Every non-placeholder insertion must call _track_history_message;
@@ -516,6 +517,39 @@ class DuplexEngineSession:
     def history_revision(self) -> int:
         return self._conversation.revision
 
+    def checkpoint_append_history(self, cursor: int) -> None:
+        self._conversation.append_cursor = cursor
+
+    @property
+    def history_storage_length(self) -> int:
+        # response.created may already have reserved the reply's empty slot.
+        # It belongs to the output of this append, not to its submitted prefix.
+        messages = self._conversation.messages
+        end = len(messages)
+        while end and not messages[end - 1]:
+            end -= 1
+        return end
+
+    def append_history_tail(self) -> tuple[str, tuple[dict[str, object], ...]] | None:
+        """Return only the completed reply and new user items after the checkpoint."""
+        history = self._conversation
+        if not history.append_cursor:
+            return None
+        tail = [item for item in history.messages[history.append_cursor :] if item]
+        if len(tail) < 2 or tail[0].get("role") != "assistant":
+            return None
+        text = tail[0].get("content")
+        if not isinstance(text, str) or any(item.get("role") != "user" for item in tail[1:]):
+            return None
+        return text, tuple(dict(item) for item in tail[1:])
+
+    def _invalidate_appended_history(self, message: dict[str, object]) -> None:
+        history = self._conversation
+        if history.append_cursor is not None and any(
+            item is message for item in history.messages[: history.append_cursor]
+        ):
+            history.append_cursor = None
+
     def history_snapshot(self) -> DuplexHistorySnapshot:
         """Capture content and identities together, without yielding ownership."""
         messages = self._visible_history_messages()
@@ -572,6 +606,7 @@ class DuplexEngineSession:
         self._conversation.revision += 1
 
     def _forget_history_message(self, message: dict[str, object]) -> None:
+        self._conversation.append_cursor = None
         if id(message) in self._conversation.sources:
             self._history_source(message)
             del self._conversation.sources[id(message)]
@@ -669,6 +704,7 @@ class DuplexEngineSession:
         """Materialize or update a response item without changing its order."""
         existing = self._conversation.item_ids.get(item_id)
         if existing is not None:
+            self._invalidate_appended_history(existing)
             changed = existing != message
             if existing is not message:
                 existing.clear()
@@ -678,6 +714,7 @@ class DuplexEngineSession:
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is not None:
+            self._invalidate_appended_history(placeholder)
             for index, candidate in enumerate(self._conversation.messages):
                 if candidate is placeholder:
                     self._conversation.messages[index] = message
@@ -694,6 +731,7 @@ class DuplexEngineSession:
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
         if placeholder is None:
             return False
+        self._invalidate_appended_history(placeholder)
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not placeholder
         ]
@@ -988,6 +1026,7 @@ class DuplexEngineSession:
         if "transcript" in message or "transcript" in audio_part:
             return False
         audio_part["transcript"] = transcript
+        self._invalidate_appended_history(message)
         message["transcript"] = transcript
         self._track_history_message(message, changed=True)
         return True
@@ -1764,6 +1803,7 @@ class DuplexEngineSession:
                 self.release_response_playback(response_id)
         if message is None:
             return pending is not None or removed_placeholder or audio_only
+        self._conversation.append_cursor = None
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message
@@ -1890,6 +1930,8 @@ class DuplexEngineSession:
             marks=self._conversation.item_audio_text_marks.get(item_id, []),
             playback=playback,
         )
+        if changed:
+            self._invalidate_appended_history(stored_message)
         # Explicit truncation clears content, not the turn. The command also
         # sends a playback ACK, which must still find this item even at zero.
         if changed and self._message_text_len(message) <= 0 and not hard:

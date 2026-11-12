@@ -43,6 +43,64 @@ With this in mind, consider the set of blocks in a 2D layout, where the row repr
 
 Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
+### Qwen3-Omni duplex reuse
+
+The existing CUDA `qwen3_omni_duplex.yaml` profile defaults to a resident
+resumable Thinker request across committed turns. No extra deployment file or
+session switch is required. The capability is resolved from existing engine
+options: V1 or CUDA MRv2, prefix caching, async-chunk transport and
+no speculative decoding. Other combinations log the unsupported condition and
+use fresh per-turn requests. APC can still reuse
+matching prefixes in that path. Non-CUDA profile overrides disable caching.
+Talker and Code2Wav remain per-turn, with caching disabled.
+
+The normal resident path appends new tokens and media to the actual generated
+sequence. A session cursor selects only new user messages; edits to submitted
+history invalidate it. The token ledger checks the latest heard reply against
+completed output before rendering a delta, without rebuilding old history or
+decoding old media. Window eviction, tool turns and nonempty `initial_user_text`
+use a full snapshot. The latter is injected into the current audio turn only,
+so keeping earlier injections would change the conversation.
+EngineCore validates the resident prefix
+length, token-content digest and salt, without comparing history block hashes. Old materialized media
+remain in the resident request; only new media touch the sender/receiver caches.
+APC stays enabled and upstream maintains hashes for newly completed blocks.
+History changes and incompatible boundaries use the full-snapshot fallback,
+which releases the resident allocation and lets ordinary APC re-match unchanged
+blocks. The partial block is recomputed in both paths.
+Stage-output caching remains required to replay complete conditioning rows to
+each fresh downstream speech pipeline. A worker retirement/arrival pair resets
+per-turn delivery state without releasing scheduler-owned matching KV.
+Both synchronous and asynchronous scheduling are supported. With async
+scheduling, a continued request waits for its previous turn's in-flight outputs
+to drain before worker retirement and arrival. The existing stale-output fence
+discards those results without appending tokens or forwarding conditioning rows.
+Other requests and decode steps within a turn remain asynchronous.
+
+When runnable waiting work makes no progress, the scheduler can reclaim one
+idle turn's KV after its in-flight outputs have drained. It preserves the
+logical token history and materialized media while resetting the computed-token
+count. Delta validation still checks the logical prefix; the next continuation
+recovers available cached blocks through APC and recomputes the rest. Reclamation
+does not close the session or release its request slot.
+
+The continuation adapter delegates token extension to vLLM's
+`Scheduler._update_request_as_session`. After delta validation it normalizes
+the resident request to the retained prefix plus one uncomputed lookahead token
+(discarded by upstream), and passes only the remaining prompt as a
+`StreamingUpdate`. Upstream owns token folding, block-hash generation, feature
+offset rebasing, sampling parameters and the waiting-input counter. Features
+starting before the retained boundary stay at absolute offsets, including one
+that spans the boundary; later feature descriptors are copied into delta-relative
+coordinates. The input snapshot is never rebased in place. Encoder-cache request
+ownership is released before reinstalling the snapshot's feature indices.
+
+This follows the [upstream streaming-input implementation](https://github.com/vllm-project/vllm/blob/d3fb7166e0ac9db82158129face12ae28209757a/vllm/v1/core/sched/scheduler.py#L1921),
+while preserving Omni's complete-block requirement for hidden-state replay.
+Omni still owns connector generation fencing, worker delivery reset and movement
+between its extra waiting queues. These are not provided by upstream token
+extension and do not imply native continuous audio input support.
+
 ### Example
 
 !!! note "Note 3"
@@ -387,6 +445,12 @@ in and reuses native KV only, since `llm2tts` takes the reply rows from the
 row ledger. MiniCPM-o duplex keeps prefix caching disabled because its mutable
 KV window cannot share cached blocks; the Talker does not opt into output
 replay.
+
+Qwen3-Omni duplex on CUDA MRv2 retains the Thinker request across turns.
+At continuation, retirement precedes re-admission under the same request ID,
+resetting delivery watermarks while retaining matching scheduler KV blocks.
+The native data plane terminates each downstream turn separately and fences
+queued outputs against the request state that owned them.
 
 Duplex models that commit each utterance as a fresh request can use this path
 when their KV and model-state contracts permit reuse. The NPU MRv2 runner does

@@ -29,7 +29,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest, PayloadSenderInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -1436,7 +1436,10 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                wire_request = (
+                    request.for_engine_submission() if isinstance(request, OmniEngineCoreRequest) else request
+                )
+                await self._llm_client(replica_id).add_request_async(wire_request)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
@@ -1736,6 +1739,25 @@ class StagePool:
                 self._discard_watermark_state(watermark_abort_ids)
 
         return abort_outputs
+
+    async def finish_turn(self, request_id: str) -> None:
+        """Await transport retirement on the bound replica before reusing an ID.
+
+        Failures propagate: best-effort cleanup is insufficient for same-ID
+        continuation. The resident scheduler KV allocation remains untouched.
+        """
+        if not self._has_chunk_transfer_adapter:
+            return
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None:
+            return
+        call = getattr(self._llm_client(replica_id), "call_utility_async", None)
+        if call is None:
+            raise RuntimeError("Chunk-transfer stage cannot acknowledge turn retirement")
+        await asyncio.wait_for(
+            call("omni_finish_turn", request_id),
+            timeout=self.RELEASE_RPC_TIMEOUT_S,
+        )
 
     def schedule_release_request_resources(self, request_ids: list[str]) -> None:
         """Queue a best-effort release of *request_ids* on every live replica.

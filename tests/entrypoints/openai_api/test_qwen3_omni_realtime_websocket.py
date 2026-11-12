@@ -24,9 +24,11 @@ import json
 import os
 import wave
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import httpx
 import numpy as np
 import pytest
 import websockets
@@ -42,6 +44,7 @@ from openai.types.realtime import (
 )
 from openai.types.realtime.realtime_client_event import RealtimeClientEvent
 from openai.types.realtime.realtime_conversation_item_user_message import Content
+from prometheus_client.parser import text_string_to_metric_families
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -1086,27 +1089,38 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smar
     assert run_level in {"advanced_model", "full_model"}, "Duplex playback acceptance requires real weights"
     artifacts = tmp_path_factory.mktemp("qwen_duplex_playback")
     deploy = artifacts / "deploy.yaml"
+    base_path = get_deploy_config_path("qwen3_omni_duplex.yaml")
+    base_session = load_deploy_config(base_path).duplex_session
     # An absolute base keeps the production YAML's relative inheritance intact
     # when the test's Silero override lives in a temporary directory.
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
+                "base_config": base_path,
                 "duplex_session": {
+                    # Deploy overlays replace this section atomically. Keep
+                    # the selected profile's continuation and session policy.
+                    **asdict(base_session),
                     "server_vad_model_path": cached_silero_vad_artifact,
                     "semantic_vad_model_path": cached_smart_turn_artifact,
                 },
             }
         )
     )
-    assert load_deploy_config(deploy).session_mode == "duplex"
+    resolved = load_deploy_config(deploy)
+    assert resolved.session_mode == "duplex"
+    assert resolved.duplex_session.max_sessions == base_session.max_sessions
     model = get_model_prefix() + MODEL
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
-    with OmniServer(
-        model,
-        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600"],
-        env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts)},
-    ) as server:
+    with (
+        (artifacts / "server.log").open("w") as log_file,
+        OmniServer(
+            model,
+            ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600", "--log-stats"],
+            env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts), "VLLM_LOGGING_LEVEL": "DEBUG"},
+            log_file=log_file,
+        ) as server,
+    ):
         yield _DuplexTestRuntime(server=server, processor=processor, artifacts=artifacts)
 
 
@@ -1267,6 +1281,7 @@ def _duplex_assert_prompt(
     instructions: str,
     request_count: int,
     assistant_texts: list[str] | None = None,
+    turn_delta: bool = False,
 ):
     captures = []
     for path in runtime.artifacts.glob("*/input.json"):
@@ -1277,7 +1292,7 @@ def _duplex_assert_prompt(
     capture = max(captures, key=lambda item: item[0])[1]
     assert capture["audio_count"] == audio_count
     # The camera belongs to the first user turn and leaves with its audio.
-    image_retained = request_count <= 4
+    image_retained = request_count <= 4 and not turn_delta
     assert len(capture["images"]) == int(image_retained)
     messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
     if assistant_texts is None:
@@ -1290,6 +1305,8 @@ def _duplex_assert_prompt(
         parts.append({"type": "audio"})
         messages.append({"role": "user", "content": parts})
     expected = runtime.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if turn_delta:
+        expected = "<|im_end|>\n" + expected[expected.index("<|im_start|>user\n") :]
     assert capture["prompt"] == expected
     # Use the checkpoint tokenizer too: a repr(messages) processor stub cannot
     # establish that an empty assistant survives as a real turn separator.
@@ -1427,7 +1444,27 @@ async def _run_semantic_vad_endpoint(runtime, log_path: Path, *, fixture: str) -
     return events
 
 
-async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
+async def _duplex_thinker_cache_stats(runtime) -> dict[str, float]:
+    server = runtime.server
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"http://{server.host}:{server.port}/metrics", timeout=10)
+    response.raise_for_status()
+    stats: dict[str, float] = {}
+    for family in text_string_to_metric_families(response.text):
+        for sample in family.samples:
+            if sample.labels.get("stage") != "0":
+                continue
+            for key in ("queries", "hits"):
+                if sample.name == f"vllm:prefix_cache_{key}_total":
+                    stats[key] = stats.get(key, 0) + sample.value
+    assert stats.keys() == {"queries", "hits"}, "Thinker prefix-cache metrics must be enabled"
+    return stats
+
+
+async def _run_duplex_history_pruning(
+    runtime, log_path: Path, *, direct_append: bool = False
+) -> list[dict[str, float]]:
+    cache_stats = [await _duplex_thinker_cache_stats(runtime)]
     async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
         ws,
         events,
@@ -1449,10 +1486,11 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
             _duplex_assert_prompt(
                 runtime,
                 session_id,
-                audio_count=min(turn + 1, 4),
+                audio_count=1 if direct_append and 0 < turn < 4 else min(turn + 1, 4),
                 instructions=_DUPLEX_SHORT_INSTRUCTIONS,
                 request_count=turn + 1,
-                assistant_texts=heard_texts[-3:],
+                assistant_texts=[] if direct_append and 0 < turn < 4 else heard_texts[-3:],
+                turn_delta=direct_append and 0 < turn < 4,
             )
             # Complete playback so pruning is checked against real assistant
             # answers paired with retained user audio. Repeated empty assistant
@@ -1484,8 +1522,10 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
             assert ack["item_id"] == f"item_{response_id}"
             assert ack["committed_ms"] == ack["playback"]["sent_ms"] == played_ms
             assert ack["history_committed"] is True
+            cache_stats.append(await _duplex_thinker_cache_stats(runtime))
     for response_id in response_ids:
         _duplex_assert_completed_audio(events, response_id)
+    return cache_stats
 
 
 @pytest.mark.omni
@@ -1605,5 +1645,31 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
+    def test_resident_thinker_history_pruning(self, qwen_duplex_server, tmp_path: Path):
+        events_path = tmp_path / "events.json"
+        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, events_path, direct_append=True))
+        events = json.loads(events_path.read_text())
+        session_id = next(event["session"]["id"] for event in events if event["type"] == "session.updated")
+        captures = [json.loads(path.read_text()) for path in qwen_duplex_server.artifacts.glob("*/input.json")]
+        requests = [
+            capture["request_id"]
+            for capture in captures
+            if duplex_resource_request_belongs_to_session(capture["request_id"], session_id)
+        ]
+        assert len(requests) == 6
+        assert len(set(requests)) == 1, "All six turns must use the same resident Thinker request"
+        assert "Resident turn delta" in (qwen_duplex_server.artifacts / "server.log").read_text(), (
+            "The multi-turn test must exercise direct append, not only full-snapshot fallback"
+        )
+
+    @pytest.mark.advanced_model
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
-        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
+        stats = asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
+        # Six turns preserve multimodal history, then prune its oldest turn.
+        # The helper checks audio, transcript and the exact submitted history;
+        # require substantial reuse of turn one's prompt on turn two, rather
+        # than accepting hits on only a short shared system instruction.
+        first_prompt_tokens = stats[1]["queries"] - stats[0]["queries"]
+        second_turn_hits = stats[2]["hits"] - stats[1]["hits"]
+        assert first_prompt_tokens > 0
+        assert second_turn_hits > first_prompt_tokens / 2, stats

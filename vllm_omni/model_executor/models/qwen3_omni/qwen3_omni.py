@@ -51,6 +51,7 @@ from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.codec_config import qwen3_omni_codec_extra
 from vllm_omni.model_executor.models.qwen3_omni.first_frame_decoder import talker_first_audio_enabled
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     apply_outer_quant_config_mapping,
@@ -1752,7 +1753,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             extra = connector_cfg.get("extra", {})
         else:
             extra = getattr(connector_cfg, "extra", None) or {}
-        return extra if isinstance(extra, Mapping) else {}
+        return qwen3_omni_codec_extra(extra) if isinstance(extra, Mapping) else {}
 
     def _get_codec_frame_config(self) -> tuple[int, int]:
         """Extract codec_chunk_frames and codec_left_context_frames from stage connector config."""

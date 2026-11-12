@@ -24,7 +24,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, token_prefix_digest
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
@@ -59,8 +59,16 @@ def _encode_audio(audio: object, sample_rate_hz: int, response_format: str, spee
     return f"wav-{samples}" if samples > 0 else None
 
 
-def _stage_configs(count: int) -> list[object]:
-    return [SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096)) for _ in range(count)]
+def _stage_configs(count: int) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=4096, use_v2_model_runner=False),
+            scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=64, max_num_active_seqs=None),
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            speculative_config=None,
+        )
+        for _ in range(count)
+    ]
 
 
 def _build(
@@ -72,6 +80,8 @@ def _build(
     plugin=None,
     frontend_count: int = 1,
     frontend_index: int = 0,
+    async_chunk: bool = False,
+    stage_configs: list[SimpleNamespace] | None = None,
 ) -> tuple[DuplexOrchestrator, list[FakeStageClient], asyncio.Queue, asyncio.Queue]:
     clients = [FakeStageClient(stage_type="llm", final_output=index == stages - 1) for index in range(stages)]
     pools = _build_stage_pools(
@@ -80,7 +90,7 @@ def _build(
             for index, client in enumerate(clients)
         ],
         output_processors=[FakeOutputProcessor() for _ in clients],
-        stage_vllm_configs=_stage_configs(stages),
+        stage_vllm_configs=stage_configs or _stage_configs(stages),
     )
     rpc_q: asyncio.Queue = asyncio.Queue()
     output_q: asyncio.Queue = asyncio.Queue()
@@ -95,8 +105,78 @@ def _build(
         model_config=None,
         frontend_count=frontend_count,
         frontend_index=frontend_index,
+        async_chunk=async_chunk,
     )
     return orchestrator, clients, rpc_q, output_q
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("unsupported", [None, "v2", "cache_off", "no_chunks", "speculative"])
+async def test_qwen_continuation_defaults_follow_engine_configuration(unsupported, async_scheduling):
+    configs = _stage_configs(1)
+    entry = configs[0]
+    entry.model_config.use_v2_model_runner = unsupported == "v2"
+    entry.scheduler_config.async_scheduling = async_scheduling
+    entry.cache_config.enable_prefix_caching = unsupported != "cache_off"
+    entry.speculative_config = object() if unsupported == "speculative" else None
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
+    assert plugin.capabilities(max_sessions=1).supports_core_resumable_request
+    orchestrator, _, rpc_q, _ = _build(
+        plugin=plugin,
+        async_chunk=unsupported != "no_chunks",
+        stage_configs=configs,
+    )
+    try:
+        assert plugin.capabilities(max_sessions=1).supports_core_resumable_request is (unsupported in (None, "v2"))
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session is not None
+        assert session.capabilities.supports_core_resumable_request is (unsupported in (None, "v2"))
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sessions,per_replica,slots,active_slots,v2,rejected",
+    [
+        (2, None, 1, None, False, True),
+        (2, None, 4, 1, False, True),
+        (2, None, 2, None, False, False),
+        (4, 2, 2, None, False, False),
+        (4, 3, 2, None, False, True),
+        (1, 3, 2, None, False, False),
+        (2, None, 1, None, True, True),
+    ],
+)
+async def test_resident_thinker_session_capacity(sessions, per_replica, slots, active_slots, v2, rejected):
+    configs = _stage_configs(1)
+    configs[0].scheduler_config.max_num_seqs = slots
+    configs[0].scheduler_config.max_num_active_seqs = active_slots
+    configs[0].model_config.use_v2_model_runner = v2
+    runtime = DuplexSessionRuntimeConfig(
+        max_sessions=sessions,
+        replica_policy="least_sessions" if per_replica is not None else "legacy",
+        max_sessions_per_replica=per_replica,
+    )
+
+    def build():
+        return _build(
+            plugin=Qwen3OmniDuplexPlugin(_encode_audio),
+            runtime_config=runtime,
+            stage_configs=configs,
+            async_chunk=True,
+            replicas=2 if per_replica is not None else 1,
+        )
+
+    if rejected:
+        with pytest.raises(ValueError, match="resident Thinker.*capacity"):
+            build()
+    else:
+        orchestrator, *_ = build()
+        await orchestrator.session_manager.shutdown()
 
 
 def _open_message(
@@ -436,6 +516,154 @@ def ephemeral_submissions(mocker):
 
     builder = mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
     return orchestrator, clients, submissions, builder
+
+
+@pytest.mark.asyncio
+async def test_full_prompt_resume_processes_inputs_without_propagating_resumable(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    orchestrator, clients, submissions, builder = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", return_value=True)
+    orchestrator.async_chunk = True
+    await orchestrator.submit(submission)
+    assert builder.call_args.kwargs["resumable"] is True
+    first = clients[0].add_request_calls[-1][0]
+    assert first.resumable and first.resume_from_full_prompt
+    assert orchestrator.request_states[first.request_id].streaming.enabled
+    assert prewarm.call_args.args[1].resumable is False
+    # Re-enter through the ordinary processor, retaining the core request ID.
+    mocker.patch.object(orchestrator.stage_pools[0].output_processor, "remove_request", create=True)
+    mocker.patch.object(orchestrator.stage_pools[1].output_processor, "remove_request", create=True)
+    await orchestrator.finish_turn(first.request_id)
+    await orchestrator.submit(replace(submission, already_submitted=True))
+    assert clients[0].add_request_calls[-1][0].request_id == first.request_id
+    assert builder.call_count == 2
+    assert prewarm.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_finish_turn_keeps_entry_request_and_releases_downstream(ephemeral_submissions, mocker):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    request_id = submissions[0].context.request_id
+    await orchestrator.submit(submissions[0])
+    downstream = orchestrator.stage_pools[1]
+    downstream.bind_request_to_replica(request_id, 0)
+    remove = mocker.patch.object(downstream.output_processor, "remove_request", create=True)
+    state = orchestrator.request_states[request_id]
+    state.stage_submit_ts[1] = 1.0
+    state.upstream_first_audio = True
+    state.pending_first_audio_outputs.append((1, 0, object()))
+    state.streaming.bridge_states["previous_turn"] = object()
+    await orchestrator.finish_turn(request_id)
+    assert clients[0].abort_calls == []
+    assert clients[1].abort_calls == [[request_id]]
+    remove.assert_called_once_with(request_id)
+    assert orchestrator.stage_pools[0].get_bound_replica_id(request_id) == 0
+    assert downstream.get_bound_replica_id(request_id) is None
+    assert orchestrator.request_states[request_id] is state
+    assert 0 in state.stage_submit_ts and 1 not in state.stage_submit_ts
+    assert not state.upstream_first_audio
+    assert not state.pending_first_audio_outputs
+    assert not state.streaming.bridge_states
+
+
+@pytest.mark.asyncio
+async def test_resident_turn_holds_early_codec_terminal_until_thinker_stops(ephemeral_submissions, mocker):
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    orchestrator.plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    request_id = submissions[0].context.request_id
+    state = orchestrator.request_states[request_id]
+    state.streaming.enabled = True
+    runner = mocker.Mock()
+    runner.on_stage_output.return_value = False
+    mocker.patch.object(orchestrator.session_manager, "runner_for_request_id", return_value=runner)
+    # Talker can hit its token limit while Thinker is still decoding. Do not
+    # expose response.done (and thus reopen the resident ID) at this boundary.
+    terminal = _audio_request_output(request_id, samples=1, finished=True)
+    assert await orchestrator._intercept_stage_output(1, 0, terminal, state, None, None)
+    runner.on_stage_output.assert_not_called()
+    piece = _audio_request_output(request_id, samples=0, text="old turn", finished=False)
+    await orchestrator._intercept_stage_output(0, 0, piece, state, None, None)
+    assert [call.args[0] for call in runner.on_stage_output.call_args_list] == [0]
+    state.streaming.segment(0).finished = True
+    await orchestrator._intercept_stage_output(
+        0, 0, _audio_request_output(request_id, samples=0, finished=True), state, None, None
+    )
+    assert [call.args[0] for call in runner.on_stage_output.call_args_list] == [0, 0, 1]
+    assert runner.on_stage_output.call_args.args[1] is terminal
+
+
+@pytest.mark.asyncio
+async def test_resident_turn_cannot_reopen_until_transfer_retirement_completes(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
+
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    await orchestrator.submit(submission)
+    request_id = submission.context.request_id
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def retire(rid):
+        assert rid == request_id
+        entered.set()
+        await gate.wait()
+
+    for pool in orchestrator.stage_pools:
+        mocker.patch.object(pool, "finish_turn", side_effect=retire, create=True)
+        mocker.patch.object(pool.output_processor, "remove_request", create=True)
+    finish = asyncio.create_task(orchestrator.finish_turn(request_id))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        with pytest.raises(DuplexInputCapacityError):
+            await orchestrator.submit(replace(submission, already_submitted=True))
+        gate.set()
+        await finish
+        await orchestrator.submit(replace(submission, already_submitted=True))
+        for pool in orchestrator.stage_pools:
+            pool.finish_turn.assert_awaited_once_with(request_id)
+    finally:
+        gate.set()
+        await finish
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_retirement_closes_through_resident_failure(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    orchestrator, _, submissions, _ = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    await orchestrator.submit(submission)
+    request_id = submission.context.request_id
+    state = orchestrator.request_states[request_id]
+    failure = TimeoutError("retirement timed out")
+    for pool in orchestrator.stage_pools:
+        mocker.patch.object(pool.output_processor, "remove_request", create=True)
+    mocker.patch.object(orchestrator.stage_pools[0], "finish_turn", side_effect=failure, create=True)
+    handle = mocker.patch.object(orchestrator, "_handle_forward_failure", new_callable=mocker.AsyncMock)
+
+    # A retirement failure must not leave a resident that rejects every later turn.
+    await orchestrator.finish_turn(request_id)
+
+    handle.assert_awaited_once_with(request_id, 0, state, failure)
+    assert not state.turn_resources_released
+
+
+@pytest.mark.asyncio
+async def test_resident_downstream_failure_closes_the_session(mocker) -> None:
+    orchestrator, _, _, _ = _build(stages=2, plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    assert orchestrator.plugin.capabilities(max_sessions=1).resident_turn_entry
+    request_state = DuplexOrchestratorRequestState(request_id="resident", session_owned=True)
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    try:
+        # Talker shares the resident ID; aborting it also discards Thinker KV.
+        assert await orchestrator._handle_forward_failure("resident", 1, request_state, ValueError("talker"))
+        cleanup.assert_awaited_once_with(["resident"], abort=True, release_owners=True, trace_error="ValueError")
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1081,14 +1309,145 @@ async def test_a_dead_replica_closes_the_sessions_it_was_serving() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch):
+@pytest.mark.parametrize("worker_error", [False, True])
+async def test_incremental_tokenization_cancellation_joins_worker(monkeypatch, worker_error):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+    class BlockingTokenizer(QwenIncrementalPrompt):
+        def tokenize(self, text: str) -> list[int]:
+            started.set()
+            try:
+                assert release.wait(timeout=5)
+                if worker_error:
+                    raise ValueError("tokenization failed after cancellation")
+                return [1, 2]
+            finally:
+                finished.set()
+
+    orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
+        request_id="r", turn_prompt_tokenizer=BlockingTokenizer(None)
+    )
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: None)
+    task = asyncio.create_task(orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "hello"}))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_turn_delta_transport_keeps_full_frontend_context():
+    from vllm.sampling_params import SamplingParams
+
+    orchestrator, clients, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    params = SamplingParams(max_tokens=8)
+    state = DuplexOrchestratorRequestState(request_id="r", sampling_params_list=[params])
+    request = build_engine_core_request_from_tokens("r", {"prompt_token_ids": [10, 11, 12, 13]}, params, resumable=True)
+    request.append_prefix_length = 2
+    request.resume_from_full_prompt = True
+    pool = orchestrator.stage_pools[0]
+    await pool.submit_update("r", state, request)
+    wire = clients[0].add_request_calls[0][0]
+    assert wire.prompt_token_ids == [12, 13]
+    assert wire.append_prefix_length == 2
+    # The suffix-only wire request still lets EngineCore verify prefix content.
+    assert wire.append_prefix_digest == token_prefix_digest([10, 11])
+    assert pool.output_processor.add_request_calls[0][1]["request"].prompt_token_ids == [10, 11, 12, 13]
+    assert request.prompt_token_ids == [10, 11, 12, 13]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bypass", ["kwargs", "lowercase", "special_tokens", "ordinary", "downstream"])
+async def test_incremental_tokenization_preserves_other_input_paths(monkeypatch, bypass):
+    from vllm.renderers.params import TokenizeParams
+
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    orchestrator, _, _, _ = _build(plugin=plugin, async_chunk=True)
+    state_type = OrchestratorRequestState if bypass == "ordinary" else DuplexOrchestratorRequestState
+    orchestrator.request_states["r"] = state_type(request_id="r")
+
+    def unexpected_tokenizer(tokenizer):
+        pytest.fail("incremental tokenizer must not run on this input path")
+
+    monkeypatch.setattr(plugin, "create_turn_prompt_tokenizer", unexpected_tokenizer)
+    defaults = TokenizeParams(
+        max_total_tokens=4096, do_lower_case=bypass == "lowercase", add_special_tokens=bypass != "special_tokens"
+    )
+    processor = SimpleNamespace(tokenizer=object(), renderer=SimpleNamespace(default_cmpl_tok_params=defaults))
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: processor)
+    prompt = {"prompt": "hello"}
+
+    async def process(self, stage_id, **kwargs):
+        assert kwargs["prompt"] is prompt
+        return "processed"
+
+    monkeypatch.setattr(Orchestrator, "_process_stage_inputs", process)
+    assert (
+        await orchestrator._process_stage_inputs(
+            1 if bypass == "downstream" else 0,
+            request_id="r",
+            prompt=prompt,
+            tokenization_kwargs={"add_special_tokens": False} if bypass == "kwargs" else None,
+        )
+        == "processed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_tokenization_keeps_upstream_text_length_validation(monkeypatch):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.renderers.params import TokenizeParams
+
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+    class UnexpectedTokenizer(QwenIncrementalPrompt):
+        def tokenize(self, text: str) -> list[int]:
+            raise AssertionError("overlong text must be rejected before tokenization")
+
+    orchestrator, _, _, _ = _build(plugin=Qwen3OmniDuplexPlugin(_encode_audio), async_chunk=True)
+    orchestrator.request_states["r"] = DuplexOrchestratorRequestState(
+        request_id="r", turn_prompt_tokenizer=UnexpectedTokenizer(None)
+    )
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(max_chars_per_token=1),
+        renderer=SimpleNamespace(default_cmpl_tok_params=TokenizeParams(max_total_tokens=4)),
+    )
+    monkeypatch.setattr(orchestrator, "_get_stage_input_processor", lambda stage_id: processor)
+    with pytest.raises(VLLMValidationError, match="characters"):
+        await orchestrator._process_stage_inputs(0, request_id="r", prompt={"prompt": "too long"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incremental", [False, True])
+async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch, incremental):
     from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
     from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
-    orchestrator, clients, rpc_q, _ = _build()
     plugin = Qwen3OmniDuplexPlugin(_encode_audio)
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
-    orchestrator.plugin = orchestrator.session_manager.plugin = plugin
+    if incremental:
+        from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+        monkeypatch.setattr(
+            plugin,
+            "create_turn_prompt_tokenizer",
+            lambda tokenizer: QwenIncrementalPrompt(SimpleNamespace(encode=lambda text, **kwargs: [1, 2])),
+        )
+    orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
     seen = []
 
     def process_inputs(**kwargs):
@@ -1102,7 +1461,9 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         )
 
     monkeypatch.setattr(
-        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+        orchestrator,
+        "_get_stage_input_processor",
+        lambda stage_id: SimpleNamespace(process_inputs=process_inputs, tokenizer=object() if incremental else None),
     )
     await orchestrator._dispatch_message(
         OpenDuplexSessionMessage(
@@ -1119,10 +1480,127 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         await _submit(orchestrator, commands.Commit(final=True, create_response=True))
         assert len(seen) == 1
         assert seen[0]["prompt"]["multi_modal_data"]["audio"][0][0].shape == (16000,)
+        if incremental:
+            assert seen[0]["prompt"]["prompt_token_ids"] == [1, 2]
+            assert "prompt" not in seen[0]["prompt"]
         submitted = clients[0].add_request_calls[0][0]
-        assert submitted.resumable is False
-        assert not orchestrator.request_states[submitted.request_id].streaming.enabled
+        assert submitted.resumable is True
+        assert submitted.resume_from_full_prompt is True
+        assert orchestrator.request_states[submitted.request_id].streaming.enabled
     finally:
+        await _close(orchestrator, rpc_q)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["tokenization", "multimodal"])
+@pytest.mark.parametrize("delete_history", [False, True])
+async def test_turn_delta_history_fence_covers_input_processing(mocker, phase, delete_history):
+    from dataclasses import replace
+
+    from vllm_omni.engine.duplex.contracts import DUPLEX_TURN_DELTA_KEY
+    from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.incremental_prompt import QwenIncrementalPrompt
+
+    entered = threading.Event()
+    release = threading.Event()
+    blocking = False
+
+    def pause_worker(at):
+        if blocking and at == phase:
+            entered.set()
+            assert release.wait(10), "test did not release input preprocessing"
+
+    def encode(text, **kwargs):
+        pause_worker("tokenization")
+        return [11, 12]
+
+    ledger = QwenIncrementalPrompt(SimpleNamespace(all_special_tokens=[], encode=encode))
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace()
+    mocker.patch.object(plugin, "create_turn_prompt_tokenizer", return_value=ledger)
+    orchestrator, clients, rpc_q, _ = _build(plugin=plugin, async_chunk=True)
+
+    def process_inputs(**kwargs):
+        pause_worker("multimodal")
+        return build_engine_core_request_from_tokens(
+            kwargs["request_id"], kwargs["prompt"], kwargs["params"], resumable=kwargs["resumable"]
+        )
+
+    mocker.patch.object(
+        orchestrator,
+        "_get_stage_input_processor",
+        return_value=SimpleNamespace(tokenizer=object(), process_inputs=process_inputs),
+    )
+    mocker.patch.object(orchestrator.stage_pools[0].output_processor, "remove_request", create=True)
+    assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+    await _submit(
+        orchestrator,
+        commands.CreateItem(
+            item={
+                "id": "old-user",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "old context"}],
+            }
+        ),
+    )
+    assert session.history
+    context = DuplexStageRequestContext(
+        request_id=_stage0_request_id(),
+        session_id=SESSION_ID,
+        fence=session.fence,
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=0,
+        sampling_params=orchestrator.sampling_defaults(),
+    )
+    orchestrator.ensure_request(context)
+    first = DuplexStageSubmission(
+        context=context, prompt={"prompt": "first"}, already_submitted=False, resume_from_full_prompt=True
+    )
+    task = None
+    try:
+        await orchestrator.submit(first)
+        ledger.record_output([31, 99], True)
+        await orchestrator.finish_turn(context.request_id)
+        state = orchestrator.request_states[context.request_id]
+        state.turn_entry_finished = True
+        old_prompt = list(ledger._prompt_ids)
+        old_output = list(ledger._output_ids)
+        delta = replace(
+            first,
+            prompt={"prompt": "delta", DUPLEX_TURN_DELTA_KEY: True},
+            already_submitted=True,
+            history_revision=session.history_revision,
+        )
+        blocking = True
+        task = asyncio.create_task(orchestrator.submit(delta))
+        assert await asyncio.to_thread(entered.wait, 5)
+        if delete_history:
+            await _submit(orchestrator, commands.DeleteItem(item_id="old-user"))
+            assert session.history_revision != delta.history_revision
+        release.set()
+        if delete_history:
+            with pytest.raises(DuplexInputCapacityError, match="Conversation changed"):
+                await task
+            assert len(clients[0].add_request_calls) == 1
+            assert ledger._prompt_ids == old_prompt and ledger._output_ids == old_output
+            assert ledger._finished
+            assert state.turn_entry_finished and state.turn_resources_released
+            # Rejected preprocessing must not poison the resident's next attempt.
+            await orchestrator.submit(replace(first, prompt={"prompt": "rebuilt"}, already_submitted=True))
+            assert len(clients[0].add_request_calls) == 2
+            assert clients[0].add_request_calls[-1][0].append_prefix_length is None
+        else:
+            await task
+            assert len(clients[0].add_request_calls) == 2
+            assert clients[0].add_request_calls[-1][0].append_prefix_length == len(old_prompt) + len(old_output) - 1
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
         await _close(orchestrator, rpc_q)
 
 

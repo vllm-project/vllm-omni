@@ -295,19 +295,21 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
-        for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
-            if is_warmup_request(request_data.req_id):
-                continue
-            plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
-        if not getattr(self.model_config, "async_chunk", False):
-            plane.recv_full_payload_inputs(scheduler_output)
         natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
             plane.request_terminal(natural_terminal_req_ids)
         if aborted_req_ids:
             plane.abort_requests(aborted_req_ids)
+        # A continued turn retires and reinstalls the same request ID in one
+        # step. Retire its old transport before registering the new ledger.
+        for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
+            if is_warmup_request(request_data.req_id):
+                continue
+            plane.register_request(request_data)
+        if not getattr(self.model_config, "async_chunk", False):
+            plane.recv_full_payload_inputs(scheduler_output)
 
     def _sync_native_data_plane_payloads(
         self,
@@ -361,6 +363,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     def release_omni_shm_resources(self, request_ids: list[str]) -> int:
         plane = getattr(self, "_omni_data_plane", None)
         return 0 if plane is None else plane.release_shm_resources(request_ids)
+
+    def finish_omni_turn(self, request_id: str) -> None:
+        """Retire a completed turn's transport without releasing resident KV."""
+        plane = getattr(self, "_omni_data_plane", None)
+        if plane is not None:
+            plane.finish_turn(request_id)
 
     def _reserve_native_data_plane_outputs(self, req_ids: list[str]) -> None:
         plane = getattr(self, "_omni_data_plane", None)
