@@ -167,8 +167,8 @@ def test_declaration_rejects_contradictory_ownership():
         (None, set()),
         ("auto", set()),
         ("combined", set()),
-        ("fl2va", {"video_to_video"}),
-        ("t2va", {"video_to_video"}),
+        ("fl2va", set()),
+        ("t2va", set()),
         ("ref2va", {"text_to_video"}),
     ],
 )
@@ -196,6 +196,26 @@ def test_h3_partition_exclusions_do_not_invent_worker_release_tasks(task_type, e
             "startup_partition_excludes_profile" if profile.id in excluded else "worker_checkpoint_tasks_unavailable"
         )
         assert profile.outputs == ("video", "audio")
+        for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+            constraint = profile.request.inputs[role]
+            assert (constraint.support, constraint.min_count, constraint.max_count) == ("supported", 0, 1)
+            assert role not in profile.required_inputs
+
+
+def test_h3_conflicting_stage_tasks_keep_worker_dependent_modes_unknown():
+    stages = [{"diffusion_config": {"task_type": task}} for task in ("ref2va", "t2va")]
+    declaration = resolve_minimax_h3_capabilities(MINIMAX_H3_CAPABILITIES, stages)
+    assert declaration == MINIMAX_H3_CAPABILITIES
+    assert all(profile.support == "unknown" for profile in declaration.get("video_generation").profiles)
+
+
+def test_h3_native_and_modular_models_share_pipeline_declaration():
+    from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
+
+    for architecture in ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"):
+        assert (
+            get_diffusion_model_metadata(architecture).serving_capabilities is MINIMAX_H3_PIPELINE.serving_capabilities
+        )
 
 
 def test_cosmos_common_modes_and_worker_only_scheduler_limits():

@@ -3,7 +3,7 @@
 """Request facts use model owners, actual adapter paths and initialized data."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +21,14 @@ from vllm_omni.entrypoints.openai.tts_adapters.kokoro import KokoroAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.minimax_music3 import MiniMaxMusic3Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
-from vllm_omni.request_capabilities import ImageGeometry, InputConstraint, ParameterConstraint, RuntimeServingMetadata
+from vllm_omni.request_capabilities import (
+    ImageGeometry,
+    InputConstraint,
+    ParameterConstraint,
+    RequestConstraints,
+    RuntimeServingMetadata,
+)
+from vllm_omni.serving_capabilities import VIDEO_TO_VIDEO
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -82,6 +89,88 @@ def test_video_transport_does_not_claim_offline_last_frame_or_widen_fixed_frames
     assert magi.parameters["num_frames"].enum == (125,)
     assert magi.parameters["seconds"].enum == (10.0,)
     assert magi.parameters["fps"].enum == (12.5,)
+
+
+@pytest.mark.parametrize("architecture", ["WanImageToVideoPipeline", "Wan22I2VPipeline", "WanI2VDMD2Pipeline"])
+def test_wan_first_frame_describes_existing_required_image(architecture):
+    profile = _profile(architecture, "video_generation", "image_to_video")
+    assert profile.required_inputs == ("text", "image")
+    request = _route(profile, "/v1/videos")
+    assert request.inputs["image"].min_count == 1
+    assert request.inputs["first_frame"] == InputConstraint(support="supported", min_count=0, max_count=1)
+
+
+@pytest.mark.parametrize("architecture", ["WanVACEPipeline", "Wan22VACEPipeline"])
+@pytest.mark.parametrize("profile_id", ["text_to_video", "image_to_video", "video_to_video"])
+def test_vace_reference_inputs_do_not_claim_fixed_first_frame(architecture, profile_id):
+    profile = _profile(architecture, "video_generation", profile_id)
+    request = _route(profile, "/v1/videos")
+    assert profile.support == "supported"
+    assert request.inputs["first_frame"] == InputConstraint(support="unsupported", max_count=0)
+    for role in profile.required_inputs:
+        assert request.inputs[role] == InputConstraint(support="supported", min_count=1)
+
+
+@pytest.mark.parametrize("path", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("flag", [True, False, None, "unknown"])
+@pytest.mark.parametrize("support", ["supported", "unknown"])
+def test_video_edit_roles_use_handler_policy_without_model_name(path, flag, support):
+    roles = ("source_video", "video_noise_mask", "audio_noise_mask")
+    profile = replace(
+        VIDEO_TO_VIDEO,
+        support=support,
+        request=RequestConstraints(
+            inputs={role: InputConstraint(support="supported", min_count=0, max_count=1) for role in roles}
+        ),
+    )
+    state = SimpleNamespace(openai_serving_video=SimpleNamespace(supports_latent_mask_editing=flag))
+    request = _route(profile, path, state=state)
+    for role in roles:
+        expected = (
+            InputConstraint(support="unsupported", max_count=0) if flag is False else profile.request.inputs[role]
+        )
+        assert request.inputs[role] == expected
+    assert profile.support == support
+
+
+@pytest.mark.parametrize("flag", [True, False, None])
+def test_unknown_video_without_request_keeps_only_proven_route_facts(flag):
+    profile = replace(VIDEO_TO_VIDEO, support="unknown")
+    state = SimpleNamespace(openai_serving_video=SimpleNamespace(supports_latent_mask_editing=flag))
+    request = _route(profile, "/v1/videos", state=state)
+    assert request.inputs["last_frame"].support == "unsupported"
+    assert request.parameters["width"].minimum == 1
+    for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+        if flag is False:
+            assert request.inputs[role].support == "unsupported"
+        else:
+            assert role not in request.inputs
+
+
+@pytest.mark.parametrize("image_support,maximum", [("unknown", 3), ("supported", 1), ("unsupported", 0)])
+def test_unknown_realtime_video_keeps_input_evidence_and_transport_limits(image_support, maximum):
+    profile = replace(
+        VIDEO_TO_VIDEO,
+        support="unknown",
+        request=RequestConstraints(
+            inputs={
+                "image": InputConstraint(support=image_support, min_count=0, max_count=maximum),
+                "first_frame": InputConstraint(support="unknown", max_count=1),
+                "source_video": InputConstraint(support="supported", min_count=0, max_count=1),
+            }
+        ),
+    )
+    request = _route(profile, "/v1/realtime/video")
+    assert request.inputs["image"].support == image_support
+    assert request.inputs["image"].max_count == min(maximum, 1)
+    assert request.inputs["first_frame"].support == "unknown"
+    for role in ("video", "audio", "last_frame", "source_video", "video_noise_mask", "audio_noise_mask"):
+        assert request.inputs[role] == InputConstraint(support="unsupported", max_count=0)
+
+
+def test_unknown_nonvideo_projection_is_unchanged():
+    profile = replace(_profile("Flux2KleinPipeline", "image_edit", "image_to_image"), support="unknown")
+    assert _route(profile, "/v1/images/edits") is None
 
 
 def test_flux3_profiles_distinguish_optional_chat_images_and_required_edits():

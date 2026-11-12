@@ -569,6 +569,115 @@ async def build_initialized_test_app(
     return app, engine
 
 
+async def build_video_capability_test_app(monkeypatch, tmp_path, architecture, task_type=None, multistage=False):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import DeployConfig
+    from vllm_omni.diffusion.capability_resolvers import resolve_minimax_h3_capabilities
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+    from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
+
+    overrides = {"model": "local-checkpoint", "model_class_name": architecture, "task_type": task_type}
+    if multistage:
+        stages = VllmOmniConfig.from_pipeline_config(
+            MINIMAX_H3_PIPELINE, user_deploy_config=DeployConfig(), cli_overrides=overrides
+        ).stage_configs
+    else:
+        stages = StageConfigFactory.create_typed_default_diffusion("local-checkpoint", overrides).stage_configs
+    declaration = get_diffusion_model_metadata(architecture).serving_capabilities
+    if architecture in ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"):
+        declaration = resolve_minimax_h3_capabilities(declaration, stages)
+    app, engine = await build_initialized_test_app(monkeypatch, tmp_path, architecture)
+    # Supply resolved metadata at the initialized-engine boundary. The real
+    # app, video handler, projector and HTTP serialization remain in use;
+    # the encoder worker/tokenizer is outside these discovery tests.
+    engine.engine.stage_configs = stages
+    engine.engine.serving_capabilities = declaration
+    app.state.stage_configs = stages
+    app.state.openai_serving_video.shutdown()
+    app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+        engine, model_name="public-primary", stage_configs=stages
+    )
+    monkeypatch.setattr(engine, "get_diffusion_od_config", lambda: SimpleNamespace(model_class_name=architecture))
+    app.state.omni_serving_capabilities = OmniServingCapabilities(
+        app, engine, single_api_dependencies=(api_server._require_single_api_video_store,)
+    )
+    return app, engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", [None, "auto", "t2va", "fl2va", "ref2va"])
+@pytest.mark.parametrize("multistage", [False, True])
+async def test_h3_http_discovery_retains_known_edit_fields(monkeypatch, tmp_path, task_type, multistage):
+    app, engine = await build_video_capability_test_app(
+        monkeypatch, tmp_path, "MiniMaxH3Pipeline", task_type, multistage
+    )
+    # Querying the startup projection must not revisit configuration or load a worker.
+    monkeypatch.setattr(engine, "get_diffusion_od_config", lambda: pytest.fail("query re-read config"))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            response = await client.get("/v1/omni/capabilities")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["schema_version"] == 1
+        operation = body["models"][0]["operations"]["video_generation"]
+        assert operation["support"] == "unknown"
+        for profile in operation["profiles"]:
+            if profile["id"] == "text_to_video" and task_type == "ref2va":
+                assert profile["support"] == "unsupported"
+                continue
+            assert profile["support"] == "unknown"
+            assert profile["reason_code"] == "worker_checkpoint_tasks_unavailable"
+            for route in profile["routes"]:
+                request = route["request"]
+                assert request["inputs"]["last_frame"]["support"] == "unsupported"
+                for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+                    assert role not in profile["required_inputs"]
+                    if route["path"] == "/v1/realtime/video":
+                        assert request["inputs"][role]["support"] == "unsupported"
+                    else:
+                        assert request["inputs"][role] == {"support": "supported", "min_count": 0, "max_count": 1}
+    finally:
+        app.state.openai_serving_video.shutdown()
+    engine.generate.assert_not_called()
+    engine.wake_up.assert_not_called()
+    engine.check_health.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "architecture,profile_id,first_frame",
+    [
+        ("WanImageToVideoPipeline", "image_to_video", "supported"),
+        ("WanVACEPipeline", "image_to_video", "unsupported"),
+        ("SeedVR2Pipeline", "video_to_video", None),
+    ],
+)
+async def test_video_http_discovery_uses_real_handler_edit_gate(
+    monkeypatch, tmp_path, architecture, profile_id, first_frame
+):
+    app, engine = await build_video_capability_test_app(monkeypatch, tmp_path, architecture)
+    try:
+        assert app.state.openai_serving_video.supports_latent_mask_editing is False
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            response = await client.get("/v1/omni/capabilities")
+        assert response.status_code == 200
+        operation = response.json()["models"][0]["operations"]["video_generation"]
+        profile = next(profile for profile in operation["profiles"] if profile["id"] == profile_id)
+        assert profile["support"] == "supported"
+        for route in profile["routes"]:
+            inputs = route["request"]["inputs"]
+            for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+                assert inputs[role] == {"support": "unsupported", "max_count": 0}
+            if first_frame is None:
+                assert "first_frame" not in inputs
+            else:
+                assert inputs["first_frame"]["support"] == first_frame
+    finally:
+        app.state.openai_serving_video.shutdown()
+    engine.generate.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_pan2_video_routes_preserve_first_frame_limits(monkeypatch, tmp_path):
     app, engine = await build_initialized_test_app(monkeypatch, tmp_path, "PAN2ModularPipeline")

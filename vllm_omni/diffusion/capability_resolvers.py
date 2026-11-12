@@ -10,6 +10,7 @@ names, paths, filesystem probes, or another Hugging Face configuration load.
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
+from vllm_omni.request_capabilities import InputConstraint, RequestConstraints
 from vllm_omni.serving_capabilities import (
     IMAGE_RESPONSE,
     IMAGE_TO_VIDEO,
@@ -23,11 +24,21 @@ from vllm_omni.serving_capabilities import (
 _H3_SOURCES = (
     "vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py",
     "vllm_omni/model_executor/models/minimax_h3/checkpoint.py",
+    "vllm_omni/model_executor/models/minimax_h3/encoder_processing.py",
 )
 MINIMAX_H3_CAPABILITIES = declare_capabilities(
     *(
         replace(
-            profile, outputs=("video", "audio"), support="unknown", reason_code="worker_checkpoint_tasks_unavailable"
+            profile,
+            outputs=("video", "audio"),
+            support="unknown",
+            reason_code="worker_checkpoint_tasks_unavailable",
+            request=RequestConstraints(
+                inputs={
+                    role: InputConstraint(support="supported", min_count=0, max_count=1)
+                    for role in ("source_video", "video_noise_mask", "audio_noise_mask")
+                }
+            ),
         )
         for profile in (TEXT_TO_VIDEO, IMAGE_TO_VIDEO, VIDEO_TO_VIDEO)
     ),
@@ -75,18 +86,15 @@ def resolve_minimax_h3_capabilities(declaration: ServingCapabilities, stages: Se
 
     ``task_type`` chooses FL2VA/Ref2VA components. The worker subsequently
     reads the release's task list, which can further narrow those components.
-    An explicit partition therefore proves exclusions, but not admission.
+    Ref2VA excludes text-only generation. T2VA/FL2VA can still consume
+    source_video with latent masks, so they do not exclude all V2V requests.
     """
     task_types = {str(task).lower() for stage in stages if (task := _stage_task_type(stage)) is not None}
     # Conflicting stage overrides cannot establish a single public contract.
     if len(task_types) != 1:
         return declaration
     task_type = task_types.pop()
-    excluded = (
-        {"text_to_video"}
-        if task_type == "ref2va"
-        else ({"video_to_video"} if task_type in {"t2va", "fl2va"} else set())
-    )
+    excluded = {"text_to_video"} if task_type == "ref2va" else set()
     profiles = [
         profile
         for operation in declaration.operations

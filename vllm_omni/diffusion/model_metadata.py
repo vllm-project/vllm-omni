@@ -89,6 +89,39 @@ JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 FLUX3_MAX_INPUT_IMAGES = 10
 
+# These names share the same native input preparation. first_frame describes
+# the purpose of the existing image; it does not require an additional upload.
+_WAN_I2V_CAPABILITIES = declare_capabilities(
+    replace(
+        IMAGE_TO_VIDEO,
+        request=RequestConstraints(
+            inputs={
+                "text": InputConstraint(support="supported", min_count=1),
+                "image": InputConstraint(support="supported", min_count=1, max_count=1),
+                "first_frame": InputConstraint(support="supported", min_count=0, max_count=1),
+                "last_frame": InputConstraint(support="supported", min_count=0, max_count=1),
+            }
+        ),
+    ),
+    sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
+)
+_WAN_VACE_CAPABILITIES = declare_capabilities(
+    *(
+        replace(
+            profile,
+            request=RequestConstraints(
+                inputs={
+                    **{role: InputConstraint(support="supported", min_count=1) for role in profile.required_inputs},
+                    # Images become reference_images, not pinned first frames.
+                    "first_frame": InputConstraint(support="unsupported", max_count=0),
+                }
+            ),
+        )
+        for profile in (TEXT_TO_VIDEO, IMAGE_TO_VIDEO, VIDEO_TO_VIDEO)
+    ),
+    sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py",),
+)
+
 
 def _image_edit_profile(max_images: int | None = None, *, native_mask: bool = False) -> CapabilityProfile:
     """Native image pipeline input ownership; geometry is supplied at startup.
@@ -371,29 +404,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
-        serving_capabilities=declare_capabilities(
-            replace(
-                IMAGE_TO_VIDEO,
-                request=RequestConstraints(
-                    inputs={
-                        "text": InputConstraint(support="supported", min_count=1),
-                        "image": InputConstraint(support="supported", min_count=1, max_count=1),
-                        "last_frame": InputConstraint(support="supported", min_count=0, max_count=1),
-                    }
-                ),
-            ),
-            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
-        ),
+        serving_capabilities=_WAN_I2V_CAPABILITIES,
     ),
     "WanVACEPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
-        serving_capabilities=declare_capabilities(
-            TEXT_TO_VIDEO,
-            IMAGE_TO_VIDEO,
-            VIDEO_TO_VIDEO,
-            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py",),
-        ),
+        serving_capabilities=_WAN_VACE_CAPABILITIES,
     ),
     "WanS2VPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
@@ -412,10 +428,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     ),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(
         final_output_type="video",
-        serving_capabilities=declare_capabilities(
-            IMAGE_TO_VIDEO,
-            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
-        ),
+        serving_capabilities=_WAN_I2V_CAPABILITIES,
     ),
     "LTX2Pipeline": DiffusionModelMetadata(
         final_output_type="video",
@@ -926,10 +939,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "Wan22I2VPipeline": DiffusionModelMetadata(
-        serving_capabilities=declare_capabilities(
-            IMAGE_TO_VIDEO,
-            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py",),
-        ),
+        serving_capabilities=_WAN_I2V_CAPABILITIES,
     ),
     "Wan22Pipeline": DiffusionModelMetadata(
         serving_capabilities=declare_capabilities(
@@ -945,12 +955,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "Wan22VACEPipeline": DiffusionModelMetadata(
-        serving_capabilities=declare_capabilities(
-            TEXT_TO_VIDEO,
-            IMAGE_TO_VIDEO,
-            VIDEO_TO_VIDEO,
-            sources=("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_vace.py",),
-        ),
+        serving_capabilities=_WAN_VACE_CAPABILITIES,
     ),
 }
 

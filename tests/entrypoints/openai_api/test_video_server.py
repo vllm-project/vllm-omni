@@ -1568,25 +1568,30 @@ def test_typed_stage_drives_video_capability_checks():
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+@pytest.mark.parametrize("scalar_masks", [False, True])
+def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(
+    endpoint, scalar_masks, test_client, mocker: MockerFixture
+):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
     )
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
-    video_mask = [[[0.0, 1.0], [0.5, 1.0]]]
-    audio_mask = [0.0, 0.25, 1.0]
+    video_mask = 0.0 if scalar_masks else [[[0.0, 1.0], [0.5, 1.0]]]
+    audio_mask = 0.0 if scalar_masks else [0.0, 0.25, 1.0]
+    files = [
+        ("source_video", ("source.mov", b"source-video", "video/quicktime")),
+        ("video_noise_mask", _mask_file(video_mask)),
+        ("audio_noise_mask", _mask_file(audio_mask)),
+    ]
+    if not scalar_masks:
+        files.append(("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")))
 
     response = test_client.post(
         endpoint,
-        data={"prompt": "Replace only the masked regions."},
-        files=[
-            ("source_video", ("source.mov", b"source-video", "video/quicktime")),
-            ("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")),
-            ("video_noise_mask", _mask_file(video_mask)),
-            ("audio_noise_mask", _mask_file(audio_mask)),
-        ],
+        data={"prompt": "Replace only the masked regions.", "extra_params": json.dumps({"task": "t2va"})},
+        files=files,
     )
 
     assert response.status_code == 200
@@ -1594,19 +1599,29 @@ def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_
         _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
 
     multi_modal_data = engine.captured_prompt["multi_modal_data"]
-    assert engine.captured_latent_edit_source_bytes == {
-        "source_video": b"source-video",
-        "source_audio": b"source-audio",
-    }
+    expected_sources = {"source_video": b"source-video"}
+    if not scalar_masks:
+        expected_sources["source_audio"] = b"source-audio"
+    assert engine.captured_latent_edit_source_bytes == expected_sources
     assert multi_modal_data["video_noise_mask"] == video_mask
     assert multi_modal_data["audio_noise_mask"] == audio_mask
-    _wait_until(
-        lambda: (
-            not Path(multi_modal_data["source_video"]).exists() and not Path(multi_modal_data["source_audio"]).exists()
-        )
-    )
-    assert not Path(multi_modal_data["source_video"]).exists()
-    assert not Path(multi_modal_data["source_audio"]).exists()
+    assert engine.captured_sampling_params_list[0].extra_args["task"] == "t2va"
+    _wait_until(lambda: all(not Path(multi_modal_data[role]).exists() for role in expected_sources))
+    assert all(not Path(multi_modal_data[role]).exists() for role in expected_sources)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_regular_request_does_not_require_edit_fields(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(endpoint, data={"prompt": "A red fox.", "extra_params": json.dumps({"task": "t2va"})})
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    assert not engine.captured_latent_edit_source_bytes
+    for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+        assert role not in engine.captured_prompt.get("multi_modal_data", {})
 
 
 def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixture):
@@ -1631,7 +1646,10 @@ def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixt
     assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
-def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
+@pytest.mark.parametrize("architecture", ["WanPipeline", "SeedVR2Pipeline", "WanVACEPipeline"])
+def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client, architecture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = architecture
     response = test_client.post(
         "/v1/videos/sync",
         data={"prompt": "edit"},
@@ -1643,6 +1661,7 @@ def test_latent_edit_fields_are_rejected_for_models_without_capability(test_clie
 
     assert response.status_code == 400
     assert "not supported" in response.json()["detail"].lower()
+    assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize(

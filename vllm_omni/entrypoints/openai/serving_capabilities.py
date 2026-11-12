@@ -135,9 +135,17 @@ def _route_request(
     native_diffusion: bool,
 ) -> RequestConstraints | None:
     """Complete request facts for this adapter path, constructed only at startup."""
-    if profile.request is None or profile.support != "supported":
+    video_route = path in {"/v1/videos", "/v1/videos/sync", "/v1/realtime/video"}
+    if video_route:
+        if profile.support == "unsupported":
+            return None
+        # Checkpoint-dependent modes can still have known input facts, and
+        # transports can establish exclusions without a model declaration.
+        request = profile.request or RequestConstraints()
+    elif profile.request is None or profile.support != "supported":
         return None
-    request = profile.request
+    else:
+        request = profile.request
     inputs, parameters = dict(request.inputs), dict(request.parameters)
     mask = request.mask
     if path in {"/v1/images/generations", "/v1/images/edits"}:
@@ -180,7 +188,7 @@ def _route_request(
         request = request.model_copy(
             update={"max_output_pixels": output_maximum if type(output_maximum) is int and output_maximum > 0 else None}
         )
-    elif path in {"/v1/videos", "/v1/videos/sync", "/v1/realtime/video"}:
+    elif video_route:
         route_parameters = {
             "width": ParameterConstraint(support="supported", type="integer", minimum=1),
             "height": ParameterConstraint(support="supported", type="integer", minimum=1),
@@ -192,10 +200,18 @@ def _route_request(
         # These HTTP adapters do not map a last-image role to last_image in
         # multi_modal_data, even for native pipelines that support it offline.
         inputs["last_frame"] = InputConstraint(support="unsupported", max_count=0)
+        edit_roles = ("source_video", "video_noise_mask", "audio_noise_mask")
         if path == "/v1/realtime/video":
             if "image" in inputs:
-                inputs["image"] = InputConstraint(support="supported", min_count=inputs["image"].min_count, max_count=1)
-            for role in ("video", "audio"):
+                image = inputs["image"]
+                maximum = min(image.max_count, 1) if image.max_count is not None else 1
+                inputs["image"] = image.model_copy(update={"max_count": maximum})
+            for role in ("video", "audio", *edit_roles):
+                inputs[role] = InputConstraint(support="unsupported", max_count=0)
+        elif getattr(get_route_handler(state, path), "supports_latent_mask_editing", None) is False:
+            # This is the same gate used by the HTTP input validator. Opting
+            # in only preserves model facts; it cannot prove missing inputs.
+            for role in edit_roles:
                 inputs[role] = InputConstraint(support="unsupported", max_count=0)
     elif path == "/v1/audio/speech":
         parameters["response_format"] = ParameterConstraint(
