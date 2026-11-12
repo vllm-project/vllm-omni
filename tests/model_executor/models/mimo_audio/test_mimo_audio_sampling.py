@@ -89,7 +89,6 @@ def test_global_sampler_preserves_precision_and_filter_order(dtype: torch.dtype)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("batch_size", [1, 8])
 def test_local_sampler_cuda_replay(dtype: torch.dtype, batch_size: int) -> None:
