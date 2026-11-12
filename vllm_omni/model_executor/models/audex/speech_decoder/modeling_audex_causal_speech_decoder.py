@@ -202,6 +202,14 @@ class Attention(nn.Module):
                 # chunk and shares it across layers.
                 key_pos = torch.arange(k.size(2), device=x.device).view(1, 1, 1, -1)
                 attn_mask = key_pos <= input_pos.view(input_pos.size(0), 1, -1, 1)
+            elif attn_mask.size(-1) != k.size(2):
+                # The shared mask assumes every layer's cached length equals
+                # ``cache.position``, i.e. ``advance()`` runs exactly once after
+                # all layers appended. Fail loudly if that stops holding.
+                raise ValueError(
+                    f"attn_mask covers {attn_mask.size(-1)} keys but the cache holds {k.size(2)}; "
+                    "the shared mask requires advance() to run exactly once per chunk"
+                )
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.c_proj(y.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
 

@@ -61,9 +61,14 @@ def test_cache_grows_geometrically_and_keeps_values() -> None:
 
     buffer, _, used = cache.key_values[0]
     assert used == 16
-    # Geometric growth: capacity stays under 4x the data, unlike exact-fit growth
-    # which would reallocate on every chunk.
-    assert buffer.size(2) < 4 * used
+    # Geometric growth: an append that fits must reuse the same buffer. A
+    # capacity bound alone would also pass for exact-fit growth, which
+    # reallocates on every chunk.
+    assert buffer.size(2) > used
+    cache.update(0, torch.randn(1, 2, 2, 4), torch.randn(1, 2, 2, 4))
+    reused, _, used_after = cache.key_values[0]
+    assert reused.data_ptr() == buffer.data_ptr()
+    assert used_after == 18
     # Only the used prefix is exposed, and it matches the concatenation.
     returned_k, returned_v = cache.update(0, torch.zeros(1, 2, 0, 4), torch.zeros(1, 2, 0, 4))
     assert returned_k.size(2) == used == returned_v.size(2)
@@ -92,6 +97,11 @@ def test_one_causal_mask_per_chunk_regardless_of_depth(monkeypatch) -> None:
     x = torch.randn(1, 5, 32)
     cache = CausalCodecDecoderCache()
 
+    # Warm up RoPE: its first forward lazily builds theta and the cos/sin table,
+    # which costs two arange calls that are not per-chunk work.
+    with torch.no_grad():
+        backbone(torch.randn(1, 1, 32), cache=CausalCodecDecoderCache())
+
     calls = {"n": 0}
     original_arange = torch.arange
 
@@ -113,18 +123,26 @@ def test_attention_accepts_an_externally_built_mask() -> None:
     torch.manual_seed(0)
     rotary = RotaryPositionalEmbeddings(dim=8)
     attn = Attention(dim=16, n_heads=2, rotary_embed=rotary, layer_idx=0)
+    earlier = torch.randn(1, 2, 16)
     x = torch.randn(1, 3, 16)
+    earlier_pos = torch.arange(0, 2).unsqueeze(0)
     input_pos = torch.arange(2, 5).unsqueeze(0)
 
-    with torch.no_grad():
-        implicit = attn(x, cache=CausalCodecDecoderCache(), input_pos=input_pos)
-        key_pos = torch.arange(5).view(1, 1, 1, -1)
-        shared = attn(
-            x,
-            cache=CausalCodecDecoderCache(),
-            input_pos=input_pos,
-            attn_mask=key_pos <= input_pos.view(1, 1, -1, 1),
-            needed_len=5,
-        )
+    def _run(shared_mask: bool) -> torch.Tensor:
+        cache = CausalCodecDecoderCache()
+        with torch.no_grad():
+            # An external mask describes the whole cache, so fill the two earlier
+            # positions the way the backbone would have.
+            attn(earlier, cache=cache, input_pos=earlier_pos)
+            if not shared_mask:
+                return attn(x, cache=cache, input_pos=input_pos)
+            key_pos = torch.arange(5).view(1, 1, 1, -1)
+            return attn(
+                x,
+                cache=cache,
+                input_pos=input_pos,
+                attn_mask=key_pos <= input_pos.view(1, 1, -1, 1),
+                needed_len=5,
+            )
 
-    assert torch.allclose(implicit, shared, atol=1e-5)
+    assert torch.allclose(_run(False), _run(True), atol=1e-5)
