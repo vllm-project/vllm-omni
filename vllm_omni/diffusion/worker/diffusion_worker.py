@@ -712,10 +712,11 @@ class DiffusionWorker:
             max_num_batched_tokens = None
             if getattr(self.od_config, "is_moe", False) is True:
                 assert self.vllm_config is not None
-                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
-                    self.od_config,
-                    self.vllm_config,
-                )
+                if self.vllm_config.lora_config is not None:
+                    max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                        self.od_config,
+                        self.vllm_config,
+                    )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
