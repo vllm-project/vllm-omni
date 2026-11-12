@@ -47,6 +47,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.profiler import ProfilerActivity, profile
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -109,6 +110,7 @@ def _worker(
     warmup: int,
     iters: int,
     result_file: str,
+    init_method: str,
 ) -> None:
     label, ulysses_degree, allgather_degree, ulysses_mode = topology
 
@@ -117,15 +119,13 @@ def _worker(
             "RANK": str(rank),
             "LOCAL_RANK": str(rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12345",
         }
     )
     device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
     torch.set_default_dtype(dtype)
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=rank, distributed_init_method=init_method)
 
     parallel_config = DiffusionParallelConfig(
         pipeline_parallel_size=1,
@@ -266,6 +266,7 @@ def main() -> None:
                     args.warmup,
                     args.iters,
                     result_file,
+                    get_file_store_init_method(),
                 ),
                 nprocs=world_size,
                 join=True,

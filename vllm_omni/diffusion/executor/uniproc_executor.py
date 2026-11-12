@@ -30,6 +30,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.distributed.utils import get_diffusion_worker_init_method
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.platforms import current_omni_platform
 
@@ -72,6 +73,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             base_worker_class=resolve_obj_by_qualname(worker_cls_path),
             # Inline worker: do not overwrite the API-server process title.
             set_proc_title=False,
+            distributed_init_method=get_diffusion_worker_init_method(use_loopback=False),
         )
         logger.info("Diffusion worker initialized in-process (uniproc executor)")
 

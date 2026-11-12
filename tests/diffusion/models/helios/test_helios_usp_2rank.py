@@ -26,6 +26,7 @@ import tempfile
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -79,11 +80,6 @@ HIST_FRAMES = 1  # short history -> 6 tokens
 TEXT_LEN = 5
 
 
-def _update_env(envs_dict: dict[str, str]) -> None:
-    for k, v in envs_dict.items():
-        os.environ[k] = v
-
-
 def _make_inputs(device: torch.device) -> dict[str, torch.Tensor]:
     torch.manual_seed(RANDOM_SEED + 1)
     return {
@@ -119,22 +115,25 @@ def helios_forward_on_model(
     output_file: str,
     model_state_file: str,
     is_baseline: bool,
+    init_method: str,
 ) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
     torch.set_default_device(device)
     torch.set_default_dtype(DTYPE)
 
-    _update_env(
+    os.environ.update(
         {
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12361",
         }
     )
-    init_distributed_environment()
+    init_distributed_environment(
+        world_size=world_size,
+        rank=local_rank,
+        distributed_init_method=init_method,
+    )
 
     parallel_config = DiffusionParallelConfig(
         pipeline_parallel_size=1,
@@ -233,12 +232,12 @@ def test_helios_usp2_matches_single_rank():
     try:
         torch.multiprocessing.spawn(
             helios_forward_on_model,
-            args=(1, 1, baseline_output_file, model_state_file, True),
+            args=(1, 1, baseline_output_file, model_state_file, True, get_file_store_init_method()),
             nprocs=1,
         )
         torch.multiprocessing.spawn(
             helios_forward_on_model,
-            args=(2, 2, sp_output_file, model_state_file, False),
+            args=(2, 2, sp_output_file, model_state_file, False, get_file_store_init_method()),
             nprocs=2,
         )
 

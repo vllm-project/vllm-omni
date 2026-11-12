@@ -69,6 +69,33 @@ def executor(monkeypatch: pytest.MonkeyPatch):
     return UniProcDiffusionExecutor(_od_config(num_gpus=1)), worker
 
 
+def test_uniproc_worker_uses_selected_rendezvous(monkeypatch: pytest.MonkeyPatch):
+    """The inline worker must receive the executor-selected rendezvous."""
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.executor.uniproc_executor.current_omni_platform.get_diffusion_worker_cls",
+        MagicMock(return_value="vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker"),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.executor.uniproc_executor.resolve_obj_by_qualname",
+        MagicMock(return_value=object),
+    )
+    init_method = MagicMock(return_value="file:///tmp/vllm_dist_test")
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.executor.uniproc_executor.get_diffusion_worker_init_method",
+        init_method,
+    )
+    worker_wrapper = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase",
+        worker_wrapper,
+    )
+
+    UniProcDiffusionExecutor(_od_config(num_gpus=1))
+
+    init_method.assert_called_once_with(use_loopback=False)
+    assert worker_wrapper.call_args.kwargs["distributed_init_method"] == "file:///tmp/vllm_dist_test"
+
+
 def test_rejects_multi_gpu_config(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "vllm_omni.diffusion.executor.uniproc_executor.current_omni_platform.get_diffusion_worker_cls",

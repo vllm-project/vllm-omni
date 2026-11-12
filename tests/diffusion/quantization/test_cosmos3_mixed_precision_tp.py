@@ -46,7 +46,12 @@ def initialize_parallel(rank, init_method, topology):
 
     tp, sp, cfg = topology
     current_omni_platform.set_device(torch.device(f"cuda:{rank}"))
-    init_distributed_environment(tp * sp * cfg, rank, init_method, rank)
+    init_distributed_environment(
+        world_size=tp * sp * cfg,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=init_method,
+    )
     initialize_model_parallel(
         data_parallel_size=1,
         tensor_parallel_size=tp,

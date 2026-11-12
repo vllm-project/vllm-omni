@@ -60,20 +60,21 @@ def _reference_qwen3_moe(
 
 
 @pytest.fixture
-def cuda_vllm_env(monkeypatch):
+def cuda_vllm_env():
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-    monkeypatch.setenv("MASTER_ADDR", "localhost")
-    monkeypatch.setenv("MASTER_PORT", "29617")
     vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
     with set_current_vllm_config(vllm_config):
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method()
+        )
         initialize_model_parallel()
         # The modular FusedMoE kernel draws scratch buffers from here; the
         # diffusion worker initializes it at startup.

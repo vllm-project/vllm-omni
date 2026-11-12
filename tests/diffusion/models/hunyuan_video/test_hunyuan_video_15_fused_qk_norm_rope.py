@@ -3,7 +3,6 @@
 
 """HunyuanVideo 1.5 attention on the fused joint QK RMSNorm + RoPE op."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -35,13 +34,14 @@ def _dist_env():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29520")
     # vLLM 0.28+: parallel-state init, CustomOp construction and the linear
     # layers' forward all read the current vLLM config.
     with set_current_vllm_config(VllmConfig()):
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method()
+        )
         initialize_model_parallel()
         yield
         cleanup_dist_env_and_memory()

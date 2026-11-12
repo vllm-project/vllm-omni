@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.models.kandinsky6.modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 
@@ -80,12 +81,10 @@ def test_decode_still_applies_optimal_tiling_when_patch_parallel_is_on():
     assert tuple(out.sample.shape) == (1, 16, 8, 8, 12)
 
 
-def _patch_parallel_worker(rank: int, port: str, shapes: dict) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = port
+def _patch_parallel_worker(rank: int, init_method: str, shapes: dict) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = "2"
-    dist.init_process_group("gloo", rank=rank, world_size=2)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
     try:
         import vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor as executor_mod
 
@@ -111,8 +110,7 @@ def _patch_parallel_worker(rank: int, port: str, shapes: dict) -> None:
 def test_patch_parallel_decode_splits_tiles_across_ranks():
     manager = mp.Manager()
     shapes = manager.dict()
-    port = str(29500 + (os.getpid() % 1000))
-    mp.spawn(_patch_parallel_worker, args=(port, shapes), nprocs=2, join=True)
+    mp.spawn(_patch_parallel_worker, args=(get_file_store_init_method(), shapes), nprocs=2, join=True)
 
     assert shapes["widths"]
     assert max(shapes["widths"]) < shapes["full_width"]

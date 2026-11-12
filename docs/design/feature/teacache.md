@@ -337,17 +337,21 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.config import VllmConfig
+from vllm.utils.network_utils import get_file_store_init_method
 ...
 
 if __name__ == "__main__":
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "8192"
     os.environ["LOCAL_RANK"] = "0"
     os.environ["RANK"] = "0"
     os.environ["WORLD_SIZE"] = "1"
 
     vllm_config = VllmConfig()
-    init_distributed_environment()
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=get_file_store_init_method(),
+    )
     initialize_model_parallel()
 
     # NOTE: you may have to pass an initialized OmniDiffusionConfig as a kwarg

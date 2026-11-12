@@ -1,11 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
 import torch
+from vllm.utils.network_utils import (
+    aiter_requires_tcp_store,
+    get_distributed_init_method,
+    get_file_store_init_method,
+    get_ip,
+    get_loopback_ip,
+    get_open_port,
+)
 
 from vllm_omni.platforms import current_omni_platform
+
+
+def get_diffusion_worker_init_method(*, use_loopback: bool = True) -> str:
+    """Select a rendezvous for a local diffusion worker.
+
+    Mirror vLLM's executors: multiprocess workers use the loopback address,
+    while the in-process worker uses the host IP. FileStore avoids reserving a
+    TCP rendezvous port; AITER custom all-reduce requires a TCPStore, so use an
+    explicit TCP rendezvous when that implementation is in use.
+    """
+    if aiter_requires_tcp_store():
+        host = get_loopback_ip() if use_loopback else get_ip()
+        return get_distributed_init_method(host, get_open_port())
+    return get_file_store_init_method()
 
 
 def get_local_device() -> torch.device:

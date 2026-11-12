@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed import parallel_state
@@ -738,6 +739,7 @@ def _test_cfg_parallel_worker(
     cfg_parallel_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    init_method: str,
     result_queue: torch.multiprocessing.Queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -747,12 +749,10 @@ def _test_cfg_parallel_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29502",
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(cfg_parallel_size=cfg_parallel_size)
     assert get_classifier_free_guidance_world_size() == cfg_parallel_size
 
@@ -793,6 +793,7 @@ def _test_cfg_sequential_worker(
     world_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    init_method: str,
     result_queue: torch.multiprocessing.Queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -802,12 +803,10 @@ def _test_cfg_sequential_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29503",
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(cfg_parallel_size=1)
     assert get_classifier_free_guidance_world_size() == 1
 
@@ -849,6 +848,7 @@ def _test_multi_branch_parallel_worker(
     cfg_parallel_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    init_method: str,
     result_queue: torch.multiprocessing.Queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -858,12 +858,10 @@ def _test_multi_branch_parallel_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29504",
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(cfg_parallel_size=cfg_parallel_size)
     assert get_classifier_free_guidance_world_size() == cfg_parallel_size
 
@@ -903,6 +901,7 @@ def _test_multi_branch_sequential_worker(
     world_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    init_method: str,
     result_queue: torch.multiprocessing.Queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -912,12 +911,10 @@ def _test_multi_branch_sequential_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "29505",
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(cfg_parallel_size=1)
     assert get_classifier_free_guidance_world_size() == 1
 
@@ -977,15 +974,24 @@ def _run_two_branch_gpu_parity(
     with mp_context.Manager() as manager:
         baseline_queue = manager.Queue()
         cfg_parallel_queue = manager.Queue()
+        baseline_init_method = get_file_store_init_method()
+        parallel_init_method = get_file_store_init_method()
 
         torch.multiprocessing.spawn(
             _test_cfg_sequential_worker,
-            args=(1, dtype, test_config, baseline_queue),
+            args=(1, dtype, test_config, baseline_init_method, baseline_queue),
             nprocs=1,
         )
         torch.multiprocessing.spawn(
             _test_cfg_parallel_worker,
-            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+            args=(
+                cfg_parallel_size,
+                cfg_parallel_size,
+                dtype,
+                test_config,
+                parallel_init_method,
+                cfg_parallel_queue,
+            ),
             nprocs=cfg_parallel_size,
         )
 
@@ -1039,15 +1045,24 @@ def _run_multi_branch_gpu_parity(
     with mp_context.Manager() as manager:
         baseline_queue = manager.Queue()
         cfg_parallel_queue = manager.Queue()
+        baseline_init_method = get_file_store_init_method()
+        parallel_init_method = get_file_store_init_method()
 
         torch.multiprocessing.spawn(
             _test_multi_branch_sequential_worker,
-            args=(1, dtype, test_config, baseline_queue),
+            args=(1, dtype, test_config, baseline_init_method, baseline_queue),
             nprocs=1,
         )
         torch.multiprocessing.spawn(
             _test_multi_branch_parallel_worker,
-            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+            args=(
+                cfg_parallel_size,
+                cfg_parallel_size,
+                dtype,
+                test_config,
+                parallel_init_method,
+                cfg_parallel_queue,
+            ),
             nprocs=cfg_parallel_size,
         )
 

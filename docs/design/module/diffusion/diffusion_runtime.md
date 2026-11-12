@@ -325,7 +325,8 @@ and calls worker methods directly. It avoids a second model load, MessageQueue
 rings, ZMQ IPC sockets, and `/dev/shm` tensor packing. RPC timeouts are
 accepted for interface parity but are not enforced: a hung worker blocks the
 calling thread. Sticky accelerator faults mark the executor dead through
-failure callbacks; ordinary request errors stay per-request.
+failure callbacks; ordinary request errors stay per-request. It uses the same
+rendezvous selection as the multiproc backend.
 
 ### Multiproc backend
 
@@ -337,6 +338,11 @@ failure callbacks; ordinary request errors stay per-request.
 4. sends generation and control calls as RPC messages;
 5. applies rank-aware reply rules so only expected ranks respond; and
 6. monitors worker process sentinels and fails the executor if a worker dies.
+
+Local worker processes share one `FileStore` rendezvous in the system temp
+directory, so the default path reserves no TCP port. When ROCm AITER custom
+all-reduce is enabled, the executor uses an explicit TCP rendezvous instead
+because that implementation requires a `TCPStore`.
 
 In request mode on this backend, each async output produces two correlated
 messages keyed by `async_output_id`:

@@ -3,8 +3,6 @@
 
 """Z-Image attention on the fused single-stream QK RMSNorm + RoPE op."""
 
-import os
-
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
@@ -26,15 +24,16 @@ def _dist_env():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29519")
     config = VllmConfig()
     with (
         set_current_vllm_config(config),
         current_omni_platform.get_default_ir_op_priority(config).set_priority(),
     ):
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+        init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method()
+        )
         initialize_model_parallel()
         yield
         cleanup_dist_env_and_memory()

@@ -13,10 +13,10 @@ from typing import Literal
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -46,7 +46,7 @@ def _worker_device(local_rank: int, device_kind: DeviceKind) -> torch.device:
 def _init_worker(
     local_rank: int,
     world_size: int,
-    master_port: int,
+    init_method: str,
     device_kind: DeviceKind,
 ) -> None:
     _update_environment_variables(
@@ -54,14 +54,17 @@ def _init_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": str(master_port),
         }
     )
     if device_kind == "cpu":
         configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
-    init_distributed_environment(backend=backend)
+    init_distributed_environment(
+        world_size=world_size,
+        rank=local_rank,
+        backend=backend,
+        distributed_init_method=init_method,
+    )
 
 
 def _close_tolerance(dtype: torch.dtype) -> tuple[float, float]:
@@ -82,13 +85,13 @@ def _run_4d_identity(
     head_size: int,
     use_sync: bool,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
 
-    _init_worker(local_rank, world_size, master_port, device_kind)
+    _init_worker(local_rank, world_size, init_method, device_kind)
     initialize_model_parallel(ulysses_degree=world_size)
     sp_group = get_sp_group().ulysses_group
 
@@ -140,13 +143,13 @@ def _run_5d_identity(
     head_size: int,
     use_sync: bool,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
 
-    _init_worker(local_rank, world_size, master_port, device_kind)
+    _init_worker(local_rank, world_size, init_method, device_kind)
     initialize_model_parallel(ulysses_degree=world_size)
     sp_group = get_sp_group().ulysses_group
 
@@ -198,14 +201,14 @@ def _run_ring_p2p(
     num_heads: int,
     head_size: int,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
 
     try:
-        _init_worker(local_rank, world_size, master_port, device_kind)
+        _init_worker(local_rank, world_size, init_method, device_kind)
         initialize_model_parallel(ring_degree=world_size)
         sp_group = get_sp_group()
         comm = RingComm(sp_group.ring_group)
@@ -249,7 +252,7 @@ def _spawn_4d_identity(
     head_size: int,
     use_sync: bool,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     start_collective_workers(
         _run_4d_identity,
@@ -262,7 +265,7 @@ def _spawn_4d_identity(
             head_size,
             use_sync,
             device_kind,
-            master_port,
+            init_method,
         ),
         nprocs=world_size,
         device_kind=device_kind,
@@ -279,7 +282,7 @@ def _spawn_5d_identity(
     head_size: int,
     use_sync: bool,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     start_collective_workers(
         _run_5d_identity,
@@ -292,7 +295,7 @@ def _spawn_5d_identity(
             head_size,
             use_sync,
             device_kind,
-            master_port,
+            init_method,
         ),
         nprocs=world_size,
         device_kind=device_kind,
@@ -307,11 +310,11 @@ def _spawn_ring_p2p(
     num_heads: int,
     head_size: int,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     start_collective_workers(
         _run_ring_p2p,
-        args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, master_port),
+        args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, init_method),
         nprocs=world_size,
         device_kind=device_kind,
     )
@@ -349,7 +352,7 @@ def test_4d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=get_open_port(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -369,7 +372,7 @@ def test_5d_identity(world_size: int, use_sync: bool):
         head_size=32,
         use_sync=use_sync,
         device_kind="cpu",
-        master_port=get_open_port(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -385,7 +388,7 @@ def test_ring_p2p(world_size: int):
         num_heads=8,
         head_size=128,
         device_kind="cpu",
-        master_port=get_open_port(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -418,7 +421,7 @@ def test_4d_identity_parity(world_size: int, dtype: torch.dtype, use_sync: bool)
         head_size=32,
         use_sync=use_sync,
         device_kind="cuda",
-        master_port=29500,
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -446,7 +449,7 @@ def test_5d_identity_parity(world_size: int, dtype: torch.dtype, use_sync: bool)
         head_size=32,
         use_sync=use_sync,
         device_kind="cuda",
-        master_port=29502,
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -470,7 +473,7 @@ def test_ring_p2p_parity(world_size: int, dtype: torch.dtype):
         num_heads=8,
         head_size=128,
         device_kind="cuda",
-        master_port=29501,
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -478,7 +481,7 @@ def _run_fused_qkv_matches_three_4d(
     local_rank: int,
     world_size: int,
     device_kind: DeviceKind,
-    master_port: int,
+    init_method: str,
 ) -> None:
     """LingBot's fused (B, S/N, 3, H, D) exchange must equal three per-tensor 4D exchanges."""
     from vllm_omni.diffusion.distributed.comm import all_to_all_5D
@@ -486,7 +489,7 @@ def _run_fused_qkv_matches_three_4d(
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
-    _init_worker(local_rank, world_size, master_port, device_kind)
+    _init_worker(local_rank, world_size, init_method, device_kind)
     initialize_model_parallel(ulysses_degree=world_size)
     sp_group = get_sp_group().ulysses_group
     try:
@@ -512,7 +515,7 @@ def _run_fused_qkv_matches_three_4d(
 def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) -> None:
     start_collective_workers(
         _run_fused_qkv_matches_three_4d,
-        args=(world_size, "cpu", 29613),
+        args=(world_size, "cpu", get_file_store_init_method()),
         nprocs=world_size,
         device_kind="cpu",
     )

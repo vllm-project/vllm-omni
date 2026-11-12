@@ -17,15 +17,13 @@ def _init_distributed():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
-    from tests.helpers.runtime import assign_ephemeral_master_port
-
-    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="env://",
+        distributed_init_method=get_file_store_init_method(),
     )
     initialize_model_parallel()
     yield

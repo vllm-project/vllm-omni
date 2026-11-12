@@ -8,7 +8,6 @@ A tiny ``WanTransformer3DModel`` runs its real ``forward``: every block gets the
 ``dynamic=True``, as the model runner does. Attention runs the production SDPA math on CPU.
 """
 
-import socket
 from typing import Any
 
 import pytest
@@ -21,6 +20,7 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.model_executor.layers.utils import default_unquantized_gemm
+from vllm.utils.network_utils import get_file_store_init_method
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 import vllm_omni.diffusion.models.wan2_2.wan2_2_transformer as wan_mod
@@ -55,11 +55,8 @@ def wan_env(monkeypatch):
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
     init_distributed_environment(
-        world_size=1, rank=0, local_rank=0, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
+        world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method(), backend="gloo"
     )
     initialize_model_parallel()
     monkeypatch.setattr(wan_mod, "get_pipeline_parallel_world_size", lambda: 1)

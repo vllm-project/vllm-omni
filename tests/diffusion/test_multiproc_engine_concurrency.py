@@ -1563,6 +1563,7 @@ class TestExecutorShutdownCleaner:
                 pipe_writer=Mock(),
                 broadcast_handle=None,
                 wake_event=Mock(),
+                distributed_init_method="file:///tmp/vllm_dist_test",
             )
 
         assert events == [

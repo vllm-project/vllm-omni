@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Captured Qwen3-Omni audio encoder graphs replay the eager tower on CUDA."""
 
-import socket
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from vllm.utils.network_utils import get_file_store_init_method
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from tests.helpers.mark import hardware_marks
@@ -76,12 +76,9 @@ def _parallel_state():
         yield
         return
     previous_device = torch.accelerator.current_device_index()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
     torch.accelerator.set_device_index(0)
     parallel_state.init_distributed_environment(
-        world_size=1, rank=0, local_rank=0, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="nccl"
+        world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method(), backend="nccl"
     )
     with set_current_vllm_config(VllmConfig()):
         parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)

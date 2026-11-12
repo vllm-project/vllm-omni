@@ -42,6 +42,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion import forward_context
@@ -1063,6 +1064,9 @@ def test_sequence_parallel(
         input_data_file = tmp_file.name
 
     try:
+        baseline_init_method = get_file_store_init_method()
+        sp_init_method = get_file_store_init_method()
+
         # Step 1: Run without SP (baseline with ulysses_degree=1, ring_degree=1)
         print("\n[Baseline] Running without SP (ulysses_degree=1, ring_degree=1)...")
         torch.multiprocessing.spawn(
@@ -1088,6 +1092,7 @@ def test_sequence_parallel(
                 model_state_file,
                 input_data_file,
                 True,  # is_baseline
+                baseline_init_method,
             ),
             nprocs=1,
         )
@@ -1120,6 +1125,7 @@ def test_sequence_parallel(
                 model_state_file,
                 input_data_file,
                 False,  # is_baseline
+                sp_init_method,
             ),
             nprocs=sequence_parallel_size,
         )
@@ -1217,6 +1223,7 @@ def ulysses_attention_on_test_model(
     model_state_file: str,
     input_data_file: str,
     is_baseline: bool,
+    init_method: str,
 ):
     """Run Ulysses attention test on a test model and save results for comparison."""
     # Use fixed seed for reproducibility across baseline and SP runs
@@ -1237,12 +1244,10 @@ def ulysses_attention_on_test_model(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12345",
         }
     )
     # Initialize distributed environment
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
 
     # Set up OmniDiffusionConfig with parallel config
     parallel_config = DiffusionParallelConfig(
@@ -1412,6 +1417,7 @@ def _packed_fa_worker(
     head_size: int,
     dtype: torch.dtype,
     output_file: str,
+    init_method: str,
 ):
     """Run packed FlashAttention varlen with or without AllGather-KV SP.
 
@@ -1432,11 +1438,9 @@ def _packed_fa_worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12347",
         }
     )
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
 
     total = docs[-1]
     local_len = total // world_size
@@ -1529,18 +1533,20 @@ def test_packed_allgather_matches_unsplit_flash_varlen():
     with tempfile.TemporaryDirectory() as tmpdir:
         base_file = os.path.join(tmpdir, "baseline.pkl")
         sp_file = os.path.join(tmpdir, "sp.pkl")
+        baseline_init_method = get_file_store_init_method()
+        sp_init_method = get_file_store_init_method()
 
         # Baseline: single rank, no SP, global packed metadata as-is.
         torch.multiprocessing.spawn(
             _packed_fa_worker,
-            args=(1, docs, num_heads, head_size, torch.bfloat16, base_file),
+            args=(1, docs, num_heads, head_size, torch.bfloat16, base_file, baseline_init_method),
             nprocs=1,
         )
         # SP: two ranks with allgather_degree=2, each feeding its shard with
         # the producer's *global* packed metadata.
         torch.multiprocessing.spawn(
             _packed_fa_worker,
-            args=(2, docs, num_heads, head_size, torch.bfloat16, sp_file),
+            args=(2, docs, num_heads, head_size, torch.bfloat16, sp_file, sp_init_method),
             nprocs=2,
         )
 

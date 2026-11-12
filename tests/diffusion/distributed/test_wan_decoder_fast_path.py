@@ -14,7 +14,6 @@ worst output error and the aggregate RMS error instead.
 from __future__ import annotations
 
 import copy
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +24,8 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanCausalConv3d,
     WanDecoder3d,
 )
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import (
     install_wan_decoder_fast_path,
 )
@@ -181,14 +180,12 @@ def test_fused_level_plumbing_on_cpu(autocast: bool, norm: str) -> None:
 def _sharded_worker(
     rank: int,
     world_size: int,
-    port: str,
+    init_method: str,
     autocast: bool,
     return_dict,
     level: str = "exact",
 ) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = port
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
     try:
         torch.manual_seed(0)
         reference = _make_vae()
@@ -211,12 +208,12 @@ def _sharded_worker(
 def test_sharded_fast_path_on_every_rank(autocast: bool, level: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
-    # Ranks of this test share one port. A fixed offset collides with other
-    # files that also listen on 29610 while xdist runs them together.
-    port = str(get_open_port())
+    # Every rank must join the same rendezvous; a FileStore path avoids
+    # reserving a TCP port that another test could take concurrently.
+    init_method = get_file_store_init_method()
     mp.spawn(
         _sharded_worker,
-        args=(2, port, autocast, return_dict, level),
+        args=(2, init_method, autocast, return_dict, level),
         nprocs=2,
         join=True,
     )

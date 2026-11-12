@@ -36,7 +36,12 @@ def _run_hsdp(rank, world_size, init_method, fmt, backend, parallel):
     from vllm_omni.platforms import current_omni_platform
 
     current_omni_platform.set_device(torch.device(f"cuda:{rank}"))
-    init_distributed_environment(world_size, rank, init_method, rank)
+    init_distributed_environment(
+        world_size=world_size,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=init_method,
+    )
     replicas = 2 if parallel == "replicated" else 1
     shard_size = world_size // replicas
     config = VllmConfig()

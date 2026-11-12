@@ -52,7 +52,7 @@ class _Pipeline(torch.nn.Module):
 
 @pytest.fixture
 def runtime(monkeypatch):
-    def init_cpu(worker):
+    def init_cpu(worker, *, distributed_init_method: str):
         worker.device = torch.device("cpu")
         worker.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
 
