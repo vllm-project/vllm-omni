@@ -1118,12 +1118,11 @@ def llm2tts(
             # the first text token when no marker is emitted) is fed back but
             # is not part of total_hidden_in_unit; TTS conditions on the
             # tokens after it, up to the chunk terminator. <|turn_eos|> is not
-            # a chunk terminator: it is fed like text, its hidden state is
-            # handed to the Talker, and anything sampled after it is a stale
-            # tail that must not enter TTS.
+            # a chunk terminator: it and any subsequent tokens in this unit
+            # are forwarded and handed to the Talker. Later text or speak
+            # decisions reopen the turn, just as in streaming_generate.
             out_ids = llm_output_ids
             listen_id = special_token_ids.get("listen_token_id")
-            turn_eos_id = special_token_ids.get("turn_eos_token_id")
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
@@ -1145,9 +1144,6 @@ def llm2tts(
                 out_end = len(out_ids)
                 for idx_t in range(out_start, len(out_ids)):
                     token_id = out_ids[idx_t]
-                    if turn_eos_id is not None and token_id == turn_eos_id:
-                        out_end = idx_t + 1
-                        break
                     if token_id in tts_end_ids:
                         out_end = idx_t
                         native_segment_end = token_id in {
@@ -1166,7 +1162,7 @@ def llm2tts(
                         request_id=str(llm_output.request_id),
                     )
                 elif native_segment_end:
-                    # A held turn_eos can leave just speak + chunk_eos. This
+                    # A speech unit can contain just speak + chunk_eos. This
                     # still owns a segment boundary: dropping it would leave
                     # the runtime waiting for TTS before the next silence unit.
                     # Talker's empty-condition path emits no audio and closes
@@ -1186,8 +1182,7 @@ def llm2tts(
                 # text comes from total_ids_in_unit, the same slice that
                 # conditions the Talker.
                 thinker_text = handoff_text
-                # The sentence-end check reads the same slice, so text sampled
-                # after <|turn_eos|> (dropped above) does not decide it.
+                # The sentence-end check reads the same complete unit slice.
                 _native_duplex_append_turn_text(
                     _streaming_context, request_id=str(llm_output.request_id), text=handoff_text
                 )
@@ -1215,8 +1210,8 @@ def llm2tts(
                 ]
             )
             if turn_eos_id is not None:
-                # The talker detects turn end from <|turn_eos|> inside the
-                # handed condition (official conditions on its embedding).
+                # The Talker retains the EOS embedding in its condition, but
+                # only a condition ending in EOS closes the turn.
                 meta["turn_eos_token_id"] = int(turn_eos_id)
             meta["turn_start"] = native_turn_start
             if native_segment_end:
@@ -1238,7 +1233,7 @@ def llm2tts(
         turn_text_ends_sentence = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
-            native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
+            native_turn_end_handoff = bool(handoff_ids and handoff_ids[-1] == turn_eos_id)
             if handoff_ids is None:
                 continue
         set_tts_handoff(
