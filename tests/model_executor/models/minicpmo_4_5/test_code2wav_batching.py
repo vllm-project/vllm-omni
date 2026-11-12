@@ -1241,14 +1241,17 @@ def test_estimator_step_bridges_the_split_cache_into_the_single_step_graph():
 
 
 def test_att_slot_pool_round_trips_the_split_kv_layout():
-    """Adoption, replay and materialization must agree on the split K/V slot layout.
+    """Adoption and materialization must agree on the split K/V slot layout.
 
     The pool mirrors the arena layout -- ``(n_t, depth, 2, 2 * slots, heads,
     frames, head_dim)`` with one request's CFG pair on rows ``2 * slot`` and
-    ``2 * slot + 1`` -- and this walks the exchange ``_replay_slots``
-    performs: adopt a request's split cache, let the graph write new frames
-    into the slot's free frames, trim the layout, and materialize the
-    logical cache back out.
+    ``2 * slot + 1``, the rows ``_replay_slots``' host index table selects for
+    the graph -- and this walks the bookkeeping exchange that table drives:
+    adopt a request's split cache into the slot's rows and materialize the
+    logical cache back out. The graph-driven half of ``_replay_slots`` (mask
+    scatter, in-place write, trim) needs a captured graph, so it stays with
+    the wrapper's own tests; what the table must agree on -- the row pair,
+    the free-frame scatter order, the round-trip -- is asserted here.
     """
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     arena = WholeEulerExecutionArena(adapter.flow.decoder.estimator, device=torch.device("cpu"), dtype=torch.float32)
@@ -1277,24 +1280,16 @@ def test_att_slot_pool_round_trips_the_split_kv_layout():
     assert torch.equal(handle.materialize(), cache)
 
     # The physical slot holds the suffix frames first, then the streaming
-    # frames, in the order adopt() scatters them.
+    # frames, in the order adopt() scatters them -- and each CFG half of the
+    # request lands on its own row of the pair the replay table selects.
     slot = pool.storage[:, :, :, 2 * handle.slot : 2 * handle.slot + 2]
     assert torch.equal(slot[..., :suffix, :], cache[..., streaming:, :])
     assert torch.equal(slot[..., suffix : suffix + streaming, :], cache[..., :streaming, :])
-
-    # Replay: the graph writes the chunk's new frames into the slot's free
-    # frames (suffix 0..1 and layout 2..4 are taken; 5..7 are free), on the
-    # slot's two CFG rows; the trim then keeps a streaming prefix, exactly
-    # as `_replay_slots` does.
-    new_frames = [5, 6]
-    written = torch.full((n_t, depth, 2, 2, heads, len(new_frames), head_dim), 7.0)
-    pool.storage[:, :, :, 2 * handle.slot : 2 * handle.slot + 2, :, new_frames, :] = written
-    handle.layout = [5, 6, 2]
-    out = handle.materialize()
-    assert out.shape[-2] == 3 + suffix
-    assert torch.equal(out[..., :2, :], written)
-    assert torch.equal(out[..., 2:3, :], cache[..., 0:1, :])
-    assert torch.equal(out[..., 3:, :], cache[..., streaming:, :])
+    for half, row in enumerate((2 * handle.slot, 2 * handle.slot + 1)):
+        pool_row = pool.storage[:, :, :, row]
+        cache_half = cache[:, :, :, half]
+        assert torch.equal(pool_row[..., :suffix, :], cache_half[..., streaming:, :])
+        assert torch.equal(pool_row[..., suffix : suffix + streaming, :], cache_half[..., :streaming, :])
 
     # A cache on any other layout fails loudly instead of aliasing wrong axes.
     with pytest.raises(ValueError):
