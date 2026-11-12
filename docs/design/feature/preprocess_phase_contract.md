@@ -175,12 +175,15 @@ prefill shapes: floating-point reduction differences can change an argmax and
 diverge in subsequent autoregressive steps. Invariant kernels keep this exact
 generated-code comparison focused on the phase contract. The two engines must
 be initialized separately because their chunking settings and token budgets
-differ. On platforms where separately initialized BF16 code2wav engines are
-not waveform-bitwise deterministic, exact codes remain mandatory and the
-waveforms must retain the same shape while satisfying explicit maximum-error
-and signal-to-noise bounds. Those bounds guard the downstream decoder without
-mistaking low-amplitude cross-instance numeric drift for a prefill-routing
-failure. GPU tests belong under `tests/e2e/features/`; existing model tests
+differ. For this regression on ROCm, the code2wav stage uses FP32 because
+independent BF16 decoders can exceed the waveform bounds for identical codec
+tokens. The talker retains its deployment dtype, and exact generated codes
+remain mandatory. Waveforms must retain the same shape and satisfy the existing
+maximum-error and signal-to-noise bounds; the test records its decoder dtype
+override in the evidence artifact. This test-specific precision setting does
+not change deployment defaults or the separate BF16 CustomVoice E2E coverage.
+CUDA retains its deployment dtype and strict waveform comparison.
+GPU tests belong under `tests/e2e/features/`; existing model tests
 remain useful adjacent regression coverage. Functional audio checks do not
 establish throughput or all-model semantic parity; this change makes no
 performance claim.

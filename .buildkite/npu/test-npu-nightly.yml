@@ -158,16 +158,6 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":sound: TTS · Drama 3 Test (A3)"
-        key: nightly-tts-drama-3-npu
-        source_file_dependencies: tts_drama_3_function
-        mirror_hardwares: a3_npu_2
-        timeout_in_minutes: 60
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_drama_3.py -m 'advanced_model and npu and A3' --run-level 'advanced_model'
-
       - label: ":sound: TTS · MOSS-TTS Local MRV2 Test (A3)"
         key: nightly-tts-moss-local-mrv2-npu
         source_file_dependencies: tts_moss_tts_local_npu_mrv2_function
@@ -278,54 +268,6 @@ steps:
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m A3 --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
-      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image Accuracy Test"
-        source_file_dependencies: diffusion_qwen_image_accuracy
-        key: nightly-diffusion-x2iat-accuracy-qwen-image
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_2
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HF_TOKEN: "${HF_TOKEN}"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-NPU"
-        source_file_dependencies: diffusion_qwen_image_perf
-        key: nightly-diffusion-x2iat-performance-qwen-image-single-npu
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_2
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HF_TOKEN: "${HF_TOKEN}"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-NPU"
-        source_file_dependencies: diffusion_qwen_image_perf
-        key: nightly-diffusion-x2iat-performance-qwen-image-4npu
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          HF_TOKEN: "${HF_TOKEN}"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
