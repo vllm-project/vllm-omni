@@ -865,6 +865,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         is_segment_finished: bool | None = False,
         new_prompt_len_snapshot: int | None = None,
         num_generation_tokens: int | None = None,
+        error: Any = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
         pooling_output_payload = None
@@ -893,6 +894,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             is_segment_finished=is_segment_finished,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
             num_generation_tokens=num_generation_tokens,
+            error=error,
         )
 
     def _append_request_output(
@@ -1011,11 +1013,24 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         return True
 
     def _finish_error_requests(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
-        """Drain grammar-compilation and unavailable-encoder errors into terminal outputs."""
+        """Drain grammar and encoder-cache errors into terminal outputs."""
+        # Pin types this as dict[str, RequestError] and copies the payload onto
+        # EngineCoreOutput.error. Snapshot first: replacing the attribute drops
+        # the dict the caller still needs for the error field.
         grammar_error_reqs = getattr(self, "grammar_compile_error_reqs", None)
-        error_req_ids = set(grammar_error_reqs or ())
-        if grammar_error_reqs:
-            grammar_error_reqs.clear()
+        if grammar_error_reqs is not None and not isinstance(grammar_error_reqs, dict):
+            raise TypeError(
+                "grammar_compile_error_reqs must be a dict of RequestError values, "
+                f"got {type(grammar_error_reqs).__name__}"
+            )
+        request_errors: dict[str, Any] = dict(grammar_error_reqs) if isinstance(grammar_error_reqs, dict) else {}
+        if isinstance(grammar_error_reqs, dict):
+            self.grammar_compile_error_reqs: dict[str, Any] = {}
+        error_req_ids = set(request_errors)
+        encoder_cache_mismatch_reqs = getattr(self, "encoder_cache_mismatch_reqs", None)
+        if encoder_cache_mismatch_reqs:
+            error_req_ids.update(encoder_cache_mismatch_reqs)
+            encoder_cache_mismatch_reqs.clear()
         ec_connector = getattr(self, "ec_connector", None)
         if ec_connector is not None:
             error_req_ids.update(ec_connector.take_unavailable_requests())
@@ -1027,6 +1042,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                     request,
                     new_token_ids=[],
                     finish_reason=request.get_finished_reason(),
+                    error=request_errors.get(request.request_id),
                 )
 
     def _remove_stopped_requests_from_queues(

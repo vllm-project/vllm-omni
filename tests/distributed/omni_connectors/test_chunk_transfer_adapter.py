@@ -224,6 +224,29 @@ def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> Simpl
     )
 
 
+@pytest.mark.parametrize("stale_token_ids", [[0], [9] * 256])
+def test_refresh_generation_chunk_prefill_state_replaces_stale_token_mirrors(stale_token_ids) -> None:
+    prompt_token_ids = list(range(187))
+    all_token_ids = list(stale_token_ids)
+    request = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        _all_token_ids=all_token_ids,
+        all_token_ids=ConstantList(all_token_ids),
+        _output_token_ids=[7, 8],
+        num_prompt_tokens=len(stale_token_ids),
+        prefill_stats=None,
+    )
+
+    OmniChunkTransferAdapter._refresh_generation_chunk_prefill_state(request)
+
+    assert request._all_token_ids is all_token_ids
+    assert request._all_token_ids == prompt_token_ids
+    assert list(request.all_token_ids) == prompt_token_ids
+    assert request._output_token_ids == []
+    assert request.num_prompt_tokens == len(prompt_token_ids)
+    assert isinstance(request.prefill_stats, PrefillStats)
+
+
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
     request = SimpleNamespace(
         _all_token_ids=[0, 0, 7, 8],
@@ -2859,6 +2882,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler._first_chunk_express = False
     scheduler.aux_output_connector = None
     scheduler._express_min_slack_s = 0.0
@@ -2943,6 +2967,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.aux_output_connector = None
     scheduler.chunk_transfer_adapter = adapter_mock
     bind_omits_transfer_helpers(scheduler)
@@ -3457,6 +3482,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler.grammar_compile_error_reqs = {}
     scheduler.chunk_transfer_adapter = adapter_mock
     scheduler.connector = None
     scheduler.ec_connector = None
