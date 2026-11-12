@@ -118,10 +118,13 @@ class MixFusionChunkOutputs:
 
     The packed-path counterpart of an ``_sp_plan`` ``split_output`` boundary:
     the module still receives the per-request latent list, so each request's
-    call sees its own geometry. ``per_request_args`` are sliced per request
-    (a per-request list gives its item as a batch of one, a per-image tensor
-    its row); every other argument is passed through unchanged. ``outputs``
-    says how each returned value is combined, in return order.
+    call sees its own geometry. ``per_request_args`` are sliced per request:
+    a per-request list (outer length = request count) gives its item as a
+    batch of one, and a tensor whose leading dim equals the request count
+    gives its row. This layout family is one image per request; per-image-row
+    values are not supported. Every other argument is passed through
+    unchanged. ``outputs`` says how each returned value is combined, in
+    return order.
     """
 
     per_request_args: tuple[str, ...]

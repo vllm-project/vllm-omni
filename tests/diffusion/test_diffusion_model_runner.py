@@ -1838,12 +1838,12 @@ def test_preparation_failure_recomputes_layout_for_surviving_request():
     previous = adapter.pack_inputs(
         transformer,
         signature.bind([torch.zeros(1, 8, 4), torch.zeros(1, 12, 4)], torch.zeros(2, 3, 4)),
-        cache=None,
+        adapter_state=None,
     )
     actual = adapter.pack_inputs(
         transformer,
         signature.bind(batch.latents, torch.zeros(1, 3, 4)),
-        cache=previous,
+        adapter_state=previous.adapter_state,
     )
     assert previous.plan.chunk_size == 4
     assert actual.plan.chunk_size == 12 and actual.plan.num_chunks == 1

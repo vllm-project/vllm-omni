@@ -16,6 +16,7 @@ inert unless a ``mixfusion_step`` is armed.
 from __future__ import annotations
 
 import inspect
+from typing import Any
 
 import torch
 from torch import nn
@@ -26,7 +27,6 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
-from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import expand_per_chunk
 from vllm_omni.diffusion.mixfusion.plan import (
     ChunkedOutput,
@@ -76,10 +76,14 @@ class MixFusionRootHook(ModelHook):
 
     def __init__(self, adapter) -> None:
         self._adapter = adapter
-        # Previous bundle per CFG branch: sequential true-CFG interleaves the
-        # positive and negative calls within one step. The adapter revalidates
-        # the layout key, so a stale entry is a miss, never a wrong reuse.
-        self._cached: dict[str | None, PackedInputs] = {}
+        # Previous adapter state per CFG branch: sequential true-CFG interleaves
+        # the positive and negative calls within one step. Only the opaque
+        # step-invariant state (layout key + reusable plan) is retained; the
+        # inputs themselves stay on the armed step, so completed, cancelled or
+        # idle requests are released when the step ends. The adapter
+        # revalidates the layout key, so a stale entry is a miss, never a
+        # wrong reuse.
+        self._cached: dict[str | None, Any] = {}
 
     def pre_forward(self, module, *args, **kwargs):
         step = _active_step()
@@ -87,8 +91,8 @@ class MixFusionRootHook(ModelHook):
             return args, kwargs
         bound = inspect.signature(module.forward).bind(*args, **kwargs)
         branch = getattr(module, "cfg_branch", None)
-        packed = self._adapter.pack_inputs(module, bound, cache=self._cached.get(branch))
-        self._cached[branch] = packed
+        packed = self._adapter.pack_inputs(module, bound, adapter_state=self._cached.get(branch))
+        self._cached[branch] = packed.adapter_state
         step.plan = packed.plan
         step.packed = packed
         return packed.args, packed.kwargs
@@ -223,7 +227,10 @@ def _slice_request(value, req_idx: int, num_requests: int):
         return item if isinstance(item, torch.Tensor) else [item]
     if isinstance(value, torch.Tensor) and value.shape[0] == num_requests:
         return value[req_idx : req_idx + 1]
-    raise ValueError("MixFusion per-request argument must be a per-request list or a [num_requests, ...] tensor.")
+    raise ValueError(
+        "MixFusion per-request argument must be a per-request list or a tensor whose leading dim is the "
+        "request count (this layout family has one image per request)."
+    )
 
 
 def _chunk_stack(values, seq_dim: int, plan) -> torch.Tensor:

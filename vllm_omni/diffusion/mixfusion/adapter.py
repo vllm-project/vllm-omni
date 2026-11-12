@@ -63,7 +63,9 @@ class PackedInputs:
 
     ``boundary_outputs`` replaces the outputs of boundaries only the adapter
     can compute; ``adapter_state`` carries adapter-private reuse data for the
-    next step. Both are opaque to the framework.
+    next step (step-invariant layout only — it must not reference the input
+    latents, text embeddings or masks, which live on the active step). Both
+    are opaque to the framework.
     """
 
     args: tuple[Any, ...]
@@ -85,12 +87,13 @@ class MixFusionAdapter(Protocol):
         """Raise when runtime inputs disagree with the scheduled packed contract."""
         ...
 
-    def pack_inputs(self, module: nn.Module, bound: Any, *, cache: PackedInputs | None) -> PackedInputs:
+    def pack_inputs(self, module: nn.Module, bound: Any, *, adapter_state: Any | None) -> PackedInputs:
         """Rewrite the bound forward call into the packed layout.
 
         ``bound`` is an :class:`inspect.BoundArguments` over the model's
-        forward. ``cache`` is this branch's bundle from the previous step (or
-        ``None``); use it to skip step-invariant work.
+        forward. ``adapter_state`` is this branch's value from the previous
+        step's ``PackedInputs`` (or ``None``); it holds only step-invariant
+        layout data, so reusing it must never keep inputs alive.
         """
         ...
 

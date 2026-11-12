@@ -81,6 +81,12 @@ def prepare_image_request(
     width = sampling.width or config.default_sample_size * config.vae_scale_factor
     h, w = image_token_grid(height, width, config.vae_scale_factor, config.patch_size)
     num_images = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+    if num_images != 1:
+        # The shared chunked adapter slices one image per request: per-request
+        # arguments are either a list indexed by request or a tensor whose
+        # leading dim equals the request count. Multi-output requests keep
+        # ordinary dense admission until per-image-row slicing semantics exist.
+        return None
     negative = isinstance(prompt, dict) and prompt.get("negative_prompt") is not None
     true_cfg = (sampling.true_cfg_scale or config.default_true_cfg_scale) > 1 and negative
     return MixFusionRequestInfo(num_images, h * w, min_chunk_tokens, max_chunks, condition_key=(true_cfg,))

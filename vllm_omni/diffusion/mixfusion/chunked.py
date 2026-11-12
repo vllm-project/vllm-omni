@@ -51,13 +51,13 @@ class ChunkedJointAdapter:
             if getattr(input_batch, name, None) is not None:
                 raise ValueError(f"Scheduled MixFusion batch contains unsupported {name}")
 
-    def pack_inputs(self, module: nn.Module, bound: Any, *, cache: PackedInputs | None) -> PackedInputs:
+    def pack_inputs(self, module: nn.Module, bound: Any, *, adapter_state: Any | None) -> PackedInputs:
         """Build (or reuse) the plan; the call itself is left unchanged.
 
         The per-request latent list stays in place for the chunk-outputs
         boundary, which is its first consumer in ``forward``. The plan depends
-        only on the request shapes and text lengths, so a matching ``cache``
-        from the previous step skips the rebuild.
+        only on the request shapes and text lengths, so a matching
+        ``adapter_state`` from the previous step skips the rebuild.
         """
         latents = bound.arguments[self.root.ragged_arg]
         text = bound.arguments[self.root.text_arg]
@@ -70,8 +70,8 @@ class ChunkedJointAdapter:
         padded = int(text.shape[1])
         real_lens = [padded] * len(rows) if mask is None else [int(n) for n in mask.sum(dim=1).tolist()]
         key = (tuple(tuple(sample.shape) for sample in latents), tuple(text.shape), tuple(real_lens))
-        if cache is not None and cache.adapter_state is not None and cache.adapter_state[0] == key:
-            plan = cache.adapter_state[1]
+        if adapter_state is not None and adapter_state[0] == key:
+            plan = adapter_state[1]
         else:
             # Derive the layout from this step's actual prepared batch. Adding or
             # removing requests can change the GCD, including preparation failures.

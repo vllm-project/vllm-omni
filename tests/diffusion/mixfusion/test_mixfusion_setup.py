@@ -173,10 +173,10 @@ def test_image_request_declaration_resolves_loaded_attributes_without_model_call
     request = OmniDiffusionRequest(
         request_id="different-layout",
         prompt="image",
-        sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=2),
+        sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=1),
     )
     prepare_mixfusion_admission(Engine(), request)
-    assert (request.mixfusion_info.num_images, request.mixfusion_info.image_tokens) == (2, 4096)
+    assert (request.mixfusion_info.num_images, request.mixfusion_info.image_tokens) == (1, 4096)
 
 
 def test_declared_runtime_mode_disables_packing_before_admission():

@@ -129,10 +129,16 @@ def test_continuous_admission_checks_cached_and_new_requests_and_completion():
     assert set(scheduler.schedule().scheduled_request_ids) == {"a", "c"}
 
 
-def test_per_request_multi_image_limits_are_aggregated():
+def test_multi_output_requests_keep_dense_admission():
+    # The shared chunked adapter slices one image per request; per-image-row
+    # values have no request-index mapping, so multi-output requests stay
+    # dense until that slicing semantics exists.
     a = _request("a", num_outputs_per_prompt=2)
-    b = _request("b", 768, 1024, num_outputs_per_prompt=2, extra_args={"mixfusion_max_chunks": 13})
-    assert _scheduler(a, b).schedule().scheduled_request_ids == ["a"]  # 8 + 6 chunks > 13
+    b = _request("b", 768, 1024, num_outputs_per_prompt=2)
+    assert a.mixfusion_info is None and b.mixfusion_info is None
+    output = _scheduler(a, b).schedule()
+    assert output.scheduled_request_ids == ["a"]
+    assert not output.use_mixfusion
 
 
 def test_cfg_branches_are_part_of_packing_compatibility():

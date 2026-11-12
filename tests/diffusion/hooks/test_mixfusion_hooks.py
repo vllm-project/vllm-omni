@@ -10,7 +10,10 @@ chunk layout, and verify:
 
 - hooks are inert without an armed ``mixfusion_step`` (serial path unchanged);
 - the root hook binds the forward call, delegates packing to the adapter,
-  caches its bundle per CFG branch and restores the per-request output list;
+  passes the step-invariant adapter state per CFG branch, reuses plans across
+  steps and restores the per-request output list;
+- a completed step releases its packed inputs: only layout state survives;
+- per-request arguments are sliced per request, with one image per request;
 - the replace-output hook returns the adapter-computed boundary value instead
   of running the (layout-incompatible) original forward;
 - the expand hooks map per-request rows to per-chunk rows;
@@ -20,6 +23,8 @@ chunk layout, and verify:
 
 from __future__ import annotations
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -29,10 +34,16 @@ from torch import nn
 from vllm_omni.diffusion.forward_context import (
     ForwardContext,
     MixFusionStep,
+    get_forward_context,
     override_forward_context,
 )
-from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, remove_mixfusion
+from vllm_omni.diffusion.hooks.mixfusion import (
+    _slice_request,
+    apply_mixfusion,
+    remove_mixfusion,
+)
 from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
+from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
@@ -99,27 +110,35 @@ class _DummyAdapter:
     def validate_inputs(self, module, input_batch) -> None:
         pass
 
-    def pack_inputs(self, module, bound, *, cache: PackedInputs | None) -> PackedInputs:
+    def pack_inputs(self, module, bound, *, adapter_state: tuple | None) -> PackedInputs:
         rows = [h.float() for h in bound.arguments["hidden_states"]]
         row_freqs = [torch.arange(SEQ_LEN, dtype=torch.float32).reshape(SEQ_LEN, 1)] * len(rows)
         chunks = [chunk for row in rows for chunk in row.split(CHUNK_SIZE, dim=1)]
         freq_chunks = [chunk for freqs in row_freqs for chunk in freqs.split(CHUNK_SIZE, dim=0)]
         per_row = SEQ_LEN // CHUNK_SIZE
-        ranges = [(idx * per_row, (idx + 1) * per_row) for idx in range(len(rows))]
-        chunk_to_request = [idx for idx in range(len(rows)) for _ in range(per_row)]
+        key = (len(rows), SEQ_LEN)
+        if adapter_state is not None and adapter_state[0] == key:
+            plan = adapter_state[1]
+        else:
+            plan = SimpleNamespace(
+                request_chunk_ranges=[(idx * per_row, (idx + 1) * per_row) for idx in range(len(rows))],
+                chunk_to_request=torch.tensor(
+                    [idx for idx in range(len(rows)) for _ in range(per_row)], dtype=torch.long
+                ),
+                image_row_counts=(1,) * len(rows),
+            )
         packed_hidden = torch.cat(chunks, dim=0)
         bound.arguments["hidden_states"] = packed_hidden
         packed = PackedInputs(
             args=tuple(bound.args),
             kwargs=dict(bound.kwargs),
-            plan=SimpleNamespace(
-                request_chunk_ranges=ranges,
-                chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long),
-                image_row_counts=(1,) * len(rows),
-            ),
+            plan=plan,
             boundary_outputs={"rope": (packed_hidden, torch.cat(freq_chunks, dim=0), torch.zeros(SEQ_LEN, 1))},
+            adapter_state=(key, plan),
         )
-        self.pack_calls.append({"cache": cache, "produced": packed})
+        # Keep only the step-invariant state: recording the packed bundle here
+        # would itself pin the input tensors and defeat the retention test.
+        self.pack_calls.append({"adapter_state": adapter_state, "produced_state": packed.adapter_state, "plan": plan})
         return packed
 
     def restore_output(self, module, output, plan):
@@ -271,10 +290,115 @@ class TestPackedForward:
                 model(**kwargs)
 
         calls = model.pack_calls
-        assert [call["cache"] is None for call in calls] == [True, False, True, True, False, False]
-        assert calls[1]["cache"] is calls[0]["produced"]
-        assert calls[4]["cache"] is calls[2]["produced"]
-        assert calls[5]["cache"] is calls[3]["produced"]
+        assert [call["adapter_state"] is None for call in calls] == [True, False, True, True, False, False]
+        assert calls[1]["adapter_state"] is calls[0]["produced_state"]
+        assert calls[4]["adapter_state"] is calls[2]["produced_state"]
+        assert calls[5]["adapter_state"] is calls[3]["produced_state"]
+
+
+def _root_hook(model):
+    return model._hook_registry._hooks["mixfusion_pack"]
+
+
+def _run_armed_step(model, kwargs):
+    """One denoise step through the real driver lifecycle.
+
+    Returns the armed ``MixFusionStep`` captured inside the context: the driver
+    restores the previous step on exit, so it is gone afterwards.
+    """
+    driver = MixFusionDriver(SimpleNamespace(interrupt=False), model, model.mixfusion_adapter)
+    with driver.armed():
+        step = get_forward_context().mixfusion_step
+        model(**kwargs)
+        return step
+
+
+class TestBoundedRetention:
+    def test_armed_step_releases_inputs_and_retains_only_adapter_state(self):
+        # P2 review: the root hook used to cache the whole PackedInputs,
+        # pinning every request's latents/text across steps. A completed step
+        # must leave nothing but the step-invariant (key, plan) state.
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        latents = _latents()
+        text = torch.zeros(NUM_REQUESTS, 5, 2)
+        refs = [weakref.ref(tensor) for tensor in (*latents, text)]
+        kwargs = dict(hidden_states=latents, encoder_hidden_states=text, img_shapes=[(1, 4, 4)] * NUM_REQUESTS)
+
+        ctx = ForwardContext()
+        with override_forward_context(ctx):
+            step = _run_armed_step(model, kwargs)
+            assert step is not None
+            assert step.packed is None and step.plan is None, "the step bundle must not survive its exit"
+        del kwargs, step
+        del latents, text
+        gc.collect()
+
+        assert all(ref() is None for ref in refs), "an input tensor outlived the step"
+        assert list(_root_hook(model)._cached) == [None]
+        key, plan = _root_hook(model)._cached[None]
+        assert key == (NUM_REQUESTS, SEQ_LEN)
+        assert isinstance(plan, SimpleNamespace)
+
+    def test_armed_step_clears_the_step_bundle_on_exit(self, monkeypatch):
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        ctx = ForwardContext()
+        with override_forward_context(ctx):
+            driver = MixFusionDriver(SimpleNamespace(interrupt=False), model, model.mixfusion_adapter)
+            with driver.armed():
+                step = get_forward_context().mixfusion_step
+                step.packed = SimpleNamespace()
+                step.plan = SimpleNamespace()
+            assert get_forward_context().mixfusion_step is None
+        assert step.packed is None and step.plan is None
+
+    def test_plan_is_reused_across_steps(self):
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        kwargs = _packed_kwargs(_latents())
+        with override_forward_context(ForwardContext()):
+            for _ in range(2):
+                _run_armed_step(model, kwargs)
+        calls = model.pack_calls
+        assert calls[0]["adapter_state"] is None
+        assert calls[1]["adapter_state"] is calls[0]["produced_state"]
+        assert calls[1]["plan"] is calls[0]["plan"], "rebuilding the plan should be skipped"
+
+    def test_changed_layout_is_a_cache_miss_not_a_wrong_reuse(self):
+        model = _DummyTransformer()
+        apply_mixfusion(model, _plan())
+        with override_forward_context(ForwardContext()):
+            _run_armed_step(model, _packed_kwargs(_latents()))
+            _run_armed_step(
+                model,
+                dict(
+                    hidden_states=_latents() + [torch.randn(1, SEQ_LEN, 3)],
+                    encoder_hidden_states=torch.zeros(NUM_REQUESTS + 1, 5, 2),
+                    img_shapes=[(1, 4, 4)] * (NUM_REQUESTS + 1),
+                ),
+            )
+        calls = model.pack_calls
+        assert calls[1]["adapter_state"] is calls[0]["produced_state"]
+        assert calls[1]["plan"] is not calls[0]["plan"]
+        assert calls[1]["plan"].image_row_counts == (1,) * (NUM_REQUESTS + 1)
+
+
+class TestPerRequestSlicing:
+    def test_image_rows_are_not_request_rows(self):
+        # Three requests, four image rows: this layout family is one image per
+        # request, so a per-image-row value has no request-index mapping.
+        with pytest.raises(ValueError, match="one image per request"):
+            _slice_request(torch.zeros(4, SEQ_LEN, 3), 0, 3)
+
+    def test_list_length_must_be_the_request_count(self):
+        with pytest.raises(ValueError, match="4 entries for 3 requests"):
+            _slice_request([torch.zeros(1, SEQ_LEN, 3)] * 4, 0, 3)
+
+    def test_request_tensor_gives_its_row_and_list_gives_a_batch_of_one(self):
+        rows = torch.arange(3).reshape(3, 1)
+        assert _slice_request(rows, 1, 3).tolist() == [[1]]
+        assert _slice_request(["a", "b", "c"], 2, 3) == ["c"]
 
 
 class TestBoundaryErrors:

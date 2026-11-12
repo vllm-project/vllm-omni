@@ -43,6 +43,10 @@ class MixFusionDriver:
             info = state.mixfusion_info
             if state.request_id != request_id or info is None:
                 raise ValueError(f"MixFusion request {request_id}: missing or mismatched admission metadata")
+            if info.num_images != 1:
+                raise ValueError(
+                    f"MixFusion request {request_id}: the chunked joint adapter supports one image per request"
+                )
             if latent.ndim != 3 or tuple(latent.shape[:2]) != (info.num_images, info.image_tokens):
                 raise ValueError(f"MixFusion request {request_id}: actual latents disagree with admitted token counts")
         first = input_batch.latents[0]
@@ -75,10 +79,16 @@ class MixFusionDriver:
     def armed(self) -> Iterator[None]:
         ctx = get_forward_context()
         previous = ctx.mixfusion_step
-        ctx.mixfusion_step = MixFusionStep()
+        step = MixFusionStep()
+        ctx.mixfusion_step = step
         try:
             yield
         finally:
+            # Drop the step's packed inputs with the step itself: nothing after
+            # the step may pin latents or text embeddings of requests that
+            # completed or were cancelled mid-step.
+            step.packed = None
+            step.plan = None
             ctx.mixfusion_step = previous
 
 
