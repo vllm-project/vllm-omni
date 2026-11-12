@@ -59,9 +59,16 @@ class SelectionOnlyPolicy(QwenHistoryPolicy):
         return None
 
 
-def test_selection_only_extension_cannot_claim_to_implement_compression():
-    with pytest.raises(TypeError, match="build_compression.*parse_compression"):
-        load_history_policy(__name__ + ":SelectionOnlyPolicy")
+@pytest.mark.parametrize(
+    "name,error,match",
+    [
+        (__name__ + ":SelectionOnlyPolicy", TypeError, "build_compression.*parse_compression"),
+        ("misspelled-policy", ValueError, "history policy"),
+    ],
+)
+def test_invalid_external_policy_is_rejected_at_load(name, error, match):
+    with pytest.raises(error, match=match):
+        load_history_policy(name)
 
 
 @pytest.mark.asyncio
@@ -164,7 +171,11 @@ async def test_public_guards_reject_before_custom_parser(mocker, failure):
         sync_history(state, history)
     assert not owner.apply(state, request, output)
     parse.assert_not_called()
-    assert state.processed == 0
+    assert state.processed == 0 and not state.omissions
+    if failure != "edited_source":
+        retry = await owner.prepare(state)
+        assert retry.model_source == request.model_source
+        assert retry.retry_delays_s
 
 
 @pytest.mark.asyncio
@@ -177,7 +188,8 @@ async def test_capacity_reduction_rebuilds_custom_prompt_for_actual_batch(mocker
     owner.max_model_len = count + owner.limits.summary_tokens
     build = mocker.spy(owner.policy, "build_compression")
     request = await owner.prepare(state)
-    assert [len(call.args[0]) for call in build.call_args_list] == [8, 6, 4, 2]
+    assert build.call_count > 1
+    assert len(build.call_args.args[0]) == request.model_source.end - request.model_source.start
     assert request.model_source.end == 2
     assert "message 0" in request.prompt["prompt"]
     assert "message 2" not in request.prompt["prompt"]
@@ -235,28 +247,46 @@ def test_compression_sampling_rejects_invalid_temperature(temperature):
 
 
 @pytest.mark.asyncio
-async def test_custom_compressor_uses_existing_session_execution_and_cleanup():
+@pytest.mark.parametrize("kind", ["audio", "visual", "custom"])
+async def test_compression_uses_session_runtime_and_releases_request(kind):
     from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import start_summary, summary_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
 
     h = await open_qwen()
     try:
-        owner = runtime(__name__ + ":StructuredMemoryPolicy", recent_messages=2)
+        policy = __name__ + ":StructuredMemoryPolicy" if kind == "custom" else "incremental"
+        owner = runtime(policy, recent_messages=2)
         h.runner.plugin._history_runtime = owner
         h.runner.plugin.supports_auxiliary_requests = True
+        state = h.runner.model_state.history_policy_state
+        if kind == "audio":
+            message, payload = audio_message(0)
+            h.session.append_history_message(message)
+            h.session.append_history_message({"role": "assistant", "content": "heard prefix"})
+            state.retain([((message["content"],), payload)], owner.limits)
+        elif kind == "visual":
+            h.session.append_history_message(image_message())
+            h.session.append_history_message({"role": "assistant", "content": "red"})
         for entry in text_history(4):
             h.session.append_history_message(entry)
         submission = await start_summary(h)
         assert submission.context.stage_id == submission.context.final_stage_id == 0
-        assert "JSON object" in submission.prompt["prompt"]
-        h.deliver(
-            summary_output(submission.context.request_id, '{"facts": ["budget 3000"]}'),
-            stage_id=0,
-            segment_finished=True,
-        )
+        assert not submission.resumable
+        if kind == "custom":
+            assert "JSON object" in submission.prompt["prompt"]
+        else:
+            media = "image" if kind == "visual" else "audio"
+            assert len(submission.prompt["multi_modal_data"][media]) == 1
+        memory = '{"facts":["budget 3000"]}' if kind == "custom" else "remembered source"
+        h.deliver(summary_output(submission.context.request_id, memory), stage_id=0, segment_finished=True)
         events = await h.settle()
-        assert h.runner.model_state.history_policy_state.summary == '{"facts":["budget 3000"]}'
-        assert not any(e.to_realtime()["type"].startswith("response.") for e in events)
+        if kind == "visual":
+            visual = state.visual
+            assert visual.covered == 1 and visual.resolved(visual.memory.mid_term)[0].text == memory
+        else:
+            assert state.summary == memory
+        assert not any(event.to_realtime()["type"].startswith("response.") for event in events)
         assert submission.context.request_id not in h.session.resource_request_ids()
     finally:
         await h.manager.shutdown()

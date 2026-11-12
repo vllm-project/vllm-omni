@@ -4,7 +4,7 @@
 
 import pytest
 
-from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message, long_history
+from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
 from tests.model_executor.models.qwen3_omni.test_history_policy import completion, runtime, sync_history, text_history
 from vllm_omni.engine.duplex.config import DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLevel, source_refs
@@ -75,12 +75,15 @@ async def test_append_preserves_pending_sources_and_ledger_is_summary_authority(
     owner = runtime(recent_messages=2, chunk_messages=2)
     state, session = setup_history(text_history(6), owner=owner)
     request = await owner.prepare(state)
-    session.register_history_item("tail", {"role": "user", "content": "new question"})
+    session.register_history_item("tail", {"role": "user", "content": "new budget is 5000"})
     refresh(state, session)
     assert owner.apply(state, request, completion("budget 3000"))
     (node,) = summaries(session)
     assert node.sources == source_refs(session.history_snapshot(), *session.history_snapshot().source_ids[:2])
-    assert owner.foreground(state, {}).summary == node.message["content"]
+    context = owner.foreground(state, {})
+    assert context.summary == node.message["content"]
+    prompt = owner.build_foreground(context, {}, 128)["prompt"]
+    assert "new budget is 5000" in prompt and "Later messages and corrections take precedence" in prompt
     session.context_ledger.remove(node.node_id)
     refresh(state, session)
     assert state.summary == "" and state.processed == 0
@@ -96,29 +99,17 @@ async def test_omitted_audio_is_not_claimed_as_summary_evidence():
     state, session = setup_history([missing, {"role": "assistant", "content": "heard"}, *text_history(6)], owner=owner)
     request = await owner.prepare(state)
     assert state.processed == 2 and request.model_source.start == 2
+    assert list(state.omissions) == [(0, 2, "source_unavailable")]
+    assert "heard" not in request.prompt["prompt"]
     assert owner.apply(state, request, completion("text facts"))
+    assert state.processed > 2
     (node,) = summaries(session)
     assert node.sources == source_refs(session.history_snapshot(), *session.history_snapshot().source_ids[2:4])
 
 
 @pytest.mark.asyncio
-async def test_partial_text_is_unpublished_and_source_edit_discards_fold():
-    owner = runtime(summary_tokens=64)
-    owner.max_model_len = 720
-    state, session = setup_history(long_history(), owner=owner)
-    request = await owner.prepare(state)
-    assert not request.model_source.complete
-    assert owner.apply(state, request, completion("partial"))
-    assert state.partial and not summaries(session) and not state.summary
-    pending = await owner.prepare(state)
-    session.register_history_item("0", {"role": "user", "content": "replacement"})
-    refresh(state, session)
-    assert state.partial is None
-    assert not owner.apply(state, pending, completion("stale partial"))
-
-
-@pytest.mark.asyncio
-async def test_visual_merge_inherits_sources_l1_coexists_and_old_nodes_are_cleaned():
+@pytest.mark.parametrize("mutation", ["caption", "delete"])
+async def test_visual_merge_inherits_sources_l1_coexists_and_old_nodes_are_cleaned(mutation):
     owner = runtime(recent_messages=2, visual_chunk_images=1, visual_mid_group=2, visual_max_long=1)
     messages = []
     for color in ("red", "blue", "green", "yellow"):
@@ -140,12 +131,16 @@ async def test_visual_merge_inherits_sources_l1_coexists_and_old_nodes_are_clean
         assert not state.visual.memory.long_term[0].text  # No second authoritative summary string.
     assert l1_ids <= {n.node_id for n in session.context_ledger.nodes()}
     assert "visual long 1" in owner.foreground(state, {}).visual_summaries[0]
-    # Same image bytes with changed caption still advances the public source revision.
-    changed = image_message("green")
-    changed["content"].append({"type": "text", "text": "corrected caption"})
-    session.register_history_item("4", changed)
+    if mutation == "caption":
+        # Identical pixels with a changed caption still revoke derived memory.
+        changed = image_message("green")
+        changed["content"].append({"type": "text", "text": "corrected caption"})
+        session.register_history_item("4", changed)
+    else:
+        session.delete_history_item("4")
     refresh(state, session)
     assert not summaries(session) and not state.visual.summaries()
+    assert state.visual.covered == 0
 
 
 @pytest.mark.asyncio

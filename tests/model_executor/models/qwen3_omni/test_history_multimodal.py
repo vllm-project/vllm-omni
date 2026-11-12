@@ -19,7 +19,6 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
     text_history,
 )
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
-from vllm_omni.engine.duplex.visual_memory import VisualMemory
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import VisualWork
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -79,6 +78,7 @@ async def test_partial_text_reject_retry_source_edit_and_late_result():
     sync_history(state, history)
     first = await owner.prepare(state)
     assert owner.apply(state, first, completion("first fold"))
+    assert state.partial and not state.summary and not state.ledger.nodes()
     second = await owner.prepare(state)
     partial = state.partial
     assert not owner.apply(state, second, completion("truncated", "length"))
@@ -89,7 +89,7 @@ async def test_partial_text_reject_retry_source_edit_and_late_result():
     assert owner.source_matches(state, second.model_source)
     history[0] = {"role": "user", "content": "corrected budget 5000"}
     sync_history(state, history)
-    assert state.partial is None
+    assert state.partial is None and not state.ledger.nodes()
     assert not owner.apply(state, second, completion("stale fold"))
 
 
@@ -120,7 +120,6 @@ async def test_visual_frames_to_mid_to_long_and_foreground_reuse():
         *text_history(4),
     ]
     sync_history(state, history)
-    assert isinstance(state.visual.memory, VisualMemory)
     for color in ("red", "blue"):
         request = await owner.prepare(state)
         assert isinstance(request.model_source, VisualWork)
@@ -300,45 +299,6 @@ async def test_session_image_admission_uses_plugin_limits(policy, limit):
         assert len(h.session.history) == limit
     finally:
         await h.manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_visual_result_uses_session_runtime_and_releases_request():
-    from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import start_summary, summary_output
-    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
-
-    h = await open_qwen()
-    try:
-        h.runner.plugin._history_runtime = runtime(recent_messages=2)
-        h.runner.plugin.supports_auxiliary_requests = True
-        for item in [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]:
-            h.session.append_history_message(item)
-        submission = await start_summary(h)
-        assert submission.context.stage_id == submission.context.final_stage_id == 0
-        assert len(submission.prompt["multi_modal_data"]["image"]) == 1
-        h.deliver(summary_output(submission.context.request_id, "red object"), stage_id=0, segment_finished=True)
-        events = await h.settle()
-        visual = h.runner.model_state.history_policy_state.visual
-        assert visual.covered == 1 and visual.resolved(visual.memory.mid_term)[0].text == "red object"
-        assert not any(event.to_realtime()["type"].startswith("response.") for event in events)
-        assert submission.context.request_id not in h.session.resource_request_ids()
-    finally:
-        await h.manager.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_visual_memory_is_revoked_after_published_source_is_deleted():
-    owner = runtime(recent_messages=2, visual_mid_group=1)
-    state = owner.create_state()
-    history = [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)]
-    sync_history(state, history)
-    for text in ("mid red", "long red"):
-        request = await owner.prepare(state)
-        assert owner.apply(state, request, completion(text))
-    assert state.visual.memory.long_term
-    sync_history(state, history[1:])
-    assert state.visual.covered == 0
-    assert not state.visual.summaries()
 
 
 @pytest.mark.asyncio

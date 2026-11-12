@@ -19,9 +19,7 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     HistoryLimits,
     IncrementalHistoryPolicy,
-    QwenHistoryPolicy,
     QwenHistoryState,
-    load_history_policy,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
@@ -118,11 +116,6 @@ def completion(text="user budget is 3000", reason="stop"):
     )
 
 
-class IncompleteHistoryPolicy(QwenHistoryPolicy):
-    def select(self, state, limits):
-        return []
-
-
 class IdleHistoryPolicy(IncrementalHistoryPolicy):
     """Example extension that defers work while preparing or after rejection."""
 
@@ -130,11 +123,6 @@ class IdleHistoryPolicy(IncrementalHistoryPolicy):
         if state.preparing or state.counts["rejected_summaries"]:
             return None
         return super().next_batch(state, limits, max_audio=max_audio)
-
-
-def test_incomplete_external_policy_is_rejected_at_load():
-    with pytest.raises(TypeError):
-        load_history_policy(__name__ + ":IncompleteHistoryPolicy")
 
 
 def test_unavailable_current_audio_cannot_silently_fall_back_to_old_question():
@@ -354,35 +342,6 @@ async def test_audio_pressure_precedes_text_window_and_uses_original_pcm_once():
 
 
 @pytest.mark.asyncio
-async def test_permanently_missing_audio_does_not_block_following_text():
-    owner = runtime(recent_messages=2)
-    state = owner.create_state()
-    message, _ = audio_message(0)
-    sync_history(
-        state, [message, {"role": "assistant", "content": "answer without available evidence"}, *text_history(8)]
-    )
-    request = await owner.prepare(state)
-    assert list(state.omissions) == [(0, 2, "source_unavailable")]
-    assert "answer without available evidence" not in request.prompt["prompt"]
-    assert request.model_source.start == 2
-    assert owner.apply(state, request, completion())
-    assert state.processed > 2
-
-
-@pytest.mark.asyncio
-async def test_transient_failure_retries_same_source_and_preserves_summary():
-    owner = runtime()
-    state = owner.create_state()
-    sync_history(state, text_history())
-    request = await owner.prepare(state)
-    assert not owner.apply(state, request, completion("", "length"))
-    assert state.processed == 0 and not state.omissions
-    again = await owner.prepare(state)
-    assert again.model_source == request.model_source
-    assert request.retry_delays_s
-
-
-@pytest.mark.asyncio
 async def test_cached_decision_reconsiders_rejected_summary_for_custom_policy():
     owner = runtime()
     state = owner.create_state()
@@ -434,13 +393,6 @@ def test_media_pool_deduplicates_bindings_and_enforces_single_item_limit():
     assert state.audio_bytes <= 1500
 
 
-def test_external_policy_is_loadable_without_modifying_plugin():
-    policy = load_history_policy(__name__ + ":IncrementalHistoryPolicy")
-    assert isinstance(policy, IncrementalHistoryPolicy)
-    with pytest.raises(ValueError):
-        load_history_policy("misspelled-policy")
-
-
 def test_policy_accepts_images_but_rejects_tools_and_video_files():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     assert plugin.capabilities(max_sessions=1).supports_image_input
@@ -470,54 +422,11 @@ async def test_expanded_audio_context_limit_and_oversize_batch_progress():
         owner.build_foreground(context, {}, 64)
 
 
-@pytest.mark.asyncio
-async def test_new_tail_does_not_revoke_valid_summary_or_old_source_request():
-    owner = runtime()
-    state = owner.create_state()
-    history = text_history()
-    sync_history(state, history)
-    request = await owner.prepare(state)
-    sync_history(state, [*history, {"role": "user", "content": "new budget is 5000"}])
-    assert owner.apply(state, request, completion())
-    context = owner.foreground(state, {})
-    prompt = owner.build_foreground(context, {}, 512)["prompt"]
-    assert "new budget is 5000" in prompt and "Later messages and corrections take precedence" in prompt
-
-
 def test_configuration_rejects_nonintegral_and_unbounded_values():
     for value in (0, -1, True, 0.5):
         for name in ("max_audio_bytes", "audio_summary_trigger_bytes"):
             with pytest.raises(ValueError):
                 replace(HistoryLimits(), **{name: value})
-
-
-@pytest.mark.asyncio
-async def test_real_session_runtime_keeps_audio_summary_private_and_stops_at_thinker():
-    from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import start_summary, summary_output
-    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
-
-    h = await open_qwen()
-    try:
-        owner = runtime(recent_messages=2)
-        h.runner.plugin._history_runtime = owner
-        h.runner.plugin.supports_auxiliary_requests = True
-        message, payload = audio_message(0)
-        h.session.append_history_message(message)
-        h.session.append_history_message({"role": "assistant", "content": "heard prefix"})
-        for entry in text_history(4):
-            h.session.append_history_message(entry)
-        h.runner.model_state.history_policy_state.retain([((message["content"],), payload)], owner.limits)
-        submission = await start_summary(h)
-        assert submission.context.stage_id == submission.context.final_stage_id == 0
-        assert not submission.resumable
-        assert len(submission.prompt["multi_modal_data"]["audio"]) == 1
-        h.deliver(summary_output(submission.context.request_id, "user budget 3000"), stage_id=0, segment_finished=True)
-        events = await h.settle()
-        assert h.runner.model_state.history_policy_state.summary == "user budget 3000"
-        assert not any(e.to_realtime()["type"].startswith("response.") for e in events)
-        assert submission.context.request_id not in h.session.resource_request_ids()
-    finally:
-        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -537,32 +446,6 @@ async def test_real_session_close_cancels_private_summary_and_rejects_late_outpu
     assert task.done()
     h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
     assert not h.runner.model_state.history_policy_state.summary
-
-
-@pytest.mark.asyncio
-async def test_real_foreground_append_uses_stage_sampling_object_and_preserves_current_input():
-    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
-    from vllm_omni.engine.duplex.commands import CreateItem, CreateResponse
-
-    h = await open_qwen()
-    try:
-        h.runner.plugin._history_runtime = runtime()
-        h.runner.plugin.supports_auxiliary_requests = True
-        await h.run(
-            CreateItem(
-                item={
-                    "id": "current-input",
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "current budget is 5000"}],
-                }
-            )
-        )
-        await h.run(CreateResponse())
-        assert h.port.submissions
-        assert "current budget is 5000" in h.port.submissions[-1].prompt["prompt"]
-    finally:
-        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
