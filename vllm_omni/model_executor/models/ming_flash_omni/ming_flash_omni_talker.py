@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, Audi
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.models.model_local_kv import ModelLocalKVScope, RowDriver, spec_from_hf_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalkerConfig
 
 from .native_text_frontend import normalize_native_fragment
@@ -507,7 +508,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             text_hidden_states=None,
             multimodal_outputs={
                 "audio": [audio.detach().float() for audio in audios],
-                "sr": torch.tensor(self.audio_vae.config.sample_rate),
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self.audio_vae.config.sample_rate, len(audios)),
             },
         )
 
@@ -650,7 +651,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 text_hidden_states=None,
                 multimodal_outputs={
                     "audio": audio.detach().float().cpu(),
-                    "sr": torch.tensor(self.audio_vae.config.sample_rate),
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(self.audio_vae.config.sample_rate),
                 },
             )
         except BaseException:
@@ -922,7 +923,12 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             if trim_silence:
                 waveform = self.audio_generator.trim_trailing_silence(waveform)
             multimodal_outputs["audio"] = waveform.detach().float().cpu()
-            multimodal_outputs["sr"] = torch.tensor(self.audio_vae.config.sample_rate)
+            # A single waveform tensor covers either one request ([T]) or a
+            # batch ([B, T]); the per-request rate list must match its rows.
+            num_requests = waveform.shape[0] if waveform.dim() >= 2 else 1
+            multimodal_outputs[SAMPLE_RATE_KEY] = make_sample_rate_tensors(
+                self.audio_vae.config.sample_rate, num_requests
+            )
         elif latents:
             all_lat = torch.cat(latents, dim=1)
             multimodal_outputs["audio_latents"] = all_lat.detach().float().cpu()

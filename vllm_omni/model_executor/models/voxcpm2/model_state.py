@@ -11,6 +11,7 @@ from typing import Any, Literal, NamedTuple
 import numpy as np
 import torch
 
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.streaming_audio import AudioRequest, StreamingAudioBuffer
 
@@ -101,7 +102,10 @@ class VoxCPM2AudioOutput:
             output = [None] * metadata.num_reqs
             offset = 0
             for row, length in zip(metadata.batch_rows, metadata.lengths.tolist(), strict=True):
-                output[row] = {"model_outputs": self.wav[offset : offset + length], "sr": self.sample_rate}
+                output[row] = {
+                    "model_outputs": self.wav[offset : offset + length],
+                    SAMPLE_RATE_KEY: self.sample_rate,
+                }
                 offset += length
             return output
         metadata = self.metadata
@@ -111,7 +115,7 @@ class VoxCPM2AudioOutput:
         for row, request in enumerate(metadata.requests):
             pcm = self.wav[row].reshape(-1) if valid[row] else self.wav.new_empty(0)
             chunk = request.push(pcm, bool(ended[row]))
-            output.append({"model_outputs": chunk, "sr": self.sample_rate} if chunk is not None else None)
+            output.append({"model_outputs": chunk, SAMPLE_RATE_KEY: self.sample_rate} if chunk is not None else None)
         return output
 
 

@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 # -------------------- token/protocol constants --------------------
 
@@ -65,7 +66,6 @@ STOP_TOKEN_IDS = [ABC_END, MUSIC_END]
 # the song is synthesized and MUSIC_END is emitted.
 HOLD_TOKEN = LATENT_PAD
 
-SAMPLE_RATE = 48000
 AUDIO_CHANNELS = 2
 FRAMES_PER_SECOND = 25
 SAMPLES_PER_FRAME = 1920
@@ -2098,6 +2098,18 @@ class Yue2ForCausalLM(nn.Module):
             self._vae_device = device
         return self._vae
 
+    def _output_sample_rate(self) -> int:
+        """The rate the VAE decoder emits at, read from its config.
+
+        Before the VAE has been loaded (an error clip can ship without any
+        successful decode), the config class default stands in — every
+        checkpoint VAE carries its own ``sample_rate`` in config.json.
+        """
+        vae = self._vae
+        if vae is not None:
+            return int(vae.config.sample_rate)
+        return int(YuE2VAEConfig().sample_rate)
+
     def _decode_latents_iter(self, latents: torch.Tensor) -> Iterator[None]:
         """Device latents -> device stereo [2, samples] as a work generator
         (one unit per VAE tile); nothing is read back to the host."""
@@ -2698,7 +2710,7 @@ class Yue2ForCausalLM(nn.Module):
             self._audio_queue.append((req_id, audio, truncated, error))
             return
         mm["model_outputs"].append(audio)
-        mm["sr"].append(torch.tensor(SAMPLE_RATE, dtype=torch.int32))
+        mm[SAMPLE_RATE_KEY].extend(make_sample_rate_tensors(self._output_sample_rate()))
         meta = mm["meta"]
         meta["req_id"].append(req_id)
         # Keep the flags ints, not strs: the wire payload is tensor-only
@@ -2718,7 +2730,6 @@ class Yue2ForCausalLM(nn.Module):
             failed[req_id] = is_error
         self._audio_queue.clear()
         ready = list(by_req)
-        sr = torch.tensor(SAMPLE_RATE, dtype=torch.int32)
         # The sparse marker rides EVERY step, even ones that decoded nothing
         # (req_id=[] is the legal zero-audio shape): without it the runner
         # falls back to the dense pooler payload, whose per-step hidden states
@@ -2726,7 +2737,10 @@ class Yue2ForCausalLM(nn.Module):
         # states instead of the decoded waveform (gepard_talker precedent).
         mm: dict[str, Any] = {
             "model_outputs": [by_req[r] for r in ready],
-            "sr": [sr for _ in ready],
+            # Zero-audio steps are legal (see the comment above); the rate
+            # list stays parallel to ``model_outputs`` and is empty then
+            # (the helper rejects a zero count by design).
+            SAMPLE_RATE_KEY: make_sample_rate_tensors(self._output_sample_rate(), len(ready)) if ready else [],
             "meta": {
                 "req_id": ready,
                 "sparse_audio": ["1"],
