@@ -572,6 +572,28 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Wrapped linears (e.g. LoRA) must retain their own forward computation.
+        if x.device.type == "npu" and type(self.fc1) is MergedColumnParallelLinear:
+            from vllm_omni.quantization.int8_config import NPUInt8LinearMethod
+
+            if isinstance(self.fc1.quant_method, NPUInt8LinearMethod):
+                try:
+                    from mindiesd.layers._custom_ops import eagle_quant_batch_matmul_swiglu
+                except ImportError:
+                    pass
+                else:
+                    import torch_npu
+
+                    quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x.reshape(-1, x.shape[-1]))
+                    hidden = eagle_quant_batch_matmul_swiglu(
+                        quantized_x,
+                        self.fc1.weight,
+                        self.fc1.weight_scale,
+                        pertoken_scale=pertoken_scale,
+                        output_dtype=x.dtype,
+                    ).reshape(*x.shape[:-1], -1)
+                    out, _ = self.fc2(hidden)
+                    return out
         hidden, _ = self.fc1(x)
         hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
