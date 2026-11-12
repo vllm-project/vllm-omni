@@ -66,21 +66,10 @@ class OmniNewRequestData(NewRequestData):
         Returns:
             OmniNewRequestData instance with data from the request
         """
-        prompt_token_ids = request.prompt_token_ids
-        if (
-            prefill_token_ids is not None
-            and prompt_token_ids is not None
-            and request.num_computed_tokens == 0
-            and len(prefill_token_ids) < len(prompt_token_ids)
-        ):
-            # Async generation chunks replace the prewarm prompt before the
-            # legacy all-token mirror is refreshed. A fresh MRV2 prefill has no
-            # generated suffix to preserve, so the current prompt is canonical.
-            prefill_token_ids = prompt_token_ids.copy()
         return cls(
             req_id=request.request_id,
             external_req_id=getattr(request, "external_req_id", None),
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids=request.prompt_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,

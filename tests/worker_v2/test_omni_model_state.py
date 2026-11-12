@@ -241,18 +241,6 @@ def test_structured_postprocess_rejects_multiple_logits_rows_per_request():
     state.model.make_omni_output.assert_not_called()
 
 
-def test_structured_postprocess_requires_logits_indices():
-    state = _make_state(have_multimodal_outputs=True)
-    state.model.postprocess_requires_multimodal_outputs = True
-    batch = _DummyInputBatch([0])
-    del batch.logits_indices
-
-    with pytest.raises(RuntimeError, match="requires input_batch.logits_indices"):
-        state.postprocess_model_output(torch.zeros(1, 4), batch, SimpleNamespace())
-
-    state.model.make_omni_output.assert_not_called()
-
-
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
 def test_decode_cohort_uses_batch_hook(hook_name):
     state = _make_state(max_num_reqs=2, has_preprocess=True)

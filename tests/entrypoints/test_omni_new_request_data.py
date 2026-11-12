@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 from types import SimpleNamespace
 
 import pytest
@@ -57,27 +54,6 @@ def test_omni_new_request_data_allows_missing_payloads():
 
     assert data.prompt_embeds is None
     assert data.additional_information is None
-
-
-def test_omni_new_request_data_repairs_stale_fresh_prefill_buffer():
-    prompt_token_ids = list(range(187))
-    request = SimpleNamespace(
-        request_id="req-stale-prefill",
-        external_req_id="ext-stale-prefill",
-        prompt_token_ids=prompt_token_ids,
-        mm_features=None,
-        sampling_params=None,
-        pooling_params=None,
-        num_computed_tokens=0,
-        lora_request=None,
-        prompt_embeds=None,
-        additional_information=None,
-    )
-
-    data = OmniNewRequestData.from_request(request, ([0],), prefill_token_ids=[0])
-
-    assert data.prompt_token_ids == prompt_token_ids
-    assert data.prefill_token_ids == prompt_token_ids
 
 
 def test_from_base_preserves_every_upstream_field_and_adds_omni_payloads():
