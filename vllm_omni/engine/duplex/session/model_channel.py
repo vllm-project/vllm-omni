@@ -1491,7 +1491,7 @@ class ModelChannel:
             stage_metrics=response_stage_metrics,
             response_request_metrics=response_request_metrics,
         )
-        if "audio" not in session.capabilities.supported_output_modalities:
+        if not session.capabilities.emits_audio:
             # The data plane supplies text and native turn boundaries. Reuse
             # the existing text projector without synthesizing audio events.
             if has_text:

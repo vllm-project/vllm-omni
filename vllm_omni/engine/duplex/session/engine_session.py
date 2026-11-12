@@ -1114,7 +1114,7 @@ class DuplexEngineSession:
             self.perf.bind_response(
                 epoch=self.epoch, turn_id=self._response.active_response_turn_id, response_id=response_id
             )
-        if "audio" not in self.capabilities.supported_output_modalities:
+        if not self.capabilities.emits_audio:
             # Input may continue while text is emitted. Reserve its position
             # before a later user commit, without waiting for playback.
             self.reserve_history_item(f"item_{response_id}")
@@ -1632,20 +1632,20 @@ class DuplexEngineSession:
             response_input_commit_seq = self.input_commit_seq
         response_history_is_late = self.input_commit_seq > response_input_commit_seq
         assistant_text = "".join(self._response.assistant_text_buffer)
-        if "audio" in self.capabilities.supported_output_modalities:
+        if self.capabilities.emits_audio:
             assistant_text = assistant_text.strip()
+        has_assistant_text = bool(assistant_text.strip())
         message: dict[str, object] | None = None
-        if assistant_text and response_id is not None:
+        if has_assistant_text and response_id is not None:
             self._conversation.assistant_response_snapshots[response_id] = (
                 _object_dict(role="assistant", content=assistant_text),
                 tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
                 response_input_commit_seq,
             )
         text_slot = (
-            "audio" not in self.capabilities.supported_output_modalities
-            and f"item_{response_id}" in self._conversation.history_item_placeholders
+            not self.capabilities.emits_audio and f"item_{response_id}" in self._conversation.history_item_placeholders
         )
-        if commit_text and assistant_text and (not response_history_is_late or text_slot):
+        if commit_text and has_assistant_text and (not response_history_is_late or text_slot):
             committed_text = self._playback_committed_text(
                 assistant_text,
                 playback_commit_policy=playback_commit_policy,
@@ -1662,12 +1662,12 @@ class DuplexEngineSession:
         effective_playback_policy = playback_commit_policy or self.config.playback_commit_policy
         if (
             response_id is not None
-            and assistant_text
+            and has_assistant_text
             and message is None
             and effective_playback_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
         ):
             self.register_history_item(f"item_{response_id}", None)
-        elif response_id is not None and not assistant_text:
+        elif response_id is not None and not has_assistant_text:
             # Sent audio has no transcript to store, but the client still has
             # to ack it. Dropping the item makes that ack fail and leaves
             # sent_ms ahead of committed_ms, so the next response cannot start.
@@ -1997,10 +1997,7 @@ class DuplexEngineSession:
         *,
         playback_commit_policy: str | None = None,
     ) -> str:
-        if (
-            "audio" not in (self.response_config.modalities or ())
-            and max(self.playback.sent_ms, self.playback.generated_ms) <= 0
-        ):
+        if not self.capabilities.emits_audio:
             # Text was emitted to the response stream. Playback policy and
             # audio alignment cannot gate a text-only reply, including cancel.
             return assistant_text

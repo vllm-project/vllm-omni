@@ -49,10 +49,10 @@ def _output_modalities(payload: Mapping[str, object]) -> tuple[str, ...] | None:
         if (
             not isinstance(value, list | tuple)
             or not value
-            or any(not isinstance(item, str) or item not in {"text", "audio"} for item in value)
+            or any(not isinstance(item, str) or item.lower() not in {"text", "audio"} for item in value)
         ):
             raise DuplexConfigError("Output modalities must be a nonempty list of text and/or audio", param=name)
-        current = tuple(value)
+        current = tuple(item.lower() for item in value)
         if len(set(current)) != len(current):
             raise DuplexConfigError("Output modalities must not contain duplicates", param=name)
         if resolved is not None and set(resolved) != set(current):
@@ -170,6 +170,11 @@ class DuplexCapabilities:
     #: (RFC #8325). Set by the engine from ``duplex_session.collect_stats``, never by
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
+
+    @property
+    def emits_audio(self) -> bool:
+        """Whether the bound deployment can generate audio output."""
+        return "audio" in self.supported_output_modalities
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -435,7 +440,7 @@ class DuplexSessionConfig:
 
     def with_output_capabilities(self, capabilities: DuplexCapabilities) -> DuplexSessionConfig:
         modalities = capabilities.resolve_output_modalities(self.modalities)
-        if "audio" not in capabilities.supported_output_modalities:
+        if not capabilities.emits_audio:
             for name, unsupported in (
                 ("voice", bool(_normalized_voice(self.voice))),
                 ("speed", self.speed not in (None, 1)),

@@ -186,6 +186,15 @@ class SessionControl:
     # Control events                                                     #
     # ------------------------------------------------------------------ #
 
+    def check_audio_truncate_support(self, *, event_id: object | None = None) -> bool:
+        """Use the same capability gate for native and typed truncation commands."""
+        if self._ctx.session.capabilities.supports_audio_truncate:
+            return True
+        self._out.emit_error(
+            "unsupported_operation", "This deployment does not support audio truncation", event_id=event_id
+        )
+        return False
+
     async def on_turn_signal(self, event: dict[str, object]) -> None:
         session = self._ctx.session
         turn_event = event.get("event")
@@ -225,12 +234,7 @@ class SessionControl:
             )
             return
         if turn_event == "conversation.item.truncate":
-            if "audio" not in session.capabilities.supported_output_modalities:
-                self._out.emit_error(
-                    "unsupported_operation",
-                    "Text-only output cannot be truncated at an audio position",
-                    event_id=realtime_event_id,
-                )
+            if not self.check_audio_truncate_support(event_id=realtime_event_id):
                 return
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None

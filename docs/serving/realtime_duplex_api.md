@@ -1022,8 +1022,11 @@ with no OpenAI counterpart.
 Output availability is deployment-specific. `capabilities` includes
 `supported_output_modalities` and `default_output_modalities`. Omitting both
 `modalities` and `output_modalities` uses the deployment defaults. Explicit
-lists must be nonempty and contain `text` and/or `audio`; if both aliases are
-supplied they must agree. A request for unavailable output fails with
+lists must be nonempty and contain `text` and/or `audio`. Names are
+case-insensitive and normalized to lowercase, so `["Audio", "Text"]` remains
+accepted by speech deployments. Duplicate entries after normalization and
+non-list values are rejected explicitly. If both aliases are supplied they
+must agree after normalization. A request for unavailable output fails with
 `unsupported_output_modality` at session open, `session.update`, or
 `response.create`, including the inline Python API. Rejected updates preserve
 the current configuration and rejected output requests allocate no model work.
@@ -1033,7 +1036,11 @@ ACKs, audio truncation, and inter-stage handoff. Synthesis-only `voice` and
 non-default `speed` fail with `unsupported_parameter`; audio format defaults
 remain accepted for client compatibility. Text replies commit the emitted text
 without playback ACKs even under `ack_only`; cancellation retains the emitted
-prefix and discards stale output. Targeted playback ACKs for text-only items
+prefix and discards stale output. Whitespace-only replies are not stored as
+assistant turns; meaningful text retains its emitted whitespace verbatim.
+This playback-policy bypass applies only to deployments without audio output,
+not to a text modality override on a speech deployment.
+Targeted playback ACKs for text-only items
 and audio truncation on text-only deployments fail with `unsupported_operation`
 without modifying history. The default MiniCPM three-stage deployment continues
 to advertise text and audio. This negotiation does not by itself register a

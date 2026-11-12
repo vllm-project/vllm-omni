@@ -82,7 +82,7 @@ def test_omission_survives_normalization_until_deployment_is_known(factory):
 
 
 @pytest.mark.parametrize("field", ["modalities", "output_modalities"])
-@pytest.mark.parametrize("value", [[], None, "text", ["image"], [1], ["text", "text"]])
+@pytest.mark.parametrize("value", [[], None, "text", ["image"], [1], ["text", "text"], ["Audio", "audio"]])
 @pytest.mark.parametrize(
     "factory", [DuplexSessionConfig.from_event, DuplexSessionConfig.from_realtime, ResponseCreateOptions.from_realtime]
 )
@@ -147,6 +147,94 @@ def test_text_history_does_not_wait_for_playback(policy, complete_audio_metadata
     events = apply_playback_ack(session, {"response_id": response, "played_ms": 500})
     assert events[0].type == "error" and events[0].code == "unsupported_operation"
     assert session.history == before
+
+
+@pytest.mark.parametrize("text", ["", " ", "\n", "\t \n"])
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+def test_whitespace_only_text_does_not_create_history_or_snapshots(text, policy):
+    session = DuplexEngineSession(
+        session_id="blank", config=DuplexSessionConfig(playback_commit_policy=policy), capabilities=_caps()
+    )
+    response = session.begin_response()
+    session.append_assistant_text(text)
+    assert session.end_response() is None
+    assert session.history == ()
+    assert not session.pending_history_item_ids
+    assert not session._conversation.assistant_response_snapshots
+    assert not session._conversation.history_item_placeholders
+    session.finalize_response_playback(response)
+    assert not session._playback.by_response
+
+
+@pytest.mark.parametrize("text_override", [False, True])
+def test_speech_deployment_keeps_playback_policy_for_text_response_override(text_override):
+    session = DuplexEngineSession(session_id="speech", config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    if text_override:
+        session.reserve_response_options(ResponseCreateOptions(modalities=("text",)))
+    response = session.begin_response()
+    session.append_assistant_text(" emitted text ")
+    session.mark_audio_sent(None, text_requires_complete_audio=True)
+    # A text request on a speech deployment does not establish TTS bypass.
+    assert session.end_response() is None
+    assert session.history == ()
+    assert session._conversation.assistant_response_snapshots[response][0]["content"] == "emitted text"
+
+
+@pytest.mark.parametrize("field", ["modalities", "output_modalities"])
+@pytest.mark.parametrize(
+    "factory", [DuplexSessionConfig.from_event, DuplexSessionConfig.from_realtime, ResponseCreateOptions.from_realtime]
+)
+def test_mixed_case_modalities_are_normalized(factory, field):
+    config = factory({field: ["Audio", "Text"]})
+    assert config.modalities is not None
+    assert list(config.modalities) == ["audio", "text"]
+    config = factory({"modalities": ["Text"], "output_modalities": ["TEXT"]})
+    assert config.modalities is not None
+    assert list(config.modalities) == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_case_modalities_normalized_on_live_update_and_response():
+    h = await open_harness(plugin=_text_plugin(), stage_count=1)
+    try:
+        events = await h.run(commands.UpdateSession(patch={"output_modalities": ["Text"]}))
+        assert not any(event.type == "error" for event in events)
+        assert h.session.config.modalities == ["text"]
+        events = await h.run(commands.CreateResponse(options={"modalities": ["Audio"]}))
+        assert len(events) == 1 and events[0].type == "error"
+        assert events[0].code == "unsupported_output_modality"
+        assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.asyncio
+async def test_audio_capable_deployment_can_disable_truncation_without_history_changes(native):
+    h = await open_harness()
+    try:
+        assert h.session.capabilities.emits_audio
+        h.session.capabilities = replace(h.session.capabilities, supports_audio_truncate=False)
+        response = h.session.begin_response()
+        h.session.append_assistant_text("keep this reply")
+        h.session.mark_audio_sent(100, audio_complete=True)
+        before = copy.deepcopy((h.session.history, h.session._playback, h.session._conversation))
+        command = (
+            commands.SignalTurn(
+                event="conversation.item.truncate",
+                signal_payload={"item_id": f"item_{response}", "audio_end_ms": 0},
+                event_id="unsupported-cut",
+            )
+            if native
+            else commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=0, event_id="unsupported-cut")
+        )
+        events = await h.run(command)
+        assert len(events) == 1 and events[0].type == "error"
+        assert events[0].code == "unsupported_operation"
+        assert events[0].related_event_id == "unsupported-cut"
+        assert (h.session.history, h.session._playback, h.session._conversation) == before
+    finally:
+        await close_harness(h)
 
 
 @pytest.mark.parametrize("field", ["modalities", "output_modalities"])
