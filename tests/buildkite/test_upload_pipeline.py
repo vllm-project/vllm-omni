@@ -960,6 +960,31 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
     assert "TTS · Ming · GLM · IndexTTS · Breeze · L4" not in {step.get("label") for step in _iter_steps(doc)}
 
 
+def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    assert matching_steps[0]["source_file_dependencies"] == [
+        "tts_audex_weekly",
+        "tts_cosyvoice3_function",
+        "tts_qwen3_tts_function",
+    ]
+
+    group = next(step for step in doc["steps"] if "Audex CosyVoice and Qwen3-TTS Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for changed_file in (
+        "tests/e2e/offline_inference/test_audex_tts.py",
+        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py",
+        "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 @pytest.mark.parametrize(
     ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
     [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
