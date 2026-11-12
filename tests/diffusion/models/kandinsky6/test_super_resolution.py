@@ -83,6 +83,38 @@ def test_unsupported_execution_is_rejected_before_generation(world_size, hsdp, l
         validate_super_resolution_execution(config)
 
 
+@pytest.mark.parametrize(
+    "offload",
+    [
+        {"enable_layerwise_offload": True},
+        {"enable_distributed_layerwise_offload": True},
+        {"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+    ],
+)
+def test_layer_offload_is_rejected_at_both_sr_boundaries(monkeypatch, offload):
+    from vllm_omni.diffusion.models.kandinsky6_sr import pipeline_kandinsky6_sr as module
+
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    config = OmniDiffusionConfig(model="unused-checkpoint", **offload)
+    with pytest.raises(ValueError, match="component CPU offload"):
+        validate_super_resolution_execution(config)
+    # Validation must fail before downloading or constructing checkpoint weights.
+    with pytest.raises(ValueError, match="component CPU offload"):
+        module.Kandinsky6SRRefiner(od_config=config)
+
+
+@pytest.mark.parametrize("offload", [{}, {"diffusion_offload_config": {"mode": "module", "components": ["dit"]}}])
+def test_supported_sr_offload_policy_is_accepted(offload):
+    validate_super_resolution_execution(OmniDiffusionConfig(**offload))
+
+
 def test_cpu_staging_restores_parameters_after_error(monkeypatch):
     from vllm_omni.diffusion.models.kandinsky6 import super_resolution as module
 

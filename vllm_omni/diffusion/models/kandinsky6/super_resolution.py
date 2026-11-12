@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.offloader.config import offload_streams_blocks
 from vllm_omni.platforms import current_omni_platform
 
 DEFAULT_SR_MODEL = "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers"
@@ -23,7 +24,7 @@ def validate_super_resolution_execution(config: Any) -> None:
     if config is None:
         return
     parallel = config.parallel_config
-    if parallel.world_size != 1 or parallel.use_hsdp or config.enable_layerwise_offload:
+    if parallel.world_size != 1 or parallel.use_hsdp or offload_streams_blocks(config):
         raise ValueError("Kandinsky6 HD/FHD refinement requires one GPU and supports component CPU offload")
 
 

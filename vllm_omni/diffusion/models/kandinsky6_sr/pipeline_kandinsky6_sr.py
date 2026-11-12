@@ -21,7 +21,7 @@ from torch.nn import functional as F
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.offloader.config import offload_enabled
+from vllm_omni.diffusion.offloader.config import offload_enabled, offload_streams_blocks
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder_kandinsky6_sr import Kandinsky6SRVAE
@@ -119,7 +119,7 @@ class Kandinsky6SRRefiner(nn.Module):
         ):
             if getattr(parallel, name) != 1:
                 raise ValueError("Kandinsky VSR currently runs on one GPU; all parallel degrees must be 1")
-        if parallel.use_hsdp or parallel.enable_expert_parallel or od_config.enable_layerwise_offload:
+        if parallel.use_hsdp or parallel.enable_expert_parallel or offload_streams_blocks(od_config):
             raise ValueError("Kandinsky VSR supports component CPU offload, not HSDP, expert or layerwise offload")
         if od_config.quantization_config is not None or od_config.lora_path is not None:
             raise ValueError("Kandinsky VSR does not support quantization or LoRA adapters")
