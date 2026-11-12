@@ -837,6 +837,12 @@ would discard the current continuation logits and add another input unit
 before retrying. The alternative reapplies top-k/top-p after masking EOS and
 rescales the original uniform within the EOS interval, so the conditional
 draw is unbiased and unused alternatives do not advance RNG.
+Missing punctuation alone does not justify every continuation. If the alternative
+is a canonical one-token proper suffix of the last accepted text token, retain
+EOS rather than forcing partial token replay (for example, `十一` followed by `一`).
+This conservative veto does not classify sentence meaning: it leaves model-selected
+repetition and whole-token repetition (`1` followed by `1`) unchanged. Tokenizer
+suffix IDs are cached with a fixed bound, and the deferred decision stays on device.
 If no new text token arrives before the next `<|turn_eos|>`, that turn end is accepted. Control tokens do
 not count as text progress. New text permits another continuation attempt,
 up to 16 held turn ends per turn. Sentence-ending punctuation releases the

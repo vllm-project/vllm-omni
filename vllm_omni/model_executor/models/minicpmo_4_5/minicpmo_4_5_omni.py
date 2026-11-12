@@ -1474,7 +1474,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 for i, local_idx in enumerate(members):
                     samples[local_idx] = draws[i : i + 1]
                     alternatives[local_idx] = alternate[i : i + 1]
-        return torch.cat(samples), torch.cat(alternatives)  # type: ignore[arg-type]
+        draws = torch.cat(samples)  # type: ignore[arg-type]
+        alternate_draws = torch.cat(alternatives)  # type: ignore[arg-type]
+        # EOS is a legitimate end even without punctuation. Do not replace it
+        # with a partial replay of the last accepted text token (e.g. 十一 -> 一).
+        # Keep the check on device so deferred sampling still needs no host read.
+        for local, row_idx in enumerate(rows):
+            if continuation_logits is None or not self._minicpmo45_hold_unfinished_turn(row_idx):
+                continue
+            replay_ids = self._minicpmo45_partial_token_replays(row_idx)
+            if replay_ids:
+                replay = (alternate_draws[local] == index_to_device(replay_ids, device)).any()
+                alternate_draws[local] = torch.where(replay, draws[local], alternate_draws[local])
+        return draws, alternate_draws
 
     def _sample_minicpmo45_native_duplex_rows(
         self,
@@ -1519,7 +1531,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 stage2_rows, torch.stack((draws, alternatives), dim=1).tolist(), strict=True
             ):
                 sampled = raw
-                if raw == turn_eos_id and self._minicpmo45_hold_unfinished_turn(row_idx):
+                if raw == turn_eos_id and alternate != raw and self._minicpmo45_hold_unfinished_turn(row_idx):
                     self._minicpmo45_note_held_turn_end(row_idx)
                     sampled = alternate
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
@@ -1752,6 +1764,37 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state.open_turn_tail = ""
         state.open_turn_token_ids = []
         state.turn_end_hold_pending = False
+
+    def _minicpmo45_partial_token_replays(self, row_idx: int) -> list[int]:
+        """Canonical one-token proper suffixes of the last accepted text token.
+
+        This only vetoes forced EOS continuations, never normal model draws.
+        Whole-token repetition remains valid (including two digits forming 11).
+        Incomplete UTF-8 is not a complete text token and must be allowed to finish.
+        """
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        tokens = getattr(state, "open_turn_token_ids", None)
+        encode = getattr(self._minicpmo45_tokenizer(), "encode", None)
+        if not tokens or not callable(encode):
+            return []
+        last = int(tokens[-1])
+        cache = getattr(self, "_minicpmo45_partial_replay_cache", None)
+        if cache is None:
+            cache = self._minicpmo45_partial_replay_cache = {}
+        if last not in cache:
+            text = self._minicpmo45_decode_duplex_tokens([last])
+            ids = []
+            if "\ufffd" not in text:
+                for start in range(max(1, len(text) - MiniCPMO45DuplexPolicy.TURN_TEXT_TAIL_CHARS), len(text)):
+                    suffix = text[start:]
+                    encoded = encode(suffix, add_special_tokens=False)
+                    if len(encoded) == 1 and self._minicpmo45_decode_duplex_tokens(encoded) == suffix:
+                        ids.append(int(encoded[0]))
+            # Tokenizer-derived data is shared across sessions, but bounded.
+            if len(cache) >= 256:
+                cache.clear()
+            cache[last] = ids
+        return cache[last]
 
     def _minicpmo45_hold_unfinished_turn(self, row_idx: int) -> bool:
         """Keep an open turn when ``<|turn_eos|>`` arrives before the sentence ends.
