@@ -8,6 +8,11 @@ Four scenarios:
 - Merge CI: async_chunk on + send delay, full accuracy check.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
 - Server VAD: two turns without client commits.
+
+Turn tests that need async_chunk share one class-scoped server. pytest 9.1.1
+(the CI pin) finalizes that fixture when the next test's param value differs
+and does not revive it, so those tests stay contiguous and the async_chunk-off
+server runs after them. The JIT replay keeps its own function-scoped server.
 """
 
 from __future__ import annotations
@@ -88,16 +93,17 @@ SEND_DELAY_MS = 200
 CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
+# Its seq and sampling caps stay: production max_tokens would change how long
+# these realtime replies run, not only how the server is launched.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
-server_vad_stage_config = modify_stage_config(
-    default_stage_config,
-    {
-        "async_chunk": True,
-        "duplex_session": (
-            {"server_vad_model_path": SERVER_VAD_MODEL_PATH} if SERVER_VAD_MODEL_PATH is not None else {}
-        ),
-    },
-)
+# One parsed deploy for every turn test that needs async_chunk, including
+# server VAD. The flag lives in the YAML (the CLI override used to disagree
+# with the overlay's ``async_chunk: false``). A pinned Silero path is applied
+# only when the env var is set; otherwise VAD resolves the same way as before.
+_async_chunk_updates: dict[str, bool | dict[str, str]] = {"async_chunk": True}
+if SERVER_VAD_MODEL_PATH is not None:
+    _async_chunk_updates["duplex_session"] = {"server_vad_model_path": SERVER_VAD_MODEL_PATH}
+async_chunk_stage_config = modify_stage_config(default_stage_config, _async_chunk_updates)
 
 realtime_sync_server_params = [
     pytest.param(
@@ -110,21 +116,26 @@ realtime_sync_server_params = [
     ),
 ]
 
+# Same server object under two ids. pytest 9.1.1 reuses a class-scoped fixture
+# for equal param values, including across ids, but only while those tests stay
+# adjacent. ``server_vad`` keeps its node id; it does not boot a second model.
+# ``async_chunk`` stays in the parsed deploy. The tool-call flags are the CLI
+# surface added for the audio tool-call case; they ride this shared server.
+_async_chunk_server = OmniServerParams(
+    model=MODEL,
+    stage_config_path=async_chunk_stage_config,
+    use_stage_cli=True,
+    server_args=[
+        "--tool-call-parser",
+        "hermes",
+        "--enable-auto-tool-choice",
+    ],
+)
 realtime_async_chunk_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=default_stage_config,
-            use_stage_cli=True,
-            server_args=[
-                "--async-chunk",
-                "--tool-call-parser",
-                "hermes",
-                "--enable-auto-tool-choice",
-            ],
-        ),
-        id="async_chunk",
-    ),
+    pytest.param(_async_chunk_server, id="async_chunk"),
+]
+realtime_server_vad_server_params = [
+    pytest.param(_async_chunk_server, id="server_vad"),
 ]
 
 # Stage-log lines the cold-start replay test checks.
@@ -133,17 +144,6 @@ REALTIME_CONNECTION_LOG_MARKER = "[realtime] connection opened"
 # text, once per kernel and process (``warning_once``).
 RUNTIME_JIT_LOG_MARKER = "JIT compilation during inference"
 MOE_PREFILL_WARMUP_LOG_MARKER = "MoE prefill warmup ran"
-
-realtime_server_vad_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=server_vad_stage_config,
-            use_stage_cli=True,
-        ),
-        id="server_vad",
-    ),
-]
 
 
 def _pcm16_mono_from_wav_bytes(wav_bytes: bytes, sample_rate_hz: int = 16000) -> bytes:
@@ -791,8 +791,10 @@ async def _conformance_open_session(host, port, model):
 class TestQwen3OmniRealtimeWebSocket:
     @pytest.fixture(scope="class")
     def omni_server(self, request, run_level):
-        # Release the legacy turn deployment before the duplex class below
-        # starts another model server on the same pair of GPUs.
+        # Class scope, not module: this process has to exit before the
+        # function-scoped JIT replay and the duplex class boot on the same GPUs.
+        # Keep equal ``omni_server`` params adjacent; pytest 9.1.1 drops the
+        # fixture when the next value differs and will not reuse the earlier one.
         from tests.helpers.fixtures.runtime import omni_fixture_lock
         from tests.helpers.runtime import iter_omni_server
 
@@ -867,6 +869,49 @@ class TestQwen3OmniRealtimeWebSocket:
             f"Expected an issue-like audio response longer than 5 seconds, got {output_duration_s:.2f}s"
         )
 
+    # -- Protocol conformance (same async_chunk server as the cases above) -- #
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_session_lifecycle_events(self, omni_server) -> None:
+        """session.created must precede session.updated; both appear exactly once."""
+
+        async def _run():
+            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                created = _conformance_events_of_type(events, "session.created")
+                updated = _conformance_events_of_type(events, "session.updated")
+                assert len(created) == 1
+                assert len(updated) == 1
+                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
+                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
+                assert ci < ui, "session.created must precede session.updated"
+                assert "id" in created[0].get("session", {})
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_empty_commit_returns_error(self, omni_server) -> None:
+        """Committing an empty audio buffer must return an error event."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                events = await _conformance_recv_until(
+                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
+                )
+                errors = _conformance_events_of_type(events, "error")
+                assert errors
+                assert "empty" in json.dumps(errors[0]).lower()
+
+        asyncio.run(_run())
+
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -902,10 +947,6 @@ class TestQwen3OmniRealtimeWebSocket:
     ) -> None:
         """Two Qwen turns are endpointed without client commits."""
         assert cached_silero_vad_artifact
-        deploy = load_deploy_config(server_vad_stage_config)
-        assert deploy.session_mode == "turn"
-        assert deploy.async_chunk is True
-        assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
         pcm16_24k = _duplex_fixture_pcm(validated_input_wav())
 
         turns = asyncio.run(
@@ -959,49 +1000,6 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
-
-    # -- Protocol conformance --------------------------------------------- #
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_session_lifecycle_events(self, omni_server) -> None:
-        """session.created must precede session.updated; both appear exactly once."""
-
-        async def _run():
-            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
-            async with ws:
-                created = _conformance_events_of_type(events, "session.created")
-                updated = _conformance_events_of_type(events, "session.updated")
-                assert len(created) == 1
-                assert len(updated) == 1
-                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
-                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
-                assert ci < ui, "session.created must precede session.updated"
-                assert "id" in created[0].get("session", {})
-
-        asyncio.run(_run())
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_empty_commit_returns_error(self, omni_server) -> None:
-        """Committing an empty audio buffer must return an error event."""
-
-        async def _run():
-            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
-            async with ws:
-                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                events = await _conformance_recv_until(
-                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
-                )
-                errors = _conformance_events_of_type(events, "error")
-                assert errors
-                assert "empty" in json.dumps(errors[0]).lower()
-
-        asyncio.run(_run())
 
 
 # These regressions use the engine-owned Qwen duplex plugin. The older class

@@ -137,3 +137,36 @@ def test_sdpa_contract_does_not_claim_cuda_support_for_cpu_tensors():
     result = impl.resolve_execution_path(ExecutionContext(platform="cuda"), query, query, query, None)
 
     assert result.support.status is SupportStatus.UNMIGRATED
+
+
+def test_sdpa_dispatches_out_of_tree_platforms_to_torch_sdpa(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention.backends import abstract
+
+    platform = SimpleNamespace(
+        **{name: lambda: False for name in ("is_rocm", "is_cuda", "is_npu", "is_xpu", "is_musa")},
+        is_out_of_tree=lambda: True,
+    )
+    monkeypatch.setattr(abstract, "current_omni_platform", platform)
+    query, key, value = torch.randn(3, 1, 5, 2, 8).unbind(0)
+
+    output = SDPAImpl(num_heads=2, num_kv_heads=2, head_size=8, softmax_scale=8**-0.5).forward(query, key, value)
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), scale=8**-0.5
+    ).transpose(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+def test_out_of_tree_platforms_reject_backends_without_forward_oot():
+    from vllm_omni.platforms.interface import OmniPlatformEnum, UnspecifiedOmniPlatform
+
+    class OutOfTreePlatform(UnspecifiedOmniPlatform):
+        _omni_enum = OmniPlatformEnum.OOT
+
+    OutOfTreePlatform.validate_diffusion_attn_backend("TORCH_SDPA")
+    with pytest.raises(ValueError, match="FLASH_ATTN diffusion attention backend does not implement forward_oot"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("FLASH_ATTN")
+    with pytest.raises(ValueError, match=r"such as TORCH_SDPA\.$"):
+        OutOfTreePlatform.validate_diffusion_attn_backend("RAINFUSION_ATTN")

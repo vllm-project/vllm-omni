@@ -685,7 +685,8 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, layerwise offload, and "
+                "--diffusion-attention-schedule profiles."
             ),
         )
         omni_config_group.add_argument(
@@ -705,6 +706,16 @@ class OmniServeCommand(CLISubcommand):
                 "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
                 "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
                 "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
             ),
         )
         omni_config_group.add_argument(
@@ -774,8 +785,11 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
-                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+                "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
+                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
+                "TorchNPU NPUSHMEM and Triton-Ascend, "
+                "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
             ),
         )
         omni_config_group.add_argument(
@@ -1193,13 +1207,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
@@ -1265,6 +1279,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
 
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
 
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
@@ -1518,6 +1535,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)

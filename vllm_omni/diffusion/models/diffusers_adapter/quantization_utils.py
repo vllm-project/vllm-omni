@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Quantization helpers for the Diffusers backend."""
 
 from __future__ import annotations
@@ -214,6 +214,13 @@ def _validate_fp8_quant_config(quant_config: Any) -> None:
         raise NotImplementedError(
             "Diffusers backend fp8 conversion does not map vLLM weight_block_size "
             "to TorchAO. Use diffusers_load_kwargs for a native Diffusers config."
+        )
+
+    online_block_size = getattr(quant_config, "online_block_size", None)
+    if online_block_size is not None:
+        raise NotImplementedError(
+            "Diffusers backend fp8 conversion does not map vLLM online_block_size "
+            "to TorchAO. Use the native vLLM-Omni diffusion backend."
         )
 
     _ensure_no_ignored_layers(quant_config)

@@ -25,7 +25,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
+from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -47,6 +47,7 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -394,15 +395,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         chunk = req_state.stage_output_chunks.get(src_stage_id)
         if chunk is None:
             return
-        for next_input in next_inputs:
-            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
-            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
-            if isinstance(buffer, dict) and isinstance(duplex, dict):
-                # Copy both levels: the stage-input processor may share them with bridge state.
-                next_input["model_intermediate_buffer"] = {
-                    **buffer,
-                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
-                }
+        for index, next_input in enumerate(next_inputs):
+            if isinstance(next_input, dict):
+                next_inputs[index] = with_perf_chunk(next_input, chunk)
 
     async def _report_duplex_session_request_error(
         self,
