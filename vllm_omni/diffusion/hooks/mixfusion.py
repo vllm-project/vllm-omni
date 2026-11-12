@@ -223,13 +223,14 @@ def _slice_request(value, req_idx: int, num_requests: int):
         if len(value) != num_requests:
             raise ValueError(f"MixFusion per-request argument has {len(value)} entries for {num_requests} requests.")
         item = value[req_idx]
-        # A list entry stays a batch of one so the module sees its usual type.
+        # A list entry stays a batch (that request's images) so the module
+        # sees its usual type.
         return item if isinstance(item, torch.Tensor) else [item]
     if isinstance(value, torch.Tensor) and value.shape[0] == num_requests:
         return value[req_idx : req_idx + 1]
     raise ValueError(
         "MixFusion per-request argument must be a per-request list or a tensor whose leading dim is the "
-        "request count (this layout family has one image per request)."
+        "request count; per-request image rows only travel inside list entries."
     )
 
 

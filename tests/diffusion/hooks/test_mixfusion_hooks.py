@@ -13,7 +13,8 @@ chunk layout, and verify:
   passes the step-invariant adapter state per CFG branch, reuses plans across
   steps and restores the per-request output list;
 - a completed step releases its packed inputs: only layout state survives;
-- per-request arguments are sliced per request, with one image per request;
+- per-request arguments are sliced per request (a tensor entry is
+  request-indexed; a request's several images travel inside its list entry);
 - the replace-output hook returns the adapter-computed boundary value instead
   of running the (layout-incompatible) original forward;
 - the expand hooks map per-request rows to per-chunk rows;
@@ -386,9 +387,9 @@ class TestBoundedRetention:
 
 class TestPerRequestSlicing:
     def test_image_rows_are_not_request_rows(self):
-        # Three requests, four image rows: this layout family is one image per
-        # request, so a per-image-row value has no request-index mapping.
-        with pytest.raises(ValueError, match="one image per request"):
+        # Three requests, four image rows: the tensor branch is request-indexed,
+        # so a per-image-row value has no request-index mapping.
+        with pytest.raises(ValueError, match="only travel inside list entries"):
             _slice_request(torch.zeros(4, SEQ_LEN, 3), 0, 3)
 
     def test_list_length_must_be_the_request_count(self):
@@ -399,6 +400,14 @@ class TestPerRequestSlicing:
         rows = torch.arange(3).reshape(3, 1)
         assert _slice_request(rows, 1, 3).tolist() == [[1]]
         assert _slice_request(["a", "b", "c"], 2, 3) == ["c"]
+
+    def test_list_entry_may_carry_several_images(self):
+        # A request's images travel inside its list entry: a tensor entry with
+        # a two-image leading dim passes through as that request's batch.
+        two = torch.zeros(2, SEQ_LEN, 3)
+        assert _slice_request([two] * 3, 0, 3) is two
+        pair = [torch.zeros(1, SEQ_LEN, 3), torch.zeros(1, SEQ_LEN, 3)]
+        assert _slice_request([pair, pair, pair], 0, 3) == [pair]
 
 
 class TestBoundaryErrors:

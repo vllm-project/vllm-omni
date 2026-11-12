@@ -129,16 +129,16 @@ def test_continuous_admission_checks_cached_and_new_requests_and_completion():
     assert set(scheduler.schedule().scheduled_request_ids) == {"a", "c"}
 
 
-def test_multi_output_requests_keep_dense_admission():
-    # The shared chunked adapter slices one image per request; per-image-row
-    # values have no request-index mapping, so multi-output requests stay
-    # dense until that slicing semantics exists.
+def test_multi_output_requests_share_packed_admission():
+    # Multi-output requests carry their image count in the admission metadata
+    # and pack like any other request; the tensor slicing limitation only
+    # applies to per-request forward arguments, which travel as lists.
     a = _request("a", num_outputs_per_prompt=2)
     b = _request("b", 768, 1024, num_outputs_per_prompt=2)
-    assert a.mixfusion_info is None and b.mixfusion_info is None
+    assert a.mixfusion_info.num_images == 2 and b.mixfusion_info.num_images == 2
     output = _scheduler(a, b).schedule()
-    assert output.scheduled_request_ids == ["a"]
-    assert not output.use_mixfusion
+    assert output.scheduled_request_ids == ["a", "b"]
+    assert output.use_mixfusion
 
 
 def test_cfg_branches_are_part_of_packing_compatibility():

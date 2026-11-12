@@ -43,10 +43,6 @@ class MixFusionDriver:
             info = state.mixfusion_info
             if state.request_id != request_id or info is None:
                 raise ValueError(f"MixFusion request {request_id}: missing or mismatched admission metadata")
-            if info.num_images != 1:
-                raise ValueError(
-                    f"MixFusion request {request_id}: the chunked joint adapter supports one image per request"
-                )
             if latent.ndim != 3 or tuple(latent.shape[:2]) != (info.num_images, info.image_tokens):
                 raise ValueError(f"MixFusion request {request_id}: actual latents disagree with admitted token counts")
         first = input_batch.latents[0]

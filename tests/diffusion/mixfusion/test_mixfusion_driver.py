@@ -84,14 +84,16 @@ def test_bad_shape_fails_before_any_forward():
             _driver().run(batch, states, lambda *a, **k: pytest.fail("must not run or fall back"))
 
 
-def test_multi_image_admission_is_rejected():
+def test_multi_image_requests_pass_the_execution_contract():
+    # Latents are checked against the admitted (num_images, image_tokens)
+    # pair, so a multi-image request validates like any other and reaches the
+    # adapter, which may express its own restrictions.
     driver = _driver()
     states = _states()
     states[0].mixfusion_info = MixFusionRequestInfo(2, 8, 1, 128)
     states[0].latents = torch.zeros(2, 8, 4)
     batch = InputBatch.make_batch(states, use_mixfusion=True)
-    with pytest.raises(ValueError, match="one image per request"):
-        driver.validate(batch)
+    driver.validate(batch)
 
 
 def test_armed_step_releases_its_packed_bundle_on_exit():
