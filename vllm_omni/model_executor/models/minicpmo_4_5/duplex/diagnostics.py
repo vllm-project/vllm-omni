@@ -39,9 +39,6 @@ def turn_state(state: object) -> dict[str, object]:
         name: getattr(state, name, None)
         for name in (
             "current_turn_ended",
-            "open_turn_tail",
-            "held_turn_ends",
-            "turn_end_hold_pending",
             "pending_terminator_token",
             "last_terminator_token",
         )
@@ -94,7 +91,7 @@ class SamplingTrace:
         elif hit:
             reason = "chunk_boundary"
         elif raw == self.token_ids.get("turn_eos_token_id"):
-            reason = "hold_turn_eos" if final != raw else "accept_turn_eos"
+            reason = "accept_turn_eos"
         elif final != raw:
             reason = "listen_to_tts_bos"
         else:
@@ -113,8 +110,6 @@ class SamplingTrace:
             for row, values in zip(rows, host.cpu().tolist(), strict=True):
                 if name == "stage2_logits" and self.records[row].get("boundary_hit"):
                     continue  # No committed stage-2 decision on this row.
-                if name == "continuation_logits" and self.records[row].get("reason") != "hold_turn_eos":
-                    continue  # The alternative was not used.
                 scores = [value if math.isfinite(value) else None for value in values[k:]]
                 self.records[row][name] = {
                     "top_ids": [int(value) for value in values[:k]],

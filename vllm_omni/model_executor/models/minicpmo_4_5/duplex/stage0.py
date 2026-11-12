@@ -100,10 +100,6 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
-    open_turn_token_ids: list[int] = field(default_factory=list)
-    open_turn_tail: str = ""
-    held_turn_ends: int = 0
-    turn_end_hold_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)

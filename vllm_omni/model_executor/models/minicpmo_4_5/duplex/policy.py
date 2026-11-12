@@ -108,10 +108,6 @@ class MiniCPMO45DuplexPolicy:
     SENTENCE_END_PUNCTUATION = "。！？.!?…"
     CLOSING_PUNCTUATION = "\"'”’」』）)】"
     TURN_TEXT_TAIL_CHARS = 16
-    # Issue 9828 samples <|turn_eos|> after 「正」. One more chunk is about 20
-    # tokens. Retry only while text advances, up to 16 holds per turn; another
-    # <|turn_eos|> without new text is accepted immediately.
-    MAX_HELD_UNFINISHED_TURN_ENDS = 16
 
     @staticmethod
     def turn_text_ends_sentence(text: str) -> bool:
