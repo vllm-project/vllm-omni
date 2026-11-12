@@ -49,7 +49,6 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_batch import BatchedCellAdapter
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
@@ -742,34 +741,20 @@ class CausVidWanPipeline(nn.Module):
         outputs: list[DiffusionOutput] = []
         stream_jobs: list[Any | None] = []
         try:
-            members: dict[str, WanCell] = {}
-            order: list[tuple[str, WanCell, Any | None]] = []
-            for item in _as_request_list(req):
-                adapter, kv_id, _persist, stream_job = self.admit_cell_request(item)
-                if not isinstance(adapter, WanCell):
-                    raise TypeError(f"expected WanCell adapter, got {type(adapter).__name__}")
-                if kv_id in members:
-                    raise ValueError(f"duplicate cell-batch member id {kv_id!r}")
-                members[kv_id] = adapter
-                order.append((kv_id, adapter, stream_job))
-                stream_jobs.append(stream_job)
-            batch_adapter: WanCell | BatchedCellAdapter
-            if len(members) == 1:
-                batch_adapter = next(iter(members.values()))
-            else:
-                max_batch = getattr(getattr(ctx, "spec", None), "max_batch_size", None)
-                batch_adapter = BatchedCellAdapter(
-                    members,
-                    max_batch_size=max_batch if max_batch is not None else len(members),
-                    compatibility_of=lambda req, cell: (
-                        cell,
-                        members[req].latent_shape,
-                        members[req].num_denoise_steps,
-                    ),
-                    pack_batch=WanCell.pack_compute_batch,
-                )
             try:
-                run_cell_pipeline(ctx=ctx, adapter=batch_adapter)
+                members: dict[str, WanCell] = {}
+                order: list[tuple[str, WanCell, Any | None]] = []
+                for item in _as_request_list(req):
+                    adapter, kv_id, _persist, stream_job = self.admit_cell_request(item)
+                    if not isinstance(adapter, WanCell):
+                        raise TypeError(f"expected WanCell adapter, got {type(adapter).__name__}")
+                    if kv_id in members:
+                        raise ValueError(f"duplicate cell-batch member id {kv_id!r}")
+                    members[kv_id] = adapter
+                    order.append((kv_id, adapter, stream_job))
+                    stream_jobs.append(stream_job)
+                # Batch organization lives in run_cell_pipeline; Pipeline only supplies members.
+                run_cell_pipeline(ctx=ctx, members=members)
             except Exception:
                 for stream_job in stream_jobs:
                     if stream_job is not None:

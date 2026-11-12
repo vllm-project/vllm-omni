@@ -71,11 +71,15 @@ def _schedule(**kwargs) -> CellSchedule:
 
 
 class _CountingAdapter(CellAdapter):
-    def forward(self, tasks, kv_contexts, *, hidden):
-        return torch.zeros(1, 4, 8)
+    def compatibility_key(self, cell):
+        return cell
+
+    def forward(self, batch, members, *, task_count, member_inputs):
+        del members, task_count, member_inputs
+        return {"hidden_states": torch.zeros(batch.size, 4, 8)}
 
     def pack_activation(self, output):
-        return {"hidden_states": output}
+        return output if isinstance(output, dict) else {"hidden_states": output}
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]

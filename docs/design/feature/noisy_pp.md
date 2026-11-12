@@ -287,25 +287,29 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).
 - Micro-batch packing (`R`): attention still loops per-member paged-KV views;
-  DiT FFN/embed/unembed pack via ``BatchedCellAdapter`` + model ``pack_batch``
-  when ``max_batch_size>1``. Varlen / pad merge and Legacy step Batch remain open.
+  DiT FFN/embed/unembed pack via executor-organized ``ComputeBatch`` +
+  ``CellAdapter.forward`` when ``max_batch_size>1``. Varlen / pad merge
+  and Legacy step Batch remain open.
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
 
 ## Cell Batch (Noisy KV)
 
-Batch is a Noisy PP execution contract, not a model feature. Compatible
-plan-allowed Cells in one slot form a ``CellComputeBatch``: ordered member
-identity, per-member KV views, and batch-row → member result mapping (same
-member contract as step ``InputBatch``, Cell granularity).
-``BatchedCellAdapter`` + ``organize_cell_batches`` group by compatibility and
-split on ``max_batch_size`` without deferring Cells to a later plan slot.
+Batch is a Noisy PP execution contract, not a model feature. Same boundary as
+Stepwise: the generic runtime organizes compute; the model consumes a batch.
+Pipeline admits requests and passes a ``kv_id → CellAdapter`` map; it does not
+own batch policy.
 
-Model backends only supply ``pack_batch`` for each ``CellComputeBatch``
-(including size 1). CausVid's ``WanCell.pack_compute_batch`` is the first
-packer: embed / block / unembed on the batch axis, per-member prompt /
-sampler / seed / finished / paged-KV. Other Noisy PP models reuse
-``BatchedCellAdapter`` with their own packer.
+Per slot, ``run_cell_pipeline`` collects ready tasks, groups them with
+``organize_batches`` (``compatibility_key`` + ``max_batch_size`` split, no
+deferral to a later plan slot), maps each member's activation by request
+identity for the consumer ``(chunk, step)``, then calls ``CellAdapter.forward``.
+
+``ComputeBatch`` requires a shared DiT ``block`` only; each member keeps its
+own ``(chunk, step, block)``, KV view, and output row. CausVid's ``WanCell``
+keys on ``(block, latent_shape, dtype)``; chunk / step / timestep are member
+inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
+``timesteps=[800, 500]``, ``chunks=[0, 3]``) into embed / block / unembed.
 
 ## Related
 
@@ -313,5 +317,5 @@ sampler / seed / finished / paged-KV. Other Noisy PP models reuse
 - [AR-Diffusion pipeline capability](../ar_diffusion_pipeline_capability.md)
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
-- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{cell_batch,noisy_pp_plan,noisy_pp_executor}.py`;
+- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{batch,noisy_pp_plan,noisy_pp_executor}.py`;
   NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`

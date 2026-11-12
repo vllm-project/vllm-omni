@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -12,6 +12,11 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
+    ComputeBatch,
+    organize_batches,
+    slice_activation_for_task,
+)
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellPlan,
@@ -36,22 +41,41 @@ def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
     return int(pp_group.ranks[group_rank])
 
 
-def _consumer_stash_meta(
-    src_tasks: tuple[tuple[str, Cell], ...],
+def _consumer_stash_meta_for_task(
+    req: str,
+    cell: Cell,
     *,
     topology: CellTopology,
     src: int,
 ) -> tuple[str, int, int]:
-    """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
+    """Stash key for one member: ``(request_id, consumer_chunk, consumer_step)``.
 
     Producer schedule meta alone is wrong across step replicas: consumer step is
-    ``producer_step + 1``. Same-step layer-group boundaries keep the step.
+    ``producer_step + 1`` when leaving a denoise stage. Mid-group boundaries keep
+    the step (next block on the same chunk/step).
     """
-    _req, cell = src_tasks[0]
     chunk, step, _block = cell
     if topology.is_layer_group_last(src):
         step = int(step) + 1
-    return ("", int(chunk), int(step))
+    return (str(req), int(chunk), int(step))
+
+
+def _stash_activation_rows(
+    act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]],
+    payload: Mapping[str, torch.Tensor] | dict,
+    src_tasks: tuple[tuple[str, Cell], ...],
+    *,
+    topology: CellTopology,
+    src: int,
+) -> None:
+    """Split a packed PP activation by send-time member order into per-request rows."""
+    n = len(src_tasks)
+    for i, (req, cell) in enumerate(src_tasks):
+        row = slice_activation_for_task(payload, task_index=i, task_count=n)
+        if row is None:
+            continue
+        meta = _consumer_stash_meta_for_task(req, cell, topology=topology, src=src)
+        _stash_activation(act_stash, row, meta=meta)
 
 
 def _activation_edges(
@@ -113,6 +137,18 @@ def _warmup_activation_p2p(pp_group: Any, *, world: int, rank: int, device: torc
         work.wait()
 
 
+def _stash_activation(
+    stash: dict[tuple[str, int, int], dict[str, torch.Tensor]],
+    payload: dict,
+    *,
+    meta: tuple[str, int, int] | None,
+) -> None:
+    if meta is None:
+        raise RuntimeError("stash_activation needs meta")
+    tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
+    stash[meta] = tensors
+
+
 def _post_activations_ws(
     pp_group: Any,
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]],
@@ -122,10 +158,11 @@ def _post_activations_ws(
     adapter: CellAdapter,
     topology: CellTopology,
     device: torch.device,
+    act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]],
 ) -> None:
     """Fixed-shape activation P2P: one ``batch_isend_irecv``, wait before return."""
     ops: list[dist.P2POp] = []
-    recv_jobs: list[tuple[dict[str, torch.Tensor], tuple[str, int, int]]] = []
+    recv_jobs: list[tuple[dict[str, torch.Tensor], tuple[tuple[str, Cell], ...], int]] = []
     group = pp_group.device_group
 
     for src, dst, src_tasks in edges:
@@ -148,12 +185,14 @@ def _post_activations_ws(
             payload = {key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in spec_list}
             for key, _shape, _dtype in spec_list:
                 ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
-            recv_jobs.append((payload, _consumer_stash_meta(src_tasks, topology=topology, src=src)))
+            recv_jobs.append((payload, src_tasks, src))
 
     if ops:
         _wait(list(dist.batch_isend_irecv(ops)))
-    for payload, meta in recv_jobs:
-        adapter.stash_activation(payload, meta=meta)
+    for payload, src_tasks, src_rank in recv_jobs:
+        _stash_activation_rows(
+            act_stash, payload, src_tasks, topology=topology, src=src_rank
+        )
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -339,21 +378,27 @@ class ARDiffusionCellContext:
 
 
 class CellAdapter:
-    """Model-side cell step on this rank.
+    """Model backend for one request's Cell compute.
 
-    Receives the slot's plan-allowed tasks and KV views. Compatible members may
-    be organized into ``CellComputeBatch`` groups inside the adapter (or a
-    shared organizer) for one tensor-packed model call; scheduling order stays
-    with CellPlan.
+    The executor organizes ``ComputeBatch`` groups. Adapters only declare
+    packing compatibility and run one batch.
     """
+
+    def compatibility_key(self, cell: Cell) -> Hashable:
+        """Model-declared key for which Cells may share one compute call."""
+        del cell
+        raise NotImplementedError
 
     def forward(
         self,
-        tasks: tuple[tuple[str, Cell], ...],
-        kv_contexts: list[list[Any]],
+        batch: ComputeBatch,
+        members: Sequence["CellAdapter"],
         *,
-        hidden: Any | None,
-    ) -> Any:
+        task_count: int,
+        member_inputs: Sequence[Any | None],
+    ) -> dict[str, torch.Tensor]:
+        """Pack inputs → model → split/update per-member state; return packed tensors."""
+        del batch, members, task_count, member_inputs
         raise NotImplementedError
 
     def pack_activation(self, output: Any) -> dict:
@@ -367,20 +412,6 @@ class CellAdapter:
     ) -> list[tuple[str, tuple[int, ...], torch.dtype]] | None:
         """Fixed NCCL recv schema ``[(key, shape, dtype), ...]``, or ``None`` for tensor_dict."""
         del batch, include_hidden
-        return None
-
-    def stash_activation(
-        self,
-        payload: dict,
-        *,
-        handles: list[Any] | None = None,
-        meta: tuple[str, int, int] | None = None,
-    ) -> None:
-        """Buffer peer activation until the matching cell runs (recv already waited)."""
-        del payload, handles, meta
-
-    def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
-        del req, chunk, step
         return None
 
 
@@ -406,17 +437,102 @@ def _tasks_need_activation_send(
     return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
 
 
+class _UniformMembers(Mapping[str, CellAdapter]):
+    """Resolve every request id to the same adapter (test / single-backend helpers)."""
+
+    def __init__(self, adapter: CellAdapter) -> None:
+        self._adapter = adapter
+
+    def __getitem__(self, key: str) -> CellAdapter:
+        del key
+        return self._adapter
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 1
+
+    def values(self):
+        return (self._adapter,)
+
+
+def _as_member_map(members: Mapping[str, CellAdapter] | CellAdapter) -> Mapping[str, CellAdapter]:
+    if isinstance(members, CellAdapter):
+        return _UniformMembers(members)
+    return members
+
+
+def _pack_task_outputs(outs: list[dict[str, torch.Tensor] | None]) -> dict[str, torch.Tensor] | None:
+    typed = [item for item in outs if item is not None]
+    if not typed:
+        return None
+    if len(typed) == 1:
+        return typed[0]
+    keys = typed[0].keys()
+    return {k: torch.cat([o[k] for o in typed], dim=0) for k in keys}
+
+
+def _run_slot_batches(
+    *,
+    tasks: tuple[tuple[str, Cell], ...],
+    contexts: list[Any],
+    members: Mapping[str, CellAdapter],
+    max_batch_size: int,
+    pending_hidden: dict[str, Any],
+    act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]],
+) -> list[dict[str, torch.Tensor] | None]:
+    """Organize compatible Batches, map per-member activations, run model forward."""
+    batches = organize_batches(
+        tasks,
+        contexts,
+        compatibility_of=lambda req, cell: members[req].compatibility_key(cell),
+        max_batch_size=max_batch_size,
+    )
+    outs: list[dict[str, torch.Tensor] | None] = [None] * len(tasks)
+    for batch in batches:
+        member_adapters = [members[m.request_id] for m in batch.members]
+        member_inputs: list[Any | None] = []
+        for member_ref in batch.members:
+            req = member_ref.request_id
+            # Local mid-group / clean handoff is request-keyed; PP rows use the
+            # consumer (req, chunk, step) written at send time.
+            if req in pending_hidden:
+                member_inputs.append(pending_hidden.pop(req))
+            else:
+                member_inputs.append(
+                    act_stash.pop((req, int(member_ref.chunk), int(member_ref.step)), None)
+                )
+        packed = member_adapters[0].forward(
+            batch,
+            member_adapters,
+            task_count=len(tasks),
+            member_inputs=member_inputs,
+        )
+        for local_i, part in enumerate(batch.split_outputs(packed)):
+            outs[batch.members[local_i].task_index] = part
+    return outs
+
+
 def run_cell_pipeline(
     *,
     ctx: ARDiffusionCellContext,
-    adapter: CellAdapter,
+    members: Mapping[str, CellAdapter] | CellAdapter | None = None,
+    adapter: CellAdapter | None = None,
     max_slots: int | None = None,
 ) -> None:
     """Run inflight plans on this rank (one cell per tick).
 
-    Per tick: prepare → forward → publish → post act/KV → wait outbound.
-    Mid-group cells keep ``hidden`` locally; group-boundary cells P2P.
+    Per tick: prepare → organize Batches → compute → publish → post act/KV.
+    ``members`` maps request/kv id → model adapter. A single ``CellAdapter`` (or
+    legacy ``adapter=``) is treated as the backend for every request.
     """
+    if members is None:
+        members = adapter
+    if members is None:
+        raise ValueError("run_cell_pipeline requires members= or adapter=")
+    member_map = _as_member_map(members)
+    primary = next(iter(member_map.values()))
     spec = ctx.spec
     kv = ctx.kv
     kv.bind_rank(spec.rank, spec.pp_group)
@@ -431,11 +547,13 @@ def run_cell_pipeline(
     )
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
-    pending_hidden: Any | None = None
+    # Request-keyed local handoff (mid-group / same-rank clean). PP rows live in act_stash.
+    pending_hidden: dict[str, Any] = {}
+    act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
     try:
         kv_stream = kv.uses_comm_stream
         prev_slot_for_evict: int | None = None
-        act_device = getattr(adapter, "device", None)
+        act_device = getattr(primary, "device", None)
         if act_device is None:
             act_device = (
                 current_omni_platform.get_torch_device()
@@ -446,7 +564,7 @@ def run_cell_pipeline(
             pp is not None
             and spec.topology.world > 1
             and not activation_use_tensor_dict()
-            and adapter.activation_spec(batch=1, include_hidden=False) is not None
+            and primary.activation_spec(batch=1, include_hidden=False) is not None
         )
         if use_ws_act:
             _warmup_activation_p2p(pp, world=spec.topology.world, rank=spec.rank, device=act_device)
@@ -465,7 +583,15 @@ def run_cell_pipeline(
                 # Consume-time wait: covers prefetch that landed many ticks earlier.
                 kv.await_task_sources(tasks)
                 contexts = kv.prepare(tasks)
-                output = adapter.forward(tasks, contexts, hidden=pending_hidden)
+                task_outs = _run_slot_batches(
+                    tasks=tasks,
+                    contexts=contexts,
+                    members=member_map,
+                    max_batch_size=max(1, int(spec.max_batch_size)),
+                    pending_hidden=pending_hidden,
+                    act_stash=act_stash,
+                )
+                output = _pack_task_outputs(task_outs)
                 kv.publish(tasks)
                 # A local clean successor consumes the chunk-0 final latent here.
                 # The executor owns this handoff; adapters need no latent cache.
@@ -474,12 +600,17 @@ def run_cell_pipeline(
                     and schedule.ordering is Ordering.SAME_STEP
                     and schedule.chunks > 1
                     and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
-                    and tasks[0][1] == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
+                    and any(
+                        cell == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
+                        for _req, cell in tasks
+                    )
                 )
                 if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
-                    pending_hidden = output
+                    pending_hidden = {
+                        req: part for (req, _cell), part in zip(tasks, task_outs, strict=True) if part is not None
+                    }
                 else:
-                    pending_hidden = None
+                    pending_hidden = {}
             if kv_stream and prev_slot_for_evict is not None:
                 kv.wait_sends()
                 kv.evict(prev_slot_for_evict)
@@ -495,14 +626,17 @@ def run_cell_pipeline(
                 if not use_ws_act:
                     for src, dst, src_tasks in edges:
                         if spec.rank == src and output is not None:
-                            handles = pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst)
+                            handles = pp.isend_tensor_dict(primary.pack_activation(output), dst=dst)
                             comm_handles.extend(handles)
                         elif spec.rank == dst:
                             recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
                             comm_handles.extend(recv_handles)
-                            adapter.stash_activation(
+                            _stash_activation_rows(
+                                act_stash,
                                 recv,
-                                meta=_consumer_stash_meta(src_tasks, topology=spec.topology, src=src),
+                                src_tasks,
+                                topology=spec.topology,
+                                src=src,
                             )
                 elif edges:
                     _post_activations_ws(
@@ -510,9 +644,10 @@ def run_cell_pipeline(
                         edges,
                         rank=spec.rank,
                         output=output,
-                        adapter=adapter,
+                        adapter=primary,
                         topology=spec.topology,
                         device=act_device,
+                        act_stash=act_stash,
                     )
             kv_handles = kv.exchange(slot)
             if not kv_stream:

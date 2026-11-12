@@ -8,7 +8,7 @@ Layer split uses stage group ``G`` via ``layer_pp_rank`` / ``layer_pp_world``.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable, Sequence
 from typing import Any
 
 import torch
@@ -117,8 +117,8 @@ class StageWanTransformer(nn.Module):
         self._wan: nn.Module | None = None
         self._cell_kv_ctx: Any | None = None
         self._text: torch.Tensor | None = None
-        self._embeddings: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self._rotary: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._embeddings: dict[Hashable, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._rotary: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
         self._init_wan(
             transformer_config=transformer_config,
             fallback_geo={
@@ -248,19 +248,27 @@ class StageWanTransformer(nn.Module):
         return hidden.flatten(2).transpose(1, 2)
 
     def _embedding(
-        self, step: int, timestep: torch.Tensor, *, batch_size: int, device: torch.device, dtype: torch.dtype
+        self,
+        step: Hashable,
+        timestep: torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._wan is not None and self._text is not None
-        hit = self._embeddings.get(step)
-        if hit is not None:
-            return hit
         ts = timestep.to(device=device, dtype=torch.float32)
         if ts.ndim == 0 or (ts.ndim == 1 and ts.shape[0] == 1 and batch_size > 1):
             ts = ts.expand(batch_size)
+        # Key by per-member noise levels so mixed-shift packs do not reuse a scalar cache.
+        cache_key = (step, tuple(float(x) for x in ts.detach().reshape(-1).tolist()))
+        hit = self._embeddings.get(cache_key)
+        if hit is not None:
+            return hit
         temb, timestep_proj, enc, _ = self._wan.condition_embedder(ts, self._text, None, timestep_seq_len=None)
         timestep_proj = self._wan.timestep_proj_prepare(timestep_proj, None)
         out = (temb.to(dtype=dtype), timestep_proj.to(dtype=dtype), enc.to(dtype=dtype))
-        self._embeddings[step] = out
+        self._embeddings[cache_key] = out
         return out
 
     def _rope_with_temporal_offset(
@@ -298,36 +306,81 @@ class StageWanTransformer(nn.Module):
         return freqs_cos_out.to(latent.device), freqs_sin_out.to(latent.device)
 
     def _rotary_emb(self, chunk: int, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """RoPE for one latent row (batch dim may be 1)."""
         assert self._wan is not None
-        hit = self._rotary.get(chunk)
+        frames = int(latent.shape[2])
+        cache_key = (int(chunk), frames)
+        hit = self._rotary.get(cache_key)
         if hit is not None:
             return hit
         # Absolute temporal offset so history KV and the current chunk do not share
         # the same frame indices (official CausVid ``current_start``).
-        start_frame = int(chunk) * int(latent.shape[2])
+        start_frame = int(chunk) * frames
         freqs_cos, freqs_sin = self._rope_with_temporal_offset(latent, start_frame=start_frame)
         rotary = (freqs_cos[..., 0::2].to(latent.dtype), freqs_sin[..., 1::2].to(latent.dtype))
-        self._rotary = {chunk: rotary}
+        self._rotary[cache_key] = rotary
         return rotary
+
+    def _rotary_emb_for_batch(
+        self, chunks: Sequence[int], latent: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-member chunk RoPE, concatenated on the batch axis."""
+        if len(chunks) != int(latent.shape[0]):
+            raise ValueError(f"chunks length {len(chunks)} != latent batch {latent.shape[0]}")
+        if len(chunks) == 1:
+            return self._rotary_emb(int(chunks[0]), latent)
+        cos_rows: list[torch.Tensor] = []
+        sin_rows: list[torch.Tensor] = []
+        for i, chunk in enumerate(chunks):
+            cos, sin = self._rotary_emb(int(chunk), latent[i : i + 1])
+            cos_rows.append(cos)
+            sin_rows.append(sin)
+        return torch.cat(cos_rows, dim=0), torch.cat(sin_rows, dim=0)
+
+    @staticmethod
+    def _as_member_list(value: int | Sequence[int], *, batch_size: int, name: str) -> list[int]:
+        if isinstance(value, int):
+            return [int(value)] * batch_size
+        out = [int(v) for v in value]
+        if len(out) != batch_size:
+            raise ValueError(f"{name} length {len(out)} != batch_size {batch_size}")
+        return out
 
     def block(
         self,
         index: int,
         hidden: torch.Tensor,
         *,
-        chunk: int,
-        step: int,
         latent: torch.Tensor,
         timestep: torch.Tensor,
         kv_ctx: Any | None = None,
+        chunks: int | Sequence[int] | None = None,
+        steps: int | Sequence[int] | None = None,
+        chunk: int | None = None,
+        step: int | None = None,
     ) -> torch.Tensor:
         assert self._wan is not None
         if not self.start_layer <= index < self.end_layer:
             raise ValueError(f"block {index} not in [{self.start_layer}, {self.end_layer})")
+        batch_size = int(latent.shape[0])
+        if chunks is None:
+            if chunk is None:
+                raise TypeError("block() requires chunks= or chunk=")
+            chunks = chunk
+        if steps is None:
+            if step is None:
+                raise TypeError("block() requires steps= or step=")
+            steps = step
+        chunk_list = self._as_member_list(chunks, batch_size=batch_size, name="chunks")
+        step_list = self._as_member_list(steps, batch_size=batch_size, name="steps")
         _temb, timestep_proj, enc = self._embedding(
-            step, timestep, batch_size=latent.shape[0], device=latent.device, dtype=latent.dtype
+            tuple(step_list),
+            timestep,
+            batch_size=batch_size,
+            device=latent.device,
+            dtype=latent.dtype,
         )
-        rotary_emb = self._rotary_emb(chunk, latent)
+        rotary_emb = self._rotary_emb_for_batch(chunk_list, latent)
         self._cell_kv_ctx = kv_ctx
         try:
             return self._wan.blocks[index](hidden, enc, timestep_proj, rotary_emb, None, None, False)
@@ -338,18 +391,31 @@ class StageWanTransformer(nn.Module):
         self,
         hidden: torch.Tensor,
         *,
-        chunk: int,
-        step: int,
         latent: torch.Tensor,
         timestep: torch.Tensor,
+        chunks: int | Sequence[int] | None = None,
+        steps: int | Sequence[int] | None = None,
+        chunk: int | None = None,
+        step: int | None = None,
     ) -> torch.Tensor:
-        del chunk
+        del chunks, chunk  # RoPE is block-only; keep kwargs for call-site symmetry.
         assert self._wan is not None
         wan = self._wan
         batch_size, _c, num_frames, height, width = latent.shape
         p_t, p_h, p_w = self.patch_size
         post_t, post_h, post_w = num_frames // p_t, height // p_h, width // p_w
-        temb, _, _ = self._embedding(step, timestep, batch_size=batch_size, device=latent.device, dtype=latent.dtype)
+        if steps is None:
+            if step is None:
+                raise TypeError("unembed() requires steps= or step=")
+            steps = step
+        step_list = self._as_member_list(steps, batch_size=batch_size, name="steps")
+        temb, _, _ = self._embedding(
+            tuple(step_list),
+            timestep,
+            batch_size=batch_size,
+            device=latent.device,
+            dtype=latent.dtype,
+        )
         shift, scale = wan.output_scale_shift_prepare(temb)
         shift, scale = shift.to(hidden.device), scale.to(hidden.device)
         if shift.ndim == 2:
