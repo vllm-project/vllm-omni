@@ -1209,7 +1209,10 @@ def _conv2d_with_padding(conv: nn.Conv2d, frame: torch.Tensor, pad: tuple[int, i
     key = _conv_verdict_key(conv, frame, 0)
     verdict = verdicts.get(key)
     if verdict is None:
-        verdict = _equal_on_random_operands(frame, conv.weight, candidate, padded, pre_pad)
+        # Probe a template, like the Conv3d paths: the probe never holds scratch sized from a live input, and a
+        # declined probe falls back to the reference formulation (``frame`` plus one padded copy, as ``off`` does).
+        template = torch.empty_strided(frame.shape, frame.stride(), dtype=frame.dtype, device="meta")
+        verdict = _equal_on_random_operands(template, conv.weight, candidate, padded, pre_pad)
         if verdict is None:
             _log_probe_skipped(conv, frame)
             return padded(pre_pad(frame), conv.weight)

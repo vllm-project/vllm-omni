@@ -400,14 +400,13 @@ def test_reference_norm_keeps_its_reduction_and_never_probes(monkeypatch) -> Non
     # The model's own forward (e.g. QwenImage21RMS_norm) calls the shared helper without the fast path.
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 
-    norm = WanRMS_norm(96, images=False).eval()
+    norm = WanRMS_norm(96, images=False).eval().to(x.dtype)
     with torch.no_grad():
         norm.gamma.uniform_(0.5, 1.5)
         reference = vrn.rms_norm_fastpath(norm, x)
-        probed = vrn.rms_norm_fastpath(norm, x, probe_reduction=True)
-    assert reference is not None and probed is not None
-    # Same bits here (this backend's reductions agree); only the reference path is pinned to the old expression.
-    assert torch.equal(reference.view(torch.int16), probed.view(torch.int16))
+        expected = (x.float() / direct.clamp_min(1e-12)).to(x.dtype) * norm.scale * norm.gamma + norm.bias
+    assert reference is not None
+    torch.testing.assert_close(reference, expected, rtol=0, atol=0)  # the reduction it always read
     assert not vrn._FP32_NORM_VERDICTS  # nothing probed on the reference path
 
 
