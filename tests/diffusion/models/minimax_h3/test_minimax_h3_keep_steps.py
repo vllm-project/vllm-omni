@@ -876,7 +876,9 @@ def test_request_path_normalizes_video_first_references(monkeypatch: pytest.Monk
     from vllm_omni.model_executor.models.minimax_h3 import encoder_processing
 
     monkeypatch.setattr(
-        encoder_processing, "load_minimax_h3_images", lambda values: [Image.new("RGB", (64, 64))]
+        # 512x512 clears the real reference-image validation ([256, 5760]
+        # pixels per side, ratio in [0.4, 2.5]) that this request path runs.
+        encoder_processing, "load_minimax_h3_images", lambda values: [Image.new("RGB", (512, 512))]
     )
     monkeypatch.setattr(
         encoder_processing,
