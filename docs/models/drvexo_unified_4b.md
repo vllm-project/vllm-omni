@@ -8,6 +8,9 @@ with its trained temporal connector, and a CPU FP32 candidate decision head.
 
 ## Package and launch
 
+The complete 4B checkpoint is available on
+[Hugging Face](https://huggingface.co/DRVEXO-LLM/drvexo-4b-unified) and
+[ModelScope](https://modelscope.cn/models/DRVEXOLLM/drvexo-4b-unified).
 Download the complete package before serving. The loader is local-only and does
 not fetch separate component weights. It requires the root safetensors index,
 all eight components, tokenizer, `assets/qwen35` vision processor, audio frontend,
@@ -60,6 +63,10 @@ backbone is not thereby accepted.
 Explicit reference-voice requests use the existing `/v1/audio/speech` Base task
 with `ref_audio` and `x_vector_only_mode: true`. The DRVEXO adapter marks this as
 caller text, while chat-to-speech checks the exact generated-token provenance.
+Standard speech admission rejects control tokens and text that cannot round-trip
+through the local `talker/` tokenizer before dispatch. Prompt lengths and
+precomputed text IDs use that same tokenizer, including when
+`non_streaming_mode=true`; the root tokenizer belongs to Thinker.
 Default-speaker sentence synthesis uses `/v1/drvexo/speech`. Native sentence
 streaming returns incremental Code2Wav chunks; the chat stream splits generated
 text at punctuation before synthesizing segments. Neither endpoint introduces
