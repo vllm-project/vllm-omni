@@ -90,6 +90,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
+from vllm_omni.model_executor.models.qwen2_5_omni.vision_encoder_cudagraph import (
+    Qwen2_5OmniVisionEncoderCudaGraphMixin,
+)
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
     resolve_encoder_quant_config,
@@ -991,6 +994,7 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
 )
 class Qwen2_5OmniThinkerForConditionalGeneration(
     nn.Module,
+    Qwen2_5OmniVisionEncoderCudaGraphMixin,
     SupportsMultiModal,
     SupportsPP,
     SupportsLoRA,
@@ -1101,6 +1105,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 )
             else:
                 self.visual = None
+
+        self._enable_image_encoder_cudagraph()
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
