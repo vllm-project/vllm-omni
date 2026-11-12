@@ -6,16 +6,20 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.mimo_audio.mimo_audio_llm import MiMoLocalSamplerTensor, MiMoSampler
+from vllm_omni.model_executor.models.mimo_audio.mimo_audio_llm import (
+    MiMoLocalSampler,
+    MiMoLocalSamplerTensor,
+    MiMoSampler,
+)
 
 pytestmark = [pytest.mark.core_model]
 
 _EMPTY_ID = 1024
 
 
-def _samplers(batch_size: int, device: str) -> tuple[MiMoSampler, MiMoLocalSamplerTensor]:
+def _samplers(batch_size: int, device: str) -> tuple[MiMoLocalSampler, MiMoLocalSamplerTensor]:
     return (
-        MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95),
+        MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95),
         MiMoLocalSamplerTensor(
             temperature=torch.full((batch_size,), 0.9, dtype=torch.float32, device=device),
             top_k=torch.full((batch_size,), -1, dtype=torch.int64, device=device),
@@ -40,8 +44,15 @@ def _logits(scenario: str, batch_size: int, dtype: torch.dtype, device: str) -> 
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("scenario", ["near_tie", "excluded_maximum"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    ("scenario", "dtype"),
+    [
+        ("near_tie", torch.bfloat16),
+        ("excluded_maximum", torch.bfloat16),
+        ("excluded_maximum", torch.float16),
+        ("excluded_maximum", torch.float32),
+    ],
+)
 @pytest.mark.parametrize("batch_size", [1, 8])
 def test_local_sampler_parity(scenario: str, dtype: torch.dtype, batch_size: int) -> None:
     scores = _logits(scenario, batch_size, dtype, "cpu")
@@ -57,10 +68,22 @@ def test_local_sampler_parity(scenario: str, dtype: torch.dtype, batch_size: int
 @pytest.mark.cpu
 def test_stochastic_sampler_filters_after_excluding_tokens() -> None:
     scores = _logits("excluded_maximum", 1, torch.float32, "cpu")
-    sampler = MiMoSampler(do_sample=True, temperature=0.9, top_k=1, top_p=0.95)
+    sampler = MiMoLocalSampler(do_sample=True, temperature=0.9, top_k=1, top_p=0.95)
 
     # With top-k=1, the only allowed draw is the best nonempty token.
     assert sampler.sample(scores, [_EMPTY_ID]).item() == 1
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_global_sampler_preserves_precision_and_filter_order(dtype: torch.dtype) -> None:
+    scores = _logits("excluded_maximum", 1, dtype, "cpu")
+    sampler = MiMoSampler(do_sample=False, temperature=0.6, top_p=0.95)
+
+    # The global sampler has no graph counterpart. Keep its existing arithmetic
+    # and post-filter exclusion behavior outside the local speech-code fix.
+    assert sampler.process(scores).dtype == dtype
+    assert sampler.sample(scores, [_EMPTY_ID]).item() == 0
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

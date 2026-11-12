@@ -81,9 +81,6 @@ class MiMoSampler:
     top_p: float | None = None
 
     def process(self, scores: torch.Tensor) -> torch.Tensor:
-        # Match the tensor-parameter graph path; BF16 division can introduce
-        # ties and change the greedy token before the audio feedback step.
-        scores = scores.float()
         if self.temperature is not None:
             scores = scores / self.temperature
 
@@ -104,19 +101,29 @@ class MiMoSampler:
         return scores
 
     def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
-        if removed_tokens:
-            # Preserve the caller's logits while excluding tokens before top-p
-            # can let an excluded maximum suppress every valid candidate.
-            scores = scores.clone()
-            for t in removed_tokens:
-                scores[:, t] = float("-inf")
         scores = self.process(scores)
+        for t in removed_tokens or []:
+            scores[:, t] = float("-inf")
 
         if self.do_sample:
             probs = scores.softmax(dim=-1)
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
         return torch.argmax(scores, dim=-1)
+
+
+class MiMoLocalSampler(MiMoSampler):
+    """Match the graph sampler without changing global-token sampling."""
+
+    def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
+        # Match the graph's FP32 tensor parameters; BF16 division can create ties.
+        scores = scores.float()
+        if removed_tokens:
+            # Preserve caller logits and exclude before top-k/top-p filtering.
+            scores = scores.clone()
+            for t in removed_tokens:
+                scores[:, t] = float("-inf")
+        return super().sample(scores)
 
 
 # CUDA Graph implementation for local_forward, adapted from sglang's mimo_audio
@@ -566,7 +573,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # audio-embedding feedback path and destabilises text continuations even
         # though `global_sampler` is greedy.  Voice diversity must be tackled in
         # the codec/vocoder path (stage-1), not by randomising local_sampler.
-        self.local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
+        self.local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
         self.removed_tokens = None
 
         self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
@@ -894,7 +901,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             device=tokens_device,
         )
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
+            local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         past_key_values = DynamicCache()
         for t in range(delay_iters):
@@ -942,7 +949,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_sampler: MiMoSampler | None = None,
     ):
         if local_sampler is None:
-            local_sampler = MiMoSampler(do_sample=False, temperature=0.9, top_p=0.95)
+            local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
 
         b = int(local_embeds.shape[0])
         use_cg = (local_sampler.do_sample is None or local_sampler.do_sample is False) and bool(
