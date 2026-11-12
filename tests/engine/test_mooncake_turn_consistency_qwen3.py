@@ -65,6 +65,8 @@ def _multimodal_cases(prompt: dict) -> list[tuple[str, dict]]:
 
 
 def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncake: dict | None, monkeypatch) -> dict:
+    from vllm import SamplingParams
+
     from vllm_omni.entrypoints.omni import Omni
 
     directory.mkdir()
@@ -94,6 +96,7 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
                 "gpu_memory_utilization": 0.3,
                 "max_num_seqs": 1,
                 "revision": REVISION,
+                "subtalker_sampling_params": {"do_sample": False},
             },
             "2": {
                 "enable_prefix_caching": False,
@@ -113,6 +116,8 @@ def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncak
         init_timeout=1800,
         batch_timeout=5,
     )
+    # The shared collector passes this list explicitly to every request.
+    omni.default_sampling_params_list = [SamplingParams(**helpers.GREEDY) for _ in range(omni.num_stages)]
     outputs = {}
     try:
         for case, prompt in cases:

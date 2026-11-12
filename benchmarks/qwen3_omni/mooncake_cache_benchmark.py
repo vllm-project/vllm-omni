@@ -97,7 +97,12 @@ def deployment(mode, store_config, namespace, max_concurrency, kv_bytes):
         lmcache=False,
         thinker_extra=thinker,
         downstream_extra={
-            "1": {"max_num_seqs": max_concurrency, "gpu_memory_utilization": 0.3, "revision": REVISION},
+            "1": {
+                "max_num_seqs": max_concurrency,
+                "gpu_memory_utilization": 0.3,
+                "revision": REVISION,
+                "subtalker_sampling_params": {"do_sample": False},
+            },
             "2": {"max_num_seqs": max_concurrency, "gpu_memory_utilization": 0.2, "revision": REVISION},
         },
     )
@@ -133,10 +138,16 @@ def input_digest(item):
 
 
 async def request(omni, text, request_id):
+    from vllm import SamplingParams
+    from vllm.sampling_params import RequestOutputKind
+
+    params = [SamplingParams(**helpers.GREEDY, output_kind=RequestOutputKind.DELTA) for _ in range(omni.num_stages)]
     start = time.perf_counter()
     result = {"request_id": request_id, "ttft_ms": None, "first_audio_ms": None, "cached_tokens": 0}
     tokens, audio, text_parts = [], [], []
-    async for out in omni.generate(text, request_id=request_id, output_modalities=["text", "audio"]):
+    async for out in omni.generate(
+        text, request_id=request_id, sampling_params_list=params, output_modalities=["text", "audio"]
+    ):
         if out.error:
             raise RuntimeError(out.error)
         elapsed = (time.perf_counter() - start) * 1000
@@ -334,6 +345,7 @@ async def run(args):
         "unsupported_mode": "local prefix + Mooncake (two-level cooperation)",
         "arguments": vars(args),
         "model_revision": REVISION,
+        "request_sampling_params": {**helpers.GREEDY, "output_kind": "DELTA"},
         "namespace": namespace,
         "deployment": overrides,
         "packages": {name: importlib.metadata.version(name) for name in ("vllm", "torch", "transformers")},
