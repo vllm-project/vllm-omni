@@ -9,8 +9,10 @@ Configuration, supported deployments, and validation commands are in the
 ## Scope
 
 M1 serves ordinary Qwen3-Omni turn requests on CUDA with Model Runner V2: a
-Thinker with tensor parallel size 1, one full-attention KV group, and equal KV
-and hash block sizes. The connector rejects other deployments at startup.
+unquantized Thinker with tensor parallel size 1, one full-attention KV group,
+and equal KV and hash block sizes. The connector rejects other deployments at
+startup, including runtime quantization, whose effective model values are not
+represented by the checkpoint configuration alone.
 
 **Cache mode.** M1 is a Mooncake-only external cache. Selecting this backend
 rejects local Thinker prefix caching, so every reused prefix is restored from
@@ -98,7 +100,9 @@ preempted attempt already handed to Talker.
 Complete prompt blocks are copied out of each step's captures. Saving is best
 effort: blocks are skipped when the staging budget or save queue is full, and
 the response does not change. A lookup stops at the first missing block, so a
-request stops saving after it skips one. A save worker writes each HS object
+request stops saving after it skips one. Queued saves for one request attempt
+run in order; a failed write or expired KV wait also stops later saves while
+preserving any successfully saved leading blocks. A save worker writes each HS object
 and reads back the stored winner, because a put to an existing key keeps the
 first value. It then releases the staging reservation and polls for the
 blocks' KV objects until `load_timeout_seconds`. Completion records are

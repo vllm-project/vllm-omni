@@ -204,7 +204,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self._attempts: dict[str, Attempt] = {}
         self._delivered_until: dict[str, int] = {}
         self._reads: dict[str, PendingRead] = {}
-        self._saves: dict[Future[None], PendingSave] = {}
+        self._saves: dict[Future[bool], PendingSave] = {}
         self._reserved_bytes = 0
         self._scheduler_attempts: dict[str, str] = {}
         self._lookup_started: dict[str, float] = {}
@@ -303,6 +303,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             raise ValueError("Mooncake KV/HS requires a single TP=1 serving replica")
         if getattr(model, "model_stage", None) != "thinker" or model.hf_config.model_type != "qwen3_omni_moe":
             raise ValueError("Mooncake KV/HS supports the Qwen3-Omni Thinker only")
+        if model.quantization is not None or config.quant_config is not None:
+            raise ValueError("Mooncake KV/HS does not yet support a quantized Thinker")
         if config.cache_config.enable_prefix_caching or config.speculative_config or config.lora_config:
             raise ValueError("Mooncake KV/HS does not support local prefix caching, speculation, or LoRA")
         if getattr(model, "session_mode", "turn") not in ("turn", "turn_based"):
@@ -591,8 +593,14 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
 
     def _release_staging(self, save: PendingSave) -> None:
         with self._lock:
+            save.blocks.clear()
             self._reserved_bytes -= save.reserved_bytes
             save.reserved_bytes = 0
+
+    def _stop_saving(self, attempt: Attempt) -> None:
+        with self._lock:
+            if attempt.rows is not None:
+                attempt.rows.save_enabled = False
 
     def _write_hs_block(
         self, store: Any, attempt: Attempt, block: tuple[int, int, CaptureTensors]
@@ -615,43 +623,59 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         kv_key = self.connector_worker.token_dbs[0].key_for(block_hash)
         return kv_key, key + ":ready", hashlib.sha256(actual).digest()
 
-    def _save_hs(self, save: PendingSave) -> None:
+    def _save_hs(self, save: PendingSave, previous: Future[bool] | None = None) -> bool:
         """Write HS objects, then publish each completion record after its KV.
 
+        Saves for one attempt follow their predecessors, so a failed block
+        stops already queued successors as well as future capture staging.
         Tensors and their staging reservation are released before waiting for
         native KV objects, so a slow KV write holds only this save worker.
         """
         assert self.connector_worker is not None
         attempt = save.attempt
         store = self.connector_worker.store
-        deadline = time.monotonic() + self.settings.load_timeout_seconds
-        commits: list[tuple[str, str, bytes]] = []
         try:
+            if previous is not None:
+                try:
+                    if not previous.result():
+                        return False
+                except (ValueError, RuntimeError, OSError):
+                    return False
+            deadline = time.monotonic() + self.settings.load_timeout_seconds
+            commits: list[tuple[str, str, bytes]] = []
+            complete = True
             # Indexing leaves no tensor reference in this frame for the KV wait.
             for position in range(len(save.blocks)):
                 if attempt.cancelled:
-                    return
+                    return False
                 written = self._write_hs_block(store, attempt, save.blocks[position])
                 if written is None:
+                    self._stop_saving(attempt)
+                    complete = False
                     break
                 commits.append(written)
-        finally:
-            save.blocks.clear()
             self._release_staging(save)
-        # Publish in block order and stop at the first block whose KV is still
-        # missing: a record past a gap could never extend a joint lookup.
-        while commits and not attempt.cancelled and time.monotonic() < deadline:
-            exists = store.batch_is_exist([kv_key for kv_key, _, _ in commits])
-            ready = 0
-            while ready < min(len(commits), len(exists)) and exists[ready] == 1:
-                ready += 1
-            for _, ready_key, digest in commits[:ready]:
-                if attempt.cancelled:
-                    return
-                self._publish_ready(store, ready_key, digest)
-            del commits[:ready]
+            # Preserve successful leading blocks even if a later write failed.
+            while commits and not attempt.cancelled and time.monotonic() < deadline:
+                exists = store.batch_is_exist([kv_key for kv_key, _, _ in commits])
+                ready = 0
+                while ready < min(len(commits), len(exists)) and exists[ready] == 1:
+                    ready += 1
+                for _, ready_key, digest in commits[:ready]:
+                    if attempt.cancelled:
+                        return False
+                    self._publish_ready(store, ready_key, digest)
+                del commits[:ready]
+                if commits:
+                    time.sleep(_KV_POLL_SECONDS)
             if commits:
-                time.sleep(_KV_POLL_SECONDS)
+                self._stop_saving(attempt)
+            return complete and not commits and not attempt.cancelled
+        except (ValueError, RuntimeError, OSError):
+            self._stop_saving(attempt)
+            raise
+        finally:
+            self._release_staging(save)
 
     @staticmethod
     def _publish_ready(store: Any, ready_key: str, digest: bytes) -> None:
@@ -660,8 +684,10 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         # object needs a new record; immutable put alone would preserve the
         # old digest and poison every later hit.
         if previous and previous != digest:
-            store.remove(ready_key, force=True)
-        store.put(ready_key, digest)
+            if store.remove(ready_key, force=True) != 0:
+                raise RuntimeError("Mooncake HS completion record replacement failed")
+        if store.put(ready_key, digest) != 0:
+            raise RuntimeError("Mooncake HS completion record write failed")
 
     def capture_step(
         self, req_id: str, attempt_id: str, start_token: int, prompt_len: int, tensors: dict[str, torch.Tensor]
@@ -690,8 +716,12 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                 ):
                     self._reserved_bytes += reserve
                     save = PendingSave(attempt, blocks, reserve)
+                    previous = next(
+                        (future for future, pending in reversed(self._saves.items()) if pending.attempt is attempt),
+                        None,
+                    )
                     assert self._save_executor is not None
-                    self._saves[self._save_executor.submit(self._save_hs, save)] = save
+                    self._saves[self._save_executor.submit(self._save_hs, save, previous)] = save
                 else:
                     # Lookups stop at the first missing block, so blocks
                     # after a dropped one would be stored but never reused.

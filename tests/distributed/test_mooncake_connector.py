@@ -15,7 +15,7 @@ import torch
 import transformers.configuration_utils
 from transformers import Qwen3OmniMoeConfig
 from vllm import SamplingParams
-from vllm.config import CacheConfig, KVTransferConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, SchedulerConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -140,6 +140,7 @@ class ModelConfigSeam:
     engine_output_type: str = "latent"
     hf_text_config: object | None = None
     dtype: torch.dtype = torch.bfloat16
+    quantization: str | None = None
 
 
 @dataclass
@@ -166,6 +167,7 @@ class ServingConfigSeam:
     cache_config: CacheConfigSeam = field(default_factory=CacheConfigSeam)
     speculative_config: object | None = None
     lora_config: object | None = None
+    quant_config: object | None = None
 
 
 class ManualExecutor:
@@ -522,6 +524,19 @@ def test_full_save_queue_preserves_output_and_stops_later_saves(connector):
     assert not connector._save_executor.jobs
 
 
+def test_admission_gap_preserves_previously_queued_prefix(connector):
+    attempt = install_attempt(connector)
+    connector.settings = replace(connector.settings, max_pending_transfers=1)
+    store = connector.connector_worker.store
+    store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
+    connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
+    assert not attempt.rows.save_enabled
+    connector._save_executor.run().result()
+    assert hs_key(connector.namespace, attempt.hashes[0]) + ":ready" in store.objects
+    assert hs_key(connector.namespace, attempt.hashes[1]) not in store.objects
+
+
 class LateKVStore(MemoryStore):
     """The first block's KV object appears only at the second existence poll."""
 
@@ -590,6 +605,104 @@ def test_failed_save_cannot_publish_completion(connector):
     connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
     assert key not in store.objects
     assert key + ":ready" not in store.objects
+
+
+@pytest.mark.parametrize("failure", ["put", "readback", "timeout", "ready", "remove", "exception"])
+def test_save_failure_stops_already_queued_and_future_saves(connector, monkeypatch, failure):
+    attempt = install_attempt(connector, prompt_len=13)
+    store = connector.connector_worker.store
+    first, second = (hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes[:2])
+    for block_hash in attempt.hashes:
+        store.objects["kv:" + block_hash.hex()] = b"kv"
+    if failure in ("put", "ready"):
+        store.fail_put.add(first if failure == "put" else first + ":ready")
+    elif failure == "remove":
+        store.objects[first + ":ready"] = b"stale"
+        monkeypatch.setattr(store, "remove", lambda *_args, **_kwargs: -1)
+    elif failure == "timeout":
+        del store.objects["kv:" + attempt.hashes[0].hex()]
+        connector.settings = replace(connector.settings, load_timeout_seconds=0.01)
+    else:
+        original_get = store.get
+
+        def failed_read(key):
+            if key == first:
+                if failure == "exception":
+                    raise OSError("HS read-back failed")
+                return b""
+            return original_get(key)
+
+        monkeypatch.setattr(store, "get", failed_read)
+    for start in (0, 4):
+        output = connector.capture_step(attempt.req_id, attempt.token, start, 13, captures(start, start + 4))
+        assert torch.equal(output["embedding"], captures(start, start + 4)["embedding"])
+    connector._save_executor.run(0)
+    connector._save_executor.run(1).result()
+    assert not attempt.rows.save_enabled
+    assert second not in store.objects
+    assert second + ":ready" not in store.objects
+    assert store.objects.get(first + ":ready") == (b"stale" if failure == "remove" else None)
+    output = connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 12))
+    assert torch.equal(output["hidden"], captures(8, 12)["hidden"])
+    assert len(connector._save_executor.jobs) == 2
+    connector.get_transfer_results(set())
+    assert connector._reserved_bytes == 0
+
+
+def test_save_failure_preserves_successful_leading_blocks(connector):
+    attempt = install_attempt(connector, prompt_len=13)
+    store = connector.connector_worker.store
+    keys = [hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes]
+    for block_hash in attempt.hashes:
+        store.objects["kv:" + block_hash.hex()] = b"kv"
+    store.fail_put.add(keys[1])
+    connector.capture_step(attempt.req_id, attempt.token, 0, 13, captures(0, 8))
+    connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 12))
+    connector._save_executor.run(0).result()
+    connector._save_executor.run(1).result()
+    assert keys[0] + ":ready" in store.objects
+    assert keys[1] not in store.objects
+    assert keys[2] not in store.objects
+    assert connector._reserved_bytes == 0
+
+
+def test_concurrent_saves_wait_for_the_same_attempts_preceding_save(connector, monkeypatch):
+    attempt = install_attempt(connector)
+    store = connector.connector_worker.store
+    first, second = (hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes[:2])
+    store.fail_put.add(first)
+    store.objects["kv:" + attempt.hashes[1].hex()] = b"kv"
+    first_writing, second_started, release = (threading.Event() for _ in range(3))
+    write = connector._write_hs_block
+    save_hs = connector._save_hs
+
+    def blocked_write(store, owner, block):
+        if block[0] == 0:
+            first_writing.set()
+            assert release.wait(timeout=5)
+        return write(store, owner, block)
+
+    def observe_save(save, *args):
+        if save.blocks[0][0] == 4:
+            second_started.set()
+        return save_hs(save, *args)
+
+    monkeypatch.setattr(connector, "_write_hs_block", blocked_write)
+    monkeypatch.setattr(connector, "_save_hs", observe_save)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        connector._save_executor = executor
+        try:
+            connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
+            assert first_writing.wait(timeout=5)
+            connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
+            assert second_started.wait(timeout=5)
+        finally:
+            release.set()
+        for future in connector._saves:
+            future.result(timeout=5)
+    assert second not in store.objects
+    assert not attempt.rows.save_enabled
+    assert connector._reserved_bytes == 0
 
 
 def test_duplicate_save_publishes_actual_immutable_winner(connector):
@@ -741,6 +854,26 @@ def supported_config(monkeypatch):
 
 def test_supported_turn_configuration_passes_startup_guard(supported_config):
     OmniMooncakeStoreConnector._validate_supported(*supported_config)
+
+
+@pytest.mark.parametrize("configured,resolved", [(True, False), (False, True), (True, True)])
+def test_quantization_rejected_for_an_otherwise_identical_checkpoint(supported_config, configured, resolved):
+    from vllm.config.quantization import resolve_quantization_config
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+    config, kv_config = supported_config
+    config.model_config.hf_config = Qwen3OmniMoeConfig()
+    OmniMooncakeStoreConnector._validate_supported(config, kv_config)
+    if configured:
+        config.model_config.quantization = "fp8_per_tensor"
+    if resolved:
+        args = resolve_quantization_config("fp8_per_tensor", None)
+        assert args is not None
+        config.quant_config = OnlineQuantizationConfig(args)
+    # The checkpoint config, activation dtype and KV layout remain unchanged;
+    # only runtime quantization differs from the accepted unquantized setup.
+    with pytest.raises(ValueError, match="quantized Thinker"):
+        OmniMooncakeStoreConnector._validate_supported(config, kv_config)
 
 
 @pytest.mark.parametrize(
@@ -1086,7 +1219,7 @@ def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector
 
 def ar_scheduler(connector):
     """Production AR scheduler and KV allocator; only lookups reach the connector."""
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     config.model_config = SimpleNamespace(
         multimodal_config=None,
         uses_mrope=False,

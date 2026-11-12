@@ -139,7 +139,9 @@ GPU transfers or the complete serving pipeline.
 
 ### Configuration
 
-Use an explicit Qwen3-Omni MRv2 turn deployment with CUDA and Thinker TP=1.
+Use an explicit Qwen3-Omni MRv2 turn deployment with CUDA and an unquantized
+Thinker at TP=1. Runtime quantization is rejected to prevent incompatible
+effective models from sharing cached KV and hidden states.
 Keep the deployment's normal async-chunk handoff and downstream stage settings.
 Set this on the Thinker stage:
 
