@@ -37,7 +37,7 @@ class _FakeTransformer:
         self.last_kv_ctx = None
         self.last_latent = None
         self.last_timestep = None
-        self.last_chunks = None
+        self.last_chunks: list[int] | None = None
         self._text: torch.Tensor | None = None
 
     def prepare_cell(self, text: torch.Tensor, **_kwargs) -> None:
@@ -76,7 +76,9 @@ class _FakeTransformer:
             raise RuntimeError("prepare_cell text batch must match latent batch")
         text_scale = self._text.reshape(batch, -1).to(dtype=torch.float32).mean(dim=1)
         tok_scale = tokens.reshape(batch, -1).to(dtype=torch.float32).mean(dim=1)
-        scale = (ts / 1000.0) + 0.01 * torch.tensor(chunk_ids, dtype=torch.float32) + 0.1 * text_scale + 0.01 * tok_scale
+        scale = (
+            (ts / 1000.0) + 0.01 * torch.tensor(chunk_ids, dtype=torch.float32) + 0.1 * text_scale + 0.01 * tok_scale
+        )
         return scale.to(dtype=latent.dtype).view(batch, *([1] * (latent.ndim - 1))).expand_as(latent).contiguous()
 
     def seq_len_for_latent(self, latent_shape):
@@ -111,7 +113,6 @@ def _member(
         shift=shift,
         advance=lambda pred, latent, step, s=seed: latent - (0.01 * s) * (step + 1) * pred,
     )
-    cell.shift = float(shift)
     cell.num_denoise_steps = n
     cell._timesteps = [torch.tensor(float(t)) for t in grid]
     cell._timestep_clean = torch.zeros(())
@@ -141,7 +142,6 @@ def _run_batches(
         adapters[0].forward(
             batch,
             adapters,
-            task_count=len(tasks),
             member_inputs=inputs,
         )
     return batches
@@ -160,7 +160,7 @@ def _one(
         members=(MemberRef(req, chunk=chunk, step=step, block=block, task_index=0),),
         kv_views=(kv,),
     )
-    return member.forward(batch, [member], task_count=1, member_inputs=[member_input])
+    return member.forward(batch, [member], member_inputs=[member_input])
 
 
 @pytest.mark.parametrize(

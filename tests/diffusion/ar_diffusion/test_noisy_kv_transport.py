@@ -255,8 +255,8 @@ def _sink_pipeline_worker(
                     schema.append(("hidden_states", (batch,), torch.float32))
                 return schema
 
-            def forward(self, batch, members, *, task_count, member_inputs):
-                del members, task_count
+            def forward(self, batch, members, *, member_inputs):
+                del members
                 m0 = batch.members[0]
                 cell = (m0.chunk, m0.step, m0.block)
                 chunk, step, block = cell

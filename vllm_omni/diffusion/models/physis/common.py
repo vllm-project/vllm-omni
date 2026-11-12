@@ -28,10 +28,8 @@ class PhysisCell(WanCell):
         batch: ComputeBatch,
         members: Sequence[CellAdapter],
         *,
-        task_count: int,
         member_inputs: Sequence[Any | None],
     ) -> dict[str, torch.Tensor]:
-        del task_count
         if batch.size != 1:
             raise ValueError(f"PhysisCell currently supports batch size 1, got {batch.size}")
         member = members[0]

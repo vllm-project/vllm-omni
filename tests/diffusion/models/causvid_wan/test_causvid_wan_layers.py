@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellRunSpec,
     CellTopology,
 )
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
-from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_DENOISE_STEPS,
     CAUSVID_DEFAULT_SHIFT,
@@ -106,9 +106,7 @@ def test_resolve_member_input_reuses_live_tensor_without_bool_check():
         dtype=torch.float32,
     )
     live = {0: torch.ones(shape)}
-    latent, tokens = adapter._resolve_member_input(
-        req="r0", chunk=0, member_input=None, live=live
-    )
+    latent, tokens = adapter._resolve_member_input(req="r0", chunk=0, member_input=None, live=live)
     assert tokens is None
     assert latent is live[0]
     torch.testing.assert_close(latent, torch.ones(shape))
@@ -420,7 +418,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
             members=(MemberRef(req, chunk=chunk, step=step, block=block, task_index=0),),
             kv_views=(None,),
         )
-        return adapter.forward(batch, [adapter], task_count=1, member_inputs=[member_input])
+        return adapter.forward(batch, [adapter], member_inputs=[member_input])
 
     mid_out = _compute(mid, "r0", (0, 0, 0))
     assert {"latent", "hidden_states"} <= set(mid_out)
@@ -445,10 +443,12 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
 def test_pipeline_forward_passes_members_map_once(monkeypatch):
     pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline._chunk_ctx = SimpleNamespace()
-    calls: list[object] = []
+    calls: list[dict] = []
+    tags: dict[str, int] = {}
     cells = {"A": WanCell.__new__(WanCell), "B": WanCell.__new__(WanCell)}
 
-    def _admit(req: OmniDiffusionRequest):
+    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
+        tags[req.request_id] = decode_tag
         return cells[req.request_id], req.request_id, False, None
 
     monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
@@ -477,11 +477,13 @@ def test_pipeline_forward_passes_members_map_once(monkeypatch):
     assert calls[0]["members"]["A"] is cells["A"]
     assert calls[0]["members"]["B"] is cells["B"]
     assert calls[0]["ctx"] is pipeline._chunk_ctx
+    assert tags == {"A": 0, "B": 1}
     assert emitted == ["A", "B"]
     assert len(outs) == 2
 
 
-def test_pipeline_forward_cancels_prior_stream_jobs_if_later_admit_fails(monkeypatch):
+@pytest.mark.parametrize("failure_stage", ["admit", "compute", "output"])
+def test_pipeline_forward_cancels_stream_jobs_on_failure(monkeypatch, failure_stage):
     pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline._chunk_ctx = SimpleNamespace()
     cancelled: list[str] = []
@@ -493,25 +495,31 @@ def test_pipeline_forward_cancels_prior_stream_jobs_if_later_admit_fails(monkeyp
         def cancel(self) -> None:
             cancelled.append(self.rid)
 
-    cells = {"A": WanCell.__new__(WanCell)}
+    cells = {rid: WanCell.__new__(WanCell) for rid in ("A", "B")}
 
-    def _admit(req: OmniDiffusionRequest):
-        if req.request_id == "B":
-            raise ValueError("admit B failed")
+    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
+        if req.request_id == "B" and failure_stage == "admit":
+            raise ValueError("decode wave failed")
         return cells[req.request_id], req.request_id, False, _Job(req.request_id)
 
     monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
     monkeypatch.setattr(pipeline, "admit_cell_request", _admit)
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
-        lambda **kwargs: None,
-    )
+
+    def run(**kwargs):
+        if failure_stage == "compute":
+            raise ValueError("decode wave failed")
+
+    def emit(*args):
+        raise ValueError("decode wave failed")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline", run)
+    monkeypatch.setattr(pipeline, "emit_cell_output", emit)
     batch = DiffusionRequestBatch(
         [
             OmniDiffusionRequest(prompt="a", request_id="A", sampling_params=OmniDiffusionSamplingParams()),
             OmniDiffusionRequest(prompt="b", request_id="B", sampling_params=OmniDiffusionSamplingParams()),
         ]
     )
-    with pytest.raises(ValueError, match="admit B failed"):
+    with pytest.raises(ValueError, match="decode wave failed"):
         pipeline.forward(batch)
-    assert cancelled == ["A"]
+    assert cancelled == (["A"] if failure_stage == "admit" else ["A", "B"])

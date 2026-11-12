@@ -73,9 +73,7 @@ def _wan_self_attn_with_kv(
         if isinstance(kv_ctx, (list, tuple)):
             contexts = list(kv_ctx)
             if len(contexts) != query.shape[0]:
-                raise ValueError(
-                    f"batched self-attn expects {query.shape[0]} kv contexts, got {len(contexts)}"
-                )
+                raise ValueError(f"batched self-attn expects {query.shape[0]} kv contexts, got {len(contexts)}")
         else:
             contexts = [kv_ctx] * query.shape[0]
         outs = []
@@ -321,9 +319,7 @@ class StageWanTransformer(nn.Module):
         self._rotary[cache_key] = rotary
         return rotary
 
-    def _rotary_emb_for_batch(
-        self, chunks: Sequence[int], latent: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rotary_emb_for_batch(self, chunks: Sequence[int], latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-member chunk RoPE, concatenated on the batch axis."""
         if len(chunks) != int(latent.shape[0]):
             raise ValueError(f"chunks length {len(chunks)} != latent batch {latent.shape[0]}")

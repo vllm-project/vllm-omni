@@ -154,7 +154,10 @@ def _post_activations_ws(
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]],
     *,
     rank: int,
-    output: Any | None,
+    task_outs: Sequence[dict[str, torch.Tensor] | None],
+    tasks: Sequence[tuple[str, Cell]],
+    packed_output: Any | None,
+    members: Mapping[str, CellAdapter],
     adapter: CellAdapter,
     topology: CellTopology,
     device: torch.device,
@@ -168,12 +171,18 @@ def _post_activations_ws(
     for src, dst, src_tasks in edges:
         batch = max(1, len(src_tasks))
         include_hidden = not topology.is_layer_group_last(src)
-        spec_list = adapter.activation_spec(batch=batch, include_hidden=include_hidden)
+        send_adapter = members.get(src_tasks[0][0], adapter) if src_tasks else adapter
+        spec_list = send_adapter.activation_spec(batch=batch, include_hidden=include_hidden)
         if not spec_list:
             continue
         keys = tuple(k for k, _shape, _dtype in spec_list)
-        if rank == src and output is not None:
-            packed = adapter.pack_activation(output)
+        edge_out = (
+            packed_output
+            if packed_output is not None and len(src_tasks) == len(tasks)
+            else _pack_outs_for_tasks(task_outs, tasks, src_tasks)
+        )
+        if rank == src and edge_out is not None:
+            packed = send_adapter.pack_activation(edge_out)
             peer = _pp_global_rank(pp_group, dst)
             for key in keys:
                 tensor = packed[key]
@@ -190,9 +199,7 @@ def _post_activations_ws(
     if ops:
         _wait(list(dist.batch_isend_irecv(ops)))
     for payload, src_tasks, src_rank in recv_jobs:
-        _stash_activation_rows(
-            act_stash, payload, src_tasks, topology=topology, src=src_rank
-        )
+        _stash_activation_rows(act_stash, payload, src_tasks, topology=topology, src=src_rank)
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -392,13 +399,12 @@ class CellAdapter:
     def forward(
         self,
         batch: ComputeBatch,
-        members: Sequence["CellAdapter"],
+        members: Sequence[CellAdapter],
         *,
-        task_count: int,
         member_inputs: Sequence[Any | None],
     ) -> dict[str, torch.Tensor]:
         """Pack inputs → model → split/update per-member state; return packed tensors."""
-        del batch, members, task_count, member_inputs
+        del batch, members, member_inputs
         raise NotImplementedError
 
     def pack_activation(self, output: Any) -> dict:
@@ -463,14 +469,99 @@ def _as_member_map(members: Mapping[str, CellAdapter] | CellAdapter) -> Mapping[
     return members
 
 
+def _tensor_dicts_concatable(typed: Sequence[Mapping[str, torch.Tensor]]) -> bool:
+    """True when every dict shares keys and trailing tensor shapes (dim 1+)."""
+    if len(typed) <= 1:
+        return True
+    keys = set(typed[0].keys())
+    if any(set(item.keys()) != keys for item in typed[1:]):
+        return False
+    for key in keys:
+        ref = typed[0][key]
+        if not isinstance(ref, torch.Tensor):
+            return False
+        ref_tail = ref.shape[1:]
+        for item in typed[1:]:
+            tensor = item[key]
+            if not isinstance(tensor, torch.Tensor) or tensor.shape[1:] != ref_tail:
+                return False
+    return True
+
+
 def _pack_task_outputs(outs: list[dict[str, torch.Tensor] | None]) -> dict[str, torch.Tensor] | None:
+    """Cat slot members along dim 0 when geometries match; else keep them unmerged.
+
+    Compatibility grouping already isolates DiT compute. This pack is only for
+    PP activation transport. Mixed latent H/W (same token count) must not
+    ``torch.cat`` here — callers keep using per-task ``task_outs``.
+    """
     typed = [item for item in outs if item is not None]
     if not typed:
         return None
     if len(typed) == 1:
         return typed[0]
+    if not _tensor_dicts_concatable(typed):
+        return None
     keys = typed[0].keys()
     return {k: torch.cat([o[k] for o in typed], dim=0) for k in keys}
+
+
+def _pack_outs_for_tasks(
+    task_outs: Sequence[dict[str, torch.Tensor] | None],
+    tasks: Sequence[tuple[str, Cell]],
+    src_tasks: Sequence[tuple[str, Cell]],
+) -> dict[str, torch.Tensor] | None:
+    index = {task: i for i, task in enumerate(tasks)}
+    selected: list[dict[str, torch.Tensor] | None] = []
+    for task in src_tasks:
+        i = index.get(task)
+        selected.append(None if i is None else task_outs[i])
+    return _pack_task_outputs(selected)
+
+
+def _member_pack_geometry(adapter: CellAdapter, *, include_hidden: bool) -> Hashable:
+    """Rank-shared activation geometry used to decide whether edge members can pack.
+
+    Must not depend on local ``task_outs``: every rank expands the same
+    ``_activation_edges`` list and must agree on message count/size.
+    """
+    spec = adapter.activation_spec(batch=1, include_hidden=include_hidden)
+    if spec:
+        return tuple((key, tuple(shape[1:]), str(dtype)) for key, shape, dtype in spec)
+    shape = getattr(adapter, "latent_shape", None)
+    dtype = getattr(adapter, "dtype", None)
+    return ("latent_shape", shape, str(dtype) if dtype is not None else None)
+
+
+def _expand_activation_edges_for_geometry(
+    edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]],
+    *,
+    members: Mapping[str, CellAdapter],
+    topology: CellTopology,
+    fallback: CellAdapter,
+) -> list[tuple[int, int, tuple[tuple[str, Cell], ...]]]:
+    """Split multi-member edges when member geometries cannot share one packed send.
+
+    Uses only member metadata available on every rank. Local compute outputs are
+    intentionally ignored so senders and receivers expand identically even when
+    they are working on different Cells this tick.
+    """
+    expanded: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
+    for src, dst, src_tasks in edges:
+        if len(src_tasks) <= 1:
+            expanded.append((src, dst, src_tasks))
+            continue
+        include_hidden = not topology.is_layer_group_last(src)
+        geos = [
+            _member_pack_geometry(members.get(req, fallback), include_hidden=include_hidden)
+            for req, _cell in src_tasks
+        ]
+        if all(geo == geos[0] for geo in geos[1:]):
+            expanded.append((src, dst, src_tasks))
+            continue
+        for task in src_tasks:
+            expanded.append((src, dst, (task,)))
+    return expanded
 
 
 def _run_slot_batches(
@@ -500,13 +591,10 @@ def _run_slot_batches(
             if req in pending_hidden:
                 member_inputs.append(pending_hidden.pop(req))
             else:
-                member_inputs.append(
-                    act_stash.pop((req, int(member_ref.chunk), int(member_ref.step)), None)
-                )
+                member_inputs.append(act_stash.pop((req, int(member_ref.chunk), int(member_ref.step)), None))
         packed = member_adapters[0].forward(
             batch,
             member_adapters,
-            task_count=len(tasks),
             member_inputs=member_inputs,
         )
         for local_i, part in enumerate(batch.split_outputs(packed)):
@@ -579,6 +667,7 @@ def run_cell_pipeline(
             schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
             contexts: list[Any] = []
             output = None
+            task_outs: list[dict[str, torch.Tensor] | None] = []
             if tasks:
                 # Consume-time wait: covers prefetch that landed many ticks earlier.
                 kv.await_task_sources(tasks)
@@ -601,8 +690,7 @@ def run_cell_pipeline(
                     and schedule.chunks > 1
                     and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
                     and any(
-                        cell == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
-                        for _req, cell in tasks
+                        cell == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1) for _req, cell in tasks
                     )
                 )
                 if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
@@ -623,10 +711,22 @@ def run_cell_pipeline(
                     slot=slot,
                     schedule=schedule,
                 )
+                edges = _expand_activation_edges_for_geometry(
+                    edges,
+                    members=member_map,
+                    topology=spec.topology,
+                    fallback=primary,
+                )
                 if not use_ws_act:
                     for src, dst, src_tasks in edges:
-                        if spec.rank == src and output is not None:
-                            handles = pp.isend_tensor_dict(primary.pack_activation(output), dst=dst)
+                        edge_out = (
+                            output
+                            if output is not None and len(src_tasks) == len(tasks)
+                            else _pack_outs_for_tasks(task_outs, tasks, src_tasks)
+                        )
+                        if spec.rank == src and edge_out is not None:
+                            send_adapter = member_map.get(src_tasks[0][0], primary)
+                            handles = pp.isend_tensor_dict(send_adapter.pack_activation(edge_out), dst=dst)
                             comm_handles.extend(handles)
                         elif spec.rank == dst:
                             recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
@@ -643,7 +743,10 @@ def run_cell_pipeline(
                         pp,
                         edges,
                         rank=spec.rank,
-                        output=output,
+                        task_outs=task_outs,
+                        tasks=tasks,
+                        packed_output=output,
+                        members=member_map,
                         adapter=primary,
                         topology=spec.topology,
                         device=act_device,

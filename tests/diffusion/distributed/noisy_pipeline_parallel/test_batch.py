@@ -48,9 +48,7 @@ def test_organize_respects_compatibility_key_order_and_split_outputs():
     )
     assert [b.request_ids for b in batches] == [("A", "C"), ("B",)]
     assert batches[0].task_indices == (0, 2)
-    split = batches[0].split_outputs(
-        {"latent": torch.stack([torch.full((1,), 1.0), torch.full((1,), 3.0)])}
-    )
+    split = batches[0].split_outputs({"latent": torch.stack([torch.full((1,), 1.0), torch.full((1,), 3.0)])})
     assert split[0]["latent"].item() == 1.0
     assert split[1]["latent"].item() == 3.0
 

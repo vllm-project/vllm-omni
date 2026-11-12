@@ -311,6 +311,15 @@ keys on ``(block, latent_shape, dtype)``; chunk / step / timestep are member
 inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
 ``timesteps=[800, 500]``, ``chunks=[0, 3]``) into embed / block / unembed.
 
+Async VAE decode retains a separate temporal state per member. Each request in
+an execution wave receives a deterministic Gloo tag from its input position;
+sender and VAE owner use the same tag, so interleaved member chunks cannot match
+another request's receives. Single-request execution uses tag 0. The Pipeline
+joins all decode jobs before returning and cancels them on admission, compute,
+or output failure. Cancellation drains posted latent transfers before the next
+wave reuses tags; a failed drain stops the Worker rather than reusing an unsafe
+communication group. This does not change Engine dispatch or Request completion.
+
 ## Related
 
 - [Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)

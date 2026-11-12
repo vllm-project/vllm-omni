@@ -35,8 +35,8 @@ class CountingAdapter(CellAdapter):
     def compatibility_key(self, cell):
         return cell
 
-    def forward(self, batch, members, *, task_count, member_inputs):
-        del members, task_count, member_inputs
+    def forward(self, batch, members, *, member_inputs):
+        del members, member_inputs
         tasks = tuple((m.request_id, (m.chunk, m.step, m.block)) for m in batch.members)
         self.calls.append(tasks)
         return {"hidden_states": torch.zeros(batch.size, 4, 8)}
@@ -209,8 +209,8 @@ def test_executor_releases_versions_when_forward_raises():
     assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
 
     class BoomAdapter(CountingAdapter):
-        def forward(self, batch, members, *, task_count, member_inputs):
-            del batch, members, task_count, member_inputs
+        def forward(self, batch, members, *, member_inputs):
+            del batch, members, member_inputs
             raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -319,8 +319,8 @@ def test_same_rank_clean_receives_final_latent_without_adapter_cache():
         def compatibility_key(self, cell):
             return cell
 
-        def forward(self, batch, members, *, task_count, member_inputs):
-            del members, task_count
+        def forward(self, batch, members, *, member_inputs):
+            del members
             m0 = batch.members[0]
             cell = (m0.chunk, m0.step, m0.block)
             hidden = member_inputs[0] if member_inputs else None
@@ -352,8 +352,8 @@ def test_run_slot_batches_uses_per_request_stash_rows():
         def compatibility_key(self, c):
             return c[2]  # block only
 
-        def forward(self, batch, members, *, task_count, member_inputs):
-            del members, task_count
+        def forward(self, batch, members, *, member_inputs):
+            del members
             rows = []
             for inp in member_inputs:
                 assert isinstance(inp, dict) and "latent" in inp
@@ -377,3 +377,153 @@ def test_run_slot_batches_uses_per_request_stash_rows():
     )
     assert act_stash == {}
     assert seen == [[1.0, 2.0], [3.0]]
+
+
+def test_pack_task_outputs_skips_incompatible_latent_geometry():
+    """Same token count but different H/W must not torch.cat on the slot pack."""
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+        _pack_task_outputs,
+    )
+
+    a = {"latent": torch.zeros(1, 4, 1, 2, 4)}
+    b = {"latent": torch.zeros(1, 4, 1, 4, 2)}
+    assert a["latent"].numel() == b["latent"].numel()
+    assert _pack_task_outputs([a, b]) is None
+    packed = _pack_task_outputs([a, {"latent": torch.ones(1, 4, 1, 2, 4)}])
+    assert packed is not None
+    assert packed["latent"].shape == (2, 4, 1, 2, 4)
+
+
+def test_mixed_latent_geometry_same_slot_retains_shapes():
+    """Two requests with equal tokens but swapped H/W both finish with own shapes."""
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=1,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=1,
+        )
+    )
+    # 1*4*1*2*4 == 1*4*1*4*2 == 32 tokens; pool uses max_chunk_tokens only.
+    shape_a = (1, 4, 1, 2, 4)
+    shape_b = (1, 4, 1, 4, 2)
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=2,
+            head_size=4,
+            block_size=4,
+            max_chunk_tokens=32,
+            max_history_chunks=1,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=2,
+    )
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), max_batch_size=2, rank=0),
+        kv=NoisyKVState(cache),
+    )
+    ctx.enqueue("A", plan, chunk_tokens=32)
+    ctx.enqueue("B", plan, chunk_tokens=32)
+
+    finished: dict[str, tuple[int, ...]] = {}
+
+    class _GeomAdapter(CellAdapter):
+        def __init__(self, req: str, shape: tuple[int, ...]) -> None:
+            self.req = req
+            self.shape = shape
+
+        def compatibility_key(self, cell):
+            return (cell[2], self.shape)
+
+        def forward(self, batch, members, *, member_inputs):
+            del member_inputs
+            latents = []
+            for member_ref, member in zip(batch.members, members, strict=True):
+                assert isinstance(member, _GeomAdapter)
+                latent = torch.full(member.shape, float(ord(member.req[0])))
+                finished[member_ref.request_id] = tuple(latent.shape)
+                latents.append(latent)
+            # Homogeneous ComputeBatch may cat; cross-geometry packing is executor-side.
+            return {"latent": torch.cat(latents, dim=0)}
+
+    run_cell_pipeline(
+        ctx=ctx,
+        members={"A": _GeomAdapter("A", shape_a), "B": _GeomAdapter("B", shape_b)},
+    )
+    assert finished == {"A": shape_a, "B": shape_b}
+    assert not ctx.inflight
+    assert not ctx.pending
+
+
+def test_expand_activation_edges_agrees_without_local_outs():
+    """Sender/receiver expand identically from shared member geometry, not local outs.
+
+    Simulates two ranks whose current Cells differ: the receiver may not have
+    computed the edge's src_tasks yet. Expansion must still match the sender.
+    """
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+        _expand_activation_edges_for_geometry,
+    )
+
+    class _SpecAdapter(CellAdapter):
+        def __init__(self, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> None:
+            self._shape = shape
+            self._dtype = dtype
+            self.latent_shape = shape
+            self.dtype = dtype
+
+        def compatibility_key(self, cell):
+            return (cell[2], self._shape, str(self._dtype))
+
+        def forward(self, batch, members, *, member_inputs):
+            del batch, members, member_inputs
+            raise AssertionError("expand must not run forward")
+
+        def activation_spec(self, *, batch: int, include_hidden: bool):
+            _b, c, t, h, w = self._shape
+            spec = [("latent", (batch, c, t, h, w), self._dtype)]
+            if include_hidden:
+                spec.append(("hidden_states", (batch, t * h * w, 8), self._dtype))
+            return spec
+
+    topology = CellTopology(step_replicas=1, layer_groups=2)
+    same_a = _SpecAdapter((1, 4, 1, 2, 4))
+    same_b = _SpecAdapter((1, 4, 1, 2, 4))
+    mixed_a = _SpecAdapter((1, 4, 1, 2, 4))
+    mixed_b = _SpecAdapter((1, 4, 1, 4, 2))
+    # Receiver may only know a fallback adapter for its own current Cell.
+    fallback = _SpecAdapter((1, 4, 1, 8, 8))
+
+    same_edge = [(0, 1, (("A", (0, 0, 0)), ("B", (0, 0, 0))))]
+    mixed_edge = [(0, 1, (("A", (1, 0, 0)), ("B", (1, 0, 0))))]
+
+    # Two ranks: sender holds outs for A/B; receiver is on an unrelated Cell and
+    # has empty local outs. Both expand from the shared members map only.
+    sender_members = {"A": same_a, "B": same_b}
+    receiver_members = {"A": same_a, "B": same_b}
+    sender_same = _expand_activation_edges_for_geometry(
+        same_edge, members=sender_members, topology=topology, fallback=fallback
+    )
+    receiver_same = _expand_activation_edges_for_geometry(
+        same_edge, members=receiver_members, topology=topology, fallback=fallback
+    )
+    assert sender_same == receiver_same == same_edge
+
+    sender_members = {"A": mixed_a, "B": mixed_b}
+    receiver_members = {"A": mixed_a, "B": mixed_b}
+    sender_mixed = _expand_activation_edges_for_geometry(
+        mixed_edge, members=sender_members, topology=topology, fallback=fallback
+    )
+    receiver_mixed = _expand_activation_edges_for_geometry(
+        mixed_edge, members=receiver_members, topology=topology, fallback=fallback
+    )
+    assert sender_mixed == receiver_mixed
+    assert sender_mixed == [
+        (0, 1, (("A", (1, 0, 0)),)),
+        (0, 1, (("B", (1, 0, 0)),)),
+    ]

@@ -40,9 +40,7 @@ class ComputeBatch:
         if not self.members:
             raise ValueError("ComputeBatch requires at least one member")
         if len(self.members) != len(self.kv_views):
-            raise ValueError(
-                f"members ({len(self.members)}) and kv_views ({len(self.kv_views)}) length mismatch"
-            )
+            raise ValueError(f"members ({len(self.members)}) and kv_views ({len(self.kv_views)}) length mismatch")
         blocks = {int(m.block) for m in self.members}
         if len(blocks) != 1:
             raise ValueError(f"ComputeBatch members must share one block, got {blocks}")
@@ -144,11 +142,7 @@ def slice_activation_for_task(
         return None
     out: dict[str, torch.Tensor] = {}
     for key, tensor in src.items():
-        if (
-            isinstance(tensor, torch.Tensor)
-            and tensor.ndim >= 1
-            and tensor.shape[0] == task_count
-        ):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1 and tensor.shape[0] == task_count:
             out[key] = tensor[task_index : task_index + 1]
         else:
             out[key] = tensor

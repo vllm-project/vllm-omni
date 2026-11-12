@@ -41,8 +41,6 @@ class WanCell(CellAdapter):
         self.dtype = dtype
         self.on_finished = on_finished
         self.num_denoise_steps = len(sampler.timesteps)
-        # FlowEuler shift selects each request's timestep grid; packed via per-member t.
-        self.shift = float(getattr(sampler, "shift", 1.0))
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
         self._live: dict[str, dict[int, torch.Tensor]] = {}
         self._timesteps = [torch.tensor(float(t), dtype=torch.float32) for t in sampler.timesteps]
@@ -86,11 +84,9 @@ class WanCell(CellAdapter):
         batch: ComputeBatch,
         members: Sequence[CellAdapter],
         *,
-        task_count: int,
         member_inputs: Sequence[Any | None],
     ) -> dict[str, torch.Tensor]:
         """Wan DiT packer for one ``ComputeBatch`` (inputs already mapped by executor)."""
-        del task_count
         typed_members = [m for m in members if isinstance(m, WanCell)]
         if len(typed_members) != batch.size:
             raise ValueError(f"members length {len(typed_members)} != batch size {batch.size}")
@@ -152,9 +148,7 @@ class WanCell(CellAdapter):
                 typed_members[local_i]._live.setdefault(member_ref.request_id, {})[member_ref.chunk] = latents[local_i]
             return {"latent": latent_b, "hidden_states": tokens_b}
 
-        pred_b = tf.unembed(
-            tokens_b, chunks=chunks, steps=steps, latent=latent_b, timestep=t
-        )
+        pred_b = tf.unembed(tokens_b, chunks=chunks, steps=steps, latent=latent_b, timestep=t)
         out_latents: list[torch.Tensor] = []
         for local_i, member_ref in enumerate(batch.members):
             member = typed_members[local_i]

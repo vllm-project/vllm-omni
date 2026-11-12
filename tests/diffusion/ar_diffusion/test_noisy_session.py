@@ -74,8 +74,8 @@ class _CountingAdapter(CellAdapter):
     def compatibility_key(self, cell):
         return cell
 
-    def forward(self, batch, members, *, task_count, member_inputs):
-        del members, task_count, member_inputs
+    def forward(self, batch, members, *, member_inputs):
+        del members, member_inputs
         return {"hidden_states": torch.zeros(batch.size, 4, 8)}
 
     def pack_activation(self, output):
