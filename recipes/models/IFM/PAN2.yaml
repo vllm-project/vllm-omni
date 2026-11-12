@@ -1,0 +1,222 @@
+meta:
+  title: "PAN 2"
+  slug: "pan2"
+  provider: "IFM"
+  description: "29B foundation world model for text-to-video and image-to-video: a dual-stream diffusion transformer that simulates how a scene evolves under a time-grounded plan"
+  date_added: 2026-10-12
+  date_updated: 2026-11-05
+  difficulty: advanced
+  tasks:
+    - omni
+  performance_headline: "29B video DiT — 13 s of 704x1248 video in ~119 s on 4×B300 (CFG parallel × Ulysses 2)"
+  hardware:
+    b300: verified
+    gb300: supported
+    b200: supported
+    gb200: supported
+    h200: verified
+    h100: supported
+    rtx_pro_6000: verified
+    rtx_pro_6000_2x: verified
+    l40s: supported
+
+model:
+  model_id: "IFM/PAN2"
+  min_vllm_version: "0.33.0"
+  install:
+    pip:
+      command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+    docker: false
+  architecture: dense
+  parameter_count: "29B"
+  active_parameters: "29B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+dependencies:
+  - note: "PAN 2 guardrails: they may block a request with HTTP 400."
+    command: "uv pip install git+https://github.com/ifm-ai/pan2-guardrail"
+
+omni:
+  # One server handles both tasks: a request with a first-frame image runs
+  # I2V, a request without one runs T2V. PAN 2 needs the prompt as its
+  # rewriter's structured caption (compact one-line JSON), so the examples
+  # read it from a file; plain one-line prompts give unusable videos.
+  tasks:
+    - id: t2v
+      description: "Text → video (704x1248, 241 frames = 10 s at 24 fps)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "prompt=<prompt.json" \
+          -F "negative_prompt=<negative_prompt.json" \
+          -F "size=1248x704" \
+          -F "num_frames=241" \
+          -F "fps=24" \
+          -F "num_inference_steps=50" \
+          -F "guidance_scale=2.5" \
+          -F "seed=42" \
+          --output pan2_t2v.mp4
+    - id: i2v
+      description: "First frame + text → video (704x1248, 241 frames = 10 s at 24 fps)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "input_reference=@first_frame.jpg" \
+          -F "prompt=<i2v_prompt.json" \
+          -F "negative_prompt=<i2v_negative_prompt.json" \
+          -F "size=1248x704" \
+          -F "num_frames=241" \
+          -F "fps=24" \
+          -F "num_inference_steps=50" \
+          -F "guidance_scale=2.5" \
+          -F "seed=42" \
+          --output pan2_i2v.mp4
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 108
+    description: "BF16 — one ≥141 GB GPU holds the whole pipeline (107 GiB peak at 481 frames); smaller GPUs use tensor parallelism and layerwise offload"
+    hardware_overrides:
+      # Each profile is sized for the longest 481-frame, 704x1248 output.
+      h200:
+        extra_args: ["--num-gpus", "4", "--cfg-parallel-size", "2", "--usp", "2", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile"]
+      b200:
+        extra_args: ["--num-gpus", "4", "--cfg-parallel-size", "2", "--usp", "2", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile"]
+      b300:
+        extra_args: ["--num-gpus", "4", "--cfg-parallel-size", "2", "--usp", "2", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile"]
+      gb200:
+        extra_args: ["--num-gpus", "4", "--cfg-parallel-size", "2", "--usp", "2", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile"]
+      gb300:
+        extra_args: ["--num-gpus", "4", "--cfg-parallel-size", "2", "--usp", "2", "--vae-patch-parallel-size", "4", "--vae-parallel-mode", "tile"]
+      h100:
+        extra_args: ["--num-gpus", "8", "--tensor-parallel-size", "4", "--cfg-parallel-size", "2", "--vae-patch-parallel-size", "8", "--vae-parallel-mode", "tile", "--stage-overrides", '{"0": {"model_config": {"offload_guardrail_models": true}}}']
+      rtx_pro_6000:
+        extra_args: ["--vae-use-tiling", "--enable-distributed-layerwise-offload", "--dlo-no-use-allgather", "--dlo-resident-layers", "48", "--stage-overrides", '{"0": {"model_config": {"offload_guardrail_models": true}}}']
+        extra_env: {VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "14400", VLLM_OMNI_DLO_DP_WAVE_TIMEOUT: "14400"}
+      rtx_pro_6000_2x:
+        extra_args: ["--num-gpus", "2", "--tensor-parallel-size", "2", "--vae-patch-parallel-size", "2", "--vae-parallel-mode", "tile"]
+        extra_env: {VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "14400", VLLM_OMNI_DLO_DP_WAVE_TIMEOUT: "14400"}
+      l40s:
+        extra_args: ["--vae-use-tiling", "--enable-distributed-layerwise-offload", "--dlo-no-use-allgather", "--dlo-resident-layers", "10", "--enforce-eager", "--stage-overrides", '{"0": {"model_config": {"offload_guardrail_models": true}}}']
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  **PAN 2** is a foundation world model that simulates how a scene evolves
+  under a time-grounded plan of actions and camera movements. Its 29B
+  generative simulator is a dual-stream multimodal diffusion transformer
+  (MMDiT): the prompt is encoded into a continuous state stream, and the state
+  and video streams, each with its own projections and feed-forward networks,
+  are joined by self-attention at every layer. The plan guides video denoising,
+  while the developing video refines the state. One server handles both
+  tasks: a request with a first-frame image runs image-to-video (I2V), a
+  request without one runs text-to-video (T2V).
+
+  | Item | Contract |
+  | --- | --- |
+  | Tasks | T2V; I2V from one first-frame image |
+  | Prompt | One structured-caption prompt per request, plus an optional negative prompt |
+  | Default output | 704x1248, 313 frames (13 s) at 24 fps |
+  | Longest output | 481 frames (20 s) at 24 fps |
+  | Size | `height` and `width` multiples of 32 |
+  | Frame count | `num_frames` of the form `4k+1` (`duration_sec * 24 + 1` for whole seconds) |
+  | Sampling | 50 steps and CFG 2.5 by default; PAN 2's own flow-matching schedule |
+
+  ## Prompt format
+
+  PAN 2 needs a structured prompt. It is trained on the captions written by its
+  [prompt rewriter](https://github.com/ifm-ai/PAN2/blob/main/inference/pan-prompt-rewriter/SKILL.md),
+  and expects the prompt as that caption serialized to **compact one-line
+  JSON** (`json.dumps(caption, ensure_ascii=False, separators=(",", ":"))`).
+  A plain one-line prompt produces unusable video. The caption describes the
+  style, lighting, camera, subjects, the first frame, and a timeline of events:
+
+  ```json
+  {
+    "video_style": "Serene aerial travel footage during blue hour, captured in one uninterrupted continuous shot.",
+    "lighting": "Soft blue skylight after sunset, a pale violet horizon and small pools of amber light ...",
+    "perspective_view": "Wide drone view looking obliquely down along Santorini's caldera rim ...",
+    "subjects_lifecycle": [],
+    "init_frame_visual_description": "Two cobalt-blue church domes rise among tightly stepped white Cycladic buildings ...",
+    "events": [
+      {
+        "event_index": 0,
+        "time_range_sec": "0 to 4",
+        "event_description": "The drone glides gently right along the cliff ...",
+        "camera_motion": [{"time_range_sec": "0 to 4", "camera_motion": ["track_right"]}],
+        "contained_actions": []
+      }
+    ],
+    "quality": {"video_quality": "Resolved architectural edges ...", "text_logos_overlays": null, "artifacts": null}
+  }
+  ```
+
+  The negative prompt uses the same format. Without one, or with an empty one,
+  PAN 2 uses the negative prompt it was released with, its time ranges set to
+  the clip's duration. The request examples read the prompt and negative
+  prompt from `prompt.json` and `negative_prompt.json`
+  (`i2v_prompt.json` and `i2v_negative_prompt.json` for image-to-video).
+
+  ## Guardrails
+
+  PAN 2 runs guardrails on the prompt and the generated video, and they may
+  block a request with HTTP 400. They need the `pan2-guardrail` package.
+
+  ## Hardware profiles
+
+  Pick the hardware above and the command updates. Every profile is sized for
+  the longest 481-frame, 704x1248 output. Peaks are per GPU.
+
+  | GPU memory | GPUs | Key arguments | Peak memory |
+  | --- | ---: | --- | ---: |
+  | ≥141 GB (H200, B200, B300, GB200, GB300) | 1 | (none) | 107.4 GiB |
+  | | 4 | `--cfg-parallel-size 2 --usp 2` | 110.7 GiB |
+  | | 8 | `--cfg-parallel-size 2 --usp 4` | 110.4 GiB |
+  | 96 GB (RTX PRO 6000) | 1 | `--enable-distributed-layerwise-offload --dlo-resident-layers 48`, `offload_guardrail_models` | 84.4 GiB |
+  | | 2 | `--tensor-parallel-size 2` | 84.5 GiB |
+
+  `offload_guardrail_models` is set with
+  `--stage-overrides '{"0": {"model_config": {"offload_guardrail_models": true}}}'`.
+  With `--enable-distributed-layerwise-offload`, the DiT blocks stay in pinned
+  host memory and stream to the GPU each step, with `--dlo-resident-layers`
+  leading blocks kept on the GPU. The offloaded weights live in pinned system
+  RAM, so these profiles need a large amount of it, and each CFG-parallel
+  branch adds its own copy.
+
+  ## Request options
+
+  ```bash
+  -F "size=1248x704" -F "num_frames=481" \
+  -F "num_inference_steps=50" -F "guidance_scale=2.5"
+  ```
+
+  Use `num_frames` to set the length; `seconds` is not used. Requests with a
+  size that is not a multiple of 32, a frame count that is not `4k+1`, more
+  than one image, video input, or custom `sigmas`/`timesteps` are rejected
+  with HTTP 400 before they reach the GPUs.
+
+  ### Request-scoped quality
+
+  PAN 2 can switch Cache-DiT per request without a startup option:
+  `-F 'quality=lossless'` runs the reference path, `-F 'quality=high'` PAN 2's
+  conservative Cache-DiT profile. `high` is about 1.3× faster than `lossless`;
+  the speedup depends on the prompt and the parallel configuration.
+
+  ## References
+
+  - [Model card](https://huggingface.co/IFM/PAN2)
+  - [vLLM-Omni PR #8602](https://github.com/vllm-project/vllm-omni/pull/8602)
+  - [PAN 2 guardrail](https://github.com/ifm-ai/pan2-guardrail)

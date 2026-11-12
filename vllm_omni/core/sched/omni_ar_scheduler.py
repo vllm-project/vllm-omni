@@ -1903,13 +1903,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         runtime_config = duplex.get("runtime_config")
         runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
         window = runtime_config.get("duplex_window_config")
-        if not isinstance(window, dict):
-            return False
-        mode = window.get("sliding_window_mode", "off")
+        mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
         if mode not in {"basic", "context"}:
             # Without a window the worker keeps no unit history to carry.
             session._minicpmo45_carried_window = None
-            return False
 
         try:
             seq = int(duplex.get("seq", 0) or 0)
@@ -1935,6 +1932,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         carry = getattr(session, "_minicpmo45_carried_window", None)
         session._minicpmo45_carried_window = None
         session._minicpmo45_window_planned = True
+        # Boundary reconciliation is required even with an unbounded context:
+        # async lookahead can overwrite the worker's pending terminator after
+        # the scheduler accepted the segment stop. Window retention is optional.
+        if not isinstance(window, dict) or mode not in {"basic", "context"}:
+            return False
         base_len = int(getattr(session, "num_prompt_tokens", 0) or 0) + len(generated_ids)
         boundary = base_len + 2
         # A legitimate open_start of 0 (an empty context prefix) must not fall

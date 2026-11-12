@@ -33,8 +33,9 @@ The bundled Qwen3-Omni setup explicitly sets `moe_backend: triton` for the Think
 both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashInfer CUTLASS unquantized MoE path on
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
-On CUDA the same file selects model runner v2 and leaves the Thinker prefix cache off.
-NPU, XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to keep the CUDA V1 path.
+On CUDA and NPU the same file selects model runner v2 for all three stages. The Thinker prefix cache is enabled on CUDA; NPU keeps it disabled by default (set `enable_prefix_caching: true` on stage 0 to opt in). Talker and Code2Wav keep it disabled.
+The NPU Thinker and Talker use an Ascend model state for attention metadata while retaining Omni request lifecycle and M-RoPE handling. Code2Wav uses Ascend input batches and forward context with the shared V2 chunk lifecycle. It runs without outer graph padding and copies audio to host synchronously before publishing each output. Code2Wav captures up to 32 exact-shape NPU graphs at startup for its streaming decode windows; other shapes run eagerly and nothing is captured while serving. Set `enforce_eager: true` on stage 2 to disable them.
+XPU, ROCm and MUSA stay on model runner v1. Set `model_runner: v1` in an overlay to opt out on CUDA or NPU.
 
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
@@ -106,6 +107,23 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 
 Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
 the same single-stage pipeline without `--deploy-config`.
+
+### Thinking checkpoint chat template
+
+Serving `Qwen/Qwen3-Omni-30B-A3B-Thinking` with function tools through
+`/v1/chat/completions` or the turn-based `/v1/realtime` endpoint requires the
+compatibility chat template bundled with vLLM-Omni. From a source checkout:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
+    --chat-template vllm_omni/transformers_utils/chat_templates/qwen3_omni_thinking.jinja \
+    --reasoning-parser qwen3 \
+    --tool-call-parser hermes \
+    --enable-auto-tool-choice
+```
+
+For an installed package, substitute the path to `qwen3_omni_thinking.jinja`
+inside its `vllm_omni/transformers_utils/chat_templates` directory.
 
 ### Launch individual stages (stage-based CLI)
 

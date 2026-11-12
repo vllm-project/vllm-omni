@@ -138,6 +138,14 @@ _BLOCK_PREFIXES = (
 )
 
 
+def _resolve_dit_attention_spec(od_config: Any) -> Any | None:
+    """The spec the 50-block H3 DiT resolves from the attention config: ``per_role["self"]``, else the default."""
+    attention_config = getattr(od_config, "diffusion_attention_config", None)
+    per_role = getattr(attention_config, "per_role", None) or {}
+    spec = per_role.get(_H3_DIT_ATTENTION_ROLE)
+    return spec if spec is not None else getattr(attention_config, "default", None)
+
+
 def _resolve_dit_attention_backend(od_config: Any) -> str:
     """The backend the 50-block H3 DiT will actually resolve to.
 
@@ -662,6 +670,12 @@ class FastH3WeightFusion(MiniMaxH3WeightFusion):
                     "FastH3 VSA supports local attention or pure Ulysses sequence parallelism; "
                     "ring/all-gather SP does not give the block-sparse kernel the complete packed sequence."
                 )
+            # Imported here because fasth3_checkpoint imports this module.
+            from .fasth3_checkpoint import check_base_vsa_provider, check_scheduled_vsa_providers
+
+            # The fused gates run on tile64, the H3 default.
+            check_base_vsa_provider(_resolve_dit_attention_spec(od_config), name=self.adapter_name, tile_size=64)
+            check_scheduled_vsa_providers(od_config, name=self.adapter_name, tile_size=64)
         logger.info(
             "FastH3 adapter active: sigma points %s for %d transformer forwards, "
             "flow_shift=%g, audio_flow_shift=%g, tasks=%s",

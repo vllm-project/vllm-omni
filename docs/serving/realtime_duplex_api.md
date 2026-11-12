@@ -285,6 +285,32 @@ stops retaining output PCM for calibration. Broader language, boundary and
 sustained-load validation is still needed before enabling either strategy by
 default.
 
+## Qwen3-Omni L1 history views
+
+The deployment setting `duplex_session.context_keep_media_turns` opts the
+Qwen3-Omni Thinker (stage 0) into L1 history views. Its default, `null`, preserves
+the existing prompt construction. Set a nonnegative integer in the deployment
+configuration, for example:
+
+```yaml
+duplex_session:
+  context_keep_media_turns: 2
+```
+
+This keeps the two most recent user runs verbatim. Eligible older user messages
+use their text and available transcripts instead of resubmitting audio and image
+parts. Consecutive user messages form one run. Setting `0` makes all older runs
+eligible, while the Qwen consumer still protects the current input's media,
+including during tool continuations. If dropping media would empty a whole user
+run, that run is kept unchanged.
+
+Lower values trade older media access for text-only context. This does not add
+ASR, create captions or preserve an old image's meaning without an existing text
+representation. The setting changes the Thinker's prompt view, not authoritative
+history; it does not bound total session memory. The existing 16-message prompt
+window, retained-audio slot count and byte limits remain in effect. Clients
+cannot override this deployment-owned policy through session updates.
+
 ## JoyAI visual and conversation memory
 
 JoyAI keeps three levels of visual memory: accepted observation frames, summaries
@@ -903,7 +929,7 @@ through a `DuplexSessionHandle`.
 
 ```python
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit
-from vllm_omni.engine.duplex.events import AudioDelta, SessionClosed
+from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 omni = DuplexOmni(model="openbmb/MiniCPM-o-4_5", trust_remote_code=True)

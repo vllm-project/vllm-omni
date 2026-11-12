@@ -65,6 +65,7 @@ nav:
       - Online Quantization: user_guide/quantization/online.md
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
+      - Online FP8 Block Scaling (ROCm): user_guide/quantization/rocm_online_fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
       - ConvRot W8A8/W4A4: user_guide/quantization/convrot.md
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
@@ -107,8 +108,10 @@ nav:
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
         - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
+        - Attention Schedules: user_guide/diffusion/attention_backends/schedules.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - MiniMax-H3 LiteVAE Decoder: user_guide/diffusion/light_vae.md
+      - Denoise Step Graphs: user_guide/diffusion/denoise_graph.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
@@ -155,6 +158,7 @@ nav:
           - Yuanrong Store Connector: design/feature/omni_connectors/yuanrong_connector.md
           - Yuanrong Transfer Engine Connector: design/feature/omni_connectors/yuanrong_transfer_engine_connector.md
       - Quantization: design/feature/quantization.md
+      - LoRA: design/feature/lora.md
       - Diffusion Acceleration:
         - Parallelism:
           - CFG-Parallel: design/feature/cfg_parallel.md
