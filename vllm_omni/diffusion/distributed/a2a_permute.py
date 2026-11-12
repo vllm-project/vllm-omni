@@ -216,9 +216,7 @@ def _get_symm_buffer(
                 # Do not release an older buffer while kernels still consume it.
                 torch.accelerator.synchronize(device)
                 # Peer pointers must identify this allocation, not a pool base.
-                allocation = symm_mem._SymmetricMemory.empty_strided_p2p(
-                    (required_bytes,), (1,), torch.uint8, device
-                )
+                allocation = symm_mem._SymmetricMemory.empty_strided_p2p((required_bytes,), (1,), torch.uint8, device)
             with setup_context():
                 handle = symm_mem.rendezvous(allocation, group_name)
             workspace = _SymmWorkspace(
