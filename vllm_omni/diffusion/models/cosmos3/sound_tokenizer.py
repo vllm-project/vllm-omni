@@ -60,14 +60,15 @@ class Cosmos3SoundTokenizerPaths:
         """Read the paths from ``custom_pipeline_args``.
 
         Precedence: ``custom_pipeline_args`` > deprecated environment variable.
+        If neither is set, the caller falls back to ``sound_tokenizer/`` under the model path.
         """
         args = _pipeline_args(od_config)
         checkpoint_path = _path_arg(args, ("sound_tokenizer_path", "avae_path", "cosmos3_avae_path"))
         if checkpoint_path is None:
-            checkpoint_path = _deprecated_env_path("COSMOS3_SOUND_TOKENIZER_PATH", "sound_tokenizer_path")
+            checkpoint_path = _legacy_env_path("COSMOS3_SOUND_TOKENIZER_PATH", "sound_tokenizer_path")
         config_path = _path_arg(args, ("sound_tokenizer_config_path",))
         if config_path is None:
-            config_path = _deprecated_env_path("COSMOS3_SOUND_TOKENIZER_CONFIG_PATH", "sound_tokenizer_config_path")
+            config_path = _legacy_env_path("COSMOS3_SOUND_TOKENIZER_CONFIG_PATH", "sound_tokenizer_config_path")
         return cls(checkpoint_path=checkpoint_path, config_path=config_path)
 
 
@@ -82,7 +83,7 @@ def _path_arg(args: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def _deprecated_env_path(env_name: str, arg_name: str) -> str | None:
+def _legacy_env_path(env_name: str, arg_name: str) -> str | None:
     value = os.environ.get(env_name)
     if not value:
         return None
