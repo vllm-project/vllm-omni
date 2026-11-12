@@ -165,6 +165,57 @@ def test_staging_transitions_are_idempotent_and_reuse_one_event(patched_runtime,
     retention.release_if_needed.assert_called_once_with(force=False)
 
 
+@pytest.mark.parametrize("release_cache", [False, True])
+def test_successful_offload_can_retain_cache_without_changing_model_state(patched_runtime, release_cache):
+    empty_cache, synchronize = patched_runtime
+    module = nn.Linear(4, 3)
+    input_ = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    expected_output = module(input_).detach()
+    parameter = module.weight
+    master_pointer = parameter.untyped_storage().data_ptr()
+    stager = PinnedModuleStager(module, torch.device("cpu"), pin_memory=False)
+
+    stager.load()
+    assert torch.equal(module(input_), expected_output)
+    stager.offload(release_cache=release_cache)
+
+    assert not stager.loaded
+    assert not stager._device_storages
+    assert module.weight is parameter
+    assert parameter.untyped_storage().data_ptr() == master_pointer
+    assert torch.equal(module(input_), expected_output)
+    synchronize.assert_called_once_with()
+    assert empty_cache.call_count == int(release_cache)
+    stager.offload(release_cache=release_cache)
+    assert empty_cache.call_count == int(release_cache)
+
+
+def test_retain_request_preserves_explicit_bounded_cache_owner(patched_runtime, mocker):
+    empty_cache, _ = patched_runtime
+    retention = mocker.Mock(spec=BoundedAllocatorCache)
+    stager = PinnedModuleStager(nn.Linear(2, 2), torch.device("cpu"), pin_memory=False, cache_retention=retention)
+    stager.load()
+    stager.offload(release_cache=False)
+    retention.release_if_needed.assert_called_once_with(force=False)
+    empty_cache.assert_not_called()
+
+
+def test_failed_offload_still_releases_cache_when_reuse_is_requested(patched_runtime, monkeypatch):
+    empty_cache, _ = patched_runtime
+    stager = PinnedModuleStager(nn.Linear(2, 2), torch.device("cpu"), pin_memory=False)
+    stager.load()
+
+    def fail_restore() -> None:
+        raise RuntimeError("master restore failed")
+
+    monkeypatch.setattr(stager, "_restore_masters", fail_restore)
+    with pytest.raises(RuntimeError, match="master restore failed"):
+        stager.offload(release_cache=False)
+    assert not stager.loaded
+    assert not stager._device_storages
+    empty_cache.assert_called_once_with()
+
+
 def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patched_runtime, mocker):
     module = nn.Linear(2, 2)
     expected = module.weight.detach().clone()

@@ -98,7 +98,7 @@ def test_encoder_non_block_children_use_one_shared_snapshot_stager(monkeypatch, 
         cache_retention=cache,
     )
     stager.load.assert_called_once_with()
-    stager.offload.assert_called_once_with()
+    stager.offload.assert_called_once_with(release_cache=True)
     hook.offload_layer.assert_called_once_with()
 
 

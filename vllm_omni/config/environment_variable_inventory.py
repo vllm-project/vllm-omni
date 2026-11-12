@@ -246,6 +246,8 @@ _MODEL_PROMOTE = (
     "H3_VAE_XEFMHA",
     # Wan2.2 S2V: =1 quantizes the audio injector with the DiT's quant config (default off).
     "VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR",
+    # MiniMax-H3 manual component allocator-cache policy.
+    "H3_COMPONENT_CACHE_REUSE",
 )
 
 _MODEL_REQUEST_SCOPE = (

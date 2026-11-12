@@ -49,6 +49,8 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .component_cache_policy import release_component_cache
+
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
@@ -1312,7 +1314,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 hook.offload_layer()
             stager = getattr(self, "_omni_non_block_stager", None)
             if stager is not None:
-                stager.offload()
+                stager.offload(release_cache=release_component_cache())
             else:
                 # The initial DLO setup reaches this branch before the first
                 # load. These modules were constructed on CPU, so this is not
@@ -1323,7 +1325,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             return
         self.vision.to("cpu")
         self.text_model.to("cpu")
-        torch.accelerator.empty_cache()
+        if release_component_cache():
+            torch.accelerator.empty_cache()
+        else:
+            self._release_omni_component_cache()
 
     def _omni_non_block_modules(self) -> list[nn.Module]:
         modules = [child for name, child in self.vision.named_children() if name != "blocks"]
@@ -1338,10 +1343,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
 
     def _release_omni_component_cache(self) -> None:
         cache = getattr(self, "_omni_component_cache", None)
-        if cache is None:
-            torch.accelerator.empty_cache()
-        else:
+        if cache is not None:
             cache.release_if_needed()
+        elif release_component_cache():
+            torch.accelerator.empty_cache()
 
     def _encode(
         self,
