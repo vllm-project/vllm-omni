@@ -250,6 +250,7 @@ class MossLocalModelState(OmniModelState):
             return
         count = sum(codes.shape[0] for _, codes in references)
         capacity = max(count, self._static_inputs_embeds.shape[0])
+        is_accel = embeds.is_cuda or embeds.device.type == "npu"
         staging = None
         for item in self._prefill_staging:
             if item[0].shape[0] >= count and (item[2] is None or item[2].query()):
@@ -257,7 +258,13 @@ class MossLocalModelState(OmniModelState):
                 break
         if staging is None:
             host = torch.empty((capacity, self.model.n_vq + 1), dtype=torch.long, pin_memory=embeds.is_cuda)
-            device = torch.empty_like(host, device=embeds.device) if embeds.is_cuda else host
+            device = torch.empty_like(host, device=embeds.device) if is_accel else host
+            # NPU records no event, so the reuse check below treats the slot as
+            # free immediately. That is safe only because the H2D copy below is
+            # blocking and the following ``_audio_embed`` / ``index_copy_`` run
+            # on the same stream, so the device buffer is consumed before the
+            # next call can overwrite it. If prefill ever moves to a side
+            # stream, record a ``torch.npu.Event`` here and gate reuse on it.
             staging = [host, device, torch.cuda.Event() if embeds.is_cuda else None]
             if len(self._prefill_staging) < 3:
                 self._prefill_staging.append(staging)
@@ -268,9 +275,12 @@ class MossLocalModelState(OmniModelState):
             host[offset:end, 0].numpy()[:] = np.arange(start, start + codes.shape[0])
             host[offset:end, 1:].copy_(codes)
             offset = end
-        if embeds.is_cuda:
-            device[:count].copy_(host[:count], non_blocking=True)
-            event.record(torch.cuda.current_stream(embeds.device))
+        if is_accel:
+            # ``non_blocking`` is False on NPU, so this copy blocks the current
+            # stream and orders before the ``_audio_embed`` read below.
+            device[:count].copy_(host[:count], non_blocking=embeds.is_cuda)
+            if embeds.is_cuda:
+                event.record(torch.cuda.current_stream(embeds.device))
         packed = device[:count]
         positions = packed[:, 0]
         audio = self.model._audio_embed(packed[:, 1:])
