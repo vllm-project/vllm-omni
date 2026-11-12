@@ -1024,6 +1024,10 @@ class OmniModelState(DefaultModelState):
             info = {key: value for key, value in buf.items() if isinstance(key, str) and key != "hidden_states"}
             if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
                 info["multimodal_outputs"] = multimodal_outputs
+                # Structured outputs preserve the current batch row.  Passing
+                # that row explicitly keeps model feedback aligned even when
+                # an earlier request has no live buffer or is a warmup row.
+                info["_omni_batch_row"] = i
             updates = self.model.postprocess(h_slice, **info)
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
@@ -1068,6 +1072,17 @@ class OmniModelState(DefaultModelState):
                     "model_intermediate_buffer": buffer_list,
                     "request_token_spans": self._request_token_spans(input_batch),
                 }
+                logits_index = getattr(input_batch, "logits_indices", None)
+                if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+                    if logits_index is None:
+                        raise RuntimeError("Structured per-request postprocess requires input_batch.logits_indices")
+                    if logits_index.shape[0] != input_batch.num_reqs:
+                        raise RuntimeError(
+                            "Structured per-request postprocess requires exactly one logits row per request: "
+                            f"num_logits={logits_index.shape[0]} num_reqs={input_batch.num_reqs}"
+                        )
+                if logits_index is not None:
+                    make_output_kwargs["logits_index"] = logits_index
                 make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 
