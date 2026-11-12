@@ -16,6 +16,11 @@ import base64
 import numpy as np
 import pytest
 
+from vllm_omni.engine.duplex.realtime_events import (
+    RealtimeProjectionState,
+    realtime_session_payload,
+)
+from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.protocol.realtime.audio import encode_g711_alaw, encode_g711_ulaw
 from vllm_omni.protocol.realtime.audio_input import decode_audio_append
 from vllm_omni.protocol.realtime.session import (
@@ -145,3 +150,31 @@ def test_g711_append_rate_overrides_the_session_rate(event_format, _session_form
     )
 
     _assert_16khz_tone(decoded)
+
+
+def _accepted_session_defaults(session_payload: dict[str, object]) -> RealtimeInputDefaults:
+    """Run a session payload through the real projection and accepted-envelope update."""
+    state = RealtimeProjectionState(session_id="sess-round-trip")
+    state.apply_session_defaults(session_payload)
+    projected = realtime_session_payload(state, session_payload)
+    envelope = RealtimeEnvelope()
+    envelope.apply_accepted_session(projected)
+    return envelope.defaults
+
+
+@pytest.mark.parametrize(("event_format", "_session_format", "encode"), _CODECS)
+def test_flat_rate_less_g711_survives_the_session_round_trip(event_format, _session_format, encode):
+    defaults = _accepted_session_defaults({"input_audio_format": event_format})
+
+    assert defaults.input_sample_rate_hz == NATIVE_RATE_HZ
+    _assert_16khz_tone(decode_audio_append(_append_event(encode, NATIVE_RATE_HZ), defaults=defaults))
+
+
+@pytest.mark.parametrize(("event_format", "_session_format", "encode"), _CODECS)
+def test_explicit_g711_rate_survives_the_session_round_trip(event_format, _session_format, encode):
+    defaults = _accepted_session_defaults(
+        {"audio": {"input": {"format": {"type": event_format, "rate": DECLARED_RATE_HZ}}}}
+    )
+
+    assert defaults.input_sample_rate_hz == DECLARED_RATE_HZ
+    _assert_16khz_tone(decode_audio_append(_append_event(encode, DECLARED_RATE_HZ), defaults=defaults))
