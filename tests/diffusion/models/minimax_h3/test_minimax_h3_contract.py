@@ -2844,7 +2844,8 @@ def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     assert video_vae._device_target.type == "meta"
 
 
-def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
+@pytest.mark.parametrize("device_type, pin_memory", [("cuda", True), ("npu", False)])
+def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch, device_type, pin_memory):
     from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
 
     class FakeRemote(torch.nn.Module):
@@ -2872,7 +2873,7 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
 
     video_vae = vae_module.MiniMaxH3VideoVAE(
         "unused",
-        device=torch.device("cuda"),
+        device=torch.device(device_type),
         load_device=torch.device("cpu"),
     )
     video_vae.load_to_device()
@@ -2880,8 +2881,8 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
 
     stager_cls.assert_called_once_with(
         video_vae.remote,
-        torch.device("cuda"),
-        pin_memory=True,
+        torch.device(device_type),
+        pin_memory=pin_memory,
     )
     stager.load.assert_called_once_with()
     stager.offload.assert_called_once_with()

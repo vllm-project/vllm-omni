@@ -147,6 +147,42 @@ This prevents a model from interpreting serialized weights with an online
 loader or silently applying the wrong method to one transformer in a
 multi-transformer pipeline.
 
+MiniMax H3's `additional_config.offline_quantization` overrides component weight
+sources while preserving the original model snapshot's architecture and
+non-overridden components. Its streaming reader validates the ModelSlim scheme,
+tensor dtype, shape, shard index, and required scales before loading. Native
+INT8 uses serialized `W8A8_DYNAMIC` weights, retaining the existing QKV/MLP
+mapping and TP-aware parameter loaders for both weights and channel scales.
+FLOAT projections remain unquantized; unsupported native INT8 shapes fail
+rather than casting INT8 bytes into floating weights. Component routing exposes
+offline status only when every enabled quantized component is offline, allowing
+CPU offload loading without startup weight quantization.
+
+H3 also accepts the supplied mixed MXFP8/dual-scale FP4 delivery through an
+explicit `execution_mode="dequantize"` compatibility path. This reconstructs
+floating weights using all serialized scale levels and does not imply native
+MX compute. The `execution_mode="native_mx"` adapter instead re-encodes the
+fully reconstructed weights once at load time, preserving delivery bit widths:
+MXFP8 uses W8A8 and dual-scale FP4 uses native single-scale W4A4. Runtime
+activation quantization and GEMM use Ascend MX operators without a floating
+GEMM fallback. Plain uint8 weight/scale parameters preserve their bytes through
+DLO; packed FP4 does not use the incompatible dual-level/NZ representation.
+Before native dispatch, FP4 weight views with nonzero storage offsets are
+copied into a zero-offset buffer, bounded to one output chunk. DLO buffers
+and wide AdaLN slices can otherwise expose incorrect packed-FP4 addressing;
+contiguity alone does not establish a zero storage offset.
+Native Linear inputs and outputs remain FP16, BF16, or FP32. Checkpoint VAE
+dtype helpers must not cast activations to the packed weight's uint8 dtype;
+the adapter dispatches native layers without that cast and rejects integer
+activations. Audio encoder attention routes QKV through the native module,
+then adds the checkpoint's separate Q/K/V biases once before floating attention.
+The conversion may introduce error and requires hardware and quality validation.
+Custom component readers
+bypass direct checkpoint mmap; HSDP and host weight runtime are rejected for
+these overrides. VAE state replacement happens before inference patches are
+installed. See the [INT8 guide](../../user_guide/quantization/int8.md#minimax-h3-offline-component-checkpoints)
+for the supported checkpoint contract and limitations.
+
 ## Model and layer integration
 
 Diffusion model constructors receive the resolved configuration and pass it to
