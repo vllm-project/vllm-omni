@@ -50,6 +50,11 @@ selection mark for ready CI.
 The recorded model comparison below was measured on L20X. This is a strict regression
 threshold, not a claim of cross-hardware token equality.
 
+The CUDA Thinker uses native `rms_norm` and `fused_add_rms_norm`, with
+QK-norm/RoPE fusion disabled. Changes to this numerical profile need the real
+long-video regression on the target GPU; archived transcript replay only
+validates the scoring contract.
+
 `recorded_transcripts.json` contains the actual before/intermediate/after and
 Transformers outputs used to test the scoring contract without a GPU. The
 unfixed default covers 11/12, the repaired output and Transformers 4.51.3 cover

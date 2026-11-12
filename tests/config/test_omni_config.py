@@ -420,11 +420,11 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
     if cli_prefix is not None:
         cli = {
             cli_prefix + "kernel_config": {
-                "ir_op_priority": {"rms_norm": ["native"], "fused_add_rms_norm": ["native"]}
+                "ir_op_priority": {"rms_norm": ["vllm_c", "native"], "fused_add_rms_norm": ["vllm_c", "native"]}
             },
             cli_prefix + "compilation_config": {
-                "custom_ops": ["none"],
-                "pass_config": {"enable_qk_norm_rope_fusion": False},
+                "custom_ops": ["none", "+rotary_embedding"],
+                "pass_config": {"enable_qk_norm_rope_fusion": True},
             },
         }
     config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / filename), cli_overrides=cli)
@@ -434,15 +434,15 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
     resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
 
     if cli_prefix is not None:
-        assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
-        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["native"]
-        assert resolved.compilation_config.custom_ops == ["none"]
-        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is False
-    elif filename == "minicpmo_4_5.yaml":
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
-        assert resolved.compilation_config.custom_ops == ["none", "+silu_and_mul", "+rotary_embedding"]
+        assert resolved.compilation_config.custom_ops == ["none", "+rotary_embedding"]
         assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is True
+    elif filename == "minicpmo_4_5.yaml":
+        assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
+        assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["native"]
+        assert resolved.compilation_config.custom_ops == ["none", "+silu_and_mul", "+rotary_embedding"]
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is False
         assert resolved.compilation_config.pass_config.fuse_norm_quant is False
         assert resolved.compilation_config.pass_config.fuse_act_quant is False
     else:
