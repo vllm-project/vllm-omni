@@ -75,7 +75,7 @@ def memory_worker(weight_sharing, monkeypatch, mocker):
     worker.set_proc_title = False
     worker.od_config = SimpleNamespace(
         num_gpus=1,
-        parallel_config=mocker.Mock(ulysses_a2a_permute=False),
+        parallel_config=mocker.Mock(),
         diffusion_kv_mode=kv_modes.PAGED_SCHEDULER,
         additional_config={runtime.CONFIG_KEY: msgspec.to_builtins(bootstrap)},
     )
