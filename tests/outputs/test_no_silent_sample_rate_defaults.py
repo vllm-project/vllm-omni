@@ -36,7 +36,6 @@ _ALLOWLIST = {
         "vllm_omni/entrypoints/openai/video_stream_base.py",
         "def _pcm_to_wav_b64(pcm_data: bytes, sample_rate: int = 16000) -> str:",
     ),
-    ("vllm_omni/entrypoints/openai/video_stream_base.py", "sample_rate=24000,"),
     ("vllm_omni/engine/orchestrator.py", "audio_sample_rate: int = 24000,"),
     (
         "vllm_omni/engine/duplex/session/runner.py",
