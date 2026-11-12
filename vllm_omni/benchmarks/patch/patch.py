@@ -136,6 +136,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     }
 )
 _PRINT_STAGE = False
+_DUPLEX_METRIC_AGGREGATION = "session"
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -170,6 +171,14 @@ def should_request_stage_metrics(args: Any) -> bool:
     extra_body = getattr(args, "extra_body", None) or {}
     modalities = extra_body.get("modalities") if isinstance(extra_body, dict) else None
     return backend == "openai-chat-omni" and "image" in (modalities or [])
+
+
+def set_duplex_metric_aggregation(aggregation: str) -> None:
+    """Select the observation unit for duplex latency distributions."""
+    if aggregation not in {"session", "response"}:
+        raise ValueError(f"Unknown duplex metric aggregation: {aggregation}")
+    global _DUPLEX_METRIC_AGGREGATION
+    _DUPLEX_METRIC_AGGREGATION = aggregation
 
 
 def set_print_stage(enabled: bool) -> None:
@@ -687,6 +696,55 @@ def get_samples(args, tokenizer, **kwargs):
     any upstream caller reaching this patched replacement keeps working; they are
     forwarded to the original implementation on every delegate path.
     """
+    pool_size = getattr(args, "duplex_sample_pool_size", None)
+    if pool_size is not None:
+        if args.dataset_name not in {"omniinteract", "omni-duplex-eval"}:
+            raise ValueError("--duplex-sample-pool-size requires OmniInteract or Omni-DuplexEval")
+        if getattr(args, "omniinteract_evaluate", False) or getattr(args, "duplex_eval_evaluate", False):
+            raise ValueError("--duplex-sample-pool-size is for performance runs without answer evaluation")
+        count = args.num_prompts or pool_size
+        if count > pool_size and getattr(args, "no_oversample", False):
+            raise ValueError("Repeating the duplex sample pool conflicts with --no-oversample")
+        pool_count = min(count, pool_size)
+        pool_args = argparse.Namespace(**vars(args))
+        pool_args.duplex_sample_pool_size = None
+        pool_args.num_prompts = pool_count
+        # Load the source pool once, including OmniInteract's predecoded media.
+        # Clear the option so this call cannot recurse again.
+        pool = get_samples(pool_args, tokenizer, **kwargs)
+        if len(pool) != pool_count:
+            raise ValueError(f"Requested {pool_count} distinct duplex samples, but selected {len(pool)}")
+        requests = []
+        identities = set()
+        for index in range(count):
+            cycle, offset = divmod(index, len(pool))
+            # Repeats can overlap: shared media/options must stay read-only.
+            # Prepared media is frozen bytes/tuples; stream cursors and playback
+            # state are created separately by each run_omniinteract_case call.
+            request = replace(pool[offset], request_id=f"{args.request_id_prefix or ''}{index}")
+            if isinstance(request, OmniInteractSampleRequest) and request.omniinteract_case is not None:
+                case = request.omniinteract_case
+                if cycle:
+                    relative = Path(case.video_rel)
+                    request.omniinteract_case = replace(
+                        case, video_rel=str(relative.with_name(f"{relative.stem}__repeat_{cycle}{relative.suffix}"))
+                    )
+                output_keys = [(request.omniinteract_case.subset, request.omniinteract_case.video_rel)]
+            elif isinstance(request, OmniDuplexEvalSampleRequest) and request.sample is not None:
+                if cycle:
+                    request.sample = replace(request.sample, id=f"{request.sample.id}__repeat_{cycle}")
+                output_keys = [
+                    (request.sample.split, f"{request.sample.id}{suffix}") for suffix in (".json", ".meta.json")
+                ]
+            else:
+                raise TypeError("Duplex sample pool lost its dataset identity")
+            if any(key in identities for key in output_keys):
+                raise ValueError(f"Repeated duplex output identity would collide: {output_keys}")
+            identities.update(output_keys)
+            requests.append(request)
+        args.num_prompts = len(requests)
+        return requests
+
     if args.dataset_name == "realtime-video":
         return get_realtime_video_samples(args)
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
@@ -1059,6 +1117,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     cancelled_after_timeout: bool = False
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
+    # Request start to receipt of the last non-empty audio payload; None for
+    # backends without this request-level clock (e.g. multi-turn duplex).
+    audio_latency: float | None = None
     audio_frames: int = 0
     audio_rtf: float = 0.0
     image_count: int = 0
@@ -2083,12 +2144,12 @@ async def async_request_openai_chat_omni_completions(
         audio_bytes_buffer = bytearray()
         most_recent_timestamp = st
         timestamp = st
-        audio_generate_time = 0.0
         output.itl = []
         output.generated_text = ""
         output.ttft = 0.0
         output.audio_ttfp = 0.0
         output.audio_duration = 0.0
+        output.audio_latency = None
         output.audio_frames = 0
         output.audio_rtf = 0.0
         output.text_latency = 0.0
@@ -2199,10 +2260,10 @@ async def async_request_openai_chat_omni_completions(
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
                                         if content:
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            output.audio_latency = timestamp - st
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
@@ -2311,7 +2372,7 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        output.audio_rtf = defs.compute_audio_rtf(output.audio_latency or 0.0, audio_duration)
                         if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
@@ -2835,6 +2896,7 @@ async def async_request_openai_audio_speech(
                     if not chunk:
                         continue
                     timestamp = time.perf_counter()
+                    output.audio_latency = timestamp - st
                     if output.audio_ttfp == 0.0:
                         # TTS speech endpoint emits no text tokens, so TTFT is
                         # not defined here; only audio TTFP is meaningful.
@@ -2857,7 +2919,7 @@ async def async_request_openai_audio_speech(
                 output.audio_duration = (
                     float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
                 )
-                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                output.audio_rtf = defs.compute_audio_rtf(output.audio_latency or 0.0, output.audio_duration)
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
@@ -3589,7 +3651,9 @@ async def async_request_openai_realtime_duplex(
         output.latency = request_finished_at - output.start_time
         output.tts_turn_pcm_bytes = turn_pcm_bytes
         output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
-        if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+        if _DUPLEX_METRIC_AGGREGATION == "response" or bool(
+            (request_func_input.extra_body or {}).get("save_duplex_request_metrics")
+        ):
             output.duplex_request_metrics = turn_metrics
             output.duplex_session_metrics = session_metrics
         output.output_tokens = sum(
@@ -4104,6 +4168,9 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Capture the measurement boundary before metrics and accuracy evaluation.
+    # Upstream's result "date" is populated only after this function returns.
+    benchmark_end_time = datetime.now().isoformat()
 
     if endpoint_type == "realtime-video":
         await session.close()
@@ -4149,6 +4216,7 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            duplex_metric_aggregation=_DUPLEX_METRIC_AGGREGATION,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -4236,6 +4304,7 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    result["benchmark_end_time"] = benchmark_end_time
     result["timed_out_requests"] = sum(bool(getattr(output, "timed_out", False)) for output in outputs)
     result["cancelled_after_timeout_requests"] = sum(
         bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs
@@ -4247,6 +4316,16 @@ async def benchmark(
     ]
     if any(request_stage_metrics):
         result["request_stage_metrics"] = request_stage_metrics
+
+    # Client audio completion is independent of server stage snapshots and
+    # trailing usage/EOF. Keep request order and explicit holes for unavailable
+    # or failed requests; duplex session-mean RTF cannot recover this clock.
+    result["request_audio_metrics"] = [
+        {"audio_duration_s": output.audio_duration, "audio_latency_s": output.audio_latency}
+        if output.success and getattr(output, "audio_latency", None) is not None and output.audio_duration > 0
+        else None
+        for output in outputs
+    ]
 
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
@@ -4393,6 +4472,9 @@ async def benchmark(
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+
+    if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
+        result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION
 
     if task_type == TaskType.GENERATION:
         for metric in result_percentile_metrics:
