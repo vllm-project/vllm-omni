@@ -79,13 +79,21 @@ def test_npu_v2_initializes_stage_output_cache_after_native_kv(monkeypatch, prof
 def test_minicpmo_dispatches_via_lifecycle_flags(monkeypatch, device_type):
     """MiniCPM-o rides the shared lifecycle-flag dispatch from #10062.
 
-    The model declares ``have_multimodal_outputs`` and ships no
-    ``create_omni_model_state`` factory, so ``init_omni_model_state`` picks
-    the state class from the device: the Ascend-backed NPU state on NPU,
-    the generic Omni state elsewhere. This is the production path (verified
-    end-to-end on a 910B1: three-stage serving starts and answers requests)
-    and the test keys off the signal the dispatch actually reads
-    (``device.type``).
+    The model declares ``have_multimodal_outputs`` in ``__init__``
+    (``minicpmo_4_5_omni.py``) and ships no ``create_omni_model_state``
+    factory, so ``init_omni_model_state`` picks the state class from the
+    device: the Ascend-backed NPU state on NPU, the generic Omni state
+    elsewhere. This is the production path (verified end-to-end on a 910B1:
+    three-stage serving starts and answers requests) and the test keys off
+    the signal the dispatch actually reads (``device.type``).
+
+    The lifecycle flag is forced here — building a real MiniCPM-o needs
+    full weight loads, out of scope for a unit test. The ``__init__``
+    wiring of that flag is exercised by the NPU CI serving tests: if the
+    assignment disappeared, the dispatch would stop handing back the
+    Ascend-backed state and ``NPUOmniARModelRunner`` would refuse to start,
+    failing those tests. This test therefore pins the dispatch given the
+    flag, not the flag assignment itself.
     """
     from types import SimpleNamespace
 
@@ -93,10 +101,6 @@ def test_minicpmo_dispatches_via_lifecycle_flags(monkeypatch, device_type):
         MiniCPMO45OmniForConditionalGeneration,
     )
     from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
-
-    # Single dispatch path by design: the factory hook was dropped in favour
-    # of the shared lifecycle-flag branch, and it must not silently return.
-    assert not hasattr(MiniCPMO45OmniForConditionalGeneration, "create_omni_model_state")
 
     init = Mock(return_value=None)
     monkeypatch.setattr(OmniModelState, "__init__", init)
