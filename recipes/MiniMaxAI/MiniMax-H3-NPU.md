@@ -663,3 +663,43 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Route supported unmasked, non-causal FP16/BF16 decoder self-attention through Ascend FIA. Fix the CPU BSND head-count fixture (BSND [1,2,3,4] has three heads), register the model control, and add a portable full-checkpoint benchmark. Unsupported calls retain the original attention implementation. No new production attention change was needed during this validation.
+
+```bash
+# MAIN and CANDIDATE are the source checkouts; MODEL is the Ref2VA task partition.
+# LATENTS contains torch.save((video_z, audio_z)); use the same nightly software/driver.
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
+H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=0 H3_VAE_OPERATOR_FIR_C16_INSTALL=0 \
+H3_VAE_OPERATOR_FIR_C16=0 H3_VIDEO_DECODER_CROSS_CHUNK=0 H3_COMPONENT_CACHE_REUSE=0 \
+PYTHONPATH="$MAIN" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm baseline --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir baseline-results --warmups 3 --formals 5 --precision
+H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=1 PYTHONPATH="$CANDIDATE" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm candidate --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir candidate-results --warmups 3 --formals 5 --precision
+python3 -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_vae_npu_fia.py tests/config/test_environment_variables.py
+```
+
+Measured scope: **resident Video VAE decode, max of eight ranks**.
+
+| Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
+| --- | ---: | ---: | --- |
+| main | 4.062523 ± 0.007200 | 4.054639–4.070466 | 4.055762, 4.069284 |
+| PR | 3.613800 ± 0.000713 | 3.612586–3.614838 | 3.613377, 3.614222 |
+
+Latency reduction: **11.045%**; speedup: **1.124169x** (main mean / PR mean).
+
+Main samples (s): 4.056119, 4.056571, 4.055717, 4.054639, 4.055761, 4.069841, 4.070460, 4.070466, 4.067707, 4.067945.
+
+PR samples (s): 3.613071, 3.613699, 3.613786, 3.613746, 3.612586, 3.613361, 3.614838, 3.614735, 3.613734, 3.614442.
+
+Peak device memory in the accepted repeat (max rank/request, allocated / reserved GiB): main 14.801 / 16.180; PR 14.804 / 15.994.
+
+Full normalized Float32 video: RMSE 4.418180802e-05, max absolute difference 0.003160476685. Canonical RGB24 and ordinary decode RGB: maximum difference 1, PSNR 71.286561 dB. Audio PCM is bit-exact. Video is **not bit-exact**. These values pass the engineering gates declared before candidate runs (video RMSE <= 0.002, max <= 0.02, RGB PSNR >= 50 dB and max difference <= 3); they are numeric validation on this fixed input, not a subjective or general quality guarantee.
+
+The actual default-codec MP4 capture is decoded and measured separately: H.264 RGB PSNR 41.718508 dB, max channel difference 40; AAC-decoded PCM is bit-exact (including codec padding). These H.264 differences are not treated as isolated patch error: encoding the SAME saved immutable RGB/PCM twice through the unchanged main encoder produces different decoded RGB hashes, and setting threads=1 did not remove this reference variability. The predeclared precision acceptance uses the complete PRE-CODEC tensors above; encoded MP4 bit equality is not claimed. Both the repeatability diagnostic and all per-arm MP4 differences are retained.
+
+The result measures decoder work on eight 910B4-1 NPUs using the nightly image software stack (CANN 9.2.1), main `b7bbfbdb4f2b3c070d9632043ea6cd2b1c601270`, original Ref2VA weights and identical captured latents. Each of two launches uses three warmups and five formal samples. It excludes conditioning/DiT and HTTP latency.

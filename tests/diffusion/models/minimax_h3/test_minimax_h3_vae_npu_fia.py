@@ -19,7 +19,7 @@ class _FakeAttn(nn.Module):
     def __init__(self):
         super().__init__()
         self.training = False
-        self.calls = []
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]] = []
 
         def original(query, key, value, pack_info):
             self.calls.append((query, key, value, pack_info))
@@ -115,7 +115,7 @@ def test_fast_path_calls_fused_infer_attention(decoder, monkeypatch):
         return q, None
 
     fake_torch_npu = types.ModuleType("torch_npu")
-    fake_torch_npu.npu_fused_infer_attention_score = fake_fia
+    setattr(fake_torch_npu, "npu_fused_infer_attention_score", fake_fia)
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
     monkeypatch.setattr(fia_module, "_fallback_reason", lambda *args: None)
 
@@ -126,8 +126,8 @@ def test_fast_path_calls_fused_infer_attention(decoder, monkeypatch):
     q, k, v, kwargs = calls[0]
     assert q.shape == (1, 3, 2, 4)
     assert k.shape == q.shape and v.shape == q.shape
-    assert kwargs["num_heads"] == 2
-    assert kwargs["num_key_value_heads"] == 2
+    assert kwargs["num_heads"] == 3
+    assert kwargs["num_key_value_heads"] == 3
     assert kwargs["input_layout"] == "BNSD"
     assert kwargs["scale"] == pytest.approx(4**-0.5)
     assert kwargs["sparse_mode"] == 0
