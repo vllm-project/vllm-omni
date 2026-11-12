@@ -21,6 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig, parse_weight_sharing
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -642,7 +643,10 @@ class StageDeployConfig:
     # today). Independent of compilation_config.cudagraph_mode;
     # enforce_eager=True also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool | None = None
+    diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     video_output_transport: dict[str, Any] | None = None
@@ -742,6 +746,10 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in L1 history view for plugins that consume ``conversation_view``
+    # (Qwen3-Omni): user turns before the N most recent user runs drop their
+    # audio and image parts there. ``None`` leaves every prompt unchanged.
+    context_keep_media_turns: int | None = None
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
@@ -758,6 +766,12 @@ class DuplexSessionRuntimeConfig:
             or self.max_sessions_per_replica < 1
         ):
             raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.context_keep_media_turns is not None and (
+            isinstance(self.context_keep_media_turns, bool)
+            or not isinstance(self.context_keep_media_turns, int)
+            or self.context_keep_media_turns < 0
+        ):
+            raise ValueError("duplex_session.context_keep_media_turns must be an integer >= 0 or null")
         if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
             raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
         if self.replica_groups is not None:
@@ -857,6 +871,7 @@ class DeployConfig:
 
     # Async chunk's default depends on whether or not the pipeline supports it.
     async_chunk: bool | None = None
+    weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
@@ -1123,6 +1138,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     # TODO (Alex): Clean this up, we should not have fallback values here
     kwargs: dict[str, Any] = {
         "speech_cache": SpeechCacheConfig(**speech_cache),
+        "weight_sharing": parse_weight_sharing(raw_dict.get("weight_sharing")),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
