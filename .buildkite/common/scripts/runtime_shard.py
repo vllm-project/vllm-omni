@@ -42,7 +42,7 @@ import shlex
 from pathlib import Path
 from typing import Any, NamedTuple
 
-MAX_AUTOMATIC_SHARDS = 4
+MAX_AUTOMATIC_SHARDS = 5
 # File seconds stop at each test. Checkout, collection, and startup still run
 # inside ``timeout_in_minutes``, so packing uses only this fraction of it.
 FILE_TIME_BUDGET_RATIO = 0.8
