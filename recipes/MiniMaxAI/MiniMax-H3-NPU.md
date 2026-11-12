@@ -663,3 +663,43 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Schedule the same native spatial tiles across temporal chunk boundaries before replaying them into the unchanged native spatial blend/crop. The original checkpoint lacks the private component-group marker assumed by the initial PR: check native decoder capabilities instead. Use a request-owned padded all-gather that supports empty local tails and restores round-robin global task order, without depending on private checkpoint gather code. Keep state restoration and unsupported-boundary fallback. Add original-checkpoint and real Gloo empty-tail regression coverage, model-control inventory and a portable benchmark.
+
+```bash
+# MAIN and CANDIDATE are the source checkouts; MODEL is the Ref2VA task partition.
+# LATENTS contains torch.save((video_z, audio_z)); use the same nightly software/driver.
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
+H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=0 H3_VAE_OPERATOR_FIR_C16_INSTALL=0 \
+H3_VAE_OPERATOR_FIR_C16=0 H3_VIDEO_DECODER_CROSS_CHUNK=0 H3_COMPONENT_CACHE_REUSE=0 \
+PYTHONPATH="$MAIN" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm baseline --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir baseline-results --warmups 3 --formals 5 --precision
+H3_VIDEO_DECODER_CROSS_CHUNK=1 H3_VIDEO_DECODER_TILE_BATCHING=1 H3_VIDEO_DECODER_TILE_BATCH_SIZE=4 PYTHONPATH="$CANDIDATE" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm candidate --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir candidate-results --warmups 3 --formals 5 --precision
+python3 -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_vae_cross_chunk_tiling.py tests/config/test_environment_variables.py
+```
+
+Measured scope: **resident Video VAE decode, max of eight ranks**.
+
+| Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
+| --- | ---: | ---: | --- |
+| main | 4.060742 ± 0.005288 | 4.054639–4.066834 | 4.055762, 4.065722 |
+| PR | 3.635241 ± 0.488651 | 3.405175–4.710818 | 3.405630, 3.864852 |
+
+Latency reduction: **10.478%**; speedup: **1.117049x** (main mean / PR mean).
+
+Main samples (s): 4.056119, 4.056571, 4.055717, 4.054639, 4.055761, 4.065229, 4.065630, 4.066834, 4.065504, 4.065413.
+
+PR samples (s): 3.406290, 3.406074, 3.405378, 3.405231, 3.405175, 3.407478, 3.407080, 3.406996, 4.391890, 4.710818.
+
+Peak device memory in the accepted repeat (max rank/request, allocated / reserved GiB): main 14.801 / 16.180; PR 16.208 / 17.514.
+
+Full normalized Float32 video: RMSE 4.304842522e-05, max absolute difference 0.001710668206. Canonical RGB24 and ordinary decode RGB: maximum difference 1, PSNR 71.478381 dB. Audio PCM is bit-exact. Video is **not bit-exact**. These values pass the engineering gates declared before candidate runs (video RMSE <= 0.002, max <= 0.02, RGB PSNR >= 50 dB and max difference <= 3); they are numeric validation on this fixed input, not a subjective or general quality guarantee.
+
+The actual default-codec MP4 capture is decoded and measured separately: H.264 RGB PSNR 41.718081 dB, max channel difference 39; AAC-decoded PCM is bit-exact (including codec padding). These H.264 differences are not treated as isolated patch error: encoding the SAME saved immutable RGB/PCM twice through the unchanged main encoder produces different decoded RGB hashes, and setting threads=1 did not remove this reference variability. The predeclared precision acceptance uses the complete PRE-CODEC tensors above; encoded MP4 bit equality is not claimed. Both the repeatability diagnostic and all per-arm MP4 differences are retained.
+
+The result measures decoder work on eight 910B4-1 NPUs using the nightly image software stack (CANN 9.2.1), main `b7bbfbdb4f2b3c070d9632043ea6cd2b1c601270`, original Ref2VA weights and identical captured latents. Each of two launches uses three warmups and five formal samples. It excludes conditioning/DiT and HTTP latency.

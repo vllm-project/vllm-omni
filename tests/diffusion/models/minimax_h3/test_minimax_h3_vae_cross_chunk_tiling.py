@@ -7,6 +7,8 @@ import types
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 
 from vllm_omni.diffusion.models.minimax_h3 import vae_reshape as reshape_module
@@ -103,7 +105,8 @@ def test_install_is_a_noop_when_disabled(monkeypatch):
     adapter = _FakeAdapter()
     original = adapter.decode_latent
     reshape_module.install_cross_chunk_tiling(adapter)
-    assert adapter.decode_latent is original
+    assert getattr(adapter.decode_latent, "__func__") is getattr(original, "__func__")
+    assert getattr(adapter.decode_latent, "__self__") is getattr(original, "__self__")
     assert getattr(adapter, "_h3_vae_reshape_installed", False) is False
 
 
@@ -115,7 +118,7 @@ def test_install_wraps_entrypoints_and_completes_the_native_plan(monkeypatch):
     original_latent = adapter.decode_latent
     original_chunks = adapter.decode_with_chunks
     reshape_module.install_cross_chunk_tiling(adapter)
-    assert adapter._h3_vae_reshape_installed is True
+    assert getattr(adapter, "_h3_vae_reshape_installed") is True
     assert adapter.decode_latent is not original_latent
     assert adapter.decode_with_chunks is not original_chunks
 
@@ -143,7 +146,7 @@ def test_decode_with_chunks_uses_the_same_scheduler(monkeypatch):
     adapter = _FakeAdapter()
     reshape_module.install_cross_chunk_tiling(adapter)
     latent = torch.arange(1, 65, dtype=torch.float32).reshape(1, 1, 4, 4, 4)
-    received = []
+    received: list[torch.Tensor] = []
     adapter.decode_with_chunks(latent, on_chunk=received.append)
     assert len(received) == 1
     torch.testing.assert_close(received[0], torch.tensor(_expected_tile_sums(latent)))
@@ -169,3 +172,28 @@ def test_wrong_clip_length_is_rejected(monkeypatch):
     pool = reshape_module._TilePool(adapter, torch.zeros(1, 1, 4, 4, 4), all_outputs=False)
     with pytest.raises(RuntimeError, match="native temporal plan"):
         pool.decode_chunk(torch.zeros(1, 1, 1, 4, 4))
+
+
+def test_original_checkpoint_does_not_need_a_private_component_marker():
+    adapter = _FakeAdapter()
+    del adapter.model._h3_component_group_supported
+    assert reshape_module._supported(adapter.model, torch.zeros(1, 1, 4, 4, 4))
+
+
+def _gather_worker(rank, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        adapter = _FakeAdapter()
+        pool = reshape_module._TilePool(adapter, torch.zeros(1, 1, 4, 4, 4), all_outputs=True)
+        pool.state = {"sp_process_group": dist.group.WORLD}
+        pool.rank, pool.size = rank, 2
+        for count in (1, 2, 3, 4, 7, 8):
+            outputs = [torch.full((1,), float(item), dtype=torch.float64) for item in range(rank, count, 2)]
+            gathered = pool._gather(outputs, count)
+            torch.testing.assert_close(torch.cat(gathered), torch.arange(count, dtype=torch.float64), atol=0, rtol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gather_restores_round_robin_order_with_empty_tail_ranks(tmp_path):
+    mp.spawn(_gather_worker, args=(f"file://{tmp_path / 'gather-store'}",), nprocs=2, join=True)
