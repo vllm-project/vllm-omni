@@ -1070,7 +1070,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if "speaker_embedding" not in tensors:
                 logger.warning("Key 'speaker_embedding' missing in %s", file_path)
                 return None
-            return tensors["speaker_embedding"].squeeze().tolist()
+            embedding = tensors["speaker_embedding"].squeeze()
+            # Uploads now reject non-finite values, but a file stored before that
+            # check (for example 1e39, which became Inf in float32) is still on disk.
+            if not bool(torch.isfinite(embedding).all()):
+                logger.warning("Stored 'speaker_embedding' for voice %s is not finite: %s", voice_name, file_path)
+                return None
+            return embedding.tolist()
         except Exception as e:
             logger.error("Could not load embedding for voice %s: %s", voice_name, e)
             return None
