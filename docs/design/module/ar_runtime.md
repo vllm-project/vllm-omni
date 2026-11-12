@@ -32,6 +32,13 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
+because their replay returns that tree directly to model postprocessing.
+FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
+native graph buffers; FULL replay restores the tree before postprocessing.
+Both paths therefore publish the same named hidden-state fields to prefix
+caching and downstream stages.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
