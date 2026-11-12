@@ -1644,6 +1644,44 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+@pytest.mark.parametrize("kv_isolate", [False, True])
+def test_packed_attention_sdpa_without_visual_references_preserves_padding(kv_isolate):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+    from vllm_omni.diffusion.models.minimax_h3.reference_isolation import MiniMaxH3ReferenceIsolation
+
+    attention = _fake_packed_attention("SDPA")
+    query = torch.zeros(8, 2, 4)
+    value = torch.ones_like(query)
+    value[5:] = 0
+    isolation = (
+        MiniMaxH3ReferenceIsolation(
+            torch.empty(0, dtype=torch.long),
+            sequence_rows=8,
+            used_rows=5,
+            condition_timestep=0.999,
+            device=query.device,
+        )
+        if kv_isolate
+        else None
+    )
+    attention._run_packed_attention(
+        query,
+        query,
+        value,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+        reference_isolation=isolation,
+    )
+    # Exercise CUDA's mask-consuming entry point with portable CPU tensors.
+    impl = SDPAImpl(num_heads=2, head_size=4, softmax_scale=0.5)
+    metadata = attention.attention.metadata
+    output = impl.forward_cuda(query[None], query[None], value[None], metadata)
+    torch.testing.assert_close(output[0, :5], torch.ones_like(query[:5]))
+    assert metadata.packed_padding is None
+    assert metadata.attn_mask.tolist() == [[True, True, True, True, True, False, False, False]]
+
+
 def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
     attention = _fake_packed_attention("CUDNN_ATTN")
     attention.attention.use_ring = True

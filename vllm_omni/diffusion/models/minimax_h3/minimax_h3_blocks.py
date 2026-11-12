@@ -410,7 +410,7 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                reference_isolation is not None
+                (reference_isolation is not None and reference_isolation.reference_rows > 0)
                 or backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
