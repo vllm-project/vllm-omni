@@ -2410,6 +2410,9 @@ class OrchestratorBase:
         model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
 
         if isinstance(raw_prompt, dict):
+            raw_buffer = raw_prompt.get("model_intermediate_buffer")
+            if model_intermediate_buffer is None and isinstance(raw_buffer, dict):
+                model_intermediate_buffer = raw_buffer
             if prompt_embeds is None:
                 raw_prompt_embeds = raw_prompt.get("prompt_embeds")
                 if isinstance(raw_prompt_embeds, torch.Tensor):
