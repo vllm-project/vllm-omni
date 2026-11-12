@@ -9,21 +9,25 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 3
+      parallelism: 5
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 90
+      artifact_paths:
+        - "artifacts/amd-cpu-suites/**/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
+        # Match the four-CPU pod quota instead of the host-visible CPU count.
+        - export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         - >-
-          pytest -sv tests/model_executor
+          python -u .buildkite/amd/scripts/run_cpu_suite.py
+          --timing-profile=.buildkite/amd/cpu-timings/model-executor-v1.json
+          model-executor -sv tests/model_executor
           -m 'core_model and cpu and not omni'
           --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
-          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
-          --shard-id=$$BUILDKITE_PARALLEL_JOB
 
     - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
@@ -47,7 +51,7 @@ steps:
       grade: Blocking
       timeout_in_minutes: 60
       artifact_paths:
-        - "artifacts/amd-diffusion-cpu-shards/*.xml"
+        - "artifacts/amd-cpu-suites/**/*"
       # Buildkite's status-based rule cannot prove every exit 134 is a GPU hang.
       # It retries 134 once; the Kubernetes job retry starts a fresh pod.
       # Assertions (1), timeouts (124), and OOMs (137) remain non-retryable.
@@ -57,8 +61,8 @@ steps:
             limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        - export DIFFUSION_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-cpu-shards"
-        - mkdir -p "$$DIFFUSION_CPU_ARTIFACT_DIR"
+        # Two gloo ranks each use two CPU threads within the four-CPU quota.
+        - export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
@@ -66,7 +70,9 @@ steps:
         # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
         # the same suite mandatorily, and AMD covers it non-blocking in nightly.
         - >-
-          pytest -sv tests/diffusion
+          python -u .buildkite/amd/scripts/run_cpu_suite.py
+          --timing-profile=.buildkite/amd/cpu-timings/diffusion-v1.json
+          diffusion -sv tests/diffusion
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
           --ignore=tests/diffusion/models/pi05/test_pi05_units.py
@@ -76,10 +82,6 @@ steps:
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
-          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
-          --shard-id=$$BUILDKITE_PARALLEL_JOB
-          --durations=50
-          --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
 
     # Hash sharding put these six CPU cases on shard 2/5. Main builds 13600 and
     # 13615 spent about 15 and 23 minutes on them. A separate job keeps that
@@ -91,7 +93,7 @@ steps:
       grade: Blocking
       timeout_in_minutes: 40
       artifact_paths:
-        - "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+        - "artifacts/amd-cpu-suites/**/*"
       # Same exit-134 retry as the five-way shards. Buildkite cannot prove
       # every 134 is a GPU hang. Assertions (1), timeouts (124), and OOMs
       # (137) remain non-retryable.
@@ -101,10 +103,10 @@ steps:
             limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        - export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"
-        - mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"
+        # Two gloo ranks each use two CPU threads within the four-CPU quota.
+        - export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
         - >-
-          pytest -sv
+          python -u .buildkite/amd/scripts/run_cpu_suite.py diffusion -sv
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
           'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
@@ -112,8 +114,6 @@ steps:
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
           'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-          --durations=20
-          --junitxml="$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1
@@ -137,16 +137,19 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
 
-    - label: "Simple · Other Test"
+    - label: "Simple · Other Test · Shard %N/%t"
       agent_pool: mi300_1
+      parallelism: 2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      artifact_paths:
+        - "artifacts/amd-cpu-suites/**/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - "python -u .buildkite/amd/scripts/run_cpu_suite.py --timing-profile=.buildkite/amd/cpu-timings/other-v1.json other -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --ignore=tests/diffusion/cache/test_teacache_extractors.py"
 
 - label: "Custom Pipeline Test"
   agent_pool: mi300_1
@@ -320,10 +323,10 @@ steps:
         - |
           timeout --signal=TERM --kill-after=1m 30m bash <<'PAUSE_KEEP_READY'
           set -euo pipefail
-          # Cold AITER JIT can consume the default 600-second DLO wave budget
-          # before the first execute_model returns. Keep AITER enabled while
-          # leaving the 30-minute command as the outer bound.
-          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900
+          # Cold AITER JIT has exceeded 900 seconds before the first
+          # execute_model returns. Keep AITER enabled, give the compile a
+          # 20-minute wave budget, and retain the 30-minute outer fail-close.
+          export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200
           nodes=(
             "tests/diffusion/distributed/test_pause_keep_two_ranks.py::test_keep_pause_two_ranks_ack_and_rank_failure"
           )
@@ -421,6 +424,64 @@ steps:
             --run-level "core_model"
           WAN22_READY
 
+    # Eight-prompt batch at core_model. SDPA only; nightly keeps the AITER smoke.
+    - label: "READY · Qwen-Image Batch"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 60
+      artifact_paths:
+        - artifacts/rocm-qwen-image-batch-ready/**/*
+      commands:
+        - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+        - export QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-batch-ready"
+        - mkdir -p "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          node='tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]'
+          pytest --collect-only -q "$$node" \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
+            --run-level core_model \
+            > "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/collection.txt"
+          count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+            "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != 1 ]]; then
+            echo "Expected exactly one Qwen-Image READY batch node, found $$count." >&2
+            cat "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/collection.txt" >&2
+            exit 5
+          fi
+        - |
+          status=0
+          timeout --signal=TERM --kill-after=2m 45m \
+            pytest -s -v -ra \
+            'tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
+            --run-level core_model \
+            --junitxml="$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/pytest.xml" \
+            || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 1 or skipped != 0:
+              print(
+                  f"Expected exactly one executed Qwen-Image READY batch test; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
     - label: "ROCm · Diffusion Device-Reduction GPU Test"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -496,7 +557,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # Keep this broad integration/determinism matrix on the reference
       # backend. Existing READY diffusion jobs cover the ROCm default/AITER
       # path without making two cold JIT builds dominate this serial lane.
@@ -554,6 +615,28 @@ steps:
             -m "core_model and diffusion and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --junitxml="$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml"
+          # Pytest includes subtests in the suite total; compare the parent node ids.
+          python -c 'import sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          from pathlib import Path
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          expected = Counter()
+          for node in Path(sys.argv[2]).read_text().splitlines():
+              module, name = node.split("::", 1)
+              expected[(module.removesuffix(".py").replace("/", "."), name)] += 1
+          actual = Counter((case.get("classname"), case.get("name")) for case in root.iter("testcase"))
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          bad_results = any(int(suite.get(key, "0")) != 0
+                            for suite in suites for key in ("skipped", "failures", "errors"))
+          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("skipped", "failure", "error"))
+          if actual != expected or bad_results:
+              print("Expected every pinned tiny-diffusion READY node to execute without skips or failures; "
+                    f"missing={expected - actual}, unexpected={actual - expected}, bad_results={bad_results}",
+                    file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml" /tmp/tiny-diffusion-base-ready-expected.txt
           TINY_DIFFUSION_BASE_READY
 
 
@@ -590,11 +673,12 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # Shard 0 checks the full 1416-node set. The other shards skip that
-    # collection and run their pytest slice immediately.
+    # Shard 0 checks the full 1424-node set. The other shards skip that
+    # collection and run their pytest slice immediately. CUDA READY runs the
+    # same guard when tests/model_executor/ or this file changes.
     - |
       if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
-        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1416 \
+        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1424 \
           tests/model_executor/ \
           -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
           --run-level "core_model"
@@ -718,6 +802,9 @@ steps:
       nodes=(
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]"
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape0]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape1]"
+            "tests/worker/test_batched_omni_output.py::test_equal_shape_async_snapshot_survives_source_reuse[shape2]"
             "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets0]"
             "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets1]"
             "tests/worker/test_batched_omni_output.py::test_mixed_stop_flags_do_not_synchronize_cuda"
@@ -760,7 +847,7 @@ steps:
         | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
         | sort > /tmp/worker-ready-collected.txt
       if ! diff -u /tmp/worker-ready-expected.txt /tmp/worker-ready-collected.txt; then
-        echo "One-card worker READY collection drifted from the 32 MI325 nodes" >&2
+        echo "One-card worker READY collection drifted from the 35 MI325 nodes" >&2
         exit 1
       fi
       WORKER_READY
@@ -775,7 +862,7 @@ steps:
         --run-level "core_model" \
         --junitxml="$$WORKER_READY_ARTIFACT_DIR/pytest.xml" || status=$$?
       if [[ "$$status" -eq 0 ]]; then
-        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 32 and skipped == 0; print(f"Expected exactly 32 executed one-card worker GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
+        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 35 and skipped == 0; print(f"Expected exactly 35 executed one-card worker GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
         then
           status=0
         else
@@ -848,7 +935,7 @@ steps:
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 30
   env:
     VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -862,8 +949,8 @@ steps:
     - >-
       ps -eo pid=,ppid=,lstart=,stat=,comm= >
       "$$R2_02_ARTIFACT_DIR/processes-before.txt"
-    # The preflight prevents marker drift; verbose output and JUnit retain the
-    # selected node IDs from the GPU run.
+    # The preflight prevents marker drift. Collection is not execution:
+    # the run below fails when JUnit is not exactly three tests and zero skips.
     # The inner timeout leaves five minutes for teardown verification and
     # artifact generation before the Buildkite step timeout.
     - >-
@@ -872,20 +959,49 @@ steps:
       -m 'core_model and rocm and MI325 and not nvidia_only and not
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
       --run-level "core_model"
-    - >-
-      timeout --signal=TERM --kill-after=1m 25m
-      pytest -s -v -ra
-      tests/entrypoints/
-      -m 'core_model and rocm and MI325 and not nvidia_only and not
-      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-      --run-level "core_model"
-      --durations=0
-      --junitxml="$$R2_02_ARTIFACT_DIR/pytest.xml"
-      2>&1 | tee "$$R2_02_ARTIFACT_DIR/pytest.log"
-    - >-
-      tail -n 100 "$$R2_02_ARTIFACT_DIR/pytest.log" >
-      "$$R2_02_ARTIFACT_DIR/pytest-summary.txt"
     - |
+      if (
+        trap - ERR
+        set +e
+        timeout --signal=TERM --kill-after=1m 25m \
+          pytest -s -v -ra \
+          tests/entrypoints/ \
+          -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
+          --run-level "core_model" \
+          --durations=0 \
+          --junitxml="$$R2_02_ARTIFACT_DIR/pytest.xml" \
+          2>&1 | tee "$$R2_02_ARTIFACT_DIR/pytest.log"
+        exit "$${PIPESTATUS[0]}"
+      ); then
+        status=0
+      else
+        status=$$?
+      fi
+      tail -n 100 "$$R2_02_ARTIFACT_DIR/pytest.log" > \
+        "$$R2_02_ARTIFACT_DIR/pytest-summary.txt"
+      if [[ "$$status" -eq 0 ]]; then
+        if python -c 'import sys, xml.etree.ElementTree as ET
+      root = ET.parse(sys.argv[1]).getroot()
+      suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+      tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+      skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+      if tests != 3 or skipped != 0:
+          print(
+              f"Expected exactly 3 executed entrypoint GPU tests; "
+              f"reported tests={tests}, skipped={skipped}.",
+              file=sys.stderr,
+          )
+          raise SystemExit(5)
+      ' "$$R2_02_ARTIFACT_DIR/pytest.xml"
+        then
+          status=0
+        else
+          status=$$?
+        fi
+      fi
+      (exit "$$status")
+    - |
+      set -o pipefail
       sleep 5
       ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$R2_02_ARTIFACT_DIR/processes-after.txt"
       # Compare PID plus process start time so PID reuse cannot hide a leak.
@@ -919,7 +1035,7 @@ steps:
   agent_pool: mi300_2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   timeout_in_minutes: 25
   artifact_paths:
     - artifacts/rocm-qwen3-omni-ready/**/*
@@ -936,11 +1052,8 @@ steps:
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_audio_output[default]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]"
         "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]"
-        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]"
       )
       printf '%s\n' "$${nodes[@]}" | sort > /tmp/qwen3-omni-ready-expected.txt
       pytest -q tests/e2e/online_serving/test_qwen3_omni.py \
@@ -951,7 +1064,7 @@ steps:
         | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
         | sort > /tmp/qwen3-omni-ready-collected.txt
       if ! diff -u /tmp/qwen3-omni-ready-expected.txt /tmp/qwen3-omni-ready-collected.txt; then
-        echo "Qwen3-Omni READY collection drifted from the 11 core_model nodes" >&2
+        echo "Qwen3-Omni READY collection drifted from the 8 core_model nodes" >&2
         exit 1
       fi
     - |
@@ -979,9 +1092,9 @@ steps:
       suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
       tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
       skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-      if tests != 11 or skipped != 0:
+      if tests != 8 or skipped != 0:
           print(
-              f"Expected exactly 11 executed Qwen3-Omni READY tests; "
+              f"Expected exactly 8 executed Qwen3-Omni READY tests; "
               f"reported tests={tests}, skipped={skipped}.",
               file=sys.stderr,
           )
@@ -1131,7 +1244,7 @@ steps:
           marker="core_model and omni and rocm and MI325 and cards_1"
           pytest --collect-only -q "$${nodes[@]}" \
             --shard-id=0 --num-shards=1 \
-            -m "$$marker" --run-level core_model \
+            -m "$$marker" --run-level advanced_model \
             > "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"
           count=$$(awk '/::/ { n++ } END { print n + 0 }' \
             "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt")
@@ -1155,10 +1268,79 @@ steps:
           timeout --signal=TERM --kill-after=1m 35m \
             pytest -s -v "$${nodes[@]}" \
             --shard-id=0 --num-shards=1 \
-            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level advanced_model \
             --junitxml="$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
           if [[ "$$status" -eq 0 ]]; then
             if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    - label: "ROCm · MiniCPM-o 4.5 V1 Fallback Duplex Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 45
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-v1-fallback-duplex/**/*
+      commands:
+        - export ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-v1-fallback-duplex"
+        - mkdir -p "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR"
+        # The shared deploy profile is MRv2 on CUDA but deliberately resolves
+        # every stage to V1 on ROCm. Prove that production resolver contract in
+        # the same hardware job before running the five real-weight cases.
+        - >-
+          pytest -q
+          'tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py::test_duplex_mrv2_profile_keeps_non_cuda_on_v1[rocm]'
+          --run-level core_model
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"
+          )
+          marker="advanced_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level advanced_model \
+            > "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o ROCm V1 fallback duplex nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o ROCm V1 fallback duplex node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 35m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "advanced_model and omni and rocm and MI325 and cards_1" --run-level advanced_model \
+            --junitxml="$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 5 and skipped == 0; print(f"Expected exactly five executed MiniCPM-o ROCm V1 fallback duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR/pytest.xml"
             then
               status=0
             else
@@ -1228,7 +1410,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 40
       artifact_paths:
         - "artifacts/rocm-drama3-ready/**/*"
@@ -1242,8 +1424,10 @@ steps:
             "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-ready-expected.txt
-          pytest -q tests/e2e/online_serving/test_drama_3.py \
-            -m "core_model and tts and rocm and MI325 and cards_1" \
+          # Select by node id: every Drama 3 case now shares ``slow``, so a
+          # file-level ``-m slow`` collect would also pull voice-clone nodes.
+          pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --collect-only \
             | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
@@ -1252,8 +1436,8 @@ steps:
             echo "Drama 3 READY collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
-            -m "core_model and tts and rocm and MI325 and cards_1" \
+          pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --junitxml="$$DRAMA3_READY_ARTIFACT_DIR/pytest.xml"
           DRAMA3_READY
@@ -1262,18 +1446,23 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # The step is 40 minutes. The command leaves ten minutes for preflight.
       # Cold AITER MHA JIT varied from 911s to 1211s in READY qualification,
       # consuming most of the command before VeRL generation began. Keep this
       # focused integration/cleanup smoke bounded; dedicated READY jobs cover
       # the AITER backend itself.
       timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/rocm-verl-generate/**/*"
       commands:
         - |
-          timeout --signal=TERM --kill-after=1m 30m bash <<'VERL_GENERATE_READY'
           set -euo pipefail
           export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+          export ROCM_VERL_GENERATE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-verl-generate"
+          mkdir -p "$$ROCM_VERL_GENERATE_ARTIFACT_DIR"
+          bash <<'VERL_GENERATE_READY'
+          set -euo pipefail
           nodes=(
             "tests/e2e/features/rlhf_test/test_verl_omni_e2e.py::test_generate"
           )
@@ -1288,10 +1477,23 @@ steps:
             echo "VeRL-Omni READY collection drifted from test_generate" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py \
-            -m "core_model and diffusion and rocm and MI325 and cards_1" \
-            --run-level "core_model"
           VERL_GENERATE_READY
+        - |
+          status=0
+          timeout --signal=TERM --kill-after=1m 30m \
+            pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --junitxml="$$ROCM_VERL_GENERATE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 1 and skipped == 0; print(f"Expected exactly one executed VeRL-Omni generate test; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_VERL_GENERATE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

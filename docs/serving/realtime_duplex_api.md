@@ -285,6 +285,32 @@ stops retaining output PCM for calibration. Broader language, boundary and
 sustained-load validation is still needed before enabling either strategy by
 default.
 
+## Qwen3-Omni L1 history views
+
+The deployment setting `duplex_session.context_keep_media_turns` opts the
+Qwen3-Omni Thinker (stage 0) into L1 history views. Its default, `null`, preserves
+the existing prompt construction. Set a nonnegative integer in the deployment
+configuration, for example:
+
+```yaml
+duplex_session:
+  context_keep_media_turns: 2
+```
+
+This keeps the two most recent user runs verbatim. Eligible older user messages
+use their text and available transcripts instead of resubmitting audio and image
+parts. Consecutive user messages form one run. Setting `0` makes all older runs
+eligible, while the Qwen consumer still protects the current input's media,
+including during tool continuations. If dropping media would empty a whole user
+run, that run is kept unchanged.
+
+Lower values trade older media access for text-only context. This does not add
+ASR, create captions or preserve an old image's meaning without an existing text
+representation. The setting changes the Thinker's prompt view, not authoritative
+history; it does not bound total session memory. The existing 16-message prompt
+window, retained-audio slot count and byte limits remain in effect. Clients
+cannot override this deployment-owned policy through session updates.
+
 ## JoyAI visual and conversation memory
 
 JoyAI keeps three levels of visual memory: accepted observation frames, summaries
@@ -382,11 +408,11 @@ backlog remains in the session ledger for successive summary requests to process
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
-unplayed generated speech or retained image/audio payloads. With JoyAI's current
-all-sync audio output, the assistant transcript becomes eligible only after the
-complete audio has been acknowledged. Playback corrections and conversation
-edits invalidate summaries derived from the changed text; newer appended turns
-can coexist with consolidation of an unchanged older prefix.
+unplayed generated speech or retained image/audio payloads. A JoyAI assistant
+transcript becomes eligible only after its complete audio has been acknowledged.
+Playback corrections and conversation edits invalidate summaries derived from
+the changed text; newer appended turns can coexist with consolidation of an
+unchanged older prefix.
 
 The text summary and model-input context are bounded; the underlying Session
 conversation ledger retains its source items. Visual facts can also enter the
@@ -518,9 +544,12 @@ record rejection and retry counts when measuring service capacity.
 
 PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
 positive frame count to enable it. Frontends with nonzero admission budgets
-then warm their owned groups locally and gate their own duplex connections
-until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
-before being admitted, as in single-frontend mode.
+then warm their owned groups locally. Native duplex endpoints accept the
+WebSocket transport immediately, then hold session configuration and engine
+admission until warmup completes; clients wait at most
+`DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s) before session admission, as in
+single-frontend mode. The warmup wait does not consume the WebSocket opening
+handshake deadline.
 `/health` retains the engine-health check; it is not an
 all-frontend warmup barrier, and a 200 response does not mean that the accepting
 frontend has free admission slots.
@@ -893,7 +922,7 @@ through a `DuplexSessionHandle`.
 
 ```python
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit
-from vllm_omni.engine.duplex.events import AudioDelta, SessionClosed
+from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 omni = DuplexOmni(model="openbmb/MiniCPM-o-4_5", trust_remote_code=True)
