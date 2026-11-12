@@ -749,3 +749,123 @@ def test_small_timestep_classes_match_dense_unique(times, locked_audio):
         branch.audio_condition_positions.untyped_storage().data_ptr()
         == branch.audio_pos_dev.untyped_storage().data_ptr()
     )
+
+
+def _timestep_layout_branch(interleaved: bool):
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+
+    if interleaved:
+        packed = {
+            "seq_len": torch.tensor(12),
+            "img_pos": torch.tensor([2, 4, 6, 8]),
+            "audio_pos": torch.tensor([3, 5, 7]),
+            "text_pos": torch.tensor([0, 1]),
+            "update_mask": torch.tensor([False, True, False, True]),
+            "audio_update_mask": torch.tensor([True, False, True]),
+            "cu_seqlens": torch.tensor([0, 9, 12], dtype=torch.int32),
+            "img_position_ids": torch.zeros(12, 3, dtype=torch.long),
+            "latent_grid": torch.tensor([1, 1, 4]),
+            "video_row_start": torch.tensor(2),
+            "token_tags": torch.zeros(12, dtype=torch.long),
+        }
+    else:
+        packed = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=2,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=4,
+            ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}, {"kind": "audio", "ref_audio_t": 2}],
+        )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, _HIDDEN),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    return branch, packed
+
+
+@pytest.mark.parametrize("reverse_requests", [False, True])
+@pytest.mark.parametrize("edit_targets", [False, True])
+def test_batched_timestep_classes_preserve_mixed_condition_layouts(reverse_requests, edit_targets):
+    from vllm_omni.diffusion.models.minimax_h3.batched_packing import minimax_h3_batched_forward_kwargs
+
+    pairs = [_timestep_layout_branch(False), _timestep_layout_branch(True)]
+    if reverse_requests:
+        pairs.reverse()
+    branches = [branch for branch, _ in pairs]
+    branches[1].locked_audio_rows = torch.zeros(int(branches[1].audio_update_mask.sum()), 32)
+    video = [torch.arange(len(b.img_pos) * 96).reshape(-1, 96).float() / 100 for b in branches]
+    audio = [torch.arange(len(b.audio_pos) * 32).reshape(-1, 32).float() / 100 for b in branches]
+    # Reuse both cached layouts across steps with different schedules.
+    for video_times, audio_times in [([0.2, 0.7], [0.3, 0.8]), ([0.9, 0.1], [0.6, 0.4])]:
+        video_edits = [torch.linspace(0.15, 0.85, int(b.update_mask.sum())) if edit_targets else None for b in branches]
+        audio_edits = [
+            torch.linspace(0.25, 0.75, int(b.audio_update_mask.sum())) if edit_targets else None for b in branches
+        ]
+        expected_parts = []
+        independent = []
+        for index, (branch, packed) in enumerate(pairs):
+            expected = torch.full((branch.seq_len,), video_times[index])
+            expected[packed["img_pos"][~packed["update_mask"]]] = 0.999
+            expected[packed["img_pos"][packed["update_mask"]]] = (
+                video_edits[index] if edit_targets else video_times[index]
+            )
+            expected[packed["audio_pos"][~packed["audio_update_mask"]]] = 1.0
+            expected[packed["audio_pos"][packed["audio_update_mask"]]] = (
+                audio_edits[index] if edit_targets else (1.0 if index == 1 else audio_times[index])
+            )
+            expected_parts.append(expected)
+            independent.append(
+                branch.forward_kwargs(
+                    video_rows=video[index],
+                    audio_rows=audio[index],
+                    t_video=video_times[index],
+                    t_audio=audio_times[index],
+                    imgvid_cond_timestep=0.999,
+                    audio_ref_cond_timestep=1.0,
+                    video_target_timesteps=video_edits[index],
+                    audio_target_timesteps=audio_edits[index],
+                )
+            )
+        actual = minimax_h3_batched_forward_kwargs(
+            branches=branches,
+            video_rows=video,
+            audio_rows=audio,
+            t_video=video_times,
+            t_audio=audio_times,
+            imgvid_cond_timesteps=[0.999, 0.999],
+            audio_ref_cond_timesteps=[1.0, 1.0],
+            video_target_timesteps=video_edits,
+            audio_target_timesteps=audio_edits,
+        )
+        expected = torch.cat(expected_parts)
+        unique, inverse = torch.unique(expected, sorted=True, return_inverse=True)
+        assert torch.equal(actual["unique_timesteps"], unique)
+        assert torch.equal(actual["inverse_indices"], inverse)
+        assert torch.equal(actual["unique_timesteps"][actual["inverse_indices"]], expected)
+        assert actual["packed_seq_params"]["num_requests"] == 2
+        model = _SegmentMeanModel()
+        batched_video, batched_audio = model(**actual)
+        single_outputs = [model(**kwargs) for kwargs in independent]
+        torch.testing.assert_close(batched_video, torch.cat([out[0] for out in single_outputs]), rtol=0, atol=0)
+        torch.testing.assert_close(batched_audio, torch.cat([out[1] for out in single_outputs]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["t_video", "t_audio", "imgvid_cond_timestep", "audio_ref_cond_timestep"])
+def test_nonfinite_timestep_preparation_matches_dense_unique(field, nonfinite):
+    branch, packed = _timestep_layout_branch(False)
+    times = dict(t_video=0.3, t_audio=0.6, imgvid_cond_timestep=0.999, audio_ref_cond_timestep=1.0)
+    times[field] = nonfinite
+    expected = torch.full((branch.seq_len,), times["t_video"])
+    expected[packed["img_pos"][~packed["update_mask"]]] = times["imgvid_cond_timestep"]
+    expected[packed["audio_pos"][packed["audio_update_mask"]]] = times["t_audio"]
+    expected[packed["audio_pos"][~packed["audio_update_mask"]]] = times["audio_ref_cond_timestep"]
+    unique, inverse = torch.unique(expected, sorted=True, return_inverse=True)
+    actual_unique, actual_inverse = branch.prepare_timesteps(**times)
+    torch.testing.assert_close(actual_unique, unique, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(actual_inverse, inverse)
+    torch.testing.assert_close(actual_unique[actual_inverse], expected, rtol=0, atol=0, equal_nan=True)
