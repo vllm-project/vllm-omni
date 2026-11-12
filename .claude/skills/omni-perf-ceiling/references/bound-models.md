@@ -35,11 +35,19 @@ mean RTF      = mean_r(T_r / d_r)
 aggregate RTF = sum_r T_r / sum_r d_r
 ```
 
-In a closed loop with C requests actually in flight, Little's law gives
-`C = lambda * mean(T)` and `X = lambda * mean(d)`, hence
-`aggregate RTF = C / X`. Ramp-up, drain, failures and too few prompts break
-this approximation. The report checks the residual; a small residual checks
-population accounting, not the validity of the roofline model.
+Let `E_r` be full request E2EL, including trailing usage or transport completion
+after the last audio packet. In a closed loop with C requests actually in flight,
+Little's law gives `C = lambda * mean(E)` and `X = lambda * mean(d)`, hence
+`request_e2el_rtf = mean(E) / mean(d) = C / X`. The report checks this request
+occupancy ratio, separately from aggregate audio RTF. They coincide only when
+audio completion and request completion coincide. Ramp-up, drain, failures and
+too few prompts break the approximation; a small residual checks population
+accounting, not the validity of the roofline model.
+
+Aggregate audio RTF requires complete client `request_audio_metrics` containing
+matched `audio_latency_s` and `audio_duration_s` for every successful request.
+Legacy results or partial coverage leave it unavailable. Server stage snapshots
+and full E2EL cannot substitute for the last-audio clock.
 
 ## Per-stage calibrated work
 
@@ -153,8 +161,9 @@ a = (mean RTF - aggregate RTF) / (mean(1/d) - 1/mean(d))
 b = aggregate RTF - a / mean(d)
 ```
 
-The report retains this descriptive fit, skips nearly equal durations, and
-warns on negative coefficients or incomplete duration coverage. Positive
+The report retains this descriptive fit only with complete client audio timing
+coverage, uses both ratios from that same population, skips nearly equal
+durations, and warns on negative coefficients or missing coverage. Positive
 coefficients do not validate the model. Correlated request work and queueing
 can alter both coefficients; neither identifies a causal host/kernel split.
 

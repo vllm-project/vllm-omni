@@ -37,11 +37,14 @@ reference's (checkpoint dtype for decoders, fp32 for Token2wav) and
 ``--dtype NAME=DTYPE`` sets the deployment's compute mode and default decoder
 storage dtype (TF32/HF32 use FP32 storage). ``--weight-dtype`` and ``--kv-dtype``
 override decoder storage independently when it differs from computation.
+Code2Wav prompt setup needs ``--prompt-setup-per-request NAME=RATE`` to account
+for cache hits and setup sharing within batches; omission reports it unmodeled.
 """
 
 import argparse
 import importlib.util
 import json
+import math
 import sys
 import time
 import types
@@ -321,6 +324,11 @@ def emit_flags(result: dict, args: argparse.Namespace) -> list[str]:
             f"{d['dtype']},{k * d['streamed_gib_per_step']:.4g}"
         )
     for name, c in result["code2wav"].items():
+        if (setups := c["prompt_setup_per_request"]) is not None:
+            dtype = dtypes.get(f"{name}.flow", dtypes.get(name, c["dtype"]))
+            flags.append(
+                f"--fixed-bound {name}_prompt_setup@{c['stage'] or 0}={setups * c['prompt_setup_tflop']:.4g},{dtype}"
+            )
         for row, r in c["rows"].items():
             dtype = dtypes.get(f"{name}.{row}", dtypes.get(name, c["dtype"]))
             tag = f"{name}" if c["stage"] is None else f"{name}@{c['stage']}"
@@ -354,6 +362,13 @@ def main() -> int:
     parser.add_argument("--codec-hz", type=float, default=25.0, help="codec tokens per audio second of the codec")
     parser.add_argument("--n-timesteps", type=int, default=10, help="flow-matching steps per chunk")
     parser.add_argument("--prompt-audio-s", type=float, default=6.0, help="reference (speaker prompt) audio seconds")
+    parser.add_argument(
+        "--prompt-setup-per-request",
+        action="append",
+        default=[],
+        help="NAME=RATE effective prompt setup executions/request in [0,1], including cache and batch sharing; "
+        "0 explicitly assumes cache hits, 1 setup per request, omitted means unmodeled",
+    )
     parser.add_argument("--chunks", type=int, default=4, help="chunks streamed; the last is the steady state")
     parser.add_argument("--tokens-per-audio-s", action="append", default=[], help="NAME=X, from the result JSON")
     parser.add_argument("--mean-context", action="append", default=[], help="NAME=TOKENS for KV GiB per sequence")
@@ -374,6 +389,16 @@ def main() -> int:
     )
     parser.add_argument("--json", help="write the counts to this path")
     args = parser.parse_args()
+
+    try:
+        setup_rates = keyed(args.prompt_setup_per_request, float)
+    except ValueError:
+        parser.error("--prompt-setup-per-request requires NAME=RATE with a finite rate in [0,1]")
+    for name, rate in setup_rates.items():
+        if name != "code2wav" or not args.code2wav:
+            parser.error(f"--prompt-setup-per-request: unknown Code2Wav name {name!r}")
+        if not math.isfinite(rate) or not 0 <= rate <= 1:
+            parser.error("--prompt-setup-per-request rate must be finite and in [0,1]")
 
     for name in args.block_import:
         sys.modules[name] = None
@@ -414,7 +439,17 @@ def main() -> int:
         recipe, stage = name_stage(key)
         if recipe not in CODE2WAV_RECIPES:
             parser.error(f"unknown recipe {recipe!r}; known: {sorted(CODE2WAV_RECIPES)}")
-        result["code2wav"]["code2wav"] = {"stage": stage, **CODE2WAV_RECIPES[recipe](asset_dir, args)}
+        result["code2wav"]["code2wav"] = {
+            "stage": stage,
+            **CODE2WAV_RECIPES[recipe](asset_dir, args),
+            "prompt_setup_per_request": setup_rates.get("code2wav"),
+        }
+        if "code2wav" not in setup_rates:
+            print(
+                "WARNING code2wav: prompt setup is unmodeled; set --prompt-setup-per-request code2wav=RATE "
+                "from cache misses and batch sharing, or compare explicit 0/1 sensitivity scenarios.",
+                file=sys.stderr,
+            )
 
     print(json.dumps(result, indent=2))
     if flags := emit_flags(result, args):

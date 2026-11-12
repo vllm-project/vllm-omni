@@ -129,6 +129,7 @@ def run_report(
                 "mean_e2el_ms": 1000.0,
                 "mean_audio_rtf": 0.5,
                 "median_audio_rtf": 0.5,
+                "request_audio_metrics": [{"audio_duration_s": 2.0, "audio_latency_s": 1.0}],
             }
         )
     )
@@ -150,6 +151,49 @@ def run_report(
     proc = subprocess.run(args + ["--json", str(ledger)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     return json.loads(ledger.read_text())[0], proc.stdout
+
+
+@pytest.mark.parametrize("coverage", ["complete", "partial", "legacy", "invalid"])
+def test_audio_completion_scope_and_coverage(ceiling, tmp_path, coverage):
+    # T_audio = 1 + .5 * duration; the request remains open for another 2 s.
+    rows = [
+        {"audio_duration_s": 2.0, "audio_latency_s": 2.0},
+        {"audio_duration_s": 6.0, "audio_latency_s": 4.0},
+    ]
+    result = {
+        "max_concurrency": 1,
+        "completed": 2,
+        "failed": 0,
+        "duration": 10.0,
+        "audio_throughput": 0.8,
+        "mean_audio_duration_s": 4.0,
+        "mean_e2el_ms": 5000.0,
+        "mean_audio_rtf": (1 + 4 / 6) / 2,
+        "median_audio_rtf": (1 + 4 / 6) / 2,
+        # Old/partial stage snapshots must not supply the fit's population.
+        "request_stage_metrics": [{"2": {"audio_duration_s": 2.0}}, None],
+    }
+    if coverage != "legacy":
+        result["request_audio_metrics"] = rows
+    if coverage == "partial":
+        result["request_audio_metrics"] = [rows[0], None]
+    elif coverage == "invalid":
+        rows[1]["audio_latency_s"] = float("nan")
+    path = tmp_path / "audio.json"
+    path.write_text(json.dumps(result))
+    cell = ceiling.analyse_cell("audio", str(path), "AI Core(%)")
+    assert cell["request_e2el_rtf"] == pytest.approx(1.25)
+    assert cell["little_residual"] == pytest.approx(0)
+    if coverage == "complete":
+        assert cell["aggregate_rtf"] == pytest.approx(0.75)
+        assert cell["audio_coverage"] == 1
+        assert cell["measured_fixed_s"] == pytest.approx(1)
+        assert cell["measured_rate"] == pytest.approx(0.5)
+    else:
+        assert cell["aggregate_rtf"] is None
+        assert cell["audio_coverage"] == (0 if coverage == "legacy" else 0.5)
+        assert "measured_fixed_s" not in cell
+        assert "aggregate audio RTF unavailable" in ceiling.render([cell], [])
 
 
 def test_postprocessing_does_not_shift_utilisation_window(tmp_path: Path, backend: str) -> None:

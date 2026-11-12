@@ -17,7 +17,8 @@ The ledger is a queueing and work argument, not a CUDA one. These hold on any
 accelerator:
 
 - RTF definitions, and the gap between per-request mean and aggregate.
-- Little's law in a closed-loop bench: `aggregate RTF(C) = C / X`.
+- Little's law in a closed-loop bench: `mean(request E2EL) / mean(audio duration) = C / X`;
+  aggregate audio RTF excludes any request tail after the last audio packet.
 - Shared capacity accumulates demand per resource and takes the maximum;
   independent stage durations must not be summed. Serial stage constraints
   and path gates remain separate (see [bound-models.md](bound-models.md)).

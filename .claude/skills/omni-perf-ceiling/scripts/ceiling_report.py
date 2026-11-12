@@ -234,14 +234,16 @@ def percentile(result: dict, name: str, p: float) -> float | None:
     return None if value is None else float(value)
 
 
-def request_audio_durations(result: dict) -> list[float]:
-    """Per-request audio seconds from ``--save-detailed`` stage metrics."""
-    durations = []
-    for metrics in result.get("request_stage_metrics") or []:
-        audio_s = max((float(stage.get("audio_duration_s") or 0.0) for stage in (metrics or {}).values()), default=0.0)
-        if audio_s > 0:
-            durations.append(audio_s)
-    return durations
+def request_audio_timings(result: dict) -> list[tuple[float, float]]:
+    """Matched (audio seconds, last-audio latency) from client measurements."""
+    timings = []
+    for metrics in result.get("request_audio_metrics") or []:
+        if not metrics:
+            continue
+        duration, latency = metrics.get("audio_duration_s"), metrics.get("audio_latency_s")
+        if all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in (duration, latency)):
+            timings.append((duration, latency))
+    return timings
 
 
 def fixed_rate_split(mean_rtf: float, aggregate_rtf: float, mean_audio_s: float, durations: list[float]) -> dict:
@@ -283,17 +285,22 @@ def analyse_cell(name: str, spec: str, npu_column: str) -> dict:
         "mean_audio_ttfp_ms": float(result.get("mean_audio_ttfp_ms") or 0.0),
         "p50_audio_ttfp_ms": float(result.get("median_audio_ttfp_ms") or 0.0),
         "mean_audio_duration_s": mean_audio_s,
-        # Ratio of means; E2EL ends at the last audio packet for audio requests.
-        "aggregate_rtf": mean_e2el_s / mean_audio_s if mean_audio_s else None,
+        "aggregate_rtf": None,
+        # Request occupancy includes any tail after the last audio packet.
+        "request_e2el_rtf": mean_e2el_s / mean_audio_s if mean_audio_s else None,
         "little_rtf": concurrency / throughput if throughput else None,
     }
-    if cell["aggregate_rtf"] and cell["little_rtf"]:
-        cell["little_residual"] = cell["little_rtf"] / cell["aggregate_rtf"] - 1.0
-    if durations := request_audio_durations(result):
+    if cell["request_e2el_rtf"] and cell["little_rtf"]:
+        cell["little_residual"] = cell["little_rtf"] / cell["request_e2el_rtf"] - 1.0
+    timings = request_audio_timings(result)
+    cell["audio_coverage"] = len(timings) / max(1, int(result["completed"]))
+    if timings and len(timings) == int(result["completed"]):
+        durations = [d for d, _ in timings]
         cell["request_audio_s"] = durations
-        cell["audio_coverage"] = len(durations) / max(1, int(result["completed"]))
-        if cell["aggregate_rtf"]:
-            cell.update(fixed_rate_split(cell["mean_audio_rtf"], cell["aggregate_rtf"], mean_audio_s, durations))
+        cell["aggregate_rtf"] = sum(t for _, t in timings) / sum(durations)
+        # Fit both ratios on the same complete request population and clock.
+        mean_rtf = sum(t / d for d, t in timings) / len(timings)
+        cell.update(fixed_rate_split(mean_rtf, cell["aggregate_rtf"], sum(durations) / len(durations), durations))
 
     if len(parts) > 1 and parts[1]:
         stage_ms = parse_stage_times(Path(parts[1]))
@@ -632,15 +639,16 @@ def render_latency(cells: list[dict]) -> list[str]:
 
 def render(cells: list[dict], extra_warnings: list[str]) -> str:
     lines = [
-        "| Cell | C | Done/Fail | Mean RTF | P50 | P99 | Aggregate RTF | C/X | Little residual "
+        "| Cell | C | Done/Fail | Mean RTF | P50 | P99 | Aggregate RTF | Request E2EL/audio | C/X | Little residual "
         "| Audio X (s/s) | GPU busy | RTF if no idle | Aggregate RTF estimate | Estimate/measured | Mean RTF estimate "
         "| Mean estimate/measured |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in cells:
         lines.append(
             f"| {c['name']} | {c['concurrency']} | {c['completed']}/{c['failed']} | {fmt(c['mean_audio_rtf'])} "
             f"| {fmt(c['p50_audio_rtf'])} | {fmt(c['p99_audio_rtf'])} | {fmt(c['aggregate_rtf'])} "
+            f"| {fmt(c['request_e2el_rtf'])} "
             f"| {fmt(c['little_rtf'])} | {fmt(c.get('little_residual'), 3)} | {fmt(c['audio_throughput'], 2)} "
             f"| {fmt(c.get('gpu_busy_share'), 2)} | {fmt(c.get('rtf_floor_no_idle'))} | {fmt(c.get('rtf_bound'))} "
             f"| {fmt_pct(c.get('pct_of_sol'))} | {fmt(c.get('rtf_bound_mean'))} | {fmt_pct(c.get('pct_of_sol_mean'))} |"
@@ -814,10 +822,12 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
         if (c.get("pct_of_sol") or 0.0) > 1.05
     ]
     warnings += [
-        f"{c['name']}: only {c['audio_coverage']:.0%} of requests carry stage audio durations; "
-        "the fixed / per-audio split uses that subset"
+        f"{c['name']}: aggregate audio RTF unavailable: client audio timing coverage "
+        f"{c['audio_coverage']:.0%}; complete request_audio_metrics are required, "
+        "including for the fixed / rate split. "
+        "E2EL and stage durations are not substitutes"
         for c in cells
-        if c.get("audio_coverage", 1.0) < 0.9
+        if c["aggregate_rtf"] is None
     ]
     warnings += [
         f"{c['name']}: measured split gives a {c['measured_fixed_s'] * 1000:.0f} ms, b {c['measured_rate']:.3f}; "

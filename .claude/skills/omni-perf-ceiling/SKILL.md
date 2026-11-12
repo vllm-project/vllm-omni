@@ -43,9 +43,10 @@ Do not use one model for both. Derivations:
 - **Low concurrency**: account for serial stage work and the gates before
   each stage starts. Stage wall time includes upstream waits, so it does not
   establish exclusive kernel time or exclude scheduling overhead.
-- **High concurrency**: Little's law relates aggregate RTF to audio throughput
-  while concurrency is held. Accumulate shared demand per resource (memory
-  and each compute dtype), take the maximum, then combine with each stage's
+- **High concurrency**: Little's law relates full request E2EL/audio duration
+  to audio throughput while concurrency is held. Aggregate audio RTF ends at
+  the last audio packet and excludes any request tail. Accumulate shared demand
+  per resource (memory and each compute dtype), take the maximum, then combine with each stage's
   serial constraint. Do not sum durations of stages that can overlap via MPS
   or independent streams. Serial rows inside one stage may still be summed.
 
@@ -91,8 +92,9 @@ has no queueing term, so judge it at concurrency 1.
 4. **Build the ledger.** Run
    `python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py`
    on the result JSON and bench log of each cell. It checks Little's law,
-   derives aggregate RTF, per-stage time shares, GPU idle share, and the
-   implied throughput floor. A Little's-law mismatch above 10% means the run
+   derives aggregate audio RTF from complete client `request_audio_metrics`
+   (unavailable for legacy or partial data), per-stage time shares, GPU idle share,
+   and the implied throughput floor. A Little's-law mismatch above 10% means the run
    did not hold concurrency (ramp, failures, or too few prompts); fix that
    before reading anything else. Pass `--series` with the cells of one
    configuration. Decreases in throughput, aggregate RTF, TTFT or TTFP
@@ -234,7 +236,7 @@ has no queueing term, so judge it at concurrency 1.
 term left "not bounded: <reason>"]
 
 ## Checks
-- Little's law: C / audio_throughput vs aggregate RTF
+- Little's law: C / audio_throughput vs request_e2el_rtf, separately from audio RTF
 - Admission: stage capacities and KV capacity >= C; graph fallbacks at C
 - Sweep: investigate changes in throughput, aggregate RTF, TTFT and TTFP
 - Attribution: trace evidence, or gap remains unattributed

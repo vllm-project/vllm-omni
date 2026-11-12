@@ -102,6 +102,7 @@ python .claude/skills/omni-perf-ceiling/scripts/count_reference_work.py \
   --decoder thinker@0=llm --decoder talker@1=tts.model+tts.head_code \
   --prompt-tokens <mean input tokens> --context thinker=<mean context> --context talker=<mean context> \
   --code2wav minicpmo-token2wav@2=$CKPT/assets/token2wav --prompt-audio-s <reference audio s> \
+  --prompt-setup-per-request code2wav=<effective setup executions per request> \
   --tokens-per-audio-s thinker=<text tokens per audio-s> --tokens-per-audio-s talker=<codec tokens per audio-s> \
   --mean-context thinker=<tokens> --mean-context talker=<tokens> \
   --uncached-tokens thinker=<uncached prompt tokens> \
@@ -124,6 +125,18 @@ It prints the JSON and the `ceiling_report.py` flags:
 - `--compute-bound code2wav@STAGE` rows per audio second and
   `--fill-bound code2wav_<row>_first@out` for the first chunk, from the
   recipe's steady and first chunks.
+- `--fixed-bound code2wav_prompt_setup@STAGE`: reference prompt setup FLOPs
+  times `--prompt-setup-per-request code2wav=RATE`, using the flow compute dtype.
+  `RATE` is effective setup executions divided by requests, including cache hits
+  and sharing one setup among requests with the same prompt in a batch. It is
+  in `[0,1]`: `0` explicitly assumes no setup work, `1` assumes one setup per
+  request. For example, one setup shared by four requests gives `0.25`.
+  The JSON records `prompt_setup_per_request`; omission leaves it `null` and
+  prints an **unmodeled setup** warning, never silently assuming cache hits.
+  If cache behavior is unknown, compare explicit `0` and `1` sensitivity
+  scenarios and label the assumptions. Count at the runtime's clipped reference
+  audio length and sampling steps. This average work does not model miss-tail
+  latency, speaker frontend work or additional serial execution constraints.
 
 Inputs that are not work counts:
 

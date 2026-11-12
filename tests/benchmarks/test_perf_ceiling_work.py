@@ -17,6 +17,59 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 SCRIPT = Path(__file__).resolve().parents[2] / ".claude/skills/omni-perf-ceiling/scripts/count_reference_work.py"
 
 
+@pytest.fixture
+def counter():
+    spec = importlib.util.spec_from_file_location("count_reference_work", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("rate", [None, "0", "0.25", "1"])
+@pytest.mark.parametrize("dtype_options,setup_dtype", [([], "fp32"), (["--dtype", "code2wav.flow=tf32"], "tf32")])
+def test_prompt_setup_policy_flags(counter, monkeypatch, tmp_path, capsys, rate, dtype_options, setup_dtype):
+    # Exercise the CLI contract with a known reference count; no checkpoint needed.
+    monkeypatch.setitem(
+        counter.CODE2WAV_RECIPES,
+        "minicpmo-token2wav",
+        lambda *_: {
+            "dtype": "fp32",
+            "prompt_setup_tflop": 2.0,
+            "rows": {
+                "flow": {"tflop_per_audio_s": 3.0, "first_chunk_tflop": 3.0},
+                "vocoder": {"tflop_per_audio_s": 1.0, "first_chunk_tflop": 1.0},
+            },
+        },
+    )
+    output = tmp_path / "work.json"
+    args = [str(SCRIPT), "--code2wav", "minicpmo-token2wav@2=unused", "--json", str(output), *dtype_options]
+    if rate is not None:
+        args += ["--prompt-setup-per-request", f"code2wav={rate}"]
+    monkeypatch.setattr(sys, "argv", args)
+    assert counter.main() == 0
+    captured = capsys.readouterr()
+    counts = json.loads(output.read_text())["code2wav"]["code2wav"]
+    assert counts["prompt_setup_per_request"] == (None if rate is None else float(rate))
+    if rate is None:
+        assert "prompt setup is unmodeled" in captured.err
+        assert "--fixed-bound" not in captured.out
+    else:
+        assert f"--fixed-bound code2wav_prompt_setup@2={2 * float(rate):g},{setup_dtype}" in captured.out
+        assert "unmodeled" not in captured.err
+    assert "--compute-bound code2wav@2=1,fp32" in captured.out
+
+
+@pytest.mark.parametrize("policy", ["code2wav=-0.1", "code2wav=1.1", "code2wav=nan", "code2wav=inf", "typo=0.5"])
+def test_invalid_prompt_setup_policy(counter, monkeypatch, policy):
+    monkeypatch.setattr(
+        sys, "argv", [str(SCRIPT), "--code2wav", "minicpmo-token2wav@2=unused", "--prompt-setup-per-request", policy]
+    )
+    with pytest.raises(SystemExit) as exc:
+        counter.main()
+    assert exc.value.code == 2
+
+
 @pytest.mark.parametrize(
     "reference_dtype,options,weight_bytes,kv_bytes,compute_mode",
     [

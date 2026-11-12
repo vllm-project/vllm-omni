@@ -305,7 +305,18 @@ P99 AUDIO_RTF:                           0.48
 ```
 
 Notes:
-We use audio generation time / audio duration to calculate RTF.
+For the HTTP chat-omni and audio-speech backends, audio RTF uses client request
+start to receipt of the last non-empty audio payload, divided by generated audio
+duration. Trailing usage events (chat) or delayed stream EOF (speech) remain in
+E2EL but do not increase audio RTF. Mean RTF averages the individual request ratios; aggregate
+RTF divides summed audio-completion latencies by summed audio durations.
+
+Saved results include `request_audio_metrics` in input request order. Each
+successful audio request carries `audio_latency_s` and `audio_duration_s`;
+failed, non-audio or unsupported measurements are `null`. This metadata is
+independent of server stage metrics and remains present without `--save-detailed`.
+Duplex backends keep their per-response/session clocks described below and do
+not synthesize a request audio-completion latency from their mean RTF.
 
 </details>
 

@@ -1050,6 +1050,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     cancelled_after_timeout: bool = False
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
+    # Request start to receipt of the last non-empty audio payload; None for
+    # backends without this request-level clock (e.g. multi-turn duplex).
+    audio_latency: float | None = None
     audio_frames: int = 0
     audio_rtf: float = 0.0
     image_count: int = 0
@@ -2074,12 +2077,12 @@ async def async_request_openai_chat_omni_completions(
         audio_bytes_buffer = bytearray()
         most_recent_timestamp = st
         timestamp = st
-        audio_generate_time = 0.0
         output.itl = []
         output.generated_text = ""
         output.ttft = 0.0
         output.audio_ttfp = 0.0
         output.audio_duration = 0.0
+        output.audio_latency = None
         output.audio_frames = 0
         output.audio_rtf = 0.0
         output.text_latency = 0.0
@@ -2190,10 +2193,10 @@ async def async_request_openai_chat_omni_completions(
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
                                         if content:
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            output.audio_latency = timestamp - st
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
@@ -2302,7 +2305,7 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        output.audio_rtf = defs.compute_audio_rtf(output.audio_latency or 0.0, audio_duration)
                         if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
@@ -2826,6 +2829,7 @@ async def async_request_openai_audio_speech(
                     if not chunk:
                         continue
                     timestamp = time.perf_counter()
+                    output.audio_latency = timestamp - st
                     if output.audio_ttfp == 0.0:
                         # TTS speech endpoint emits no text tokens, so TTFT is
                         # not defined here; only audio TTFP is meaningful.
@@ -2848,7 +2852,7 @@ async def async_request_openai_audio_speech(
                 output.audio_duration = (
                     float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
                 )
-                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                output.audio_rtf = defs.compute_audio_rtf(output.audio_latency or 0.0, output.audio_duration)
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
@@ -4213,6 +4217,16 @@ async def benchmark(
     ]
     if any(request_stage_metrics):
         result["request_stage_metrics"] = request_stage_metrics
+
+    # Client audio completion is independent of server stage snapshots and
+    # trailing usage/EOF. Keep request order and explicit holes for unavailable
+    # or failed requests; duplex session-mean RTF cannot recover this clock.
+    result["request_audio_metrics"] = [
+        {"audio_duration_s": output.audio_duration, "audio_latency_s": output.audio_latency}
+        if output.success and getattr(output, "audio_latency", None) is not None and output.audio_duration > 0
+        else None
+        for output in outputs
+    ]
 
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
