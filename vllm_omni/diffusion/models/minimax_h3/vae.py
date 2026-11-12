@@ -422,6 +422,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
+        if device.type == "npu" and decoder is not None and decoder_path is None:
+            from vllm_omni.diffusion.models.minimax_h3.vae_npu_fia import install_vae_npu_fia
+
+            install_vae_npu_fia(decoder, device, logger)
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
