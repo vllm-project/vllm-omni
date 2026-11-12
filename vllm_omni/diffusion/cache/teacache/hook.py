@@ -159,9 +159,13 @@ class TeaCacheHook(ModelHook):
         self.state_manager.set_context(context_name)
         state = self.state_manager.get_state()
 
-        # Decide whether to compute or cache based on modulated input similarity
-        local_should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
-        sync_cache_decision = (ctx.extra_states or {}).get("synchronize_cache_decision")
+        # Decide whether to compute or cache based on modulated input similarity.
+        # Extractors may override the configured threshold per call (e.g. per CFG mode).
+        extra_states = ctx.extra_states or {}
+        local_should_compute = self._should_compute_full_transformer(
+            state, ctx.modulated_input, extra_states.get("rel_l1_thresh")
+        )
+        sync_cache_decision = extra_states.get("synchronize_cache_decision")
         if sync_cache_decision is not None:
             should_compute = sync_cache_decision(local_should_compute)
             # A rank that locally chose the cache path must reset its counter
@@ -241,7 +245,9 @@ class TeaCacheHook(ModelHook):
         # Sequential CFG without a stamp: assume calls alternate on this rank.
         return "negative" if self._forward_cnt % 2 == 1 else "positive"
 
-    def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
+    def _should_compute_full_transformer(
+        self, state: TeaCacheState, modulated_inp: torch.Tensor, rel_l1_thresh: float | None = None
+    ) -> bool:
         """
         Determine whether to compute full transformer or reuse cached residual.
 
@@ -257,6 +263,7 @@ class TeaCacheHook(ModelHook):
         Args:
             state: Current TeaCacheState containing counters and cached values
             modulated_inp: Modulated input extracted from first transformer block
+            rel_l1_thresh: Optional per-call threshold; None uses the configured value
 
         Returns:
             True to compute full transformer, False to reuse cached residual
@@ -284,7 +291,8 @@ class TeaCacheHook(ModelHook):
         state.accumulated_rel_l1_distance += abs(rescaled_distance)
 
         # Decision: below threshold = cache, above = compute
-        rel_l1_thresh = self.config.rel_l1_thresh
+        if rel_l1_thresh is None:
+            rel_l1_thresh = self.config.rel_l1_thresh
         assert rel_l1_thresh is not None
         if state.accumulated_rel_l1_distance < rel_l1_thresh:
             return False  # Use cache
