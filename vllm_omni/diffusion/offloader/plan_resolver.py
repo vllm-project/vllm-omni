@@ -460,12 +460,18 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
 
 
 def _validate_unique_ownership(resolved: ResolvedOffloadPlan) -> None:
-    """Reject topologies where two components would hook the same blocks."""
+    """Reject overlapping whole-module placement and block ownership."""
+    component_placement_paths = {component.path for component in resolved.encoders + resolved.vaes + resolved.residents}
+    component_placement_paths.update(component.path for component in resolved.dits if not component.selected)
     owner_by_block: dict[int, str] = {}
     pending = list(reversed(resolved.components))
     while pending:
         component = pending.pop()
         pending.extend(reversed(component.children))
+        if (
+            component.path in component_placement_paths or (component.selected and not component.stacks)
+        ) and resolved.tensor_inventory.contains_independent(component.module):
+            raise ValueError(f"Independent roots conflict with whole-module placement of {component.path!r}")
         for block in (block for stack in component.stacks for block in stack.blocks):
             owner = owner_by_block.setdefault(id(block), component.path)
             if owner != component.path:

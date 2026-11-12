@@ -44,9 +44,10 @@ class OffloadTensorInventory:
 
     _independent_ids: frozenset[int] = frozenset()
 
-    @property
-    def has_independent(self) -> bool:
-        return bool(self._independent_ids)
+    def contains_independent(self, module: nn.Module) -> bool:
+        return bool(self._independent_ids) and any(
+            id(tensor) in self._independent_ids for tensor in chain(module.parameters(), module.buffers())
+        )
 
     @classmethod
     def resolve(

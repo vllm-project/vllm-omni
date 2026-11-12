@@ -125,6 +125,62 @@ def _independent_projection_pipeline():
     return Pipeline()
 
 
+def test_non_block_placement_preserves_independent_cpu_storage(patched_offload_runtime):
+    pipeline = _independent_projection_pipeline()
+    transformer = pipeline.transformer
+    weight = transformer.final_projection.weight
+    pointer = weight.data_ptr()
+    transformer.final_projection = nn.Sequential(transformer.final_projection)
+    pipeline._offload_plan = replace(
+        pipeline._offload_plan,
+        independently_managed_submodules=frozenset({"transformer.final_projection.0"}),
+        offload_submodules={},
+    )
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            dlo_use_allgather=False,
+            pin_cpu_memory=False,
+            dlo_resident_layers=len(transformer.blocks),
+        ),
+        torch.device("meta"),
+    )
+
+    backend.enable(pipeline)
+
+    assert transformer.token_refiner.blocks[0].weight.is_meta
+    assert transformer.final_projection[0].weight is weight
+    assert weight.device.type == "cpu" and weight.data_ptr() == pointer
+    backend.disable()
+
+
+@pytest.mark.parametrize("stackless_owner", ["transformer", "transformer.token_refiner", "encoder", "vae", "resident"])
+def test_independent_root_in_whole_module_placement_rejected(patched_offload_runtime, stackless_owner):
+    pipeline = _independent_projection_pipeline()
+    if stackless_owner == "transformer":
+        pipeline.transformer.blocks = nn.ModuleList()
+        root = "transformer.final_projection"
+    elif stackless_owner == "transformer.token_refiner":
+        pipeline.transformer.token_refiner = _StagedVAE()
+        root = "transformer.token_refiner.proj"
+    else:
+        pipeline._encoder_modules = []
+        pipeline._vae_modules = []
+        pipeline._resident_modules = []
+        setattr(pipeline, f"_{stackless_owner}_modules", ["transformer.final_projection"])
+        root = "transformer.final_projection"
+    pipeline._offload_plan = replace(pipeline._offload_plan, independently_managed_submodules=frozenset({root}))
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dlo_use_allgather=False, pin_cpu_memory=False),
+        torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match="Independent.*whole-module placement"):
+        backend.enable(pipeline)
+    if stackless_owner == "transformer.token_refiner":
+        assert pipeline.transformer.token_refiner.offload_calls == 0
+
+
 @pytest.mark.parametrize(
     "resident_layers,retain",
     [(0, False), (2, False), (5, False), (2, True), (5, True)],
@@ -1923,6 +1979,15 @@ class TestMmapWeightLoading:
         assert not backend.enabled
         assert not backend._blocks
         assert not backend._all_hook_groups
+
+    def test_independent_root_rejection_releases_hwr_lease(self, patched_offload_runtime):
+        _, backend, carrier, lease = _hwr_backend()
+
+        with pytest.raises(ValueError, match="Independent CPU roots"):
+            backend.enable(_independent_projection_pipeline())
+
+        assert not carrier.taken
+        assert lease.closed
 
 
 class TestCrossGroupSharedBuffer:

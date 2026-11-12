@@ -55,7 +55,6 @@ from .host_registration import (
     HostRegistrationError,
     register_host_mappings,
 )
-from .offload_plan import get_offload_plan
 from .plan_resolver import BlockStack, ResolvedComponent, resolve_offload_plan
 from .tensor_utils import (
     OffloadTensorInventory,
@@ -1746,6 +1745,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     )
                 continue
 
+            if self._tensor_inventory.contains_independent(module):
+                move_non_block_state_to_device(module, (stack.blocks,), self.device, self._tensor_inventory)
+                continue
+
             try:
                 # Place only this child's non-block tensors. A wrapper can
                 # share the streamed layers through another attribute; moving
@@ -1791,14 +1794,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._poisoned_reason is not None:
             raise RuntimeError(self._poisoned_reason)
 
-        declaration = get_offload_plan(pipeline)
-        if (
-            self.host_weight_plan is not None
-            and declaration is not None
-            and declaration.independently_managed_submodules
-        ):
-            raise ValueError("Independent CPU roots cannot use loader-owned host plans")
-
         # A rank-local rollback can reconstruct ordinary tensors from its host
         # masters. A multi-rank AllGather rollback is unsafe: another rank may
         # never enter the matching restoration collective after startup fails.
@@ -1824,6 +1819,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # One resolver call validates the whole topology; an explicit selection
         # has already failed by the time any of the checks below run.
         resolved = resolve_offload_plan(pipeline, self.config)
+        if self.host_weight_plan is not None and resolved.tensor_inventory.contains_independent(pipeline):
+            raise ValueError("Independent CPU roots cannot use loader-owned host plans")
         self._tensor_inventory = resolved.tensor_inventory
         if not resolved.dits and self.config.offloads(DIT_COMPONENT):
             if self.host_weight_plan is not None:

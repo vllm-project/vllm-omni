@@ -185,6 +185,51 @@ This mode means:
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
+### Independently staged CPU projections
+
+A pipeline may declare `OffloadPlan.independently_managed_submodules` for CPU
+weights that already have model-owned staging. The resolver builds one tensor
+inventory before DLO mutates storage. Hooks, non-block placement, and resident
+groups use that inventory so they do not move, shard, pin, or clear those
+weights. Registered parameter names remain intact for checkpoint loading.
+
+Independent roots must contain materialized CPU weights and must not overlap
+or alias another owner, including through shared storage. Their enclosing DiT
+must have a streamable block stack. A root cannot overlap a stackless
+on-demand component whose lifecycle DLO does not control. Unsupported topology,
+AllGather, HSDP, and loader-owned host plans fail before placement. Startup
+failure still releases any host lease already owned by the backend.
+
+Native MiniMax-H3-Image uses this boundary to compose its existing exact AdaLN
+cache with rank-local CUDA TP2 DLO. AdaLN projection masters stay on CPU and
+stage on cache misses. DLO owns the remaining block tensors. The qualified
+image path requires USP1, DP1, unquantized weights, exact caching, and disabled
+Host Weight Runtime. Other models and topologies keep their existing policy.
+
+### Resident-core device storage
+
+Resident layers normally release their device backing at denoise-stage exit.
+`OffloadPlan.retain_resident_storage` is an explicit exception for a pipeline
+with independent CPU staging and a positive resident-layer count. Its default
+is false. On scope exit, DLO restores placeholder parameter bindings while
+keeping the backing allocations. The next scope rebinds those allocations
+without another H2D copy.
+
+Retained backing stays allocated during subsequent encoder and VAE stages.
+It consumes physical device memory and is separate from the free allocator
+cache policy below. A partial load latches a failure rather than reusing
+incomplete backing. Disable restores ordinary CPU tensors, releases retained
+allocations, and clears that failure state. Base weights must stay immutable
+until this disable, update, and re-enable cycle completes.
+
+The H3-Image recipe validates this opt-in policy on two RTX 3090 GPUs. That
+measurement does not establish memory headroom for another workload, device,
+or resident-layer count. See the
+[user guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md#minimax-h3-image-exact-adaln-staging)
+for configuration and the
+[recipe](../../../../recipes/MiniMaxAI/MiniMax-H3-Image-RTX3090.md)
+for its validation limits.
+
 ### Component allocator-cache retention
 
 MiniMax-H3 DLO keeps one bounded PyTorch allocator cache across its staged
