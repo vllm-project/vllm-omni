@@ -10,6 +10,7 @@ once, only for ids that are still live. A malformed payload must never raise.
 from __future__ import annotations
 
 from collections import defaultdict
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -176,6 +177,127 @@ def test_readd_of_live_id_takes_no_prewarm(scheduler_cls, base_scheduler, status
     assert update.additional_information is update_info
     assert set(scheduler._pending_request_prewarms) == {"req-1"}
     assert scheduler._pending_request_prewarms["req-1"] is first_prewarm
+
+
+def _producer_adapter(*, active_sender: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        receives_chunks=False,
+        custom_process_next_stage_input_func=object(),
+        has_active_sender=lambda _id: active_sender,
+    )
+
+
+def _receiver_only_adapter() -> SimpleNamespace:
+    return SimpleNamespace(
+        receives_chunks=True,
+        custom_process_next_stage_input_func=None,
+        has_active_sender=lambda _id: False,
+    )
+
+
+@_SCHEDULERS
+def test_adapter_owing_terminal_without_sender_on_producer(scheduler_cls) -> None:
+    """A 2150 stop may drop the sender token; the Talker still owes Code2Wav a terminal."""
+    scheduler = _make_scheduler(scheduler_cls)
+    adapter = _producer_adapter(active_sender=False)
+    scheduler.chunk_transfer_adapter = adapter
+    request = _StubRequest("req-1")
+    assert scheduler._adapter_owing_terminal(request) is adapter
+
+
+@_SCHEDULERS
+def test_adapter_owing_terminal_skips_receiver_only_stage(scheduler_cls) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    scheduler.chunk_transfer_adapter = _receiver_only_adapter()
+    assert scheduler._adapter_owing_terminal(_StubRequest("req-1")) is None
+
+
+@_SCHEDULERS
+def test_readd_finish_on_next_stop_stamps_the_parked_session(scheduler_cls, base_scheduler) -> None:
+    """Last JoyAI sentence is a resumable unpark; 2150 must be request-finished."""
+    scheduler = _make_scheduler(scheduler_cls)
+    first = _StubRequest("req-1", _placeholder_info())
+    scheduler.add_request(first)
+    first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first.resumable = True
+    update = _StubRequest(
+        "req-1",
+        serialize_additional_information(
+            {
+                "meta": {
+                    "replace_streaming_prompt": True,
+                    "joyai_finish_on_next_stop": True,
+                }
+            }
+        ),
+    )
+    update.resumable = True
+
+    scheduler.add_request(update)
+
+    assert getattr(first, "_joyai_finish_on_next_stop", False) is True
+    assert getattr(update, "_joyai_finish_on_next_stop", False) is True
+    assert base_scheduler == [first, update]
+
+
+@_SCHEDULERS
+def test_readd_top_level_finish_on_next_stop_stamps_the_parked_session(scheduler_cls, base_scheduler) -> None:
+    """Prompt-side stamp is top-level ``joyai_finish_on_next_stop``, not only ``meta.``."""
+    scheduler = _make_scheduler(scheduler_cls)
+    first = _StubRequest("req-1", _placeholder_info())
+    scheduler.add_request(first)
+    first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first.resumable = True
+    update = _StubRequest(
+        "req-1",
+        serialize_additional_information({"joyai_finish_on_next_stop": True}),
+    )
+    update.resumable = True
+
+    scheduler.add_request(update)
+
+    assert getattr(first, "_joyai_finish_on_next_stop", False) is True
+    assert getattr(update, "_joyai_finish_on_next_stop", False) is True
+
+
+@_SCHEDULERS
+def test_readd_without_finish_on_next_stop_does_not_stamp_the_parked_session(scheduler_cls, base_scheduler) -> None:
+    """Earlier sentences stay resumable parks so later sentences can still unpark."""
+    scheduler = _make_scheduler(scheduler_cls)
+    first = _StubRequest("req-1", _placeholder_info())
+    scheduler.add_request(first)
+    first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first.resumable = True
+    update = _StubRequest(
+        "req-1",
+        serialize_additional_information({"meta": {"replace_streaming_prompt": True}}),
+    )
+    update.resumable = True
+
+    scheduler.add_request(update)
+
+    assert getattr(first, "_joyai_finish_on_next_stop", False) is False
+    assert getattr(update, "_joyai_finish_on_next_stop", False) is False
+    assert base_scheduler == [first, update]
+
+
+@_SCHEDULERS
+def test_parked_non_resumable_without_sender_finishes_session(scheduler_cls, base_scheduler) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    first = _StubRequest("req-1", _placeholder_info())
+    scheduler.add_request(first)
+    first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    adapter = _producer_adapter(active_sender=False)
+    scheduler.chunk_transfer_adapter = adapter
+    finished_calls: list[tuple[object, object]] = []
+    scheduler._finish_parked_streaming_session = lambda request, owner: finished_calls.append((request, owner))
+    update = _StubRequest("req-1")
+    update.resumable = False
+
+    scheduler.add_request(update)
+
+    assert finished_calls == [(first, adapter)]
+    assert base_scheduler == [first]
 
 
 def _bad_ref_audio(**entry_fields) -> dict:
