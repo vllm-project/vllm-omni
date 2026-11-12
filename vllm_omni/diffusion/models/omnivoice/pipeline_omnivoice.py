@@ -252,6 +252,11 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
     supports_request_batch: ClassVar[bool] = True
     supports_step_execution: ClassVar[bool] = True
 
+    # Advertised to the diffusion output formatter, which resolves the audio
+    # sample rate from the class without a pipeline instance; ``__init__``
+    # validates the checkpoint's config agrees (auk/stable_audio pattern).
+    audio_sample_rate: ClassVar[int] = 24000
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -305,6 +310,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self.position_temperature = self.config.position_temperature
         self.class_temperature = self.config.class_temperature
         self.sample_rate = self.config.sample_rate
+        if self.sample_rate != self.audio_sample_rate:
+            raise ValueError(
+                f"OmniVoice advertises {self.audio_sample_rate} Hz output but the checkpoint is {self.sample_rate} Hz."
+            )
 
     def _initialize_asr(self, additional_config: Mapping[str, object] | None) -> None:
         load_asr_on_startup, self._asr_model_name, self._asr_device = _parse_asr_config(additional_config)
