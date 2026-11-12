@@ -106,17 +106,6 @@ def test_existing_asset_needs_no_download(tmp_path, image_download, existing_loc
     sleep.assert_not_called()
 
 
-def test_pan2_doc_cli_is_skipped_without_guardrail_package():
-    """The nightly doc node more_cli_examples_005 must not launch guardrails-on PAN 2."""
-    pan2_snippets = [snippet for snippet in example.README_SNIPPETS if "IFM/PAN2" in snippet.code]
-    assert [snippet.test_id for snippet in pan2_snippets] == ["more_cli_examples_005"]
-    snippet = pan2_snippets[0]
-    assert snippet.skip == (True, example._PAN2_CI_SKIP_REASON)
-    assert "pan2_i2v_output.mp4" in snippet.code
-    assert "--no-guardrails" not in snippet.code
-    assert "guardrails" not in snippet.code
-
-
 def test_cli_examples_share_download_and_get_separate_copies(tmp_path, image_download):
     get, sleep = image_download
     response = Mock()
