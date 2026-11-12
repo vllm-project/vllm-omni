@@ -486,6 +486,10 @@ async def omni_run_server_worker(
                 app.state.drvexo_speech_tokenizer = await anyio.to_thread.run_sync(
                     load_speech_tokenizer, chat.model_config.model
                 )
+                # Standard speech admission and prompt estimation share the
+                # tokenizer loaded off the event loop for the sentence routes.
+                if (speech := getattr(app.state, "openai_serving_speech", None)) is not None:
+                    speech._tts_tokenizer = app.state.drvexo_speech_tokenizer
             app.include_router(drvexo_router)
 
         # The inherited routes assume a tokenization handler. Pure diffusion
