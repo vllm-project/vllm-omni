@@ -225,9 +225,13 @@ def decode_audio_append(
     fmt, format_rate = parse_realtime_audio_format(
         event.get("format") or event.get("input_audio_format") or defaults.input_audio_format
     )
-    sample_rate_hz = (
-        event.get("sample_rate_hz") or event.get("sample_rate") or format_rate or defaults.input_sample_rate_hz
-    )
+    sample_rate_hz = event.get("sample_rate_hz") or event.get("sample_rate") or format_rate
+    if sample_rate_hz is None:
+        # G.711 is an 8 kHz codec. Falling back to the session default (16 kHz)
+        # would skip the 8k -> 16k resample and hand the bytes over as 16 kHz.
+        sample_rate_hz = (
+            8_000 if isinstance(fmt, str) and fmt in {"g711_ulaw", "g711_alaw"} else defaults.input_sample_rate_hz
+        )
     if not is_supported_realtime_input_format(fmt):
         raise RealtimeProtocolError(
             f"Unsupported input_audio_format: {fmt}",
