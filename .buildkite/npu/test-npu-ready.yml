@@ -70,6 +70,7 @@ steps:
           - ".buildkite/npu/test-npu-ready.yml"
         env:
           NPU_SHMEM_SYMMETRIC_SIZE: "4294967296"
+          SHMEM_LOG_TO_STDOUT: "1"
         commands:
           # Reuse one four-card allocation to cover both two- and four-rank exchanges.
           - >-

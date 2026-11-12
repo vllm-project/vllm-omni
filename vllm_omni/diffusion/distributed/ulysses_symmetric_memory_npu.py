@@ -31,6 +31,10 @@ _WORKSPACE_GROUP = None
 @cache
 def _runtime_library() -> ctypes.CDLL:
     try:
+        # Load CANN normally before deep-binding SHMEM. Older wheels look up
+        # rt* symbols through the ACL handle; lazy loading with LD_PRELOAD
+        # can leave those transitive Runtime symbols outside its lookup scope.
+        ctypes.CDLL("libascendcl.so", mode=os.RTLD_LOCAL)
         # MemFabric exports some of the same internal HYBM symbols globally.
         # Keep SHMEM's references bound to its own implementation and state.
         mode = os.RTLD_LOCAL | os.RTLD_DEEPBIND
