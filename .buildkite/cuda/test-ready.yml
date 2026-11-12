@@ -216,19 +216,32 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: h100_1
 
-      # The live client waits for a learned turn terminator; use real weights.
+      # CUDA defaults to MRv2. The live client checks the protocol lifecycle;
+      # keep 1/4-session overlap, staggered sessions, image chat and recognition.
+      # Omit the standalone handshake smoke and intermediate 2-session overlap
+      # to avoid duplicate coverage and another module-scoped model startup.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_function
-        timeout_in_minutes: 35
+        source_file_dependencies:
+          - omni_minicpmo_4_5_duplex_function
+          - omni_minicpmo_4_5_duplex_mrv2_function
+        timeout_in_minutes: 60
+        artifact_paths:
+          - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
+          - tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
-        mirror_hardwares: h100_1
-
-      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
-        timeout_in_minutes: 40
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py -m 'advanced_model and cuda' --run-level advanced_model
+          - |
+            bash -e <<'BASH'
+            mkdir -p tests/e2e/online_serving/results/minicpmo_duplex
+            timeout 55m pytest -s -v \
+              tests/e2e/online_serving/test_duplex_client_live.py \
+              'tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]' \
+              'tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]' \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
+              -m '(core_model or advanced_model) and cuda' --run-level advanced_model \
+              --junitxml=tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
+            BASH
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
