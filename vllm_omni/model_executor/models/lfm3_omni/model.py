@@ -8,9 +8,11 @@ independent downstream talker. Only waveform decoding is a separate stage.
 
 import importlib
 from collections.abc import Iterable
+from types import ModuleType
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -33,6 +35,15 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
     has_preprocess = True
     has_postprocess = False
     omni_pooler_payload_include_hidden = False
+    # Checkpoint module and class that define the encoders and depth head.
+    _reference = ("modeling_lfm3_omni", "Lfm3OmniModel")
+
+    def _build_reference_modules(self, ref: ModuleType, c: PretrainedConfig) -> None:
+        self.model.audio_encoder = ref.Lfm3OmniEncoder(c.audio_encoder_config)
+        self.model.audio_projector = ref.Lfm3OmniProjector(c)
+        self.model.vision_tower = ref.Lfm3VlVisionModel(c.vision_config)
+        self.model.multi_modal_projector = ref.Lfm3OmniMultiModalProjector(c)
+        self.model.depth_decoder = ref.Lfm3OmniDepthDecoder(c)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -49,7 +60,7 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
             raise ValueError("LFM3-Omni audio feedback currently requires enable_chunked_prefill=False")
         self.config = c = mc.hf_config
         self._supports_mm_inputs = mc.supports_multimodal_inputs
-        ref = reference_module(mc, "modeling_lfm3_omni", "Lfm3OmniModel")
+        ref = reference_module(mc, *self._reference)
         backbone_ref = importlib.import_module(ref.Lfm3Model.__module__)
         self.model = nn.Module()
         self.model.language_model = Lfm3TemporalModel(
@@ -59,24 +70,30 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Match Transformers' construction of non-persistent rotary buffers
         # in every reference component, not only the temporal backbone.
         with torch.device("cpu"):
-            self.model.audio_encoder = ref.Lfm3OmniEncoder(c.audio_encoder_config)
-            self.model.audio_projector = ref.Lfm3OmniProjector(c)
-            self.model.vision_tower = ref.Lfm3VlVisionModel(c.vision_config)
-            self.model.multi_modal_projector = ref.Lfm3OmniMultiModalProjector(c)
-            self.model.depth_decoder = ref.Lfm3OmniDepthDecoder(c)
-        for component in (
-            self.model.audio_encoder,
-            self.model.audio_projector,
-            self.model.vision_tower,
-            self.model.multi_modal_projector,
-            self.model.depth_decoder,
-        ):
-            component.to(device)
+            self._build_reference_modules(ref, c)
+        for name, component in self.model.named_children():
+            if name != "language_model":
+                component.to(device)
         self.model.codebook_embedding = nn.Embedding(c.num_codebooks * c.codebook_size, c.text_config.hidden_size)
         # All encoder/depth attention is bidirectional or explicitly masked by
         # the reference. Do not replace it with causal PagedAttention.
-        for subconfig in (c.audio_encoder_config.text_config, c.depth_config, c.vision_config):
-            subconfig._attn_implementation = "eager"
+        for subconfig in (c.audio_encoder_config.text_config, c.depth_config, getattr(c, "vision_config", None)):
+            if subconfig is not None:
+                subconfig._attn_implementation = "eager"
+        # Media placeholders are never sampled as text.
+        self._placeholder_token_ids = [
+            getattr(c, name)
+            for name in ("image_token_id", "video_token_id", "audio_token_id", "audio_out_token_id")
+            if hasattr(c, name)
+        ]
+        # Like the reference's generate(), speech settings a request omits come
+        # from the checkpoint's generation config (they differ per checkpoint).
+        generation = mc.try_get_generation_config()
+        self._speech_defaults = {
+            name: generation[name]
+            for name in ("audio_temperature", "audio_top_k", "audio_repetition_penalty", "audio_repetition_window")
+            if generation.get(name) is not None
+        }
         self.lm_head = nn.Linear(c.text_config.hidden_size, c.text_config.vocab_size, bias=False)
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
         self._depth_graph_enabled = bool(getattr(c, "lfm3_depth_graph", False))
@@ -149,7 +166,7 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
         is_prefill = info["_omni_is_prefill"]
         state = self._states.get(req_id)
         if state is None:
-            state = RequestState(slots_left=self.config.interleaved_n_text)
+            state = RequestState(slots_left=self.config.interleaved_n_text, **self._speech_defaults)
             state.generator = torch.Generator(device=input_ids.device)
             seed = info.get("_omni_seed")
             state.generator.manual_seed(0 if seed is None else seed)
@@ -291,7 +308,7 @@ class Lfm3OmniForConditionalGeneration(nn.Module, SupportsMultiModal):
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states).float()
         c = self.config
-        logits[:, [c.image_token_id, c.video_token_id, c.audio_token_id, c.audio_out_token_id]] = -torch.inf
+        logits[:, self._placeholder_token_ids] = -torch.inf
         for row, forced in enumerate(self._forced_tokens):
             if self._batch_states[row].text_only:
                 logits[row, [c.audio_start_token_id, c.mixed_start_token_id]] = -torch.inf
