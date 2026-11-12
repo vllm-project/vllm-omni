@@ -639,7 +639,13 @@ def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
+            # Harness bound only - it guards against a wedged cleanup, while the
+            # semantic bound is the monkeypatched ABORT_TIMEOUT_S=0.05 asserted
+            # via seen_timeouts below. CI scheduling stalls (CPU throttling, GC
+            # pauses) can delay the cleanup chain for ~1s before the inner bound
+            # arms (issue #10165), so keep generous headroom here instead of
+            # matching the inner bound's magnitude.
+            await asyncio.wait_for(task, timeout=5.0)
         assert seen_timeouts
         assert seen_timeouts[-1] == 0.05
         assert omni.request_states == {}
