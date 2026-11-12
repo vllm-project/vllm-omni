@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Decoded-video diagnostics and isolated, reference-free quality evaluators.
+"""Complete-video coverage and isolated native semantic quality measurements.
 
-Pixel distances describe rollout divergence, not tensor numerical parity. Quality
-scores use each suite's native scale and are custom-input diagnostics, never a
-leaderboard total. Same-code repeat rollouts are needed to interpret differences.
+Scores use each suite's native scale and are custom-input measurements, never
+a leaderboard total or a recorded-baseline accuracy acceptance verdict.
 """
 
 from __future__ import annotations
@@ -13,12 +12,13 @@ import hashlib
 import json
 import math
 import os
-import re
 import signal
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 VBENCH_DIMENSIONS = (
     "subject_consistency",
@@ -65,16 +65,6 @@ def _capture_metadata(capture: Any, path: Path, cv2: Any) -> dict[str, Any]:
     return {"path": str(path), **values, "duration_s": values["frame_count"] / values["fps"]}
 
 
-def _distances(absolute_sum: float, squared_sum: float, samples: int) -> dict[str, Any]:
-    mse = squared_sum / samples
-    return {
-        "mae": absolute_sum / samples,
-        "rmse": math.sqrt(mse),
-        "psnr_db": 10 * math.log10(255.0**2 / mse) if mse else None,
-        "psnr_is_infinite": mse == 0,
-    }
-
-
 def verify_video_coverage(path: Path, *, frames: int, width: int, height: int, fps: int) -> dict:
     """Decode the complete input; semantic scorers cannot accept a partial rollout."""
     import cv2
@@ -97,131 +87,6 @@ def verify_video_coverage(path: Path, *, frames: int, width: int, height: int, f
         return {**metadata, "decoded_frames": count}
     finally:
         capture.release()
-
-
-def compare_video_pair(
-    reference: Path, candidate: Path, *, window_seconds: float = 30.0, ssim_stride: int = 0
-) -> dict[str, Any]:
-    """Stream every decoded frame; reject unequal or incomplete video coverage.
-
-    Distances use decoded 8-bit BGR samples. Identical frames have infinite PSNR,
-    represented by ``psnr_db=None, psnr_is_infinite=True`` for strict JSON output.
-    """
-    if not math.isfinite(window_seconds) or window_seconds <= 0:
-        raise ValueError("window_seconds must be finite and positive")
-    if not isinstance(ssim_stride, int) or ssim_stride < 0:
-        raise ValueError("ssim_stride must be a nonnegative integer")
-    try:
-        import cv2
-        import numpy as np
-    except ImportError as exc:
-        raise VideoQualityError("Video comparison requires opencv-python and numpy") from exc
-
-    reference, candidate = Path(reference).resolve(), Path(candidate).resolve()
-    captures = [cv2.VideoCapture(str(path)) for path in (reference, candidate)]
-    try:
-        ref, cand = [_capture_metadata(cap, path, cv2) for cap, path in zip(captures, (reference, candidate))]
-        for key in ("fps", "frame_count", "width", "height"):
-            if ref[key] != cand[key]:
-                raise VideoQualityError(f"Video {key} mismatch: {ref[key]} != {cand[key]}")
-        frame_metrics: list[dict[str, Any]] = []
-        ssim_values: list[float] = []
-        windows: list[dict[str, Any]] = []
-        uniform_frames: dict[str, list[int]] = {"reference": [], "candidate": []}
-        totals = {"absolute_sum": 0.0, "squared_sum": 0.0, "samples": 0, "different_frames": 0}
-        window: dict[str, Any] | None = None
-        index = 0
-        while True:
-            ref_ok, ref_frame = captures[0].read()
-            cand_ok, cand_frame = captures[1].read()
-            if ref_ok != cand_ok:
-                raise VideoQualityError(f"Video decode coverage mismatch at frame {index}")
-            if not ref_ok:
-                break
-            expected_shape = (ref["height"], ref["width"], 3)
-            if ref_frame.shape != expected_shape or cand_frame.shape != expected_shape:
-                raise VideoQualityError(f"Decoded geometry changed at frame {index}")
-            if ref_frame.dtype != np.uint8 or cand_frame.dtype != np.uint8:
-                raise VideoQualityError(f"Expected 8-bit decoded frames at frame {index}")
-            for role, frame in (("reference", ref_frame), ("candidate", cand_frame)):
-                if not np.any(frame != frame[0, 0]):
-                    uniform_frames[role].append(index)
-            delta = ref_frame.astype(np.float64) - cand_frame
-            if ssim_stride and index % ssim_stride == 0:
-                from skimage.metrics import structural_similarity
-
-                ssim_values.append(
-                    float(
-                        structural_similarity(
-                            ref_frame,
-                            cand_frame,
-                            channel_axis=2,
-                            data_range=255,
-                            gaussian_weights=True,
-                            sigma=1.5,
-                            use_sample_covariance=False,
-                        )
-                    )
-                )
-            absolute_sum = float(np.abs(delta).sum())
-            squared_sum = float(np.square(delta).sum())
-            samples = delta.size
-            timestamp_s = index / ref["fps"]
-            window_index = math.floor(timestamp_s / window_seconds)
-            if window is None or window["index"] != window_index:
-                window = {
-                    "index": window_index,
-                    "start_s": window_index * window_seconds,
-                    "end_s": min((window_index + 1) * window_seconds, ref["duration_s"]),
-                    "start_frame": index,
-                    "frame_count": 0,
-                    "absolute_sum": 0.0,
-                    "squared_sum": 0.0,
-                    "samples": 0,
-                    "different_frames": 0,
-                }
-                windows.append(window)
-            for accumulator in (totals, window):
-                accumulator["absolute_sum"] += absolute_sum
-                accumulator["squared_sum"] += squared_sum
-                accumulator["samples"] += samples
-                accumulator["different_frames"] += int(squared_sum != 0)
-            window["frame_count"] += 1
-            frame_metrics.append(
-                {"index": index, "time_s": timestamp_s, **_distances(absolute_sum, squared_sum, samples)}
-            )
-            index += 1
-        if index != ref["frame_count"]:
-            raise VideoQualityError(f"Truncated or inconsistent video: decoded {index} of {ref['frame_count']} frames")
-        for accumulator in windows:
-            accumulator.update(
-                _distances(accumulator.pop("absolute_sum"), accumulator.pop("squared_sum"), accumulator.pop("samples"))
-            )
-        return {
-            "status": "complete",
-            "reference": ref,
-            "candidate": cand,
-            "decoded_frames": index,
-            "uniform_frame_indices": uniform_frames,
-            "window_seconds": window_seconds,
-            "total": {
-                "frame_count": index,
-                "different_frames": totals["different_frames"],
-                **_distances(totals["absolute_sum"], totals["squared_sum"], totals["samples"]),
-            },
-            "windows": windows,
-            "frame_metrics": frame_metrics,
-            "ssim": {
-                "stride": ssim_stride,
-                "samples": len(ssim_values),
-                "mean": sum(ssim_values) / len(ssim_values) if ssim_values else None,
-            },
-            "scope": "Decoded-frame divergence diagnostics, not tensor parity or a quality acceptance test.",
-            "baseline_repeat_required": True,
-        }
-    finally:
-        for capture in captures:
-            capture.release()
 
 
 # The worker runs only in the caller-selected evaluator environment. Inputs are
@@ -250,14 +115,20 @@ def strict_json(value):
 try:
     background_stats = None
     if manifest["suite"] == "vbench" and "background_consistency" in manifest["dimensions"]:
-        sys.path.insert(0, manifest["adapter_root"])
         import hashlib
-        import benchmarks.lingbot_world.encoder_inference as encoder_adapter
-        from benchmarks.lingbot_world.encoder_inference import install_vbench_background_inference
-        adapter_sha256 = hashlib.sha256(pathlib.Path(encoder_adapter.__file__).read_bytes()).hexdigest()
+        import importlib.util
+        adapter_path = pathlib.Path(manifest["encoder_adapter"])
+        adapter_sha256 = hashlib.sha256(adapter_path.read_bytes()).hexdigest()
         if adapter_sha256 != manifest["protocol"]["background_clip_inference"]["adapter_sha256"]:
             raise ValueError("Background CLIP inference adapter differs from the recorded source")
-        background_stats = install_vbench_background_inference()
+        # The isolated evaluator intentionally has its own Torch, without vLLM.
+        # Loading this dependency-free file avoids executing Omni package init.
+        spec = importlib.util.spec_from_file_location("video_encoder_adapter", adapter_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("Cannot load background CLIP inference adapter")
+        encoder_adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(encoder_adapter)
+        background_stats = encoder_adapter.install_vbench_background_inference()
     if manifest["suite"] == "wbench":
         if "hpsv3_quality" in manifest["dimensions"]:
             # RAFT adds core/ (which contains datasets.py) to sys.path.
@@ -402,7 +273,7 @@ def evaluate_video_quality(
         report["mode"] = mode
         report["protocol"] = {"sampling": "native evaluator defaults"}
         if suite == "vbench" and "background_consistency" in dimensions:
-            from benchmarks.lingbot_world.encoder_inference import BACKGROUND_CLIP_BATCH_SIZE
+            from vllm_omni.benchmarks.realtime_video.encoder_inference import BACKGROUND_CLIP_BATCH_SIZE
 
             report["protocol"]["background_clip_inference"] = {
                 "batch_size": BACKGROUND_CLIP_BATCH_SIZE,
@@ -438,7 +309,7 @@ def evaluate_video_quality(
         run_dir = Path(tempfile.mkdtemp(prefix=f"{suite}-", dir=Path(output_dir).resolve()))
         manifest_path = run_dir / "inputs.json"
         manifest = {
-            "adapter_root": str(Path(__file__).resolve().parents[2]),
+            "encoder_adapter": str(Path(__file__).with_name("encoder_inference.py").resolve()),
             "suite": suite,
             "mode": mode,
             "repo": str(repo),

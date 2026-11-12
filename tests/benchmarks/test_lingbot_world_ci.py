@@ -16,8 +16,8 @@ from typing import NamedTuple
 
 import pytest
 
-from benchmarks.lingbot_world.regression import RegressionError, check_binary_activity, check_quality
 from tests.e2e.accuracy.lingbot_world.runner import server_arguments, server_environment
+from vllm_omni.benchmarks.realtime_video.metrics import RegressionError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 ROOT = Path(__file__).resolve().parents[2]
@@ -213,17 +213,14 @@ def test_invalid_worker_thread_count_fails_before_launch(tmp_path: Path, threads
         server_environment(tmp_path, cpu_threads=threads)
 
 
-@pytest.mark.parametrize("role", ["reference", "candidate"])
-def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monkeypatch, role: str):
+def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monkeypatch):
     from tests.e2e.accuracy.lingbot_world import runner
 
     calls = []
     monkeypatch.setenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", "1")
     monkeypatch.setenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "999")
     monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
-    source = tmp_path / role
     runner._capture(
-        source,
         tmp_path / "model",
         tmp_path / "precision.npz",
         {
@@ -235,7 +232,7 @@ def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monke
     )
     assert len(calls) == 1
     options = calls[0][1]
-    assert options["cwd"] == source
+    assert options["cwd"] == runner.ROOT
     assert all(options["env"][name] == "1" for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"))
     assert options["env"]["VLLM_OMNI_AR_DIFFUSION_KV_GATHER"] == "0"
     assert options["env"]["AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH"] == "0"
@@ -244,35 +241,33 @@ def test_fixed_worker_threads_also_reach_precision_capture(tmp_path: Path, monke
 def evaluator_repository(root: Path):
     directory = root / "tests/e2e/accuracy/lingbot_world"
     directory.mkdir(parents=True)
-    (directory / "evaluators.lock.json").write_text('{"repositories": {}, "files": {}}')
+    evaluator_lock = root / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json"
+    evaluator_lock.parent.mkdir(parents=True)
+    evaluator_lock.write_text('{"repositories": {}, "files": {}}')
     (directory / "opencv_provider.py").write_text("# canonical provider policy\n")
     (root / "requirements").mkdir()
     (root / "requirements/lingbot-quality.txt").write_text("example==1\n")
 
 
-@pytest.mark.parametrize("broken_role", [None, "reference", "candidate"])
-def test_source_import_preflight_uses_each_checkout(tmp_path, monkeypatch, broken_role):
+@pytest.mark.parametrize("broken", [False, True])
+def test_source_import_preflight_uses_only_the_candidate(tmp_path, monkeypatch, broken):
     from tests.e2e.accuracy.lingbot_world import prepare
 
-    for role in ("reference", "candidate"):
-        package = tmp_path / role / "vllm_omni"
-        cli = package / "entrypoints/cli"
-        cli.mkdir(parents=True)
-        (package / "__init__.py").write_text("")
-        model = package / "diffusion/models/lingbot_world"
-        model.mkdir(parents=True)
-        (model / "pipeline.py").write_text("")
-        (cli / "main.py").write_text("raise ImportError('removed runtime API')\n" if role == broken_role else "")
-        if role != broken_role:
-            (cli / "main.py").write_text("def main(): pass\n")
+    package = tmp_path / "candidate" / "vllm_omni"
+    cli = package / "entrypoints/cli"
+    cli.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    model = package / "diffusion/models/lingbot_world"
+    model.mkdir(parents=True)
+    (model / "pipeline.py").write_text("")
+    (cli / "main.py").write_text("raise ImportError('removed runtime API')\n" if broken else "def main(): pass\n")
     monkeypatch.setattr(prepare, "ROOT", tmp_path / "candidate")
-    # A candidate inherited from the job must not shadow the reference.
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "candidate"))
-    if broken_role:
-        with pytest.raises(RegressionError, match=f"{broken_role} serving import preflight failed"):
-            prepare.verify_source_imports(tmp_path / "reference")
+    if broken:
+        with pytest.raises(RegressionError, match="candidate serving import preflight failed"):
+            prepare.verify_source_imports()
     else:
-        prepare.verify_source_imports(tmp_path / "reference")
+        prepare.verify_source_imports()
 
 
 def test_evaluator_cache_isolated_by_code_weights_and_dependencies(tmp_path: Path):
@@ -283,9 +278,11 @@ def test_evaluator_cache_isolated_by_code_weights_and_dependencies(tmp_path: Pat
     (tmp_path / "requirements/lingbot-quality.txt").write_text("example==2\n")
     assert evaluator_cache_key(tmp_path) != initial
     (tmp_path / "requirements/lingbot-quality.txt").write_text("example==1\n")
-    (tmp_path / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json").write_text('{"revision": "different"}')
+    (tmp_path / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json").write_text('{"revision": "different"}')
     assert evaluator_cache_key(tmp_path) != initial
-    (tmp_path / "tests/e2e/accuracy/lingbot_world/evaluators.lock.json").write_text('{"repositories": {}, "files": {}}')
+    (tmp_path / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json").write_text(
+        '{"repositories": {}, "files": {}}'
+    )
     (tmp_path / "tests/e2e/accuracy/lingbot_world/opencv_provider.py").write_text(
         "# changed canonical provider policy\n"
     )
@@ -341,42 +338,6 @@ def test_ready_evaluator_is_never_resynced(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(RegressionError, match="fresh evaluator root"):
         prepare._prepare_evaluators(root)
     assert sum(command[:3] == ["uv", "pip", "sync"] for command in calls) == 1
-
-
-def test_activity_is_not_a_higher_is_better_quality_score():
-    result = check_quality(
-        [{"dynamic_degree": 0.1}] * 3,
-        {"dynamic_degree": 0.9},
-        tolerances={"dynamic_degree": 0.1},
-        activity_dimensions=("dynamic_degree",),
-    )
-    assert not result["passed"]
-
-
-@pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_every_configured_quality_dimension_rejects_a_collapse(platform):
-    limits = json.loads((ROOT / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
-    # Both pinned evaluators return these dimensions on a [0, 1] scale.
-    # A tolerance accidentally expressed as percentage points must not make
-    # a dimension incapable of blocking a regression.
-    for suite in ("vbench", "wbench"):
-        binary_dimensions = set(limits["binary_activity_dimensions"])
-        assert binary_dimensions == {"dynamic_degree"}
-        tolerances = limits["candidate_tolerances"][platform][suite]
-        assert set(tolerances) - binary_dimensions == set(limits["max_reference_spreads"][platform][suite])
-        for dimension, tolerance in tolerances.items():
-            if dimension in binary_dimensions:
-                assert not check_binary_activity([1, 1, 1], [0, 0, 0], tolerance=tolerance)["passed"]
-                assert not check_binary_activity([0, 0, 0], [1, 1, 1], tolerance=tolerance)["passed"]
-                continue
-            result = check_quality(
-                [{dimension: 0.9}] * 3,
-                {dimension: 0.0},
-                tolerances={dimension: tolerance},
-                activity_dimensions=("dynamic_degree",),
-                max_reference_spreads={dimension: limits["max_reference_spreads"][platform][suite][dimension]},
-            )
-            assert not result["passed"], (suite, dimension)
 
 
 def opencv_provider_installation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -12,7 +12,10 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from benchmarks.lingbot_world.encoder_inference import install_vbench_background_inference, verify_background_coverage
+from vllm_omni.benchmarks.realtime_video.encoder_inference import (
+    install_vbench_background_inference,
+    verify_background_coverage,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

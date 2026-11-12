@@ -626,6 +626,19 @@ def add_realtime_video_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--realtime-video-ping-interval", type=float, default=20.0)
     group.add_argument("--realtime-video-save-video", help="Save the last measured rollout without re-encoding.")
     group.add_argument("--realtime-video-print-chunks", action="store_true")
+    group.add_argument("--realtime-video-evaluate", choices=("precision", "wbench", "vbench"))
+    group.add_argument(
+        "--realtime-video-candidate", type=Path, help="Recorded candidate generation.json; no server is used."
+    )
+    group.add_argument(
+        "--realtime-video-record-only",
+        action="store_true",
+        help="Record numerical or semantic measurements; baseline comparison remains pending.",
+    )
+    group.add_argument("--realtime-video-eval-output-dir", type=Path, default=Path("realtime-video-evaluation"))
+    group.add_argument("--realtime-video-evaluator-root", type=Path)
+    group.add_argument("--realtime-video-evaluator-python", type=Path)
+    group.add_argument("--realtime-video-evaluator-requirements", type=Path)
 
 
 def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
@@ -676,6 +689,21 @@ def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
         args.model = DEFAULT_MODEL
     if args.base_url is not None:
         args.base_url = realtime_video_base_url(args.base_url)
+    if args.realtime_video_evaluate or args.realtime_video_candidate or args.realtime_video_record_only:
+        if not args.realtime_video_record_only or not args.realtime_video_evaluate or not args.realtime_video_candidate:
+            raise ValueError(
+                "Realtime-video accuracy currently requires --realtime-video-record-only, "
+                "--realtime-video-evaluate SUITE and --realtime-video-candidate generation.json; "
+                "recorded baseline comparison will be added separately"
+            )
+        if args.realtime_video_evaluate != "precision" and not all(
+            (
+                args.realtime_video_evaluator_root,
+                args.realtime_video_evaluator_python,
+                args.realtime_video_evaluator_requirements,
+            )
+        ):
+            raise ValueError("Semantic recording requires evaluator root, Python and requirements lock")
 
 
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
@@ -693,7 +721,13 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
-    if getattr(args, "backend", None) == "realtime-video" or getattr(args, "dataset_name", None) == "realtime-video":
+    if (
+        getattr(args, "backend", None) == "realtime-video"
+        or getattr(args, "dataset_name", None) == "realtime-video"
+        or getattr(args, "realtime_video_evaluate", None)
+        or getattr(args, "realtime_video_record_only", False)
+        or getattr(args, "realtime_video_candidate", None)
+    ):
         _preprocess_realtime_video_args(args)
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
         if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":

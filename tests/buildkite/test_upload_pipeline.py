@@ -1235,11 +1235,14 @@ def test_qwen_image_21_accuracy_model_dependencies(
     "changed_path,roles",
     [
         ("vllm_omni/benchmarks/realtime_video/client.py", {"performance", "accuracy"}),
+        ("vllm_omni/benchmarks/realtime_video/evaluators.lock.json", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/serve.py", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/patch/patch.py", {"performance", "accuracy"}),
         ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", {"performance", "accuracy"}),
         ("tests/dfx/perf/tests/test_lingbot_world_realtime.json", {"performance"}),
         ("tests/e2e/accuracy/lingbot_world/test_precision.py", {"accuracy"}),
+        ("tests/benchmarks/test_realtime_video_eval.py", {"accuracy"}),
+        ("pyproject.toml", {"accuracy"}),
         ("requirements/lingbot-quality.txt", {"accuracy"}),
         ("requirements/lingbot-quality.in", {"accuracy"}),
         ("vllm_omni/benchmarks/audio_continuity.py", set()),
@@ -1281,6 +1284,10 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
     assert _gpu_limit(accuracy) == 2
     assert accuracy["agents"]["queue"] == "mithril-h100-pool"
+    assert "Recording" in perf["label"] and "Baseline Pending" in perf["label"]
+    assert "Recording" in accuracy["label"] and "Baseline Pending" in accuracy["label"]
+    assert accuracy["timeout_in_minutes"] == 120
+    assert "--lingbot-record-only" in " ".join(accuracy["commands"])
     for name in ("precision", "wbench", "vbench"):
         assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in " ".join(accuracy["commands"])
     retry = _load_mirror_hardwares()["h100_2"]["retry"]
@@ -1289,6 +1296,8 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
         assert "run_ci.sh" not in " ".join(job.get("commands", []))
         if "plugins" in job:
             assert job["retry"] == retry
+        if "accuracy" in job["key"]:
+            assert job["timeout_in_minutes"] <= 120
     if platform == "cuda":
         assert len(jobs) == 2
         assert _gpu_limit(perf) == 2
@@ -1299,11 +1308,70 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
         capture = jobs["lingbot-npu-nightly-accuracy-data"]
         assert capture["agents"] == perf["agents"]
         assert "prepare capture" in " ".join(capture["commands"])
+        assert "--record-only" in " ".join(capture["commands"])
         assert accuracy["depends_on"] == [
             {"step": "lingbot-npu-nightly-accuracy-data", "allow_failure": True},
             "lingbot-npu-accuracy-ci-image",
         ]
         assert "--lingbot-generation=lingbot-artifacts/npu-accuracy" in " ".join(accuracy["commands"])
+
+
+@pytest.mark.parametrize("platform,download_exit", [("cuda", 0), ("npu", 0), ("npu", 1)])
+@pytest.mark.parametrize("pytest_exit", [0, 1])
+def test_lingbot_recording_commands_preserve_independent_checks_and_failure_status(
+    tmp_path, monkeypatch, platform, download_exit, pytest_exit
+):
+    """A missing NPU download reaches the three tests' own input diagnosis."""
+    path = Path(f".buildkite/{platform}/{'test-npu-nightly.yml' if platform == 'npu' else 'test-nightly.yml'}")
+    job = next(
+        step
+        for step in _iter_steps(yaml.safe_load(path.read_text()))
+        if step.get("key") == f"lingbot-{platform}-nightly-accuracy"
+    )
+    calls_path = tmp_path / "calls.jsonl"
+    for name, exit_code in (("pytest", pytest_exit), ("buildkite-agent", download_exit)):
+        executable = tmp_path / name
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "with open(os.environ['LINGBOT_COMMAND_CALLS'], 'a') as output:\n"
+            "    output.write(json.dumps({'tool': Path(sys.argv[0]).name, 'args': sys.argv[1:]}) + '\\n')\n"
+            f"sys.exit({exit_code})\n"
+        )
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("LINGBOT_COMMAND_CALLS", str(calls_path))
+    result = subprocess.run(
+        ["/bin/sh", "-e", "-c", "\n".join(job["commands"])],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == pytest_exit, result.stderr
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    pytest_args = calls[-1]["args"]
+    assert calls[-1]["tool"] == "pytest"
+    assert "--lingbot-record-only" in pytest_args
+    for name in ("precision", "wbench", "vbench"):
+        assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in pytest_args
+    assert not any("baseline" in arg or "reference" in arg for arg in pytest_args)
+    if platform == "npu":
+        assert calls[0]["tool"] == "buildkite-agent"
+        assert calls[0]["args"] == [
+            "artifact",
+            "download",
+            "lingbot-artifacts/npu-accuracy/**",
+            ".",
+            "--step",
+            "lingbot-npu-nightly-accuracy-data",
+        ]
+        assert "--lingbot-generation=lingbot-artifacts/npu-accuracy" in pytest_args
+        if download_exit:
+            assert "each test will validate its required inputs" in result.stdout
+    else:
+        assert len(calls) == 1
 
 
 def test_lingbot_weekly_and_eight_device_reservations_are_absent(monkeypatch):

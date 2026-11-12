@@ -63,19 +63,27 @@ eight-chunk warmup; six attention-window chunks and the terminal chunk are
 excluded from steady cadence. Readiness does not inject an unrecorded full
 rollout. The 12 FPS playback target is a measurement basis, not an absolute
 acceptance gate. Missing real baseline numbers remain an explicit gap.
+Until matching measured values are reviewed, the LingBot World performance jobs
+are explicitly labeled as recording with a baseline pending.
 
 `tests/e2e/accuracy/lingbot_world` contains three independent numerical, WBench
-and VBench tests. A session fixture records real accuracy reference/candidate
-inputs without judging them. Three fresh starts retain the original pixel and
-semantic repeatability/activity rules; no performance verdict depends on them.
-Each test checks its own complete input population, writes its own accuracy JSON
-before asserting, and does not read another test's verdict. Numerical checks
-retain fixed VAE samples and full-video/window/content checks; native evaluators
-retain per-dimension/binary limits and complete frame coverage.
+and VBench tests. The temporary **record-only** CI captures one candidate server
+lifetime, one fixed VAE replay and one 40-chunk video per existing case, with
+excluded warmup. It does not check out or restart a live official reference.
+After generation releases its server, the packaged `vllm bench serve --omni`
+evaluation path records actual numerical and native WBench/VBench measurements.
+Each test validates its own complete input population, prints measured values
+and writes its own accuracy JSON before asserting. It does not read another
+test's verdict. Raw tensors, complete videos and per-dimension/binary scores
+remain CI artifacts for a follow-up PR to pin reviewed measured baselines.
+Recording success is explicitly marked as baseline pending and does not
+establish an accuracy regression pass; generation and evaluator errors still
+fail. No performance verdict depends on accuracy recording.
 
 CUDA generation uses two H100 GPUs and SP=2. NPU uses its existing four-device A2
 profile, followed by CUDA evaluation; result metadata distinguishes generation
-and evaluator hardware. There is no long-stability, cohort, held-out or external
-calibration-delivery workflow. CPU tests/rendering establish implementation
-contracts; matching-source native runs are still needed to establish actual
-accuracy, performance and capacity.
+and evaluator hardware. Every accuracy leaf has a timeout of at most 120
+minutes, expressing a configured bound rather than a measured duration. There
+is no long-stability, cohort, held-out or external calibration-delivery workflow.
+CPU tests/rendering establish implementation contracts; matching-source native
+runs are still needed to establish actual accuracy, performance and capacity.

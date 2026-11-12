@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Generate real accuracy references; each pytest case judges its own inputs."""
+"""Capture one candidate lifetime for temporary accuracy recording."""
 
 from __future__ import annotations
 
@@ -10,20 +10,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from benchmarks.lingbot_world.regression import RegressionError, read_json, sha256, write_json
 from vllm_omni.benchmarks.realtime_video.client import resolve_image_reference
+from vllm_omni.benchmarks.realtime_video.eval import read_json, sha256, write_json
+from vllm_omni.benchmarks.realtime_video.metrics import RegressionError
 
 ROOT = Path(__file__).resolve().parents[4]
 ENGINE_ENVIRONMENT = {"VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0", "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0"}
-CAPTURE_RECIPE = {"independent_starts_per_source": 3, "sessions_per_case": 1}
+CAPTURE_RECIPE = {"candidate_starts": 1, "sessions_per_case": 1}
 
 
-def load_settings(profile: Path, output: Path, *, reference_root=None, generation=None):
+def load_settings(profile: Path, output: Path, *, generation=None):
     settings = read_json(profile)
     settings.update(
         profile_path=profile.resolve(),
         output=output.resolve(),
-        reference_root=reference_root,
         generation=generation,
     )
     return settings
@@ -91,8 +91,8 @@ def git_revision(root: Path) -> str:
     return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
 
 
-def record_benchmark_revisions(document: dict[str, Any], source: Path) -> None:
-    """Bind client measurements to this harness and the separate server source."""
+def record_benchmark_revisions(document: dict[str, Any]) -> None:
+    """Bind both client and candidate server measurements to this source."""
     revision = git_revision(ROOT)
     if "git_revision" not in document or document["git_revision"] not in (None, revision):
         raise RegressionError("Benchmark client revision differs from the attested harness")
@@ -100,7 +100,7 @@ def record_benchmark_revisions(document: dict[str, Any], source: Path) -> None:
     # None. This harness can attest its image's full Buildkite commit without
     # letting an installed standalone wheel claim an unrelated checkout.
     document["git_revision"] = revision
-    document["server_revision"] = git_revision(source)
+    document["server_revision"] = revision
 
 
 def checked_assets(settings: dict[str, Any]) -> tuple[Path, dict[str, Path]]:
@@ -127,26 +127,11 @@ def checked_assets(settings: dict[str, Any]) -> tuple[Path, dict[str, Path]]:
     return model, images
 
 
-def validate_reference(settings: dict[str, Any]) -> Path:
-    root = settings["reference_root"]
-    if root is None:
-        raise RegressionError("Accuracy generation requires the pinned reference checkout")
-    root = root.resolve()
-    if root == ROOT or git_revision(root) != settings["reference_revision"]:
-        raise RegressionError("Reference must be a separate checkout at the frozen revision")
-    dirty = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True)
-    if dirty.strip():
-        raise RegressionError("Reference checkout must be clean")
-    return root
-
-
-def _capture(source: Path, model: Path, destination: Path, settings: dict[str, Any]) -> None:
+def _capture(model: Path, destination: Path, settings: dict[str, Any]) -> None:
     subprocess.run(
         [
             sys.executable,
             str(Path(__file__).with_name("capture_precision.py")),
-            "--source-root",
-            str(source),
             "--model",
             str(model),
             "--output",
@@ -158,8 +143,8 @@ def _capture(source: Path, model: Path, destination: Path, settings: dict[str, A
         ],
         check=True,
         timeout=settings["precision_timeout_s"],
-        cwd=source,
-        env={**os.environ, **server_environment(source, cpu_threads=settings.get("cpu_threads_per_worker"))},
+        cwd=ROOT,
+        env={**os.environ, **server_environment(ROOT, cpu_threads=settings.get("cpu_threads_per_worker"))},
     )
 
 
@@ -232,19 +217,27 @@ def benchmark_args(server, settings, case, destination):
     )
 
 
-def generation_paths(settings, repeats=range(3)):
+def generation_paths(settings):
     return {
-        f"{role}/{repeat}/{name}"
-        for role in ("reference", "candidate")
-        for repeat in repeats
-        for name in [
-            "precision.npz",
-            *[
-                f"{case['id']}/{file}"
-                for case in settings["cases"]
-                for file in ("serve-result.json", "benchmark.json", "rollout.mp4")
-            ],
-        ]
+        "candidate/precision.npz",
+        "candidate/cleanup.json",
+        *{
+            f"candidate/{case['id']}/{file}"
+            for case in settings["cases"]
+            for file in ("serve-result.json", "benchmark.json", "rollout.mp4")
+        },
+    }
+
+
+def generation_contract(settings):
+    """Retain model, workload and topology identity with raw candidate data."""
+    return {
+        "profile": read_json(settings["profile_path"]),
+        "capture_recipe": dict(CAPTURE_RECIPE),
+        "model_assets_sha256": sha256(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json"),
+        "deploy_sha256": sha256(ROOT / settings["deploy_config"]),
+        "engine_environment": dict(ENGINE_ENVIRONMENT),
+        "hardware": {name: settings[name] for name in ("platform", "hardware", "cards", "dies")},
     }
 
 
@@ -252,117 +245,71 @@ def collect_measurements(settings):
     from tests.helpers.runtime import OmniServer
 
     output = settings["output"]
-    if any((output / role).exists() for role in ("reference", "candidate")):
+    if (output / "candidate").exists():
         raise RegressionError("Use a fresh measurement output")
     model, images = checked_assets(settings)
-    reference = validate_reference(settings)
-    repeats = range(3)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "kind": "realtime-video-accuracy-candidate",
         "complete": False,
         "candidate_revision": git_revision(ROOT),
-        "reference_revision": settings["reference_revision"],
-        "contract": {
-            "hardware": hardware_contract(settings),
-            "profile": read_json(settings["profile_path"]),
-            "capture_recipe": dict(CAPTURE_RECIPE),
-            "model_assets_sha256": sha256(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json"),
-            "deploy_sha256": sha256(ROOT / settings["deploy_config"]),
-            "engine_environment": dict(ENGINE_ENVIRONMENT),
-        },
+        "contract": generation_contract(settings),
+        "hardware": hardware_contract(settings),
         "errors": [],
         "artifacts": {},
     }
     write_json(output / "generation.json", report)
-    for repeat in repeats:
-        for role in ("reference", "candidate") if repeat % 2 == 0 else ("candidate", "reference"):
-            source = reference if role == "reference" else ROOT
-            arm = output / role / str(repeat)
-            arm.mkdir(parents=True)
-            try:
-                _capture(source, model, arm / "precision.npz", settings)
-            except (OSError, subprocess.SubprocessError) as error:
-                report["errors"].append({"role": role, "repeat": repeat, "component": "precision", "error": str(error)})
-            try:
-                with OmniServer(
-                    str(model),
-                    server_arguments(settings),
-                    source_root=str(source),
-                    env_dict=server_environment(source, cpu_threads=settings.get("cpu_threads_per_worker")),
-                    startup_timeout=settings["startup_timeout_s"],
-                ) as server:
-                    for case in settings["cases"]:
-                        destination = arm / case["id"]
-                        destination.mkdir()
-                        try:
-                            from vllm_omni.benchmarks.serve import main as bench_serve
+    arm = output / "candidate"
+    arm.mkdir(parents=True)
+    try:
+        _capture(model, arm / "precision.npz", settings)
+    except (OSError, subprocess.SubprocessError) as error:
+        report["errors"].append({"component": "precision", "error": str(error)})
+    try:
+        with OmniServer(
+            str(model),
+            server_arguments(settings),
+            env_dict=server_environment(ROOT, cpu_threads=settings.get("cpu_threads_per_worker")),
+            startup_timeout=settings["startup_timeout_s"],
+        ) as server:
+            for case in settings["cases"]:
+                destination = arm / case["id"]
+                destination.mkdir()
+                try:
+                    from vllm_omni.benchmarks.serve import main as bench_serve
 
-                            result = bench_serve(
-                                benchmark_args(server, settings, {**case, "path": images[case["image"]]}, destination)
-                            )
-                            document = result["realtime_video"]
-                            record_benchmark_revisions(document, source)
-                            write_json(destination / "benchmark.json", document)
-                            if not document["passed"]:
-                                raise RegressionError(f"Incomplete realtime-video measurement: {document['errors']}")
-                        except Exception as error:
-                            report["errors"].append(
-                                {
-                                    "role": role,
-                                    "repeat": repeat,
-                                    "case": case["id"],
-                                    "component": "stream",
-                                    "error": str(error),
-                                }
-                            )
-            except Exception as error:
-                report["errors"].append({"role": role, "repeat": repeat, "component": "server", "error": str(error)})
-            try:
-                assert_device_cleanup(settings["dies"], arm / "cleanup.json")
-            except Exception as error:
-                report["errors"].append({"role": role, "repeat": repeat, "component": "cleanup", "error": str(error)})
-            report["artifacts"] = {
-                str(p.relative_to(output)): sha256(p)
-                for role in ("reference", "candidate")
-                for p in (output / role).rglob("*")
-                if p.is_file()
-            }
-            write_json(output / "generation.json", report)
-    report["complete"] = not report["errors"] and generation_paths(settings, repeats) <= report["artifacts"].keys()
+                    result = bench_serve(
+                        benchmark_args(server, settings, {**case, "path": images[case["image"]]}, destination)
+                    )
+                    document = result["realtime_video"]
+                    record_benchmark_revisions(document)
+                    write_json(destination / "benchmark.json", document)
+                    if not document["passed"]:
+                        raise RegressionError(f"Incomplete realtime-video measurement: {document['errors']}")
+                except Exception as error:
+                    # Preserve partial inputs so each independent scorer can
+                    # diagnose its own missing/incomplete case after shutdown.
+                    report["errors"].append({"case": case["id"], "component": "stream", "error": str(error)})
+    except Exception as error:
+        report["errors"].append({"component": "server", "error": str(error)})
+    try:
+        assert_device_cleanup(settings["dies"], arm / "cleanup.json")
+    except Exception as error:
+        report["errors"].append({"component": "cleanup", "error": str(error)})
+    report["artifacts"] = {str(p.relative_to(output)): sha256(p) for p in arm.rglob("*") if p.is_file()}
+    report["complete"] = not report["errors"] and generation_paths(settings) <= report["artifacts"].keys()
     write_json(output / "generation.json", report)
     return report
 
 
 def validate_manifest(settings, manifest):
-    contract = manifest.get("contract", {})
-    hardware = contract.get("hardware", {})
     if (
-        manifest.get("schema_version") != 1
+        manifest.get("schema_version") != 2
+        or manifest.get("kind") != "realtime-video-accuracy-candidate"
         or manifest.get("candidate_revision") != git_revision(ROOT)
-        or manifest.get("reference_revision") != settings["reference_revision"]
-        or contract.get("profile") != read_json(settings["profile_path"])
-        or contract.get("capture_recipe") != CAPTURE_RECIPE
-        or contract.get("model_assets_sha256") != sha256(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")
-        or hardware.get("platform") != settings["platform"]
-        or hardware.get("cards") != settings["cards"]
-        or hardware.get("dies") != settings["dies"]
-        or len(hardware.get("devices", [])) != settings["dies"]
-        or contract.get("deploy_sha256") != sha256(ROOT / settings["deploy_config"])
-        or contract.get("engine_environment") != ENGINE_ENVIRONMENT
+        or manifest.get("contract") != generation_contract(settings)
     ):
         raise RegressionError("Measurement source/profile/runtime contract mismatch")
-
-
-def checked_artifact(root, manifest, name):
-    relative = Path(name)
-    if relative.is_absolute() or ".." in relative.parts or name not in manifest.get("artifacts", {}):
-        raise RegressionError(f"Missing or unsafe measurement artifact: {name}")
-    path = root / relative
-    if not path.resolve().is_relative_to(root.resolve()):
-        raise RegressionError("Artifact escapes the measurement directory")
-    if sha256(path) != manifest["artifacts"][name]:
-        raise RegressionError(f"Measurement artifact checksum mismatch: {name}")
-    return path
 
 
 def measurement_data(settings):

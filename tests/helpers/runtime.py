@@ -193,11 +193,9 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
-        source_root: str | None = None,
     ) -> None:
         cleanup_test_environment()
         self.startup_timeout = startup_timeout
-        self.source_root = source_root or _omni_subprocess_cwd()
         self.model = model
         self.serve_args = list(serve_args)
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
@@ -287,7 +285,7 @@ class OmniServer:
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=self.source_root,
+            cwd=_omni_subprocess_cwd(),
             stderr=subprocess.PIPE,
             encoding="utf-8",
             errors="replace",

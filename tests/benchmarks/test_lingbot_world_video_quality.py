@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,8 +13,7 @@ from typing import Any
 
 import pytest
 
-from benchmarks.lingbot_world import video_quality as quality
-from benchmarks.lingbot_world.regression import RegressionError, check_video_precision
+from vllm_omni.benchmarks.realtime_video import video_quality as quality
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -29,155 +29,6 @@ def _write_video(path: Path, levels: list[int], *, fps: int = 4, size: tuple[int
             writer.write(np.full((size[1], size[0], 3), level, dtype=np.uint8))
     finally:
         writer.release()
-
-
-def test_video_windows_reveal_late_drift(tmp_path: Path) -> None:
-    reference, candidate = tmp_path / "reference.avi", tmp_path / "candidate.avi"
-    _write_video(reference, [40] * 12)
-    _write_video(candidate, [40] * 4 + [60] * 4 + [100] * 4)
-    result = quality.compare_video_pair(reference, candidate, window_seconds=1)
-    assert result["reference"]["frame_count"] == result["decoded_frames"] == 12
-    assert result["candidate"]["duration_s"] == 3
-    assert [window["frame_count"] for window in result["windows"]] == [4, 4, 4]
-    assert [window["mae"] for window in result["windows"]] == pytest.approx([0, 20, 60], abs=2)
-    assert result["windows"][0]["psnr_is_infinite"] is True
-    assert result["windows"][1]["psnr_db"] > result["windows"][2]["psnr_db"]
-    assert result["total"]["different_frames"] == 8
-    assert result["baseline_repeat_required"] is True
-    json.dumps(result, allow_nan=False)
-
-
-def _write_textured_video(path: Path, base: int, *, corrupt_tail: bool = False) -> None:
-    cv2 = pytest.importorskip("cv2")
-    np = pytest.importorskip("numpy")
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 16, (32, 24))
-    if not writer.isOpened():
-        pytest.skip("OpenCV MJPEG encoder unavailable")
-    y, x = np.indices((24, 32))
-    texture = ((x * 3 + y * 5) % 40).astype(np.uint8)
-    image = np.stack([texture + base, texture + base + 5, texture + base + 10], axis=-1)
-    try:
-        for index in range(160):
-            frame = np.roll(image, index % 32, axis=1)
-            writer.write(np.zeros_like(frame) if corrupt_tail and index >= 128 else frame)
-    finally:
-        writer.release()
-
-
-def _pixel_packages() -> dict[str, str]:
-    from importlib.metadata import version
-
-    return {name: version(name) for name in ("numpy", "opencv-python", "scikit-image")}
-
-
-@pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_noisy_reference_budget_cannot_hide_a_spatially_empty_window(tmp_path: Path, platform: str) -> None:
-    paths = [tmp_path / f"reference-{index}.avi" for index in range(3)]
-    for path, base in zip(paths, (20, 160, 90)):
-        _write_textured_video(path, base)
-    references = [
-        quality.compare_video_pair(paths[a], paths[b], window_seconds=2, ssim_stride=24)
-        for a, b in ((0, 1), (0, 2), (1, 2))
-    ]
-    candidate = tmp_path / "late-black-window.avi"
-    _write_textured_video(candidate, 20, corrupt_tail=True)
-    measured = quality.compare_video_pair(paths[0], candidate, window_seconds=2, ssim_stride=24)
-    assert measured["uniform_frame_indices"]["reference"] == []
-    assert measured["uniform_frame_indices"]["candidate"] == list(range(128, 160))
-    policy = json.loads((Path(__file__).parents[2] / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
-    options = {"min_psnr_db": policy["min_psnr_db"], **policy["pixel_budgets"][platform]}
-    assert check_video_precision(references, measured, **options)["passed"]
-    strict = {**options, "reject_uniform_frames": policy["reject_uniform_frames"]}
-    check = check_video_precision(references, measured, **strict)
-    assert not check["passed"] and any("uniform" in violation for violation in check["violations"])
-    assert check_video_precision(references, references[0], **strict)["passed"]
-
-
-def test_identically_blank_reference_and_candidate_cannot_pass_content_validation(tmp_path: Path) -> None:
-    path = tmp_path / "blank.avi"
-    _write_video(path, [0] * 16)
-    pair = quality.compare_video_pair(path, path, window_seconds=2, ssim_stride=8)
-    options = {"min_psnr_db": 40, "psnr_drop_db": 3, "ssim_drop": 0.04}
-    assert check_video_precision([pair] * 3, pair, **options)["passed"]
-    check = check_video_precision([pair] * 3, pair, reject_uniform_frames=True, **options)
-    assert not check["passed"] and all("uniform" in violation for violation in check["violations"])
-
-
-def test_selected_content_validation_requires_decoded_frame_evidence(tmp_path: Path) -> None:
-    path = tmp_path / "valid.avi"
-    _write_textured_video(path, 20)
-    pair = quality.compare_video_pair(path, path, window_seconds=2, ssim_stride=24)
-    missing = {key: value for key, value in pair.items() if key != "uniform_frame_indices"}
-    with pytest.raises(RegressionError, match="uniform-frame coverage"):
-        check_video_precision(
-            [pair] * 3, missing, reject_uniform_frames=True, min_psnr_db=40, psnr_drop_db=3, ssim_drop=0.04
-        )
-
-
-@pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_late_corruption_fails_even_when_global_pixel_scores_pass(tmp_path: Path, platform: str) -> None:
-    reference, candidate = tmp_path / "reference.avi", tmp_path / "candidate.avi"
-    _write_video(reference, [40] * 512, fps=16)
-    _write_video(candidate, [40] * 504 + [60] * 8, fps=16)
-    repeats = [quality.compare_video_pair(reference, reference, window_seconds=2, ssim_stride=16)] * 3
-    measured = quality.compare_video_pair(reference, candidate, window_seconds=2, ssim_stride=16)
-    assert measured["total"]["psnr_db"] > 40
-    assert measured["ssim"]["mean"] >= 0.99
-    limits = json.loads((Path(__file__).parents[2] / "tests/e2e/accuracy/lingbot_world/quality.json").read_text())
-    result = check_video_precision(
-        repeats,
-        measured,
-        min_psnr_db=limits["min_psnr_db"],
-        **limits["pixel_budgets"][platform],
-    )
-    assert not result["passed"]
-    assert result["psnr"][0]["passed"]
-    assert "window 15" in result["violations"][0]
-
-
-def test_pixel_gate_rejects_incomplete_window_coverage(tmp_path: Path) -> None:
-    reference = tmp_path / "reference.avi"
-    _write_video(reference, [40] * 16)
-    measured = quality.compare_video_pair(reference, reference, ssim_stride=4)
-    assert check_video_precision([measured] * 2, measured, min_psnr_db=40, psnr_drop_db=1, ssim_drop=0.01)["passed"]
-    with pytest.raises(RegressionError, match="same frames"):
-        check_video_precision(
-            [measured, {**measured, "windows": []}],
-            measured,
-            min_psnr_db=40,
-            psnr_drop_db=1,
-            ssim_drop=0.01,
-        )
-
-
-@pytest.mark.parametrize("change", ["length", "fps", "geometry"])
-def test_video_pair_rejects_metadata_mismatches(tmp_path: Path, change: str) -> None:
-    reference, candidate = tmp_path / "reference.avi", tmp_path / "candidate.avi"
-    _write_video(reference, [40] * 8)
-    _write_video(
-        candidate,
-        [40] * (4 if change == "length" else 8),
-        fps=8 if change == "fps" else 4,
-        size=(48, 24) if change == "geometry" else (32, 24),
-    )
-    with pytest.raises(quality.VideoQualityError, match="mismatch"):
-        quality.compare_video_pair(reference, candidate)
-
-
-def test_truncated_real_video_cannot_pass_on_matching_headers(tmp_path: Path) -> None:
-    reference, truncated = tmp_path / "reference.avi", tmp_path / "truncated.avi"
-    _write_video(reference, [40] * 20)
-    content = reference.read_bytes()
-    truncated.write_bytes(content[: len(content) // 2])
-    with pytest.raises(quality.VideoQualityError):
-        quality.compare_video_pair(reference, truncated)
-
-
-def test_video_pair_rejects_empty_video(tmp_path: Path) -> None:
-    video = tmp_path / "empty.avi"
-    video.write_bytes(b"")
-    with pytest.raises(quality.VideoQualityError, match="Cannot open|Empty"):
-        quality.compare_video_pair(video, video)
 
 
 @pytest.fixture
@@ -433,3 +284,65 @@ def test_semantic_video_coverage_checks_its_own_full_input(tmp_path):
     assert quality.verify_video_coverage(path, frames=3, width=32, height=24, fps=4)["decoded_frames"] == 3
     with pytest.raises(quality.VideoQualityError):
         quality.verify_video_coverage(path, frames=4, width=32, height=24, fps=4)
+
+
+@pytest.mark.parametrize("wrong_adapter_hash", [False, True])
+def test_isolated_background_worker_loads_only_the_pinned_adapter_file(tmp_path, wrong_adapter_hash):
+    """The evaluator venv has neither vLLM nor the Omni runtime dependencies."""
+    repo, output = tmp_path / "native-fixture", tmp_path / "run"
+    (repo / "vbench").mkdir(parents=True)
+    output.mkdir()
+    (repo / "torch.py").write_text("def device(value): return value\n")
+    (repo / "vbench/background_consistency.py").write_text(
+        "from types import SimpleNamespace\n"
+        "def load(*args, **kwargs): raise AssertionError('native loader is not used in CPU fixture')\n"
+        "clip = SimpleNamespace(load=load)\n"
+    )
+    (repo / "vbench/__init__.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        "class VBench:\n"
+        "    def __init__(self, device, info, output): self.output = Path(output)\n"
+        "    def evaluate(self, stage, name, dimension_list, **kwargs):\n"
+        "        from . import background_consistency as background\n"
+        "        assert background._lingbot_clip_inference_stats['gradients'] is False\n"
+        "        assert background.clip.load.__module__ == 'video_encoder_adapter'\n"
+        "        video = next(Path(stage).glob('*.mp4'))\n"
+        "        raw = {'background_consistency': [0.8, [{'video_path': str(video), 'video_results': 0.8}]]}\n"
+        "        (self.output / (name + '_eval_results.json')).write_text(json.dumps(raw))\n"
+    )
+    video = tmp_path / "cpu-fixture.mp4"
+    video.write_bytes(b"scripted evaluator fixture, not an actual native video")
+    adapter = Path(quality.__file__).with_name("encoder_inference.py").resolve()
+    digest = hashlib.sha256(adapter.read_bytes()).hexdigest()
+    manifest = {
+        "repo": str(repo),
+        "run_dir": str(output),
+        "suite": "vbench",
+        "mode": "custom_input",
+        "dimensions": ["background_consistency"],
+        "videos": {"cpu-fixture": str(video)},
+        "encoder_adapter": str(adapter),
+        "protocol": {"background_clip_inference": {"adapter_sha256": "0" * 64 if wrong_adapter_hash else digest}},
+    }
+    path = output / "inputs.json"
+    path.write_text(json.dumps(manifest))
+    # -I ignores inherited PYTHONPATH and -S removes site-packages: only the
+    # stdlib, explicit fake native repository and hash-checked adapter can load.
+    worker = (
+        "import importlib.util\nassert importlib.util.find_spec('vllm_omni') is None\n"
+        + quality._EVALUATOR_WORKER
+        + "\nassert 'vllm_omni' not in sys.modules\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", worker, str(path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    raw = json.loads((output / "worker_result.json").read_text())
+    if wrong_adapter_hash:
+        assert not raw["scores"] and "differs from the recorded source" in raw["errors"][0]
+    else:
+        assert raw["errors"] == []
+        assert raw["scores"] == {"cpu-fixture": {"background_consistency": 0.8}}

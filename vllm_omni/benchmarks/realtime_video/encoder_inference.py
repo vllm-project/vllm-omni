@@ -75,6 +75,6 @@ def install_vbench_background_inference() -> dict[str, Any]:
 
     # Only this native metric sees the loader adapter. Aesthetics/HPS and the
     # installed clip module retain their own native inference paths.
-    background.clip = SimpleNamespace(load=load)
-    background._lingbot_clip_inference_stats = stats
+    setattr(background, "clip", SimpleNamespace(load=load))
+    setattr(background, "_lingbot_clip_inference_stats", stats)
     return stats

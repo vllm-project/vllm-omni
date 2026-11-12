@@ -75,6 +75,12 @@ def _validate_fail_fast_on_timeout(args: argparse.Namespace) -> None:
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     """Run the common serving lifecycle from async protocol/CI callers too."""
+    if getattr(args, "realtime_video_evaluate", None):
+        # Saved outputs are scored after the generation server has released its
+        # devices; no server discovery, tokenizer or benchmark traffic is needed.
+        from vllm_omni.benchmarks.realtime_video.eval import evaluate_from_args
+
+        return await asyncio.to_thread(evaluate_from_args, args)
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):

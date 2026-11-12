@@ -6,14 +6,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import sys
 import tempfile
 from pathlib import Path
 
 
 def load_capture_format():
-    # Format belongs to the candidate harness, not the selected model checkout.
-    helper = Path(__file__).resolve().parents[4] / "benchmarks/lingbot_world/precision.py"
+    helper = Path(__file__).resolve().parents[4] / "vllm_omni/benchmarks/realtime_video/precision.py"
     spec = importlib.util.spec_from_file_location("lingbot_capture_format", helper)
     assert spec is not None and spec.loader is not None
     precision = importlib.util.module_from_spec(spec)
@@ -23,16 +21,12 @@ def load_capture_format():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     args = parser.parse_args()
-    # The capture format comes from the candidate harness; model implementation
-    # must come from the selected reference/candidate checkout.
     precision = load_capture_format()
-    sys.path.insert(0, str(args.source_root.resolve()))
 
     import torch
 
