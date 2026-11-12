@@ -184,20 +184,18 @@ platforms:
     cuda_mps: true
     stages:
       - stage_id: 0
-        # Preserve the native normalization rounding for long-context duplex.
-        # The CUDA fused norm path can flip close text/EOS decisions before a
-        # scene description reaches its number. Keep activation kernels enabled.
+        # Use the existing CUDA operators for Thinker normalization and activation.
+        # Keep the checkpoint's model head dtype and the other stages unchanged.
         kernel_config:
           ir_op_priority:
-            rms_norm: [native]
-            fused_add_rms_norm: [native]
+            rms_norm: [vllm_c, native]
+            fused_add_rms_norm: [vllm_c, native]
         compilation_config:
           custom_ops: [none, +silu_and_mul, +rotary_embedding]
           pass_config:
             fuse_norm_quant: false
             fuse_act_quant: false
-            # This fusion would bypass the native Q/K normalization above.
-            enable_qk_norm_rope_fusion: false
+            enable_qk_norm_rope_fusion: true
         # Match the CUDA Thinker backend used for Transformers accuracy validation.
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN

@@ -67,7 +67,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
         "import json, os, sys\n"
         "with open(os.environ['PYTEST_CALLS'], 'w') as output:\n"
         "    json.dump(sys.argv[1:], output)\n"
-        "print('MINICPMO_DUPLEX_TRACE test')\n"
+        "print('pytest-stdout')\n"
         "print('pytest-stderr', file=sys.stderr)\n"
         "sys.exit(int(os.environ['PYTEST_EXIT']))\n"
     )
@@ -87,7 +87,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
     assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
     log = tmp_path / "tests/e2e/online_serving/results/minicpmo_duplex/server.log"
-    assert "MINICPMO_DUPLEX_TRACE test" in log.read_text()
+    assert "pytest-stdout" in log.read_text()
     assert "pytest-stderr" in log.read_text()
 
 

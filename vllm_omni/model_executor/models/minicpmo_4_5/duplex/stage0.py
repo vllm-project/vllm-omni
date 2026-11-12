@@ -20,7 +20,6 @@ from numpy.typing import NDArray
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.diagnostics import emit_trace, trace_enabled
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
 if TYPE_CHECKING:
@@ -424,7 +423,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             return result
         state.attempted_append_identity = append_identity
         self._require_special_token_ids()
-        worker_pending_terminator = state.pending_terminator_token
         if isinstance(stage0_window, dict):
             completed_ids = stage0_window.get("completed_token_ids")
             if isinstance(completed_ids, list):
@@ -519,7 +517,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                     processor=processor,
                 )
                 state.audio_encoder_chunk_idx += 1
-            injected_terminator = None
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
@@ -530,7 +527,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                 pending_terminator = state.pending_terminator_token
                 closure_token_ids: list[int] = []
                 if pending_terminator is not None and units_built == 0:
-                    injected_terminator = int(pending_terminator)
                     state.pending_terminator_token = None
                     embed_parts.append(self._embed_token(pending_terminator))
                     token_ids.append(int(pending_terminator))
@@ -548,7 +544,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                     state.pending_window_unit.token_ids.extend(closure_token_ids)
             unit_embed_start = len(embed_parts)
             unit_token_start = len(token_ids)
-            unit_num_frames = len(frame_blocks)
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -576,28 +571,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
-            if trace_enabled(state):
-                emit_trace(
-                    {
-                        "event": "prefill_unit",
-                        "session_id": state.session_id,
-                        "append_identity": append_identity,
-                        "unit_count": state.audio_chunk_idx,
-                        "audio_encoder_chunk_count": state.audio_encoder_chunk_idx,
-                        "video_frames": unit_num_frames,
-                        "consumed_audio_samples": consumed_samples,
-                        "buffered_audio_samples": len(state.audio_buffer),
-                        "unit_input_tokens": len(token_ids) - unit_token_start,
-                        "append_input_tokens_so_far": len(token_ids),
-                        "previous_terminator": state.last_terminator_token,
-                        "injected_terminator": injected_terminator,
-                        "worker_pending_terminator_before_sync": worker_pending_terminator,
-                        "scheduler_completed_terminator": (stage0_window or {}).get("completed_terminator_token_id"),
-                        "is_speech": is_speech,
-                        "final": final,
-                        "window_enabled": state.window_enabled,
-                    }
-                )
             if state.window_enabled:
                 if state.pending_window_unit is None:
                     state.pending_window_unit = _MiniCPMO45WindowUnit()
