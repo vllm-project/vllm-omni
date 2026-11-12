@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, ClassVar
 
 import torch
@@ -10,6 +11,7 @@ from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders import wan_encode_split, wan_spatial_shard
@@ -35,23 +37,75 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+_GFX11_AOTRITON_MAX_HEAD_DIM = 256
+
+
+def _wan_attention_head_dims(model: torch.nn.Module) -> Iterator[int]:
+    for module in model.modules():
+        if module.__class__.__name__ != "WanAttentionBlock":
+            continue
+        qkv = getattr(module, "to_qkv", None)
+        out_channels = getattr(qkv, "out_channels", None)
+        if isinstance(out_channels, int) and out_channels % 3 == 0:
+            yield out_channels // 3
+
+
+def _requires_gfx11_math_sdpa(
+    model: torch.nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    if dtype not in (torch.float16, torch.bfloat16) or device.type != "cuda":
+        return False
+    if not current_omni_platform.is_rocm():
+        return False
+
+    capability = current_omni_platform.get_device_capability(device.index or 0)
+    if capability is None or capability[0] != 11:
+        return False
+
+    return any(head_dim > _GFX11_AOTRITON_MAX_HEAD_DIM for head_dim in _wan_attention_head_dims(model))
+
 
 class OmniAutoencoderKLWan(AutoencoderKLWan):
-    def _execution_context(self):
+    @contextmanager
+    def _execution_context(self) -> Iterator[None]:
         try:
             first_param = next(self.parameters())
         except StopIteration:
-            return nullcontext()
+            yield
+            return
 
         dtype = first_param.dtype
         if dtype not in (torch.float16, torch.bfloat16):
-            return nullcontext()
+            yield
+            return
 
-        return current_omni_platform.create_autocast_context(
+        autocast_context = current_omni_platform.create_autocast_context(
             device_type=first_param.device.type,
             dtype=dtype,
             enabled=True,
         )
+        force_math_sdpa = _requires_gfx11_math_sdpa(
+            self,
+            device=first_param.device,
+            dtype=dtype,
+        )
+        with autocast_context:
+            if not force_math_sdpa:
+                yield
+                return
+
+            # Remove this guard only after the supported ROCm image contains
+            # pytorch/pytorch#194100 and #194280 and W7900 validates issue #7484.
+            logger.warning_once(
+                "Wan VAE is forcing math SDPA because gfx11 AOTriton does not "
+                "support attention head dimensions above %d.",
+                _GFX11_AOTRITON_MAX_HEAD_DIM,
+            )
+            with sdpa_kernel(SDPBackend.MATH):
+                yield
 
     def _install_attention_alignment(self) -> None:
         """Realign 1x1 Wan attention inputs before the first encode or decode."""
