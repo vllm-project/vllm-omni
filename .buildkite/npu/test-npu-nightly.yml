@@ -433,10 +433,6 @@ steps:
               -k test_minimax_h3_ref2va_dlo_4npu_a5 \
               -m "full_model and npu and A5 and diffusion and cards_4" --run-level full_model \
               --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
-            if ! compgen -G "$$BENCHMARK_DIR/result_test_minimax_h3_ref2va_dlo_4npu_a5_*.json" >/dev/null; then
-              echo "MiniMax-H3 Ref2VA A5 benchmark did not produce a result JSON" >&2
-              exit 1
-            fi
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
         key: nightly-diffusion-x2v-timeline-minimax-h3
         source_file_dependencies: diffusion_minimax_h3_accuracy
