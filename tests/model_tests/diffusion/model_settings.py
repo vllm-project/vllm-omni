@@ -51,6 +51,9 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # ROCm multi-GPU cold starts repeatedly straddle the default 600s
+        # deadline while succeeding just beyond it. Keep a finite 50% margin.
+        offline_init_timeout_s=900,
     ),
     "LTX2Pipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",
@@ -62,6 +65,11 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # The LTX2 audio vocoder has no usable MIOpen conv1d algorithm on
+        # MI325. Keep the one-card groups and these multi-GPU groups on CUDA
+        # until that runtime path is qualified separately.
+        rocm_multigpu=False,
+        rocm_base=False,
     ),
     "LTX2TextToAudioPipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",
@@ -70,6 +78,9 @@ DIFFUSION_TEST_SETTINGS = {
         model_type_marker=ModelTypeMarker.DIFFUSION,
         check_multi_output=False,
         check_determinism=False,
+        # Same unqualified MIOpen conv1d vocoder as LTX2Pipeline. This
+        # pipeline's only group is the one-card base case.
+        rocm_base=False,
     ),
     "SanaVideoPipeline": DiffusionModelTestOpts(
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
@@ -188,5 +199,12 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_krea2_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
         model_type_marker=ModelTypeMarker.DIFFUSION,
+    ),
+    "StableDiffusionXLPipeline": DiffusionModelTestOpts(
+        model="stabilityai/stable-diffusion-xl-base-1.0",
+        builder=diff_model_builders.tiny_sdxl_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+        model_type_marker=ModelTypeMarker.DIFFUSION,
+        extra_test_groups=[[DiffusionAccs.CPU_OFFLOAD]],
     ),
 }

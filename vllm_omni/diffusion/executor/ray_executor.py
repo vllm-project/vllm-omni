@@ -561,7 +561,12 @@ class RayDiffusionExecutor(DiffusionExecutor):
             validate_new_request_data_identity(new_req)
 
         if len(new_reqs) > 1 and _uses_dlo_dp_concurrency(self.od_config):
-            compatibility_keys = [build_request_batch_sampling_params_key(item.req) for item in new_reqs]
+            # Building the keys below cannot raise: add_request() already resolved each schedule
+            # against this service config and rejected an invalid one as that request's client error.
+            attention_schedule_config = self.od_config.diffusion_attention_schedule
+            compatibility_keys = [
+                build_request_batch_sampling_params_key(item.req, attention_schedule_config) for item in new_reqs
+            ]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
                     "Rank-local DP concurrency requires compatible shape, CFG, denoise schedule, "

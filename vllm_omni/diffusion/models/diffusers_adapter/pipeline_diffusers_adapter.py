@@ -388,7 +388,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 attention_backend_attempts.append("_native_npu")
             case "TORCH_SDPA":
                 attention_backend_attempts.append("native")
-            case "CUDNN_ATTN" | "FLASHINFER_ATTN" | "TRTLLM_ATTN":
+            case "CUDNN_ATTN" | "FLASHINFER_ATTN" | "TRTLLM_ATTN" | "SPARGE_ATTN":
                 raise ValueError(
                     f"{attention_backend_config} was explicitly selected, but Diffusers adapters do not "
                     "provide a binding for this vLLM-Omni backend. Select TORCH_SDPA or a Diffusers-native backend."

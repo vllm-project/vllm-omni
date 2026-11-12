@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
@@ -17,6 +18,10 @@ BLOCK = 16
 
 
 def _manager(num_blocks=40, enable_caching=False, groups=1):
+    # vLLM lazily registers built-in KV specs. Another test may already have
+    # registered an out-of-tree spec, so the registry can be non-empty before
+    # FullAttentionSpec has a manager. Initialize the native mappings first.
+    native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.float16)
     config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -68,6 +73,69 @@ def test_fast_path_matches_full_allocation_through_block_boundaries(skip_zeroing
     reserve = ref.block_pool.get_num_free_blocks() + 1
     assert ref.allocate_slots(r_ref, 1, reserved_blocks=reserve) is None
     assert fast.allocate_slots(r_fast, 1, reserved_blocks=reserve) is None
+
+
+def test_foreign_registry_still_builds_full_attention_manager():
+    """A prior out-of-tree spec must not hide FullAttentionSpec from ``_manager``.
+
+    ``KVCacheSpecRegistry._ensure_registered`` returns once the registry is
+    non-empty, which is the weekly ``No manager registered for KVCacheSpec
+    <...FullAttentionSpec>`` failure. ``_manager`` calls
+    ``register_all_kvcache_specs`` anyway, so the same construction succeeds.
+    The process registry is restored afterwards.
+    """
+    from dataclasses import dataclass
+
+    import vllm.v1.kv_cache_spec_registry as kv_spec_registry
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
+    @dataclass(frozen=True)
+    class _ForeignKVCacheSpec(KVCacheSpec):
+        """Occupies the registry without registering a native attention spec."""
+
+    class _ForeignKVManager:
+        """Never constructed. Its registration only makes the registry non-empty."""
+
+    spec_registry = kv_spec_registry._REGISTRY_KVCACHESPEC_LIST
+    role_registry = kv_spec_registry._REGISTRY_ROLE_MANAGERS
+    saved_specs = dict(spec_registry)
+    saved_roles = dict(role_registry)
+    spec = FullAttentionSpec(block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.float16)
+    config = KVCacheConfig(
+        num_blocks=40,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+    )
+
+    def construct_without_native_registration():
+        return KVCacheManager(
+            config,
+            max_model_len=256,
+            scheduler_block_size=BLOCK,
+            hash_block_size=BLOCK,
+            enable_caching=False,
+        )
+
+    try:
+        spec_registry.clear()
+        kv_spec_registry.KVCacheSpecRegistry.register(_ForeignKVCacheSpec, _ForeignKVManager)
+        kv_spec_registry.KVCacheSpecRegistry._ensure_registered(None)
+        assert FullAttentionSpec not in spec_registry
+
+        with pytest.raises(
+            AssertionError,
+            match=r"No manager registered for KVCacheSpec <class '.*FullAttentionSpec'>",
+        ):
+            construct_without_native_registration()
+
+        manager = _manager()
+        assert manager.coordinator.single_type_managers
+        assert FullAttentionSpec in spec_registry
+    finally:
+        spec_registry.clear()
+        spec_registry.update(saved_specs)
+        role_registry.clear()
+        role_registry.update(saved_roles)
 
 
 def test_fast_path_only_installs_where_it_is_exact():

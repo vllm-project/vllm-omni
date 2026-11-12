@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import OrderedDict, UserDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +23,48 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("capture_sizes,expected", [(None, [1, 8]), ([2, 4, 16], [1, 2, 4, 8])])
+def test_talker_initializes_predictor_buckets_without_cuda_graphs(mocker, capture_sizes, expected):
+    from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as module
+
+    # Stop at the predictor boundary, before the constructor loads tokenizers.
+    class BucketsConfiguredError(Exception):
+        pass
+
+    predictor = mocker.Mock()
+    predictor.configure_mtp_execution_buckets.side_effect = BucketsConfiguredError
+    predictor_cls = mocker.patch.object(
+        module, "Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM", return_value=predictor
+    )
+    predictor_cls._stage_connector_extra_config.return_value = {}
+    mocker.patch.object(module, "Qwen3Model")
+    mocker.patch.object(module, "get_pp_group", return_value=SimpleNamespace(is_last_rank=False))
+    mocker.patch.object(module, "ECAPATimeDelayNet")
+    mocker.patch("vllm.config.vllm.set_current_vllm_config", return_value=nullcontext())
+    talker_config = SimpleNamespace(
+        code_predictor_config=SimpleNamespace(vocab_size=16),
+        hidden_size=8,
+        text_hidden_size=8,
+        text_vocab_size=16,
+        vocab_size=16,
+        num_code_groups=4,
+        hidden_act="silu",
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="unused",
+            hf_config=SimpleNamespace(talker_config=talker_config, speaker_encoder_config=None),
+            use_v2_model_runner=True,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=capture_sizes),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=SimpleNamespace(),
+    )
+    with pytest.raises(BucketsConfiguredError):
+        module.Qwen3TTSTalkerForConditionalGeneration(vllm_config=config)
+    predictor.configure_mtp_execution_buckets.assert_called_once_with(expected)
 
 
 def _make_minimal_talker(

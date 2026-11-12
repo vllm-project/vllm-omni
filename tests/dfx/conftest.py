@@ -276,6 +276,25 @@ def _create_unique_server_params(
         serve_flat = _build_serve_args(server_params.get("serve_args"))
         raw_extra = tuple(server_params.get("extra_cli_args") or ())
         extra_cli_args = tuple(serve_flat) + raw_extra
+        # Apply the existing update/delete mechanism to explicit deploy paths too.
+        # The generated config is temporary; the source deploy stays unchanged.
+        if not stage_config_name and ("update" in server_params or "delete" in server_params):
+            args = list(extra_cli_args)
+            # Match argparse: the last deploy flag wins over earlier defaults.
+            for index in range(len(args) - 1, -1, -1):
+                arg = args[index]
+                if arg == "--deploy-config" and index + 1 < len(args):
+                    args[index + 1] = modify_stage(
+                        args[index + 1], server_params.get("update"), server_params.get("delete")
+                    )
+                    break
+                if arg.startswith("--deploy-config="):
+                    path = modify_stage(arg.split("=", 1)[1], server_params.get("update"), server_params.get("delete"))
+                    args[index] = f"--deploy-config={path}"
+                    break
+            else:
+                raise ValueError("server_params.update/delete requires stage_config_name or --deploy-config")
+            extra_cli_args = tuple(args)
         use_omni = bool(server_params.get("use_omni", True))
 
         server_param = (
@@ -678,7 +697,7 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
-        from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import _acc_result_filename
+        from tests.e2e.accuracy.helpers import _acc_result_filename
 
         def argument(name: str, default: str = "") -> str:
             return args[args.index(name) + 1] if name in args else default

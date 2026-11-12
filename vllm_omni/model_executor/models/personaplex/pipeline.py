@@ -50,6 +50,10 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
             },
+            # Each frame's base embedding carries the previous frame's temporal
+            # hidden plus the text step; talker_mtp adds the agent codebook
+            # (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

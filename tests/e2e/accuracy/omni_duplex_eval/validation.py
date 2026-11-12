@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_QUESTION
 
 
 def load_accuracy_config(path: str, params: dict) -> dict:
@@ -19,11 +20,12 @@ def load_accuracy_config(path: str, params: dict) -> dict:
     expected_ids = {sid for ids in config["sample_ids_per_split"].values() for sid in ids}
     assert set(params["duplex_eval_ids"]) == expected_ids, "benchmark sample IDs differ from CI config"
     assert params["num_prompts"] == [len(expected_ids)], "benchmark sample count differs from CI config"
+    assert params.get("duplex_eval_mix", MIX_QUESTION) == config["mix"], "benchmark mix differs from CI config"
     return config
 
 
-def assert_accuracy_result(benchmark: dict, config: dict) -> None:
-    """Validate the saved summary and every selected score file before accepting a run."""
+def assert_accuracy_result(benchmark: dict, config: dict, *, enforce_score_floors: bool = True) -> None:
+    """Validate the saved summary and selected scores, optionally enforcing calibrated floors."""
     expected_files = {
         Path(split) / f"{sid}.json" for split, ids in config["sample_ids_per_split"].items() for sid in ids
     }
@@ -51,6 +53,8 @@ def assert_accuracy_result(benchmark: dict, config: dict) -> None:
     for path in score_files:
         row = json.loads(path.read_text(encoding="utf-8"))
         assert row.get("protocol_pin") == PROTOCOL_PIN, f"protocol_pin mismatch in score file: {path}"
+        mix = row.get("response_meta", {}).get("mix", MIX_QUESTION)
+        assert mix == config["mix"], f"mix {mix!r} in score file differs from CI config: {path}"
 
     rtd = summary.get("rtd", {})
     pr = summary.get("pr", {})
@@ -67,16 +71,23 @@ def assert_accuracy_result(benchmark: dict, config: dict) -> None:
         "proactive_reminder",
         "post_event_reminder",
     }, "PR by_task keys mismatch"
-    baseline = config["baseline"]
-    for label, value, minimum, maximum in (
-        ("RTD content score", rtd.get("mean_content_score"), baseline["min_rtd_mean_content_score"], 3.0),
-        ("RTD temporal score", rtd.get("mean_avg_temporal_score"), baseline["min_rtd_mean_temporal_score"], 3.0),
-        ("PR success rate", pr.get("mean_all_success"), baseline["min_pr_mean_all_success"], 1.0),
-    ):
-        assert 0 < minimum <= maximum, f"invalid {label} threshold: {minimum}"
+    scores = (
+        ("RTD content score", rtd.get("mean_content_score"), "min_rtd_mean_content_score", 3.0),
+        ("RTD temporal score", rtd.get("mean_avg_temporal_score"), "min_rtd_mean_temporal_score", 3.0),
+        ("PR success rate", pr.get("mean_all_success"), "min_pr_mean_all_success", 1.0),
+    )
+    for label, value, _minimum_key, maximum in scores:
         assert (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
             and math.isfinite(value)
-            and minimum <= value <= maximum
-        ), f"{label} {value!r} outside [{minimum}, {maximum}]"
+            and 0 <= value <= maximum
+        ), f"{label} {value!r} outside [0, {maximum}]"
+
+    if not enforce_score_floors:
+        return
+    baseline = config["baseline"]
+    for label, value, minimum_key, maximum in scores:
+        minimum = baseline[minimum_key]
+        assert 0 < minimum <= maximum, f"invalid {label} threshold: {minimum}"
+        assert value >= minimum, f"{label} {value!r} outside [{minimum}, {maximum}]"
