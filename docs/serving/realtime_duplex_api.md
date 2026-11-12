@@ -1038,8 +1038,11 @@ remain accepted for client compatibility. Text replies commit the emitted text
 without playback ACKs even under `ack_only`; cancellation retains the emitted
 prefix and discards stale output. Whitespace-only replies are not stored as
 assistant turns; meaningful text retains its emitted whitespace verbatim.
-This playback-policy bypass applies only to deployments without audio output,
-not to a text modality override on a speech deployment.
+The unconditional playback-policy bypass applies to deployments without audio
+output. On speech deployments, text replies with zero generated/sent audio and
+no audio-completion dependency commit without an ACK. Text that depends on
+complete audio follows alignment and playback checks. A text modality override
+alone does not implement per-request TTS skipping.
 Targeted playback ACKs for text-only items
 and audio truncation on text-only deployments fail with `unsupported_operation`
 without modifying history. The default MiniCPM three-stage deployment continues

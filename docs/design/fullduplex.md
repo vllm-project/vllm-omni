@@ -61,8 +61,11 @@ reserve their history position before continued input, commit emitted text
 on completion or cancellation regardless of playback policy, and release
 playback bookkeeping without ACKs. Whitespace-only output creates no assistant
 history item or snapshot; meaningful emitted text is preserved verbatim.
-The bypass is deployment-scoped: requesting text on an audio-capable deployment
-retains that deployment's playback and history contract.
+The unconditional bypass is deployment-scoped. On audio-capable deployments,
+a reply with zero generated/sent audio and no audio-completion dependency
+commits text without an ACK through the zero-audio fallback. Replies whose
+text depends on complete audio still follow alignment and playback checks.
+Selecting text output alone does not implement per-request TTS skipping.
 Cancellation rejects old-epoch results
 through the existing fence. Audio calibration is not started for deployments
 without audio output. These contracts do not register a Thinker-only model
