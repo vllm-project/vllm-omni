@@ -149,3 +149,22 @@ def test_cpu_execution_falls_back_to_the_original_forward(monkeypatch):
     assert up.called == 1 and low.called == 1
     assert not hasattr(up, "_h3_fir_c16_calls")
     assert not hasattr(low, "_h3_fir_c16_calls")
+
+
+@pytest.mark.parametrize("unsupported", ["absent", "none", "taps", "stride", "ratio"])
+def test_install_preserves_unsupported_native_filters(unsupported):
+    up, low = UpSample1d(_taps()), LowPassFilter1d(_taps())
+    original = up.forward
+    if unsupported == "absent":
+        del up.filter
+    elif unsupported == "none":
+        up.filter = None
+    elif unsupported == "taps":
+        up.filter = up.filter[..., :8]
+    elif unsupported == "stride":
+        up.stride = 3
+    else:
+        up.ratio = 3
+    assert pack.install(_FakeAudioVAE(up, low)) == 1
+    assert getattr(up.forward, "__func__") is getattr(original, "__func__")
+    assert not hasattr(up, "_h3_dense_fir")
