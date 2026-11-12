@@ -181,6 +181,41 @@ native mask/reference roles. For an external Diffusers backend the frontend
 leaves these facts unknown; the worker rejects a supplied field when its loaded
 pipeline signature cannot accept it, rather than silently discarding it.
 
+### Video input roles
+
+`image_to_video` and `video_to_video` identify broad input modes. They do not
+establish whether an image pins the first frame or whether a video can be
+edited with latent noise masks. Check the selected route's `request.inputs`:
+
+| Role | Meaning |
+| --- | --- |
+| `first_frame` | The existing image is used as a fixed first frame. This role does not require a second image upload. |
+| `source_video` | A source clip used for latent editing, separate from ordinary video conditioning. |
+| `video_noise_mask` | A video latent noise mask; a scalar `0.0` is a supplied input. |
+| `audio_noise_mask` | An audio latent noise mask; a scalar `0.0` is a supplied input. |
+
+Explicit Wan I2V pipelines declare `first_frame` with at most one image. VACE
+uses images as reference material and explicitly excludes `first_frame`; its
+ordinary `image` and `video` contracts remain available.
+
+H3 declares each of the three edit roles as optional (`min_count: 0`,
+`max_count: 1`). Existing request validation still checks their combinations;
+these declarations do not make editing fields mandatory for every V2V request.
+H3's overall modes remain `unknown` because release task lists are worker-owned.
+`task_type=t2va` and `fl2va` do not exclude V2V: source-video editing is separate
+from reference-video conditioning. `ref2va` still excludes text-only generation.
+
+HTTP projections use the handler's existing `supports_latent_mask_editing`
+gate. A false gate excludes all three edit roles, including on SeedVR2, whose
+ordinary V2V support is unchanged. A true gate preserves model declarations
+without inferring support for undeclared roles. The realtime video route
+excludes these editing fields and retains its single-image input limit.
+HTTP and realtime routes continue to exclude native `last_frame` input.
+
+An overall `unknown` video profile can still report known input support,
+exclusions, and counts. Those facts survive route projection; they do not
+promote the overall mode to `supported`. Missing role declarations stay unknown.
+
 ### Other operation families
 
 | Family | Current source-backed facts and boundaries |
@@ -256,7 +291,7 @@ Older plugins omit it and retain their existing behavior.
 | Qwen3-Omni audio-output branch | The existing HF-config resolver selects a full audio topology or the text-only topology. Both own separate declarations. See `model_executor/models/qwen3_omni/pipeline.py`. |
 | Audex S2S / thinker-only / TTS / TTA | Decoder presence and the selected entry stage distinguish chat, ordinary speech, and caption-to-audio. See `tts_adapters/audex.py`, `tts_adapters/audex_tta.py`, and the Audex recipe. |
 | MOSS-TTS / SoundEffect / VoiceGenerator | Startup uses the same variant dispatch as the speech adapter. SoundEffect requires `ambient_sound`; VoiceGenerator requires text and `instructions`; ordinary TTS requires reference audio or a registered voice. See `tts_adapters/moss_tts.py`. |
-| MiniMax-H3 FL2VA / Ref2VA | Explicit `task_type` excludes incompatible profiles. Remaining profiles are unknown with `worker_checkpoint_tasks_unavailable`: the release task list is held only by the worker. See `diffusion/models/minimax_h3/pipeline_minimax_h3.py`. |
+| MiniMax-H3 FL2VA / Ref2VA | `ref2va` excludes text-only generation. T2VA/FL2VA retain unknown V2V because source-video editing is implemented. Other modes remain unknown with `worker_checkpoint_tasks_unavailable`: the release task list is held only by the worker. See `diffusion/models/minimax_h3/pipeline_minimax_h3.py`. |
 | Cosmos3 normal / distilled / Edge | T2I and I2V are common modes. T2V and V2V are unknown with `worker_scheduler_mode_unavailable`, because the frontend does not own the loaded scheduler/backbone mode. Policy deployments have a separate action-only declaration. See `diffusion/models/cosmos3/pipeline_cosmos3.py`. |
 | Wan generic / explicit I2V / TI2V | Generic I2V requires checkpoint `expand_timesteps`; explicit task-specific pipelines have separate declarations. See the Wan pipeline definitions. |
 | Lance image / video checkpoint | The existing checkpoint resolver selects the matching declaration. I2V is unsupported for the video checkpoint: the current HTTP adapter supplies `image`, while the pipeline requires `first_frame`. Its image-generation and editing contracts remain unknown. See `config/config_factory.py` and the Lance pipeline. |
