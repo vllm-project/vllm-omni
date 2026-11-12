@@ -68,15 +68,22 @@ def _wan_self_attn_with_kv(
         key = attn.rotary_embedding(key, freqs_cos, freqs_sin)
     scale = 1.0 / (attn.head_dim**0.5)
     if kv_ctx is not None:
-        inputs = kv_ctx.to_layer_inputs() if hasattr(kv_ctx, "to_layer_inputs") else kv_ctx
-        if query.shape[0] == 1:
-            out = paged_write_attn(inputs, query[0], key[0], value[0], None, None, scale)
-            hidden_states = out.unsqueeze(0).flatten(2, 3).type_as(query)
+        # Batched DiT QKV may share one forward while each request keeps its own
+        # paged-KV view; accept a per-batch context list for that case.
+        if isinstance(kv_ctx, (list, tuple)):
+            contexts = list(kv_ctx)
+            if len(contexts) != query.shape[0]:
+                raise ValueError(
+                    f"batched self-attn expects {query.shape[0]} kv contexts, got {len(contexts)}"
+                )
         else:
-            outs = [
-                paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale) for i in range(query.shape[0])
-            ]
-            hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
+            contexts = [kv_ctx] * query.shape[0]
+        outs = []
+        for i in range(query.shape[0]):
+            ctx_i = contexts[i]
+            inputs = ctx_i.to_layer_inputs() if hasattr(ctx_i, "to_layer_inputs") else ctx_i
+            outs.append(paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale))
+        hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
     else:
         hidden_states = attn.attn(query, key, value, None)
         hidden_states = hidden_states.flatten(2, 3).type_as(query)

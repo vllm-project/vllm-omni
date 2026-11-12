@@ -286,7 +286,9 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).
-- Micro-batch packing (`R`): varlen vs pad.
+- Micro-batch packing (`R`): varlen vs pad for attention contexts (DiT FFN/embed
+  already pack compatible same-cell members via ``WanCellBatch`` when
+  ``max_batch_size>1``).
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
 

@@ -49,7 +49,7 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellBatch
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
     load_causvid_generator_state,
@@ -731,22 +731,40 @@ class CausVidWanPipeline(nn.Module):
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Mainline request entry: plan, run the Cell executor, then emit.
 
-        Session reset and release stay on the runner. This method only advances
-        the request with the KV pool bound for the call.
+        Compatible requests admitted into the same Cell context share one
+        ``run_cell_pipeline`` so same-cell members can compute together.
+        Session reset and release stay on the runner.
         """
         ctx = self._execution_context()
         previous = getattr(self, "_chunk_ctx", None)
         self._chunk_ctx = ctx
         outputs: list[DiffusionOutput] = []
+        stream_jobs: list[Any | None] = []
         try:
+            members: dict[str, WanCell] = {}
+            order: list[tuple[str, WanCell, Any | None]] = []
             for item in _as_request_list(req):
                 adapter, kv_id, _persist, stream_job = self.admit_cell_request(item)
-                try:
-                    run_cell_pipeline(ctx=ctx, adapter=adapter)
-                except Exception:
+                if not isinstance(adapter, WanCell):
+                    raise TypeError(f"expected WanCell adapter, got {type(adapter).__name__}")
+                if kv_id in members:
+                    raise ValueError(f"duplicate cell-batch member id {kv_id!r}")
+                members[kv_id] = adapter
+                order.append((kv_id, adapter, stream_job))
+                stream_jobs.append(stream_job)
+            batch_adapter: WanCell | WanCellBatch
+            if len(members) == 1:
+                batch_adapter = next(iter(members.values()))
+            else:
+                batch_adapter = WanCellBatch(members)
+            try:
+                run_cell_pipeline(ctx=ctx, adapter=batch_adapter)
+            except Exception:
+                for stream_job in stream_jobs:
                     if stream_job is not None:
                         stream_job.cancel()
-                    raise
+                raise
+            for kv_id, adapter, stream_job in order:
                 outputs.append(self.emit_cell_output(adapter, kv_id, stream_job))
             return outputs
         finally:
