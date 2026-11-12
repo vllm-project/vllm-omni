@@ -96,6 +96,9 @@ dev = [
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
     # Hopper dense FA3. Optional at runtime (#7735, #9201); nightly installs [dev].
     "fa3-fwd==0.0.3",
+    # PAN 2 guardrails are on by default. The image-to-video doc test runs the
+    # README command, and CI installs [dev].
+    "pan2-guardrail @ git+https://github.com/ifm-ai/pan2-guardrail@267f95a943162e56d835f3897217a7d14ee7edce",
 ]
 
 demo = [

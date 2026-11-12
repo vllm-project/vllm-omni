@@ -387,15 +387,10 @@ steps:
         commands:
           - pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va_ref2va.py -m "full_model and cuda and H100 and B200 and cards_2" --run-level "full_model"
 
-      # The image does not ship pan2-guardrail. This step runs the PAN 2 README
-      # command with guardrails left on, so install the package here. Pinned to
-      # the live ifm-ai/pan2-guardrail main commit. from_pretrained then
-      # downloads public Qwen/Qwen3Guard-Gen-4B and IFM/PAN2-guardrail-Q16.
       - label: ":full_moon: Diffusion X2V · Doc Test"
         source_file_dependencies: diffusion_image_to_video_doc
         timeout_in_minutes: 60
         commands:
-          - uv pip install --system 'pan2-guardrail @ git+https://github.com/ifm-ai/pan2-guardrail@267f95a943162e56d835f3897217a7d14ee7edce'
           - pytest -s -v tests/examples/offline_inference/test_image_to_video.py -m "full_model and example and H100 and B200 and cards_1" --run-level "full_model"
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Autoround Function Test"
