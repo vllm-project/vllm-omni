@@ -4,6 +4,8 @@
 # Adapted from https://github.com/feifeibear/long-context-attention
 
 
+import os
+
 import torch
 
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
@@ -62,8 +64,6 @@ def ring_flash_attn_forward(
             "the mask would silently shift. Unpad before the ring, or use causal=False."
         )
 
-    comm = RingComm(process_group)
-
     out = None
     lse = None
 
@@ -79,66 +79,87 @@ def ring_flash_attn_forward(
     if not v.is_contiguous():
         v = v.contiguous()
 
-    for step in range(comm.world_size):
-        if step + 1 != comm.world_size:
-            next_k = comm.send_recv(k)
-            next_v = comm.send_recv(v)
-            comm.commit()
+    if os.environ.get("VLLM_OMNI_RING_CE_TRANSPORT") == "1":
+        from vllm_omni.diffusion.attention.backends.ring.ce_transport import maybe_ce_ring_comm
 
-        if not causal or step <= comm.rank:
-            block_rank = (comm.rank - step) % comm.world_size
-            block_valid_length = ring_kv_block_valid_length(
-                valid_kv_length,
-                k.shape[1],
-                block_rank,
-                comm.world_size,
-            )
-            step_k = k[:, :block_valid_length]
-            step_v = v[:, :block_valid_length]
-            if step == 0 and joint_tensor_key is not None:
-                if joint_strategy == "front":
-                    step_k = torch.cat([joint_tensor_key, step_k], dim=1)
-                    step_v = torch.cat([joint_tensor_value, step_v], dim=1)
-                else:
-                    step_k = torch.cat([step_k, joint_tensor_key], dim=1)
-                    step_v = torch.cat([step_v, joint_tensor_value], dim=1)
+        # Opt-in copy-engine K/V transport; it returns None where it cannot run. It relies on the
+        # loop below calling send_recv(k), send_recv(v), commit(), attention, wait() each step.
+        comm = maybe_ce_ring_comm(process_group, k, v) or RingComm(process_group)
+    else:
+        comm = RingComm(process_group)
 
-            if step_k.shape[1] > 0:
-                fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
-                block_out, block_lse = fn(
-                    q,
-                    step_k,
-                    step_v,
-                    dropout_p=dropout_p,
-                    softmax_scale=softmax_scale,
-                    causal=causal and step == 0,
-                    window_size=window_size,
-                    softcap=softcap,
-                    alibi_slopes=alibi_slopes,
-                    return_softmax=True and dropout_p > 0,
+    try:
+        for step in range(comm.world_size):
+            if step + 1 != comm.world_size:
+                next_k = comm.send_recv(k)
+                next_v = comm.send_recv(v)
+                comm.commit()
+
+            if not causal or step <= comm.rank:
+                block_rank = (comm.rank - step) % comm.world_size
+                block_valid_length = ring_kv_block_valid_length(
+                    valid_kv_length,
+                    k.shape[1],
+                    block_rank,
+                    comm.world_size,
                 )
+                step_k = k[:, :block_valid_length]
+                step_v = v[:, :block_valid_length]
+                if step == 0 and joint_tensor_key is not None:
+                    if joint_strategy == "front":
+                        step_k = torch.cat([joint_tensor_key, step_k], dim=1)
+                        step_v = torch.cat([joint_tensor_value, step_v], dim=1)
+                    else:
+                        step_k = torch.cat([step_k, joint_tensor_key], dim=1)
+                        step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
-                # Ensure block_out is contiguous if needed, though usually it is from FA
-
-                if attn_type == AttnType.SPARSE_SAGE:
-                    out, lse = block_out, block_lse
-                else:
-                    # Ring kernel wrappers canonicalize LSE to (B, H, S).
-                    out, lse = update_out_and_lse(
-                        out, lse, block_out, block_lse, lse_layout="bhs", use_fused_merge=use_fused_merge
+                if step_k.shape[1] > 0:
+                    fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
+                    block_out, block_lse = fn(
+                        q,
+                        step_k,
+                        step_v,
+                        dropout_p=dropout_p,
+                        softmax_scale=softmax_scale,
+                        causal=causal and step == 0,
+                        window_size=window_size,
+                        softcap=softcap,
+                        alibi_slopes=alibi_slopes,
+                        return_softmax=True and dropout_p > 0,
                     )
 
-        if step + 1 != comm.world_size:
-            comm.wait()
-            k = next_k
-            v = next_v
+                    # Ensure block_out is contiguous if needed, though usually it is from FA
 
-    assert out is not None
-    out = out.to(q.dtype)
-    if attn_type != AttnType.SPARSE_SAGE:
-        assert lse is not None
-        lse = lse.squeeze(dim=-1).transpose(1, 2)
-    return out, lse
+                    if attn_type == AttnType.SPARSE_SAGE:
+                        out, lse = block_out, block_lse
+                    else:
+                        # Ring kernel wrappers canonicalize LSE to (B, H, S).
+                        out, lse = update_out_and_lse(
+                            out, lse, block_out, block_lse, lse_layout="bhs", use_fused_merge=use_fused_merge
+                        )
+
+            if step + 1 != comm.world_size:
+                comm.wait()
+                k = next_k
+                v = next_v
+
+        # CeRingComm hands back its last two FREE credits so the next call starts clean.
+        if hasattr(comm, "finish"):
+            comm.finish()
+
+        assert out is not None
+        out = out.to(q.dtype)
+        if attn_type != AttnType.SPARSE_SAGE:
+            assert lse is not None
+            lse = lse.squeeze(dim=-1).transpose(1, 2)
+        return out, lse
+    except BaseException:
+        # A rank-local failure can leave peers at different ring steps. Returning
+        # this worker to the request loop would reuse an inconsistent signal pad.
+        # CE aborts the process; the executor monitor tears down the worker group.
+        if hasattr(comm, "abort"):
+            comm.abort()
+        raise
 
 
 class RingFlashAttnFunc(torch.autograd.Function):
