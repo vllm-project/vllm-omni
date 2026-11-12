@@ -30,8 +30,10 @@ def test_http_and_native_tokenizers_use_the_same_version_settings(monkeypatch, t
     native_tokenizer = builder.get_text_tokenizer()
     assert http_tokenizer.padding_side == native_tokenizer.padding_side == "left"
     server = Mock(spec=OmniOpenAIServingSpeech, _tts_tokenizer=None)
-    adapter = DRVEXOTTSAdapter.__new__(DRVEXOTTSAdapter)
-    adapter.ctx = SpeechServingContext(server=server, engine_client=Mock(model_config=Mock(model=str(tmp_path))))
+    server._tts_executor = None
+    adapter = DRVEXOTTSAdapter(
+        SpeechServingContext(server=server, engine_client=Mock(model_config=Mock(model=str(tmp_path))))
+    )
     adapter._load_text_tokenizer()
     assert server._tts_tokenizer.padding_side == "left"
     assert loader.call_count == 3
