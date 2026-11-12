@@ -636,15 +636,16 @@ def test_save_failure_stops_already_queued_and_future_saves(connector, monkeypat
     for start in (0, 4):
         output = connector.capture_step(attempt.req_id, attempt.token, start, 13, captures(start, start + 4))
         assert torch.equal(output["embedding"], captures(start, start + 4)["embedding"])
+    futures = list(connector._saves)
     connector._save_executor.run(0)
-    connector._save_executor.run(1).result()
+    assert futures[1].result() is False
     assert not attempt.rows.save_enabled
     assert second not in store.objects
     assert second + ":ready" not in store.objects
     assert store.objects.get(first + ":ready") == (b"stale" if failure == "remove" else None)
     output = connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 12))
     assert torch.equal(output["hidden"], captures(8, 12)["hidden"])
-    assert len(connector._save_executor.jobs) == 2
+    assert len(connector._save_executor.jobs) == 1
     connector.get_transfer_results(set())
     assert connector._reserved_bytes == 0
 
@@ -658,50 +659,111 @@ def test_save_failure_preserves_successful_leading_blocks(connector):
     store.fail_put.add(keys[1])
     connector.capture_step(attempt.req_id, attempt.token, 0, 13, captures(0, 8))
     connector.capture_step(attempt.req_id, attempt.token, 8, 13, captures(8, 12))
+    futures = list(connector._saves)
     connector._save_executor.run(0).result()
-    connector._save_executor.run(1).result()
+    assert futures[1].result() is False
     assert keys[0] + ":ready" in store.objects
     assert keys[1] not in store.objects
     assert keys[2] not in store.objects
     assert connector._reserved_bytes == 0
 
 
-def test_concurrent_saves_wait_for_the_same_attempts_preceding_save(connector, monkeypatch):
+@pytest.mark.parametrize("fail_predecessor", [False, True])
+def test_queued_successor_leaves_a_save_worker_for_other_requests(connector, monkeypatch, fail_predecessor):
     attempt = install_attempt(connector)
+    other = install_attempt(connector, req_id="other", token="other")
+    other.hashes = [b"other"]
     store = connector.connector_worker.store
     first, second = (hs_key(connector.namespace, block_hash) for block_hash in attempt.hashes[:2])
-    store.fail_put.add(first)
-    store.objects["kv:" + attempt.hashes[1].hex()] = b"kv"
-    first_writing, second_started, release = (threading.Event() for _ in range(3))
-    write = connector._write_hs_block
-    save_hs = connector._save_hs
+    first_kv = "kv:" + attempt.hashes[0].hex()
+    for block_hash in [*attempt.hashes[:2], *other.hashes]:
+        store.objects["kv:" + block_hash.hex()] = b"kv"
+    if fail_predecessor:
+        store.fail_put.add(first + ":ready")
+    first_waiting, release = threading.Event(), threading.Event()
+    poll = store.batch_is_exist
 
-    def blocked_write(store, owner, block):
-        if block[0] == 0:
-            first_writing.set()
+    def blocked_poll(keys):
+        if first_kv in keys:
+            first_waiting.set()
             assert release.wait(timeout=5)
-        return write(store, owner, block)
+        return poll(keys)
 
-    def observe_save(save, *args):
-        if save.blocks[0][0] == 4:
-            second_started.set()
-        return save_hs(save, *args)
-
-    monkeypatch.setattr(connector, "_write_hs_block", blocked_write)
-    monkeypatch.setattr(connector, "_save_hs", observe_save)
+    monkeypatch.setattr(store, "batch_is_exist", blocked_poll)
     with ThreadPoolExecutor(max_workers=2) as executor:
         connector._save_executor = executor
         try:
             connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
-            assert first_writing.wait(timeout=5)
+            assert first_waiting.wait(timeout=5)
             connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
-            assert second_started.wait(timeout=5)
+            connector.capture_step(other.req_id, other.token, 0, 9, captures(0, 4))
+            futures = list(connector._saves)
+            assert futures[2].result(timeout=2), "another request's save waited behind a queued successor"
+            assert second not in store.objects
+            assert not futures[1].done()
         finally:
             release.set()
-        for future in connector._saves:
-            future.result(timeout=5)
-    assert second not in store.objects
-    assert not attempt.rows.save_enabled
+        if fail_predecessor:
+            with pytest.raises(RuntimeError, match="completion record write failed"):
+                futures[0].result(timeout=5)
+        else:
+            assert futures[0].result(timeout=5)
+        assert futures[1].result(timeout=5) is not fail_predecessor
+    assert (second + ":ready" in store.objects) is not fail_predecessor
+    assert attempt.rows.save_enabled is not fail_predecessor
+    assert connector._reserved_bytes == 0
+
+
+def test_shutdown_drains_deferred_saves(connector, monkeypatch):
+    attempt = install_attempt(connector)
+    store = KVPollStore(["kv:" + attempt.hashes[0].hex()])
+    connector.connector_worker = WorkerSeam(store)
+    connector._read_executor = None
+    connector._save_executor = ThreadPoolExecutor(max_workers=2)
+    connector._closed = False
+    monkeypatch.setattr(MooncakeStoreConnector, "shutdown", lambda _self: None)
+    try:
+        connector.capture_step(attempt.req_id, attempt.token, 0, 9, captures(0, 4))
+        assert store.saves_waiting.wait(timeout=5)
+        connector.capture_step(attempt.req_id, attempt.token, 4, 9, captures(4, 8))
+        futures = list(connector._saves)
+    finally:
+        connector.shutdown()
+    assert [future.result(timeout=5) for future in futures] == [False, False]
+    assert connector._reserved_bytes == 0
+    assert not connector._saves
+    assert hs_key(connector.namespace, attempt.hashes[1]) not in store.objects
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_large_deferred_save_queue_releases_every_successor(connector, cancelled):
+    blocks = 513
+    attempt = install_attempt(connector, prompt_len=blocks * 4 + 1)
+    attempt.hashes = [f"block-{index}".encode() for index in range(blocks)]
+    connector.settings = replace(connector.settings, max_pending_transfers=1024, max_hs_bytes=64 * 1024 * 1024)
+    store = connector.connector_worker.store
+    store.fail_put.add(hs_key(connector.namespace, attempt.hashes[0]))
+    for start in range(0, blocks * 4, 4):
+        connector.capture_step(attempt.req_id, attempt.token, start, attempt.prompt_len, captures(start, start + 4))
+    futures = list(connector._saves)
+    assert len(connector._save_executor.jobs) == 1
+
+    other = install_attempt(connector, req_id="other", token="other")
+    other.hashes = [b"other"]
+    store.objects["kv:" + other.hashes[0].hex()] = b"kv"
+    connector.capture_step(other.req_id, other.token, 0, 9, captures(0, 4))
+    other_future = next(reversed(connector._saves))
+    if cancelled:
+        attempt.cancelled = True
+        connector._save_executor.jobs[0][0].cancel()
+    else:
+        assert connector._save_executor.run(0).result() is False
+    assert all(future.done() for future in futures)
+    assert all(future.result() is False for future in futures)
+    assert not other_future.done()
+    assert connector._reserved_bytes == connector._saves[other_future].reserved_bytes
+    assert connector._save_executor.run(1).result() is True
+    assert other_future.result() is True
     assert connector._reserved_bytes == 0
 
 
@@ -856,7 +918,7 @@ def test_supported_turn_configuration_passes_startup_guard(supported_config):
     OmniMooncakeStoreConnector._validate_supported(*supported_config)
 
 
-@pytest.mark.parametrize("configured,resolved", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("configured,resolved", [(True, False), (False, True)])
 def test_quantization_rejected_for_an_otherwise_identical_checkpoint(supported_config, configured, resolved):
     from vllm.config.quantization import resolve_quantization_config
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig

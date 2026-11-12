@@ -602,6 +602,43 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             if attempt.rows is not None:
                 attempt.rows.save_enabled = False
 
+    def _queue_save(self, save: PendingSave, previous: Future[bool] | None) -> None:
+        """Count deferred saves against admission without occupying a worker."""
+        result: Future[bool] = Future()
+        self._saves[result] = save
+
+        def finish(future: Future[bool]) -> None:
+            if future.cancelled():
+                self._release_staging(save)
+                result.set_result(False)
+            elif (error := future.exception()) is not None:
+                result.set_exception(error)
+            else:
+                result.set_result(future.result())
+
+        def submit(predecessor: Future[bool] | None) -> None:
+            with self._lock:
+                if result.done():
+                    return
+                if save.attempt.cancelled or (
+                    predecessor is not None
+                    and (predecessor.cancelled() or predecessor.exception() is not None or not predecessor.result())
+                ):
+                    # Resolve tails first so callbacks see completed results
+                    # instead of recursively failing a long successor chain.
+                    for future, pending in reversed(self._saves.items()):
+                        if pending.attempt is save.attempt and not future.done():
+                            self._release_staging(pending)
+                            future.set_result(False)
+                    return
+                assert self._save_executor is not None
+                self._save_executor.submit(self._save_hs, save).add_done_callback(finish)
+
+        if previous is None:
+            submit(None)
+        else:
+            previous.add_done_callback(submit)
+
     def _write_hs_block(
         self, store: Any, attempt: Attempt, block: tuple[int, int, CaptureTensors]
     ) -> tuple[str, str, bytes] | None:
@@ -623,11 +660,11 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         kv_key = self.connector_worker.token_dbs[0].key_for(block_hash)
         return kv_key, key + ":ready", hashlib.sha256(actual).digest()
 
-    def _save_hs(self, save: PendingSave, previous: Future[bool] | None = None) -> bool:
+    def _save_hs(self, save: PendingSave) -> bool:
         """Write HS objects, then publish each completion record after its KV.
 
-        Saves for one attempt follow their predecessors, so a failed block
-        stops already queued successors as well as future capture staging.
+        Successors are submitted only after this save completes successfully,
+        so a failed block stops queued successors and future capture staging.
         Tensors and their staging reservation are released before waiting for
         native KV objects, so a slow KV write holds only this save worker.
         """
@@ -635,12 +672,6 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         attempt = save.attempt
         store = self.connector_worker.store
         try:
-            if previous is not None:
-                try:
-                    if not previous.result():
-                        return False
-                except (ValueError, RuntimeError, OSError):
-                    return False
             deadline = time.monotonic() + self.settings.load_timeout_seconds
             commits: list[tuple[str, str, bytes]] = []
             complete = True
@@ -720,8 +751,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                         (future for future, pending in reversed(self._saves.items()) if pending.attempt is attempt),
                         None,
                     )
-                    assert self._save_executor is not None
-                    self._saves[self._save_executor.submit(self._save_hs, save, previous)] = save
+                    self._queue_save(save, previous)
                 else:
                     # Lookups stop at the first missing block, so blocks
                     # after a dropped one would be stored but never reused.

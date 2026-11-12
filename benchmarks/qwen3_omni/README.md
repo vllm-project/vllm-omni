@@ -2,6 +2,8 @@
 
 Measured 2026-11-12 at source `83b8c3102`. Mooncake retains full-prefix hits after the local KV working set overflows; local prefix caching is faster when its working set fits. These are bounded turn-serving measurements, not production tail-latency estimates.
 
+These measurements precede the change that submits a successor to the save executor only after its predecessor finishes. That scheduling change requires a new GPU run; the results below remain evidence for the recorded revision.
+
 ## Configuration and workload
 
 - Model: `Qwen/Qwen3-Omni-30B-A3B-Instruct`, checkpoint `26291f793822fb6be9555850f06dfe95f2d7e695`, loaded from a local copy.
@@ -50,6 +52,23 @@ Mean ± sample standard deviation, pooled across the two processes. Latencies ar
 | after overflow | B | 239.7 ± 53.7 | 270.7 ± 56.4 | 926.7 ± 19.2 | 0.2428 ± 0.0050 | 2.116 ± 0.002 |
 | after overflow | D | 82.0 ± 23.7 | 114.1 ± 23.6 | 741.8 ± 17.3 | 0.1943 ± 0.0045 | 2.638 ± 0.009 |
 
+At concurrency 2, Mooncake's cold E2E latency was 3.7% higher and throughput 4.2% lower than cache off. The run did not isolate HS staging, serialization, background saves, or native KV transfer costs, so it does not establish which operation caused this overhead.
+
+## Store fault injection
+
+The recorded run at `bb18ac89a` used `--repeats 3 --delay 5 --lookup-timeout 1`, the same model/hardware above, and a real single-host Store. It requested Thinker text only: a 256-token ongoing decode, a cold 48-token writer, and a 48-token healthy request. A zero-delay control preceded each delayed trial. The following values are healthy-request means ± sample standard deviation over three trials, in milliseconds.
+
+| Delayed operation | Delay s | TTFT ms | E2E ms | First scheduling ms |
+| --- | ---: | ---: | ---: | ---: |
+| Lookup | 0 | 221.1 ± 10.5 | 1152.6 ± 7.8 | 166.5 ± 9.8 |
+| Lookup | 5 | 230.9 ± 3.2 | 1269.8 ± 3.6 | 41.2 ± 6.0 |
+| KV write | 0 | 332.4 ± 2.2 | 1356.5 ± 3.1 | 275.4 ± 2.3 |
+| KV write | 5 | 301.7 ± 43.7 | 1328.2 ± 41.8 | 243.5 ± 43.0 |
+
+All 12 trials passed: healthy token IDs matched their controls, healthy requests produced text before the five-second delay ended, ongoing decode progressed during lookup delays, and cached HS reads completed during KV-write delays. The lookup deadline changes the healthy request from a cache hit to recomputation, so scheduling-time differences are not a speedup claim. Delays occur at Store API entry and do not reproduce Store-internal transport or mutex stalls.
+
+**Save-drop/skip counts were not measured in this run.** The healthy KV-write peer was a cache hit, so these results establish read/serving progress, not isolation between unrelated saves. The updated harness adds a cold peer and checks that its HS save starts while the first writer has both an unfinished save and a queued successor. It records complete computed prompt blocks dropped before admission, admitted blocks skipped before execution, failed started batches, and batches pending at the final snapshot, per request and in aggregate. The cold-peer run and its counters have not yet been measured on GPUs.
+
 ## Cache and memory observations
 
 Text full hits restored 544 prefix tokens; partial hits restored 256. Four divergent overflow documents require 2,240 rounded prompt tokens, exceeding the measured 1,360-token local pool. Every local revisit then missed; every Mooncake revisit retained its 544-token hit. Each unchanged image/audio hit reused 560 tokens; changing only the media yielded zero cached tokens and zero Mooncake restored rows.
@@ -85,7 +104,7 @@ All 144 cached quality requests passed those fixed limits with exact tokens and 
 
 The audio full-hit workload exposed a pre-existing PIECEWISE capture bug: flattening auxiliary outputs for FULL-graph buffers also changed the PIECEWISE replay payload from a dictionary to a list. The measured source preserves the original auxiliary pytree for PIECEWISE and retains flattening for NONE warmup/FULL. Earlier failed local/Mooncake audio runs are retained as diagnostic artifacts and excluded from these tables.
 
-Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py); CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
+Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py); its recorded report is `results/mooncake_m1_review_20261112/fault-final-data/report.json`. CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
 
 ## Reproduction
 

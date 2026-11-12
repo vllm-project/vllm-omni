@@ -90,6 +90,8 @@ class FaultProbeWorker(GPUARWorker):
         schedule = OmniARScheduler.schedule
         capture = OmniMooncakeStoreConnector.capture_step
         read = OmniMooncakeStoreConnector._read_hs
+        queue_save = OmniMooncakeStoreConnector._queue_save
+        save_hs = OmniMooncakeStoreConnector._save_hs
 
         def initialize_store(worker, *args, **kwargs):
             initialize(worker, *args, **kwargs)
@@ -112,12 +114,18 @@ class FaultProbeWorker(GPUARWorker):
             return result
 
         def captured(connector, req_id, attempt_id, start_token, prompt_len, tensors):
+            attempt = connector._attempts.get(req_id)
+            cursor = attempt.rows._save_cursor if attempt is not None and attempt.rows is not None else 0
             result = capture(connector, req_id, attempt_id, start_token, prompt_len, tensors)
             if result is not None:
+                end = min(start_token + tensors["embedding"].shape[0], prompt_len)
                 probe.record(
                     "capture",
                     request_id=req_id,
                     restored_rows=result["embedding"].shape[0] - tensors["embedding"].shape[0],
+                    save_candidate_blocks=max(
+                        0, end // connector.block_size - max(start_token, cursor) // connector.block_size
+                    ),
                 )
             return result
 
@@ -126,11 +134,46 @@ class FaultProbeWorker(GPUARWorker):
             probe.record("hs_read", request_id=attempt.req_id, tokens=tokens)
             return result
 
+        def queued_save(connector, save, previous):
+            save_id = f"{save.attempt.token}:{save.blocks[0][0]}"
+            probe.record(
+                "save_queued",
+                request_id=save.attempt.req_id,
+                save_id=save_id,
+                blocks=len(save.blocks),
+                predecessor_pending=previous is not None and not previous.done(),
+            )
+            queue_save(connector, save, previous)
+            future = next(future for future, pending in connector._saves.items() if pending is save)
+
+            def finished(done):
+                success = not done.cancelled() and done.exception() is None and done.result()
+                probe.record("save_finished", request_id=save.attempt.req_id, save_id=save_id, success=success)
+
+            future.add_done_callback(finished)
+            path = probe.started_path
+            if path is not None and path.stem + "-writer-" in save.attempt.req_id:
+                admitted = sum(
+                    e["event"] == "save_queued" and e.get("request_id") == save.attempt.req_id for e in probe.events
+                )
+                if admitted == 2:
+                    path.with_suffix(".writer-saves").write_text("two save batches admitted\n")
+
+        def started_save(connector, save):
+            probe.record(
+                "save_started",
+                request_id=save.attempt.req_id,
+                save_id=f"{save.attempt.token}:{save.blocks[0][0]}",
+            )
+            return save_hs(connector, save)
+
         JointStoreWorker.__init__ = initialize_store
         JointStoreWorker.lookup = lookup_store
         OmniARScheduler.schedule = scheduled
         OmniMooncakeStoreConnector.capture_step = captured
         OmniMooncakeStoreConnector._read_hs = read_hs
+        OmniMooncakeStoreConnector._queue_save = queued_save
+        OmniMooncakeStoreConnector._save_hs = started_save
         super().init_device()
 
     def fault_probe_arm(self, kind: str, delay: float, started_path: str) -> bool:
@@ -208,16 +251,28 @@ def _analyze(trial: dict, events: list[dict]) -> None:
     trial["fault_start_ns"], trial["fault_end_ns"] = begin, end
     trial["events"] = events
     for request in trial["requests"]:
-        scheduled = [e for e in events if e["event"] == "scheduled" and request["label"] in e["request_id"]]
+        own = [e for e in events if request["label"] in e.get("request_id", "")]
+        scheduled = [e for e in own if e["event"] == "scheduled"]
         assert scheduled, f"No scheduler observations for {request['label']}"
         request["first_observed_schedule_ms"] = (scheduled[0]["time_ns"] - request["started_ns"]) / 1e6
         request["schedule_call_max_ms"] = max(e["duration_ns"] for e in scheduled) / 1e6
         request["scheduled_during_stall"] = sum(begin <= e["time_ns"] < end for e in scheduled)
-        request["restored_rows"] = sum(
-            e["restored_rows"] for e in events if e["event"] == "capture" and request["label"] in e["request_id"]
+        request["restored_rows"] = sum(e["restored_rows"] for e in own if e["event"] == "capture")
+        queued = {e["save_id"]: e for e in own if e["event"] == "save_queued"}
+        started = {e["save_id"] for e in own if e["event"] == "save_started"}
+        finished = {e["save_id"]: e["success"] for e in own if e["event"] == "save_finished"}
+        request["save_dropped_blocks"] = max(
+            0,
+            sum(e["save_candidate_blocks"] for e in own if e["event"] == "capture")
+            - sum(e["blocks"] for e in queued.values()),
         )
+        request["save_skipped_blocks"] = sum(
+            e["blocks"] for key, e in queued.items() if key not in started and finished.get(key) is False
+        )
+        request["save_failed_batches"] = sum(finished.get(key) is False for key in queued if key in started)
+        request["save_pending_batches"] = sum(key not in finished for key in queued)
     if trial["delay_seconds"]:
-        ongoing, _, healthy = trial["requests"]
+        ongoing, writer, healthy = trial["requests"][:3]
         assert healthy["token_times_ns"][0] < end, "Healthy request waited for the delayed Store call"
         if trial["kind"] == "lookup":
             assert ongoing["scheduled_during_stall"] > 0, "Existing decode did not progress during lookup"
@@ -227,6 +282,21 @@ def _analyze(trial: dict, events: list[dict]) -> None:
                 e["event"] == "hs_read" and healthy["label"] in e["request_id"] and begin < e["time_ns"] < end
                 for e in events
             ), "Healthy HS read did not complete while native KV put was delayed"
+            writer_saves = [e for e in events if e["event"] == "save_queued" and writer["label"] in e["request_id"]]
+            successors = [e for e in writer_saves if e["predecessor_pending"]]
+            assert successors, "Delayed writer did not queue a same-attempt successor"
+            first_done = next(
+                e["time_ns"]
+                for e in events
+                if e["event"] == "save_finished" and e["save_id"] == writer_saves[0]["save_id"]
+            )
+            unrelated = trial["requests"][3]
+            assert any(
+                e["event"] == "save_started"
+                and unrelated["label"] in e["request_id"]
+                and successors[0]["time_ns"] < e["time_ns"] < first_done
+                for e in events
+            ), "Unrelated HS save waited behind a same-attempt successor"
 
 
 async def _run(args) -> None:
@@ -307,7 +377,14 @@ async def _run(args) -> None:
                         # must take the bypass while the old RPC still drains.
                         await asyncio.sleep(args.lookup_timeout + 0.1)
                     healthy = asyncio.create_task(_request(engine, case + "-healthy", healthy_prompt, 48))
-                    requests = await asyncio.wait_for(asyncio.gather(ongoing, writer, healthy), timeout=180)
+                    tasks = [ongoing, writer, healthy]
+                    if kind == "kv_put":
+                        # A cold peer must populate HS while the first writer's
+                        # successor is pending; a cache hit exercises only reads.
+                        await _wait_file(started_path.with_suffix(".writer-saves"))
+                        peer_prompt = {"prompt": healthy_prompt["prompt"].replace("user\n", f"user\nPeer {case}: ", 1)}
+                        tasks.append(asyncio.create_task(_request(engine, case + "-peer", peer_prompt, 48)))
+                    requests = await asyncio.wait_for(asyncio.gather(*tasks), timeout=180)
                     # Only snapshot after the injected operation completes.
                     await _wait_file(started_path.with_suffix(".completed"), timeout=delay + 30)
                     events = _snapshot(await engine.collective_rpc("fault_probe_snapshot", stage_ids=[0], timeout=30))
@@ -333,6 +410,7 @@ async def _run(args) -> None:
             for delay in (0.0, args.delay):
                 trials = [t for t in report["trials"] if t["kind"] == kind and t["delay_seconds"] == delay]
                 values = [t["requests"][2]["ttft_ms"] for t in trials]
+                end_to_end = [t["requests"][2]["e2e_ms"] for t in trials]
                 scheduled = [t["requests"][2]["first_observed_schedule_ms"] for t in trials]
                 report["summary"].append(
                     {
@@ -341,10 +419,22 @@ async def _run(args) -> None:
                         "healthy_ttft_mean_ms": statistics.mean(values),
                         "healthy_ttft_min_ms": min(values),
                         "healthy_ttft_max_ms": max(values),
+                        "healthy_e2e_mean_ms": statistics.mean(end_to_end),
+                        "healthy_e2e_min_ms": min(end_to_end),
+                        "healthy_e2e_max_ms": max(end_to_end),
                         "repeats": len(values),
                         "healthy_first_schedule_mean_ms": statistics.mean(scheduled),
                         "healthy_first_schedule_min_ms": min(scheduled),
                         "healthy_first_schedule_max_ms": max(scheduled),
+                        **{
+                            field: sum(r[field] for t in trials for r in t["requests"])
+                            for field in (
+                                "save_dropped_blocks",
+                                "save_skipped_blocks",
+                                "save_failed_batches",
+                                "save_pending_batches",
+                            )
+                        },
                     }
                 )
         report["passed"] = True

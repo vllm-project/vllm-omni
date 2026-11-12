@@ -18,7 +18,7 @@ represented by the checkpoint configuration alone.
 rejects local Thinker prefix caching, so every reused prefix is restored from
 Mooncake. It is not a two-level cache; the
 [deferred two-level design](#deferred-two-level-cache-cooperation) records what
-that mode requires. Duplex sessions and performance evaluation are M2 work.
+that mode requires. Duplex sessions remain M2 work.
 Online connector reset is unsupported.
 
 In this page, **HS** means the two Thinker captures that Talker reads for
@@ -101,7 +101,9 @@ Complete prompt blocks are copied out of each step's captures. Saving is best
 effort: blocks are skipped when the staging budget or save queue is full, and
 the response does not change. A lookup stops at the first missing block, so a
 request stops saving after it skips one. Queued saves for one request attempt
-run in order; a failed write or expired KV wait also stops later saves while
+run in order; a successor enters the executor only after its predecessor
+finishes, so waiting for that predecessor never occupies another save worker.
+A failed write or expired KV wait also stops later saves while
 preserving any successfully saved leading blocks. A save worker writes each HS object
 and reads back the stored winner, because a put to an existing key keeps the
 first value. It then releases the staging reservation and polls for the
@@ -249,12 +251,22 @@ Two manual benchmarks use the same pinned Qwen3-Omni MRv2 deployment:
   an overflow working set that exceeds the configured GPU KV capacity.
 - `benchmarks/qwen3_omni/mooncake_faults.py` delays lookup and native KV-write
   calls against a real Store, checking unaffected requests' progress, latency,
-  and generated tokens. Delays are injected at API entry; they do not model
-  Store-internal mutex or transport stalls.
+  and generated tokens. A cold peer checks that an unrelated HS save can start
+  while a writer's successor waits; per-request counters distinguish admission
+  drops, skipped saves, failed saves, and pending saves. Delays are injected at
+  API entry; they do not model Store-internal mutex or transport stalls.
 
 Performance runs use explicit greedy sampling and disable residual-codebook
 sampling. They contain no source-tensor dumps or save barriers. Output hashes
 and memory snapshots are collected between timed waves. Two-level cache
 cooperation and duplex sessions remain outside this validation.
 
-See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md).
+The recorded `bb18ac89a` fault run passed 12 trials. Healthy-request mean
+TTFT/E2E was 221.1/1152.6 ms without a lookup delay and 230.9/1269.8 ms with a
+five-second delay; the KV-write counterparts were 332.4/1356.5 and
+301.7/1328.2 ms. That run measured serving/read progress, not save drops or
+unrelated save progress. The revised save scheduling and cold-peer probe still
+need a GPU rerun.
+
+See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
+for variability, fault timing, and the limits of the recorded evidence.
