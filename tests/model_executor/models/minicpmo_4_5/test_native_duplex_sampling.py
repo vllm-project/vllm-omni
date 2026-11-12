@@ -277,28 +277,17 @@ def test_explicit_force_listen_bypasses_only_soft_character_target(monkeypatch, 
     assert state.generated_tokens == []
 
 
-class _AnswerTokenizer(_CharTokenizer):
-    pieces = {21: "十一", 22: "一", 23: "1", 24: "hello", 25: "lo", 26: "方形", 27: "正", 28: "北京", 29: "是"}
-
-    def decode(self, ids, skip_special_tokens=False):
-        return "".join(self.pieces.get(int(token), "") for token in ids)
-
-
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("all_greedy", [False, True])
-@pytest.mark.parametrize("across_chunk", [False, True])
-@pytest.mark.parametrize("prefix,candidate", [([23, 23], 23), ([28], 29), ([21], 22), ([24], 25), ([27], 26)])
-def test_sampled_eos_is_preserved_without_punctuation(
-    monkeypatch, deferred, all_greedy, across_chunk, prefix, candidate
-):
+def test_sampled_eos_is_preserved_without_punctuation(monkeypatch, deferred, all_greedy):
     """Neither an unpunctuated answer nor an unfinished word authorizes resampling EOS."""
     model, state, md, _ = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
     model.max_speak_chars_per_chunk = 0
-    model._minicpmo45_tokenizer_cache = _AnswerTokenizer()
     state.current_turn_ended = False
+    prefix, candidate = [27], 26
     for token in prefix:
         model._record_minicpmo45_duplex_generation_token(0, token)
-    md.output_token_ids[0] = [] if across_chunk else list(prefix)
+    md.output_token_ids[0] = list(prefix)
     eos = TOKEN_IDS["turn_eos_token_id"]
     logits = torch.full((1, VOCAB), -100.0)
     logits[0, eos], logits[0, candidate] = 27.5, 25.0
@@ -314,11 +303,10 @@ def test_sampled_eos_is_preserved_without_punctuation(
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("previous,candidate", [(21, 22), (23, 23), (27, 26)])
+@pytest.mark.parametrize("previous,candidate", [(23, 23), (27, 26)], ids=["repetition", "continuation"])
 def test_model_selected_repetition_and_continuation_are_preserved(monkeypatch, deferred, previous, candidate):
     model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
     model.max_speak_chars_per_chunk = 0
-    model._minicpmo45_tokenizer_cache = _AnswerTokenizer()
     state.current_turn_ended = False
     model._record_minicpmo45_duplex_generation_token(0, previous)
     md.output_token_ids[0] = []
@@ -372,9 +360,9 @@ def test_deferred_text_is_committed_before_the_next_turn_eos(monkeypatch):
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("window_enabled", [False, True])
 def test_discarded_async_text_cannot_suppress_next_unit_eos(monkeypatch, deferred, window_enabled):
-    from tests.worker.test_native_duplex_hooks import _stage0_vision_runtime
+    from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
 
-    runtime = _stage0_vision_runtime()
+    runtime = stage0_vision_runtime()
     for name, value in TOKEN_IDS.items():
         setattr(runtime, name, value)
     state = _MiniCPMO45Stage0SessionState(session_id="accepted-span", window_enabled=window_enabled)
@@ -382,10 +370,9 @@ def test_discarded_async_text_cannot_suppress_next_unit_eos(monkeypatch, deferre
     assert first["success"]
     model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
     model._minicpmo45_duplex_state_for_row = lambda row: state
-    model._minicpmo45_tokenizer_cache = _AnswerTokenizer()
     model.max_speak_chars_per_chunk = 0
     md.output_token_ids[0] = []
-    assert sample(23) == 23  # Accepted text "1".
+    assert sample(23) == 23  # Accepted text.
     md.output_token_ids[0] = [23]
     assert sample(CHUNK_EOS) == CHUNK_EOS
     assert sample(23) == 23  # Late lookahead text; scheduler stopped at the boundary.

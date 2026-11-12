@@ -1449,7 +1449,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
                 hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
-                resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
+                resolved.update(
+                    (row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist(), strict=True) if hit
+                )
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(

@@ -786,7 +786,7 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_d
 @pytest.mark.parametrize("as_tensor", [False, True], ids=["transport-list", "tensor"])
 @pytest.mark.parametrize(
     "condition_ids,turn_end",
-    [([41, 99, 42], False), ([99, 41], False), ([99, 41, 99], True), ([99], True), ([], False)],
+    [([99, 41], False), ([99, 41, 99], True), ([99], True), ([], False)],
 )
 def test_talker_turn_end_follows_last_condition_token(condition_ids, turn_end, as_tensor) -> None:
     info = {

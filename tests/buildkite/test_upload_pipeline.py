@@ -918,6 +918,29 @@ def test_source_file_dependencies_list_of_keys_concatenates() -> None:
     assert resolved.count("vllm_omni/model_executor/models/common/snake_activation.py") == 1
 
 
+@pytest.mark.parametrize(
+    "changed_file,expected_keys",
+    [
+        ("vllm_omni/worker_v2/output_snapshot.py", {"ready"}),
+        ("vllm_omni/outputs/output_processor.py", {"ready"}),
+        ("tests/worker_v2/test_omni_model_runner.py", {"ready"}),
+        ("vllm_omni/outputs/duplex.py", {"ready", "merge"}),
+    ],
+)
+def test_minicpmo_mrv2_dependencies_do_not_expand_shared_duplex_jobs(changed_file, expected_keys):
+    steps = []
+    for key, path in [("ready", CUDA_READY_YAML), ("merge", Path(".buildkite/cuda/test-merge.yml"))]:
+        doc = yaml.safe_load(path.read_text())
+        duplex_step = next(
+            step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test"
+        )
+        steps.append(
+            {"key": key, "commands": ["true"], "source_file_dependencies": duplex_step["source_file_dependencies"]}
+        )
+    rendered = _render_test_pipeline({"steps": steps}, changed_files=[changed_file])
+    assert {step["key"] for step in _iter_steps(rendered)} == expected_keys
+
+
 def test_unknown_source_file_dependencies_key() -> None:
     with pytest.raises(ValueError, match="unknown source_file_dependencies"):
         _render_test_pipeline(
