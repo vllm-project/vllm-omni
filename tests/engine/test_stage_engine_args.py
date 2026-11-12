@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import types
 from dataclasses import fields, replace
@@ -45,7 +46,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import (
@@ -480,8 +481,16 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["profiler_config"].profiler == "cuda"
 
 
-def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
+@pytest.mark.parametrize("adapter_path", [None, "pipeline.CustomSchedulingMetadataAdapter"])
+def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path, adapter_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    pipeline = replace(
+        pipeline,
+        stages=tuple(
+            replace(stage, scheduling_metadata_adapter=adapter_path) if stage.stage_id == 1 else stage
+            for stage in pipeline.stages
+        ),
+    )
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
     connector_spec = {"name": "SharedMemoryConnector", "extra": {"mode": "test"}}
     cli_tokenizer = "/external/tokenizer"
@@ -505,6 +514,9 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
         assert {name: typed_args[name] for name in expected_args} == expected_args
         assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
+        expected_adapter = adapter_path if stage_id == 1 else None
+        assert legacy_args["scheduling_metadata_adapter"] == expected_adapter
+        assert typed_args["scheduling_metadata_adapter"] == expected_adapter
 
     thinker_args = typed_args_by_stage[0]
     inherited_vllm_fields = {
@@ -542,8 +554,16 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert talker_args["enable_prefix_caching"] is False
 
 
-def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
+@pytest.mark.parametrize("adapter_path", [None, "pipeline.CustomSchedulingMetadataAdapter"])
+def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path, adapter_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    pipeline = replace(
+        pipeline,
+        stages=tuple(
+            replace(stage, scheduling_metadata_adapter=adapter_path) if stage.stage_id == 2 else stage
+            for stage in pipeline.stages
+        ),
+    )
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
 
     legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
@@ -565,6 +585,56 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     assert isinstance(typed_args["diffusion_attention_config"], AttentionConfig)
     assert typed_args["diffusion_attention_config"].default.backend == "FLASH_ATTN"
     assert typed_args["diffusion_attention_config"].per_role["cross"].backend == "TORCH_SDPA"
+
+    for engine_args in (legacy_args, typed_args):
+        diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=2, include_engine_adapter_metadata=True
+        )
+        assert "scheduling_metadata_adapter" not in diffusion_kwargs
+        assert engine_args["scheduling_metadata_adapter"] == adapter_path
+        with pytest.raises(ValueError, match="scheduling_metadata_adapter"):
+            extract_diffusion_stage_config_kwargs(engine_args, stage_id=2)
+
+
+@pytest.mark.diffusion
+@pytest.mark.parametrize("cli_override", [False, True])
+def test_attention_schedule_survives_yaml_and_both_stage_projections(tmp_path, cli_override):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    raw = {
+        "profiles": {"sparse": {"default": {"backend": "TRTLLM_ATTN", "skip_softmax": {"threshold": 0.1}}}},
+        "default": [{"start": 3, "end": None, "profile": "sparse"}],
+    }
+    yaml_path = tmp_path / "schedule.yaml"
+    yaml_path.write_text(json.dumps({"stages": [{"stage_id": 2, "diffusion_attention_schedule": raw}]}))
+    loaded = load_deploy_config(yaml_path)
+    deploy.stages[2] = replace(
+        deploy.stages[2], diffusion_attention_schedule=loaded.stages[0].diffusion_attention_schedule
+    )
+    override = {
+        "profiles": {"dense": {"default": "TORCH_SDPA"}},
+        "default": [{"start": 1, "end": 5, "profile": "dense"}],
+    }
+    cli: dict[str, object] | None = {"stage_2_diffusion_attention_schedule": override} if cli_override else None
+    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model, cli_overrides=cli)
+    expected_profile = "dense" if cli_override else "sparse"
+    for args in (
+        build_legacy_engine_args_dict(legacy_stages[2], model),
+        build_engine_args_dict_from_omni_stage_config(omni_config.stage_by_id(2), model),
+    ):
+        terminal = OmniDiffusionConfig.from_kwargs(
+            **extract_diffusion_stage_config_kwargs(args, stage_id=2, include_engine_adapter_metadata=True)
+        )
+        schedule = terminal.diffusion_attention_schedule
+        assert isinstance(schedule, AttentionScheduleConfig)
+        # Service CLI dictionaries merge with YAML, but the default interval
+        # list is replaced rather than concatenated.
+        assert set(schedule.profiles) == ({"sparse", "dense"} if cli_override else {"sparse"})
+        assert schedule.profiles["sparse"].default.backend_kwargs() == {"skip_softmax_threshold": 0.1}
+        assert len(schedule.default) == 1
+        assert schedule.default[0].profile == expected_profile
+        assert schedule.default[0].start == (1 if cli_override else 3)
+        assert schedule.default[0].end == (5 if cli_override else None)
+    assert deploy.stages[2].diffusion_attention_schedule == raw
 
 
 def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):

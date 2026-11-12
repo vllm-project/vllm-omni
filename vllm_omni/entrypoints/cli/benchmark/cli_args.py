@@ -227,6 +227,27 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
 
+def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared duplex workload and metric options."""
+    group = parser.add_argument_group("Duplex Benchmark Options")
+    group.add_argument(
+        "--duplex-metric-aggregation",
+        choices=("session", "response"),
+        default="session",
+        help="Aggregate duplex TTFT, audio TTFP and RTF over session means (default) or individual responses.",
+    )
+    group.add_argument(
+        "--duplex-sample-pool-size",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Select a fixed pool of OmniInteract or Omni-DuplexEval sessions and cycle it to reach --num-prompts. "
+            "With a pool, --num-prompts 0 selects exactly the pool size instead of the full dataset. "
+            "For performance runs without answer evaluation; repeated sessions use distinct output identities."
+        ),
+    )
+
+
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
@@ -249,6 +270,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "Total per-request timeout in seconds for benchmark HTTP requests. Timed-out requests are "
             "recorded as failed instead of stalling the run on a hung server. Defaults to 900 when "
             "omitted; set <= 0 to restore the legacy 6 h cap."
+        ),
+    )
+    group.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "After the first timed-out benchmark request, cancel all remaining queued or in-flight requests. "
+            "Completed outputs and partial result metrics are retained. Supported only with "
+            "--backend openai-chat-omni, --request-rate inf, and non-self-timed workloads."
         ),
     )
 
@@ -538,6 +569,13 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
                 'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
             )
+        if action.dest == "goodput":
+            action.help = (
+                'Specify service level objectives for goodput as "KEY:VALUE" pairs, where the key is a '
+                'request-level metric name and the value is in milliseconds. Multiple "KEY:VALUE" pairs '
+                "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
+                'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
+            )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (
                 "Per-modality hard caps for items attached per request, e.g. "
@@ -569,6 +607,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
+    add_duplex_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

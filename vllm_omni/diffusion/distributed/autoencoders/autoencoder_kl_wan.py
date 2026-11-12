@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, ClassVar
 
 import torch
@@ -10,6 +11,7 @@ from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders import wan_encode_split, wan_spatial_shard
@@ -29,28 +31,81 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     is_encoder_installed,
     is_installed,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import suggests_channels_last
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+_GFX11_AOTRITON_MAX_HEAD_DIM = 256
+
+
+def _wan_attention_head_dims(model: torch.nn.Module) -> Iterator[int]:
+    for module in model.modules():
+        if module.__class__.__name__ != "WanAttentionBlock":
+            continue
+        qkv = getattr(module, "to_qkv", None)
+        out_channels = getattr(qkv, "out_channels", None)
+        if isinstance(out_channels, int) and out_channels % 3 == 0:
+            yield out_channels // 3
+
+
+def _requires_gfx11_math_sdpa(
+    model: torch.nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    if dtype not in (torch.float16, torch.bfloat16) or device.type != "cuda":
+        return False
+    if not current_omni_platform.is_rocm():
+        return False
+
+    capability = current_omni_platform.get_device_capability(device.index or 0)
+    if capability is None or capability[0] != 11:
+        return False
+
+    return any(head_dim > _GFX11_AOTRITON_MAX_HEAD_DIM for head_dim in _wan_attention_head_dims(model))
+
 
 class OmniAutoencoderKLWan(AutoencoderKLWan):
-    def _execution_context(self):
+    @contextmanager
+    def _execution_context(self) -> Iterator[None]:
         try:
             first_param = next(self.parameters())
         except StopIteration:
-            return nullcontext()
+            yield
+            return
 
         dtype = first_param.dtype
         if dtype not in (torch.float16, torch.bfloat16):
-            return nullcontext()
+            yield
+            return
 
-        return current_omni_platform.create_autocast_context(
+        autocast_context = current_omni_platform.create_autocast_context(
             device_type=first_param.device.type,
             dtype=dtype,
             enabled=True,
         )
+        force_math_sdpa = _requires_gfx11_math_sdpa(
+            self,
+            device=first_param.device,
+            dtype=dtype,
+        )
+        with autocast_context:
+            if not force_math_sdpa:
+                yield
+                return
+
+            # Remove this guard only after the supported ROCm image contains
+            # pytorch/pytorch#194100 and #194280 and W7900 validates issue #7484.
+            logger.warning_once(
+                "Wan VAE is forcing math SDPA because gfx11 AOTriton does not "
+                "support attention head dimensions above %d.",
+                _GFX11_AOTRITON_MAX_HEAD_DIM,
+            )
+            with sdpa_kernel(SDPBackend.MATH):
+                yield
 
     def _install_attention_alignment(self) -> None:
         """Realign 1x1 Wan attention inputs before the first encode or decode."""
@@ -301,17 +356,47 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         return tiletask_list, grid_spec
 
     def tile_exec(self, task: TileTask) -> torch.Tensor:
-        """Decode a single latent tile into RGB space."""
+        """Decode one tile, retaining raw values and patch layout for blending."""
         self.clear_cache()
-        time = []
-        with self._execution_context():
-            for k in range(len(task.tensor)):
-                self._conv_idx = [0]
-                tile = self.post_quant_conv(task.tensor[k])
-                decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0))
-                time.append(decoded)
-        result = torch.cat(time, dim=2)
-        return result
+        output = None
+        offset = 0
+        frames_per_chunk = 2 ** sum(bool(flag) for flag in self.decoder.temperal_upsample)
+        channels_last = False
+        try:
+            with self._execution_context():
+                for k in range(len(task.tensor)):
+                    self._conv_idx = [0]
+                    tile = self.post_quant_conv(task.tensor[k])
+                    decoded = self.decoder(
+                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
+                    )
+                    if output is None:
+                        total_frames = decoded.shape[2] + (len(task.tensor) - 1) * frames_per_chunk
+                        channels_last = suggests_channels_last(decoded)
+                        output = torch.empty(
+                            (*decoded.shape[:2], total_frames, *decoded.shape[3:]),
+                            dtype=decoded.dtype,
+                            device=decoded.device,
+                            memory_format=torch.channels_last_3d if channels_last else torch.contiguous_format,
+                        )
+                    elif channels_last and not suggests_channels_last(decoded):
+                        # Match cat's layout when chunks have different formats.
+                        output = output.contiguous()
+                        channels_last = False
+                    if decoded.shape[:2] != output.shape[:2] or decoded.shape[3:] != output.shape[3:]:
+                        raise RuntimeError("Wan tile decoder changed its non-temporal output shape")
+                    if decoded.shape[2] < 1 or (k > 0 and decoded.shape[2] != frames_per_chunk):
+                        raise RuntimeError("Wan tile decoder produced an unexpected temporal chunk length")
+                    end = offset + decoded.shape[2]
+                    output[:, :, offset:end].copy_(decoded)
+                    offset = end
+                    del decoded
+        finally:
+            # Keep causal history between temporal chunks, never between tiles.
+            self.clear_cache()
+        if output is None or offset != output.shape[2]:
+            raise RuntimeError("Wan tile decoder produced no output or an incomplete temporal output")
+        return output
 
     def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = x.shape

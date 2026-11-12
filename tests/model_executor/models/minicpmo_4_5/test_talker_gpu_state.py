@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.core_model]
 
 @pytest.fixture(
     params=[
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
         pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1)),
     ]
 )
@@ -290,7 +290,7 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-6, atol=1e-6)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
     from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
@@ -374,7 +374,7 @@ def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
     assert _extract_codec_delta(to_payload_element(mm, 1, 1, 2, seq_len=2), "b") == [3]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("aux_penalty", ["neutral", "frequency", "presence", "mixed"])
 def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_penalty, mocker):

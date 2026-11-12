@@ -12,10 +12,13 @@ embedding path gets enabled.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     minicpmo_4_5_code2wav as code2wav_module,
@@ -33,6 +36,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _FakeToken2Wav:
     def __init__(self, path, **kwargs):
+        self.device = (
+            "cuda"
+            if current_omni_platform.is_cuda()
+            else "npu"
+            if current_omni_platform.is_npu()
+            else current_omni_platform.device_type or "cpu"
+        )
         self.path = path
         self.kwargs = kwargs
         self.device_spk_calls = 0
@@ -55,8 +65,9 @@ class _FakeToken2Wav:
     def flow(self):
         estimator = SimpleNamespace()
         decoder = SimpleNamespace(estimator=estimator)
+        device = torch.device("privateuseone" if self.device == "npu" else self.device)
         return SimpleNamespace(
-            parameters=lambda: iter([SimpleNamespace(device="cuda")]),
+            parameters=lambda: iter([SimpleNamespace(device=device)]),
             decoder=decoder,
         )
 
@@ -65,6 +76,7 @@ class _FakeBackend:
     def __init__(self, token2wav, **kwargs):
         self.token2wav = token2wav
         self.kwargs = kwargs
+        self._whole_euler_graph_wrapper = None
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +88,7 @@ def tensorrt_importable(monkeypatch):
 @pytest.fixture(params=["cuda", "npu"])
 def device_platform(monkeypatch, request):
     """Exercise each device speaker backend without loading model assets."""
+    monkeypatch.setattr(current_omni_platform, "device_type", request.param)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: request.param == "npu")
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: request.param == "cuda")
 
@@ -122,10 +135,60 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, devic
     assert token2wav.trt_spk_calls == 0
 
 
+@pytest.mark.parametrize(
+    "flow,reason",
+    [
+        pytest.param(torch.nn.Identity(), "flow has no parameters", id="parameterless"),
+        pytest.param(torch.nn.Linear(1, 1, device="cpu"), "flow is on CPU", id="cpu"),
+    ],
+)
+def test_device_speaker_fallback_without_accelerator(tmp_path, monkeypatch, mocker, flow, reason):
+    monkeypatch.setattr(_FakeToken2Wav, "flow", property(lambda self: flow))
+    warning = mocker.patch.object(code2wav_module.logger, "warning")
+
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": True})
+
+    assert token2wav.device_spk_calls == 0
+    assert token2wav.trt_spk_calls == 0
+    warning.assert_called_once_with(
+        "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime", reason
+    )
+
+
 @pytest.mark.parametrize("value", ["maybe", "yes", 2, 1.5, []])
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, device_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
+
+
+@pytest.mark.parametrize("value", [None, False, True])
+def test_other_torch_accelerator_honors_device_speaker_flag(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(current_omni_platform, "device_type", "mps")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    extra = {} if value is None else {"token2wav_device_spk": value}
+    _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
+    assert token2wav.device_spk_calls == int(value is True)
+    assert token2wav.trt_spk_calls == 0
+
+
+def test_device_speaker_cache_reuses_unindexed_mps(tmp_path, monkeypatch):
+    """An unindexed MPS device and mps:0 share one loaded speaker."""
+    from vllm_omni.model_executor.models.cosyvoice3 import speaker_embedding_torch
+
+    device = torch.device("mps:0")
+    build = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(speaker_embedding_torch, "_CAMPPLUS_TORCH_CACHE", {})
+    monkeypatch.setattr(speaker_embedding_torch, "_build_campplus_fp32", build)
+    monkeypatch.setattr(torch, "empty", Mock(return_value=Mock(spec=torch.Tensor, device=device)))
+    path = str(tmp_path / "campplus.onnx")
+
+    speaker = speaker_embedding_torch.get_campplus_torch(path, "mps")
+
+    assert speaker.device == device
+    assert speaker_embedding_torch.get_campplus_torch(path, torch.device("mps")) is speaker
+    assert speaker_embedding_torch.get_campplus_torch(path, "mps:0") is speaker
+    build.assert_called_once_with(path)
 
 
 def test_invalid_value_is_rejected_off_device_too(tmp_path, monkeypatch):
@@ -402,3 +465,204 @@ def test_facade_forwards_speaker_reference_policy(mocker, cpu_reference):
     facade._core = core
     facade.enable_trt_spk_embedding(cpu_reference=cpu_reference)
     core.enable_trt_spk_embedding.assert_called_once_with(cpu_reference=cpu_reference)
+
+
+def _model_with_sweep(tmp_path, monkeypatch, extra):
+    """Build the model with a stubbed precapture sweep, recording its calls."""
+    model, _ = _build_backend(tmp_path, monkeypatch, extra)
+    calls: list[int] = []
+
+    def sweep() -> None:
+        calls.append(1)
+        model._precapture_pending = False
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
+    return model, calls
+
+
+def _force_platform(monkeypatch, platform: str) -> None:
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+
+
+def test_startup_sweep_stays_off_when_precapture_is_disabled(tmp_path, monkeypatch, device_platform):
+    """``cfm_graph_precapture: false`` keeps every graph lazy, as before."""
+    model, calls = _model_with_sweep(
+        tmp_path,
+        monkeypatch,
+        {"cfm_graph_precapture": "false", "cfm_graph_precapture_at_init": "true"},
+    )
+    assert model._precapture_pending is False
+    model.capture_auxiliary_graphs()
+    assert calls == []
+
+
+def test_capture_auxiliary_graphs_runs_the_sweep_once(tmp_path, monkeypatch, device_platform):
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model.capture_auxiliary_graphs()
+    assert calls == [1]
+    # The cleared flag is what keeps the first forward from sweeping again.
+    assert model._precapture_pending is False
+    model.capture_auxiliary_graphs()
+    assert calls == [1]
+
+
+def test_load_weights_does_not_sweep(tmp_path, monkeypatch, device_platform):
+    """Sweeping at weight-load time raised the reserved footprint by ~4 GiB on CUDA."""
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model.load_weights([])
+    assert calls == []
+    assert model._precapture_pending is True
+
+
+@pytest.mark.parametrize("platform", ["npu", "cuda"])
+def test_startup_sweep_is_on_by_default(tmp_path, monkeypatch, platform):
+    """The sweep matches main's default: on, only moved to the warmup hook."""
+    _force_platform(monkeypatch, platform)
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {})
+    model.capture_auxiliary_graphs()
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("platform", ["npu", "cuda"])
+def test_startup_sweep_can_be_disabled_explicitly(tmp_path, monkeypatch, platform):
+    """An overlay can still turn the startup sweep off."""
+    _force_platform(monkeypatch, platform)
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "false"})
+    model.capture_auxiliary_graphs()
+    assert calls == []
+    assert model._precapture_pending is True
+
+
+def test_startup_sweep_matches_the_forward_context(tmp_path, monkeypatch, device_platform):
+    """Graphs captured there must replay what the lazy path would have recorded."""
+    model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    seen: dict[str, object] = {}
+
+    def sweep() -> None:
+        seen["inference"] = torch.is_inference_mode_enabled()
+        seen["grad"] = torch.is_grad_enabled()
+        model._precapture_pending = False
+
+    @contextlib.contextmanager
+    def policy(mode):
+        seen["policy"] = mode
+        yield
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
+    monkeypatch.setattr(code2wav_module, "_stage_matmul_policy", policy)
+    model.capture_auxiliary_graphs()
+    assert seen["inference"] is True
+    assert seen["grad"] is False
+    assert seen["policy"] == model._tf32_mode
+
+
+def test_startup_sweep_propagates_a_poisoned_wrapper(tmp_path, monkeypatch, device_platform):
+    """A poisoned wrapper fails startup instead of degrading to lazy capture."""
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"cfm_graph_precapture_at_init": "true", "cfm_precapture_empty_cache": "true"},
+    )
+    released: list[int] = []
+
+    def sweep() -> None:
+        raise RuntimeError("poisoned wrapper")
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
+    monkeypatch.setattr(model, "_release_precapture_cache", lambda: released.append(1))
+    with pytest.raises(RuntimeError, match="poisoned wrapper"):
+        model.capture_auxiliary_graphs()
+    # The caller-less allocator blocks are still returned before the failure.
+    assert released == [1]
+
+
+def test_startup_sweep_does_not_mask_the_sweep_error(tmp_path, monkeypatch, device_platform):
+    """A failing cache release must not replace the error startup is failing for."""
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"cfm_graph_precapture_at_init": "true", "cfm_precapture_empty_cache": "true"},
+    )
+
+    def sweep() -> None:
+        raise RuntimeError("poisoned wrapper")
+
+    def release() -> None:
+        raise RuntimeError("empty_cache failed")
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
+    monkeypatch.setattr(model, "_release_precapture_cache", release)
+    with pytest.raises(RuntimeError, match="poisoned wrapper"):
+        model.capture_auxiliary_graphs()
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+def test_precapture_cache_release_uses_the_npu_allocator(tmp_path, monkeypatch):
+    """Ascend exposes the allocator through ``torch.npu``, not ``torch.accelerator``.
+
+    Skipped on CUDA-only builds: ``_release_precapture_cache`` builds the device
+    with ``torch.device(accelerator.type, ...)``, which raises when no backend
+    registered the ``npu`` device type — the dispatch itself needs that type.
+    """
+    model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_precapture_empty_cache": "true"})
+    calls: list[str] = []
+
+    class _FakeNpu:
+        @staticmethod
+        def current_device() -> int:
+            return 0
+
+        @staticmethod
+        def synchronize(device=None) -> None:
+            calls.append("synchronize")
+
+        @staticmethod
+        def empty_cache() -> None:
+            calls.append("empty_cache")
+
+    monkeypatch.setattr(code2wav_module.torch, "npu", _FakeNpu, raising=False)
+    monkeypatch.setattr(
+        code2wav_module.torch.accelerator,
+        "current_accelerator",
+        lambda: torch.device("npu"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        code2wav_module.torch.accelerator,
+        "current_device_index",
+        lambda: 0,
+        raising=False,
+    )
+
+    model._release_precapture_cache()
+
+    assert calls == ["synchronize", "empty_cache"]
+
+
+def test_npu_worker_warmup_hook_reaches_the_model(monkeypatch):
+    """The NPU worker must forward its warmup hook to the model's capture hook.
+
+    ``_capture_auxiliary_graphs`` resolves ``capture_auxiliary_graphs`` through
+    ``getattr(self.model_runner.model, ...)``, which depends on any graph wrapper
+    forwarding attribute access. If a future wrapper stops forwarding, the hook
+    would silently become a no-op and the sweep would fall back to the first
+    request again — the exact failure this PR removes. Pin the forwarding.
+    """
+
+    class _FakeModel:
+        calls = 0
+
+        def capture_auxiliary_graphs(self) -> None:
+            _FakeModel.calls += 1
+
+    worker_module = pytest.importorskip("vllm_omni.platforms.npu.worker.base")
+    worker = object.__new__(worker_module.OmniNPUWorkerBase)
+
+    worker.model_runner = SimpleNamespace(model=_FakeModel())
+    worker._capture_auxiliary_graphs()
+    assert _FakeModel.calls == 1
+
+    # Models without the hook stay a no-op instead of failing startup.
+    worker.model_runner = SimpleNamespace(model=SimpleNamespace())
+    worker._capture_auxiliary_graphs()

@@ -22,7 +22,7 @@ from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import Sen
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.sensenova_u1 import SenseNovaU1Config, SenseNovaU1VisionConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 class _BranchProbe(nn.Module):
@@ -65,6 +65,7 @@ def _forbid_item(self, *args, **kwargs):
         ([False, True], (True, True)),
     ],
 )
+@pytest.mark.cpu
 def test_token_routing_fallback(indicators, expected):
     model = _RoutingModel()
     model(
@@ -76,6 +77,7 @@ def test_token_routing_fallback(indicators, expected):
 
 
 @pytest.mark.parametrize("teacache", [False, True])
+@pytest.mark.cpu
 def test_known_generation_type_avoids_scalar_reads(monkeypatch, teacache):
     model = _RoutingModel()
     embeds = torch.randn(1, 2, 4)
@@ -104,6 +106,7 @@ def _vision_config():
 
 @pytest.mark.parametrize("sizes", [[[4, 6]], [[4, 6], [6, 4]]])
 @torch.inference_mode()
+@pytest.mark.cpu
 def test_vision_grid_reuse_preserves_changing_image_features(monkeypatch, sizes):
     torch.manual_seed(42)
     model = NEOVisionEmbeddings(_vision_config())
@@ -173,6 +176,7 @@ class _LoopProbe(SenseNovaU1Pipeline):
 )
 @pytest.mark.parametrize("noise_embedding", [False, True])
 @torch.inference_mode()
+@pytest.mark.cpu
 def test_denoise_loop_preserves_cfg_boundaries_and_request_isolation(
     is_it2i, interval, scale, img_scale, noise_embedding
 ):

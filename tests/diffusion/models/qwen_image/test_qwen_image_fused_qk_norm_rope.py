@@ -141,7 +141,7 @@ def force_always_fuse(monkeypatch):
     monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     data = _make_input(
@@ -158,7 +158,7 @@ def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-5, rtol=1e-5)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     data = _make_input(
@@ -326,6 +326,7 @@ def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len, force_always
     assert torch.equal(joint_v, torch.cat([txt_v, img_v], dim=1))
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_packed_table_skipped_when_fused_path_unavailable(force_always_fuse):
     """No table, no allocation, where the CUDA kernel cannot run."""
     from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
@@ -401,6 +402,7 @@ def test_min_tokens_env_zero_forces_both_paths(monkeypatch):
     assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16).shape == (80, HEAD_DIM)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @_REQUIRES_ROCM
 def test_packed_table_is_none_on_rocm(force_always_fuse):
     """The token gate is open, but ROCm has no fused CUDA kernel."""
@@ -412,6 +414,7 @@ def test_packed_table_is_none_on_rocm(force_always_fuse):
     assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_min_tokens_env_invalid_value_raises(monkeypatch):
     """Both paths surface the shared parser's ``ValueError`` before touching the tensors."""
     from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table

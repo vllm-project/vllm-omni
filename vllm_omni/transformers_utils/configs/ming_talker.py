@@ -32,6 +32,7 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         max_decode_steps: int = 200,
         max_cache_len: int = 2048,
         enable_llm_cuda_graph: bool = False,
+        compile_flow: bool = False,
         low_latency_streaming: bool = False,
         strict_weight_loading: bool = False,
         normalize_text: bool = True,
@@ -55,6 +56,8 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         self.max_decode_steps = max_decode_steps
         self.max_cache_len = max_cache_len
         self.enable_llm_cuda_graph = enable_llm_cuda_graph
+        # Batched Talker only: torch.compile the DiT forward before capture.
+        self.compile_flow = compile_flow
         self.low_latency_streaming = low_latency_streaming
         self.strict_weight_loading = strict_weight_loading
         self.normalize_text = normalize_text

@@ -29,7 +29,7 @@ class CFMSampler(nn.Module):
     All randomness (``y0``, ``sde_rnd``) and the timestep schedule ``t`` are
     passed in as float32 tensors so the loop is deterministic during replay and
     the integration matches the eager float32 path. Equivalent to eager
-    ``Solver.integrate`` for ``temperature==0`` (the TTS default).
+    ``Solver.integrate`` for ``temperature==0``.
     """
 
     def __init__(self, dit_model: nn.Module, steps: int = DEFAULT_CFM_STEPS):
@@ -90,10 +90,20 @@ class CFMGraphExecutor:
         self.num_warmups = max(1, int(num_warmups))
         self.initialized = False
         self.graph: torch.cuda.CUDAGraph | None = None
+        self._timesteps_cache: dict[torch.device, torch.Tensor] = {}
+        self._last_sde_args: tuple[float, float, float] | None = None
 
     def _timesteps(self, device):
         # Raw EPSS schedule + sway in float32, identical to eager build_timesteps.
-        return build_timesteps(self.steps, device=device, dtype=torch.float32, use_epss=True, sway_sampling_coef=-1.0)
+        # The schedule is constant; building it from a Python list is a
+        # pageable H2D copy that blocks the host, so build it once per device.
+        timesteps = self._timesteps_cache.get(device)
+        if timesteps is None:
+            timesteps = build_timesteps(
+                self.steps, device=device, dtype=torch.float32, use_epss=True, sway_sampling_coef=-1.0
+            )
+            self._timesteps_cache[device] = timesteps
+        return timesteps
 
     def _pad_batch(self, tensor: torch.Tensor, *, dim: int = 0) -> torch.Tensor:
         actual_batch_size = int(tensor.shape[dim])
@@ -155,18 +165,21 @@ class CFMGraphExecutor:
 
         # As in the MOSS bucket wrapper, keep address-stable full-bucket
         # buffers and replace only the live rows. CFM has no persistent row
-        # state, so zero-filled padding is sufficient.
-        self._llm_cond_ph.zero_()
+        # state, so zero-filled padding is sufficient; full buckets skip it.
+        padded = actual_batch_size < self.batch_size
+        if padded:
+            self._llm_cond_ph[actual_batch_size:].zero_()
+            self._his_lat_ph[actual_batch_size:].zero_()
+            self._y0_ph[actual_batch_size:].zero_()
+            self._sde_rnd_ph[:, actual_batch_size:].zero_()
         self._llm_cond_ph[:actual_batch_size].copy_(llm_cond)
-        self._his_lat_ph.zero_()
         self._his_lat_ph[:actual_batch_size].copy_(his_lat)
-        self._y0_ph.zero_()
         self._y0_ph[:actual_batch_size].copy_(y0)
-        self._t_ph.copy_(t)
-        self._sde_args_ph[0] = float(cfg_strength)
-        self._sde_args_ph[1] = float(sigma)
-        self._sde_args_ph[2] = float(temperature)
-        self._sde_rnd_ph.zero_()
+        # ``_t_ph`` holds the constant schedule copied in at capture time.
+        sde_args = (float(cfg_strength), float(sigma), float(temperature))
+        if sde_args != self._last_sde_args:
+            self._sde_args_ph[0], self._sde_args_ph[1], self._sde_args_ph[2] = sde_args
+            self._last_sde_args = sde_args
         self._sde_rnd_ph[:, :actual_batch_size].copy_(sde_rnd)
 
         self.graph.replay()

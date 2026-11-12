@@ -5,16 +5,15 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
-from abc import ABC, abstractmethod
 from base64 import b64decode, b64encode
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
@@ -22,7 +21,7 @@ from hashlib import sha1
 from io import BytesIO
 from mimetypes import guess_type
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -126,6 +125,11 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "qwen3_omni" / "results" / "qwen_omni_acc"
 
 
+def _default_diffusion_accuracy_result_dir() -> Path:
+    """Shared sink for diffusion (and other non-bench) accuracy ``result_acc_*.json`` files."""
+    return Path(__file__).resolve().parent / "results"
+
+
 def _accuracy_hardware_label() -> str:
     """Local device token for the accuracy result, or ``""`` when detection fails.
 
@@ -144,6 +148,73 @@ def _accuracy_hardware_label() -> str:
         return ""
 
 
+def _json_safe_metric_value(value: Any) -> Any:
+    """Make metric values JSON-serializable with ``allow_nan=False``.
+
+    Legitimate infinite PSNR (identical images) becomes the string ``\"inf\"``.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metric_value(item) for item in value]
+    return value
+
+
+def _is_hardware_nested_accuracy_baseline(baseline: Mapping[str, Any]) -> bool:
+    """True when every value is a non-empty metric dict (perf-style hardware nesting)."""
+    if not baseline:
+        return False
+    return all(isinstance(value, Mapping) and bool(value) for value in baseline.values())
+
+
+def normalize_accuracy_baseline(
+    baseline: Mapping[str, Any] | None,
+    *,
+    hardware: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Normalize accuracy thresholds to the perf hardware-nested shape.
+
+    Perf result JSON stores::
+
+        {"baseline": {"H100": {"ssim": 0.99, "psnr": 40.0}, "A3": {...}}}
+
+    Callers may pass that nested map, a ``SimilarityThresholds`` table (via
+    :func:`baseline_from_similarity_thresholds`), or a flat metric dict. Flat
+    dicts are wrapped under the current ``Hardware`` label (or ``default`` when
+    detection fails), matching how a single-SKU perf case records one bucket.
+    """
+    if not baseline:
+        return {}
+    if _is_hardware_nested_accuracy_baseline(baseline):
+        nested: dict[str, dict[str, Any]] = {}
+        for profile, metrics in baseline.items():
+            if not isinstance(metrics, Mapping):
+                continue
+            cleaned = {str(key): value for key, value in metrics.items() if value is not None}
+            if cleaned:
+                nested[str(profile)] = cleaned
+        return nested
+
+    hw = hardware if hardware is not None else _accuracy_hardware_label()
+    if not hw:
+        hw = "default"
+    flat = {str(key): value for key, value in baseline.items() if value is not None}
+    return {hw: flat} if flat else {}
+
+
+def baseline_from_similarity_thresholds(
+    table: Mapping[str, "SimilarityThresholds"],
+) -> dict[str, dict[str, float]]:
+    """Convert a per-device ``SimilarityThresholds`` table into a nested baseline."""
+    return {str(profile): {"ssim": thr.ssim, "psnr": thr.psnr} for profile, thr in table.items()}
+
+
 def _write_accuracy_result_metadata(
     path: Path,
     data: dict[str, Any],
@@ -156,7 +227,8 @@ def _write_accuracy_result_metadata(
     ``vllm bench serve`` saves measured scores only. The thresholds from the
     accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
     are applied afterwards, so persist them under ``baseline`` before the check.
-    Unset optional gates (``None``) are omitted.
+    Unset optional gates (``None``) are omitted. ``baseline`` is normalized to the
+    same hardware-nested shape as perf / :func:`write_accuracy_result`.
 
     ``dataset`` is the filename token (``daily_omni``, ``videomme``, ``seed_tts``).
     Model and dataset names both contain underscores, so the dashboard reads
@@ -169,11 +241,66 @@ def _write_accuracy_result_metadata(
     performance result records and Omni-DuplexEval accuracy artifacts. It is
     empty outside CI.
     """
+    hardware = _accuracy_hardware_label()
     data["dataset"] = dataset
-    data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
-    data["Hardware"] = _accuracy_hardware_label()
+    data["baseline"] = normalize_accuracy_baseline(baseline, hardware=hardware or None)
+    data["Hardware"] = hardware
     data["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_accuracy_result(
+    *,
+    model_id: str,
+    dataset: str,
+    metrics: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None = None,
+    result_dir: str | Path | None = None,
+    when: datetime | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> Path:
+    """Persist measured accuracy scores into a dashboard ``result_acc_*.json`` file.
+
+    Keep this separate from ``assert_*`` helpers: compute metrics, call this to
+    retain SSIM/PSNR/WER (and related fields), then assert. Failed gates still
+    keep numbers when write happens first.
+
+    ``metrics`` is merged at the top level (for example ``ssim``, ``psnr``,
+    ``seed_tts_content_error_mean`` / WER). ``baseline`` is stored like perf:
+    hardware-nested ``{ \"H100\": {\"ssim\": ...}, \"A3\": {...} }``. Pass an
+    already-nested map (or :func:`baseline_from_similarity_thresholds`); a flat
+    metric dict is wrapped under the current ``Hardware`` label.
+
+    ``result_dir`` defaults to ``ACC_BENCH_RESULT_DIR`` when set, otherwise
+    ``tests/e2e/accuracy/results``.
+    """
+    when = datetime.now() if when is None else when
+    if result_dir is None:
+        env_dir = os.environ.get("ACC_BENCH_RESULT_DIR")
+        result_dir = Path(env_dir) if env_dir else _default_diffusion_accuracy_result_dir()
+    else:
+        result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    path = result_dir / _acc_result_filename(model_id, dataset, when=when)
+    hardware = _accuracy_hardware_label()
+    data: dict[str, Any] = {
+        "model_id": model_id,
+        "date": when.strftime("%Y%m%d-%H%M%S"),
+        "Hardware": hardware,
+        **{str(key): _json_safe_metric_value(value) for key, value in metrics.items()},
+    }
+    if extra:
+        data.update({str(key): _json_safe_metric_value(value) for key, value in extra.items()})
+    data["dataset"] = dataset
+    data["baseline"] = normalize_accuracy_baseline(baseline, hardware=hardware or None)
+    data["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
+    # Metrics/extra are sanitized above; allow_nan=False fails closed if a caller skips that.
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"accuracy_result={path}", flush=True)
+    return path
 
 
 def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
@@ -238,6 +365,14 @@ def _validate_seed_tts(
     if setup:
         errs.append(f"Seed-TTS eval setup failed: {setup}")
         return errs
+    timed_out = int(result.get("timed_out_requests", 0) or 0)
+    cancelled = int(result.get("cancelled_after_timeout_requests", 0) or 0)
+    if timed_out or cancelled:
+        errs.append(
+            "Seed-TTS benchmark coverage is incomplete: "
+            f"timed_out_requests={timed_out}, cancelled_after_timeout_requests={cancelled}; "
+            "accuracy metrics exclude unsuccessful outputs."
+        )
     n = int(result.get("seed_tts_content_evaluated", 0) or 0)
     if n <= 0:
         errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
@@ -538,6 +673,8 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
         argv.append("--seed-tts-wer-save-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
+    if getattr(ns, "omni_fail_fast_on_timeout", False):
+        argv.append("--omni-fail-fast-on-timeout")
     extra_env = seed_tts_eval_env(ns)
     print("\n$", vllm, *argv, "\n", flush=True)
     _omni_acc_bench_core().run_vllm_bench_subprocess(vllm, argv, extra_env=extra_env)
@@ -572,6 +709,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="If set, forwarded to ``vllm bench serve`` (probe first request until success). "
         "Omit to use upstream default (typically skip).",
+    )
+    p.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        help="Forward the benchmark timeout circuit breaker to Seed-TTS runs.",
     )
     p.add_argument(
         "--trust-remote-code",
@@ -905,6 +1047,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
 
 
 DEFAULT_DEVICE_PROFILE = "default"
+# Torch's NPU name does not contain the CI profile key ``A3``. Atlas A3 runners
+# report ``Ascend910`` / ``Ascend910_93xx``; Atlas A2 reports ``Ascend910B*``
+# and must not inherit the A3 accuracy row. #10054.
+_DEVICE_NAME_PROFILE_ALIASES: tuple[tuple[str, str], ...] = (("Ascend910", "A3"),)
+_DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST: tuple[tuple[str, str], ...] = (("Ascend910", "Ascend910B"),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -915,31 +1062,75 @@ class SimilarityThresholds:
     psnr: float
 
 
+def _current_device_identity() -> tuple[str | None, str | None]:
+    """Return the current device marketing name and architecture, best effort."""
+    try:
+        from vllm_omni.platforms import current_omni_platform
+    except Exception:
+        logging.getLogger(__name__).debug("Could not import the current Omni platform", exc_info=True)
+        return None, None
+
+    device_name: str | None = None
+    device_architecture: str | None = None
+    try:
+        value = current_omni_platform.get_device_name()
+        if value:
+            device_name = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device marketing name", exc_info=True)
+
+    try:
+        device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+        properties = device_module.get_device_properties(0)
+        value = getattr(properties, "gcnArchName", None)
+        if value:
+            device_architecture = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device architecture", exc_info=True)
+
+    return device_name, device_architecture
+
+
 def resolve_device_profile(
     device_name: str | None = None,
     *,
+    device_architecture: str | None = None,
     profiles: Mapping[str, Any],
 ) -> str:
-    """Map a device marketing name to a key in *profiles*.
+    """Map a device marketing name or architecture to a key in *profiles*.
 
-    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
-    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    When both identifiers are omitted, queries the current platform. Non-
+    ``default`` profile keys are matched as substrings of either identifier
+    first so a later explicit row (for example ``Ascend910B``) wins over an
+    alias. Otherwise a name such as ``Ascend910`` / ``Ascend910_93xx`` is
+    rewritten to its CI alias (``A3``) when that key is present;
+    ``Ascend910B*`` (Atlas A2) is excluded from that alias. Unmatched devices
+    use ``default``. Callers with an already captured device record should pass
+    both values so profile selection uses the same evidence as the saved
+    artifacts.
     """
-    if device_name is None:
-        try:
-            from vllm_omni.platforms import current_omni_platform
+    if device_name is None and device_architecture is None:
+        device_name, device_architecture = _current_device_identity()
 
-            device_name = current_omni_platform.get_device_name()
-        except Exception:
-            return DEFAULT_DEVICE_PROFILE
-
-    if not device_name:
+    identifiers = tuple(value for value in (device_name, device_architecture) if value)
+    if not identifiers:
         return DEFAULT_DEVICE_PROFILE
 
     for profile in profiles:
         if profile == DEFAULT_DEVICE_PROFILE:
             continue
-        if profile in device_name:
+        if any(profile in identifier for identifier in identifiers):
+            return profile
+
+    for identifier in identifiers:
+        for needle, profile in _DEVICE_NAME_PROFILE_ALIASES:
+            if profile not in profiles or needle not in identifier:
+                continue
+            if any(
+                blocked_needle == needle and blocked in identifier
+                for blocked_needle, blocked in _DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST
+            ):
+                continue
             return profile
     return DEFAULT_DEVICE_PROFILE
 
@@ -949,11 +1140,16 @@ def resolve_similarity_thresholds(
     device_profile: str | None = None,
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
 ) -> SimilarityThresholds:
     """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
     if DEFAULT_DEVICE_PROFILE not in table:
         raise ValueError("threshold table must include a 'default' entry")
-    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    profile = device_profile or resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
@@ -961,20 +1157,25 @@ def resolve_device_threshold(
     thresholds: float | int | Mapping[str, float],
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
     label: str = "threshold",
 ) -> tuple[str, float]:
-    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+    """Resolve a scalar or per-device threshold for the current accelerator.
 
     Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
-    A mapping matches keys as substrings of the device name via
-    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
-    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    A mapping matches keys as substrings of the device name or architecture via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "gfx942": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched devices should fall back;
     otherwise unmatched devices raise.
     """
     if isinstance(thresholds, float | int):
         return DEFAULT_DEVICE_PROFILE, float(thresholds)
 
-    profile = resolve_device_profile(device_name, profiles=thresholds)
+    profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=thresholds,
+    )
     if profile in thresholds:
         return profile, float(thresholds[profile])
     if DEFAULT_DEVICE_PROFILE in thresholds:
@@ -1216,6 +1417,32 @@ def assert_video_metadata(
     assert metadata["frame_count"] == frame_count
 
 
+def measure_video_similarity_metrics(
+    *,
+    label: str,
+    online_path: Path,
+    offline_path: Path,
+) -> tuple[float, float]:
+    """Run ffmpeg SSIM/PSNR and print diagnostics without gating."""
+    ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
+    psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
+    ssim_score = parse_ssim_score(ssim_output)
+    psnr_score = parse_psnr_score(psnr_output)
+
+    print(f"{label} similarity metrics:")
+    print(f"  SSIM: value={ssim_score:.6f}, range=[0, 1], higher_is_better=True, interpretation=structural_similarity")
+    print(
+        "  PSNR:"
+        f" value={psnr_score:.6f} dB,"
+        " range=[0, +inf),"
+        " higher_is_better=True,"
+        " interpretation=pixel_error_in_decibels"
+    )
+    print(f"online_video={online_path}")
+    print(f"offline_video={offline_path}")
+    return ssim_score, psnr_score
+
+
 def assert_video_similarity_metrics(
     *,
     label: str,
@@ -1223,31 +1450,36 @@ def assert_video_similarity_metrics(
     offline_path: Path,
     ssim_threshold: float,
     psnr_threshold: float,
+    ssim_score: float | None = None,
+    psnr_score: float | None = None,
 ) -> tuple[float, float]:
-    ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
-    psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
-    ssim_score = parse_ssim_score(ssim_output)
-    psnr_score = parse_psnr_score(psnr_output)
-
-    print(f"{label} similarity metrics:")
-    print(
-        "  SSIM:"
-        f" value={ssim_score:.6f},"
-        f" threshold>={ssim_threshold:.6f},"
-        " range=[0, 1],"
-        " higher_is_better=True,"
-        " interpretation=structural_similarity"
-    )
-    print(
-        "  PSNR:"
-        f" value={psnr_score:.6f} dB,"
-        f" threshold>={psnr_threshold:.6f} dB,"
-        " range=[0, +inf),"
-        " higher_is_better=True,"
-        " interpretation=pixel_error_in_decibels"
-    )
-    print(f"online_video={online_path}")
-    print(f"offline_video={offline_path}")
+    """Gate video SSIM/PSNR. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if ssim_score is None or psnr_score is None:
+        ssim_score, psnr_score = measure_video_similarity_metrics(
+            label=label,
+            online_path=online_path,
+            offline_path=offline_path,
+        )
+    else:
+        print(f"{label} similarity metrics:")
+        print(
+            "  SSIM:"
+            f" value={ssim_score:.6f},"
+            f" threshold>={ssim_threshold:.6f},"
+            " range=[0, 1],"
+            " higher_is_better=True,"
+            " interpretation=structural_similarity"
+        )
+        print(
+            "  PSNR:"
+            f" value={psnr_score:.6f} dB,"
+            f" threshold>={psnr_threshold:.6f} dB,"
+            " range=[0, +inf),"
+            " higher_is_better=True,"
+            " interpretation=pixel_error_in_decibels"
+        )
+        print(f"online_video={online_path}")
+        print(f"offline_video={offline_path}")
 
     assert ssim_score >= ssim_threshold, (
         f"SSIM below threshold: got {ssim_score:.6f}, expected >= {ssim_threshold:.6f}. "
@@ -1260,17 +1492,16 @@ def assert_video_similarity_metrics(
     return ssim_score, psnr_score
 
 
-def assert_similarity(
+def measure_image_similarity(
     *,
     model_name: str,
     vllm_image: Image.Image,
     diffusers_image: Image.Image,
-    ssim_threshold: float,
-    psnr_threshold: float,
     width: int | None = None,
     height: int | None = None,
     compare_mode: str = "RGB",
-) -> None:
+) -> tuple[float, float]:
+    """Compute image SSIM/PSNR without gating. Callers write results then assert."""
     requested_size = (width, height) if width is not None and height is not None else None
     if requested_size is not None and diffusers_image.size != requested_size:
         pytest.skip(
@@ -1281,12 +1512,36 @@ def assert_similarity(
     assert vllm_image.size == diffusers_image.size, (
         f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
     )
-
-    ssim_score, psnr_score = compute_image_ssim_psnr(
+    return compute_image_ssim_psnr(
         prediction=vllm_image,
         reference=diffusers_image,
         compare_mode=compare_mode,
     )
+
+
+def assert_similarity(
+    *,
+    model_name: str,
+    vllm_image: Image.Image,
+    diffusers_image: Image.Image,
+    ssim_threshold: float,
+    psnr_threshold: float,
+    width: int | None = None,
+    height: int | None = None,
+    compare_mode: str = "RGB",
+    ssim_score: float | None = None,
+    psnr_score: float | None = None,
+) -> tuple[float, float]:
+    """Gate image SSIM/PSNR. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if ssim_score is None or psnr_score is None:
+        ssim_score, psnr_score = measure_image_similarity(
+            model_name=model_name,
+            vllm_image=vllm_image,
+            diffusers_image=diffusers_image,
+            width=width,
+            height=height,
+            compare_mode=compare_mode,
+        )
     assert_similarity_metrics(
         model_name=model_name,
         ssim_score=ssim_score,
@@ -1294,6 +1549,7 @@ def assert_similarity(
         ssim_threshold=ssim_threshold,
         psnr_threshold=psnr_threshold,
     )
+    return ssim_score, psnr_score
 
 
 def assert_similarity_metrics(
@@ -1304,7 +1560,7 @@ def assert_similarity_metrics(
     ssim_threshold: float,
     psnr_threshold: float,
 ) -> None:
-    """Check computed image metrics, allowing callers to save all evidence first."""
+    """Check computed image metrics. Persist scores with ``write_accuracy_result`` before this."""
     print(f"{model_name} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={ssim_threshold:.6f}, range=[-1, 1], higher_is_better=True")
     print(
@@ -1319,6 +1575,30 @@ def assert_similarity_metrics(
     )
 
 
+def measure_image_sequence_similarity(
+    *,
+    model_name: str,
+    vllm_images: list[Image.Image],
+    diffusers_images: list[Image.Image],
+    compare_mode: str = "RGB",
+) -> list[tuple[float, float]]:
+    """Measure per-layer SSIM/PSNR without gating."""
+    assert len(vllm_images) == len(diffusers_images), (
+        f"Output image count mismatch for {model_name}: online={len(vllm_images)}, diffusers={len(diffusers_images)}"
+    )
+    scores: list[tuple[float, float]] = []
+    for index, (vllm_image, diffusers_image) in enumerate(zip(vllm_images, diffusers_images, strict=True), start=1):
+        scores.append(
+            measure_image_similarity(
+                model_name=f"{model_name}[layer={index}]",
+                vllm_image=vllm_image,
+                diffusers_image=diffusers_image,
+                compare_mode=compare_mode,
+            )
+        )
+    return scores
+
+
 def assert_image_sequence_similarity(
     *,
     model_name: str,
@@ -1327,45 +1607,38 @@ def assert_image_sequence_similarity(
     ssim_threshold: float,
     psnr_threshold: float,
     compare_mode: str = "RGB",
-) -> None:
-    assert len(vllm_images) == len(diffusers_images), (
-        f"Output image count mismatch for {model_name}: online={len(vllm_images)}, diffusers={len(diffusers_images)}"
-    )
-    for index, (vllm_image, diffusers_image) in enumerate(zip(vllm_images, diffusers_images, strict=True), start=1):
-        assert_similarity(
-            model_name=f"{model_name}[layer={index}]",
-            vllm_image=vllm_image,
-            diffusers_image=diffusers_image,
-            ssim_threshold=ssim_threshold,
-            psnr_threshold=psnr_threshold,
+    layer_scores: list[tuple[float, float]] | None = None,
+) -> list[tuple[float, float]]:
+    """Gate each layer. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if layer_scores is None:
+        layer_scores = measure_image_sequence_similarity(
+            model_name=model_name,
+            vllm_images=vllm_images,
+            diffusers_images=diffusers_images,
             compare_mode=compare_mode,
         )
+    assert len(layer_scores) == len(vllm_images), (
+        f"Output image count mismatch for {model_name}: scores={len(layer_scores)}, images={len(vllm_images)}"
+    )
+    for index, (ssim_score, psnr_score) in enumerate(layer_scores, start=1):
+        assert_similarity_metrics(
+            model_name=f"{model_name}[layer={index}]",
+            ssim_score=ssim_score,
+            psnr_score=psnr_score,
+            ssim_threshold=ssim_threshold,
+            psnr_threshold=psnr_threshold,
+        )
+    return list(layer_scores)
 
 
-def assert_images_pixel_close(
+def measure_images_pixel_close(
     *,
     model_name: str,
     vllm_image: Image.Image,
     diffusers_image: Image.Image,
-    mean_threshold: float,
-    p99_threshold: float,
     compare_mode: str = "RGB",
-) -> None:
-    """Assert full-image pixel closeness between online serving and diffusers output.
-
-    Match the threshold style used by diffusion parallelism tests: convert both
-    images to float32 RGB tensors in the [0, 1] range, then compare mean and p99
-    absolute channel differences.
-
-    Accuracy improves as both values move lower:
-    - ``mean_abs_diff`` tracks global average drift across the whole image.
-    - ``p99_abs_diff`` tracks tail drift while ignoring the noisiest 1% of
-      channel samples.
-
-    The printed mismatch ratios are diagnostics only. ``pixel_ratio`` counts
-    pixels where any channel exceeds a tolerance, while ``channel_ratio`` counts
-    individual channel samples above that tolerance.
-    """
+) -> dict[str, Any]:
+    """Compute pixel closeness metrics without gating."""
     assert vllm_image.size == diffusers_image.size, (
         f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
     )
@@ -1380,17 +1653,12 @@ def assert_images_pixel_close(
     }
 
     print(f"{model_name} pixel metrics:")
-    print(
-        f"  mean_abs_diff: value={mean_abs_diff:.6e}, threshold<={mean_threshold:.6e}, "
-        "range=[0, 1], lower_is_better=True"
-    )
-    print(
-        f"  p99_abs_diff: value={p99_abs_diff:.6e}, threshold<={p99_threshold:.6e}, range=[0, 1], lower_is_better=True"
-    )
+    print(f"  mean_abs_diff: value={mean_abs_diff:.6e}, range=[0, 1], lower_is_better=True")
+    print(f"  p99_abs_diff: value={p99_abs_diff:.6e}, range=[0, 1], lower_is_better=True")
     print("  abs_diff_percentiles:")
     for percentile, value in percentiles.items():
         print(f"    p{percentile}: value={value:.6e}, range=[0, 1], lower_is_better=True")
-    print("  mismatch_ratios_by_channel_threshold:")
+    print("  mismatch_rates_by_channel_threshold:")
     for tolerance in (0, 1, 2, 4, 8, 16, 32, 64, 128):
         normalized_tolerance = tolerance / 255.0
         pixel_mismatch = np.any(channel_abs_diff > normalized_tolerance, axis=-1)
@@ -1402,12 +1670,46 @@ def assert_images_pixel_close(
             f"    threshold>{normalized_tolerance:.6e} ({tolerance}/255): pixel_ratio={pixel_mismatch_ratio:.8f}, "
             f"channel_ratio={channel_mismatch_ratio:.8f}"
         )
+    return {
+        "mean_abs_diff": mean_abs_diff,
+        "p99_abs_diff": p99_abs_diff,
+        "abs_diff_percentiles": percentiles,
+    }
 
+
+def assert_images_pixel_close(
+    *,
+    model_name: str,
+    vllm_image: Image.Image,
+    diffusers_image: Image.Image,
+    mean_threshold: float,
+    p99_threshold: float,
+    compare_mode: str = "RGB",
+    metrics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assert full-image pixel closeness between online serving and diffusers output.
+
+    Match the threshold style used by diffusion parallelism tests: convert both
+    images to float32 RGB tensors in the [0, 1] range, then compare mean and p99
+    absolute channel differences.
+
+    Prefer ``measure_images_pixel_close`` → ``write_accuracy_result`` → this assert.
+    """
+    if metrics is None:
+        metrics = measure_images_pixel_close(
+            model_name=model_name,
+            vllm_image=vllm_image,
+            diffusers_image=diffusers_image,
+            compare_mode=compare_mode,
+        )
+    mean_abs_diff = float(metrics["mean_abs_diff"])
+    p99_abs_diff = float(metrics["p99_abs_diff"])
     assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
         f"Image diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
         f"p99_abs_diff={p99_abs_diff:.6e} (thresholds: mean<={mean_threshold:.6e}, "
         f"p99<={p99_threshold:.6e})"
     )
+    return dict(metrics)
 
 
 def compute_image_ssim_psnr(
@@ -1545,345 +1847,3 @@ def download_images(urls: list[str]) -> list[Image.Image]:
         images.append(image)
 
     return images
-
-
-_DREAMZERO_UPSTREAM_SERVER_SCRIPT = (
-    Path(__file__).resolve().parent / "upstream_mock" / "upstream_socket_server_no_compile.py"
-)
-_DREAMZERO_DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
-_DREAMZERO_DEFAULT_READY_TIMEOUT_S = int(os.environ.get("OPENPI_SERVICE_READY_TIMEOUT_S", "900"))
-_DREAMZERO_DEFAULT_PROMPT = (
-    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
-)
-_DREAMZERO_DEFAULT_SESSION_ID = "openpi-e2e-parity-session"
-_DREAMZERO_OPENPI_VLLM_PATH = "/v1/realtime/robot/openpi"
-
-
-def require_dreamzero_parity_env() -> tuple[Path, Path]:
-    repo_env = os.environ.get("DREAMZERO_REPO")
-    if repo_env is None:
-        raise ValueError("DREAMZERO_REPO environment variable is required.")
-    repo = Path(repo_env).expanduser()
-    if not repo.is_dir():
-        raise FileNotFoundError(f"DREAMZERO_REPO does not exist: {repo}")
-    checkpoint_dir = repo / "checkpoints" / "dreamzero"
-    if not checkpoint_dir.is_dir():
-        raise FileNotFoundError(f"DreamZero checkpoint not found: {checkpoint_dir}")
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
-    return repo, checkpoint_dir
-
-
-def load_dreamzero_upstream_modules():
-    require_dreamzero_parity_env()
-    import test_client_AR as dreamzero_upstream_client
-    from eval_utils.policy_client import WebsocketClientPolicy
-
-    return dreamzero_upstream_client, WebsocketClientPolicy
-
-
-def dreamzero_cfg_parallel_size() -> int:
-    return int(os.environ.get("OPENPI_E2E_CFG_PARALLEL_SIZE", "2"))
-
-
-def _dreamzero_parity_vllm_env() -> dict[str, str]:
-    from tests.helpers.clean import pick_least_used_device_indices
-    from tests.helpers.runtime import get_open_port
-
-    parallel_size = dreamzero_cfg_parallel_size()
-    gpus = [str(index) for index in pick_least_used_device_indices(parallel_size)]
-    if parallel_size > len(gpus):
-        raise RuntimeError(
-            f"cfg_parallel_size={parallel_size} requires at least {parallel_size} GPUs, but only got {gpus}."
-        )
-    return {
-        "CUDA_VISIBLE_DEVICES": ",".join(gpus[:parallel_size]),
-        "ATTENTION_BACKEND": "torch",
-        "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
-        "VLLM_DISABLE_COMPILE_CACHE": "1",
-        "MASTER_PORT": str(get_open_port()),
-    }
-
-
-def dreamzero_parity_vllm_params(model: str | None = None):
-    from tests.helpers.runtime import OmniServerParams
-    from tests.helpers.stage_config import get_deploy_config_path
-
-    parallel_size = dreamzero_cfg_parallel_size()
-    server_args = [
-        "--served-model-name",
-        "dreamzero-droid",
-        "--enforce-eager",
-    ]
-    if parallel_size > 1:
-        server_args.extend(["--cfg-parallel-size", str(parallel_size)])
-    resolved_model = model or os.environ.get("VLLM_DREAMZERO_MODEL") or _DREAMZERO_DEFAULT_MODEL
-    return OmniServerParams(
-        model=resolved_model,
-        stage_config_path=get_deploy_config_path("dreamzero_tp1_cfg2.yaml"),
-        server_args=server_args,
-        env_dict=_dreamzero_parity_vllm_env(),
-    )
-
-
-def _dreamzero_omni_server_from_params(params):
-    from tests.helpers.runtime import OmniServer
-
-    server_args = list(params.server_args or [])
-    if params.stage_config_path is not None:
-        server_args += ["--deploy-config", params.stage_config_path]
-    return OmniServer(
-        params.model,
-        server_args,
-        port=params.port,
-        env_dict=params.env_dict,
-        use_omni=params.use_omni,
-    )
-
-
-@contextmanager
-def dreamzero_parity_vllm_client(
-    params=None,
-    *,
-    ready_timeout_s: float = _DREAMZERO_DEFAULT_READY_TIMEOUT_S,
-) -> Iterator["DreamZeroParityClient"]:
-    """Start vLLM via ``OmniServer`` and return a ready OpenPI parity client."""
-    with _dreamzero_omni_server_from_params(params or dreamzero_parity_vllm_params()) as server:
-        client = _dreamzero_wait_for_client_ready(
-            lambda: _dreamzero_create_openpi_vllm_client(server.host, server.port),
-            timeout_s=ready_timeout_s,
-            proc=server.proc,
-        )
-        yield DreamZeroParityClient(client)
-
-
-def _dreamzero_create_openpi_vllm_client(host: str, port: int) -> Any:
-    from openpi_client import msgpack_numpy
-
-    _, websocket_client_policy_cls = load_dreamzero_upstream_modules()
-
-    class _OpenPIWebsocketClientPolicy(websocket_client_policy_cls):  # type: ignore[misc, valid-type]
-        def __init__(
-            self,
-            host: str = "127.0.0.1",
-            port: int = 8000,
-            path: str = _DREAMZERO_OPENPI_VLLM_PATH,
-        ) -> None:
-            self._uri = f"ws://{host}:{port}{path}"
-            self._packer = msgpack_numpy.Packer()
-            self._ws, self._server_metadata = self._wait_for_server()
-
-    return _OpenPIWebsocketClientPolicy(host=host, port=port)
-
-
-def _dreamzero_stop_process(proc: subprocess.Popen[str]) -> None:
-    log_file = getattr(proc, "_codex_log_file", None)
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:  # pragma: no cover - cleanup path
-            proc.kill()
-            proc.wait(timeout=10)
-    if log_file is not None:
-        log_file.close()
-
-
-def _dreamzero_wait_for_client_ready(
-    client_factory: Callable[[], Any],
-    *,
-    timeout_s: float,
-    proc: subprocess.Popen[str] | None = None,
-    log_path: Path | None = None,
-) -> Any:
-    deadline = time.time() + timeout_s
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        if proc is not None and proc.poll() is not None:
-            details = ""
-            if log_path is not None and log_path.exists():
-                details = log_path.read_text(errors="replace")[-8000:]
-            raise RuntimeError(f"Service exited before becoming ready with code {proc.returncode}.\n{details}")
-        try:
-            return client_factory()
-        except Exception as exc:  # pragma: no cover - retry path
-            last_err = exc
-            time.sleep(1)
-    raise TimeoutError(f"Timed out waiting for websocket service: {last_err}")
-
-
-def _dreamzero_normalize_reset_response(response: Any) -> str:
-    from openpi_client import msgpack_numpy
-
-    if isinstance(response, str):
-        return response
-    decoded = msgpack_numpy.unpackb(response)
-    if isinstance(decoded, dict):
-        return str(decoded.get("status"))
-    return str(decoded)
-
-
-def normalize_dreamzero_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(metadata)
-    if isinstance(normalized.get("image_resolution"), tuple):
-        normalized["image_resolution"] = list(normalized["image_resolution"])
-    return normalized
-
-
-def assert_dreamzero_logs_clean(log_path: Path) -> None:
-    text = log_path.read_text(errors="replace")
-    if "SignalException: Process" in text and "got signal: 15" in text:
-        text = text.split("Traceback (most recent call last):", 1)[0]
-    assert "Traceback" not in text, text
-    assert "RuntimeError:" not in text, text
-
-
-def assert_dreamzero_upstream_log_matches_vllm_baseline(log_path: Path) -> None:
-    text = log_path.read_text(errors="replace")
-    assert "DIT Compute Steps 8 steps" not in text, text
-    assert "DIT Compute Steps 16 steps" in text, text
-
-
-class DreamZeroParityClient:
-    """Connected OpenPI websocket client for DreamZero parity inference."""
-
-    def __init__(self, client: Any) -> None:
-        self._client = client
-
-    @property
-    def raw_client(self) -> Any:
-        return self._client
-
-    def build_obs_sequence(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        dreamzero_upstream_client, _ = load_dreamzero_upstream_modules()
-        camera_frames = dreamzero_upstream_client.load_camera_frames()
-        chunks = dreamzero_upstream_client.build_frame_schedule(
-            min(v.shape[0] for v in camera_frames.values()),
-            1,
-        )
-        obs0 = dreamzero_upstream_client._make_obs_from_video(
-            camera_frames,
-            [0],
-            _DREAMZERO_DEFAULT_PROMPT,
-            _DREAMZERO_DEFAULT_SESSION_ID,
-        )
-        obs1 = dreamzero_upstream_client._make_obs_from_video(
-            camera_frames,
-            chunks[0],
-            _DREAMZERO_DEFAULT_PROMPT,
-            _DREAMZERO_DEFAULT_SESSION_ID,
-        )
-        return obs0, obs1
-
-    def collect_parity_outputs(self) -> tuple[dict[str, Any], list[np.ndarray]]:
-        metadata = self._client.get_server_metadata()
-        obs0, obs1 = self.build_obs_sequence()
-        outputs = [
-            self._client.infer(dict(obs0)),
-            self._client.infer(dict(obs1)),
-        ]
-        assert _dreamzero_normalize_reset_response(self._client.reset({})) == "reset successful"
-        outputs.append(self._client.infer(dict(obs0)))
-        self._client._ws.close()
-        return metadata, outputs
-
-
-class _DreamZeroParityServer(ABC):
-    host = "127.0.0.1"
-
-    def __init__(
-        self,
-        *,
-        log_path: Path,
-        port: int | None = None,
-        ready_timeout_s: float = _DREAMZERO_DEFAULT_READY_TIMEOUT_S,
-    ) -> None:
-        from tests.helpers.runtime import get_open_port
-
-        self.log_path = log_path
-        self.port = get_open_port() if port is None else port
-        self.ready_timeout_s = ready_timeout_s
-        self.proc: subprocess.Popen[str] | None = None
-        self._log_file: IO[str] | None = None
-
-    @abstractmethod
-    def _build_argv(self) -> list[str]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _build_env(self) -> dict[str, str]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _create_client(self) -> Any:
-        raise NotImplementedError
-
-    def _start(self) -> None:
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_file = self.log_path.open("w")
-        self.proc = subprocess.Popen(
-            self._build_argv(),
-            stdout=self._log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=str(Path.cwd()),
-            env=self._build_env(),
-        )
-        self.proc._codex_log_file = self._log_file  # type: ignore[attr-defined]
-
-    def __enter__(self) -> DreamZeroParityClient:
-        self._start()
-        client = _dreamzero_wait_for_client_ready(
-            self._create_client,
-            timeout_s=self.ready_timeout_s,
-            proc=self.proc,
-            log_path=self.log_path,
-        )
-        return DreamZeroParityClient(client)
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self.proc is not None:
-            _dreamzero_stop_process(self.proc)
-            self.proc = None
-
-
-class DreamZeroUpstreamServer(_DreamZeroParityServer):
-    """Official DreamZero upstream reference server launched via torchrun."""
-
-    def _build_argv(self) -> list[str]:
-        _, checkpoint_dir = require_dreamzero_parity_env()
-        return [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc_per_node",
-            str(dreamzero_cfg_parallel_size()),
-            str(_DREAMZERO_UPSTREAM_SERVER_SCRIPT),
-            "--port",
-            str(self.port),
-            "--model_path",
-            str(checkpoint_dir),
-        ]
-
-    def _build_env(self) -> dict[str, str]:
-        from tests.helpers.clean import pick_least_used_device_indices
-
-        dreamzero_repo, _ = require_dreamzero_parity_env()
-        env = os.environ.copy()
-        env.setdefault("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{Path.cwd()}:{dreamzero_repo}:{env['PYTHONPATH']}".rstrip(":")
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(index) for index in pick_least_used_device_indices(max(dreamzero_cfg_parallel_size(), 1))
-        )
-        env.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-        env["ATTENTION_BACKEND"] = "torch"
-        env.setdefault("ENABLE_TENSORRT", "false")
-        env["ENABLE_DIT_CACHE"] = "false"
-        env["NUM_DIT_STEPS"] = "16"
-        env["DYNAMIC_CACHE_SCHEDULE"] = "false"
-        return env
-
-    def _create_client(self) -> Any:
-        _, WebsocketClientPolicy = load_dreamzero_upstream_modules()
-        return WebsocketClientPolicy(host=self.host, port=self.port)

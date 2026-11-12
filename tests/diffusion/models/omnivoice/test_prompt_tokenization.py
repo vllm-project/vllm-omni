@@ -23,7 +23,9 @@ def test_prepare_request_tokenizes_text_once_with_reference_audio(audio_mode):
     torch.nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.sample_rate = 24000
-    pipeline.config = SimpleNamespace(num_audio_codebook=8, audio_mask_id=99)
+    pipeline.config = SimpleNamespace(
+        num_audio_codebook=8, audio_mask_id=99, frame_rate=25, audio_chunk_duration=15.0, audio_chunk_threshold=30.0
+    )
     pipeline.duration_estimator = SimpleNamespace(estimate_duration=Mock(return_value=2))
     pipeline.tokenizer = SimpleNamespace(
         encode=Mock(side_effect=[SimpleNamespace(ids=[1, 2]), SimpleNamespace(ids=[5, 6, 7])])
