@@ -124,6 +124,7 @@ def build_stage_runtime_overrides(
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
+    stage_overrides: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
         if value is None or key in internal_keys:
@@ -134,11 +135,13 @@ def build_stage_runtime_overrides(
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
             if override_stage_id == stage_id and param_name not in internal_keys:
-                result[param_name] = value
+                stage_overrides[param_name] = value
             continue
 
         result[key] = value
 
+    # Stage-scoped inputs take precedence regardless of their insertion order.
+    result.update(stage_overrides)
     return result
 
 
