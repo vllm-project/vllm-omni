@@ -71,7 +71,7 @@ official CLI's minimum length (**124** frames at 24 FPS), use
 `duration=5.0` (or an equivalent `num_frames=124`). `duration=5.2` rounds up to
 **141** frames under H3's `17n+5` rule.
 
-### Example T2VA request (aligned with assets below)
+### Example T2VA request (aligned with CUDA evidence below)
 
 ```bash
 curl -sS -X POST "http://localhost:8091/v1/videos/sync" \
@@ -109,7 +109,7 @@ Same prompt / seed / steps / resolution / frame count:
 | DiT weights | `/data/models/hyperflow-h3-flash` (`fl2va_int8_convrot`) | same local weights |
 | TE / VAE | Omni `MiniMax-H3-FL2VA` layout | Hub `MiniMaxAI/MiniMax-H3` |
 | Wall | ~17 s sync request (warm server) | ~12 s denoise; cold CLI longer (Hub fetch) |
-| Sample | [omni mp4](assets/hyperflow-h3-flash/omni_t2va_clayfox_seed42_steps6_f124.mp4) · [still](assets/hyperflow-h3-flash/omni_f124_t1.jpg) | [official mp4](assets/hyperflow-h3-flash/official_t2va_clayfox_seed42_steps6_f124.mp4) · [still](assets/hyperflow-h3-flash/official_t1.jpg) |
+| Sample | See inline videos on PR [#10257](https://github.com/vllm-project/vllm-omni/pull/10257) (not committed to the tree) | same |
 
 Notes: Omni P0 **densifies** INT8/low-rank into dense Omni H3 modules, so
 outputs are visually close at matched length but not bitwise identical to the
