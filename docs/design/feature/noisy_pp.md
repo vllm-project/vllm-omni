@@ -301,11 +301,11 @@ member contract as step ``InputBatch``, Cell granularity).
 ``BatchedCellAdapter`` + ``organize_cell_batches`` group by compatibility and
 split on ``max_batch_size`` without deferring Cells to a later plan slot.
 
-Model backends only supply ``pack_batch`` (and per-request ``run_one``).
-CausVid's ``WanCell.pack_compute_batch`` is the first packer: embed / block /
-unembed on the batch axis, per-member prompt / sampler / seed / finished /
-paged-KV. Other Noisy PP models reuse ``BatchedCellAdapter`` with their own
-packer.
+Model backends only supply ``pack_batch`` for each ``CellComputeBatch``
+(including size 1). CausVid's ``WanCell.pack_compute_batch`` is the first
+packer: embed / block / unembed on the batch axis, per-member prompt /
+sampler / seed / finished / paged-KV. Other Noisy PP models reuse
+``BatchedCellAdapter`` with their own packer.
 
 ## Related
 

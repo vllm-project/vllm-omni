@@ -138,9 +138,8 @@ CellBatchPackFn = Callable[..., Mapping[str, torch.Tensor]]
 class BatchedCellAdapter:
     """Framework multi-member CellAdapter: organize Batches, delegate pack to the model.
 
-    Members are per-request adapters (``run_one`` for B=1). ``pack_batch`` is the
-    model backend that packs a ``CellComputeBatch`` (B>1) and returns batch-axis
-    tensors for ``split_outputs``.
+    Every ``CellComputeBatch`` (including size 1) is passed to ``pack_batch``; the
+    model backend does not branch on run-one vs batch.
     """
 
     def __init__(
@@ -207,23 +206,7 @@ class BatchedCellAdapter:
         outs: list[dict[str, torch.Tensor] | None] = [None] * len(tasks)
         for batch in batches:
             chunk, step, _block = batch.cell
-            if batch.size == 1:
-                member_ref = batch.members[0]
-                member = self.members[member_ref.request_id]
-                self._last_meta = (member_ref.request_id, chunk, step)
-                self.block_call_members.append(1)
-                outs[member_ref.task_index] = member.run_one(
-                    member_ref.request_id,
-                    member_ref.cell,
-                    batch.kv_views[0],
-                    index=member_ref.task_index,
-                    n_tasks=len(tasks),
-                    hidden=hidden,
-                    stash_take=self.take_stashed_activation,
-                    bind_text=True,
-                )
-                continue
-            self._last_meta = ("", chunk, step)
+            self._last_meta = ("", chunk, step) if batch.size > 1 else (batch.members[0].request_id, chunk, step)
             self.block_call_members.append(batch.size)
             packed = dict(
                 self._pack_batch(
