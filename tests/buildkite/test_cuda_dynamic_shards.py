@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA ready/merge directory sweeps shard from measured durations.
 
-``automatic_shard: true`` does not reserve agents. With no usable timings the
-uploader opens the smaller of ``MAX_AUTOMATIC_SHARDS`` and the discovered file count (and still
-records ``timings/jobs/*.json``). A profile that exceeds the file budget packs
+``automatic_shard: true`` does not set parallelism in the YAML. With no usable timings the
+uploader opens the smaller of ``MAX_AUTOMATIC_SHARDS`` and the files whose marks satisfy
+``-m`` (and still records ``timings/jobs/*.json``). A profile that exceeds the file budget packs
 files into bins, writes each bin as a file list, and sets ``parallelism``. A
 shard runs only its list.
 """
@@ -44,9 +44,11 @@ from runtime_shard import (  # noqa: E402
     FILE_TIME_BUDGET_RATIO,
     MAX_AUTOMATIC_SHARDS,
     PLUGIN_MODULE,
+    _file_matches_marker,
     _file_shard_command,
     _inject_plugin,
-    discover_test_files,
+    apply_automatic_shard,
+    fallback_file_bins,
     fallback_shard_count,
     pack_files,
     plan_shard_count,
@@ -127,14 +129,22 @@ def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.M
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     assert all("automatic_shard" not in leaf for leaf in _leaves(rendered["steps"]))
     step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
-    discovered = discover_test_files("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
-    expect = fallback_shard_count(len(discovered))
+    command = "pytest -sv tests/ -m 'core_model and cpu'"
+    bins = fallback_file_bins(command, upload_pipeline_mod.ROOT)
+    assert bins is not None
+    expect = fallback_shard_count(len({path for group in bins for path in group}))
     assert expect == MAX_AUTOMATIC_SHARDS
-    assert step["parallelism"] == expect
+    assert step["parallelism"] == len(bins)
     assert step["label"] == "Simple Test · Shard %N/%t"
     lists = _read_shard_lists("simple-test")
-    assert len(lists) == expect
-    assert sorted(path for group in lists for path in group) == discovered
+    assert lists == bins
+    listed = {path for group in lists for path in group}
+    assert "tests/buildkite/test_cuda_dynamic_shards.py" in listed
+    assert "tests/entrypoints/test_omni_sleep_mode.py" not in listed
+    for group in lists:
+        assert any(
+            _file_matches_marker(upload_pipeline_mod.ROOT / path, "core_model and cpu") is True for path in group
+        )
     assert "automatic_shard" not in step
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
@@ -751,10 +761,12 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     document = yaml.safe_load(READY.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
-    discovered = discover_test_files("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
-    assert step["parallelism"] == fallback_shard_count(len(discovered))
+    bins = fallback_file_bins("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
+    assert bins is not None
+    assert step["parallelism"] == len(bins)
     lists = _read_shard_lists("simple-test")
-    assert sorted(path for group in lists for path in group) == discovered
+    assert lists == bins
+    assert set(files) != {path for group in lists for path in group}
 
 
 def test_missing_profile_uses_the_smaller_of_job_cap_and_file_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -783,6 +795,123 @@ def test_missing_profile_uses_the_smaller_of_job_cap_and_file_count(monkeypatch:
     step = render(six)
     assert step["parallelism"] == MAX_AUTOMATIC_SHARDS
     assert sorted(path for group in _read_shard_lists("simple-test") for path in group) == six
+
+
+def test_no_profile_puts_a_marker_match_in_every_shard(tmp_path: Path) -> None:
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    match = """
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_two():
+    pass
+"""
+    other = """
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_cpu():
+    pass
+"""
+    (tests / "test_match_a.py").write_text(match, encoding="utf-8")
+    (tests / "test_match_b.py").write_text(match.replace("def test_two", "def test_two_b"), encoding="utf-8")
+    (tests / "test_cpu_a.py").write_text(other, encoding="utf-8")
+    (tests / "test_cpu_b.py").write_text(other.replace("def test_cpu", "def test_cpu_b"), encoding="utf-8")
+    command = 'pytest -s -v tests/ -m "advanced_model and cuda and L4 and cards_2"'
+
+    def plan() -> dict:
+        return apply_automatic_shard(
+            {
+                "label": "Entrypoint Test with L4 · 2-GPU",
+                "automatic_shard": True,
+                "timeout_in_minutes": 60,
+                "commands": [command],
+            },
+            timings=None,
+            root=tmp_path,
+            log=lambda _message: None,
+        )
+
+    split = plan()
+    assert split["parallelism"] == 2
+    slug = tmp_path / "timings" / "file-shards" / "entrypoint-test-with-l4-2-gpu"
+    lists = [path.read_text(encoding="utf-8").split() for path in sorted(slug.glob("*.txt"))]
+    assert sorted(path for group in lists for path in group) == [
+        "tests/test_match_a.py",
+        "tests/test_match_b.py",
+    ]
+    for group in lists:
+        assert group
+
+    (tests / "test_match_b.py").unlink()
+    single = plan()
+    assert "parallelism" not in single
+
+
+def test_marker_match_follows_each_item(tmp_path: Path) -> None:
+    mixed = tmp_path / "test_mixed.py"
+    mixed.write_text(
+        """
+import pytest
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+def test_mixed():
+    pass
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("device", [pytest.param("cpu", marks=pytest.mark.cpu)])
+def test_param_cpu():
+    pass
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_only_two():
+    pass
+""",
+        encoding="utf-8",
+    )
+    assert _file_matches_marker(mixed, "cards_2") is True
+    assert _file_matches_marker(mixed, "H100 and cards_2") is False
+    assert _file_matches_marker(mixed, "H100 and cards_4") is True
+    assert _file_matches_marker(mixed, "core_model and cpu") is True
+    assert _file_matches_marker(mixed, "not cards_2") is True
+
+    only_two = tmp_path / "test_only_two.py"
+    only_two.write_text(
+        """
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_only_two():
+    pass
+""",
+        encoding="utf-8",
+    )
+    assert _file_matches_marker(only_two, "advanced_model and cuda and L4 and cards_2") is True
+    assert _file_matches_marker(only_two, "not cards_2") is False
+
+    opaque = tmp_path / "test_opaque.py"
+    opaque.write_text(
+        """
+@pytest.mark.parametrize("x", [pytest.param(1, marks=SOME)])
+def test_dynamic():
+    pass
+""",
+        encoding="utf-8",
+    )
+    assert _file_matches_marker(opaque, "core_model") is None
+
+    root = upload_pipeline_mod.ROOT
+    own = root / "tests/buildkite/test_cuda_dynamic_shards.py"
+    sleep = root / "tests/entrypoints/test_omni_sleep_mode.py"
+    assert _file_matches_marker(own, "core_model and cpu") is True
+    assert _file_matches_marker(own, "advanced_model and cuda and L4 and cards_2") is False
+    assert _file_matches_marker(sleep, "advanced_model and cuda and L4 and cards_2") is True
 
 
 def test_schema_check_plans_without_writing_shard_files(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -663,7 +663,7 @@ def _ensure_shard_timings_env() -> None:
         _log(f"automatic-shard: timing download skipped ({exc})")
         return
     if path is None:
-        _log("automatic-shard: no historical timings; enrolled steps stay 1 job")
+        _log("automatic-shard: no historical timings; enrolled steps use the no-profile fallback")
         return
     os.environ["VLLM_OMNI_SHARD_TIMINGS"] = str(path)
     _log(f"automatic-shard: using timing profile {path}")
@@ -677,7 +677,7 @@ def _shard_timings() -> dict[str, float] | None:
     timings = load_shard_timings()
     if raw and timings is None and not Path(raw).is_file() and getattr(_shard_timings, "warned", None) != raw:
         _shard_timings.warned = raw  # type: ignore[attr-defined]
-        _log(f"automatic-shard: {raw!r} is not a file; steps stay 1 job")
+        _log(f"automatic-shard: {raw!r} is not a file; steps use the no-profile fallback")
     return timings
 
 
