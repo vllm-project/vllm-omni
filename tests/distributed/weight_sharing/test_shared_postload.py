@@ -179,31 +179,29 @@ def moe_block_cls():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shared", [False, True])
-def test_router_override_only_applies_to_shared_weights(moe_block_cls, dtype, shared):
+def test_router_always_runs_in_fp32(moe_block_cls, dtype):
     config = SimpleNamespace(
         num_experts=2, moe_topk=1, hidden_size=4, intermediate_size=8, moe_intermediate_size=None, use_mixed_mlp_moe=0
     )
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        block = moe_block_cls(config, **({"shared_router_dtype": torch.float32} if shared else {}))
+        block = moe_block_cls(config)
     finally:
         torch.set_default_dtype(previous_dtype)
-    assert block.gate.weight.dtype == (torch.float32 if shared else dtype)
+    assert block.gate.weight.dtype == torch.float32
     x = torch.randn(2, 4, dtype=dtype)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         output = block(x)
         assert torch.is_autocast_enabled("cpu")
-    assert block.gate.input_dtype == (torch.float32 if shared else dtype)
-    assert block.gate.autocast_enabled is (not shared)
-    assert block.gate.output_dtype == (torch.float32 if shared else torch.bfloat16)
+    assert block.gate.input_dtype == torch.float32
+    assert block.gate.autocast_enabled is False
+    assert block.gate.output_dtype == torch.float32
     assert block.experts.input_dtype == dtype
     assert output.dtype == dtype
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_backbone_propagates_router_dtype_through_all_layers(moe_block_cls, shared):
+def test_backbone_propagates_fp32_router_through_all_layers(moe_block_cls):
     namespace = moe_block_cls.__init__.__globals__
     namespace.update(
         logger=Mock(),
@@ -239,23 +237,19 @@ def test_backbone_propagates_router_dtype_through_all_layers(moe_block_cls, shar
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("meta"):
-            model = model_cls(
-                config,
-                shared_router_dtype=torch.float32 if shared else None,
-                rope_device=torch.device("cpu") if shared else None,
-            )
+            model = model_cls(config, rope_device=torch.device("cpu"))
     finally:
         torch.set_default_dtype(previous_dtype)
     for layer in model.layers:
-        assert layer.mlp.gate.weight.dtype == (torch.float32 if shared else torch.bfloat16)
+        assert layer.mlp.gate.weight.dtype == torch.float32
         assert layer.mlp.gate.weight.device.type == "meta"
     for call in namespace["HunYuanAttention"].call_args_list:
-        assert call.kwargs["rope_device"] == (torch.device("cpu") if shared else None)
+        assert call.kwargs["rope_device"] == torch.device("cpu")
 
 
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("meta", [False, True])
-def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, meta):
+def test_pipeline_router_dtype_is_fp32_regardless_of_sharing_or_meta(monkeypatch, shared, meta):
     class PipelineBase(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -293,7 +287,7 @@ def test_pipeline_router_dtype_depends_on_sharing_not_meta(monkeypatch, shared, 
     )
     with pytest.raises(RuntimeError, match="backbone constructor reached"):
         cls(od_config, backbone_meta=meta)
-    assert backbone.call_args.kwargs["shared_router_dtype"] == (torch.float32 if shared else None)
+    assert backbone.call_args.kwargs["shared_router_dtype"] == torch.float32
     assert backbone.call_args.kwargs.get("rope_device") == (torch.device("cpu") if meta else None)
 
 

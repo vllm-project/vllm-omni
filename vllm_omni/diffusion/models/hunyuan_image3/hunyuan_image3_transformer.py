@@ -1682,7 +1682,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         layer_id: int = -1,
         prefix: str = "",
         enable_eplb: bool = False,
-        shared_router_dtype: torch.dtype | None = None,
+        shared_router_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -1714,13 +1714,16 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
-        # None preserves the ordinary model dtype and autocast behavior.
+        # The DiT backbone matches the AR/AR-adapter contract: the MoE router
+        # always runs in FP32 (official Hunyuan ``HunyuanTopKGate.wg`` is
+        # constructed with ``dtype=torch.float32``). ``None`` remains accepted
+        # for callers that explicitly opt out of the FP32 router.
         self._shared_router_dtype = shared_router_dtype
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             params_dtype=shared_router_dtype,
             prefix=f"{prefix}.gate",
         )
@@ -1766,7 +1769,8 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Only shared routers override the ordinary dtype/autocast contract.
+        # MoE routing runs in FP32 by default, matching the official Hunyuan
+        # implementation. ``None`` opts a caller back into the model dtype.
         if self._shared_router_dtype is not None:
             with torch.autocast(device_type=hidden_states.device.type, enabled=False):
                 router_logits, _ = self.gate(hidden_states.to(dtype=self._shared_router_dtype))
@@ -1947,7 +1951,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None,
         layer_idx: int,
         prefix: str = "",
-        shared_router_dtype: torch.dtype | None = None,
+        shared_router_dtype: torch.dtype = torch.float32,
         rope_device: torch.device | None = None,
     ):
         super().__init__()
@@ -2190,7 +2194,7 @@ class HunyuanImage3Model(nn.Module):
         config: HunyuanImage3Config,
         quant_config=None,
         prefix: str = "",
-        shared_router_dtype: torch.dtype | None = None,
+        shared_router_dtype: torch.dtype = torch.float32,
         rope_device: torch.device | None = None,
     ):
         super().__init__()

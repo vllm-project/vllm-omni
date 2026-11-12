@@ -423,9 +423,11 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        shared_group = getattr(od_config, "weight_sharing", None)
-        # The AR adapter's router contract is FP32; ordinary DiT stays unchanged.
-        shared_router_dtype = torch.float32 if shared_group is not None and shared_group.role == "consumer" else None
+        # MoE routers run in FP32 on both AR and DiT stages, matching the
+        # official Hunyuan code (``HunyuanTopKGate.wg`` uses
+        # ``dtype=torch.float32``). This also keeps the router representation
+        # identical when the backbone is shared across stages.
+        shared_router_dtype = torch.float32
         if backbone_meta:
             from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
 
