@@ -12,7 +12,7 @@ from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -65,6 +65,28 @@ def test_mixed_resolutions_share_scheduler_approved_batch():
     output = scheduler.schedule()
     assert output.scheduled_request_ids == ["a", "b"]
     assert output.use_mixfusion
+
+
+def test_http_image_prompts_share_mixed_resolution_batch():
+    a, b = _request("a", 512, 512), _request("b", 768, 768)
+    for request in (a, b):
+        request.prompt = OmniTextPrompt(prompt="a fox", negative_prompt="blurry", modalities=["image"])
+        prepare_mixfusion_admission(_Engine(_Config()), request)
+        assert request.mixfusion_info is not None
+        assert request.mixfusion_info.condition_key == (True,)
+        assert request.prompt["modalities"] == ["image"]
+    assert (a.mixfusion_info.image_tokens, b.mixfusion_info.image_tokens) == (1024, 2304)
+    output = _scheduler(a, b).schedule()
+    assert output.scheduled_request_ids == ["a", "b"]
+    assert output.use_mixfusion
+
+
+@pytest.mark.parametrize("modalities", [None, [], ["video"], ["image", "audio"], "image"])
+def test_non_image_modalities_keep_dense_admission(modalities):
+    request = _request("a")
+    request.prompt = {"prompt": "a fox", "modalities": modalities}
+    prepare_mixfusion_admission(_Engine(_Config()), request)
+    assert request.mixfusion_info is None
 
 
 @pytest.mark.parametrize("other,extras", [(992, {}), (768, {"mixfusion_max_chunks": 4})])
@@ -135,9 +157,12 @@ def test_declared_cfg_default_controls_compatibility(default_scale, uses_cfg):
     assert request.mixfusion_info.condition_key == (uses_cfg,)
 
 
-def test_image_declaration_keeps_extra_prompt_inputs_dense():
+@pytest.mark.parametrize("modalities", [None, ["image"]])
+def test_image_declaration_keeps_extra_prompt_inputs_dense(modalities):
     request = _request("a")
     request.prompt = {"prompt": "a fox", "additional_information": {"reference": "image"}}
+    if modalities is not None:
+        request.prompt["modalities"] = modalities
     prepare_mixfusion_admission(_Engine(_Config()), request)
     assert request.mixfusion_info is None
 

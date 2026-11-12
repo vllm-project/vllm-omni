@@ -70,7 +70,10 @@ def prepare_image_request(
 
     sampling, prompt = request.sampling_params, request.prompt
     if not isinstance(prompt, str):
-        if not isinstance(prompt, dict) or set(prompt) - {"prompt", "negative_prompt"}:
+        if not isinstance(prompt, dict) or set(prompt) - {"prompt", "negative_prompt", "modalities"}:
+            return None
+        # HTTP image requests carry output routing metadata, not reference inputs.
+        if "modalities" in prompt and prompt.get("modalities") != ["image"]:
             return None
     if sampling.latents is not None:
         return None
