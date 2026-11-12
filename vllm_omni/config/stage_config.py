@@ -21,6 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig, parse_weight_sharing
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -873,6 +874,7 @@ class DeployConfig:
 
     # Async chunk's default depends on whether or not the pipeline supports it.
     async_chunk: bool | None = None
+    weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
@@ -1139,6 +1141,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     # TODO (Alex): Clean this up, we should not have fallback values here
     kwargs: dict[str, Any] = {
         "speech_cache": SpeechCacheConfig(**speech_cache),
+        "weight_sharing": parse_weight_sharing(raw_dict.get("weight_sharing")),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),

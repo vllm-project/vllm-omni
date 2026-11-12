@@ -1073,6 +1073,22 @@ source_file_dependencies:
     - *hunyuan_image3
     - tests/e2e/offline_inference/test_hunyuanimage3_i2t_expansion.py
 
+  diffusion_hunyuan_image3_weight_sharing:
+    - *hunyuan_image3
+    - vllm_omni/distributed/weight_sharing/
+    - vllm_omni/config/
+    - vllm_omni/engine/
+    - vllm_omni/worker/gpu_ar_worker.py
+    - vllm_omni/worker/gpu_ar_model_runner.py
+    - vllm_omni/worker_v2/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/deploy/hunyuan-image-3-weight-sharing.yaml
+    - vllm_omni/deploy/hunyuan-image-3-mooncakeconnector.yaml
+    - tests/e2e/offline_inference/test_hunyuanimage3.py
+    - tests/helpers/
+    - tests/e2e/accuracy/helpers.py
+
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3
     - tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py
