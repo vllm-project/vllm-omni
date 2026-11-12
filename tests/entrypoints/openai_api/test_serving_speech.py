@@ -234,6 +234,35 @@ async def test_initial_burst_holds_wav_header_with_the_release(monkeypatch):
     assert output[1] != b"" and output[2] != b""
 
 
+@pytest.mark.asyncio
+async def test_initial_burst_flushes_short_stream_at_eof(monkeypatch):
+    """A stream shorter than the reserve must still deliver everything:
+    the held chunks (and the pending header) flush at end-of-stream."""
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_INITIAL_BURST", "3")
+    serving = _burst_serving()
+    state = {"generated": 0}
+
+    async def results():
+        for _ in range(2):  # 2 chunks < burst_n=3
+            state["generated"] += 1
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(results(), "burst-short-pcm", response_format="pcm")
+    output = [c async for c in chunks]
+    assert len(output) == 2, f"short stream must flush its held chunks, got {len(output)}"
+    assert all(len(c) == 640 for c in output)
+
+    async def wav_results():
+        for _ in range(2):
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.zeros(320), "sr": 24000})
+
+    chunks = serving._generate_audio_chunks(wav_results(), "burst-short-wav", response_format="wav")
+    output = [c async for c in chunks]
+    assert len(output) == 3
+    assert output[0].startswith(b"RIFF"), "the pending header must flush at end-of-stream too"
+    assert all(len(c) > 44 for c in output[1:])
+
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):

@@ -1859,7 +1859,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # the first-packet reserve matters more than the earliest possible
         # first byte.
         burst_n = max(1, int(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1")))
-        burst_buf: list[bytes] = []
+        # Held chunks as (pcm_bytes, sample_rate) pairs; the WAV header built
+        # for the first chunk is stashed here and emitted once at the release
+        # (or at the end-of-stream flush) — the per-iteration `wav_header`
+        # local does not outlive the loop iteration it was built in.
+        burst_buf: list[tuple[bytes, int]] = []
+        pending_wav_header: bytes | None = None
         burst_released = burst_n <= 1
         first_chunk = True
         first_audio_chunk_s: float | None = None
@@ -2003,16 +2008,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if audio_format is not None and not audio_format and audio_bytes:
                         audio_format.update(_encoded_audio_format(audio_response, output_sample_rate, chunk_np))
                     if not burst_released:
-                        # Hold the WAV header with the burst: the client
-                        # connection stays silent until the reserve releases,
-                        # so header + N chunks arrive together.
-                        burst_buf.append(audio_bytes)
+                        # Hold the chunk (and the pending WAV header): the
+                        # client connection stays silent until the reserve
+                        # releases, so header + N chunks arrive together.
+                        if wav_header is not None:
+                            pending_wav_header = wav_header
+                        burst_buf.append((audio_bytes, output_sample_rate))
                         if len(burst_buf) >= burst_n:
-                            if wav_header is not None:
-                                yield wav_header
-                            for held in burst_buf:
+                            if pending_wav_header is not None:
+                                yield pending_wav_header
+                                pending_wav_header = None
+                            for held, held_sr in burst_buf:
                                 if include_sample_rate:
-                                    yield held, output_sample_rate
+                                    yield held, held_sr
                                 else:
                                     yield held
                             burst_buf.clear()
@@ -2024,6 +2032,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         yield audio_bytes, output_sample_rate
                     else:
                         yield audio_bytes
+
+            # End-of-stream flush: a stream shorter than the reserve must
+            # still deliver its held chunks (and the pending header) — the
+            # no-audio guards do not fire because record_audio_chunk already
+            # ran for every held chunk, so without this flush a short
+            # utterance would finish with no audio on the wire.
+            if not burst_released:
+                if pending_wav_header is not None:
+                    yield pending_wav_header
+                    pending_wav_header = None
+                for held, held_sr in burst_buf:
+                    if include_sample_rate:
+                        yield held, held_sr
+                    else:
+                        yield held
+                burst_buf.clear()
+                burst_released = True
 
             if resampler is not None:
                 final_chunk = resampler.process(np.empty((0,), dtype=np.float32), final=True)
