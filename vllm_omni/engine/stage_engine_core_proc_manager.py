@@ -13,8 +13,8 @@ own ZMQ allocation from :class:`OmniMasterServer` and (when an
 ``omni_coordinator_address`` is provided) its own
 :class:`OmniCoordClientForStage` reporting heartbeat / status.
 
-Liveness monitoring and shutdown are inherited from
-:class:`CoreEngineProcManager` unchanged.
+Liveness monitoring is inherited from :class:`CoreEngineProcManager`.
+The default shutdown budget also covers worker and engine resource teardown.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import weakref
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue
 
+from vllm import envs as vllm_envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -43,6 +44,12 @@ logger = init_logger(__name__)
 # guard at the call-site (vllm_config is not None and ... is not None)
 # skips the call transparently.
 set_device_control_env_var = None
+
+# MultiprocExecutor waits this long after its initial worker grace period
+# before escalating SIGTERM to SIGKILL. The parent must outlive both waits,
+# then allow EngineCore to release its queues and finish process teardown.
+_WORKER_SIGTERM_GRACE_S = 4.0
+_ENGINE_TEARDOWN_GRACE_S = 5.0
 
 
 class StageEngineCoreProcManager(CoreEngineProcManager):
@@ -80,7 +87,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
-        # while reusing the parent's instance methods (shutdown, monitor).
+        # while reusing the parent's liveness monitoring and shutdown logic.
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
 
@@ -89,6 +96,12 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         # shutdown raise AttributeError, which leaves the engine core
         # subprocesses alive and hangs interpreter exit until the job timeout.
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
+        self._process_shutdown_timeout = (
+            max(self._request_shutdown_timeout, 0.0)
+            + vllm_envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            + _WORKER_SIGTERM_GRACE_S
+            + _ENGINE_TEARDOWN_GRACE_S
+        )
 
         context = get_mp_context()
         common_kwargs: dict[str, object] = {
@@ -142,7 +155,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(self, shutdown, self.processes, timeout=self._process_shutdown_timeout)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -171,3 +184,10 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         finally:
             if self.finished_procs():
                 self.shutdown()
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        # An explicit timeout is the caller's remaining budget. Only supply
+        # the full drain + teardown budget when no deadline was provided.
+        if timeout is None:
+            timeout = self._process_shutdown_timeout
+        super().shutdown(timeout=timeout)

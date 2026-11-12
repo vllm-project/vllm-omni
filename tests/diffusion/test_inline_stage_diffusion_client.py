@@ -259,6 +259,37 @@ def test_inline_shutdown_runs_after_orchestrator_premark(client, mock_engine):
     mock_engine.close.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_async_shutdown_cancels_tasks_while_engine_close_waits(client, mock_engine):
+    cancelled = threading.Event()
+    entered = asyncio.Event()
+
+    async def pending_request():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    task = asyncio.create_task(pending_request())
+    client._tasks["pending"] = task
+    await entered.wait()
+
+    def close_engine():
+        assert cancelled.wait(timeout=2)
+
+    mock_engine.close.side_effect = close_engine
+    try:
+        await client.shutdown_async()
+        await asyncio.gather(task, return_exceptions=True)
+        assert cancelled.is_set()
+        mock_engine.close.assert_called_once()
+        assert client._shutdown_complete
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def test_inline_registers_executor_failure_callback(client, mock_engine):
     mock_engine.executor.register_failure_callback.assert_called_once()
 
