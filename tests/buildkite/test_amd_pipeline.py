@@ -2621,7 +2621,7 @@ def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "tts_voxtral_tts_perf"
+    assert step["source_file_dependencies"] == ["tts_voxtral_tts_perf", "ci_rocm", "omni_gpu_v1_runtime"]
     assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
     assert "VLLM_ROCM_USE_AITER" not in step["env"]
     commands = "\n".join(step["commands"])
@@ -2669,7 +2669,7 @@ def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert "tests/dfx/perf/tests/test_tts.json" in dependencies
     assert "vllm_omni/deploy/voxtral_tts.yaml" in dependencies
     assert "vllm_omni/entrypoints/openai/serving_speech.py" in dependencies
-    assert "vllm_omni/entrypoints/openai/tts_adapters/" in dependencies
+    assert "vllm_omni/entrypoints/openai/tts_adapters/voxtral.py" in dependencies
     assert "vllm_omni/model_executor/models/voxtral_tts/" in dependencies
     assert "vllm_omni/model_executor/stage_input_processors/voxtral_tts.py" in dependencies
     assert "vllm_omni/transformers_utils/configs/voxtral_tts.py" in dependencies
@@ -2688,7 +2688,7 @@ def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "tts_qwen3_tts_perf"
+    assert step["source_file_dependencies"] == ["tts_qwen3_tts_perf", "ci_rocm", "omni_gpu_v1_runtime"]
     assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
     assert "VLLM_ROCM_USE_AITER" not in step["env"]
     assert step["artifact_paths"] == ["artifacts/rocm-qwen3-tts-perf/**/*"]
@@ -2789,7 +2789,7 @@ def test_minicpmo_accuracy_is_two_nonblocking_nightly_jobs() -> None:
         assert step["agent_pool"] == "mi300_1"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == 180
-        assert step["source_file_dependencies"] == "omni_minicpmo_4_5_accuracy"
+        assert step["source_file_dependencies"] == ["omni_minicpmo_4_5_accuracy", "ci_rocm", "omni_gpu_v1_runtime"]
         assert step["artifact_paths"] == [artifact]
         assert step.get("env", {}) == env
         assert "full_model and omni and rocm and MI325 and cards_1" in commands
@@ -2845,7 +2845,7 @@ def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "omni_minicpmo_4_5_perf"
+    assert step["source_file_dependencies"] == ["omni_minicpmo_4_5_perf", "ci_rocm", "omni_gpu_v1_runtime"]
     assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-4-5-perf/**/*"]
     commands = "\n".join(step["commands"])
     assert "full_model and omni and rocm and MI325 and cards_1" in commands
@@ -2919,7 +2919,7 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
-    assert step["source_file_dependencies"] == "diffusion_qwen_image_accuracy"
+    assert step["source_file_dependencies"] == ["diffusion_qwen_image_accuracy", "ci_rocm"]
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
     commands = "\n".join(step["commands"])

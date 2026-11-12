@@ -35,7 +35,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
-        source_file_dependencies: diffusion_wan22_accuracy
+        source_file_dependencies: [diffusion_wan22_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -116,7 +116,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm]
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_rocm, omni_gpu_v1_runtime]
         artifact_paths:
           - artifacts/rocm-qwen3-omni-accuracy/**/*
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
@@ -227,7 +227,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 300
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm, omni_gpu_v1_runtime]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
@@ -248,7 +248,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_rocm, omni_gpu_v1_runtime]
         env:
           QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
           QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -646,7 +646,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
+        source_file_dependencies: [diffusion_hunyuan_image3_accuracy, ci_rocm]
         env:
           HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
           HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
@@ -797,7 +797,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_qwen_image_accuracy
+        source_file_dependencies: [diffusion_qwen_image_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -854,7 +854,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_minicpmo_4_5_accuracy
+        source_file_dependencies: [omni_minicpmo_4_5_accuracy, ci_rocm, omni_gpu_v1_runtime]
         artifact_paths:
           - artifacts/rocm-minicpmo-daily-omni-accuracy/**/*
         commands:
@@ -900,7 +900,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_minicpmo_4_5_accuracy
+        source_file_dependencies: [omni_minicpmo_4_5_accuracy, ci_rocm, omni_gpu_v1_runtime]
         env:
           SEED_TTS_WER_EVAL: "1"
           SEED_TTS_SIM_EVAL: "1"
@@ -952,7 +952,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_wan22_accuracy
+        source_file_dependencies: [diffusion_wan22_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -1028,7 +1028,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
+        source_file_dependencies: [diffusion_hunyuan_image3_accuracy, ci_rocm]
         env:
           HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
           HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
@@ -1089,7 +1089,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_hunyuan_video_accuracy
+        source_file_dependencies: [diffusion_hunyuan_video_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -1170,7 +1170,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_minimax_h3_accuracy
+        source_file_dependencies: [diffusion_minimax_h3_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -1227,7 +1227,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_minimax_h3_accuracy
+        source_file_dependencies: [diffusion_minimax_h3_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -1284,7 +1284,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        source_file_dependencies: [diffusion_qwen_image_21_accuracy, ci_rocm]
         env:
           QWEN_IMAGE_21_CALIBRATE: "0"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
@@ -1344,7 +1344,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: tts_voxtral_tts_perf
+        source_file_dependencies: [tts_voxtral_tts_perf, ci_rocm, omni_gpu_v1_runtime]
         env:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf/benchmark-results"
@@ -1446,7 +1446,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: tts_qwen3_tts_perf
+        source_file_dependencies: [tts_qwen3_tts_perf, ci_rocm, omni_gpu_v1_runtime]
         env:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf/benchmark-results"
@@ -1707,7 +1707,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_minicpmo_4_5_perf
+        source_file_dependencies: [omni_minicpmo_4_5_perf, ci_rocm, omni_gpu_v1_runtime]
         env:
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-4-5-perf/benchmark-results"
         artifact_paths:
@@ -1814,7 +1814,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 240
-        source_file_dependencies: omni_duplex_eval_ci
+        source_file_dependencies: [omni_duplex_eval_ci, ci_rocm, omni_gpu_v1_runtime]
         env:
           BENCHMARK_DIR: tests/dfx/perf/results
           ACC_BENCH_RESULT_DIR: tests/e2e/accuracy/omni_duplex_eval/results
@@ -1852,7 +1852,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: Blocking
         timeout_in_minutes: 180
-        source_file_dependencies: diffusion_qwen_image_accuracy
+        source_file_dependencies: [diffusion_qwen_image_accuracy, ci_rocm]
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
