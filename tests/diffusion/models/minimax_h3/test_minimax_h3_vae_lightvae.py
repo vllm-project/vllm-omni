@@ -599,6 +599,7 @@ def test_decode_latent_preserves_image_tiling_through_context_padding(monkeypatc
     native_module.apply_h3_lite_decode_profile(model, profile)
 
     vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
     vae.model = model
     vae.parallel_size = 1
     vae.config_dict = {

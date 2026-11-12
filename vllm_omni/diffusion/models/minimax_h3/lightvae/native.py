@@ -309,9 +309,7 @@ def _split_tiles_for_profile(
     layout: str,
 ) -> tuple[list[int], list[int], list[int]]:
     if size <= 0 or min_overlap < 0 or min_overlap >= size:
-        raise ValueError(
-            f"H3 Lite tile size {size} must be positive and overlap {min_overlap} must be smaller than it"
-        )
+        raise ValueError(f"H3 Lite tile size {size} must be positive and overlap {min_overlap} must be smaller than it")
     ratio = int(getattr(model, "vae_ratio", 1) or 1)
     if layout == "adaptive":
         if length <= size + min_overlap:
