@@ -191,7 +191,7 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
     assert "VLLM_ROCM_USE_AITER=1" not in command
     assert "AITER_JIT_DIR" not in command
     assert QWEN_IMAGE_SMOKE_NODE in command
-    assert "advanced_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level advanced_model" in command
     assert "full_model" not in command
     assert "Expected exactly one executed Qwen-Image MERGE test" in command
@@ -199,15 +199,16 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
 
 
 QWEN_IMAGE_BATCH_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]"
-_QWEN_IMAGE_BATCH_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
-_QWEN_IMAGE_BATCH_MERGE_MARKER = "advanced_model and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_READY_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_MERGE_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
 
 
 def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
-    """READY runs the batch node at core_model. MERGE runs it at advanced_model.
+    """READY runs the batch node at core_model depth. MERGE runs it at advanced_model depth.
 
-    The single-request MERGE smoke stays. Nightly does not gain this node.
-    Step and command timeouts are copied from that smoke, not measured here.
+    Both jobs select the same ``slow`` mark. The single-request MERGE smoke stays.
+    Nightly does not gain this node. Step and command timeouts are copied from that
+    smoke, not measured here.
     """
     ready = _find_step("READY · Qwen-Image Batch", AMD_READY_PIPELINE)
     merge = _find_step("MERGE · Qwen-Image Batch", AMD_MERGE_PIPELINE)
@@ -215,7 +216,7 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
     ready_command = "\n".join(ready["commands"])
     merge_command = "\n".join(merge["commands"])
     source = Path("tests/e2e/online_serving/test_qwen_image.py").read_text(encoding="utf-8")
-    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.core_model", 1)[1]
+    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.slow", 1)[1]
 
     for step, command, marker, artifact, message in (
         (
@@ -252,9 +253,12 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
         assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
     assert "--run-level core_model" in ready_command
-    assert "advanced_model" not in ready_command
+    assert "--run-level advanced_model" not in ready_command
     assert "--run-level advanced_model" in merge_command
-    assert "core_model" not in merge_command
+    assert "--run-level core_model" not in merge_command
+    assert "@pytest.mark.core_model" not in source
+    assert "@pytest.mark.advanced_model" not in source
+    assert "@pytest.mark.full_model" not in source
     assert QWEN_IMAGE_BATCH_NODE not in "\n".join(smoke["commands"])
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_BATCH_NODE) == []
     assert "SINGLE_CARD_FEATURE_MARKS" in batch_head
@@ -303,7 +307,7 @@ def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> 
     assert len(collect_nodes) == 1
     assert run_nodes == collect_nodes
 
-    expected_markers = f"full_model and diffusion and rocm and MI325 and cards_{card_count}"
+    expected_markers = f"slow and diffusion and rocm and MI325 and cards_{card_count}"
     assert collect_argv[collect_argv.index("-m") + 1] == expected_markers
     assert run_argv[run_argv.index("-m") + 1] == expected_markers
     assert collect_argv[collect_argv.index("--run-level") + 1] == "full_model"
@@ -2380,7 +2384,7 @@ def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert "--run-level full_model" in commands
     assert "--collect-only" in commands
     nodes = (
@@ -2869,7 +2873,7 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert '-k "2i_matches_diffusers"' in commands
     assert "test_diffusers_backend_t2i_matches_diffusers" in commands
     assert "Expected exactly one Qwen-Image backend similarity node" in commands
@@ -2879,6 +2883,8 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert "Expected exactly one executed Qwen-Image backend similarity test" in commands
     accuracy_test = Path("tests/e2e/accuracy/test_diffusers_backend_similarity.py").read_text(encoding="utf-8")
     assert "torch.version.hip is not None" in accuracy_test
+    assert "@pytest.mark.slow" in accuracy_test
+    assert "pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]" not in accuracy_test
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image Diffusers Backend Similarity" not in text
@@ -3268,7 +3274,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             one,
             "mi300_1",
-            "full_model and diffusion and rocm and MI325 and cards_1",
+            "slow and diffusion and rocm and MI325 and cards_1",
             "artifacts/rocm-qwen-image-expansion-1gpu/**/*",
             (
                 "cpu_offload",
@@ -3281,7 +3287,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             two,
             "mi300_2",
-            "full_model and diffusion and rocm and MI325 and cards_2",
+            "slow and diffusion and rocm and MI325 and cards_2",
             "artifacts/rocm-qwen-image-expansion-2gpu/**/*",
             (
                 "ulysses_2",
@@ -4428,8 +4434,8 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert path not in r2_01_command
 
 
-_DRAMA3_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
-_DRAMA3_MERGE_MARKER = "advanced_model and tts and rocm and MI325 and cards_1"
+_DRAMA3_READY_MARKER = "slow and tts and rocm and MI325 and cards_1"
+_DRAMA3_MERGE_MARKER = "slow and tts and rocm and MI325 and cards_1"
 _DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_EXCLUDED = (
     "test_voice_clone_streaming_002",
@@ -4463,7 +4469,8 @@ def test_drama3_ready_requires_one_blocking_text_to_audio_node() -> None:
     assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
     assert command.count('--run-level "core_model"') == 2
     assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 1
+    # nodes= + collect-only + run, same as MERGE text-to-audio.
+    assert command.count(_DRAMA3_READY_NODE) == 3
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
     assert "diff -u /tmp/drama3-ready-expected.txt" in command
@@ -4519,8 +4526,9 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert command.count(_DRAMA3_READY_NODE) == 3
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
-    assert "@pytest.mark.core_model" in selected
-    assert "@pytest.mark.advanced_model" in selected
+    assert "@pytest.mark.slow" in selected
+    assert "@pytest.mark.core_model" not in selected
+    assert "@pytest.mark.advanced_model" not in selected
     text_to_audio = source.split("def test_voice_clone_streaming_002", 1)[0]
     assert "send_audio_speech_request" in text_to_audio
     assert 'run_level not in {"advanced_model", "full_model"}' in speech_gate
