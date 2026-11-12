@@ -115,7 +115,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and B200 and full_model and cards_2"
 
-      - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Perf Test"
+      - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Accuracy and Perf Test"
         source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-qwen3-omni-duplex-omniinteract
         timeout_in_minutes: 180
@@ -125,7 +125,7 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
 
-      - label: ":full_moon: Omni · Qwen3-Omni · Duplex Omni-DuplexEval Perf Test"
+      - label: ":full_moon: Omni · Qwen3-Omni · Duplex Omni-DuplexEval Accuracy and Perf Test"
         source_file_dependencies: [omni_qwen3_omni_duplex_perf, ci_cuda, omni_v2_runtime]
         key: nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval
         timeout_in_minutes: 180
@@ -243,48 +243,11 @@ steps:
       build.pull_request.labels includes "nightly-test"
     steps:
 
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · Single-GPU"
-        source_file_dependencies: diffusion_qwen_image_function
-        timeout_in_minutes: 120
-        commands:
-          - >-
-            pytest -sv
-            tests/e2e/online_serving/test_qwen_image_expansion.py
-            -m "full_model and diffusion and H100 and B200 and cards_1"
-            --run-level "full_model"
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · 2-GPU"
-        source_file_dependencies: diffusion_qwen_image_function
-        timeout_in_minutes: 120
-        commands:
-          - >-
-            pytest -sv
-            tests/e2e/online_serving/test_qwen_image_expansion.py
-            -m "full_model and diffusion and H100 and B200 and cards_2"
-            --run-level "full_model"
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Single-GPU"
-        source_file_dependencies: diffusion_qwen_image_function
-        timeout_in_minutes: 120
-        commands:
-          - pytest -sv tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py -m "full_model and diffusion and L4 and B200 and cards_1" --run-level "full_model"
-
-
       - label: ":full_moon: Diffusion X2I(&A&T) · Doc Test"
         source_file_dependencies: diffusion_text_to_image_doc
         timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/examples/*/test_text_to_image.py -m "full_model and example and H100 and B200 and (cards_1 or cards_2)" --run-level "full_model"
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
-        source_file_dependencies: diffusion_qwen_image_accuracy
-        timeout_in_minutes: 180
-        artifact_paths:
-          - tests/e2e/accuracy/results/result_acc_*.json
-        commands:
-          - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
-          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
-          - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
         source_file_dependencies: diffusion_qwen_image_21_accuracy
@@ -303,6 +266,30 @@ steps:
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
 
+      - label: ":full_moon: HunyuanImage3 · Shared TP4 Smoke"
+        source_file_dependencies: diffusion_hunyuan_image3_weight_sharing
+        mirror_hardwares: h100_4
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv tests/e2e/offline_inference/test_hunyuanimage3.py
+            -k shared_backbone_ar_kv -m "full_model and cuda and H100 and cards_4"
+            --run-level full_model
+
+      - label: ":full_moon: HunyuanImage3 · Weight Sharing TP4 E2E"
+        source_file_dependencies: diffusion_hunyuan_image3_weight_sharing
+        mirror_hardwares: h100_weight_sharing_tp4
+        timeout_in_minutes: 180
+        artifact_paths:
+          - artifacts/hunyuan-weight-sharing/**/*
+        commands:
+          - >-
+            pytest -sv tests/e2e/offline_inference/test_hunyuanimage3.py
+            -k shared_backbone_matches_ordinary_loading -m "full_model and cuda and H100 and cards_8"
+            --run-level full_model
+            --basetemp=artifacts/hunyuan-weight-sharing/runs
+            --junitxml=artifacts/hunyuan-weight-sharing/pytest.xml
+
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
@@ -312,32 +299,6 @@ steps:
           - export HUNYUAN_IMAGE3_MODEL="tencent/HunyuanImage-3.0-Instruct"
           - export HUNYUAN_IMAGE3_DEVICES="0,1,2,3"
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py tests/e2e/accuracy/test_hunyuan_image3_lora.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
-        source_file_dependencies: diffusion_qwen_image_perf
-        key: nightly-diffusion-x2iat-performance-qwen-image-single
-        timeout_in_minutes: 180
-        artifact_paths:
-          - tests/dfx/perf/results/diffusion_result_*.json
-          - tests/dfx/perf/results/logs/*.log
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - export CACHE_DIT_VERSION=1.5.0
-          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_1"
-
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-GPU"
-        source_file_dependencies: diffusion_qwen_image_perf
-        key: nightly-diffusion-x2iat-performance-qwen-image-4gpu
-        timeout_in_minutes: 180
-        artifact_paths:
-          - tests/dfx/perf/results/diffusion_result_*.json
-          - tests/dfx/perf/results/logs/*.log
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - export CACHE_DIT_VERSION=1.5.0
-          # Do not pin DIFFUSION_ATTENTION_BACKEND: H100 auto-selects FLASH_ATTN;
-          # B200 rejects explicit FLASH_ATTN without FA4 and uses CUDNN/TRTLLM.
-          - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_4"
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-GPU"
         source_file_dependencies: diffusion_qwen_image_21_perf
@@ -627,8 +588,6 @@ steps:
       - nightly-omni-performance-async-chunk
       - nightly-tts-performance-single
       - nightly-tts-performance-2gpu
-      - nightly-diffusion-x2iat-performance-qwen-image-single
-      - nightly-diffusion-x2iat-performance-qwen-image-4gpu
       - nightly-diffusion-x2iat-performance-qwen-image-21-single
       - nightly-diffusion-x2iat-performance-qwen-image-21-4gpu
       - nightly-diffusion-x2v-performance-single
@@ -645,8 +604,6 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-tts-performance-2gpu
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-no-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-async-chunk
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-single
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-4gpu
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-21-single
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-21-4gpu
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance-single

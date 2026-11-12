@@ -53,8 +53,7 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(
     res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
@@ -80,7 +79,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(
     res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
@@ -119,7 +118,7 @@ def test_voice_clone_streaming_002(omni_server, openai_client, seed: int) -> Non
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(
     res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},
@@ -145,7 +144,7 @@ def test_voice_clone_concurrent_003(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config, request_num=MAX_CONCURRENT)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(
     res={"cuda": "H100", "npu": "A3", "rocm": "MI325"},

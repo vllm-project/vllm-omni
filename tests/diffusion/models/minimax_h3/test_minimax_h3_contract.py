@@ -25,6 +25,8 @@ from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 from vllm_omni.diffusion.models.minimax_h3.quality_policy import MINIMAX_H3_HIGH_CACHE_KEY, MiniMaxH3QualityPolicy
+from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+from vllm_omni.diffusion.sampler import SamplingState
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -1176,6 +1178,16 @@ def test_uniform_sigma_schedule_has_one_interval_per_requested_step(num_steps, s
     assert sigmas[0] == 1.0
     assert sigmas[-1] == 0.0
     assert all(current > following for current, following in zip(sigmas, sigmas[1:]))
+
+
+@pytest.mark.parametrize("shift_scale", [2.14, 3.0, 12.0])
+def test_shifted_sigmas_stay_in_0_1_so_the_sampler_accepts_them(shift_scale):
+    """Without the clamp, float32 rounds the first sigma for flow_shift 2.14 to one ulp above 1."""
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=shift_scale)
+
+    assert sigmas[0] == 1.0
+    assert all(0.0 <= value <= 1.0 for value in sigmas)
+    SamplingState((torch.zeros(1),), (sigmas,))  # the sampler rejects sigmas outside [0, 1]
 
 
 def test_base_schedule_overrides_the_uniform_sigma_positions():
