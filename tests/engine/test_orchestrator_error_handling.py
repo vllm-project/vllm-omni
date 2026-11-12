@@ -17,8 +17,10 @@ from unittest.mock import AsyncMock
 
 import janus
 import pytest
+from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
+from vllm.multimodal.processing import InputProcessingContext
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -985,6 +987,54 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
+async def test_joyai_asr_invalid_context_fails_only_its_request(orchestrator_factory, monkeypatch) -> None:
+    monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda _: None)
+
+    class JoyAIStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            self.bridge_inputs = joyai_bridge.asr_to_joyai(source_outputs, prompt)
+            return self.bridge_inputs
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = JoyAIStage(stage_type="llm", final_output=True)
+    proc0, proc1 = FakeOutputProcessor(), FakeOutputProcessor()
+    fixture = orchestrator_factory([stage0, stage1], output_processors=[proc0, proc1])
+    fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params),
+        renderer=SimpleNamespace(mm_processor_cache=None),
+    )
+    invalid_info: dict[str, object] = {"joyai_prompt_context": {}}
+    for index, (request_id, info) in enumerate((("invalid-context", invalid_info), ("valid", {})), start=1):
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"additional_information": info},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == index)
+        proc0.request_outputs = [_build_request_output(request_id, text="language English<asr_text>Hello.")]
+        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-asr", float(index)))
+        if info:
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and not error.fatal
+            assert error.stage_id == 1 and "joyai_prompt_context" in error.error
+            assert not stage1.add_request_calls
+        else:
+            await _wait_for(lambda: bool(stage1.add_request_calls) or fixture.result_future.done())
+            assert not fixture.result_future.done()
+            assert "Hello." in stage1.bridge_inputs[0]["prompt"]
+            proc1.request_outputs = [_build_request_output(request_id, text="Completed.")]
+            stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-joyai", float(index)))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.finished
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        assert all(pool.get_bound_replica_id(request_id) is None for pool in fixture.orchestrator.stage_pools)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
 async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     orchestrator_factory,
@@ -1123,11 +1173,12 @@ async def test_bad_video_sampling_options_keep_orchestrator_alive(orchestrator_f
     stage1 = FakeStageClient(final_output=True)
     output_processor = FakeOutputProcessor(request_outputs=[_build_request_output("valid-video")])
     fixture = orchestrator_factory([stage0, stage1], output_processors=[FakeOutputProcessor(), output_processor])
+    ctx = InputProcessingContext(SimpleNamespace(get_multimodal_config=lambda: MultiModalConfig()), tokenizer=None)
     info = SimpleNamespace(
-        ctx=SimpleNamespace(
-            get_merged_mm_kwargs=lambda kw, **_: kw,
-            get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        _merge_and_resolve_mm_processor_kwargs=lambda kw: ctx.get_merged_mm_kwargs(
+            kw, supported_mm_processor_kwargs={"videos_kwargs": {"size", "fps", "num_frames"}}
         ),
+        ctx=ctx,
         get_hf_config=lambda: SimpleNamespace(
             vision_config=SimpleNamespace(spatial_merge_size=2),
             vision_start_token_id=1,

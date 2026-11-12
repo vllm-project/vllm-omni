@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
     get_qwen_image_21_post_process_func,
@@ -23,6 +24,7 @@ def _toy_pipeline() -> QwenImage21Pipeline:
     """A pipeline shell with the attributes prepare_latents reads, no weights."""
     pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig()
     pipeline.vae_scale_factor = 16
     pipeline.latent_channels = 4
     return pipeline

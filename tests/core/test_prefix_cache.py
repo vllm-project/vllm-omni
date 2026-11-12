@@ -36,6 +36,13 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheSchedulerAdapter,
+    PrefixCacheStep,
+)
+from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTaskHandle
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
@@ -112,7 +119,7 @@ class FakeSchedOut:
 def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniPrefixCacheManager, FakeView]:
     view = view or FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, **cfg_kwargs)
-    mgr = OmniPrefixCacheManager(config, view, eager=True)
+    mgr = OmniPrefixCacheManager(config, eager=True)
     if policy is not None:
         mgr.register_policy(policy)
     return mgr, view
@@ -145,14 +152,41 @@ def run_step(
     view.step_slot_mapping = torch.cat(slot_parts)
     hidden = torch.cat(hidden_parts)
     sched_out = FakeSchedOut(new_reqs=new_reqs, finished=finished, num_scheduled=num_sched)
-    mgr.new_step_starts(sched_out)
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
     n = int(view.step_slot_mapping.numel())
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
-    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded)
+    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded, write_layout=layout)
 
 
 def expected_rows(slots: torch.Tensor) -> torch.Tensor:
     return slots.to(DTYPE).unsqueeze(1).expand(slots.numel(), HIDDEN)
+
+
+@pytest.mark.parametrize("step_count,layout_count", [(6, 4), (2, 4), (4, 0)])
+def test_save_rejects_layout_that_disagrees_with_step(step_count, layout_count):
+    mgr, view = make_manager()
+    try:
+        mgr.materialize(run_step(mgr, view, {"a": ([0, 1], 0, 8)}), ["a"])
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["a"])))
+        view.order = ["b"] if layout_count else []
+        view.req_blocks["b"], view.computed["b"] = [0, 1, 2], 8
+        hit = FakeNewReq("b", 8, [[0, 1, 2]])
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(new_reqs=[hit], num_scheduled={"b": step_count})))
+        layout = adapter.build_write_layout(view, num_scheduled_tokens={"b": layout_count})
+        rows = expected_rows(view.slots_for("b", 8, 8 + layout_count)).clone()
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="scheduled token count"):
+            mgr.save_outputs(
+                rows, {}, num_tokens_unpadded=layout_count, num_tokens_padded=layout_count, write_layout=layout
+            )
+        assert not mgr._step_ctxs  # Rejection must precede publication/staging.
+    finally:
+        mgr.shutdown()
 
 
 def plan_fetch(mgr, slots, key, *, req_id):
@@ -282,10 +316,101 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
     s3 = run_step(mgr, view, {"b": ([3], 0, 2)}, finished=["a"])
     mgr.materialize(s3, ["b"])
     s4 = run_step(mgr, view, {"a": ([0, 1, 4], 8, 4)}, new_hits={"a": 8}, finished=["b"])
-    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1])}
+    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1], 0)}
     outs = mgr.materialize(s4, ["a"])
     assert outs.hidden_states["a"].shape == (12, HIDDEN)
     assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
+
+
+def test_manager_trusts_started_event_without_a_second_lifecycle_table():
+    mgr, view = make_manager()
+    try:
+        sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+        mgr.materialize(sid, ["a"])
+        assert not hasattr(mgr._request_tasks, "live_reqs")
+        # A new STARTED is authoritative even if the old ID wrote before.
+        # Internal write bookkeeping is not a second lifecycle classifier.
+        mgr.new_step_starts(
+            PrefixCacheStep(
+                (PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),), ()
+            )
+        )
+        assert mgr._hit_spans == {"a": (4, [0], 0)}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("terminal", ["finished", "aborted", "discarded"])
+def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
+    mgr, view = make_manager()
+    try:
+        first = run_step(mgr, view, {"a": ([0], 0, 4)})
+        mgr.materialize(first, ["a"])
+        if terminal == "finished":
+            second = run_step(mgr, view, {"a": ([0, 1], 4, 1)}, new_hits={"a": 4}, finished=["a"])
+        else:
+            # The fake scheduler helper has no abort field, so construct the
+            # explicit side channel as a real producer would supply it.
+            adapter = mgr._test_adapter
+            sched = FakeSchedOut(new_reqs=[FakeNewReq("a", 4, [[0, 1]])], num_scheduled={"a": 1})
+            setattr(sched, f"{terminal}_req_ids", {"a"})
+            mgr.new_step_starts(adapter.translate_step(sched))
+            view.order = ["a"]
+            view.req_blocks["a"] = [0, 1]
+            view.computed["a"] = 4
+            second = mgr.save_outputs(
+                expected_rows(view.slots_for("a", 4, 5)),
+                {},
+                num_tokens_unpadded=1,
+                num_tokens_padded=1,
+                write_layout=adapter.build_write_layout(view, num_scheduled_tokens={"a": 1}),
+            )
+        assert mgr._step_ctxs[second].hits == {"a": (4, [0], 0)}
+        merged = mgr.materialize(second, ["a"]).hidden_states["a"]
+        assert torch.equal(merged, expected_rows(view.slots_for("a", 0, 5)))
+        third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
+        assert not mgr._step_ctxs[third].hits
+        assert mgr.materialize(third, ["a"]).hidden_states["a"].shape == (1, HIDDEN)
+    finally:
+        mgr.shutdown()
+
+
+def test_owned_step_outputs_must_be_unpadded():
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="owned step outputs must be unpadded: 4 rows for 2"):
+            mgr._split_step_outputs(torch.zeros(4, HIDDEN), {}, 2, 4, owned=True)
+    finally:
+        mgr.shutdown()
+
+
+def test_save_requires_write_layout_before_waiting(monkeypatch):
+    mgr, _ = make_manager()
+    waited = []
+    monkeypatch.setattr(mgr, "_wait_for_host_ready", lambda: waited.append(True))
+    try:
+        with pytest.raises(TypeError, match="write_layout"):
+            mgr.save_outputs(torch.zeros(1, HIDDEN), {}, num_tokens_unpadded=1, num_tokens_padded=1)
+        assert not waited
+    finally:
+        mgr.shutdown()
+
+
+def test_save_requires_slot_snapshot_with_cache_contract_error():
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheWrite, PrefixCacheWriteLayout
+
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="CPU slot snapshot"):
+            mgr.save_outputs(
+                torch.zeros(1, HIDDEN),
+                {},
+                num_tokens_unpadded=1,
+                num_tokens_padded=1,
+                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1),), 1),
+            )
+    finally:
+        mgr.shutdown()
 
 
 def test_join_next_step_hit_waits_done_then_reads_pool():
@@ -341,6 +466,13 @@ def test_absent_hit_fails_fast():
         mgr.materialize(sid, ["c"])
     if d2h_snapshot is not None:
         assert not mgr._controller._staging_pool._busy[d2h_snapshot.staging_slot]
+
+
+def test_empty_hit_block_group_fails_at_register():
+    mgr, _ = make_manager()
+    event = PrefixCacheRequestEvent("empty", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((),))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="carries no block_ids"):
+        mgr.new_step_starts(PrefixCacheStep((event,), ()))
 
 
 def test_hit_not_block_aligned_fails_at_register():
@@ -412,7 +544,9 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
     view.req_blocks["a"] = [0]
     view.computed["a"] = 0
     n = 4
-    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n}))
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n})
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_step(sched))
     hidden = torch.ones(n, HIDDEN)
     mm = {
         "codes.audio": torch.full((n, 2), 5.0),
@@ -582,8 +716,8 @@ def test_cap_forces_flush_of_deferred():
         mgr.materialize(sid, ["a"])
     # Fourth chunk flushed the first three; only it is still charged.
     assert mgr._controller._staged_bytes == 16
-    rows = mgr._pool.rows("k", view.slots_for("a", 0, 4))[:, 0].tolist()
-    assert rows == [1.0, 2.0, 3.0, 0.0]
+    slots = view.slots_for("a", 0, 4)
+    assert mgr._pool.rows("k", slots[:3])[:, 0].tolist() == [1.0, 2.0, 3.0]
     assert mgr._request_tasks.deferred["a"].write_n == 2
     assert len(mgr._request_tasks.tasks["a"]) == 1  # the flushed write was drained
 
@@ -675,7 +809,9 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, policy=None
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
         cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
@@ -684,6 +820,7 @@ def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object()
         model_config=None,
         is_pooling_model=pooling,
         speculative_config=spec,
+        model_cache_policy=policy or ModelCachePolicy(),
     )
 
 
@@ -717,6 +854,44 @@ def test_npu_runner_uses_shared_prefix_cache_gate():
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "stage_prefix_cache_config" in calls
     assert "check_prefix_cache_kv_groups" not in calls
+
+
+def test_native_only_cache_policy_leaves_hybrid_kv_cache_enabled():
+    policy = ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=True)
+    cache = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    groups = [object(), object()]
+    assert (
+        stage_prefix_cache_config(
+            kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=groups),
+            cache_config=cache,
+            kv_transfer_config=None,
+            scheduler_config=None,
+            model_config=None,
+            is_pooling_model=False,
+            model_cache_policy=policy,
+        )
+        is None
+    )
+    assert cache.enable_prefix_caching is True
+    assert len(groups) == 2
+
+
+def test_hidden_optout_does_not_bypass_multimodal_output_cache_guards():
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"codes.audio"}))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+        _stage_cfg(policy=policy, groups=(object(), object()))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
+        _stage_cfg(policy=policy, kv_transfer=SimpleNamespace(is_kv_consumer=True))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
+        _stage_cfg(policy=policy, spec=object())
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
+        _stage_cfg(policy=policy, match_unit=1)
+
+
+@pytest.mark.parametrize("hidden,deferred", [(True, ()), (False, ("codes.audio",))])
+def test_native_only_policy_rejects_prefix_output_dependencies(hidden, deferred):
+    with pytest.raises(ValueError, match="native.*only"):
+        ModelCachePolicy(needs_full_hidden_states=hidden, deferred_keys=frozenset(deferred), native_kv_cache_only=True)
 
 
 def _table_slots(table, req_idx, token_start, token_end, block_size=BLOCK_SIZE):
@@ -986,10 +1161,18 @@ def test_save_slot_mismatch_fails_fast():
     view.order = ["a"]
     view.req_blocks["a"] = [0]
     view.computed["a"] = 0
-    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2}))
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2})
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_step(sched))
     hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
     with pytest.raises(OmniPrefixCacheUnmatchError):
-        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
+        mgr.save_outputs(
+            hidden,
+            {},
+            num_tokens_unpadded=4,
+            num_tokens_padded=4,
+            write_layout=adapter.build_write_layout(view, num_scheduled_tokens=sched.num_scheduled_tokens),
+        )
 
 
 def test_materialize_rejects_out_of_snapshot_ids():
@@ -1009,10 +1192,13 @@ def test_materialize_unknown_step_id_fails_fast():
     mgr.discard_step(sid)
 
 
-def test_mm_hit_span_never_registered_serves_mirror_baseline():
+@pytest.mark.parametrize("deferred", [frozenset(), frozenset({"k"})])
+def test_mm_hit_span_never_registered_serves_mirror_baseline(monkeypatch, deferred):
     """A hit span slot on which a sparse mm key was never registered is
     legitimate absence — served from the mirror baseline, not a crash."""
-    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
+    alloc = PrefixBlockPool._alloc
+    monkeypatch.setattr(PrefixBlockPool, "_alloc", lambda self, dtype, feat: alloc(self, dtype, feat).fill_(7.0))
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=deferred)
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 5.0)})
     mgr.materialize(s1, ["a"])
@@ -1111,7 +1297,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = WriteTask.mark_host_ready
 
         def fail_copy(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected copy failure")
             return original(task)
 
@@ -1120,7 +1306,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = ctrl._scatter
 
         def fail_scatter(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected scatter failure")
             return original(task)
 
@@ -1131,12 +1317,9 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
             run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4), "c": ([2], 0, 4)})
         assert set(mgr._step_ctxs) == {preserved_sid}
         assert ctrl._staged_bytes == 0
-        tasks = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
-        assert len(tasks) == 3
-        for task in tasks:
-            expected = TaskState.WRITTEN if task.req_id == "a" else TaskState.FAILED
-            assert task.state is expected
-            assert task.done.is_set() and task.host_ready.is_set()
+        (task,) = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
+        assert task.state is TaskState.FAILED
+        assert task.done.is_set() and task.host_ready.is_set()
         assert all(
             holder == StagingBufferHolder.for_step(preserved_sid)
             for holders in ctrl._staging_pool._busy
@@ -1145,7 +1328,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         mgr.discard_step(preserved_sid)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(FakeSchedOut())
+            mgr.new_step_starts(PrefixCacheStep((), ()))
     finally:
         mgr.shutdown()
 
@@ -1172,19 +1355,17 @@ def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
         assert all(task.done.is_set() and task.host_ready.is_set() for task in tasks)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(FakeSchedOut())
+            mgr.new_step_starts(PrefixCacheStep((), ()))
     finally:
         mgr.shutdown()
 
 
-def test_per_request_staging_writes():
+def test_step_shares_one_staging_write():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
-    tp = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["p"])))
-    td = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["d"])))
-    assert tp is not None and td is not None
-    assert (tp.req_id, td.req_id) == ("p", "d")
-    assert mgr._join_next_step_tids == [tp.tid, td.tid]
+    (tid,) = mgr._request_tasks.tasks["p"]
+    assert mgr._request_tasks.tasks["d"] == {tid}
+    assert mgr._join_next_step_tids == [tid]
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))
@@ -1304,14 +1485,18 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     assert mgr._controller._tasks.get(tid) is None
 
 
-def test_blocked_save_is_released_by_pool_write_alone():
+@pytest.mark.parametrize("consume", ["materialize", "discard_step"])
+def test_blocked_save_is_released_by_pool_write_alone(consume):
     """All step contexts consumed, the only slot held by a pending write:
     the committer finishing that write must unblock the waiting save."""
     mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
     _hold_writes(mgr)
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
     tid = next(iter(mgr._request_tasks.tasks["a"]))
-    mgr.materialize(s0, ["a"])
+    if consume == "materialize":
+        mgr.materialize(s0, ["a"])
+    else:
+        mgr.discard_step(s0)
     slot = mgr._step_ctxs.get(s0)  # consumed
     assert slot is None
     assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}
@@ -1375,14 +1560,16 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         blocks = [0, 1] if reuse_blocks else [8, 9]
         sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
         mgr.materialize(sid, ["old"])
-        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["old"])))
 
-        mgr.new_step_starts(
+        step = adapter.translate_step(
             FakeSchedOut(
                 new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
                 num_scheduled={"a": 8, "b": 4},
             )
         )
+        mgr.new_step_starts(step)
         old_prefetch = dict(mgr._hit_prefetch["b"])
         # Complete the early reads before A publishes the prefix B actually hits.
         for future in old_prefetch.values():
@@ -1393,7 +1580,8 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         view.computed.update(a=0, b=8)
         hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
         mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
-        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout)
         outs = mgr.materialize(sid, ["a", "b"])
 
         assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])
@@ -1442,6 +1630,27 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+    assert not any(bool(counts.any()) for counts in mgr._pending_slot_refs.values())
+
+
+def test_pending_slot_counts_drain_with_duplicate_slots():
+    """The per-slot pending-ref counter is the fast-path gate for COW
+    preservation: a ref counts each of its slots, duplicates included, and
+    the fetch's unregister takes the same amount back."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    dup = torch.cat([slots, slots[:1]])
+    with mgr._state_lock:
+        src = mgr._slot_ref(dup, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [2, 1, 1, 1] and int(counts.sum()) == 5
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(dup))
+    assert not any(bool(c.any()) for c in mgr._pending_slot_refs.values())
+    mgr.shutdown()
 
 
 def test_done_fires_only_after_completion_record_published():
@@ -1687,10 +1896,10 @@ def _bare_controller(eager=True):
 def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
-    map_slots = mgr._map_slots
+    claim_slots = mgr._claim_slots
 
-    def fail_publish(slots, tid, keys):
-        map_slots(slots, tid, keys)
+    def fail_publish(slots, keys, spans):
+        claim_slots(slots, keys, spans)
         if "k" in keys:
             raise RuntimeError("partial publish")
 
@@ -1698,14 +1907,14 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch):
         # Rollback must release both the old and newly appended deferred rows.
         sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
         mgr.materialize(sid, ["a"])
-        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
+        monkeypatch.setattr(mgr, "_claim_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
             run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}
         assert mgr._controller._staged_bytes == 0
         assert all(not holders for holders in mgr._controller._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(FakeSchedOut())
+            mgr.new_step_starts(mgr._test_adapter.translate_step(FakeSchedOut()))
     finally:
         mgr.shutdown()
 
@@ -1837,12 +2046,21 @@ def test_scatter_host_ready_writes_only_staged_tasks():
     assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.ones(2, HIDDEN))
 
 
+def test_release_bytes_rejects_more_than_charged():
+    ctrl, _ = _bare_controller()
+    ctrl.reserve_bytes(64)
+    ctrl.release_bytes(64)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="releasing 1 GPU-budget bytes with only 0 charged"):
+        ctrl.release_bytes(1)
+    assert ctrl._staged_bytes == 0
+
+
 def test_budget_ticket_uncharges_once_per_clone():
     from vllm_omni.core.prefix_cache.controller import _BudgetTicket
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=100)
-    ctrl._reserve_bytes(100)
+    ctrl.reserve_bytes(100)
     a, _ = _bare_task(tid=1, budget=ticket)
     b, _ = _bare_task(tid=2, budget=ticket)
     ctrl._pin_budget(ticket, 1)
@@ -1862,7 +2080,7 @@ def test_fail_task_after_copy_does_not_uncharge_twice():
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=64)
-    ctrl._reserve_bytes(64)
+    ctrl.reserve_bytes(64)
     task, _ = _bare_task(tid=3, budget=ticket, queued=True)
     ctrl._tasks[task.tid] = task
     ctrl._pin_budget(ticket, 3)
@@ -1891,3 +2109,59 @@ def test_from_vllm_config_uses_batched_tokens():
         scheduler_config=SimpleNamespace(max_num_batched_tokens=None, max_model_len=4096),
     )
     assert cfg_fallback.staging_capacity_tokens == 4096
+
+
+def test_new_step_requires_step_and_never_falls_back_to_event_counts():
+    mgr, _ = make_manager()
+    event = PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, scheduled_tokens=6)
+    try:
+        with pytest.raises(TypeError, match="PrefixCacheStep"):
+            mgr.new_step_starts((event,))
+        mgr.new_step_starts(PrefixCacheStep((event,), ()))
+        assert mgr._cur_num_scheduled == {}
+    finally:
+        mgr.shutdown()
+
+
+def test_negative_hit_step_is_rejected_before_manager_prefetch(monkeypatch):
+    mgr, _ = make_manager()
+    prefetched = []
+    monkeypatch.setattr(mgr, "_prefetch_hit_spans", lambda: prefetched.append(True))
+    scheduler_output = FakeSchedOut(new_reqs=[FakeNewReq("r", 8, [[0, 1]])], num_scheduled={"r": -1})
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="negative scheduled token count for req r: -1"):
+            mgr.new_step_starts(PrefixCacheSchedulerAdapter().translate_step(scheduler_output))
+        assert not prefetched
+        assert mgr._hit_spans == {}
+        assert mgr._cur_num_scheduled == {}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("blocks", [[[0]], [[0], [1, 2]]])
+def test_short_hit_block_group_fails_at_register(monkeypatch, blocks):
+    mgr, _ = make_manager()
+    prefetched = []
+    monkeypatch.setattr(mgr, "_prefetch_hit_spans", lambda: prefetched.append(True))
+    adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(FakeSchedOut(new_reqs=[FakeNewReq("short", 8, blocks)], num_scheduled={"short": 1}))
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="has 1 group-0 blocks, need 2"):
+            mgr.new_step_starts(step)
+        assert mgr._hit_spans == {}
+        assert not prefetched
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("blocks", [[0, 1], [0, 1, 2]])
+def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
+    mgr, view = make_manager()
+    try:
+        mgr.materialize(run_step(mgr, view, {"a": ([0, 1], 0, 8)}), ["a"])
+        sid = run_step(mgr, view, {"b": (blocks + [3], 8, 1)}, new_hits={"b": 8}, finished=["a"])
+        result = mgr.materialize(sid, ["b"])
+        expected = expected_rows(view.slots_for("b", 0, 9))
+        assert torch.equal(result.hidden_states["b"], expected)
+    finally:
+        mgr.shutdown()

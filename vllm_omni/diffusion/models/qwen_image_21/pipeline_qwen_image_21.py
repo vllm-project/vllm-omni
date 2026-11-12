@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -27,7 +28,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -43,9 +50,11 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 )
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+    QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
 from vllm_omni.diffusion.models.utils import create_transformers_model
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -316,6 +325,7 @@ class QwenImage21Pipeline(
 
         The runner looks this up on the pipeline, not on the transformer.
         """
+        self._prompt_embedding_cache = OrderedDict()
         transformer = getattr(self, "transformer", None)
         release = getattr(transformer, "release_captured_graphs", None)
         if callable(release):
@@ -372,8 +382,14 @@ class QwenImage21Pipeline(
                 subfolder="text_encoder",
                 prefetch_list=qwen_subfolders,
                 local_files_only=local_files_only,
-            ).to(self.device)
+            )
+            # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+            self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(self.device)
         else:
+            if od_config.parallel_config.text_encoder_tp_size > 1:
+                raise ValueError(
+                    "Qwen-Image-2.1: --text-encoder-tp-size > 1 is not supported with a quantized text encoder"
+                )
             # Quantized path: build the HF model on meta, swap its nn.Linear
             # modules for vLLM quantizable linears, and stream the weights
             # through the pipeline loader (same integration as Z-Image). The
@@ -729,13 +745,52 @@ class QwenImage21Pipeline(
                 number of images that should be generated per prompt
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
-            prompt,
-            images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            prompt_name=prompt_name,
+        cacheable = (
+            len(prompt) == 1
+            and isinstance(prompt[0], str)
+            and not (images_per_prompt is not None and any(images_per_prompt))
+            and not torch.is_grad_enabled()
+            and not self.text_encoder.training
+            and not getattr(self.od_config, "lora_config", None)
+            and not offload_enabled(self.od_config)
         )
+        cache = getattr(self, "_prompt_embedding_cache", None)
+        if cache is None or not cacheable:
+            cache = self._prompt_embedding_cache = OrderedDict()
+        key = (
+            (
+                tuple(prompt),
+                max_sequence_length,
+                prompt_name,
+                id(self.text_encoder),
+                id(self.processor),
+                self.text_encoder.dtype,
+                str(self.device),
+                self.prompt_template_t2i,
+                self._drop_idx,
+            )
+            if cacheable
+            else None
+        )
+        encoded = cache.get(key) if cacheable else None
+        if encoded is None:
+            encoded = self._get_qwen_prompt_embeds(
+                prompt,
+                images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
+            size = sum(t.numel() * t.element_size() for t in encoded)
+            if cacheable and size <= 16 * 1024 * 1024:
+                cache[key] = encoded
+                while (
+                    len(cache) > 16
+                    or sum(t.numel() * t.element_size() for entry in cache.values() for t in entry) > 16 * 1024 * 1024
+                ):
+                    cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = encoded
 
         # Request-major expansion (A,A,B,B). ``repeat`` on the 2D masks would
         # prepend a dimension and reshape to A,B,A,B — wrong pairing with embeds.
@@ -1238,7 +1293,7 @@ class QwenImage21Pipeline(
         state.extra["width"] = width
         cache_enabled = getattr(self.transformer, "causal_condition", False)
         state.extra["kv_cache"] = (
-            [{} for _ in range(len(self.transformer.transformer_blocks))] if cache_enabled else None
+            QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
         )
 
         return state
@@ -1249,6 +1304,26 @@ class QwenImage21Pipeline(
             return "none"
         first = kv_cache[0]
         return "decode" if any("key" in branch for branch in first.values()) else "prefill"
+
+    def _release_idle_decode_graphs(self) -> None:
+        """Free finished requests' static prefix copies before the next prefill allocates."""
+        manager = getattr(self.transformer, "_decode_graph_manager", None)
+        if manager is None:
+            return
+        manager.release_idle_entries()
+
+    def release_step_request(self, state: "StepRequestState") -> None:
+        """Drop this request's prefix KV and geometry when the runner retires it.
+
+        The graph table is left alone here. The owner weakref dies with this
+        cache, and the next prefill drops that dead entry before it allocates.
+        """
+        extra = getattr(state, "extra", None)
+        if isinstance(extra, dict):
+            extra["kv_cache"] = None
+        release_geometry = getattr(self.transformer, "release_request_geometry", None)
+        if release_geometry is not None:
+            release_geometry()
 
     @staticmethod
     def _assemble_kv_cache(
@@ -1268,8 +1343,12 @@ class QwenImage21Pipeline(
             # Batched prefill: a fresh merged cache collects all requests' prefix
             # K/V; written entries are split back per request after the step.
             num_blocks = len(caches[0])
-            return [{} for _ in range(num_blocks)], True
+            return QwenImage21KVCache({} for _ in range(num_blocks)), True
         if phases == {"decode"}:
+            if len(caches) == 1:
+                # Keep the request owner stable across decode steps. Prefill
+                # still scatters and records the padded prefix lengths above.
+                return caches[0], False
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
             # cache entries carry per-request scale tensors alongside "key"/"value".
@@ -1282,7 +1361,7 @@ class QwenImage21Pipeline(
                     "lengths. denoise_step must sub-batch by prefill_prompt_seq_len first."
                 )
             num_blocks = len(caches[0])
-            merged = []
+            merged = QwenImage21KVCache()
             for block_idx in range(num_blocks):
                 branches: dict[str, dict[str, torch.Tensor]] = {}
                 branch_names = {branch for cache in caches for branch in cache[block_idx]}
@@ -1440,6 +1519,18 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        # ForwardContext carries one index for this entire transformer forward.
+        # Before allowing mixed steps, check every step-dependent consumer:
+        # Attention treats an unknown index as a skip with an active skip selector,
+        # and W4A8 Linear fallback requires a known index. A representative row's
+        # index could select the wrong precision for the other rows.
+        step_indices = {state.step_index for state in states}
+        if len(step_indices) != 1:
+            raise ValueError(f"Qwen-Image-2.1 requires a common denoise step per forward, got {sorted(step_indices)}.")
+        step_idx = states[0].step_index
+
+        if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
+            self._release_idle_decode_graphs()
 
         latents = input_batch.latents
         timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
@@ -1526,14 +1617,22 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        noise_pred = self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice=latents.size(1),
-        )
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        previous_step = forward_context.denoise_step_idx if forward_context is not None else None
+        try:
+            set_forward_context_denoise_step_idx(step_idx)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                input_batch.do_true_cfg,
+                input_batch.true_cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                input_batch.cfg_normalize,
+                output_slice=latents.size(1),
+            )
+        finally:
+            if forward_context is not None:
+                # Do not reactivate paged KV (or mask an error) while restoring.
+                forward_context.denoise_step_idx = previous_step
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a

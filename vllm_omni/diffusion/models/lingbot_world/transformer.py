@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -25,7 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_5D
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_4D, all_to_all_5D
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.layers.norm import LayerNorm
@@ -39,6 +40,8 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import Lease
 
 
 @dataclass
@@ -319,6 +322,7 @@ class LingBotSelfAttention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int,
         update_cache: bool = True,
+        _projection_lease: Lease | None = None,
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
@@ -372,11 +376,12 @@ class LingBotSelfAttention(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
             )
-            if query.is_cuda and query.shape[0] == 1:
-                # Use the same block-table FlashAttention entry point as the
-                # realtime path so direct replay is a numerical oracle for
-                # paged execution, rather than a comparison between two
-                # different attention kernels.
+            if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
+                # Package the visible window as a block table and call the
+                # same block-table entry point as the realtime path
+                # (FlashAttention on CUDA, the fused kernel on NPU) so direct
+                # replay is a numerical oracle for paged execution, rather
+                # than a comparison between two different attention kernels.
                 block_size = key.shape[1]
                 key_cache = visible_key[0].unflatten(0, (-1, block_size))
                 value_cache = visible_value[0].unflatten(0, (-1, block_size))
@@ -410,6 +415,11 @@ class LingBotSelfAttention(nn.Module):
             else:
                 output = self.attn(query, visible_key, visible_value)
         if self.ulysses_world_size > 1:
+            if _projection_lease is not None:
+                destination = _projection_lease.projection_input.unflatten(2, (40, 128))
+                all_to_all_4D(output, 1, 2, self.ulysses_group, _output_destination=destination)
+                _projection_lease.mark_projection_written()
+                return _projection_lease.finish()[0]
             output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
         return self.o(output.flatten(2, 3))
 
@@ -490,6 +500,8 @@ class LingBotCrossAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             role="cross",
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,
@@ -652,28 +664,41 @@ class LingBotAttentionBlock(nn.Module):
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
         normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
         normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
-        attention_output = self.self_attn(
-            normalized,
-            cache=self_cache,
-            current_start=current_start,
-            rotary_emb=rotary_emb,
-            sink_tokens=sink_tokens,
-            update_cache=update_cache,
-        )
-        hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
-        hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
+        if hasattr(self, "_lingbot_leased_post_attention"):
+            from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import acquire
 
-        camera_scale, camera_shift = (
-            self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
-        )
-        hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
-
-        attention_output, cross_cache = self.cross_attn(
-            self.norm3(hidden_states),
-            encoder_hidden_states,
-            cache=cross_cache,
-        )
-        hidden_states = hidden_states + attention_output
+            camera_scale, camera_shift = (
+                self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
+            )
+            post_context = acquire(self, hidden_states, gate_msa, camera_scale, camera_shift)
+        else:
+            camera_scale = camera_shift = None
+            post_context = nullcontext(None)
+        with post_context as lease:
+            projection_kwargs = {"_projection_lease": lease} if lease is not None else {}
+            attention_output = self.self_attn(
+                normalized,
+                cache=self_cache,
+                current_start=current_start,
+                rotary_emb=rotary_emb,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+                **projection_kwargs,
+            )
+            if lease is None:
+                hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
+                hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
+                if camera_scale is None:
+                    camera_scale, camera_shift = (
+                        self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
+                    )
+                hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+                cross_normalized = self.norm3(hidden_states)
+            else:
+                _, hidden_states, cross_normalized = lease.consume()
+            attention_output, cross_cache = self.cross_attn(cross_normalized, encoder_hidden_states, cache=cross_cache)
+            # This independent tensor is the final consumer; graph views never enter long-lived state.
+            hidden_states = hidden_states + attention_output
 
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
         normalized = self.norm2(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))

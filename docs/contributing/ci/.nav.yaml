@@ -5,3 +5,4 @@ nav:
   - failures.md
   - test_execution_guide.md
   - pr_merge_loop.md
+  - lessons.md

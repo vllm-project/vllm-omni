@@ -7,6 +7,7 @@ owners:
   - "@Bounty-hunter"
   - "@wtomin"
   - "@RuixiangMa"
+  - "@timzsu"
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**
@@ -57,6 +58,21 @@ cross-stage routing.
 
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
+
+HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
+generation configuration, tokenizer, and weight loading, including preprocessing.
+The shared-weight runtime pins remote loads to the commit resolved by AR;
+local checkpoint directories must remain immutable throughout the session.
+
+## Weight reloading
+
+Pipelines that support live RL weight updates opt in with
+`supports_weight_reload`. The shared loader integration records upstream vLLM
+reload metadata before external checkpoint loading and postprocessing. Their
+`load_weights` implementation must dispatch through parameter weight loaders so
+upstream WTE can track layer completion and preserve live storage. See the
+[weight-transfer contract](../../feature/weight_transfer.md#diffusion-loading-contract)
+for support limits and validation requirements.
 
 ## Exact conditioning projection reuse
 

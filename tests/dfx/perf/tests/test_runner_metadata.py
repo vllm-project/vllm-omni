@@ -147,12 +147,12 @@ def test_get_runtime_resource_label(monkeypatch):
     from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
     assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",
     )
     assert get_runtime_resource_label(refresh=True) == "910B"
@@ -318,6 +318,7 @@ def test_prefix_benchmark_uses_unified_runner(monkeypatch):
     def benchmark(**kwargs):
         calls.append(kwargs)
         assert "--name" not in kwargs["args"]
+        assert "--required-duplex-metrics" not in kwargs["args"]
         assert "--warmup-dataset-path" not in kwargs["args"]
         assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
         assert kwargs["num_warmups"] == 2
@@ -501,10 +502,8 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
 
 
 def test_is_hardware_nested_baseline():
-    from tests.dfx.conftest import (
-        _RUNTIME_DEVICE_ALIASES,
-        is_hardware_nested_baseline,
-    )
+    from tests.dfx.conftest import is_hardware_nested_baseline
+    from tests.helpers.hardware import _RUNTIME_DEVICE_ALIASES
     from tests.helpers.mark import get_hardware_mark_list
 
     hardware_marks = get_hardware_mark_list()
@@ -714,6 +713,91 @@ def test_num_warmups_preserves_explicit_zero():
     assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
 
 
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_duplex_c8_measures_and_judges_distinct_samples(monkeypatch, dataset):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    config_path = Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json")
+    config = json.loads(config_path.read_text())[0]
+    params = dict(config["benchmark_params"][0])
+    count = 60 if dataset == "omniinteract" else 120
+    prefix = "omniinteract" if dataset == "omniinteract" else "duplex_eval"
+    assert not params.get("duplex_performance_only")
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        assert "--num-warmups" not in kwargs["args"]
+        assert "--name" not in kwargs["args"]
+        return {"completed": kwargs["num_prompt"]}
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    assert len(calls) == 1
+    call = calls[0]
+    assert (call["flow"], call["num_prompt"], call["num_warmups"]) == (8, count, 8)
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.num_prompts == count and args.max_concurrency == 8
+    assert args.duplex_metric_aggregation == "response"
+    assert args.duplex_sample_pool_size is None
+    assert args.disable_shuffle and args.save_detailed
+    assert args.ready_check_timeout_sec == 0
+    assert getattr(args, f"{prefix}_evaluate")
+    assert getattr(args, f"{prefix}_judge_base_url") == ServerEndpoint.judge_base_url
+    assert getattr(args, f"{prefix}_judge_model") == params[f"{prefix}_judge_model"]
+    if dataset == "omniinteract":
+        assert args.omniinteract_subsets == params["omniinteract_subsets"].split()
+        assert args.omniinteract_require_response
+    else:
+        assert len(set(args.duplex_eval_ids)) == count
+        assert args.duplex_eval_split == params["duplex_eval_split"]
+        assert args.duplex_eval_mix == params["duplex_eval_mix"]
+
+
+def test_num_warmups_resolves_each_sweep_point():
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    assert [
+        _resolve_num_warmups({"num_warmups": [1, 8, 16]}, default=4, sweep_index=i, sweep_size=3) for i in range(3)
+    ] == [1, 8, 16]
+
+
+@pytest.mark.parametrize(
+    "warmups,message",
+    [
+        ([], "one value per sweep point"),
+        ([1, 8], "one value per sweep point"),
+        ([1, -1], "one value per sweep point"),
+        ([1, 8, False], "a non-negative integer or a list of them"),
+        ([1, 8, -1], "a non-negative integer or a list of them"),
+        ([1, 8, 1.5], "a non-negative integer or a list of them"),
+    ],
+)
+def test_num_warmups_rejects_invalid_sweep(warmups, message):
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    with pytest.raises(ValueError, match=message):
+        _resolve_num_warmups({"num_warmups": warmups}, default=16, sweep_index=0, sweep_size=3)
+
+
 def test_omniinteract_result_accepts_complete_artifacts():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -725,6 +809,208 @@ def test_omniinteract_result_accepts_complete_artifacts():
         {"dataset_name": "omniinteract"},
         4,
     )
+
+
+def _duplex_eval_result():
+    return {
+        "completed": 1,
+        "duplex_session_metrics": [
+            {"client_ttft_ms": {"count": 1, "mean": 100.0}, "client_ttfp_ms": {"count": 1, "mean": 200.0}}
+        ],
+        "omni_duplex_eval": {
+            "published": 1,
+            "published_with_unfinished_responses": 0,
+            "artifact_errors": [],
+            "accuracy": {"status": "completed", "total": 1, "evaluated": 1, "failed": 0, "skipped": 0},
+        },
+    }
+
+
+@pytest.mark.parametrize("evaluate", [False, True])
+def test_duplex_eval_result_accepts_complete_measurements(evaluate):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    if not evaluate:
+        del result["omni_duplex_eval"]["accuracy"]
+    assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": evaluate}, 1)
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("published", 0, "artifacts are incomplete"),
+        ("artifact_errors", ["disk full"], "publication failed"),
+        ("published_with_unfinished_responses", 1, "responses are unfinished"),
+        ("accuracy", None, "accuracy is missing"),
+        ("accuracy", {"status": "partial"}, "accuracy did not complete"),
+        ("accuracy", {"status": "completed", "total": 1, "evaluated": 0, "failed": 0, "skipped": 1}, "coverage"),
+    ],
+)
+def test_duplex_eval_result_rejects_incomplete_artifacts_or_judging(field, value, match):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    result["omni_duplex_eval"][field] = value
+    with pytest.raises(AssertionError, match=match):
+        assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": True}, 1)
+
+
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hardware, enforce_score_floors):
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.e2e.accuracy.omni_duplex_eval import validation
+
+    observed = []
+    monkeypatch.setattr(validation, "load_accuracy_config", lambda *args: {"baseline": {}})
+    monkeypatch.setattr(
+        validation,
+        "assert_accuracy_result",
+        lambda *args, **kwargs: observed.append(kwargs["enforce_score_floors"]),
+    )
+    result = _duplex_eval_result()
+    result["Hardware"] = hardware
+    run_benchmark.assert_result(
+        result,
+        {
+            "dataset_name": "omni-duplex-eval",
+            "duplex_eval_accuracy_config": "config.json",
+            "duplex_eval_score_floor_hardware": ["H100", "B200", "A3"],
+        },
+        1,
+    )
+    assert observed == [enforce_score_floors]
+
+
+@pytest.mark.parametrize("field", ["client_ttft_ms", "client_ttfp_ms"])
+@pytest.mark.parametrize("metric", [{}, {"count": 0, "mean": 0.0}, {"count": 1, "mean": float("nan")}])
+def test_duplex_eval_result_rejects_missing_measurements(field, metric):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    result["duplex_session_metrics"][0][field] = metric
+    with pytest.raises(AssertionError, match=f"no measured {field}"):
+        assert_result(result, {"dataset_name": "omni-duplex-eval"}, 1)
+
+
+@pytest.mark.parametrize("prefix", ["omniinteract", "duplex_eval"])
+@pytest.mark.parametrize("judge_url", [None, "http://127.0.0.1:8001"])
+def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 1}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    # The result contract is covered above; exercise actual CLI assembly here.
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    server = SimpleNamespace(host="localhost", port=8000, model="model", judge_base_url=judge_url)
+    case = {
+        "test_name": "test_duplex",
+        "params": {f"{prefix}_evaluate": True, "num_prompts": [1], "max_concurrency": [1]},
+    }
+    if judge_url is None:
+        with pytest.raises(ValueError, match="requires top-level judge_server_params"):
+            run_benchmark.test_performance_benchmark(server, case)
+        assert not calls
+    else:
+        run_benchmark.test_performance_benchmark(server, case)
+        args = calls[0]["args"]
+        assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
+
+
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
+    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    params = config["benchmark_params"][0]
+    assert len(params["duplex_eval_ids"]) == len(ids) == 66
+    assert set(params["duplex_eval_ids"]) == ids
+    assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
+    assert params["duplex_eval_evaluate"]
+    assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "openbmb/MiniCPM-o-4_5"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 66}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    assert len(calls) == 1
+    call = calls[0]
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.duplex_eval_ids == params["duplex_eval_ids"]
+    assert args.num_prompts == 66
+    assert args.max_concurrency == 8
+    assert args.save_detailed
+    assert args.duplex_eval_split == "all"
+    assert args.disable_shuffle
+    assert call["num_warmups"] == 0
+    assert args.ready_check_timeout_sec == 0
+    assert args.trust_remote_code
+    assert args.duplex_eval_evaluate
+    assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-accuracy-config" not in call["args"]
+    assert "--duplex-eval-score-floor-hardware" not in call["args"]
+    assert call["accuracy_baseline"] == (accuracy["baseline"] if enforce_score_floors else {})
+
+
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+@pytest.mark.parametrize(("devices", "judge_index", "expected"), [("4,7", "1", "7"), ("4,7,3", "2", "3")])
+def test_judge_uses_allocated_device(monkeypatch, device_env, devices, judge_index, expected):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setenv(device_env, devices)
+    monkeypatch.setattr(current_omni_platform, "device_control_env_var", device_env)
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs["env_dict"])
+
+        class Endpoint:
+            host = "localhost"
+            port = 8001
+
+        yield Endpoint()
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    with runner._start_judge_server({"model": "judge", "device_index": judge_index}):
+        pass
+    assert seen == [{device_env: expected}]
+    assert runner._resolve_judge_visible_devices("0", device_env) == "4"
+    assert __import__("os").environ[device_env] == devices
+    with pytest.raises(ValueError, match="outside"):
+        runner._resolve_judge_visible_devices(str(len(devices.split(","))), device_env)
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():
@@ -1034,3 +1320,215 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
+
+
+def _response_performance_result(dataset_name):
+    result = {"completed": 16, "duplex_metric_aggregation": "response"}
+    if dataset_name == "omni-duplex-eval":
+        result["omni_duplex_eval"] = {"published": 16, "artifact_errors": []}
+    else:
+        result["omniinteract"] = {"total": 16, "success": 16, "failed": 0, "artifacts_complete": True}
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        result[f"num_{metric}_samples"] = 16
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    return result
+
+
+@pytest.mark.parametrize("dataset_name", ["omni-duplex-eval", "omniinteract"])
+def test_response_performance_requires_measurements_not_accuracy(dataset_name):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = {"dataset_name": dataset_name, "duplex_performance_only": True}
+    result = _response_performance_result(dataset_name)
+    assert_result(result, params, 16)
+    result["num_audio_ttfp_samples"] = 0
+    with pytest.raises(AssertionError, match="No measured audio_ttfp"):
+        assert_result(result, params, 16)
+
+
+def _qwen3_joint_result(dataset):
+    from pathlib import Path
+
+    config = json.loads(Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json").read_text())[0]
+    params = config["benchmark_params"][0]
+    count = params["num_prompts"][0]
+    result = _response_performance_result(params["dataset_name"])
+    result["completed"] = count
+    for metric in params.get("required_duplex_metrics", []):
+        result[f"num_{metric}_samples"] = count
+        for stat in ("mean", "median", "p99"):
+            result[f"{stat}_{metric}"] = 0.1
+    if dataset == "omniinteract":
+        summary = result["omniinteract"]
+        summary.update(total=count, success=count)
+        summary["accuracy"] = {
+            "status": "ok",
+            "total": count,
+            "evaluated": count - 1,
+            "skipped": 1,
+            "failed": 0,
+            "summary": {"IA_QTF1": 0.5},
+        }
+    else:
+        summary = result["omni_duplex_eval"]
+        summary.update(published=count, published_with_unfinished_responses=0)
+        summary["accuracy"] = {
+            "status": "completed",
+            "total": count,
+            "evaluated": count,
+            "skipped": 0,
+            "failed": 0,
+            "pr": {"samples": count, "mean_all_success": 0.5},
+        }
+        result["duplex_session_metrics"] = [
+            {"client_ttft_ms": {"count": 1, "mean": 100.0}, "client_ttfp_ms": {"count": 1, "mean": 200.0}}
+            for _ in range(count)
+        ]
+    return result, params, count, summary["accuracy"]
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_requires_both_metrics_and_judging(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = float("nan")
+    with pytest.raises(AssertionError, match="Missing or invalid P95 audio_ttfp"):
+        assert_result(result, params, count)
+    result["p95_audio_ttfp_ms"] = 1.0
+    accuracy["status"] = "failed"
+    with pytest.raises(AssertionError, match="accuracy did not complete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+def test_qwen3_joint_run_rejects_incomplete_accuracy_coverage(dataset):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result(dataset)
+    accuracy["evaluated"] -= 1
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(
+    "field,message",
+    [("evaluated", "evaluated count is missing"), ("skipped", "accuracy coverage is incomplete")],
+)
+@pytest.mark.parametrize("value", [False, True])
+def test_qwen3_math_run_rejects_boolean_coverage_count(field, message, value):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omniinteract")
+    other_field = "skipped" if field == "evaluated" else "evaluated"
+    # Keep the total consistent so rejection must come from the type check.
+    accuracy.update({field: value, other_field: count - int(value)})
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["failed", "skipped"])
+def test_qwen3_correction_run_rejects_boolean_coverage_count(field):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy[field] = False
+    with pytest.raises(AssertionError, match="accuracy coverage is incomplete"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, -0.1, 1.1])
+def test_qwen3_correction_run_requires_valid_accuracy_score(value):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, accuracy = _qwen3_joint_result("omni_duplex_eval")
+    accuracy["pr"]["mean_all_success"] = value
+    with pytest.raises(AssertionError, match="correction score is invalid"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize(
+    "dataset_name, field, value, message",
+    [
+        ("omni-duplex-eval", None, None, "summary is missing"),
+        ("omniinteract", None, None, "summary is missing"),
+        ("omniinteract", "success", 15, "requests did not all succeed"),
+    ],
+)
+def test_response_performance_rejects_missing_artifacts(dataset_name, field, value, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _response_performance_result(dataset_name)
+    summary_key = dataset_name.replace("-", "_")
+    if field is None:
+        del result[summary_key]
+    else:
+        result[summary_key][field] = value
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("equals_syntax", [False, True])
+def test_qwen3_duplex_inline_deploy_updates_reach_runtime(monkeypatch, dataset, equals_syntax):
+    from pathlib import Path
+
+    from tests.dfx.conftest import _create_unique_server_params
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+    from vllm_omni.platforms import current_omni_platform
+
+    config = json.loads(Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json").read_text())[0]
+    source = Path(config["server_params"]["extra_cli_args"][1])
+    original = source.read_bytes()
+    # extra_cli_args overrides an earlier serve_args default, as in the CLI.
+    config["server_params"]["serve_args"] = {"deploy-config": "unused.yaml"}
+    if equals_syntax:
+        config["server_params"]["extra_cli_args"] = [f"--deploy-config={source}"]
+    row = _create_unique_server_params([config], Path("unused"))[0]
+    args = row[4]
+    deploy_path = Path(args[-1].split("=", 1)[1] if equals_syntax else args[-1])
+    try:
+        assert deploy_path != source.resolve()
+        assert source.read_bytes() == original
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        stages = merge_pipeline_deploy(QWEN3_OMNI_PIPELINE, deploy)
+        assert [stage.stage_id for stage in deploy.stages] == [0, 1, 2]
+        assert [stage.yaml_engine_args["enable_prefix_caching"] for stage in stages] == [True, False, False]
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert all(stage.yaml_engine_args["async_chunk"] for stage in stages)
+        assert all(stage.yaml_engine_args["session_mode"] == "duplex" for stage in stages)
+        assert all(stage.yaml_engine_args["duplex_max_sessions"] == 8 for stage in stages)
+        assert deploy.duplex_session.collect_stats is True
+        assert deploy.duplex_session.max_sessions == 8
+    finally:
+        deploy_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("metric", ["duplex_busy_rtf", "duplex_stall_ratio"])
+def test_joint_run_requires_measured_server_stats(dataset, metric):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result, params, count, _ = _qwen3_joint_result(dataset)
+    assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = 0
+    with pytest.raises(AssertionError, match=f"No measured {metric}"):
+        assert_result(result, params, count)
+    result[f"num_{metric}_samples"] = count
+    result[f"mean_{metric}"] = float("nan")
+    with pytest.raises(AssertionError, match=f"Missing or invalid mean {metric}"):
+        assert_result(result, params, count)
+
+
+@pytest.mark.parametrize("field", ["update", "delete"])
+def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
+    from tests.dfx.conftest import _create_unique_server_params
+
+    config = {"test_name": "missing-deploy", "server_params": {"model": "mock", field: {"async_chunk": True}}}
+    with pytest.raises(ValueError, match="requires stage_config_name or --deploy-config"):
+        _create_unique_server_params([config], tmp_path)

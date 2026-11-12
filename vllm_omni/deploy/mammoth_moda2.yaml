@@ -1,4 +1,10 @@
 # MammothModa2 AR→DiT (text-to-image).
+#
+# Stage-0 defaults to enforce_eager: true. PIECEWISE capture of MoE still
+# records both experts (#9764). FULL replay selects all-und / all-gen / blend
+# from the unpadded scheduled token ids (#9865). Keep this eager default
+# until that FULL path is remeasured. Opt into FULL via
+# mammoth_moda2_ar_graph_full.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2
@@ -22,6 +28,9 @@ stages:
     step_execution: false
     trust_remote_code: true
     enable_prefix_caching: false
+    # Optional online FP8 quantization for the DiT stage only; uncomment to
+    # enable. Keep the stage-0 AR model in BF16.
+    # quantization: fp8
     # Optional Cache-DiT acceleration for the DiT stage (~2x faster denoise,
     # training-free). Request mode only; uncomment to enable.
     # guidance=1.0 requests bypass it. Use mammoth_moda2_step.yaml for step mode.

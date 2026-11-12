@@ -253,8 +253,8 @@ class StableAudioCrossAttention(nn.Module):
     - Q projection: outputs inner_dim (full heads)
     - K/V projections: outputs kv_dim (reduced heads for GQA)
 
-    GQA is handled by manually expanding K/V heads to match Q heads
-    since the SDPA backend doesn't handle this automatically.
+    The shared backend receives native GQA heads and owns any required
+    K/V expansion or fused-kernel selection.
     """
 
     def __init__(
@@ -291,13 +291,17 @@ class StableAudioCrossAttention(nn.Module):
             ]
         )
 
-        # Use full heads for attention (KV will be expanded)
+        # Preserve native GQA geometry at the shared execution boundary.
         self.attn = Attention(
             num_heads=num_attention_heads,
             head_size=attention_head_dim,
             softmax_scale=1.0 / (attention_head_dim**0.5),
             causal=False,
-            num_kv_heads=num_attention_heads,  # After expansion
+            num_kv_heads=num_key_value_attention_heads,
+            computation="cross",
+            qkv_layout="BSND",
+            cross_parallel_layout="local_q_replicated_kv",
+            skip_sequence_parallel=True,
         )
 
     def forward(
@@ -319,13 +323,6 @@ class StableAudioCrossAttention(nn.Module):
         query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
         key = key.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
         value = value.view(batch_size, encoder_seq_len, self.num_kv_heads, self.head_dim)
-
-        # Expand K/V heads to match Q heads for GQA
-        # [B, S, kv_heads, D] -> [B, S, kv_heads, 1, D] -> [B, S, kv_heads, groups, D] -> [B, S, num_heads, D]
-        key = key.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
-        key = key.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
-        value = value.unsqueeze(3).expand(-1, -1, -1, self.num_kv_groups, -1)
-        value = value.reshape(batch_size, encoder_seq_len, self.num_heads, self.head_dim)
 
         # Compute attention
         hidden_states = self.attn(query, key, value)

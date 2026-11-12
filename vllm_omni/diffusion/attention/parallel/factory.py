@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.capabilities import CrossAttentionParallelLayout
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
 )
@@ -12,6 +13,7 @@ from vllm_omni.diffusion.attention.parallel.base import (
     NoParallelAttention,
     ParallelAttentionStrategy,
 )
+from vllm_omni.diffusion.attention.parallel.cross import ReplicatedQShardedKVParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses_allgather import (
@@ -32,6 +34,7 @@ def build_parallel_attention_strategy(
     gather_idx: int,
     use_sync: bool,
     causal: bool = False,
+    cross_parallel_layout: CrossAttentionParallelLayout | None = None,
 ) -> ParallelAttentionStrategy:
     """Select a parallel attention strategy based on current diffusion config.
 
@@ -40,6 +43,8 @@ def build_parallel_attention_strategy(
     - Parallel attention selection is handled here, based on distributed config
       and initialized process groups.
     """
+    if cross_parallel_layout is CrossAttentionParallelLayout.LOCAL_Q_REPLICATED_KV:
+        return NoParallelAttention()
     if not is_forward_context_available():
         return NoParallelAttention()
     cfg = get_forward_context().omni_diffusion_config
@@ -51,6 +56,18 @@ def build_parallel_attention_strategy(
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+    if ulysses_a2a_permute:
+        from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
+
+        validate_a2a_permute_config(
+            enforce_eager=getattr(cfg, "enforce_eager", False),
+            ulysses_mode=getattr(p, "ulysses_mode", "strict"),
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            allgather_degree=allgather_degree,
+            scatter_idx=scatter_idx,
+            gather_idx=gather_idx,
+        )
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:
@@ -68,6 +85,9 @@ def build_parallel_attention_strategy(
             f"SP is configured (ulysses={ulysses_degree}, ring={ring_degree}, "
             f"allgather={allgather_degree}), but the initialized SP world size is not greater than one."
         )
+
+    if cross_parallel_layout is not None:
+        return ReplicatedQShardedKVParallelAttention(sp_group)
 
     # AllGather-KV, optionally composed with Ulysses as an orthogonal 2D
     # sequence-parallel topology. K/V are gathered over the AllGather group

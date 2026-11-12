@@ -15,6 +15,7 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import PipelineConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
@@ -30,6 +31,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    weight_sharing: WeightSharingConfig | None = None
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -174,6 +176,9 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        # Optional: callers may build partial structured views (and older
+        # configs predate the field), exactly like strategy provenance above.
+        weight_sharing=getattr(structured_config, "weight_sharing", None),
     )
 
 
@@ -234,7 +239,9 @@ def resolve_omni_config(
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
+    default_config = StageConfigFactory.create_typed_default_diffusion(
+        model, normalized_overrides, deploy_config_path=deploy_config_path
+    )
 
     return OmniConfigResolution(
         config_path=deploy_config_path,

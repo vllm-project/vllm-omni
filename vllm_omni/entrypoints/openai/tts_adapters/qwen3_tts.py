@@ -19,6 +19,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
     ARTTSAdapter,
     PreparedRequest,
+    TextCommitmentCapabilities,
     TTSGenerationError,
     conditioning_cache_salt,
 )
@@ -155,6 +156,15 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    text_commitment = TextCommitmentCapabilities(
+        profile="zh_en_special_v1",
+        languages=frozenset({"Chinese", "English"}),
+        independent_segments=True,
+        preserves_cross_segment_context=False,
+        streaming_audio=True,
+        word_timestamps=True,
+        retry_failed_segments=False,
+    )
     supported_output_sample_rates = frozenset({8000, 24000})
 
     def __init__(self, ctx) -> None:
@@ -528,9 +538,11 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             )
 
             server = self.ctx.server
+            engine_client = self.ctx.engine_client
+            if engine_client is None or engine_client.model_config is None:
+                raise RuntimeError("Qwen3-TTS model configuration is unavailable")
             self._load_text_tokenizer()
-            assert self.ctx.engine_client is not None
-            hf_config = self.ctx.engine_client.model_config.hf_config
+            hf_config = engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
             text = (tts_params.get("text") or [""])[0]
