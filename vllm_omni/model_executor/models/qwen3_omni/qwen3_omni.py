@@ -4,7 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +62,11 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
+)
+from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
+    apply_speculative_payload,
+    finalize_speculative_payload,
+    prepare_speculative_payload,
 )
 from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_placeholder_token_ids
 from vllm_omni.model_executor.models.qwen3_omni.talker_sampler import mrv2_talker_sampler
@@ -273,7 +278,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                         raise ValueError("Qwen3-Omni DFlash requires non-empty dflash_config.target_layer_ids")
             self.use_async_omni_output = True
             self.supports_speculative_payload = True
-            self.supports_async_speculative_payload = True
             # MRv2: the Talker's prompt ends with the first generated token's
             # embedding; publishing it with the prefill output lets the first
             # Thinker->Talker chunk leave one decode step earlier.
@@ -410,13 +414,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
         if self.model_stage == "thinker":
-            capture_indices = self._thinker_capture_layer_indices()
-            start_layer = self.thinker.language_model.model.start_layer
-            incoming_captures = [f"{PP_CAPTURE_PREFIX}{index}" for index in capture_indices if index < start_layer]
-            if incoming_captures:
-                self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-                    ["hidden_states", "residual", *incoming_captures], thinker_config.text_config.hidden_size
-                )
+            self._configure_thinker_intermediate_tensors()
+
+    def _configure_thinker_intermediate_tensors(self) -> None:
+        capture_indices = self._thinker_capture_layer_indices()
+        start_layer = self.thinker.language_model.model.start_layer
+        incoming_captures = [f"{PP_CAPTURE_PREFIX}{index}" for index in capture_indices if index < start_layer]
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual", *incoming_captures], self.thinker_config.text_config.hidden_size
+            )
+            if incoming_captures
+            else self.thinker.make_empty_intermediate_tensors
+        )
 
     @staticmethod
     def _build_first_frame_decoder(
@@ -495,18 +505,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         if accept_layer is not None:
             indices.extend([0, int(accept_layer)])
 
-        # DFlash consumes a concatenation of target hidden states from the
-        # layers listed in its checkpoint.  The checkpoint ids refer to the
-        # post-layer states, while the Thinker capture API uses the same
-        # one-based convention as the upstream EAGLE interface.
-        spec_config = self.vllm_config.speculative_config
-        if spec_config is not None and spec_config.use_dflash():
-            draft_config = spec_config.draft_model_config
-            dflash_config = getattr(draft_config.hf_config, "dflash_config", {})
-            # Speculative payloads need input embeddings even without a
-            # Talker hidden-layer tap. Non-speculative runs keep no capture.
-            indices.append(0)
-            indices.extend(int(layer_id) + 1 for layer_id in dflash_config.get("target_layer_ids", ()))
+        # Upstream supplies capture IDs with its +1 convention through the
+        # SupportsEagle3 interface; preserve that order separately for drafting.
+        aux_layers = getattr(self, "_aux_hidden_state_layers", ())
+        if aux_layers:
+            indices.extend((0, *aux_layers))
 
         return sorted(set(indices))
 
@@ -598,27 +601,53 @@ class Qwen3OmniMoeForConditionalGeneration(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
 
-    @torch.inference_mode()
-    def materialize_thinker_token_embeddings(self, token_ids: Iterable[int]) -> torch.Tensor:
-        """Materialize embeddings for verifier-committed Thinker tokens."""
-        if self.model_stage != "thinker":
-            raise RuntimeError("Thinker token embeddings are only available on the Thinker stage")
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Qwen3's capture forward uses explicit layer IDs instead of the
+        # decoder's EagleModelMixin state. Upstream already converted IDs.
+        self._aux_hidden_state_layers = tuple(layers)
+        # Upstream configures aux layers after model construction. Refresh PP
+        # receive buffers now, so captures from earlier ranks are not omitted.
+        self._configure_thinker_intermediate_tensors()
 
-        # ``-1`` is the upstream sampler's empty-row sentinel.  It is not a
-        # Thinker token and must not be passed to PyTorch indexing, where it
-        # would otherwise alias the final embedding row.
-        ids = [int(token_id) for token_id in token_ids if int(token_id) >= 0]
-        device = self._module_device(self.thinker)
-        hidden_size = int(self.thinker_config.text_config.hidden_size)
-        if not ids:
-            embedding_weight = self.thinker.language_model.model.embed_tokens.weight
-            return embedding_weight.new_empty((0, hidden_size))
+    def extract_aux_hidden_states(self, model_output: OmniOutput) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        layers = (model_output.multimodal_outputs or {})["hidden_states"]["layers"]
+        return model_output.text_hidden_states, [layers[layer_id] for layer_id in self._aux_hidden_state_layers]
 
-        input_ids = torch.tensor(ids, dtype=torch.long, device=device).view(1, -1)
-        values = self.thinker.embed_input_ids(input_ids=input_ids)
-        if values.ndim == 3:
-            values = values[0]
-        return values.reshape(-1, values.shape[-1])
+    def prepare_speculative_multimodal_outputs(
+        self,
+        *,
+        multimodal_outputs: dict,
+        req_ids: Sequence[str],
+        speculative_request_ids: set[str],
+        invalid_req_indices: Sequence[int],
+        sampled_token_ids: torch.Tensor,
+        input_token_ids: torch.Tensor,
+        input_positions: torch.Tensor,
+        query_start_loc: Sequence[int],
+        prompt_lens: Sequence[int],
+        vocab_size: int,
+        consumed_input_span: bool,
+    ) -> dict:
+        return prepare_speculative_payload(
+            multimodal_outputs=multimodal_outputs,
+            req_ids=req_ids,
+            speculative_request_ids=speculative_request_ids,
+            invalid_req_indices=invalid_req_indices,
+            sampled_token_ids=sampled_token_ids,
+            input_token_ids=input_token_ids,
+            input_positions=input_positions,
+            query_start_loc=query_start_loc,
+            prompt_lens=prompt_lens,
+            vocab_size=vocab_size,
+            consumed_input_span=consumed_input_span,
+            embed_input_ids=lambda input_ids: self.thinker.embed_input_ids(input_ids=input_ids),
+        )
+
+    def finalize_multimodal_outputs_from_cpu_snapshot(self, multimodal_outputs: dict | None) -> dict | None:
+        return finalize_speculative_payload(multimodal_outputs)
+
+    def finalize_pooler_payload(self, payload: dict, *, multimodal_outputs: dict | None, idx: int) -> dict:
+        return apply_speculative_payload(payload, multimodal_outputs, idx)
 
     def embed_multimodal(self, **kwargs):
         """Delegate to active model for multimodal processing."""

@@ -53,14 +53,30 @@ def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids(dtype) 
     model.thinker = _Thinker()
     model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2))
 
-    rows = model.materialize_thinker_token_embeddings([4, -1, 1])
+    def prepare(samples):
+        mm = model.prepare_speculative_multimodal_outputs(
+            multimodal_outputs={},
+            req_ids=["r"],
+            speculative_request_ids={"r"},
+            invalid_req_indices=[],
+            sampled_token_ids=torch.tensor([samples]),
+            input_token_ids=torch.tensor([4]),
+            input_positions=torch.tensor([3]),
+            query_start_loc=[0, 1],
+            prompt_lens=[2],
+            vocab_size=6,
+            consumed_input_span=False,
+        )
+        mm = model.finalize_multimodal_outputs_from_cpu_snapshot(mm)
+        return model.finalize_pooler_payload({}, multimodal_outputs=mm, idx=0)["hidden_states.layer_0"]
+
+    rows = prepare([4, -1, 1])
     assert torch.equal(rows, torch.tensor([[8.0, 9.0], [2.0, 3.0]]))
-    for token_ids in ([], [-1]):
-        empty = model.materialize_thinker_token_embeddings(token_ids)
-        assert empty.shape == (0, 2)
-        assert empty.dtype == rows.dtype == dtype
-        assert empty.device == rows.device
-        assert torch.cat([empty, rows]).dtype == dtype
+    empty = prepare([-1, -1, -1])
+    assert empty.shape == (0, 2)
+    assert empty.dtype == rows.dtype == dtype
+    assert empty.device == rows.device
+    assert torch.cat([empty, rows]).dtype == dtype
 
 
 @pytest.mark.parametrize(

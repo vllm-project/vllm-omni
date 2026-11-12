@@ -230,6 +230,9 @@ def _make_combined(*, is_staged_run: bool, accept_hidden_layer=6) -> Qwen3OmniMo
     model.talker_config = SimpleNamespace(accept_hidden_layer=accept_hidden_layer)
     model.vllm_config = SimpleNamespace(speculative_config=None)
     model.thinker = _ThinkerStub()
+    model.thinker.language_model = SimpleNamespace(model=SimpleNamespace(start_layer=0))
+    model.thinker.make_empty_intermediate_tensors = lambda: None
+    model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=_HIDDEN))
     return model
 
 
@@ -262,6 +265,7 @@ def test_combined_forward_dflash_captures_embeddings_and_aux_layers(accept_layer
         use_dflash=lambda: True,
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
     )
+    model.set_aux_hidden_state_layers((2, 4))
     out = model.forward(**_forward_args())
     assert model.thinker.received["capture_layer_indices"] == expected
     assert model.thinker.received["return_hidden_states"] is True
@@ -282,3 +286,12 @@ def test_make_omni_output_accepts_capture_tuple():
     out = model.make_omni_output((_hidden_states(), captured))
     assert isinstance(out, OmniOutput)
     assert out.multimodal_outputs == captured
+
+
+def test_aux_hidden_state_order_follows_upstream_configuration():
+    model = _make_combined(is_staged_run=True)
+    model.set_aux_hidden_state_layers((4, 2))
+    layers = {0: torch.tensor([0.0]), 2: torch.tensor([2.0]), 4: torch.tensor([4.0]), 6: torch.tensor([6.0])}
+    assert model._thinker_capture_layer_indices() == [0, 2, 4, 6]
+    hidden, aux = model.extract_aux_hidden_states(OmniOutput(_hidden_states(), {"hidden_states": {"layers": layers}}))
+    assert [row.item() for row in aux] == [4.0, 2.0]

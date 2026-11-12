@@ -717,11 +717,11 @@ def test_async_omni_output_guard_requires_safe_conditions():
 def test_async_speculative_payload_requires_method_and_model_support(has_config, is_dflash, model_support, expected):
     runner = _make_async_output_runner()
     runner.speculative_config = SimpleNamespace(use_dflash=lambda: is_dflash) if has_config else None
-    runner.model.supports_async_speculative_payload = model_support
+    runner.model.supports_speculative_payload = model_support
     runner.model.use_async_omni_output = True
     runner.use_async_scheduling = True
     runner._should_accumulate_full_payload_output = lambda: False
-    assert runner._supports_async_speculative_payload() is expected
+    assert runner._supports_speculative_payload() is expected
     if has_config:
         assert runner._should_use_async_omni_output() is expected
 
@@ -2212,8 +2212,17 @@ def test_query_metadata_lifetime_matches_materialization_mode(snapshot):
         assert offsets.tolist() == [0, 9, 3]
 
 
-@pytest.mark.parametrize("dflash", [False, True])
-def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dflash):
+@pytest.mark.parametrize(
+    "dflash,materialization,partial_prefill",
+    [
+        (False, "deferred", False),
+        (True, "deferred", False),
+        (True, "full", False),
+        (True, "prefix_cache", False),
+        (True, "deferred", True),
+    ],
+)
+def test_output_survives_step_metadata_reuse(monkeypatch, mocker, dflash, materialization, partial_prefill):
     """Delay the real builder until offsets, batch IDs and counts are reused."""
 
     runner = _make_async_output_runner()
@@ -2229,10 +2238,26 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dfl
         )
         mocker.patch.object(runner, "_input_fits_in_drafter", return_value=False)
         mocker.patch.object(runner, "finalize_kv_connector")
-        runner.model.supports_async_speculative_payload = True
+        runner.model.supports_speculative_payload = True
         runner.model.embed_input_ids = lambda input_ids: input_ids.float().unsqueeze(-1)
         mocker.patch.object(runner, "_should_accumulate_full_payload_output", return_value=False)
         mocker.patch.object(runner, "_get_or_create_omni_payload_copy_stream", return_value=None)
+    if dflash:
+        from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
+            apply_speculative_payload,
+            finalize_speculative_payload,
+            prepare_speculative_payload,
+        )
+
+        runner.model.prepare_speculative_multimodal_outputs = lambda **kwargs: prepare_speculative_payload(
+            **kwargs, embed_input_ids=runner.model.embed_input_ids
+        )
+        runner.model.finalize_multimodal_outputs_from_cpu_snapshot = finalize_speculative_payload
+        runner.model.finalize_pooler_payload = apply_speculative_payload
+    if materialization == "full":
+        runner._async_chunk = runner.model_config.async_chunk = False
+    if materialization == "prefix_cache":
+        runner.omni_prefix_cache = object()
     runner.broadcast_pp_output = False
     runner.kv_connector_output = None
     runner.device = torch.device("cpu")
@@ -2240,6 +2265,10 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dfl
     runner.input_batch = mocker.Mock(
         spec=InputBatch, req_ids=["r1", "r2"], req_id_to_index={"r1": 0, "r2": 1}, vocab_size=10
     )
+    runner.input_batch.num_reqs = 2
+    runner.discard_request_mask = SimpleNamespace(np=np.array([partial_prefill, False]))
+    runner.positions = torch.tensor([2, 2, 3])
+    runner.requests = {rid: SimpleNamespace(prompt_token_ids=[1]) for rid in ["r1", "r2"]}
     runner.query_start_loc = object.__new__(CpuGpuBuffer)
     runner.query_start_loc.cpu = torch.tensor([0, 1, 3], dtype=torch.int32)
     runner._omni_num_scheduled_tokens_np = np.array([1, 2], dtype=np.int32)
@@ -2248,6 +2277,9 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dfl
     scheduler.total_num_scheduled_tokens = 3
     if dflash:
         scheduler.scheduled_spec_decode_tokens = {"r1": [1], "r2": [2]}
+    if partial_prefill:
+        scheduler.scheduled_spec_decode_tokens.pop("r1")
+        runner.requests["r1"].prompt_token_ids = [1, 2, 3, 4]
     hidden = torch.tensor([[1.0], [2.0], [3.0]])
     runner.input_ids = SimpleNamespace(gpu=torch.tensor([6, 7, 8]))
     captured = torch.tensor([[60.0], [70.0], [80.0]])
@@ -2281,28 +2313,26 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dfl
             {},
             runner.input_batch.req_ids.copy(),
             runner.input_batch.req_id_to_index.copy(),
-            [],
+            [0] if partial_prefill else [],
         ),
     )
-    mocker.patch.object(runner, "_run_post_sample_talker_mtp", return_value={})
+    mocker.patch.object(runner, "_run_post_sample_talker_mtp", side_effect=lambda **kw: kw["multimodal_outputs"])
     mocker.patch.object(runner, "eplb_step")
     mocker.patch.object(runner, "get_omni_connector_output", return_value=None)
     monkeypatch.setattr(gpu_ar_model_runner, "get_pp_group", lambda: mocker.Mock(world_size=1))
     mocker.patch.object(runner, "_resolve_pooler_payload_req_ids", side_effect=lambda ids: ("audio", ids))
     # Device copying is covered separately; this test isolates metadata lifetime.
-    mocker.patch.object(
-        runner,
-        "_snapshot_omni_output_tensors_for_async_output",
-        return_value=gpu_ar_model_runner._OmniOutputTensorSnapshot(
-            hidden_states=hidden, staged_hidden_states_cpu=None, multimodal_outputs={}
-        ),
-    )
+    mocker.patch.object(runner, "_get_or_create_omni_payload_copy_stream", return_value=None)
     async_output = mocker.Mock(
         spec=OmniAsyncGPUModelRunnerOutput,
         sampled_token_ids_cpu=sampler.sampled_token_ids,
         async_copy_ready_event=object(),
     )
-    constructor = mocker.patch.object(gpu_ar_model_runner, "OmniAsyncGPUModelRunnerOutput", return_value=async_output)
+    constructor = mocker.patch.object(
+        gpu_ar_model_runner,
+        "OmniAsyncGPUModelRunnerOutput" if materialization == "deferred" else "AsyncGPUModelRunnerOutput",
+        return_value=async_output,
+    )
     runner._omni_output_executor = None
 
     assert runner.sample_tokens(None) is async_output
@@ -2318,15 +2348,28 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker, dfl
         runner.requests.clear()
         # Both request state and routing may change while the output waits.
         runner._resolve_pooler_payload_req_ids.side_effect = AssertionError("read live routing")
-    output = constructor.call_args.kwargs["model_runner_output_builder"]()
+    output = (
+        constructor.call_args.kwargs["model_runner_output_builder"]()
+        if materialization == "deferred"
+        else constructor.call_args.kwargs["model_runner_output"]
+    )
 
     assert output.req_ids == ["r1", "r2"]
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
-    if dflash:
-        assert output.inter_stage_outputs[0]["ids.output"].tolist() == [6]
+    if dflash and materialization == "deferred":
+        if partial_prefill:
+            assert "ids.output" not in output.inter_stage_outputs[0]
+            torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
+        else:
+            assert output.inter_stage_outputs[0]["ids.output"].tolist() == [6]
         assert output.inter_stage_outputs[1]["ids.output"].tolist() == [7, 8]
         assert output.inter_stage_outputs[0]["hidden_states.layer_0"].flatten().tolist() == [60.0]
         assert output.inter_stage_outputs[1]["hidden_states.layer_0"].flatten().tolist() == [70.0, 80.0]
+    elif dflash:
+        assert output.inter_stage_outputs[0]["ids.output"].tolist() == [7]
+        assert output.inter_stage_outputs[1]["ids.output"].tolist() == [8, 9]
+        assert output.inter_stage_outputs[0]["hidden_states.layer_0"].flatten().tolist() == [7.0]
+        assert output.inter_stage_outputs[1]["hidden_states.layer_0"].flatten().tolist() == [8.0, 9.0]
     else:
         torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
         torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])

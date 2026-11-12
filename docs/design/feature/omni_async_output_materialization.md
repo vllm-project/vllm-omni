@@ -382,10 +382,28 @@ because they use the same Talker implementation.
     a `step_id`; the output builder later calls `materialize(sid, req_ids)` with
     the save-time request list, which may be a step late relative to the live
     `input_batch`. `_should_use_async_omni_output()` does not disable itself
-    when the cache is present. See
+    when the cache is present for non-speculative runs. The current Omni
+    prefix-cache admission check rejects speculative decoding because its
+    CPU token accounting is optimistic; the DFlash deferred-output guard
+    also retains a cache-presence fallback. See
     [Automatic Prefix Caching](prefix_caching.md#implementation).
 
 ## Compatibility and Fallbacks
+
+`async_chunk` and `async_scheduling` are independent controls.
+`async_chunk` selects incremental inter-stage delivery instead of sending a
+complete payload. `async_scheduling` overlaps scheduling with execution on an
+AR stage. Deferred Omni output materialization is a third, model-gated
+optimization: disabling it does not disable either control.
+
+For the MRv1 Qwen3-Omni Thinker with DFlash, the delivery paths are:
+
+| `async_chunk` | `async_scheduling` | Payload construction |
+| --- | --- | --- |
+| false | false | Inline committed-token embeddings, accumulated full payload |
+| false | true | Same inline construction from GPU sampled IDs; scheduling stays asynchronous |
+| true | false | Inline committed-token embeddings, incremental chunks |
+| true | true | Deferred consumed-input spans when the safety guards pass; otherwise inline committed-token embeddings |
 
 `GPUARModelRunner` uses the async output path only when all of the following
 runtime conditions hold:
@@ -395,21 +413,25 @@ runtime conditions hold:
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
-| Speculative decoding is disabled, or both the method and model payload contract are supported | `_supports_async_speculative_payload()` checks the method and `supports_async_speculative_payload` capability explicitly |
+| Speculative decoding is disabled, or both the method and model payload contract are supported | `_supports_speculative_payload()` checks the method and `supports_speculative_payload` capability explicitly |
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
 | Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns. Eager postprocess sees the scheduled slice (`None, None` combined tensors), not the prefix-cache-merged full prompt; it must only consume the tail |
 
 These checks are evaluated per stage on runners based on `GPUARModelRunner`.
-The Qwen3-Omni Thinker declares `supports_async_speculative_payload`.
+The Qwen3-Omni Thinker declares `supports_speculative_payload`.
 The current implementation explicitly permits DFlash; other speculative methods
 remain disabled until their payload contracts are validated. This path
 requires async chunks, prefix caching disabled, no model postprocess, and no
-full-payload accumulation. The execution thread snapshots target input IDs before
-drafting and pairs them with this forward's captured layer-0 embeddings. With
+full-payload accumulation. The model's
+`prepare_speculative_multimodal_outputs` hook runs after sampling and before
+drafting can overwrite target inputs. It stages target input IDs alongside
+this forward's captured layer-0 embeddings in `multimodal_outputs`. With
 k valid samples, the first k verifier input rows are the previous replacement
 or bonus plus k-1 accepted drafts. Rejected input rows are masked out before
-asynchronous copies; the background builder applies the same mask to IDs and
-embeddings. No extra embedding lookup or TP collective is performed. The newly
+asynchronous copies. These tensors use the existing Omni snapshot and its
+completion event; there is no separate speculative snapshot or event. After
+that event completes, `finalize_multimodal_outputs_from_cpu_snapshot` applies
+the same CPU mask to IDs and embeddings. No extra embedding lookup or TP collective is performed. The newly
 sampled replacement/bonus is handed off after its next target forward.
 
 These payloads set `meta.consumed_input_span` alongside `meta.decode_span`.
@@ -421,13 +443,35 @@ excluded from speech. The first consumed token completes the held prefill;
 subsequent rows use explicit decode ranges. This requires no request-local
 pending sample or send-offset state. Routing is captured on the execution
 thread; connector cancellation still controls which payloads can be sent.
-The synchronous speculative path retains committed-ID embedding lookup.
-It requires the model's `supports_speculative_payload` opt-in and
-`materialize_thinker_token_embeddings` adapter; other models retain their
-existing payload layout. There is no generic embedding fallback.
+The inline speculative path uses the same model opt-in and preparation hook.
+It reads the GPU sampled IDs directly, including when upstream async
+bookkeeping returns an empty CPU list and request history contains `-1`
+placeholders. The first prefill sample comes from the current verifier input
+only when its corrected linear position equals the prompt token count.
+This positional check preserves repeated token values without reading mutable
+request history or full-payload accumulation state. All requests share one
+padded embedding lookup/TP collective per step and one embedding CPU transfer;
+the CPU finalizer removes padding and sentinels with a matching row mask.
+Falling back to inline construction therefore keeps async scheduling enabled.
+
+The model's `finalize_pooler_payload` hook owns the speech wire contract:
+`ids.output`, layer-0 replacement, decode-span metadata, and removal of verifier
+hidden rows. Generic runner code does not interpret those fields. Other models
+retain their existing payload layout; there is no generic embedding fallback.
+Invalid sampled rows are excluded from speculative spans, but their routing is
+preserved: unfinished chunked-prefill requests still need to send prompt rows.
+
+The model implements `SupportsEagle3.set_aux_hidden_state_layers` to receive
+upstream's already converted capture IDs. Capture execution may sort the union
+with Talker layers, while `extract_aux_hidden_states` returns draft features in
+the original configured order. Non-speculative staged runs without an accept
+layer continue to request no captures and return a bare tensor.
 Qwen3-Omni auxiliary hidden-state speculation currently supports only DFlash
 with explicit, non-empty checkpoint `dflash_config.target_layer_ids`.
 EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load.
+DFlash-specific service validation currently covers MRv1 with an eager Thinker
+and TP=2 on CUDA; this is not evidence for MRv2, CUDA graph replay, or other
+hardware backends.
 
 When the output processor accumulates full payloads, `meta.decode_span`,
 `meta.consumed_input_span`, and `meta.committed_token_count` retain the latest
@@ -474,6 +518,10 @@ so Omni payload materialization remains synchronous.
   runner, where Omni output materialization remains synchronous.
 - `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py`: Thinker and
   Talker opt-in behavior.
+- `vllm_omni/model_executor/models/qwen3_omni/speculative_payload.py`:
+  Model-owned batched embedding preparation and CPU span finalization.
+- `tests/worker/test_speculative_payload.py`: Committed/consumed span alignment,
+  repeated-token seeding, real async bookkeeping, and mixed-prefill regressions.
 - `vllm_omni/deploy/qwen3_omni_moe.yaml`: Default Qwen3-Omni deployment
   settings.
 - `vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py`: Qwen3-TTS
