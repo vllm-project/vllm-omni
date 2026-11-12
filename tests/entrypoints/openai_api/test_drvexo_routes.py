@@ -221,7 +221,7 @@ async def test_sentence_stream_disconnect_closes_owned_engine_request(mocker):
 
 
 @pytest.mark.parametrize("path", ["/v1/drvexo/speech", "/v1/drvexo/speech/stream"])
-@pytest.mark.parametrize("invalid", ["Say <|im_start|> aloud.", "unroundtrippable"])
+@pytest.mark.parametrize("invalid", ["Say <|im_start|> aloud.", "unroundtrippable", "hello  world"])
 def test_invalid_speech_is_rejected_before_engine_and_valid_request_recovers(mocker, path, invalid):
     from unittest.mock import Mock
 
@@ -236,7 +236,7 @@ def test_invalid_speech_is_rejected_before_engine_and_valid_request_recovers(moc
 
     def decode(ids, **kwargs):
         text = "".join(chr(i - 100) for i in ids)
-        return "changed" if text == "unroundtrippable" else text
+        return "changed" if text == "unroundtrippable" else text.replace("  ", " ")
 
     tokenizer.encode.side_effect = encode
     tokenizer.decode.side_effect = decode
