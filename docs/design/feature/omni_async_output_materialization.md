@@ -452,7 +452,17 @@ bookkeeping returns an empty CPU list and request history contains `-1`
 placeholders. The first prefill sample comes from the current verifier input
 only when its corrected linear position equals the prompt token count.
 This positional check preserves repeated token values without reading mutable
-request history or full-payload accumulation state. All requests share one
+request history or full-payload accumulation state. For DFlash inline output,
+decode steps without scheduled drafts follow the same sampled-token convention:
+the first decode delivers its input token and newly sampled token; later steps
+deliver only their samples. Switching between zero-draft and verifier steps
+therefore does not leave an unsent tail or duplicate a previously sent token.
+Preparation considers non-discarded requests on every TP rank and masks samples
+on the GPU when the corrected linear input position is below the prompt length.
+The CPU finalizer preserves these prefill requests' original captured payloads.
+This introduces a batched lookup/TP collective on zero-draft inline steps too;
+it does not change non-speculative runs or the deferred consumed-input path.
+All requests share one
 padded embedding lookup/TP collective per step and one embedding CPU transfer;
 the CPU finalizer removes padding and sentinels with a matching row mask.
 Falling back to inline construction therefore keeps async scheduling enabled.

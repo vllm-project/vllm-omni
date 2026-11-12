@@ -28,19 +28,21 @@ def prepare_speculative_payload(
 
     Deferred chunks reuse consumed verifier rows (previous tail + accepted
     drafts). Inline output instead embeds the committed samples in one batch,
-    including the first prefill sample exactly once, by its input position.
+    including zero-draft decode steps and the first prefill sample exactly
+    once, by its input position. Prompt rows retain their ordinary payload.
     No request history is consulted: async bookkeeping may contain only -1s.
     """
     invalid = set(invalid_req_indices)
     spans = [
         (idx, int(query_start_loc[idx]), int(query_start_loc[idx + 1]))
         for idx, rid in enumerate(req_ids)
-        if idx not in invalid and rid in speculative_request_ids
+        if idx not in invalid and (not consumed_input_span or rid in speculative_request_ids)
     ]
     if not spans:
         return multimodal_outputs
 
     indices, offsets, token_parts, embedding_parts, mask_parts = [], [0], [], [], []
+    decode_parts = []
     layers = multimodal_outputs.get("hidden_states", {}).get("layers", {})
     if consumed_input_span:
         # One reduction and padded mask for the batch. Slice views below use
@@ -61,6 +63,9 @@ def prepare_speculative_payload(
             # Linear target positions are corrected on GPU under async
             # scheduling. MRoPE coordinates and optimistic CPU counts cannot
             # identify the first generated input position reliably.
+            is_decode = input_positions[start] >= prompt_lens[idx]
+            decode_parts.append(is_decode)
+            valid = valid & is_decode
             seed = (input_positions[start] == prompt_lens[idx]) & valid.any()
             first = torch.where(seed, input_token_ids[start], -1).reshape(1)
             ids = torch.cat((first, torch.where(valid, samples, -1)))
@@ -86,6 +91,7 @@ def prepare_speculative_payload(
             "embeddings": embeddings,
             "vocab_size": vocab_size,
             "consumed_input_span": consumed_input_span,
+            "decode_mask": torch.stack(decode_parts) if decode_parts else None,
         },
     }
 
@@ -98,8 +104,12 @@ def finalize_speculative_payload(multimodal_outputs: dict | None) -> dict | None
     # Inline fallback reaches this hook with GPU tensors; deferred output has
     # already copied both tensors using the ordinary Omni snapshot/event.
     ids, embeddings = stage["ids"].cpu(), stage["embeddings"].cpu()
+    decode_mask = stage["decode_mask"]
+    decode_rows = decode_mask.cpu().tolist() if decode_mask is not None else [True] * len(stage["indices"])
     payloads: list[dict | None] = [None] * (max(stage["indices"]) + 1)
-    for idx, start, end in zip(stage["indices"], stage["offsets"], stage["offsets"][1:]):
+    for idx, start, end, is_decode in zip(stage["indices"], stage["offsets"], stage["offsets"][1:], decode_rows):
+        if not is_decode:
+            continue
         tokens = ids[start:end]
         valid = (tokens >= 0) & (tokens < stage["vocab_size"])
         tokens = tokens[valid].tolist()
