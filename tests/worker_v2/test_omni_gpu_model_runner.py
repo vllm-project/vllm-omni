@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -515,7 +516,12 @@ def _aux_output(num_tokens):
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}
 
 
-def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("consumer", ["prefix_cache", "async_output"])
+def test_capture_aux_contract_preserves_payload(mode, consumer):
+    from vllm_omni.data_entry_keys import flatten_payload
+    from vllm_omni.worker_v2.omni_ar_model_runner import _async_copy_mm
+
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()
     runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
@@ -537,12 +543,15 @@ def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
     captured = {}
 
     def capture(_self, *, profile_only=False):
-        # The graph manager stores (hidden, leaves) in its aux buffers.
         assert runner.use_aux_hidden_state_outputs is True
-        hidden, leaves = runner.model.forward(4)
-        captured["hidden"], captured["leaves"] = hidden, leaves
-        assert [tuple(leaf.shape) for leaf in leaves] == [(4, 2), (4, 2)]
-        runner.model.forward(2)  # smaller capture, same structure
+        context = ForwardContext({}, {}, {}, cudagraph_runtime_mode=mode)
+        with override_forward_context(context):
+            captured["output"] = runner.model.forward(4)
+            # Native buffers consume leaves for NONE warmup and FULL capture;
+            # PIECEWISE retains its output and replays it directly.
+            if mode != CUDAGraphMode.PIECEWISE:
+                assert [tuple(leaf.shape) for leaf in captured["output"][1]] == [(4, 2), (4, 2)]
+            runner.model.forward(2)  # smaller capture, same structure
         return 1
 
     with patch.object(GPUModelRunner, "capture_model", capture):
@@ -550,11 +559,16 @@ def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
     assert runner.model.forward is original_forward and runner.use_aux_hidden_state_outputs is False
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.FULL: [full]}  # FULL kept
 
-    hidden, aux = runner._split_fullgraph_output((captured["hidden"], captured["leaves"]))
+    output = captured["output"]
+    hidden, aux = output if mode == CUDAGraphMode.PIECEWISE else runner._split_fullgraph_output(output)
+    if consumer == "async_output":
+        aux = _async_copy_mm(aux, 4, pin_memory=False)
+    flat = flatten_payload(aux)
     reference_hidden, reference_aux = _aux_output(4)
     assert torch.equal(hidden, reference_hidden)
     assert set(aux["hidden_states"]["layers"]) == {0, 24}
     assert torch.equal(aux["hidden_states"]["layers"][24], reference_aux["hidden_states"]["layers"][24])
+    assert torch.equal(flat["hidden_states.layer_0"], reference_aux["hidden_states"]["layers"][0])
 
 
 @pytest.mark.parametrize(
