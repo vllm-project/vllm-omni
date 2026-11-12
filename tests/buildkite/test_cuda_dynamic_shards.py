@@ -122,29 +122,29 @@ def test_source_filter_does_not_plan_cuda_shards() -> None:
     assert upload_pipeline_mod._shard_timings_prepared is False
 
 
-def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    matching, rejected = _write_marker_suite(suite)
+    monkeypatch.setattr(upload_pipeline_mod, "ROOT", suite)
     monkeypatch.delenv("MIRROR_HW", raising=False)
     monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
     document = yaml.safe_load(READY.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     assert all("automatic_shard" not in leaf for leaf in _leaves(rendered["steps"]))
     step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
-    command = "pytest -sv tests/ -m 'core_model and cpu'"
-    bins = fallback_file_bins(command, upload_pipeline_mod.ROOT)
+    bins = fallback_file_bins(SIMPLE_TEST_COMMAND, suite)
     assert bins is not None
-    expect = fallback_shard_count(len({path for group in bins for path in group}))
-    assert expect == MAX_AUTOMATIC_SHARDS
+    assert step["parallelism"] == fallback_shard_count(len(matching))
     assert step["parallelism"] == len(bins)
     assert step["label"] == "Simple Test · Shard %N/%t"
-    lists = _read_shard_lists("simple-test")
+    lists = _read_shard_lists("simple-test", suite)
     assert lists == bins
     listed = {path for group in lists for path in group}
-    assert "tests/buildkite/test_cuda_dynamic_shards.py" in listed
-    assert "tests/entrypoints/test_omni_sleep_mode.py" not in listed
+    assert listed == set(matching) | {rejected}
+    assert rejected in lists[0]
+    assert rejected not in {path for group in lists[1:] for path in group}
     for group in lists:
-        assert any(
-            _file_matches_marker(upload_pipeline_mod.ROOT / path, "core_model and cpu") is True for path in group
-        )
+        assert any(_file_matches_marker(suite / path, "core_model and cpu") is True for path in group)
     assert "automatic_shard" not in step
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
@@ -240,12 +240,44 @@ def test_shorter_file_time_still_stays_one_job(monkeypatch: pytest.MonkeyPatch, 
     assert "parallelism" not in step
 
 
-def _read_shard_lists(slug: str) -> list[list[str]]:
-    directory = Path("timings/file-shards") / slug
+def _read_shard_lists(slug: str, root: Path | None = None) -> list[list[str]]:
+    directory = (root or Path()) / "timings" / "file-shards" / slug
     lists = []
     for path in sorted(directory.glob("*.txt"), key=lambda item: int(item.stem)):
         lists.append([line for line in path.read_text(encoding="utf-8").splitlines() if line])
     return lists
+
+
+_CPU_MODULE = """\
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_cpu():
+    pass
+"""
+
+_CARDS_MODULE = """\
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
+def test_two():
+    pass
+"""
+
+SIMPLE_TEST_COMMAND = "pytest -sv tests/ -m 'core_model and cpu'"
+
+
+def _write_marker_suite(root: Path, cpu_files: int = 6) -> tuple[list[str], str]:
+    """A constructed ``tests/`` tree: ``cpu_files`` Simple Test matches, one ``cards_2`` miss."""
+    tests = root / "tests"
+    tests.mkdir(parents=True)
+    matching = [f"tests/test_cpu_{index}.py" for index in range(cpu_files)]
+    for name in matching:
+        (root / name).write_text(_CPU_MODULE, encoding="utf-8")
+    rejected = "tests/test_cards.py"
+    (root / rejected).write_text(_CARDS_MODULE, encoding="utf-8")
+    return matching, rejected
 
 
 def test_packed_bins_separate_slow_files() -> None:
@@ -745,28 +777,34 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    files = ["tests/buildkite/test_cuda_dynamic_shards.py", "tests/buildkite/test_upload_pipeline.py"]
+    suite = tmp_path / "suite"
+    matching, rejected = _write_marker_suite(suite)
+    timed = matching[:2]
     profile = tmp_path / "timings.json"
     profile.write_text(
         json.dumps(
             {
-                "steps": {"Simple Test": {name: 1000 for name in files}},
+                "steps": {"Simple Test": {name: 1000 for name in timed}},
                 "step_queues": {"Simple Test": "mithril-h100-pool"},
             }
         ),
         encoding="utf-8",
     )
+    monkeypatch.setattr(upload_pipeline_mod, "ROOT", suite)
     monkeypatch.setenv("VLLM_OMNI_SHARD_TIMINGS", str(profile))
     monkeypatch.delenv("MIRROR_HW", raising=False)
     document = yaml.safe_load(READY.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
-    bins = fallback_file_bins("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
-    assert bins is not None
-    assert step["parallelism"] == len(bins)
-    lists = _read_shard_lists("simple-test")
-    assert lists == bins
-    assert set(files) != {path for group in lists for path in group}
+    # Two 1000s files do not fit one 80% slice of Simple Test's 25 minutes, so using this
+    # profile would open 2 jobs. The queue does not match, so the plan is the no-profile fallback.
+    assert step["parallelism"] == fallback_shard_count(len(matching))
+    lists = _read_shard_lists("simple-test", suite)
+    assert lists == fallback_file_bins(SIMPLE_TEST_COMMAND, suite)
+    listed = {path for group in lists for path in group}
+    assert listed == set(matching) | {rejected}
+    assert rejected in lists[0]
+    assert set(timed) != listed
 
 
 def test_missing_profile_uses_the_smaller_of_job_cap_and_file_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -839,11 +877,14 @@ def test_cpu():
     slug = tmp_path / "timings" / "file-shards" / "entrypoint-test-with-l4-2-gpu"
     lists = [path.read_text(encoding="utf-8").split() for path in sorted(slug.glob("*.txt"))]
     assert sorted(path for group in lists for path in group) == [
+        "tests/test_cpu_a.py",
+        "tests/test_cpu_b.py",
         "tests/test_match_a.py",
         "tests/test_match_b.py",
     ]
+    assert lists[1] == ["tests/test_match_b.py"]
     for group in lists:
-        assert group
+        assert any(name.startswith("tests/test_match_") for name in group)
 
     (tests / "test_match_b.py").unlink()
     single = plan()

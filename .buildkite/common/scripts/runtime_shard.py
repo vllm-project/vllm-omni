@@ -15,10 +15,12 @@ in the bin. The packing is not the smallest possible.
 
 With no usable timings the uploader splits the files whose static marks
 satisfy the command's ``-m`` expression, using the smaller of
-``MAX_AUTOMATIC_SHARDS`` and that file count. A file that cannot be checked
-stays beside a file that does match, and it does not open a bin by itself.
-No confirmed match keeps the step at one job, so a shard cannot collect zero
-tests. One confirmed file stays one job. A finished session's unmeasured
+``MAX_AUTOMATIC_SHARDS`` and that file count. A file that cannot be checked,
+or whose static marks do not show a match, stays beside a file that does
+match, and it does not open a bin by itself. The real ``-m`` run still decides
+whether that file's tests run. No confirmed match keeps the step at one job,
+so a shard cannot collect zero tests. One confirmed file stays one job.
+A finished session's unmeasured
 files were filtered by ``-m`` and stay at weight 0; they are still placed in
 a bin so a new file keeps running.
 
@@ -326,10 +328,10 @@ def fallback_file_bins(command: str, root: Path) -> list[list[str]] | None:
 def _plan_fallback(per_command: list[tuple[str, list[str]]], root: Path) -> _Fallback:
     """Spread files that still have a test under each command's ``-m``.
 
-    Shard count follows confirmed matches only. A file that cannot be checked
-    is attached to the first bin, which already holds a confirmed match, so it
-    still runs and cannot be the only file in a bin. No confirmed match keeps
-    the step at one job.
+    Shard count follows confirmed matches only. Any other file is attached to
+    the first bin, which already holds a confirmed match. A static miss is not
+    trusted: the file still runs there, and the command's ``-m`` drops it if
+    the static read was right. No confirmed match keeps the step at one job.
     """
     matched_groups: list[list[str]] = []
     unknown: list[str] = []
@@ -341,10 +343,10 @@ def _plan_fallback(per_command: list[tuple[str, list[str]]], root: Path) -> _Fal
         matched: list[str] = []
         for name in discovered:
             verdict = _file_matches_marker(root / name, expression)
-            if verdict is None:
-                unknown.append(name)
-            elif verdict:
+            if verdict is True:
                 matched.append(name)
+            else:
+                unknown.append(name)
         if not matched:
             return _Fallback(None, 0, "no confirmed marker match")
         matched_groups.append(matched)
@@ -365,14 +367,12 @@ def _plan_fallback(per_command: list[tuple[str, list[str]]], root: Path) -> _Fal
 
 
 def _spread_groups(groups: list[list[str]], count: int) -> list[list[str]] | None:
-    """Deal each command's matches so every bin keeps a file for every command."""
-    if count <= 1:
-        return None
+    """Deal each command's matches so every bin keeps a file for every command.
+
+    ``count`` is already at least 2 and no larger than the smallest group.
+    """
     if len(groups) == 1:
-        unique = sorted(set(groups[0]))
-        if len(unique) < count:
-            return None
-        return _spread_files(unique, count)
+        return _spread_files(sorted(set(groups[0])), count)
     bins: list[list[str]] = [[] for _ in range(count)]
     assigned: dict[str, int] = {}
     for group in groups:
@@ -422,13 +422,7 @@ def _file_matches_marker(path: Path, expression: str) -> bool | None:
     items = _item_marks(path)
     if not items:
         return None
-    matched = False
-    for marks in items:
-        verdict = predicate(marks)
-        if verdict is None:
-            return None
-        matched = matched or verdict
-    return matched
+    return any(predicate(marks) for marks in items)
 
 
 def _marker_predicate(expression: str):
@@ -437,35 +431,42 @@ def _marker_predicate(expression: str):
     try:
         tree = ast.parse(expression, mode="eval")
     except SyntaxError:
+        tree = None
+    if tree is None or not _marker_supported(tree):
         _EXPR_CACHE[expression] = None
         return None
 
-    def evaluate(node: ast.AST, marks: set[str]) -> bool | None:
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body, marks)
-        if isinstance(node, ast.Name):
-            return node.id in marks
-        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
-            return node.value
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            inner = evaluate(node.operand, marks)
-            return None if inner is None else not inner
-        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
-            values = [evaluate(child, marks) for child in node.values]
-            if any(value is None for value in values):
-                return None
-            return all(values) if isinstance(node.op, ast.And) else any(values)
-        return None
-
-    if evaluate(tree, set()) is None:
-        _EXPR_CACHE[expression] = None
-        return None
-
-    def predicate(marks: set[str]) -> bool | None:
-        return evaluate(tree, marks)
+    def predicate(marks: set[str]) -> bool:
+        return _eval_marker(tree, marks)
 
     _EXPR_CACHE[expression] = predicate
     return predicate
+
+
+def _marker_supported(node: ast.AST) -> bool:
+    if isinstance(node, ast.Expression):
+        return _marker_supported(node.body)
+    if isinstance(node, ast.Name) or (isinstance(node, ast.Constant) and isinstance(node.value, bool)):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _marker_supported(node.operand)
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+        return all(_marker_supported(child) for child in node.values)
+    return False
+
+
+def _eval_marker(node: ast.AST, marks: set[str]) -> bool:
+    if isinstance(node, ast.Expression):
+        return _eval_marker(node.body, marks)
+    if isinstance(node, ast.Name):
+        return node.id in marks
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _eval_marker(node.operand, marks)
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+        return all(_eval_marker(child, marks) for child in node.values)
+    return any(_eval_marker(child, marks) for child in node.values)
 
 
 def _item_marks(path: Path) -> list[set[str]] | None:

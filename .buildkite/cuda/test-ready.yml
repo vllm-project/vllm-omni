@@ -10,8 +10,9 @@
 # startup, which are not in the file durations.
 # Each bin is a file list and that shard runs only those files. No usable
 # timings opens the smaller of MAX_AUTOMATIC_SHARDS and the files whose marks
-# satisfy the command's -m. A file that cannot be checked stays with a file
-# that does match, and it does not open a bin by itself. No confirmed match
+# satisfy the command's -m. A file that cannot be checked, or whose static
+# marks do not show a match, stays with a file that does match and does not
+# open a bin by itself. No confirmed match
 # keeps the step at one job, so a shard cannot collect zero tests. The YAML
 # does not set parallelism; the uploader does. Enrolled steps always write
 # `timings/jobs/*.json`. A one-node process (the entrypoint VRAM workaround)
