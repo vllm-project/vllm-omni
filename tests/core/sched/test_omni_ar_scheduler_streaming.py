@@ -688,9 +688,10 @@ def test_stage0_context_window_compacts_dropped_speech() -> None:
     assert getattr(session, "_minicpmo45_window_previous_len") == 3
 
 
+@pytest.mark.parametrize("mode", ["off", "basic"])
 @pytest.mark.parametrize("cleared_outputs", [False, True])
 @pytest.mark.parametrize("in_flight", [0, 1])
-def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight) -> None:
+def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight, mode) -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
@@ -703,15 +704,19 @@ def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_fl
     if cleared_outputs:
         # A stop without a queued append clears this before the next update.
         session._output_token_ids.clear()
-    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update = _make_minicpm_window_update(seq=2, mode=mode)
 
     sched._update_request_as_session(session, update)
 
     plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
     assert plan["completed_token_ids"] == [40]
     assert plan["completed_terminator_token_id"] == 99
-    assert plan["replacement_prompt_len"] == 9
-    assert plan["dropped_tokens"] == 9
+    if mode == "off":
+        assert "replace" not in plan
+        assert session.prompt_token_ids[:10] == [0] * 9 + [40]
+    else:
+        assert plan["replacement_prompt_len"] == 9
+        assert plan["dropped_tokens"] == 9
 
 
 def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session() -> None:
