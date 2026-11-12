@@ -31,12 +31,6 @@ _SCAN_ROOTS = ("vllm_omni/entrypoints", "vllm_omni/engine")
 # hardcoded rate. Grouped by reason; see each section.
 _ALLOWLIST = {
     # --- Generic-path fallbacks: removed by the standardization PRs ---
-    ("vllm_omni/entrypoints/openai/serving_chat.py", "sample_rate = 24000"),
-    ("vllm_omni/entrypoints/openai/serving_chat.py", "sample_rate = 48000"),
-    (
-        "vllm_omni/entrypoints/openai/serving_audio_generate.py",
-        "default_sr = 44100 # Default sample rate for Stable Audio",
-    ),
     ("vllm_omni/entrypoints/openai/video_api_utils.py", "DEFAULT_AUDIO_SAMPLE_RATE = 24_000"),
     (
         "vllm_omni/entrypoints/openai/video_stream_base.py",

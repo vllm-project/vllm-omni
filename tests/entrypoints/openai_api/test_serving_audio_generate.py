@@ -25,6 +25,7 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import (
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.sample_rate import DeprecatedSampleRateKeyWarning
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -524,7 +525,10 @@ class TestAudioResponseFormat:
         assert audio_obj.sample_rate == 44100  # Stable Audio default
 
     @pytest.mark.asyncio
-    async def test_audio_sample_rate_metadata_takes_precedence_over_legacy_sr(self):
+    async def test_canonical_sr_takes_precedence_over_legacy_metadata_key(self):
+        # The payload's canonical "sr" is authoritative; the legacy
+        # "audio_sample_rate" spelling only resolves (with a deprecation
+        # warning) when the canonical key is absent.
         engine = MagicMock()
         engine.errored = False
         engine.model_type = "LTX2TextToAudioPipeline"
@@ -549,6 +553,38 @@ class TestAudioResponseFormat:
         server.create_audio = MagicMock(return_value=response)
 
         await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="test"))
+
+        assert server.create_audio.call_args[0][0].sample_rate == 44100
+
+    @pytest.mark.asyncio
+    async def test_legacy_audio_sample_rate_key_resolves_with_warning(self):
+        # Diffusion formatters still surface the rate under the legacy
+        # "audio_sample_rate" spelling (until the formatter PR normalizes
+        # it); the serving layer resolves it instead of defaulting.
+        engine = MagicMock()
+        engine.errored = False
+        engine.model_type = "LTX2TextToAudioPipeline"
+        engine.default_sampling_params_list = [{}]
+
+        async def generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="ltx-t2a",
+                images=[],
+                prompt=None,
+                metrics={},
+                multimodal_output={
+                    "audio": torch.zeros(16),
+                    "audio_sample_rate": 48000,
+                },
+            )
+
+        engine.generate = MagicMock(side_effect=generate)
+        server = _make_server(engine)
+        response = MagicMock(audio_data=b"audio", media_type="audio/wav")
+        server.create_audio = MagicMock(return_value=response)
+
+        with pytest.warns(DeprecatedSampleRateKeyWarning):
+            await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="test"))
 
         assert server.create_audio.call_args[0][0].sample_rate == 48000
 
