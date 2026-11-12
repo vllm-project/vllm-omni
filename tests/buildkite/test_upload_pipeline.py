@@ -878,6 +878,30 @@ def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPa
     )
 
 
+def test_omnivoice_step_audio_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · OmniVoice · Step-Audio · L4"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    assert matching_steps[0]["source_file_dependencies"] == [
+        "tts_omnivoice_offline_parity_weekly",
+        "tts_omnivoice_online_weekly",
+        "tts_step_audio2_weekly",
+    ]
+
+    group = next(step for step in doc["steps"] if "OmniVoice and Step-Audio Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for changed_file in (
+        "tests/e2e/online_serving/test_omnivoice_parity.py",
+        "tests/e2e/offline_inference/test_step_audio2_expansion.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 @pytest.mark.parametrize(
     ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
     [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
