@@ -621,7 +621,7 @@ Model accuracy and performance jobs compose dependencies by responsibility:
 | Layer | Registry definitions | Selection responsibility |
 | --- | --- | --- |
 | Model | Model anchors and each job's scripts | Model code, deployment profiles, datasets, and the test or benchmark entrypoint. |
-| Shared runtime | `runtime_common`, `omni_runtime`, `diffusion_runtime` anchors | Stage lifecycle, serving and data contracts; AR scheduling and runners; or shared diffusion execution. Shared diffusion prefixes exclude `diffusion/models/` so editing one model does not select every model. |
+| Shared runtime | `runtime_common`, `omni_runtime`, `diffusion_runtime` anchors | Stage lifecycle, serving and data contracts; AR scheduling and runners; or shared diffusion execution. Include package entrypoints and their eager imports when replacing directory prefixes. Shared diffusion prefixes exclude `diffusion/models/` so editing one model does not select every model. |
 | Measurement | `serving_benchmark`, `accuracy_tests`, `perf_tests`, and speech data anchors | Select the jobs that consume the changed benchmark client, evaluator, or dataset. HunyuanImage3 performance uses the separate `benchmarks/diffusion/` client. |
 | Test infrastructure | `test_infrastructure` anchor | Shared fixtures, hardware marks, runtime helpers, and test configuration. |
 | Platform environment | `ci_cuda`, `ci_npu`, `ci_rocm` keys, each including `ci_common` | Build inputs, platform dispatch, CI images, requirements, and the corresponding nightly YAML. |
@@ -636,6 +636,18 @@ Qwen3-Omni and Qwen3-TTS NPU evaluations retain their V1 selection. ROCm speech
 evaluations retain V1. Diffusion jobs do not inherit AR worker capabilities.
 The same shared runtime anchors protect the existing CUDA model E2E jobs on
 READY/MERGE without adding accuracy or performance tooling to those jobs.
+The CUDA weekly L4 invalid-parameter suite composes both runtime anchors,
+test infrastructure and the worker capabilities used by its deployments:
+Qwen3-TTS uses MRv2, Higgs Audio V3 and Audex TTA use V1, and Stable Audio uses
+diffusion. Its model-specific speech adapters remain direct dependencies.
+
+CI routing metadata (`ci_source_file_dependencies.yml`, `upload_pipeline.py`,
+and `ci_conditions.py`) is validated by CPU routing tests and is excluded from
+`ci_common`. A registry edit accompanying model code retains that model's
+evaluation selection instead of selecting every platform's model evaluations.
+AMD's existing routing-only fallback still keeps the full admitted nightly for
+registry-only or uploader-only changes; a matching model change disables that
+fallback and narrows selection to the model's consumers.
 
 These are direct dependencies. For example, a diff containing both
 `tests/helpers/runtime.py` and Qwen3 model code retains the other models'
@@ -651,7 +663,10 @@ Use `vllm_omni/benchmarks/duplex/`, not a suffix such as `duplex/**`.
 Routing regressions in `tests/buildkite/test_model_source_dependencies.py` and
 `test_qwen3_omni_source_dependencies.py` discover families from the live pipelines,
 cover mixed-model diffs, and check platform/runner isolation without pinning job
-counts.
+counts. Both modules use `tests/buildkite/source_dependency_helpers.py` to load
+pipelines and apply the production platform filters, including the AMD wrapper.
+Package-entry regressions exercise function, performance, coverage and weekly
+consumers affected by shared dependency extraction.
 
 ### YAML examples
 

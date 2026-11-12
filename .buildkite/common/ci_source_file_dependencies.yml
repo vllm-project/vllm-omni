@@ -31,10 +31,13 @@ x-runtime-common: &runtime_common
   - vllm_omni/engine/stage_pool.py
   - vllm_omni/engine/stage_runtime.py
   - vllm_omni/entrypoints/stage_utils.py
+  - vllm_omni/distributed/omni_connectors/__init__.py
   - vllm_omni/distributed/omni_connectors/adapter.py
   - vllm_omni/distributed/omni_connectors/factory.py
+  - vllm_omni/distributed/omni_connectors/connectors/__init__.py
   - vllm_omni/distributed/omni_connectors/connectors/base.py
   - vllm_omni/distributed/omni_connectors/connectors/shm_connector.py
+  - vllm_omni/distributed/omni_connectors/connectors/yuanrong_connector.py
   - vllm_omni/distributed/omni_connectors/model_runner/
   - vllm_omni/distributed/omni_connectors/transfer_adapter/
   - vllm_omni/distributed/omni_connectors/utils/
@@ -102,6 +105,7 @@ x-runtime-common: &runtime_common
 x-omni-runtime: &omni_runtime
   - *runtime_common
   - vllm_omni/request.py
+  - vllm_omni/core/sched/__init__.py
   - vllm_omni/core/sched/fast_allocate.py
   - vllm_omni/core/sched/omni_ar_scheduler.py
   - vllm_omni/core/sched/omni_generation_scheduler.py
@@ -134,6 +138,7 @@ x-omni-runtime: &omni_runtime
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/__init__.py
   - vllm_omni/entrypoints/openai/tts_adapters/base.py
+  - vllm_omni/entrypoints/openai/tts_adapters/capabilities.py
   - vllm_omni/engine/cuda_mps.py
 
 # Shared diffusion execution only. Keep model trees out to preserve model isolation.
@@ -222,14 +227,12 @@ x-speech-benchmark-data: &speech_benchmark_data
   - vllm_omni/benchmarks/data_modules/ttsd_dataset.py
 
 # Build inputs common to the three platform environments.
+# Routing metadata is validated by CPU tests, not a dependency of every model.
 x-ci-common: &ci_common
   - pyproject.toml
   - setup.py
   - requirements/common.txt
   - .buildkite/common/ci_mirror_hardwares.yml
-  - .buildkite/common/ci_source_file_dependencies.yml
-  - .buildkite/common/scripts/upload_pipeline.py
-  - .buildkite/common/scripts/ci_conditions.py
 
 x-qwen3-tts: &qwen3_tts
   - vllm_omni/entrypoints/openai/tts_adapters/qwen3_tts.py
@@ -697,7 +700,7 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
 
   # Select V2 only for jobs whose deployment uses it; NPU also needs its adapter.
-  omni_v2_runtime:
+  omni_v2_runtime: &omni_v2_runtime
     - vllm_omni/core/prefix_cache/
     - vllm_omni/worker_v2/__init__.py
     - vllm_omni/worker_v2/delivery.py
@@ -1390,7 +1393,7 @@ source_file_dependencies:
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json
 
-  # Invalid-param jobs: model business code only, plus the reliability scripts.
+  # Invalid-param jobs: model business code and reliability scripts.
   reliability_invalid_param_h100:
     - *qwen3_omni
     - *minicpmo_4_5
@@ -1399,6 +1402,14 @@ source_file_dependencies:
     - tests/dfx/reliability/invalid_param_test/
 
   reliability_invalid_param_l4:
+    # Qwen3-TTS uses MRv2; Higgs/Audex use V1; Stable Audio uses diffusion.
+    - *test_infrastructure
+    - *omni_runtime
+    - *gpu_v1_workers
+    - *omni_v2_runtime
+    - *diffusion_runtime
     - *qwen3_tts
     - *stable_audio
+    - vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v3.py
+    - vllm_omni/entrypoints/openai/tts_adapters/audex_tta.py
     - tests/dfx/reliability/invalid_param_test/

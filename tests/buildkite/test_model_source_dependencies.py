@@ -4,67 +4,35 @@
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 
 import pytest
-import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / ".buildkite/common/scripts"))
-sys.path.insert(0, str(ROOT / ".buildkite/amd/scripts"))
-
-from filter_test_suite import filter_amd_nightly_suite  # noqa: E402
-from upload_pipeline import filter_pipeline_by_source_dependencies  # noqa: E402
+from tests.buildkite.source_dependency_helpers import (
+    PIPELINES,
+    evaluation_families,
+    load_pipeline,
+)
+from tests.buildkite.source_dependency_helpers import dependency_keys as _keys
+from tests.buildkite.source_dependency_helpers import leaf_steps as _leaves
+from tests.buildkite.source_dependency_helpers import nightly_pipeline_fixture as nightly_pipeline_fixture
+from tests.buildkite.source_dependency_helpers import selected_labels as _selected
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PIPELINES = {
-    "cuda": Path(".buildkite/cuda/test-nightly.yml"),
-    "npu": Path(".buildkite/npu/test-npu-nightly.yml"),
-    "rocm": Path(".buildkite/amd/test-amd-nightly.yml"),
-}
 QWEN = "vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py"
+MINICPM = "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni.py"
 WAN = "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"
 
 
-def _leaves(doc):
-    for step in doc.get("steps", []):
-        if not isinstance(step, dict):
-            continue
-        if "steps" in step:
-            yield from _leaves(step)
-        else:
-            yield step
-
-
-def _keys(step):
-    value = step.get("source_file_dependencies", [])
-    return [value] if isinstance(value, str) else value
-
-
-def _selected(path, doc, changes):
-    if path == PIPELINES["rocm"] and changes is not None:
-        filtered = filter_amd_nightly_suite(doc, changes, pipeline_path=path)
-    else:
-        filtered = filter_pipeline_by_source_dependencies(doc, changes, pipeline_path=path)
-    leaves = list(_leaves(filtered))
-    assert all("source_file_dependencies" not in step for step in leaves)
-    return {step["label"] for step in leaves}
-
-
-@pytest.fixture(scope="module", params=PIPELINES)
-def nightly(request):
-    platform = request.param
-    path = PIPELINES[platform]
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    families: dict[str, set[str]] = {}
-    for step in _leaves(doc):
-        for key in _keys(step):
-            if not key.startswith("omni_qwen3_omni_") and (
-                key.endswith(("_accuracy", "_perf")) or key == "omni_duplex_eval_ci"
-            ):
-                families.setdefault(key, set()).add(step["label"])
+@pytest.fixture(scope="module")
+def nightly(nightly_pipeline):
+    """Discover non-Qwen3-Omni evaluations from the shared live inventory."""
+    platform, path, doc = nightly_pipeline
+    families = {
+        key: labels for key, labels in evaluation_families(doc).items() if not key.startswith("omni_qwen3_omni_")
+    }
     # Assert the intended model families exist, without snapshotting job counts.
     for prefix in (
         "omni_minicpmo_4_5_",
@@ -169,7 +137,8 @@ def test_serving_benchmark_changes_keep_consumers(nightly, changed_file):
         for step in _leaves(doc)
         if step["label"] in labels
         and (
-            "tests/dfx/perf/scripts/run_benchmark.py" in "\n".join(step.get("commands", []))
+            "tests/dfx/perf/scripts/run_benchmark.py"
+            in json.dumps({"commands": step.get("commands", []), "env": step.get("env", {})})
             or "omni_minicpmo_4_5_accuracy" in _keys(step)
         )
     }
@@ -200,24 +169,36 @@ def test_tts_adapters_keep_model_isolation(nightly):
 
 
 @pytest.mark.parametrize(
-    "changed_file,platform",
+    "changed_file,platforms",
     [
-        ("docker/Dockerfile.ci", "cuda"),
-        ("requirements/cuda.txt", "cuda"),
-        (".buildkite/cuda/scripts/build-ci-image.sh", "cuda"),
-        ("docker/Dockerfile.npu.ci", "npu"),
-        ("requirements/npu.txt", "npu"),
-        (".buildkite/npu/scripts/build-npu-image.sh", "npu"),
-        ("docker/Dockerfile.rocm", "rocm"),
-        ("requirements/rocm.txt", "rocm"),
-        (".buildkite/amd/scripts/build-ci-image.sh", "rocm"),
+        ("vllm_omni/platforms/cuda/platform.py", {"cuda"}),
+        ("docker/Dockerfile.ci", {"cuda"}),
+        ("requirements/cuda.txt", {"cuda"}),
+        (".buildkite/cuda/scripts/build-ci-image.sh", {"cuda"}),
+        (".buildkite/cuda/test-nightly.yml", {"cuda"}),
+        ("vllm_omni/platforms/npu/attention/static_shape_decode.py", {"npu"}),
+        ("vllm_omni/platforms/npu/platform.py", {"npu"}),
+        ("docker/Dockerfile.npu.ci", {"npu"}),
+        ("requirements/npu.txt", {"npu"}),
+        (".buildkite/npu/scripts/build-npu-image.sh", {"npu"}),
+        (".buildkite/npu/test-npu-nightly.yml", {"npu"}),
+        ("vllm_omni/platforms/rocm/platform.py", {"rocm"}),
+        ("docker/Dockerfile.rocm", {"rocm"}),
+        ("requirements/rocm.txt", {"rocm"}),
+        (".buildkite/amd/scripts/build-ci-image.sh", {"rocm"}),
+        (".buildkite/amd/test-amd-nightly.yml", {"rocm"}),
+        (".buildkite/amd/test-template-amd-omni.j2", {"rocm"}),
     ],
 )
-def test_platform_changes_select_only_their_platform(nightly, changed_file, platform):
-    actual_platform, path, doc, families = nightly
-    labels = _labels(families)
-    selected = _selected(path, doc, [changed_file, QWEN]) & labels
-    assert selected == (labels if platform == actual_platform else set())
+@pytest.mark.parametrize("qwen_family", [False, True], ids=["other-models", "qwen3-omni"])
+def test_platform_changes_select_only_their_platform(nightly_pipeline, changed_file, platforms, qwen_family):
+    actual_platform, path, doc = nightly_pipeline
+    families = evaluation_families(doc)
+    labels = _labels(families, lambda key: key.startswith("omni_qwen3_omni_") == qwen_family)
+    # Use a different model to disable fallback without selecting the tested family.
+    foreign_model = MINICPM if qwen_family else QWEN
+    selected = _selected(path, doc, [changed_file, foreign_model]) & labels
+    assert selected == (labels if actual_platform in platforms else set())
 
 
 @pytest.mark.parametrize(
@@ -282,6 +263,95 @@ def test_full_nightly_preserves_every_job(nightly):
 
 
 @pytest.mark.parametrize(
+    "routing_file",
+    [
+        ".buildkite/common/ci_source_file_dependencies.yml",
+        ".buildkite/common/scripts/upload_pipeline.py",
+        ".buildkite/common/scripts/ci_conditions.py",
+    ],
+)
+@pytest.mark.parametrize(
+    "model_file",
+    [QWEN, WAN, "vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py"],
+)
+def test_routing_metadata_does_not_expand_model_evaluations(nightly_pipeline, routing_file, model_file):
+    """Registry edits accompanying a model change retain the model's selection."""
+    _, path, doc = nightly_pipeline
+    labels = _labels(evaluation_families(doc))
+    model_selection = _selected(path, doc, [model_file]) & labels
+    assert model_selection
+    assert _selected(path, doc, [routing_file, model_file]) & labels == model_selection
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        "tts_qwen3_tts_function",
+        "tts_qwen3_tts_perf",
+        "tts_qwen3_tts_cov",
+        "tts_voxtral_tts_perf",
+        "reliability_invalid_param_l4",
+    ],
+)
+def tts_consumers(request):
+    """Find every live consumer of keys narrowed by the shared-runtime extraction."""
+    consumers = []
+    paths = [
+        *PIPELINES.values(),
+        *(Path(f".buildkite/cuda/test-{level}.yml") for level in ("ready", "merge", "weekly")),
+    ]
+    for path in paths:
+        doc = load_pipeline(path)
+        labels = {step["label"] for step in _leaves(doc) if request.param in _keys(step)}
+        if labels:
+            consumers.append((path, doc, labels))
+    assert consumers, request.param
+    return consumers
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        "vllm_omni/core/sched/__init__.py",
+        "vllm_omni/distributed/omni_connectors/__init__.py",
+        "vllm_omni/distributed/omni_connectors/connectors/__init__.py",
+        "vllm_omni/distributed/omni_connectors/connectors/yuanrong_connector.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/__init__.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/capabilities.py",
+    ],
+)
+def test_package_entries_keep_tts_consumers(tts_consumers, changed_file):
+    """Package imports remain dependencies when broad directories are narrowed."""
+    for path, doc, labels in tts_consumers:
+        assert labels <= _selected(path, doc, [changed_file, WAN]), (path, changed_file)
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        "vllm_omni/engine/orchestrator.py",
+        "vllm_omni/engine/stage_pool.py",
+        "vllm_omni/worker/sampling_utils.py",
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker/gpu_ar_model_runner.py",
+        "vllm_omni/core/prefix_cache/manager.py",
+        "vllm_omni/diffusion/worker/diffusion_model_runner.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v3.py",
+        "vllm_omni/entrypoints/openai/tts_adapters/audex_tta.py",
+        "tests/helpers/runtime.py",
+        "tests/conftest.py",
+    ],
+)
+def test_weekly_l4_keeps_execution_dependencies(changed_file):
+    """Keep the shared runtimes and model adapters used by the L4 deployments."""
+    path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = load_pipeline(path)
+    expected = {step["label"] for step in _leaves(doc) if "reliability_invalid_param_l4" in _keys(step)}
+    assert expected
+    assert expected <= _selected(path, doc, [changed_file, QWEN])
+
+
+@pytest.mark.parametrize(
     "changed_file",
     [
         "vllm_omni/engine/orchestrator.py",
@@ -293,7 +363,7 @@ def test_full_nightly_preserves_every_job(nightly):
 )
 def test_cuda_ready_minicpm_perf_keeps_its_runtime_dependencies(changed_file):
     path = Path(".buildkite/cuda/test-ready.yml")
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    doc = load_pipeline(path)
     expected = {step["label"] for step in _leaves(doc) if "omni_minicpmo_4_5_perf" in _keys(step)}
     assert expected
     assert expected <= _selected(path, doc, [changed_file, QWEN])
@@ -302,7 +372,7 @@ def test_cuda_ready_minicpm_perf_keeps_its_runtime_dependencies(changed_file):
 @pytest.mark.parametrize("level", ["ready", "merge"])
 def test_cuda_shared_diffusion_runner_keeps_model_e2e(level):
     path = Path(f".buildkite/cuda/test-{level}.yml")
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    doc = load_pipeline(path)
     families = {
         key: {step["label"] for step in _leaves(doc) if key in _keys(step)}
         for key in (

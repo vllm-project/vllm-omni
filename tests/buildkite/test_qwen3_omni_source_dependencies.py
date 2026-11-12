@@ -4,61 +4,28 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
-import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
-
-from upload_pipeline import filter_pipeline_by_source_dependencies  # noqa: E402
+from tests.buildkite.source_dependency_helpers import evaluation_families
+from tests.buildkite.source_dependency_helpers import nightly_pipeline_fixture as nightly_pipeline_fixture
+from tests.buildkite.source_dependency_helpers import selected_labels as _selected
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PIPELINES = {
-    "cuda": Path(".buildkite/cuda/test-nightly.yml"),
-    "npu": Path(".buildkite/npu/test-npu-nightly.yml"),
-    "rocm": Path(".buildkite/amd/test-amd-nightly.yml"),
-}
 MINICPM = "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni.py"
 FAMILIES = ("accuracy", "perf", "duplex_perf")
 
 
-def _leaves(doc):
-    for step in doc.get("steps", []):
-        if isinstance(step, dict):
-            if "steps" in step:
-                yield from _leaves(step)
-            else:
-                yield step
-
-
-@pytest.fixture(scope="module", params=PIPELINES)
-def nightly(request):
-    platform = request.param
-    path = PIPELINES[platform]
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    families: dict[str, set[str]] = {family: set() for family in FAMILIES}
-    for step in _leaves(doc):
-        dependencies = step.get("source_file_dependencies", [])
-        if isinstance(dependencies, str):
-            dependencies = [dependencies]
-        for family in FAMILIES:
-            if f"omni_qwen3_omni_{family}" in dependencies:
-                families[family].add(step["label"])
+@pytest.fixture(scope="module")
+def nightly(nightly_pipeline):
+    """Select Qwen3-Omni families from the shared live platform inventory."""
+    platform, path, doc = nightly_pipeline
+    discovered = evaluation_families(doc)
+    families = {family: discovered.get(f"omni_qwen3_omni_{family}", set()) for family in FAMILIES}
     assert families["accuracy"]
     assert families["perf"]
     assert bool(families["duplex_perf"]) == (platform == "cuda")
     return platform, path, doc, families
-
-
-def _selected(nightly, changed_files):
-    _, path, doc, _ = nightly
-    filtered = filter_pipeline_by_source_dependencies(doc, changed_files, pipeline_path=path)
-    leaves = list(_leaves(filtered))
-    assert all("source_file_dependencies" not in step for step in leaves)
-    return {step["label"] for step in leaves}
 
 
 @pytest.mark.parametrize(
@@ -105,7 +72,7 @@ def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file):
     # A MiniCPM match disables fallback, proving Qwen has a direct dependency.
     changes = [changed_file, MINICPM]
     expected = set().union(*nightly[3].values())
-    assert expected <= _selected(nightly, changes)
+    assert expected <= _selected(nightly[1], nightly[2], changes)
 
 
 @pytest.mark.parametrize(
@@ -114,31 +81,14 @@ def test_shared_changes_keep_accuracy_and_perf(nightly, changed_file):
         ("vllm_omni/worker/gpu_ar_model_runner.py", {"cuda", "rocm"}),
         ("vllm_omni/worker_v2/omni_model_runner.py", {"cuda"}),
         ("vllm_omni/core/prefix_cache/manager.py", {"cuda"}),
-        ("vllm_omni/platforms/cuda/platform.py", {"cuda"}),
-        ("docker/Dockerfile.ci", {"cuda"}),
-        ("requirements/cuda.txt", {"cuda"}),
-        (".buildkite/cuda/scripts/build-ci-image.sh", {"cuda"}),
-        (".buildkite/cuda/test-nightly.yml", {"cuda"}),
         ("vllm_omni/platforms/npu/worker/npu_ar_model_runner.py", {"npu"}),
-        ("vllm_omni/platforms/npu/attention/static_shape_decode.py", {"npu"}),
-        ("vllm_omni/platforms/npu/platform.py", {"npu"}),
-        ("docker/Dockerfile.npu.ci", {"npu"}),
-        ("requirements/npu.txt", {"npu"}),
-        (".buildkite/npu/scripts/build-npu-image.sh", {"npu"}),
-        (".buildkite/npu/test-npu-nightly.yml", {"npu"}),
-        ("vllm_omni/platforms/rocm/platform.py", {"rocm"}),
-        ("docker/Dockerfile.rocm", {"rocm"}),
-        ("requirements/rocm.txt", {"rocm"}),
-        (".buildkite/amd/scripts/build-ci-image.sh", {"rocm"}),
-        (".buildkite/amd/test-amd-nightly.yml", {"rocm"}),
-        (".buildkite/amd/test-template-amd-omni.j2", {"rocm"}),
     ],
 )
-def test_platform_dependencies_are_scoped(nightly, changed_file, platforms):
+def test_runtime_dependencies_are_scoped(nightly, changed_file, platforms):
     platform, _, _, families = nightly
     qwen_labels = set().union(*families.values())
     # A real model match disables fallback, including for changed pipeline YAML.
-    selected = _selected(nightly, [changed_file, MINICPM]) & qwen_labels
+    selected = _selected(nightly[1], nightly[2], [changed_file, MINICPM]) & qwen_labels
     assert selected == (qwen_labels if platform in platforms else set())
 
 
@@ -166,9 +116,4 @@ def test_tooling_and_optional_features_select_relevant_jobs(nightly, changed_fil
     families = nightly[3]
     qwen_labels = set().union(*families.values())
     expected = set().union(*(families[family] for family in expected_families))
-    assert _selected(nightly, [changed_file, MINICPM]) & qwen_labels == expected
-
-
-def test_full_nightly_keeps_all_jobs(nightly):
-    doc = nightly[2]
-    assert _selected(nightly, None) == {step["label"] for step in _leaves(doc)}
+    assert _selected(nightly[1], nightly[2], [changed_file, MINICPM]) & qwen_labels == expected
