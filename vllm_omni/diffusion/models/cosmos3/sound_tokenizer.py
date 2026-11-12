@@ -59,15 +59,15 @@ class Cosmos3SoundTokenizerPaths:
     def from_config(cls, od_config: OmniDiffusionConfig) -> Cosmos3SoundTokenizerPaths:
         """Read the paths from ``custom_pipeline_args``.
 
-        Precedence: ``custom_pipeline_args`` > environment variable.
+        Precedence: ``custom_pipeline_args`` > deprecated environment variable.
         """
         args = _pipeline_args(od_config)
         checkpoint_path = _path_arg(args, ("sound_tokenizer_path", "avae_path", "cosmos3_avae_path"))
         if checkpoint_path is None:
-            checkpoint_path = _env_path("COSMOS3_SOUND_TOKENIZER_PATH")
+            checkpoint_path = _deprecated_env_path("COSMOS3_SOUND_TOKENIZER_PATH", "sound_tokenizer_path")
         config_path = _path_arg(args, ("sound_tokenizer_config_path",))
         if config_path is None:
-            config_path = _env_path("COSMOS3_SOUND_TOKENIZER_CONFIG_PATH")
+            config_path = _deprecated_env_path("COSMOS3_SOUND_TOKENIZER_CONFIG_PATH", "sound_tokenizer_config_path")
         return cls(checkpoint_path=checkpoint_path, config_path=config_path)
 
 
@@ -82,8 +82,16 @@ def _path_arg(args: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def _env_path(env_name: str) -> str | None:
-    return os.environ.get(env_name) or None
+def _deprecated_env_path(env_name: str, arg_name: str) -> str | None:
+    value = os.environ.get(env_name)
+    if not value:
+        return None
+    logger.warning_once(
+        "%s is deprecated and will be removed in a future release. Set custom_pipeline_args[%r] instead.",
+        env_name,
+        arg_name,
+    )
+    return value
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
