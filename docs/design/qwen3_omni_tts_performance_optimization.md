@@ -679,7 +679,69 @@ Compare actual graph coverage, startup cost, memory, latency and audio quality
 on the deployed model before changing these settings; synthetic tests alone do
 not establish a service-level improvement.
 
+### Independent Ascend engine migration
+
+The [independent engine](https://github.com/InferMatrixLab/qwen3-tts-rsi-npu-engine)
+uses its own scheduler and request arenas. Its performance results are evidence
+for that engine and workload, not vLLM-Omni speedup claims. The integration uses
+these existing Omni owners:
+
+| Independent engine mechanism | vLLM-Omni integration |
+| --- | --- |
+| Packed QKV / gate-up projections, native normalization / rotary | Already provided by the shared code predictor and the Talker backend |
+| Fixed predictor rotary coefficients (U002) | Predictor already uses precomputed cos/sin tables on NPU; no request-position cache or module replacement is needed |
+| Model-fixed prompt embeddings | Existing prompt builder caches projected special tokens and CustomVoice speaker/language prefixes |
+| Cached codec codebooks and fused Snake | NPU loader codebook preparation and `npu_fused_snake` |
+| Prefill/decode graphs and continuous batching | Existing vLLM scheduler, paged KV and Talker graph runner |
+| Incremental codec and convolution graphs | `npu_incremental_codec` and `npu_conv_graph_shapes` |
+| Native grouped-query predictor attention | Opt-in `code_predictor_npu_native_gqa` |
+| Fused predictor SwiGLU | Opt-in `code_predictor_npu_fused_swiglu` |
+| Overlapping disjoint codec groups (U005) | Opt-in `npu_codec_streams: 2` |
+
+Set the three new options in the connector `extra`. Both predictor switches
+default to `false`; the stream count defaults to `1`. Native predictor attention
+passes the original grouped K/V heads to Ascend inference attention instead of
+materializing repeated heads, with an explicit causal mask. The supported path
+uses FP16/BF16; the existing attention path remains the default. Native SwiGLU
+uses the existing packed gate/up projection for BF16 NPU inputs and retains the
+ordinary SiLU/multiply path on other devices or dtypes. These native operators
+can change floating-point rounding and therefore sampled codec tokens. Qualify
+paired audio quality before enabling them; operator tolerances are not a
+waveform-equivalence guarantee. CUDA behavior and shared predictor defaults
+are unchanged.
+
+Two codec streams require `npu_incremental_codec: true` and Triton Ascend.
+They overlap the existing groups without changing group sizes, request order,
+chunk lengths or `decode_batch_max_size`. Each lane owns separate graph inputs,
+scratch and output copies. A selected-row store kernel updates only each group's
+disjoint convolution/KV slots; a native whole-tensor update is not safe for this
+concurrency. Inputs are prepared on the owner stream, both lanes wait for it,
+and the owner waits for both lanes before returning or propagating an exception.
+Only then may request completion reset/reuse slots. Returned audio is independent
+of graph scratch. A single group or outer graph capture stays on the owner
+stream; later multi-group
+calls wait for that work before reusing lane storage. Invalid or overlapping
+request slots are rejected before any group is submitted.
+
+Prewarming captures the same full-chunk and single-frame shapes for both lanes,
+doubling the number of incremental codec graphs. Other lengths remain eager;
+no live request captures a new graph. Request state remains one shared slot
+arena with disjoint writers, while graph scratch and startup costs increase.
+Reload and module conversion use the existing graph cleanup. Benchmark memory,
+startup and steady-state latency separately.
+
+The independent engine's packed prefill-KV admission and single-request borrowed
+views belong to its contiguous arena and request loop. They are not copied over
+vLLM's paged-KV/input-batch owners. Similarly, inverse-CDF sampling is not
+substituted for Omni's Gumbel sampling: the latter retains its per-request
+uniforms and existing token-selection semantics. A scheduler or sampler redesign
+would require a separate semantic and service comparison.
+
 ### NPU Talker decode graph mode
+
+The measurements in this subsection are historical results from the original
+Talker graph change. They do not requalify later upstream integration or the
+additional predictor/dual-stream options described above.
 
 The Talker emits one codec frame per step, so a step is a few thousand small
 device kernels wrapped in per-step scheduler, sampling and IPC work. vLLM-Omni

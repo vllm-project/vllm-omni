@@ -107,6 +107,13 @@ connectors:
       # not establish an end-to-end gain. Leave this off: the earlier
       # concurrency 1/16/32 experiments did not consistently beat baseline.
       npu_incremental_codec: false
+      # Opt-in migrations from the independent Ascend engine. Qualify audio
+      # and service performance on the deployment before enabling them.
+      # Two streams require npu_incremental_codec=true and Triton Ascend;
+      # this doubles incremental codec graph storage, not the batch limit.
+      npu_codec_streams: 1
+      code_predictor_npu_native_gqa: false
+      code_predictor_npu_fused_swiglu: false
 
 stages:
   - stage_id: 0

@@ -104,6 +104,11 @@ def _patched_load_weights(self, weights):
     incremental = extra.get("npu_incremental_codec", False)
     if not isinstance(incremental, bool):
         raise ValueError("npu_incremental_codec must be a boolean")
+    streams = extra.get("npu_codec_streams", 1)
+    if type(streams) is not int or streams not in (1, 2):
+        raise ValueError("npu_codec_streams must be 1 or 2")
+    if streams == 2 and (not incremental or not HAS_TRITON):
+        raise ValueError("npu_codec_streams=2 requires npu_incremental_codec and Triton")
     if incremental:
         # The conv-tail graphs replay work this path no longer performs.
         from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
@@ -117,6 +122,7 @@ def _patched_load_weights(self, weights):
                 slots=slots,
                 max_batch=max(1, min(max_batch, slots)),
                 chunk_frames=chunk_frames,
+                streams=streams,
             )
     shapes = [] if incremental else extra.get("npu_conv_graph_shapes", [])
     if shapes:

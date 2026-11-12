@@ -180,3 +180,82 @@ def test_kv_graph_replay_discards_previous_frame():
     finally:
         torch.npu.synchronize()
         graph.reset()
+
+
+@pytest.mark.parametrize("batch,seq_len", [(1, 1), (1, 17), (4, 17)])
+@torch.inference_mode()
+def test_native_gqa_matches_expanded_heads_and_replays(batch, seq_len):
+    require_npu()
+    from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorAttention
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig
+
+    config = Qwen3TTSTalkerCodePredictorConfig(
+        hidden_size=512, num_attention_heads=4, num_key_value_heads=2, head_dim=128, num_code_groups=16
+    )
+    attention = CodePredictorAttention(config).to(device="npu", dtype=torch.bfloat16).eval()
+    q = torch.randn(batch, 4, seq_len, 128, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(batch, 2, seq_len, 128, device="npu", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    def forward(native):
+        attention.use_npu_native_gqa = native
+        return attention._forward_npu_attention(q, k, v, batch, seq_len)
+
+    expected = forward(False)
+    torch.testing.assert_close(forward(True), expected, atol=0.05, rtol=0.05)
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            forward(True)
+    torch.npu.current_stream().wait_stream(stream)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph, stream=stream):
+            output = forward(True)
+        for _ in range(3):
+            q.normal_()
+            k.normal_()
+            v.normal_()
+            graph.replay()
+            torch.testing.assert_close(output, forward(False), atol=0.05, rtol=0.05)
+        if seq_len > 1:
+            first = forward(True)[:, :, :1].clone()
+            v[:, :, 1:].fill_(100)
+            k[:, :, 1:].fill_(100)
+            torch.testing.assert_close(forward(True)[:, :, :1], first, atol=0, rtol=0)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()
+
+
+@torch.inference_mode()
+def test_native_swiglu_matches_packed_mlp_and_replays():
+    require_npu()
+    from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorMLP
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig
+
+    config = Qwen3TTSTalkerCodePredictorConfig(hidden_size=128, intermediate_size=256)
+    mlp = CodePredictorMLP(config).to(device="npu", dtype=torch.bfloat16).eval()
+    x = torch.randn(4, 17, 128, device="npu", dtype=torch.bfloat16)
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    mlp.use_npu_fused_swiglu = True
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            mlp(x)
+    torch.npu.current_stream().wait_stream(stream)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph, stream=stream):
+            output = mlp(x)
+        mlp.use_npu_fused_swiglu = False
+        for _ in range(3):
+            x.normal_()
+            graph.replay()
+            torch.testing.assert_close(output, mlp(x), atol=0.05, rtol=0.05)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()

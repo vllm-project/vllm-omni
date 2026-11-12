@@ -691,6 +691,7 @@ class TestCodePredictorGraphReplay:
         predictor = object.__new__(code_predictor_wrapper)
         torch.nn.Module.__init__(predictor)
         predictor._fused_requested = False
+        predictor._frame_graph_requested = False
         predictor._fused = None
         predictor._num_groups = 3
         predictor._model_dtype = torch.float32
@@ -738,6 +739,27 @@ class TestCodePredictorGraphReplay:
         else:
             assert graph.replay.call_count == 2
             predictor._compiled_model_fwd.assert_not_called()
+
+
+def test_npu_setup_captures_frame_graph_after_warmup(mocker, loaded_target_classes):
+    _, _, wrapper_class, _, _ = loaded_target_classes
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    predictor = object.__new__(wrapper_class)
+    torch.nn.Module.__init__(predictor)
+    predictor._compiled_model_fwd = None
+    predictor._kv_requested = False
+    calls = []
+
+    def prepare(self):
+        calls.append("warmup")
+        self._compiled_model_fwd = lambda: None
+
+    mocker.patch.object(common_mod.current_omni_platform, "is_cuda", return_value=False)
+    mocker.patch.object(common_mod.CodePredictorWrapper, "_setup_compile", prepare)
+    predictor._capture_frame_graphs = mocker.Mock(side_effect=lambda: calls.append("capture"))
+    predictor._setup_compile()
+    predictor._setup_compile()
+    assert calls == ["warmup", "capture"]
 
 
 class TestCodePredictorWrapperConfig:

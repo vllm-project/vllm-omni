@@ -146,15 +146,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
                 logger.warning_once(
                     "Qwen3-TTS: code_predictor_kv_cache=True is unsupported on this execution path; using re-prefill"
                 )
+            self._capture_frame_graphs()
             return
         weight = next(self.model.parameters())
-        if self._kv_requested and current_omni_platform.is_npu() and weight.dtype == torch.bfloat16:
-            # The incremental body is eager here: this branch returns before
-            # NPU graph capture, so each codec frame runs 15 uncaptured
-            # forwards. Graphed re-prefill is one replay per codebook step and
-            # was about 3x faster on a 1.7B CustomVoice serving run. Keep it.
-            logger.info("Qwen3-TTS NPU code predictor keeps graphed re-prefill instead of eager incremental KV")
-            self._kv_requested = False
         supported = (
             current_omni_platform.is_cuda()
             and weight.device.type == "cuda"
