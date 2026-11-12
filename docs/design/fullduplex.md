@@ -190,8 +190,26 @@ The built-in incremental parser also rejects output containing only source
 delimiter markers. Such an output supplies no memory and must leave the source
 pending for retry. Marker words inside actual memory facts remain valid text.
 
-The server-owned configuration field is `duplex_session.model_custom_options`.
-Default `recent` behavior is unchanged.
+Configure the policy in a deployment overlay:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_messages: 8
+      chunk_messages: 8
+      summary_tokens: 512
+```
+
+Pass the overlay with `vllm serve ... --omni --deploy-config /path/to/history.yaml`.
+Set `history_policy` to `bounded_recent` for clipping, or to
+`your_package.policy:YourPolicy` for a server-importable class with a no-argument
+constructor. Subclass `IncrementalHistoryPolicy` to reuse its selection and
+batching while overriding compression. Default `recent` behavior is unchanged.
+The optional `history_limits.max_context_tokens` caps context below the resolved
+model limit, including reserved output; omitting it uses the model limit.
 
 Incomplete implementations fail at server initialization. Selection is
 stateless and may be cached while
@@ -265,9 +283,7 @@ image count, encoded PNG byte and decoded pixel byte bounds. These are not
 process RSS limits.
 
 Opt-in policies accept text/audio/images and reject tools. The default policy
-retains existing image/tool support. Implementation, configuration, evaluation
-scope and commands are in the
-[history experiment guide](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/duplex_history/README.md).
+retains existing image/tool support.
 
 ## Architecture
 
