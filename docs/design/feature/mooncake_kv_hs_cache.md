@@ -257,4 +257,4 @@ sampling. They contain no source-tensor dumps or save barriers. Output hashes
 and memory snapshots are collected between timed waves. Two-level cache
 cooperation and duplex sessions remain outside this validation.
 
-See the [controlled M1 measurements and reproduction commands](../../../benchmarks/qwen3_omni/README.md).
+See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md).
