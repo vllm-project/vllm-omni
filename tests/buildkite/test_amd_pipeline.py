@@ -1528,6 +1528,28 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         assert f"tests != {expected_nodes} or skipped != {expected_skipped}" in command
 
 
+def test_weekly_invalid_parameter_single_gpu_jobs_use_sdpa() -> None:
+    group = _find_group("Reliability Test", AMD_WEEKLY_PIPELINE)
+    affected_labels = {
+        "Reliability Test · Invalid parameters · MI300 · Single-GPU",
+        "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU",
+    }
+    expected_env = {
+        "VLLM_ROCM_USE_AITER": "0",
+        "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
+    }
+
+    invalid_parameter_steps = {step["label"]: step for step in group["steps"] if "Invalid parameters" in step["label"]}
+    assert affected_labels < invalid_parameter_steps.keys()
+    for label, step in invalid_parameter_steps.items():
+        if label in affected_labels:
+            assert step["env"] == expected_env
+        else:
+            env = step.get("env", {})
+            assert "VLLM_ROCM_USE_AITER" not in env
+            assert "DIFFUSION_ATTENTION_BACKEND" not in env
+
+
 @pytest.mark.parametrize(
     "case",
     ("pass", "unexpected-skip", "zero-tests", "pytest-failure", "timeout"),
@@ -2121,41 +2143,113 @@ def test_moss_tts_weekly_executes_junit_guard_before_exit(
     )
 
 
-def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
-    path = "tests/e2e/offline_inference/test_cosyvoice3_expansion.py"
-    markers = "slow and tts and rocm and MI325 and cards_1"
-    step = _find_step("CosyVoice3 Offline Zero-shot Smoke", AMD_NIGHTLY_PIPELINE)
+def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
 
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 90
-    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
-    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-offline-nightly/**/*"]
-    assert "env" not in step
+    jobs = {
+        "Audex offline · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 5,
+            "artifact_name": "rocm-audex-weekly",
+            "dependency": "tts_audex_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_audex_tts.py",
+                "tests/e2e/offline_inference/test_audex_s2t.py",
+                "tests/e2e/offline_inference/test_audex_tta.py",
+            ),
+        },
+        "CosyVoice3 offline · 1-GPU": {
+            "timeout": 105,
+            "test_timeout": 75,
+            "count": 2,
+            "artifact_name": "rocm-cosyvoice3-offline-weekly",
+            "dependency": "tts_cosyvoice3_function",
+            "files": ("tests/e2e/offline_inference/test_cosyvoice3_expansion.py",),
+        },
+        "Qwen3-TTS word timestamps · 1-GPU": {
+            "timeout": 120,
+            "test_timeout": 90,
+            "count": 3,
+            "artifact_name": "rocm-qwen3-tts-word-timestamps-weekly",
+            "dependency": "tts_qwen3_tts_function",
+            "files": ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",),
+        },
+    }
+    expected_env = {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+    group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
+    labels = [step["label"] for step in group["steps"]]
 
-    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
-    assert len(pytest_commands) == 2
-    collect_command = next(command for command in pytest_commands if "--collect-only" in split(command))
-    run_command = next(command for command in pytest_commands if "--collect-only" not in split(command))
-    for command in (collect_command, run_command):
-        argv = split(command)
-        assert path in argv
-        assert argv[argv.index("-m") + 1] == markers
-        assert argv[argv.index("--run-level") + 1] == "full_model"
-    assert "--junitxml=/tmp/cosyvoice3-offline-pytest.xml" in split(run_command)
+    assert set(jobs) < set(labels)
+    for label, expected in jobs.items():
+        step = _find_step(label, AMD_WEEKLY_PIPELINE)
+        command = "\n".join(step["commands"])
+        artifact_name = cast(str, expected["artifact_name"])
+        dependency = cast(str, expected["dependency"])
+        files = cast(tuple[str, ...], expected["files"])
 
-    commands = "\n".join(step["commands"])
-    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
-    assert "VLLM_ROCM_USE_AITER" not in commands
-    assert "cp -v /tmp/cosyvoice3-offline-pytest.xml" in commands
+        assert step["agent_pool"] == "mi300_1"
+        assert step["depends_on"] == "amd-build"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["grade"] == "NonBlocking"
+        assert step["timeout_in_minutes"] == expected["timeout"]
+        assert step["source_file_dependencies"] == dependency
+        assert step["env"] == expected_env
+        assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
+        assert "retry" not in step
+        assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
+        assert "VLLM_USE_DEEP_GEMM" in command
+        assert "VLLM_MOE_USE_DEEP_GEMM" in command
+        assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in command
+        assert "ROCM_E2E_LEVEL_MARKER=slow" in command
+        assert f"ROCM_E2E_TIMEOUT_MINUTES={expected['test_timeout']}" in command
+        assert f"{files[0]} {expected['count']} tts {artifact_name}" in command
+        for path in files:
+            assert path in command
 
-    source = Path(path).read_text(encoding="utf-8")
-    decorator = source.rsplit("@hardware_test", 1)[1].split("def test_cosyvoice3_offline_reference_zero_shot", 1)[0]
-    assert '"cuda": "L4"' in decorator
-    assert '"rocm": "MI325"' in decorator
-    assert 'id="sync"' in source
-    assert 'id="async_chunk"' in source
+        dependency_paths = flatten_paths(dependencies[dependency])
+        assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in dependency_paths
+        assert set(files) <= dependency_paths
+        assert "vllm_omni/entrypoints/omni_base.py" in dependency_paths
+        assert "vllm_omni/metrics/utils.py" in dependency_paths
+        assert "vllm_omni/outputs/" in dependency_paths
+
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+            assert label not in pipeline_path.read_text(encoding="utf-8")
+
+    rocm_decorator = '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)'
+    marker_counts = {
+        "tests/e2e/offline_inference/test_audex_tts.py": 3,
+        "tests/e2e/offline_inference/test_audex_s2t.py": 1,
+        "tests/e2e/offline_inference/test_audex_tta.py": 1,
+        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
+        "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
+    }
+    for path, expected_count in marker_counts.items():
+        assert Path(path).read_text(encoding="utf-8").count(rocm_decorator) == expected_count
+
+    cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
+    assert 'id="sync"' in cosy_source
+    assert 'id="async_chunk"' in cosy_source
+    nightly_text = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert "CosyVoice3 Offline Zero-shot Smoke" not in nightly_text
+    assert "rocm-cosyvoice3-offline-nightly" not in nightly_text
+
+    runner = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert os.access(runner, os.X_OK)
 
 
 def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
@@ -4614,7 +4708,7 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 40
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
-    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900" in command
+    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=1200" in command
     assert "VLLM_ROCM_USE_AITER=0" not in command
     assert _marker_expressions(step) == [
         _PAUSE_KEEP_READY_MARKER,

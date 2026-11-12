@@ -12,6 +12,7 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
+import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
@@ -2871,95 +2872,145 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     terminal_flags.append(flag_true)
                     continue
                 eos_window_masked = silent_run < _TURN_END_SILENT_FRAMES
-            # A request pinning temperature to 0 (override or stage default)
-            # takes the deterministic boundary sampler, same as single-frame.
-            # Both boundary samplers return the full sample result; the device
-            # state inside it owns the eos/stop-id/limit transition (single
-            # source).
             assert head_logits_all is not None
             projection_index = projection_indices[index]
             frame_logits = head_logits_all[projection_index : projection_index + 1]
-            # min_tokens is enforced per frame by the boundary samplers below
-            # (same semantics as the single-frame path's ``mask_eos_rows``):
-            # while ``step < min_tokens`` the stop ids are censored, and on the
-            # first frame past the floor the model decides again on its own.
-            # There is deliberately no cross-frame stop latch here.
-            if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
-                greedy_result = self._sample_audio_code_greedy(
-                    hidden[end - 1 : end],
-                    codes,
-                    request_id,
-                    step,
-                    min_tokens,
-                    max_tokens,
-                    eos_window_masked,
-                    logits=frame_logits,
-                )
-                sample_result = greedy_result
-            else:
-                sample_result = self._sample_audio_code(
-                    hidden[end - 1 : end],
-                    codes,
-                    request_id,
-                    step,
-                    eos_window_masked,
-                    logits=frame_logits,
-                )
-            # The kernel ABI is int32, while the existing connector/audio-code
-            # payload is int64.  Keep the compatibility cast outside the fused op.
-            sampled = sample_result.sampled_token.to(torch.long).reshape(())
-            # Review P2-3: the host needs sampled_id plus the device
-            # finished/emit decision every frame; pack the three scalars
-            # into one D2H transfer so a K-frame step costs one device
-            # sync per frame instead of three.
-            packed = torch.stack(
-                (
-                    sampled,
-                    sample_result.state.finished.reshape(()).to(torch.long),
-                    sample_result.emit.reshape(()).to(torch.long),
-                )
-            )
-            # Commit all request rows before the next frame reads their history.
-            # The per-request delta, the device-side last-code shadow and the
-            # "accumulated" view are all filled from the single host readback
-            # in flush_kstep_pending: a masked_select here would add a second,
-            # data-dependent-size device sync per row per frame, and an
-            # unconditional shadow update would let a suppressed frame become
-            # the next frame's history.
-            pending = getattr(self, "_kstep_pending_packed", None)
-            if pending is None:
-                pending = self._kstep_pending_packed = []
-            # The stop row below is provisional: it only knows the device
-            # finished flag. flush_kstep_pending rewrites it in this same step
-            # when the host readback adds a repetition or quiet-drain stop, so
-            # the stop id reaches vLLM's sampler immediately instead of
-            # waiting for a next frame that a duplex turn-boundary request may
-            # never get scheduled.
-            pending.append(
-                _KStepPendingRow(
-                    packed=packed,
+            if current_omni_platform.is_npu():
+                # NPU: host-side codec sampling (PR #9990's path). The host
+                # sampler owns the eos/stop/limit transition, so no pending
+                # row is queued; the delta and state commit immediately.
+                host_id, host_finished, host_emit = self._sample_audio_code_host(
+                    hidden_state=hidden[end - 1 : end],
+                    history=codes,
                     request_id=request_id,
-                    state=state,
-                    info=info,
-                    deltas=codec_deltas,
-                    delta_slot=len(codec_deltas),
-                    stop_rows=stop_rows,
-                    terminal_flags=terminal_flags,
-                    stop_slot=len(stop_rows),
-                    row_stop=row_stop,
-                    flag_true=flag_true,
+                    request_state=state,
+                    step=step,
+                    min_tokens=min_tokens,
+                    max_tokens=max_tokens,
+                    eos_window_masked=eos_window_masked,
+                    lg_dev=frame_logits.reshape(-1),
                 )
-            )
-            codec_deltas.append(empty_delta)
-            state["step"] = _codec_int_param(state, "step", 0) + 1
-            finished = sample_result.state.finished.reshape(()).to(torch.bool)
-            info["audio_state"] = state
-            info["audio_codes"] = {
-                "current": sampled.reshape(1),
-                "accumulated": codes,
-            }
-            terminal_flags.append(torch.where(finished, flag_true, flag_false))
-            stop_rows.append(torch.where(finished, row_stop, row_continue))
+                sampled = torch.tensor(host_id, dtype=torch.long, device=hidden.device).reshape(())
+                sampled_id = int(host_id)
+                full_ids = state.get("codec_full_ids")
+                if isinstance(full_ids, list):
+                    full_ids.append(sampled_id)
+                state["step"] = _codec_int_param(state, "step", 0) + 1
+                repetition_stop = _codec_repetition_detected(state)
+                finished = bool(host_finished) or repetition_stop
+                emit_frame = bool(host_emit)
+                state["finished"] = finished
+                if emit_frame:
+                    codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
+                    delta = sampled.reshape(1, 1)
+                    state["last_code"] = sampled_id
+                    histories = getattr(self, "_request_codec_history", None)
+                    if not isinstance(histories, dict):
+                        histories = {}
+                        self._request_codec_history = histories
+                    codec_history = histories.get(request_id)
+                    if codec_history is None:
+                        codec_history = []
+                        histories[request_id] = codec_history
+                    codec_history.append(sampled_id)
+                else:
+                    delta = empty_delta
+                state["codes"] = codes
+                info["audio_state"] = state
+                info["audio_codes"] = {
+                    "current": sampled.reshape(1),
+                    "accumulated": codes,
+                }
+                codec_deltas.append(delta)
+                terminal_flags.append(flag_true if finished else flag_false)
+                stop_rows.append(row_stop if finished else row_continue)
+            else:
+                # min_tokens is enforced per frame by the boundary samplers below
+                # (same semantics as the single-frame path's ``mask_eos_rows``):
+                # while ``step < min_tokens`` the stop ids are censored, and on the
+                # first frame past the floor the model decides again on its own.
+                # There is deliberately no cross-frame stop latch here.
+                # A request pinning temperature to 0 (override or stage default)
+                # takes the deterministic boundary sampler, same as single-frame.
+                # Both boundary samplers return the full sample result; the device
+                # state inside it owns the eos/stop-id/limit transition (single
+                # source).
+                if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
+                    greedy_result = self._sample_audio_code_greedy(
+                        hidden[end - 1 : end],
+                        codes,
+                        request_id,
+                        step,
+                        min_tokens,
+                        max_tokens,
+                        eos_window_masked,
+                        logits=frame_logits,
+                    )
+                    sample_result = greedy_result
+                else:
+                    sample_result = self._sample_audio_code(
+                        hidden[end - 1 : end],
+                        codes,
+                        request_id,
+                        step,
+                        eos_window_masked,
+                        logits=frame_logits,
+                    )
+                # The kernel ABI is int32, while the existing connector/audio-code
+                # payload is int64.  Keep the compatibility cast outside the fused op.
+                sampled = sample_result.sampled_token.to(torch.long).reshape(())
+                # Review P2-3: the host needs sampled_id plus the device
+                # finished/emit decision every frame; pack the three scalars
+                # into one D2H transfer so a K-frame step costs one device
+                # sync per frame instead of three.
+                packed = torch.stack(
+                    (
+                        sampled,
+                        sample_result.state.finished.reshape(()).to(torch.long),
+                        sample_result.emit.reshape(()).to(torch.long),
+                    )
+                )
+                # Commit all request rows before the next frame reads their history.
+                # The per-request delta, the device-side last-code shadow and the
+                # "accumulated" view are all filled from the single host readback
+                # in flush_kstep_pending: a masked_select here would add a second,
+                # data-dependent-size device sync per row per frame, and an
+                # unconditional shadow update would let a suppressed frame become
+                # the next frame's history.
+                pending = getattr(self, "_kstep_pending_packed", None)
+                if pending is None:
+                    pending = self._kstep_pending_packed = []
+                # The stop row below is provisional: it only knows the device
+                # finished flag. flush_kstep_pending rewrites it in this same step
+                # when the host readback adds a repetition or quiet-drain stop, so
+                # the stop id reaches vLLM's sampler immediately instead of
+                # waiting for a next frame that a duplex turn-boundary request may
+                # never get scheduled.
+                pending.append(
+                    _KStepPendingRow(
+                        packed=packed,
+                        request_id=request_id,
+                        state=state,
+                        info=info,
+                        deltas=codec_deltas,
+                        delta_slot=len(codec_deltas),
+                        stop_rows=stop_rows,
+                        terminal_flags=terminal_flags,
+                        stop_slot=len(stop_rows),
+                        row_stop=row_stop,
+                        flag_true=flag_true,
+                    )
+                )
+                codec_deltas.append(empty_delta)
+                state["step"] = _codec_int_param(state, "step", 0) + 1
+                finished = sample_result.state.finished.reshape(()).to(torch.bool)
+                info["audio_state"] = state
+                info["audio_codes"] = {
+                    "current": sampled.reshape(1),
+                    "accumulated": codes,
+                }
+                terminal_flags.append(torch.where(finished, flag_true, flag_false))
+                stop_rows.append(torch.where(finished, row_stop, row_continue))
 
         # Flush before the stop rows freeze into batch_stop_logits: a
         # repetition/quiet-drain stop revealed by the host readback must
@@ -3377,6 +3428,205 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         device_states[request_id] = result.state
         return result
 
+    def _sample_audio_code_host(
+        self,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        request_id: str,
+        request_state: dict[str, Any],
+        step: int,
+        min_tokens: int,
+        max_tokens: int,
+        eos_window_masked: bool = False,
+        lg_dev: torch.Tensor | None = None,
+    ) -> tuple[int, bool, bool]:
+        """Host-side codec boundary sampling.
+
+        Device work per frame: one head_code Linear plus a single D2H of the
+        raw logits row (~26KB at the codec vocab). Stop censoring, repetition
+        / frequency / presence penalties, temperature, min_p, top-k, top-p,
+        the multinomial draw and the eos/stop/limit transition all run on
+        host scalars, replacing the per-frame eager micro-kernel chain (and
+        its packed.cpu() sync) that the device samplers drive.
+
+        ``lg_dev`` optionally carries the next-row head result queued by the
+        caller after the previous row's D2H. Otherwise submit the head here.
+
+        The draw uses a per-request python random.Random seeded from the
+        same codec_seed the device path derives its NPU generator from: the
+        stream is deterministic per (request, seed) but not bit-identical to
+        the NPU multinomial sequence. Greedy (temperature==0) is an argmax
+        over the same penalized logits and stays bit-identical by
+        construction.
+        """
+        if not getattr(self, "_host_codec_sample_logged", False):
+            self._host_codec_sample_logged = True
+            logger.info("[host-sample] host-side codec sampling armed")
+        states = getattr(self, "_request_host_codec_states", None)
+        if states is None:
+            states = {}
+            self._request_host_codec_states = states
+        hstate = states.get(request_id)
+        if hstate is None:
+            # A fresh request seeds its own draw stream; hstate carries the
+            # generator for the rest of the request's lifetime.
+            seed = _codec_int_param(request_state, "codec_seed", self._codec_seed)
+            generator = random.Random(int(seed))
+            window: list[int] = []
+            if isinstance(history, torch.Tensor) and history.numel() > 0:
+                window = [int(t) for t in history.detach().to(torch.long).reshape(-1).cpu().tolist()]
+                window = window[-HISTORY_WINDOW:]
+            bins: dict[int, int] = {}
+            initial_bins = _codec_full_bins_input(request_state, hidden_state.device)
+            if isinstance(initial_bins, torch.Tensor) and initial_bins.numel() > 0:
+                for tid, count in zip(
+                    range(int(initial_bins.numel())),
+                    initial_bins.detach().to(torch.long).reshape(-1).cpu().tolist(),
+                ):
+                    if count:
+                        bins[int(tid)] = int(count)
+            hstate = {
+                "history": window,
+                "step": int(step),
+                "finished": False,
+                "bins": bins,
+                "generator": generator,
+            }
+            states[request_id] = hstate
+        # Resolve knobs once per request, same sources as the device
+        # samplers; the engine fixes sampling params when the request is
+        # created, so re-reading request_state every frame is pure overhead.
+        params = hstate.get("params")
+        if params is None:
+            eos_token_id = int(self._codec_eos_id)
+            min_tokens_stop_ids = _codec_stop_ids(request_state)
+            stop_ids = tuple(dict.fromkeys((eos_token_id, *min_tokens_stop_ids)))
+            temperature = _codec_float_param(request_state, "codec_temperature", self._codec_temperature)
+            top_k = _codec_int_param(request_state, "codec_top_k", self._codec_top_k)
+            top_p = _codec_float_param(request_state, "codec_top_p", self._codec_top_p)
+            min_p = _codec_float_param(request_state, "codec_min_p", 0.0)
+            repetition_penalty = _codec_float_param(
+                request_state, "codec_repetition_penalty", self._codec_repetition_penalty
+            )
+            frequency_penalty = _codec_float_param(request_state, "codec_frequency_penalty", 0.0)
+            presence_penalty = _codec_float_param(request_state, "codec_presence_penalty", 0.0)
+            ignore_eos = _codec_bool_param(request_state, "codec_ignore_eos", False)
+            params = (
+                stop_ids,
+                eos_token_id,
+                min_tokens_stop_ids,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                ignore_eos,
+            )
+            hstate["params"] = params
+        (
+            stop_ids,
+            eos_token_id,
+            min_tokens_stop_ids,
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            ignore_eos,
+        ) = params
+        # The frame loop advances state["step"] (and passes it here) in
+        # lockstep with the device state's own counter, so trust the caller.
+        hstate["step"] = int(step)
+        # Device: project + one D2H of the raw logits row; the numpy chain (~0.9 ms/frame
+        # cheaper than CPU torch ops) then overlaps the pre-submitted next head.
+        lg = (
+            (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
+            .cpu()
+            .numpy()
+        )
+        # Engine step 3-4: stop censoring before any penalty.
+        if eos_window_masked or hstate["step"] < int(min_tokens):
+            lg[list(stop_ids)] = -np.inf
+        # Engine step 6a: repetition penalty over the history window.
+        hist = hstate["history"]
+        if repetition_penalty != 1.0 and hist:
+            counts: dict[int, int] = {}
+            for tid in hist:
+                counts[tid] = counts.get(tid, 0) + 1
+            for tid, count in counts.items():
+                alpha = repetition_penalty**count
+                value = float(lg[tid])
+                lg[tid] = value / alpha if value >= 0 else value * alpha
+        # Engine steps 6b/6c: whole-stream frequency and presence penalties.
+        bins = hstate["bins"]
+        if frequency_penalty and bins:
+            for tid, count in bins.items():
+                lg[tid] = float(lg[tid]) - frequency_penalty * count
+        if presence_penalty and bins:
+            for tid in bins:
+                lg[tid] = float(lg[tid]) - presence_penalty
+        # Engine steps 7b-7d and the draw (or the greedy argmax).
+        if temperature == 0.0:
+            sampled_id = int(np.argmax(lg))
+        else:
+            lg = lg / temperature
+            if min_p > 0.0:
+                probs = np.exp(lg - lg.max())
+                probs /= probs.sum()
+                threshold = probs.max() * min_p
+                lg[probs < threshold] = -np.inf
+            if 0 < top_k < lg.size:
+                # Same semantics as the engine prelude: keep every logit
+                # >= the k-th largest value (ties keep all members).
+                threshold = np.partition(lg, -int(top_k))[-int(top_k)]
+                lg[lg < threshold] = -np.inf
+            # top_p and the draw run on the surviving candidate subset
+            # only: -inf entries carry probability zero, so the cumsum is
+            # just shifted across them and the draw is unchanged.
+            cand = np.flatnonzero(lg > -np.inf)
+            sub = lg[cand]
+            if 0.0 < float(top_p) < 1.0:
+                order = np.argsort(sub)
+                p_sorted = np.exp(sub[order] - sub[order][-1])
+                p_sorted /= p_sorted.sum()
+                cumulative = p_sorted.cumsum()
+                remove = cumulative <= (1.0 - float(top_p))
+                remove[-1] = False
+                keep = ~remove
+                cand = cand[order[keep]]
+                probs = p_sorted[keep]
+            else:
+                probs = np.exp(sub - sub.max())
+                probs /= probs.sum()
+            probs /= probs.sum()
+            r = hstate["generator"].random()
+            j = int(np.searchsorted(probs.cumsum(), r, side="right"))
+            if j >= probs.size:
+                j = probs.size - 1
+            sampled_id = int(cand[j])
+        # eos/stop/limit transition mirroring _classify_stop +
+        # _advance_classified (single source of the emit decision).
+        is_eos = (not ignore_eos) and sampled_id == eos_token_id
+        is_stop = any(sampled_id == int(token_id) for token_id in min_tokens_stop_ids)
+        active = not hstate["finished"]
+        next_step = hstate["step"] + 1 if active else hstate["step"]
+        reached_limit = active and next_step >= int(max_tokens)
+        finished = hstate["finished"] or is_eos or is_stop or reached_limit
+        emit = active and not is_eos and not is_stop and not reached_limit
+        hstate["step"] = next_step
+        hstate["finished"] = finished
+        if emit:
+            hist.append(sampled_id)
+            if len(hist) > HISTORY_WINDOW:
+                del hist[: len(hist) - HISTORY_WINDOW]
+            if frequency_penalty or presence_penalty:
+                bins[sampled_id] = bins.get(sampled_id, 0) + 1
+        return sampled_id, finished, emit
+
     def _step_constants(self, hidden: torch.Tensor):
         """Constant per-step tensors, cached per (device, dtype).
 
@@ -3473,6 +3723,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_histories.pop(request_id, None)
             if isinstance(request_generators, dict):
                 request_generators.pop(request_id, None)
+            host_codec_states = getattr(self, "_request_host_codec_states", None)
+            if isinstance(host_codec_states, dict):
+                host_codec_states.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
             getattr(self, "_cuda_kstep_request_bank", {}).pop(request_id, None)
             bindings = getattr(self, "_cuda_kstep_rng_bindings", {})
