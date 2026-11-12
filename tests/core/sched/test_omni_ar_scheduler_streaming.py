@@ -29,7 +29,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import (
+    OmniARAsyncScheduler,
+    OmniARScheduler,
+    _streaming_update_replaces_prompt,
+)
+from vllm_omni.data_entry_keys import serialize_payload
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -845,6 +850,93 @@ def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset()
     plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
     assert plan["dropped_tokens"] == 9
     assert plan["replacement_prompt_len"] == 22
+
+
+def _joyai_sentence_payload(*, replace: bool) -> object:
+    """Wire shape ``joyai_action_to_tts`` actually sends after serialize_payload."""
+    info: dict[str, object] = {
+        "task_type": ["CustomVoice"],
+        "language": ["Auto"],
+        "speaker": ["Vivian"],
+        "instruct": [""],
+        "text": ["此诚危急存亡之秋也。"],
+    }
+    if replace:
+        info["meta"] = {
+            "replace_streaming_prompt": True,
+            "replace_runtime_additional_information": True,
+            "talker_prefill_offset": 0,
+            "talker_text_offset": 0,
+        }
+        info["embed"] = {"prefill": []}
+        info["hidden_states"] = {"trailing_text": []}
+    return serialize_payload(info)
+
+
+def _parked_talker_after_first_sentence() -> Request:
+    """Talker after sentence-1 2150: prompt zeros plus leftover codec KV."""
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.prompt_token_ids = [0] * 40
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session._output_token_ids.clear()
+    session.append_output_token_ids([100, 101, 2150])
+    session.num_prompt_tokens = 40
+    session.num_computed_tokens = 43
+    return session
+
+
+def test_serialized_joyai_meta_is_a_replace_flag() -> None:
+    payload = _joyai_sentence_payload(replace=True)
+    assert _streaming_update_replaces_prompt((None, payload)) is True
+    assert _streaming_update_replaces_prompt((None, _joyai_sentence_payload(replace=False))) is False
+    assert _streaming_update_replaces_prompt(({"meta.replace_streaming_prompt": True}, None)) is True
+
+
+def test_joyai_serialized_payload_replaces_talker_codec_instead_of_appending() -> None:
+    """Sentence 2 must not keep sentence 1's 2150 in the Talker prompt.
+
+    The production wire has no nested dict ``meta``: only a flattened
+    AdditionalInformationPayload. The old isinstance(dict) check missed it.
+    """
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=False,
+        segment_finished_requests=set(),
+    )
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=True)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert list(session.prompt_token_ids) == [0] * 44
+    assert list(session._all_token_ids) == [0] * 44
+    assert 2150 not in session.prompt_token_ids
+    assert 100 not in session._all_token_ids
+    assert session.num_computed_tokens == 0
+    assert session.num_prompt_tokens == 44
+    sched._free_request_blocks.assert_called_once_with(session)
+
+
+def test_talker_update_without_replace_flag_keeps_old_codec() -> None:
+    """Control: streaming-input append is unchanged when the flag is absent."""
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=False,
+        segment_finished_requests=set(),
+    )
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=False)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert 2150 in session.prompt_token_ids or 100 in session.prompt_token_ids or 101 in session.prompt_token_ids
+    sched._free_request_blocks.assert_not_called()
 
 
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:

@@ -241,4 +241,152 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
             "instruct": [""],
             "text": [spoken_text],
         }
+        assert talker_input["model_intermediate_buffer"] == metadata
         assert prompt_length_calls[-1] == (metadata, target_model_config)
+
+
+def test_joyai_action_to_tts_takes_the_whole_utterance() -> None:
+    """JoyAI→Talker stays orchestrator-fed; there is no thinker2talker async_chunk."""
+    assert not hasattr(joyai_bridge, "joyai_action_to_tts_async_chunk")
+
+
+def test_joyai_action_to_tts_close_only_keeps_a_one_token_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_CLOSE_ONLY_KEY,
+        JOYAI_TTS_PARTIAL_KEY,
+        SentenceTtsOutput,
+    )
+
+    target_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
+    )
+
+    def fail_prompt_length(*_args, **_kwargs):
+        raise AssertionError("close_only must not estimate a Talker prompt")
+
+    monkeypatch.setattr(joyai_bridge, "_compute_talker_prompt_length", fail_prompt_length)
+    talker_inputs = joyai_bridge.joyai_action_to_tts(
+        [SentenceTtsOutput("req-1", "")],
+        prompt={
+            "additional_information": {
+                JOYAI_TTS_PARTIAL_KEY: True,
+                JOYAI_TTS_CLOSE_ONLY_KEY: True,
+            }
+        },
+        target_model_config=target_model_config,
+    )
+    [talker_input] = talker_inputs
+    assert talker_input["prompt_token_ids"] == [0]
+    assert talker_input["additional_information"]["text"] == [""]
+    assert "meta" not in talker_input["additional_information"]
+
+
+def test_joyai_action_to_tts_partial_keeps_the_sentence_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_CLOSE_ONLY_KEY,
+        JOYAI_TTS_PARTIAL_KEY,
+        SentenceTtsOutput,
+    )
+
+    target_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
+    )
+    prompt_lengths: dict[str, int] = {}
+
+    def fake_prompt_length(additional_information, talker_model_config):
+        del talker_model_config
+        spoken = additional_information["text"][0]
+        prompt_lengths[spoken] = 4
+        return 4
+
+    monkeypatch.setattr(joyai_bridge, "_compute_talker_prompt_length", fake_prompt_length)
+    talker_inputs = joyai_bridge.joyai_action_to_tts(
+        [SentenceTtsOutput("req-1", "水开了。")],
+        prompt={
+            "additional_information": {
+                JOYAI_TTS_PARTIAL_KEY: True,
+                JOYAI_TTS_CLOSE_ONLY_KEY: False,
+                "speaker": ["Vivian"],
+            }
+        },
+        target_model_config=target_model_config,
+    )
+    [talker_input] = talker_inputs
+    assert talker_input["additional_information"]["text"] == ["水开了。"]
+    assert talker_input["prompt_token_ids"] == [0] * 4
+    assert talker_input["additional_information"]["meta"]["replace_streaming_prompt"] is True
+    assert talker_input["additional_information"]["meta"]["replace_runtime_additional_information"] is True
+    assert "joyai_finish_on_next_stop" not in talker_input["additional_information"]["meta"]
+    assert talker_input["additional_information"]["embed"]["prefill"] == []
+    assert talker_input["additional_information"]["hidden_states"]["trailing_text"] == []
+    assert talker_input["model_intermediate_buffer"] == talker_input["additional_information"]
+    from vllm_omni.core.sched.omni_ar_scheduler import _streaming_update_replaces_prompt
+    from vllm_omni.data_entry_keys import serialize_payload
+
+    payload = serialize_payload(talker_input["additional_information"])
+    assert _streaming_update_replaces_prompt((None, payload)) is True
+    assert _streaming_update_replaces_prompt((None, serialize_payload({"text": ["水开了。"]}))) is False
+
+
+def test_joyai_action_to_tts_stamps_finish_on_next_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.core.sched.omni_scheduler_mixin import _request_finishes_on_next_stop
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_CLOSE_ONLY_KEY,
+        JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
+        JOYAI_TTS_PARTIAL_KEY,
+        SentenceTtsOutput,
+    )
+
+    target_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1}))
+    )
+    monkeypatch.setattr(joyai_bridge, "_compute_talker_prompt_length", lambda *_args, **_kwargs: 4)
+    talker_inputs = joyai_bridge.joyai_action_to_tts(
+        [SentenceTtsOutput("req-1", "关火。")],
+        prompt={
+            "additional_information": {
+                JOYAI_TTS_PARTIAL_KEY: True,
+                JOYAI_TTS_CLOSE_ONLY_KEY: False,
+                JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY: True,
+                "speaker": ["Vivian"],
+            }
+        },
+        target_model_config=target_model_config,
+    )
+    [talker_input] = talker_inputs
+    assert talker_input["additional_information"]["meta"][JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] is True
+    request = SimpleNamespace(
+        additional_information=talker_input["additional_information"],
+        model_intermediate_buffer=talker_input["model_intermediate_buffer"],
+    )
+    assert _request_finishes_on_next_stop(request) is True
+    from vllm_omni.data_entry_keys import serialize_payload, to_struct
+
+    # to_struct used to reject this unknown meta key; the last-sentence 2150
+    # then never reached Code2Wav as a request terminal. Convert only the
+    # known MetaStruct subset: talker_text_offset is Talker-local and is not
+    # on the struct (flatten_payload still carries it on the wire).
+    structured = to_struct(
+        {
+            "meta": {
+                "replace_streaming_prompt": True,
+                "replace_runtime_additional_information": True,
+                "talker_prefill_offset": 0,
+                JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY: True,
+            }
+        }
+    )
+    assert structured.meta is not None
+    assert structured.meta.joyai_finish_on_next_stop is True
+    wire = SimpleNamespace(
+        additional_information=serialize_payload(talker_input["additional_information"]),
+        model_intermediate_buffer=None,
+    )
+    assert _request_finishes_on_next_stop(wire) is True
+    top_level = SimpleNamespace(
+        additional_information={JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY: True},
+        model_intermediate_buffer=None,
+    )
+    assert _request_finishes_on_next_stop(top_level) is True
+    absent = SimpleNamespace(additional_information={"meta": {}}, model_intermediate_buffer=None)
+    assert _request_finishes_on_next_stop(absent) is False

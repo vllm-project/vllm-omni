@@ -89,8 +89,10 @@ frame while idle. **Send observation** also submits the current frame. During
 generation and playback, newer frames replace the pending observation; the
 next turn starts after both `response.done` and local playback finish.
 
-Replies appear as text and play through the existing speaker component, which
-sends `playback.ack`. This profile uses camera input and text instructions;
+Replies stream as assistant text (`response.output_audio_transcript.delta` /
+`response.output_text.delta`) while JoyAI is still generating, then play through
+the existing speaker component, which sends `playback.ack`. This profile uses
+camera input and text instructions;
 the default does not request microphone access. The browser only requests camera
 permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
 

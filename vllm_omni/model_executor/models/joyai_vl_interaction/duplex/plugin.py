@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     DuplexRuntimeConfigError,
+    PartialStageForward,
     duplex_history_digest,
     duplex_text_history,
 )
@@ -82,6 +83,7 @@ from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import
     _extract_completed_action_text,
     render_joyai_memory_prefix,
 )
+from vllm_omni.worker.sampling_utils import apply_fixed_seed_to_sampling_params
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -115,6 +117,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._timestamp_tokens = 0
         self._processor_lock = asyncio.Lock()
         self._memory_budget_error: str | None = None
+        # Deploy-level ``async_chunk``: the single switch for everything this
+        # plugin streams (JoyAI text deltas, per-sentence Talker handoff, Talker
+        # DELTA parks, output-stage draining). Default on so a plugin built
+        # without the engine hook keeps the streaming profile.
+        self._async_chunk_streaming = True
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         stages = {stage.model_stage: stage.stage_id for stage in pipeline_config.stages}
@@ -123,6 +130,28 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.audio_stage_id = stages["code2wav"]
         self.data_plane.joyai_stage_id = self.joyai_stage_id
         self.data_plane.audio_stage_id = self.audio_stage_id
+
+    def configure_async_chunk(self, *, enabled: bool) -> None:
+        """Follow the deploy's ``async_chunk`` for every streaming behavior.
+
+        ``async_chunk: false`` is the off switch for this profile, not just for
+        the Talker→Code2Wav edge. Sentence TTS, Talker DELTA parks and live text
+        projection all assume a prewarmed Code2Wav fed by connector chunks; with
+        the edge off, the one-shot path needs a ``finished`` Talker output and
+        would silently produce no audio, so the plugin reverts to it entirely.
+        """
+        self._async_chunk_streaming = bool(enabled)
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Talker and Code2Wav keep running after JoyAI has finished the action."""
+        if not self._async_chunk_streaming:
+            # The one-shot path submits each output stage once per turn, so
+            # nothing of a previous turn is still draining.
+            return frozenset()
+        talker_stage_id = self.joyai_stage_id + 1
+        if talker_stage_id >= stage_count:
+            return frozenset()
+        return frozenset(range(talker_stage_id, stage_count))
 
     def input_stage_id(self, payload: object) -> int:
         if isinstance(payload, Mapping) and payload.get("audio"):
@@ -274,10 +303,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index, params in enumerate(defaults):
             if isinstance(params, SamplingParams):
                 params = params.clone()
-                # Code2Wav streams each decoded chunk once. DELTA is also safe on the all-sync
-                # profiles, where Code2Wav emits one output per request. The rest only matter when complete.
+                # Code2Wav streams each decoded chunk once (DELTA). With
+                # async_chunk on, JoyAI also streams its action text and the
+                # Talker is DELTA so a 2150 park is visible and the next queued
+                # sentence can be submitted without aborting the current one.
+                # With it off, this is the one-shot profile: only Code2Wav is
+                # DELTA and every upstream stage completes before the next runs.
+                talker_stage_id = self.joyai_stage_id + 1
+                streaming_stages = {self.audio_stage_id}
+                if self._async_chunk_streaming:
+                    streaming_stages.update((self.joyai_stage_id, talker_stage_id))
                 params.output_kind = (
-                    RequestOutputKind.DELTA if index == self.audio_stage_id else RequestOutputKind.FINAL_ONLY
+                    RequestOutputKind.DELTA if index in streaming_stages else RequestOutputKind.FINAL_ONLY
                 )
                 if index == self.joyai_stage_id:
                     params.detokenize = True
@@ -285,6 +322,19 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     for key in ("temperature", "max_tokens"):
                         if runtime_config.get(key) is not None:
                             setattr(params, key, runtime_config[key])
+                elif index == talker_stage_id and self._async_chunk_streaming:
+                    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+                        JOYAI_TTS_SEED,
+                        JOYAI_TTS_TEMPERATURE,
+                    )
+
+                    # Unseeded Talker (and MTP) is why each turn sounded like a
+                    # different speaker. The same seed also starts every turn's
+                    # first sentence from the same CustomVoice draw. Lowering
+                    # temperature keeps later sentences from drifting in rate
+                    # and pitch; the GPU runner does not reseed mid-request.
+                    apply_fixed_seed_to_sampling_params(params, JOYAI_TTS_SEED, seed_talker_mtp=True)
+                    params.temperature = JOYAI_TTS_TEMPERATURE
             configured.append(params)
         return tuple(configured)
 
@@ -1467,8 +1517,89 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
         return None
 
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Hand confirmed spoken sentences to Talker while JoyAI still generates.
+
+        Only one Talker sentence is in flight. Later sentences wait for a 2150
+        park, which this plugin sees because Talker uses DELTA output.
+
+        Requires the streaming profile: with ``async_chunk: false`` the Talker is
+        one-shot, its segment stops are not visible, and Code2Wav is not
+        prewarmed, so per-sentence handoff would strand the audio.
+        """
+        if not self._async_chunk_streaming:
+            return None
+        from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+            plan_partial_stage_output,
+        )
+
+        request_id = getattr(output, "request_id", None)
+        observation = self.data_plane.requests.get(request_id) if isinstance(request_id, str) else None
+        return plan_partial_stage_output(
+            orchestrator,
+            stage_id,
+            replica_id,
+            output,
+            req_state,
+            joyai_stage_id=self.joyai_stage_id,
+            observation=observation,
+        )
+
+    def partial_stage_followup(self, plan: PartialStageForward, req_state: object) -> PartialStageForward | None:
+        """Close the Talker stream after a resumable final sentence.
+
+        JoyAI now stamps ``finish_on_next_stop`` on that last sentence and
+        records ``close_sent``, so this follow-up is a no-op. Kept as a
+        safety net if a plan still asks for ``queue_close_after`` without
+        that stamp.
+        """
+        if plan is None or not plan.queue_close_after:
+            return None
+        from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+            SentenceTtsOutput,
+            _sentence_tts_bridge,
+            mark_close_sent,
+            mark_talker_prompt_flags,
+        )
+
+        bridge = _sentence_tts_bridge(req_state)
+        if isinstance(bridge, dict) and bridge.get("close_sent"):
+            # Already closed for this turn; a second terminal would finish a
+            # session that is already closing.
+            return None
+        mark_talker_prompt_flags(req_state, close_only=True)
+        # A later 2150 park must not send a second terminal for this turn.
+        mark_close_sent(req_state)
+        request_id = str(getattr(plan.output, "request_id", ""))
+        return PartialStageForward(
+            output=SentenceTtsOutput(request_id, ""),
+            is_final_update=True,
+            close_only=True,
+        )
+
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
-        return stage_id == self.joyai_stage_id and context.segment_finished
+        """Project JoyAI action text to the client while it is generated.
+
+        With ``async_chunk`` on, every JoyAI output is projected so DELTA text
+        reaches the client live; Code2Wav still owns the terminal audio event,
+        this only adds the assistant transcript ahead of it.
+
+        With it off, this is the one-shot profile: the whole action is projected
+        once at the segment boundary, exactly as before live text existed.
+        """
+        del output
+        if stage_id != self.joyai_stage_id:
+            return False
+        if not self._async_chunk_streaming:
+            return bool(getattr(context, "segment_finished", False))
+        return True
 
     # ---- delegation: the shared tool-call lifecycle, model side ---------- #
 

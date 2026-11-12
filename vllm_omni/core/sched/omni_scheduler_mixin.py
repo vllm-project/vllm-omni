@@ -61,6 +61,47 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 _ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
+_JOYAI_FINISH_ON_NEXT_STOP = "joyai_finish_on_next_stop"
+_JOYAI_FINISH_ON_NEXT_STOP_DOTTED = f"meta.{_JOYAI_FINISH_ON_NEXT_STOP}"
+
+
+def _flag_is_set(value: object) -> bool:
+    return value is True or value == 1
+
+
+def _info_has_meta_flag(info: object, flag: str, dotted: str) -> bool:
+    """True when ``flag`` is set on a nested ``meta`` dict, a dotted key, or top-level.
+
+    JoyAI stamps ``joyai_finish_on_next_stop`` on the prompt additional_information
+    (top-level) and copies it into Talker ``meta`` for the last sentence. The
+    EngineCore wire may keep either shape after serialize_payload / to_struct.
+    """
+    if isinstance(info, dict):
+        meta = info.get("meta")
+        if isinstance(meta, dict) and _flag_is_set(meta.get(flag)):
+            return True
+        return _flag_is_set(info.get(flag)) or _flag_is_set(info.get(dotted))
+    entries = getattr(info, "entries", None)
+    if not isinstance(entries, dict):
+        return False
+    for key in (dotted, flag):
+        entry = entries.get(key)
+        if entry is not None and _flag_is_set(getattr(entry, "scalar_data", None)):
+            return True
+    return False
+
+
+def _request_finishes_on_next_stop(request: Request) -> bool:
+    return _info_has_meta_flag(
+        getattr(request, "additional_information", None),
+        _JOYAI_FINISH_ON_NEXT_STOP,
+        _JOYAI_FINISH_ON_NEXT_STOP_DOTTED,
+    ) or _info_has_meta_flag(
+        getattr(request, "model_intermediate_buffer", None),
+        _JOYAI_FINISH_ON_NEXT_STOP,
+        _JOYAI_FINISH_ON_NEXT_STOP_DOTTED,
+    )
+
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -1186,16 +1227,22 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 super().add_request(request)
                 self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
                 return
+        finishes_on_next_stop = _request_finishes_on_next_stop(request)
+        if finishes_on_next_stop:
+            request._joyai_finish_on_next_stop = True
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming
             # updates re-add a live id and are left untouched.
             self._take_async_chunk_prewarm(request)
-        elif existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
-            if adapter is not None:
-                self._finish_parked_streaming_session(existing, adapter)
-                return
+        else:
+            if finishes_on_next_stop:
+                existing._joyai_finish_on_next_stop = True
+            if existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+                if adapter is not None:
+                    self._finish_parked_streaming_session(existing, adapter)
+                    return
         super().add_request(request)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
@@ -1259,13 +1306,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         Sender ownership starts when the first chunk is queued, before the
         background thread initializes its chunk counter. A prewarmed receiver
         needs a terminal even if that first chunk has not been sent yet.
-        Final stages never queue sends, so they never match.
+
+        A 2150 segment stop may already have dropped the sender token. The
+        producer stage still owes that terminal; ``has_active_sender`` alone
+        would abort a parked close with no ``finished`` chunk, and the
+        downstream vocoder waits until the client times out. Receiver-only
+        final stages never queue sends, so they never match.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
             return None
         external_req_id = getattr(request, "external_req_id", None) or request.request_id
-        return adapter if adapter.has_active_sender(external_req_id) else None
+        if adapter.has_active_sender(external_req_id):
+            return adapter
+        sends = getattr(adapter, "custom_process_next_stage_input_func", None) is not None
+        if getattr(adapter, "receives_chunks", False) and not sends:
+            return None
+        return adapter
 
     def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
         """End a parked async-chunk session with a downstream terminal chunk."""

@@ -408,9 +408,12 @@ backlog remains in the session ledger for successive summary requests to process
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
-unplayed generated speech or retained image/audio payloads. A JoyAI assistant
-transcript becomes eligible only after its complete audio has been acknowledged.
-Playback corrections and conversation edits invalidate summaries derived from
+unplayed generated speech or retained image/audio payloads. In the JoyAI duplex
+profile with `async_chunk` enabled, the assistant text is projected as it is
+generated, while the transcript still becomes eligible for summary only after the
+complete audio has been acknowledged. With `async_chunk` disabled the profile
+projects the text once, when the action completes. Playback corrections and
+conversation edits invalidate summaries derived from
 the changed text; newer appended turns can coexist with consolidation of an
 unchanged older prefix.
 

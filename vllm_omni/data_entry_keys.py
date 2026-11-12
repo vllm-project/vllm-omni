@@ -123,6 +123,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # JoyAI last-sentence Talker unpark: this 2150 is Code2Wav's request terminal.
+    joyai_finish_on_next_stop: bool
     # embed.prefill also holds the accept-layer hidden state at multimodal
     # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
     prefill_holds_accept_hidden: bool
@@ -249,6 +251,8 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    # Last JoyAI spoken sentence: Talker's coming 2150 finishes Code2Wav.
+    joyai_finish_on_next_stop: bool | None = None
     prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None

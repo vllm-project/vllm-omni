@@ -5,6 +5,7 @@
 from collections.abc import Sequence
 from typing import Any
 
+from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
@@ -20,10 +21,17 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+    JOYAI_TTS_CLOSE_ONLY_KEY,
+    JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
+    JOYAI_TTS_PARTIAL_KEY,
+)
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     Qwen3TTSPromptEmbedsBuilder,
     first_value,
 )
+
+logger = init_logger(__name__)
 
 # Match the standalone Qwen3-TTS default attributes
 _DEFAULT_TTS_TASK_TYPE = "CustomVoice"
@@ -223,6 +231,20 @@ def asr_to_joyai(
     return joyai_inputs
 
 
+def _talker_handoff_flags(prompt: object) -> tuple[bool, bool, bool]:
+    """Read the sentence-TTS flags stamped by ``mark_talker_prompt_flags``."""
+    if not isinstance(prompt, dict):
+        return False, False, False
+    raw_info = prompt.get("additional_information")
+    if not isinstance(raw_info, dict):
+        return False, False, False
+    return (
+        bool(raw_info.get(JOYAI_TTS_PARTIAL_KEY)),
+        bool(raw_info.get(JOYAI_TTS_CLOSE_ONLY_KEY)),
+        bool(raw_info.get(JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY)),
+    )
+
+
 def _build_tts_metadata(request_prompt: object, spoken_text: str) -> dict[str, list[str]]:
     """Build Qwen3-TTS metadata for the text JoyAI chose to speak."""
     prompt_dict = request_prompt if isinstance(request_prompt, dict) else {}
@@ -302,20 +324,59 @@ def joyai_action_to_tts(
     request_prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
     talker_inputs: list[OmniTokensPrompt] = []
     for request_index, joyai_output in enumerate(source_outputs):
-        parsed_action = parse_action(_extract_completed_action_text(joyai_output))
-        if not parsed_action.spoke or not parsed_action.text:
-            continue
-
         request_prompt = request_prompts[request_index] if request_index < len(request_prompts) else None
-        tts_metadata = _build_tts_metadata(request_prompt, parsed_action.text)
+        partial, close_only, finish_on_next_stop = _talker_handoff_flags(request_prompt)
+        if close_only:
+            spoken_text = ""
+        elif partial:
+            # SentenceTtsOutput already holds the spoken sentence; do not
+            # re-parse the JoyAI action or the remainder is collapsed back
+            # into one Talker request.
+            spoken_text = _extract_completed_action_text(joyai_output).strip()
+            if not spoken_text:
+                continue
+        else:
+            parsed_action = parse_action(_extract_completed_action_text(joyai_output))
+            if not parsed_action.spoke or not parsed_action.text:
+                continue
+            spoken_text = parsed_action.text
+
+        tts_metadata = _build_tts_metadata(request_prompt, spoken_text)
         _validate_talker_speaker(tts_metadata, target_model_config)
-        talker_prompt_length = _compute_talker_prompt_length(tts_metadata, target_model_config)
+        talker_prompt_length = 1 if close_only else _compute_talker_prompt_length(tts_metadata, target_model_config)
+        # Sentence 2+ is submit_update on the same Talker id after 2150. The AR
+        # scheduler's default is streaming-input append (keep old codec KV).
+        # Each spoken sentence is a new utterance, so tell it to replace.
+        if partial and not close_only:
+            # Qwen3-TTS Talker does not set replace_runtime_additional_information
+            # (Omni/standalone TTS still append). The GPU runner therefore merges
+            # this payload onto sentence-1's buffer and would keep embed.prefill.
+            # Empty list is not a 2-D tensor, so preprocess rebuilds embeds from
+            # this sentence's text instead of slicing the previous utterance.
+            tts_metadata["meta"] = {
+                "replace_streaming_prompt": True,
+                "replace_runtime_additional_information": True,
+                "talker_prefill_offset": 0,
+                "talker_text_offset": 0,
+            }
+            if finish_on_next_stop:
+                tts_metadata["meta"][JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] = True
+            tts_metadata["embed"] = {"prefill": []}
+            tts_metadata["hidden_states"] = {"trailing_text": []}
+        logger.info(
+            "[JoyAI] talker submit close_only=%s finish_on_next_stop=%s text_len=%d prompt_len=%d",
+            close_only,
+            finish_on_next_stop,
+            len(spoken_text),
+            talker_prompt_length,
+        )
         talker_inputs.append(
             OmniTokensPrompt(
                 # OmniTokensPrompt reserves vllm scheduler positions with zero IDs;
                 # the Talker builds the actual prompt from tts_metadata.
                 prompt_token_ids=[0] * talker_prompt_length,
                 additional_information=tts_metadata,
+                model_intermediate_buffer=dict(tts_metadata),
             )
         )
 

@@ -30,6 +30,8 @@ from .base import OmniTransferAdapterBase
 logger = get_connector_logger(__name__)
 
 _RECLAIM_WARN_INTERVAL = 1000
+_JOYAI_FINISH_ON_NEXT_STOP = "joyai_finish_on_next_stop"
+_JOYAI_FINISH_ON_NEXT_STOP_DOTTED = f"meta.{_JOYAI_FINISH_ON_NEXT_STOP}"
 
 
 class _SenderGeneration:
@@ -251,9 +253,51 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
+        if value is None:
+            return False
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
-        return bool(value) if value is not None else False
+        # Wire decode of a 0-d bool tensor can land as a 1-element list.
+        # ``bool([False])`` is True, so recurse instead of treating any
+        # non-empty container as finished.
+        if isinstance(value, (list, tuple)):
+            return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
+        return bool(value)
+
+    @classmethod
+    def _info_has_joyai_finish_on_next_stop(cls, info: object) -> bool:
+        """True when JoyAI stamped ``joyai_finish_on_next_stop`` on this payload."""
+        if isinstance(info, dict):
+            nested = info.get("meta")
+            if isinstance(nested, dict) and cls._is_truthy_scalar(nested.get(_JOYAI_FINISH_ON_NEXT_STOP)):
+                return True
+            return cls._is_truthy_scalar(info.get(_JOYAI_FINISH_ON_NEXT_STOP)) or cls._is_truthy_scalar(
+                info.get(_JOYAI_FINISH_ON_NEXT_STOP_DOTTED)
+            )
+        entries = getattr(info, "entries", None)
+        if not isinstance(entries, dict):
+            return False
+        for key in (_JOYAI_FINISH_ON_NEXT_STOP_DOTTED, _JOYAI_FINISH_ON_NEXT_STOP):
+            entry = entries.get(key)
+            if entry is not None and cls._is_truthy_scalar(getattr(entry, "scalar_data", None)):
+                return True
+        return False
+
+    @classmethod
+    def _joyai_finish_on_next_stop(cls, request: Request, meta: Mapping[str, Any] | None = None) -> bool:
+        """JoyAI last-sentence flag: this packet's meta, or leftover request state.
+
+        Independent Qwen3-TTS never stamps this field. Qwen3's processor also
+        rebuilds ``MetaStruct`` and would drop it, so Talker send re-copies it
+        onto the wire after the processor returns.
+        """
+        if meta is not None and cls._is_truthy_scalar(meta.get(_JOYAI_FINISH_ON_NEXT_STOP)):
+            return True
+        if cls._is_truthy_scalar(getattr(request, "_joyai_finish_on_next_stop", False)):
+            return True
+        return cls._info_has_joyai_finish_on_next_stop(
+            getattr(request, "additional_information", None)
+        ) or cls._info_has_joyai_finish_on_next_stop(getattr(request, "model_intermediate_buffer", None))
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -730,7 +774,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            # Incremental chunks keep an earlier meta.finished
+                            # (diffusion and generation tests rely on this).
+                            # A request-terminal generation chunk must publish
+                            # finished=True: Code2Wav reads it from
+                            # additional_information, not from the adapter flag.
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (payload_finished and self.model_mode == "generation")
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -750,12 +803,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Preserve an explicit scheduler boundary even when it
                     # contains no new codec frames.
                     request.prompt_token_ids = [0]
+                elif (
+                    not has_new_ids
+                    and payload_finished
+                    and not use_tensor_codes
+                    and self._joyai_finish_on_next_stop(request, meta)
+                ):
+                    # JoyAI last sentence: 1-D empty finished marker after the
+                    # frames were already sent. Leaving prompt_token_ids=[]
+                    # parks Code2Wav in WAITING_FOR_CHUNK. Independent Qwen3
+                    # never stamps joyai_finish_on_next_stop, so it keeps []
+                    # and the existing pending_finish path. 2-D empty windows
+                    # (Fish Omni / Drama 3) stay [] via use_tensor_codes.
+                    request.prompt_token_ids = [0]
                 if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the
                     # first DAC frame arrives.
                     return False
+                if payload_finished or payload_segment_finished:
+                    logger.info(
+                        "[chunk] recv req=%s finished=%s segment=%s empty=%s resumable=%s",
+                        req_id,
+                        payload_finished,
+                        payload_segment_finished,
+                        not has_new_ids,
+                        getattr(request, "resumable", False),
+                    )
                 self._refresh_generation_chunk_prefill_state(request)
 
             # Mark as finished for consumption
@@ -989,6 +1064,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         perf_chunk = task.get("duplex_perf_chunk")
         if perf_chunk is not None:
             payload_data.meta.duplex_perf_chunk = list(perf_chunk)
+        # Qwen3-TTS processor rebuilds MetaStruct and drops this field.
+        # Copy it back so Code2Wav receive can gate the empty-finished [0]
+        # dummy on JoyAI only; independent Qwen3 never has the flag.
+        if not self._is_truthy_scalar(payload_data.meta.joyai_finish_on_next_stop) and self._joyai_finish_on_next_stop(
+            request
+        ):
+            payload_data.meta.joyai_finish_on_next_stop = True
 
         if sender_token is not None and not self._sender_generation_is_active(
             external_req_id, sender_token, is_terminal=is_finished
