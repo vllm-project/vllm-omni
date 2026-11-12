@@ -83,6 +83,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     # `__init__` is bypassed here: `_codec_sample_setup` still reads the
     # fused-prelude switch, so set it explicitly (eager chain, no kernels).
     model._codec_fused_prelude = False
+    model._codec_fused_tail = False
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -1374,6 +1375,7 @@ def _cuda_prepare_stub():
         _codec_seed=42,
         _codec_eos_id=_EOS_ID,
         _codec_fused_prelude=False,
+        _codec_fused_tail=False,
         _merge_request_codec_params=lambda *args, **kwargs: None,
         _request_generator=lambda request_id, device: None,
     )
