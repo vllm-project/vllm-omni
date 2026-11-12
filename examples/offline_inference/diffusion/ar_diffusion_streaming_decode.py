@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stream LingBot-World 2.0 pixels from one stepwise request.
+"""Stream decoded AR-Diffusion pixels from one stepwise request.
 
 One ``AsyncOmni.generate()`` drives the whole rollout: each AR block leaves
 ``post_decode()`` as one video chunk, decoded through that session's own
@@ -52,11 +52,21 @@ _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream decoded LingBot-World 2.0 video chunks from a single stepwise request.",
+        description="Stream decoded AR-Diffusion video chunks from a single stepwise request.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--model", default=_MODEL, help="Hugging Face model ID or local checkpoint path.")
+    parser.add_argument("--model-class-name", help="Pipeline override for native checkpoints without model_index.json.")
+    parser.add_argument(
+        "--model-config", default="{}", help="JSON object of pipeline-specific configuration overrides."
+    )
+    parser.add_argument(
+        "--frames-per-block", type=int, help="Native checkpoint latent block size; pair with temporal compression."
+    )
+    parser.add_argument(
+        "--temporal-compression", type=int, help="Native checkpoint temporal factor; pair with block size."
+    )
     parser.add_argument("--image", required=True, help="Initial RGB image.")
     parser.add_argument("--prompt", required=True, help="Scene prompt for the rollout.")
     parser.add_argument(
@@ -114,7 +124,9 @@ def _model_config_json(model: str, relative_path: str) -> dict[str, Any]:
     return json.loads(Path(hf_hub_download(repo_id=model, filename=relative_path)).read_text())
 
 
-def _checkpoint_geometry(model: str) -> tuple[int, int]:
+def _checkpoint_geometry(
+    model: str, *, frames_per_block: int | None = None, temporal_compression: int | None = None
+) -> tuple[int, int]:
     """Read ``(frames_per_block, temporal_compression)`` off the checkpoint.
 
     The pipeline takes both from the model --
@@ -123,6 +135,12 @@ def _checkpoint_geometry(model: str) -> tuple[int, int]:
     silently build a wrong action script and an inconsistent ``num_frames`` the
     moment ``--model`` points at a checkpoint with different geometry.
     """
+    if frames_per_block is not None or temporal_compression is not None:
+        if frames_per_block is None or temporal_compression is None:
+            raise ValueError("--frames-per-block and --temporal-compression must be supplied together.")
+        if frames_per_block <= 0 or temporal_compression <= 0:
+            raise ValueError("Block size and temporal compression must be positive.")
+        return frames_per_block, temporal_compression
     transformer_config = _model_config_json(model, "transformer/config.json")
     vae_config = _model_config_json(model, "vae/config.json")
     if "num_frames_per_block" not in transformer_config:
@@ -171,6 +189,12 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         raise ValueError("--gpu-memory-fraction must be in (0, 1].")
     if not args.request_id.strip():
         raise ValueError("--request-id must contain non-whitespace text.")
+    try:
+        model_config = json.loads(args.model_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--model-config is not valid JSON: {exc.msg}.") from None
+    if not isinstance(model_config, dict):
+        raise ValueError("--model-config must be a JSON object.")
     return image, action_script, output_dir
 
 
@@ -200,6 +224,8 @@ def _as_frames(value: Any) -> np.ndarray:
         value = value[0]
     if value.ndim != 4 or value.shape[-1] != 3:
         raise RuntimeError(f"Expected one [T, H, W, 3] pixel chunk per AR block, got shape {tuple(value.shape)}.")
+    if not np.isfinite(value).all():
+        raise RuntimeError("Streamed chunk contains non-finite pixels.")
     if value.dtype != np.uint8:
         value = (np.clip(value, 0.0, 1.0) * 255.0).round().astype(np.uint8)
     return value
@@ -227,7 +253,9 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    frames_per_block, temporal_compression = _checkpoint_geometry(args.model)
+    frames_per_block, temporal_compression = _checkpoint_geometry(
+        args.model, frames_per_block=args.frames_per_block, temporal_compression=args.temporal_compression
+    )
     num_chunks = len(camera_action_script)
     num_frames = _validate_against_checkpoint(
         camera_action_script,
@@ -237,6 +265,7 @@ async def run(argv: Sequence[str] | None = None) -> Path:
 
     engine = AsyncOmni(
         model=args.model,
+        **({"model_class_name": args.model_class_name} if args.model_class_name else {}),
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -250,8 +279,9 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             "ar_diffusion_width": args.width,
             "ar_diffusion_kv_config": {
                 "gpu_memory_fraction": args.gpu_memory_fraction,
-                "warmup_cudagraph": True,
+                "warmup_cudagraph": not args.enforce_eager,
             },
+            **json.loads(args.model_config),
         },
     )
     sampling = OmniDiffusionSamplingParams(
@@ -274,6 +304,8 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     chunk_started = t_start
     try:
         async for output in engine.generate(prompt, sampling, request_id=args.request_id):
+            if getattr(output, "error", None):
+                raise RuntimeError(output.error)
             images = getattr(output, "images", None)
             if not images:
                 continue
@@ -284,6 +316,11 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             if first_frame_at is None:
                 first_frame_at = now - t_start
             chunk_index = len(measurements)
+            expected_frames = frames_per_block * temporal_compression
+            if chunk_index == 0:
+                expected_frames -= temporal_compression - 1
+            if frames.shape != (expected_frames, args.height, args.width, 3):
+                raise RuntimeError(f"Unexpected streamed chunk shape: {tuple(frames.shape)}.")
             metadata = _chunk_metadata(output)
 
             np.save(output_dir / f"chunk_{chunk_index:03d}.npy", frames)
@@ -305,6 +342,11 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         engine.shutdown()
 
     delivered_frames = sum(int(chunk["frames"]) for chunk in measurements)
+    if len(measurements) != num_chunks or delivered_frames != num_frames:
+        raise RuntimeError(
+            f"Incomplete rollout: received {len(measurements)}/{num_chunks} chunks "
+            f"and {delivered_frames}/{num_frames} frames."
+        )
     summary_path = output_dir / "summary.json"
     summary_path.write_text(
         json.dumps(

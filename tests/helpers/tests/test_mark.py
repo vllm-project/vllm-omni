@@ -85,6 +85,78 @@ def test_same_count_multi_platform_stays_one_item():
     assert "MI325" in names
 
 
+def test_rocm_multicard_marks_skip_an_undersized_rocm_worker(monkeypatch):
+    import vllm.platforms
+
+    class UndersizedRocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+        @staticmethod
+        def device_count() -> int:
+            return 1
+
+    monkeypatch.setattr(vllm.platforms, "current_platform", UndersizedRocmPlatform())
+
+    marks = hardware_marks(res={"rocm": "MI325"}, num_cards=2)
+    skip = next(mark for mark in marks if mark.name == "skipif")
+
+    assert skip.args == (True,)
+    assert skip.kwargs == {"reason": "Need at least 2 ROCm GPUs to run the test."}
+
+
+@pytest.mark.parametrize(("platform", "sku", "device_name"), [("npu", "A2", "NPUs"), ("musa", "S5000", "MUSA GPUs")])
+@pytest.mark.parametrize("available_devices", [0, 1, 2, 4])
+@pytest.mark.parametrize("num_cards", [2, 4])
+def test_omni_multicard_marks_check_the_visible_device_count(
+    monkeypatch, platform, sku, device_name, available_devices, num_cards
+):
+    import vllm_omni.platforms
+
+    class VisibleOmniPlatform:
+        def is_npu(self) -> bool:
+            return platform == "npu"
+
+        def is_musa(self) -> bool:
+            return platform == "musa"
+
+        def get_device_count(self) -> int:
+            return available_devices
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", VisibleOmniPlatform())
+    marks = hardware_marks(res={platform: sku}, num_cards=num_cards)
+    skip = next(mark for mark in marks if mark.name == "skipif")
+
+    assert skip.args == (available_devices < num_cards,)
+    assert skip.kwargs == {"reason": f"Need at least {num_cards} {device_name} to run the test."}
+    assert _mark_names(marks) >= {platform, sku, f"cards_{num_cards}"}
+
+
+@pytest.mark.parametrize(("platform", "sku"), [("npu", "A2"), ("musa", "S5000")])
+@pytest.mark.parametrize(("num_cards", "active"), [(1, False), (1, True), (2, False)])
+def test_omni_marks_do_not_query_device_count_for_single_or_foreign_platform(
+    monkeypatch, platform, sku, num_cards, active
+):
+    import vllm_omni.platforms
+
+    class ForeignOmniPlatform:
+        def is_npu(self) -> bool:
+            return active and platform == "npu"
+
+        def is_musa(self) -> bool:
+            return active and platform == "musa"
+
+        def get_device_count(self) -> int:
+            raise AssertionError("single-card and foreign-platform marks must not query device count")
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", ForeignOmniPlatform())
+    marks = hardware_marks(res={platform: sku}, num_cards=num_cards)
+
+    assert "skipif" not in _mark_names(marks)
+    assert _mark_names(marks) >= {platform, sku, f"cards_{num_cards}"}
+
+
 def test_hardware_test_decorator_applies_cards_mark():
     @hardware_test(res={"cuda": "H100"}, num_cards=2)
     def _probe():

@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for GLM-Image stage input processor."""
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _first_source_image,
     _has_source_image,
@@ -15,6 +18,7 @@ from vllm_omni.model_executor.stage_input_processors.glm_image import (
     ar2diffusion,
     compute_max_tokens,
 )
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # =============================================================================
 
 
-def _source_output(token_ids: list[int], mm_output: dict | None = None):
+def _source_output(token_ids: list[int], mm_output: Mapping | None = None):
     """Create a minimal AR output mock."""
     return SimpleNamespace(
         outputs=[SimpleNamespace(token_ids=token_ids, cumulative_token_ids=token_ids)],
@@ -176,10 +180,82 @@ class TestComputeMaxTokens:
         result = compute_max_tokens(512, 512, factor=16, is_i2i=False)
         assert result == 1089
 
+    def test_sizeless_resolves_to_default_grid(self):
+        # The builder owns the size-less default: None resolves to the
+        # processor's DEFAULT_TARGET_SIZE (1024x1024 -> 256 + 1024 + 1).
+        # Fails with a TypeError before the builder resolved absent sizes.
+        assert compute_max_tokens(None, None, is_i2i=False) == 1281
+        assert compute_max_tokens(None, None, is_i2i=True) == 1025
+
     def test_i2i_smaller_than_t2i(self):
         t2i = compute_max_tokens(1024, 1024, is_i2i=False)
         i2i = compute_max_tokens(1024, 1024, is_i2i=True)
         assert i2i < t2i
+
+
+class TestComputeMaxTokensMatchesParser:
+    """The serving budget and the ar2diffusion parser share one grid contract.
+
+    Serving sets the AR stage's per-request max_tokens from compute_max_tokens;
+    these tests pin that budget to exactly what _parse_generated_tokens
+    requires, so the two offsets cannot drift apart.
+    """
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+            (2048, 2048),
+            (1024, 512),
+            (1280, 720),
+        ],
+    )
+    def test_t2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=False)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=False)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        # budget-1 (small+large, no EOS slot) still parses, but one token
+        # below the small+large minimum must fail: the budget is exact.
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=False)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=False)
+
+    @pytest.mark.parametrize(
+        "height,width",
+        [
+            (1024, 1024),
+            (768, 768),
+            (1536, 1536),
+        ],
+    )
+    def test_i2i_budget_stream_parses_exactly(self, height, width):
+        budget = compute_max_tokens(height, width, is_i2i=True)
+        stream = list(range(budget))
+
+        prior, out_h, out_w = _parse_generated_tokens(stream, height, width, is_i2i=True)
+        assert (out_h, out_w) == (height, width)
+        assert prior.shape[0] == (height // 32) * (width // 32) * 4
+
+        _parse_generated_tokens(stream[:-1], height, width, is_i2i=True)
+        with pytest.raises(ValueError):
+            _parse_generated_tokens(stream[:-2], height, width, is_i2i=True)
+
+
+class TestArMaxTokensRegistry:
+    """The serving path resolves GLM-Image's AR budget through the registry."""
+
+    def test_glm_image_pipeline_declares_builder(self):
+        from vllm_omni.model_extras.registry import get_ar_max_tokens_builder
+
+        assert get_ar_max_tokens_builder("GlmImagePipeline") is compute_max_tokens
+        # AR-only deploys surface the wrapper architecture name.
+        assert get_ar_max_tokens_builder("GlmImageForConditionalGeneration") is compute_max_tokens
 
 
 # =============================================================================
@@ -276,6 +352,84 @@ class TestParseGeneratedTokens:
 
 
 class TestAr2Diffusion:
+    @pytest.mark.parametrize("include_hidden", [False, True], ids=["tokens_only", "with_generic_hidden"])
+    def test_t2i_token_id_output_preserves_cumulative_tokens(self, include_hidden):
+        """DiT consumes the cumulative token sequence, not the generic tensor payload."""
+        output_type = GLM_IMAGE_PIPELINE.stages[0].engine_output_type
+        assert output_type == "token_ids"
+
+        # Default GPU execution omits hidden; some runner paths still attach it.
+        # The shared normalizer renames it without changing the tensor's values.
+        mm_output = None
+        if include_hidden:
+            hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+            mm_output = MultimodalPayload.from_raw({"hidden": hidden}, output_type)
+            assert mm_output is not None
+            assert set(mm_output) == {"token_ids"}
+            torch.testing.assert_close(mm_output["token_ids"], hidden)
+
+        # At 64x64 the AR sequence contains a 256-token preview, four target
+        # image tokens, and EOS. The final emitted delta contains only EOS.
+        token_ids = [9] * 256 + [1, 2, 3, 4] + [16385]
+        source_output = _source_output(token_ids, mm_output)
+        source_output.outputs[0].token_ids = [16385]
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 64, "target_w": 64}}
+
+        result = ar2diffusion([source_output], prompt=prompt)
+
+        assert result is not None
+        assert (result["prompt"], result["height"], result["width"]) == ("a cat", 64, 64)
+        torch.testing.assert_close(
+            result["extra"]["prior_token_ids"],
+            torch.tensor([1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]),
+        )
+        assert result["extra"]["prior_token_image_ids"] is None
+
+    @pytest.mark.parametrize("include_hidden", [False, True], ids=["explicit_ids_only", "with_generic_hidden"])
+    def test_i2i_token_id_output_preserves_source_image_tokens(self, include_hidden):
+        """Explicit image IDs survive normalization with or without hidden output."""
+        from PIL import Image
+
+        output_type = GLM_IMAGE_PIPELINE.stages[0].engine_output_type
+        assert output_type == "token_ids"
+
+        prior_image_ids = torch.tensor([5, 6, 7, 8])
+        raw_output = {"ids.prior_image": prior_image_ids}
+        hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        if include_hidden:
+            raw_output["hidden"] = hidden
+        mm_output = MultimodalPayload.from_raw(raw_output, output_type)
+        assert mm_output is not None
+        # The output processor restores dotted runner keys before emitting
+        # the payload consumed by the stage input processor.
+        mm_output = MultimodalPayload.from_dict(unflatten_payload(mm_output.to_dict()))
+        assert mm_output is not None
+        assert set(mm_output) == ({"ids", "token_ids"} if include_hidden else {"ids"})
+        torch.testing.assert_close(mm_output["ids"]["prior_image"], prior_image_ids)
+        if include_hidden:
+            torch.testing.assert_close(mm_output["token_ids"], hidden)
+
+        source_output = _source_output([1, 2, 3, 4, 16385], mm_output)
+        source_output.outputs[0].token_ids = [16385]
+        image = Image.new("RGB", (64, 64))
+        prompt = {
+            "prompt": "edit this",
+            "mm_processor_kwargs": {"target_h": 64, "target_w": 64},
+            "multi_modal_data": {"image": image},
+        }
+
+        result = ar2diffusion([source_output], prompt=prompt, requires_multimodal_data=True)
+
+        assert result is not None
+        assert (result["prompt"], result["height"], result["width"]) == ("edit this", 64, 64)
+        assert result["pil_image"] is image
+        torch.testing.assert_close(
+            result["extra"]["prior_token_ids"],
+            torch.tensor([1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]),
+        )
+        assert len(result["extra"]["prior_token_image_ids"]) == 1
+        torch.testing.assert_close(result["extra"]["prior_token_image_ids"][0], prior_image_ids)
+
     def test_basic_t2i(self):
         """Test basic text-to-image pipeline: AR -> Diffusion."""
         # 1024x1024 t2i: small(256) + large(1024) + EOS

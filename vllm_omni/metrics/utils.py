@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
 
@@ -169,7 +169,7 @@ def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
     return dict(metrics) if isinstance(metrics, dict) else {}
 
 
-def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str | tuple[str, ...]) -> float | None:
     """Sum matching diffusion stage durations in milliseconds."""
     durations = getattr(output, "stage_durations", None)
     if not isinstance(durations, dict):
@@ -189,7 +189,12 @@ def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
 
 
 def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
-    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+    # Profiler keys are "<Class>.<target path>". Count decode and decode_latent
+    # on a module named "vae" or ending in "_vae": the default "vae.decode",
+    # MammothModa2 "gen_vae.decode" and MiniMax-H3 "video_vae.decode_latent".
+    return sum_diffusion_stage_durations_ms(
+        output, (".vae.decode", "_vae.decode", ".vae.decode_latent", "_vae.decode_latent")
+    )
 
 
 def extract_diffusion_denoise_ms(output: Any) -> float | None:
@@ -245,7 +250,7 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(value)
+        value = int(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -273,7 +278,7 @@ def coerce_positive_float_scalar(value: object) -> float | None:
         except Exception:
             return None
     try:
-        value = float(value)
+        value = float(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -328,13 +333,29 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     return {}
 
 
+def iter_request_output_items(output_source: object) -> tuple[object, ...]:
+    """Normalize vLLM generation and pooling request outputs.
+
+    ``RequestOutput.outputs`` is a list of completion outputs, while
+    ``PoolingRequestOutput.outputs`` is one scalar ``PoolingOutput``. Runtime
+    metrics inspect both shapes, so normalize them before iterating.
+    """
+    outputs = getattr(output_source, "outputs", None)
+    if outputs is None:
+        return ()
+    if isinstance(outputs, (list, tuple)):
+        return tuple(outputs)
+    return (outputs,)
+
+
 def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     """Collect all non-empty multimodal_output Mappings from ``mm_source``.
 
     Lookup order:
       1. ``mm_source.multimodal_output`` — top-level attribute / property
-      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
-         entry that carries a non-empty multimodal Mapping
+      2. each normalized output item's ``multimodal_output`` — every
+         CompletionOutput entry that carries a non-empty multimodal Mapping.
+         A scalar PoolingOutput is accepted and normally contributes nothing.
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
@@ -351,7 +372,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    for output in iter_request_output_items(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -490,7 +511,7 @@ def count_video_frames(video: object) -> int | None:
 def _build_field_defs(
     cls: type,
     exclude: set[str],
-    transforms: dict[str, tuple[str, Callable]] | None = None,
+    transforms: dict[str, tuple[str, Callable[[Any], Any]]] | None = None,
 ) -> list[tuple[str, Callable[[Any], Any]]]:
     """Auto-generate field definitions from a dataclass.
 
@@ -504,16 +525,29 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
+
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            def transformed_getter(
+                event: Any,
+                *,
+                transform: Callable[[Any], Any] = transform_fn,
+                name: str = f.name,
+            ) -> Any:
+                return transform(getattr(event, name))
+
+            result.append((display_name, transformed_getter))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+
+            def getter(event: Any, *, name: str = f.name) -> Any:
+                return getattr(event, name)
+
+            result.append((f.name, getter))
     return result
 
 

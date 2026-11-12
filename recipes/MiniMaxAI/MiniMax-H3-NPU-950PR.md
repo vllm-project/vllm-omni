@@ -164,7 +164,7 @@ and remove `--enable-distributed-layerwise-offload`.
 ## Request examples
 
 Identical to the eight-card recipe; see
-[MiniMax-H3-NPU.md § HTTP API examples](MiniMax-H3-NPU.md#http-api-examples)
+[MiniMax-H3-NPU.md § FastH3 HTTP API examples](MiniMax-H3-NPU.md#fasth3-http-api-examples)
 and the GPU recipe's full parameter table.
 
 ## Benchmarks (Ascend 950PR)

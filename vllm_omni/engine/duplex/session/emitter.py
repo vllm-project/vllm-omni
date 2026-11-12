@@ -17,15 +17,18 @@ runner injects it as ``promote_deferred_overlap``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.events import (
     DOMAIN_TERMINAL_EVENTS,
     MODEL_OUTPUT_EVENTS,
     DuplexEvent,
+    ResponseDone,
     error_event,
 )
+from vllm_omni.engine.duplex.plugin import settle_response_runtime
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     discard_pending_input_audio,
@@ -33,6 +36,18 @@ from vllm_omni.engine.duplex.realtime_events import (
 )
 from vllm_omni.engine.duplex.session import overlap_policy
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
+
+
+def session_auto_responds(capabilities: object, extra_body: object) -> bool:
+    """Whether a session with these capabilities and ``extra_body`` answers without ``response.create``.
+
+    A model that takes no client commits (``supports_client_commit`` off, a
+    lockstep model) can only auto-respond; for every other model the client
+    opts in through ``extra_body.auto_response``.
+    """
+    if not getattr(capabilities, "supports_client_commit", True):
+        return True
+    return isinstance(extra_body, dict) and extra_body.get("auto_response") is True
 
 
 class SessionEmitter:
@@ -84,8 +99,55 @@ class SessionEmitter:
     # ------------------------------------------------------------------ #
 
     def emit_events(self, events: list[DuplexEvent]) -> None:
-        for event in events:
-            self._ctx.manager.emit(self._ctx.session, event)
+        self._ctx.manager.emit(self._ctx.session, events)
+
+    def fail_output(self, message: str, *, response_id: str | None, terminal: ResponseDone | None) -> list[DuplexEvent]:
+        """Fail undelivered output, returning recovery events without sending them again."""
+        session = self._ctx.session
+        self._ctx.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
+        if session.active_response_id is not None:
+            # Close still needs the request binding to abort the real engine work.
+            failed_response_id = session.active_response_id
+            session.end_response(commit_text=False, preserve_request=True)
+            settle_response_runtime(
+                self._ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
+            )
+        events: list[DuplexEvent] = [error_event("output_backpressure", message)]
+        if response_id is None:
+            return events
+        # Normal completion can commit just before its projected ending is
+        # delivered. An ending converted to failure must undo that commit.
+        session.delete_history_item(f"item_{response_id}")
+        payload = {
+            "type": "response.done",
+            "session_id": session.session_id,
+            "response_id": response_id,
+            "epoch": session.epoch,
+            "committed": False,
+            "status": "failed",
+            "status_details": {"type": "failed", "reason": "output_backpressure"},
+            "playback": session.playback.as_dict(),
+        }
+        if terminal is None:
+            projected = project_internal_event(self.require_projector(), payload)
+            terminal = next((event for event in projected if isinstance(event, ResponseDone)), None)
+        else:
+            response = dict(terminal.response)
+            metadata = response.get("metadata")
+            response.update(
+                status="failed",
+                status_details=payload["status_details"],
+                metadata={**(metadata if isinstance(metadata, Mapping) else {}), **payload},
+            )
+            output = response.get("output")
+            if isinstance(output, list):
+                response["output"] = [
+                    {**item, "status": "failed"} if isinstance(item, Mapping) else item for item in output
+                ]
+            terminal = replace(terminal, response=response)
+        if terminal is not None:
+            events.append(terminal)
+        return events
 
     def emit_error(
         self,
@@ -110,6 +172,13 @@ class SessionEmitter:
         accepted, deferred_overlap_payload = self._apply_outbound_session_event(payload)
         if not accepted:
             return
+        if payload.get("type") == "audio.cancelled":
+            response_id = payload.get("response_id")
+            cancelled_epoch = payload.get("cancelled_epoch")
+            if isinstance(response_id, str) and isinstance(cancelled_epoch, int):
+                self._ctx.manager.invalidate_output(
+                    self._ctx.session.session_id, response_id, through_epoch=cancelled_epoch
+                )
         self.emit_events(project_internal_event(self.require_projector(), payload))
         if deferred_overlap_payload is not None and not self._ctx.run.closing:
             precreate_response = self._ctx.model_state.deferred_precreate_response
@@ -121,18 +190,10 @@ class SessionEmitter:
     # ------------------------------------------------------------------ #
 
     def auto_responds(self) -> bool:
-        """Whether the session answers committed input without a ``response.create``.
-
-        A model that takes no client commits (``supports_client_commit`` off, a
-        lockstep model) can only auto-respond; for every other model the
-        client opts in through ``extra_body.auto_response``.
-        """
-        if not self._ctx.session.capabilities.supports_client_commit:
-            return True
-        extra = getattr(self._ctx.session.config, "extra_body", None)
-        if not isinstance(extra, dict):
-            return False
-        return extra.get("auto_response") is True
+        """Whether the session answers committed input without a ``response.create``."""
+        return session_auto_responds(
+            self._ctx.session.capabilities, getattr(self._ctx.session.config, "extra_body", None)
+        )
 
     def is_stale_model_output(self, payload: dict[str, object]) -> bool:
         """Whether ``payload`` belongs to a turn the session has already moved past."""
@@ -182,15 +243,6 @@ class SessionEmitter:
         )
         can_promote_overlap = response_terminal and terminal_status not in {"cancelled", "failed"}
         deferred_overlap_payload: dict[str, object] | None = None
-        continuous_input_crosses_terminal = (
-            can_promote_overlap
-            and self.auto_responds()
-            and model_state.input_since_commit
-            and not model_state.deferred_response_create
-        )
-        if continuous_input_crosses_terminal:
-            session.reset_overlap_speech()
-            return True, None
         realtime_input_still_open = (
             can_promote_overlap and model_state.input_since_commit and not model_state.deferred_response_create
         )
@@ -211,14 +263,15 @@ class SessionEmitter:
                 deferred_overlap_payload = model_state.audio_buffer.flush(
                     chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                 )
-                if model_state.committed_audio_payload is not None:
+                prior_committed = model_state.mergeable_committed_audio()
+                if prior_committed is not None:
                     if deferred_overlap_payload is not None:
                         deferred_overlap_payload = overlap_policy.merge_audio_payloads(
-                            model_state.committed_audio_payload,
+                            prior_committed,
                             deferred_overlap_payload,
                         )
                     else:
-                        deferred_overlap_payload = model_state.committed_audio_payload
+                        deferred_overlap_payload = prior_committed
                 if self.auto_responds() and deferred_overlap_payload is not None:
                     deferred_overlap_payload = dict(deferred_overlap_payload)
                     deferred_overlap_payload["force_listen"] = False
@@ -240,16 +293,11 @@ class SessionEmitter:
                 model_state.speech_since_commit = False
                 if had_pending_overlap_audio and self._projector is not None:
                     self.emit_events(discard_pending_input_audio(self._projector, session.overlap_speech_ms))
-                if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
-                    session.release_input_bytes(model_state.clear_committed_audio())
 
         session.reset_overlap_speech()
-        if (
-            can_promote_overlap
-            and model_state.deferred_response_create
-            and model_state.committed_audio_payload is not None
-        ):
-            deferred_overlap_payload = model_state.committed_audio_payload
+        mergeable = model_state.mergeable_committed_audio()
+        if can_promote_overlap and model_state.deferred_response_create and mergeable is not None:
+            deferred_overlap_payload = mergeable
             model_state.deferred_response_create = False
             model_state.input_since_commit = False
             model_state.speech_since_commit = False

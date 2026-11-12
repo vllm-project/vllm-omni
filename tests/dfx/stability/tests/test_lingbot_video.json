@@ -1,0 +1,51 @@
+[
+    {
+        "test_name": "test_lingbot_video_t2v_stability",
+        "description": "LingBot-Video dense T2V 24h: single H800 at 320x192, 9 frames, 2 steps",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "robbyant/lingbot-video-dense-1.3b",
+            "serve_args": {
+                "model-class-name": "LingBotVideoPipeline",
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "seed": 42,
+                "enable_negative_prompt": true,
+                "random_request_config": [
+                    {
+                        "width": 320,
+                        "height": 192,
+                        "num_inference_steps": 2,
+                        "num_frames": 9,
+                        "fps": 24,
+                        "weight": 1
+                    }
+                ],
+                "extra_body": {
+                    "guidance_scale": 3.0,
+                    "flow_shift": 3.0
+                }
+            }
+        ]
+    }
+]

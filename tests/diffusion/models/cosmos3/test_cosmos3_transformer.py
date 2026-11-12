@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -95,7 +96,6 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
     expected_gen: str | None,
 ) -> None:
     """Resolve pipeline-level defaults and Cosmos3 subcomponent overrides."""
-    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
     from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
@@ -120,7 +120,7 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
             received.append(("gen_layers", quant_config))
 
     monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
-    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_gen_layer_cls", _StubGenDecoderLayer)
 
     if config_kind == "flat":
         top_level_config = configs["transformer"]
@@ -534,6 +534,58 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.validate_loaded_weights(missing_k_norm)
 
 
+def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.models import utils as model_utils
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    def _make_stage(*, first: bool) -> Cosmos3EdgeVFMTransformer:
+        model = object.__new__(Cosmos3EdgeVFMTransformer)
+        nn.Module.__init__(model)
+        model.num_hidden_layers = 2
+        model.qk_norm_for_diffusion = True
+        model.use_und_k_norm_for_gen = True
+        # PP=2 layout from make_layers: each stage owns one GEN layer and the
+        # UND backbone lives only on the first stage.
+        model.language_model = nn.Linear(1, 1) if first else PPMissingLayer()
+        model.gen_layers = nn.ModuleList(
+            [nn.Linear(1, 1), PPMissingLayer()] if first else [PPMissingLayer(), nn.Linear(1, 1)]
+        )
+        return model
+
+    first_stage = _make_stage(first=True)
+    last_stage = _make_stage(first=False)
+
+    # Simulate a stale cache lookup without mutating vLLM's process-global
+    # id-keyed cache, which would leak the same failure into later tests.
+    monkeypatch.setattr(model_utils, "get_pp_missing_layer_names", lambda _model: [])
+
+    first_loaded = {
+        f"transformer.language_model.layers.{i}.{suffix}.weight"
+        for i in range(2)
+        for suffix in ("mlp.up_proj", "mlp.down_proj", "self_attn.k_norm_und_for_gen")
+    } | {
+        "transformer.gen_layers.0.mlp.up_proj.weight",
+        "transformer.gen_layers.0.mlp.down_proj.weight",
+    }
+    last_loaded = {
+        "transformer.gen_layers.1.mlp.up_proj.weight",
+        "transformer.gen_layers.1.mlp.down_proj.weight",
+    }
+
+    first_stage.validate_loaded_weights(first_loaded)
+    last_stage.validate_loaded_weights(last_loaded)
+
+    # Layers this stage owns are still required.
+    with pytest.raises(ValueError, match=r"gen_layers\.1\.mlp\.up_proj"):
+        last_stage.validate_loaded_weights(last_loaded - {"transformer.gen_layers.1.mlp.up_proj.weight"})
+    with pytest.raises(ValueError, match=r"language_model\.layers\.1\.mlp\.down_proj"):
+        first_stage.validate_loaded_weights(first_loaded - {"transformer.language_model.layers.1.mlp.down_proj.weight"})
+
+
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
@@ -824,6 +876,134 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
         assert not hasattr(model, name)
 
 
+@pytest.mark.parametrize("sequence_length", [16, 17])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("seacache", [False, True])
+@pytest.mark.parametrize("control_count", [0, 1, 2])
+@pytest.mark.parallel
+@torch.inference_mode()
+def test_sp_releases_full_gen_embedding_during_stack(
+    monkeypatch, sequence_length, batch, rank, seacache, control_count
+) -> None:
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.cache.seacache import SeaCacheConfig, apply_sea_cache_hook
+    from vllm_omni.diffusion.distributed import parallel_state, sp_sharding
+    from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+    from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+    from vllm_omni.diffusion.hooks import sequence_parallel
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    full_refs: list = []
+    full_pointers: list = []
+    layer_calls = 0
+    total_length = sequence_length * (control_count + 1)
+    uses_sp = control_count <= 1
+
+    class CheckingLayer(nn.Module):
+        def forward(self, hidden, **kwargs):
+            nonlocal layer_calls
+            layer_calls += 1
+            if full_refs:
+                # Inspect lifetime inside the production stack while the
+                # caller's prepared state is still live.
+                assert full_refs[-1]() is None
+                if layer_calls % 2 == 1:
+                    assert hidden.untyped_storage().data_ptr() != full_pointers[-1]
+                assert hidden.shape == (batch, (total_length + 3) // 4, 8)
+                assert hidden.untyped_storage().nbytes() == hidden.numel() * hidden.element_size()
+                assert kwargs["freqs_cos"].shape[1] == kwargs["freqs_sin"].shape[1] == hidden.shape[1]
+            elif not uses_sp:
+                assert hidden.shape == (batch, total_length, 8)
+            return hidden + 1
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.gen_layers = nn.ModuleList([CheckingLayer(), CheckingLayer()])
+    model.cached_kv = [(torch.empty(0), torch.empty(0)) for _ in model.gen_layers]
+    inputs = {
+        "hidden_states": torch.randn(batch, 2, 1, 1, sequence_length),
+        "timestep": torch.ones(batch),
+        "text_ids": torch.ones(batch, 2, dtype=torch.long),
+        "text_mask": torch.ones(batch, 2, dtype=torch.long),
+        "video_shape": (1, 1, sequence_length),
+        "control_latents": [torch.randn(batch, 2, 1, 1, sequence_length) for _ in range(control_count)],
+    }
+    gathered_reference = []
+    normalized_reference = []
+    handle = model.gen_sp_gather.register_forward_pre_hook(
+        lambda module, args: gathered_reference.append(args[0].clone())
+    )
+    norm_handle = model.norm_moe_gen.register_forward_hook(
+        lambda module, args, output: normalized_reference.append(output.clone())
+    )
+    expected = model(**inputs)
+    handle.remove()
+    norm_handle.remove()
+
+    class MaskBackend:
+        @staticmethod
+        def supports_attention_mask(spec):
+            return True
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (4, rank, None))
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(selector, "get_attn_backend_for_capability", lambda **kwargs: MaskBackend())
+
+    def gather(hidden, dim, validate):
+        shard_length = hidden.shape[1]
+        start = rank * shard_length
+        valid_length = min(shard_length, total_length - start)
+        reference = normalized_reference[0] if seacache else gathered_reference[0]
+        torch.testing.assert_close(hidden[:, :valid_length], reference[:, start : start + valid_length])
+        # Supply the other ranks' outputs without retaining the original input.
+        return torch.nn.functional.pad(reference, (0, 0, 0, -total_length % 4))
+
+    monkeypatch.setattr(sequence_parallel, "sp_gather", gather)
+    sequence_parallel.apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=4), model._sp_plan)
+
+    def record_full_embedding(module, args):
+        full_refs.append(weakref.ref(args[0]))
+        full_pointers.append(args[0].untyped_storage().data_ptr())
+
+    model.gen_sp_prepare.register_forward_pre_hook(record_full_embedding)
+    metadata = SimpleNamespace(step=0)
+    if seacache:
+        sea_hook = apply_sea_cache_hook(
+            model,
+            SeaCacheConfig(threshold=100.0, residual_order=0),
+            current_step_callback=lambda: metadata.step,
+            current_sigma_callback=lambda: 1.0,
+            num_inference_steps_callback=lambda: 4,
+        )
+        sea_hook.state_manager.set_context("cond")
+    layer_calls = 0
+    for step in range(4 if seacache else 2):
+        metadata.step = step
+        with set_forward_context():
+            output = model(**inputs)
+            torch.testing.assert_close(output, expected)
+            assert get_forward_context()._sp_shard_depth == 0
+            if seacache:
+                if uses_sp:
+                    assert full_refs[-1]() is None
+                history = sea_hook.state_manager.get_state().history
+                assert history
+                residual = history[-1][1]
+                assert residual.shape == (batch, (total_length + 3) // 4 if uses_sp else total_length, 8)
+                assert residual.untyped_storage().nbytes() == residual.numel() * residual.element_size()
+    assert layer_calls == 4
+    assert len(full_refs) == ((4 if seacache else 2) if uses_sp else 0)
+    if seacache:
+        assert sea_hook.full_count == sea_hook.skip_count == 2
+
+
 def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -866,6 +1046,93 @@ def test_qwen_gen_mlp_remains_gated() -> None:
 
     assert isinstance(model.gen_layers[0].mlp, Cosmos3GatedMLP)
     assert hasattr(model.gen_layers[0].mlp, "gate_proj")
+
+
+@pytest.mark.parametrize("edge", [False, True])
+@pytest.mark.parametrize(
+    "use_hsdp,strategy", [(False, "full"), (False, "pre_sharded"), (True, "full"), (True, "pre_sharded")]
+)
+def test_cosmos3_releases_blocks_only_for_pre_sharded_hsdp(edge, use_hsdp, strategy, monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3, transformer_cosmos3_edge
+    from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
+
+    released = []
+
+    def release_and_check(block):
+        parameters = dict(block.named_parameters())
+        metadata = {name: dict(parameter.__dict__) for name, parameter in parameters.items()}
+        release_module_parameters_to_meta(block)
+        for name, parameter in block.named_parameters():
+            assert parameter is parameters[name]
+            assert parameter.device.type == "meta"
+            assert parameter.__dict__ == metadata[name]
+        released.append(block)
+
+    monkeypatch.setattr(transformer_cosmos3, "release_module_parameters_to_meta", release_and_check)
+    monkeypatch.setattr(transformer_cosmos3_edge, "release_module_parameters_to_meta", release_and_check)
+    model_cls = (
+        transformer_cosmos3_edge.Cosmos3EdgeVFMTransformer if edge else transformer_cosmos3.Cosmos3VFMTransformer
+    )
+    config = _tiny_cosmos3_edge_config if edge else _tiny_cosmos3_config
+    model = model_cls(
+        SimpleNamespace(
+            tf_model_config=config(num_hidden_layers=1),
+            dtype=torch.float32,
+            parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+            hsdp_weight_load_strategy=strategy,
+        )
+    )
+    blocks = [*model.language_model.layers, *model.gen_layers]
+    expected_meta = use_hsdp and strategy == "pre_sharded"
+    assert len(released) == (len(blocks) if expected_meta else 0)
+    assert all((p.device.type == "meta") == expected_meta for block in blocks for p in block.parameters())
+    assert model.time_embedder.linear_1.weight.device.type != "meta"
+    assert all(buffer.device.type != "meta" for buffer in model.buffers())
+
+
+@pytest.mark.parametrize("edge", [False, True])
+def test_cosmos3_pre_sharded_meta_processing_accepts_real_unquantized_blocks(edge, monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+    from vllm_omni.diffusion.models.cosmos3 import Cosmos3EdgeVFMTransformer, Cosmos3VFMTransformer
+
+    model_cls = Cosmos3EdgeVFMTransformer if edge else Cosmos3VFMTransformer
+    config = _tiny_cosmos3_edge_config if edge else _tiny_cosmos3_config
+    model = model_cls(
+        SimpleNamespace(
+            tf_model_config=config(num_hidden_layers=1),
+            dtype=torch.float32,
+            parallel_config=SimpleNamespace(use_hsdp=True),
+            hsdp_weight_load_strategy="pre_sharded",
+        )
+    )
+    groups = [SimpleNamespace(module=block) for block in (*model.language_model.layers, *model.gen_layers)]
+    plan = SimpleNamespace(roots=[SimpleNamespace(module=model)], groups=groups)
+    processed = []
+    # Exercise model selection with real vLLM linears, without invoking the
+    # CPU-specific weight packing hook on meta tensors in CPU-only CI.
+    monkeypatch.setattr(
+        UnquantizedLinearMethod, "process_weights_after_loading", lambda self, layer: processed.append(layer)
+    )
+    DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    expected = [module for group in groups for module in group.module.modules() if hasattr(module, "quant_method")]
+    assert expected
+    assert processed == expected
+
+    model._hsdp_pre_sharded_meta_post_load = False
+    with pytest.raises(ValueError, match="has not declared"):
+        DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    model._hsdp_pre_sharded_meta_post_load = True
+
+    class UnsupportedMethod(UnquantizedLinearMethod):
+        pass
+
+    expected[-1].quant_method = UnsupportedMethod()
+    processed.clear()
+    with pytest.raises(ValueError, match="UnsupportedMethod"):
+        DiffusersPipelineLoader._process_pre_sharded_hsdp_groups_on_meta(plan)
+    assert not processed
 
 
 def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1307,3 +1574,213 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    prep = model._gen_preprocess(
+        torch.zeros(1, 2, 1, 2, 2),
+        torch.tensor([1.0]),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        torch.ones(1, 2, dtype=torch.long),
+        (1, 2, 2),
+    )
+
+    sharded = model._shard_gen_prep(prep, defer_gather=True)
+    assert sharded.freqs_gen is not None
+    assert sharded.defer_gen_gather
+    with pytest.raises(RuntimeError, match="already in the execution layout"):
+        model._shard_gen_prep(sharded)
+    # A deferred gather without sharding would gather a full-layout tensor.
+    with pytest.raises(RuntimeError, match="_shard_gen_prep"):
+        model._run_gen_stack(prep._replace(defer_gen_gather=True))
+
+
+def test_transformer_builds_full_layer_replica_without_pp_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    # No PP group was initialized: the transformer must still construct and
+    # behave like a single-stage pipeline covering every layer.
+    assert model.start_layer == 0
+    assert model.end_layer == 2
+    assert len(model.gen_layers) == 2
+    assert all(not isinstance(layer, transformer_cosmos3.PPMissingLayer) for layer in model.gen_layers)
+
+    assert isinstance(model.gen_sp_prepare, transformer_cosmos3.Cosmos3GenSPPrepare)
+
+
+def test_model_cpu_offload_rejects_pipeline_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+    assert not getattr(model, "_model_cpu_offload_enabled", False)
+
+
+def test_build_pp_intermediate_tensors_sends_und_cache_on_first_step_only() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    model.cached_freqs_gen = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.reset_pp_step()
+    hidden = torch.randn(1, 4, 8)
+
+    first = model._build_pp_intermediate_tensors(hidden)
+    assert torch.equal(first["hidden_gen"], hidden)
+    assert torch.equal(first["freqs_cos"], model.cached_freqs_gen[0])
+    assert torch.equal(first["freqs_sin"], model.cached_freqs_gen[1])
+    assert torch.equal(first["cached_k_0"], model.cached_kv[0][0])
+    assert torch.equal(first["cached_v_1"], model.cached_kv[1][1])
+
+    second = model._build_pp_intermediate_tensors(hidden)
+    assert set(second.tensors) == {"hidden_gen"}
+
+
+def test_maybe_load_und_cache_and_prep_sizes_from_pp_intermediate_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    model.cached_freqs_gen = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.reset_pp_step()
+    hidden = torch.randn(1, 4, 8)
+    its = model._build_pp_intermediate_tensors(hidden)
+
+    receiver = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    receiver._maybe_load_und_cache_from_intermediate_tensors(its)
+    assert receiver.cached_kv is not None and len(receiver.cached_kv) == 2
+    assert receiver.cached_freqs_gen == model.cached_freqs_gen
+
+    action = torch.zeros(1, 3, 4)
+    sound = torch.zeros(1, 3, 2)
+    prep = receiver._prep_from_pp_intermediate_tensors(
+        its,
+        (1, 2, 2),
+        action_latents=action,
+        action_domain_ids=torch.tensor([0]),
+        sound_latents=sound,
+    )
+    assert torch.equal(prep.hidden_gen, hidden)
+    assert prep.freqs_gen is None
+    assert (prep.t, prep.h, prep.w) == (1, 2, 2)
+    # latent_patch_size=1: hp*wp == h*w
+    assert prep.s_video == 1 * 2 * 2
+    assert prep.s_action == 3
+    assert prep.s_sound == 2
+    assert prep.has_action and prep.has_sound and not prep.has_control
+
+
+def test_run_gen_layers_rejects_cache_dit_wrapper_under_pp(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    freqs = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.cached_freqs_gen = freqs
+
+    class PassthroughWrapper(nn.Module):
+        def forward(self, hidden, **kwargs):
+            return hidden
+
+    # Cache-dit replaces gen_layers with a single grouped wrapper.
+    model.gen_layers = nn.ModuleList([PassthroughWrapper()])
+
+    model.start_layer, model.end_layer = 0, 1  # a PP rank slice
+    with pytest.raises(NotImplementedError, match="Cache-Dit"):
+        model._run_gen_layers(
+            torch.randn(1, 2, 8),
+            freqs_gen=freqs,
+            gather_output=False,
+        )
+
+    # A full replica slice keeps the wrapper loop working.
+    model.start_layer, model.end_layer = 0, 2
+    hidden = torch.randn(1, 2, 8)
+    torch.testing.assert_close(
+        model._run_gen_layers(
+            hidden,
+            freqs_gen=freqs,
+            gather_output=False,
+        ),
+        hidden,
+    )
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("already_sharded", [False, True])
+def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_outputs(grouped, already_sharded) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.cached_kv = [(torch.tensor([i]), torch.tensor([i + 10])) for i in range(2)]
+    model.cached_freqs_gen = (torch.tensor([20]), torch.tensor([30]))
+    prepared = []
+    gathered = []
+
+    def prepare(hidden, cos, sin):
+        prepared.append(hidden)
+        return hidden + 1, cos, sin
+
+    def gather(hidden):
+        gathered.append(hidden)
+        return hidden + 100
+
+    model.gen_sp_prepare = prepare
+    model.gen_sp_gather = gather
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, **kwargs):
+            assert kwargs["control_token_sizes"] == (2, 3)
+            assert kwargs["control_weights"] == (0.5, 1.5)
+            if grouped:
+                assert kwargs["cached_kv"] is model.cached_kv
+                assert kwargs["freqs_gen"] == model.cached_freqs_gen
+                return (hidden + 4,)
+            assert kwargs["k_und"] is model.cached_kv[self.index][0]
+            assert kwargs["v_und"] is model.cached_kv[self.index][1]
+            return (hidden + 2,)
+
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(1 if grouped else 2)])
+    inputs = torch.zeros(1, 3, 4)
+    kwargs = dict(control_token_sizes=(2, 3), control_weights=(0.5, 1.5))
+    if already_sharded:
+        kwargs["freqs_gen"] = model.cached_freqs_gen
+    output = model._run_gen_layers(inputs, **kwargs)
+    torch.testing.assert_close(output, torch.full_like(inputs, 104 if already_sharded else 105))
+    assert len(prepared) == (0 if already_sharded else 1)
+    assert len(gathered) == 1
+    output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
+    torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
+    assert len(gathered) == 1

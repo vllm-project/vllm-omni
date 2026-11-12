@@ -45,6 +45,26 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
 | `sp_gather()` | Manual tensor gathering | Gathers sharded tensors from all workers |
 
+### NPU symmetric-memory Ulysses
+
+On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
+symmetric memory directly into the final attention layout. It requires
+TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
+search path. This backend does not build a repository C++/AscendC extension;
+Triton uses its normal JIT toolchain.
+
+The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
+`ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
+WORLD ranks in the same order within one HCCS domain. Every rank must issue
+matching exchanges on one stream. A publication barrier precedes peer reads
+and a reuse barrier follows them. Outputs own their storage; one growable staging workspace is reused
+across layers. Worker shutdown must clear it collectively before destroying
+the process group.
+
+The NPU attention factory rejects Ulysses × AllGather-KV when this option is
+enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
+The same topology remains available through the standard communication path.
+
 ---
 
 ## UAA Mode (Experimental)
@@ -281,6 +301,10 @@ NOTE: be careful to test adequately when refactoring classes that take this styl
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 | `split_output` | bool | `False`: shard **input** params; `True`: shard **output** tensors |
 | `auto_pad` | bool | Auto-pad if sequence not divisible by world_size (default: `False`) |
+| `clone_shard` | bool | Give multi-rank shards their own contiguous storage (default: `False`); single-rank inputs are unchanged |
+
+With `clone_shard=True`, memory savings require callers to drop their references to the full tensor.
+Other references to the same storage also keep the full allocation alive.
 
 **SequenceParallelOutput Parameters:**
 

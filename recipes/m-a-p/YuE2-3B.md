@@ -19,6 +19,11 @@ renders it with the lyrics. `cot=off` skips the score and generates music
 directly. Weights are **CC BY-NC 4.0** (non-commercial); this recipe loads
 user-downloaded weights and bundles none.
 
+To start from a recording, use the [SheetSage2 H200 recipe](SheetSage2-H200.md)
+to transcribe it into ABC in a separate environment, then pass the score to
+YuE2 with `--abc-file`. It includes full-song frame budgets and offline cover
+validation details.
+
 ## References
 
 - Model card: [m-a-p/YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B)
@@ -40,9 +45,11 @@ user-downloaded weights and bundles none.
 | Output | 48 kHz stereo, whole song delivered when the semantic request finishes |
 
 Generation is one or two requests on a single AR stage: the abc phase writes
-the score, the semantic phase generates codec frames and, on its last step,
-solves the ODE and decodes the whole song in-engine (weights load once; the
-VAE loads at startup from `$YUE2_VAE` or the hub id).
+the score, the semantic phase generates codec frames, then queues the ODE and VAE on a
+high-priority CUDA stream. Other requests keep decoding while the finishing
+request emits HOLD tokens (up to 4096 steps, within its token/context budget).
+The scheduler is unchanged. Weights load once; the VAE loads at startup from
+`$YUE2_VAE` or the hub id.
 
 ## Running
 
@@ -67,15 +74,50 @@ ending.
 
 ## Notes
 
-- **Memory (RTX 4090, 24 GB, `gpu_memory_utilization: 0.70`):** the engine
-  reserves ~15.8 GiB after startup; with 4 concurrent requests pinned to the
-  9000-frame cap (worst case), peak usage during the terminal NAR/VAE
-  finishing pass reaches ~20.9 GiB, leaving ~3 GiB of headroom. At 0.85 the
-  same workload OOMs inside the finishing pass, so the deploy yaml pins 0.70.
-- **Known limitations:** 4 concurrent full-length requests are the verified
-  shape (`max_num_seqs: 4`); CUDA graph capture is a
-  follow-up; the abc phase runs eagerly
-  after prefill (its tokens are the product, not audio).
+The lifecycle e2e regression forces KV-cache preemption with chunked and
+unchunked recompute, mixes ABC and semantic sampling, and cancels a request
+after NAR work has started. It checks history alignment, released synthesis
+buffers, and successful generation after cancellation. Run with one H100/H200
+and cached YuE2-3B and YuE2-Vae weights:
+
+```bash
+export YUE2_MODEL_DIR=/path/to/YuE2-3B
+export YUE2_VAE=/path/to/YuE2-Vae
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_yue2.py \
+    -k preemption_and_synthesis_abort -m 'slow and tts' --run-level full_model -q -s
+```
+
+The test retains the module's weekly TTS routing; it is not a per-PR CI gate.
+
+- **Memory:** `gpu_memory_utilization` budgets the vLLM engine; NAR K/V,
+  acoustic graph buffers and VAE activations also need room during synthesis.
+  The 0.70 / 4-slot defaults require validation on the target card. The earlier
+  RTX 4090 measurement (15.8 GiB after startup, 20.9 GiB peak at 9000 frames)
+  predates the async/compiled implementation; it does not validate this
+  version or long ABC prefixes on a 4090. Reduce the fraction if the target
+  workload needs more synthesis memory, especially for long ABC prefixes and
+  the 9000-frame cap. Releasing completed chunks bounds live NAR buffers,
+  while the shared graph allocator retains reserved storage for reuse.
+- **CUDA graphs:** the default deploy keeps the AR backbone eager. Both ABC
+  and semantic sampling use prewarmed power-of-two graph buckets. Custom
+  sampler captures have a bounded cache and fall back to eager sampling when
+  it fills. The NAR velocity pass uses a chunk graph on the serialized synthesis
+  stream. Chunk graphs share one allocator pool; completed chunks release
+  their engines and buffers after their own events. FA3 runs on Hopper; other
+  CUDA cards use SDPA, which is also warmed at startup.
+- **Serving:** run `vllm serve m-a-p/YuE2-3B --omni` with the default
+  `yue2.yaml`, which uses eager AR with 4 slots. Validate memory capacity
+  for the target card and workload.
+  For the tested single-H200 graph settings, reuse this deploy with
+  `--stage-overrides '{"0":{"max_num_seqs":32,"gpu_memory_utilization":0.5,"enforce_eager":false,"compilation_config":{"cudagraph_mode":"FULL_AND_PIECEWISE"}}}'`.
+  Decode uses FULL and mixed prefill uses PIECEWISE; VAE and the Python
+  synthesis queue remain outside these graphs.
+  Audio is delivered as a whole song; time to first audio equals completion
+  latency. Aborting a running song stops future work units and waits only for
+  the at-most-two submitted units before releasing its buffers.
+- **Preemption:** before drawing for a resumed row, model-owned sampling
+  reconciles the codec history and terminal flags with the engine's retained
+  sequence. Discarded draws cannot advance its penalty window or frame budget.
 - Audio is not expected to match the upstream torch reference bit-for-bit
   (fused vs eager kernels). Measured against the upstream torch reference
   (bd90e4c, same style/lyrics/seed 831001, cot=off, 200 frames): prompt token

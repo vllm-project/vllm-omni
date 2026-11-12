@@ -71,10 +71,28 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
+    """Detect the Flux3 package schema."""
+    from vllm_omni.diffusion.utils.flux3_package import _is_flux3_package_config
+
+    try:
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+    except Exception:
+        return False
+    if not isinstance(cfg, Mapping):
+        return False
+    return _is_flux3_package_config(cfg)
+
+
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
+    from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
-    return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
+    if _looks_like_magi2(model_name):
+        return "Magi2Pipeline"
+    if resolve_checkpoint(model_name) is not None:
+        return "VideoDepthAnythingPipeline"
+    return None
 
 
 def _looks_like_dreamzero(model_name: str) -> bool:
@@ -158,7 +176,13 @@ def is_diffusion_model(model_name: str) -> bool:
                 logger.debug("Failed to read local %s: %s", filename, e)
 
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
-    config_dict = get_diffusion_model_index(model_name)
+    # get_hf_file_to_dict can raise for local paths that don't resolve to a Hub
+    # repo id (see resolve_model_class_name's identical guard for the same call).
+    try:
+        config_dict = get_diffusion_model_index(model_name)
+    except Exception as e:
+        logger.debug("Failed to fetch diffusion model index via vllm utility: %s", e)
+        config_dict = None
     if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
         logger.debug("Detected diffusion model via a standard Diffusers index")
         return True

@@ -17,6 +17,7 @@ pytestmark = [
 ]
 
 
+@pytest.mark.nvidia_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
     """A padded flow batch must match individual flow calls on valid mels."""

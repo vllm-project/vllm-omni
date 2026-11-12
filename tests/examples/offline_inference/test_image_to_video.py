@@ -7,6 +7,8 @@ See examples/offline_inference/image_to_video/README.md
 """
 
 import shutil
+import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -51,9 +53,29 @@ def _ensure_test_image(run_dir: Path) -> None:
     if src.exists():
         shutil.copy2(src, dest)
         return
-    response = requests.get(_IMAGE_URL, timeout=60)
-    response.raise_for_status()
-    dest.write_bytes(response.content)
+    for attempt in range(3):
+        try:
+            with requests.get(_IMAGE_URL, timeout=60) as response:
+                response.raise_for_status()
+                content = response.content
+        except requests.ConnectionError as error:
+            # requests wraps urllib3's DNS error; follow the exception chain to
+            # distinguish a temporary resolver outage from permanent failures.
+            cause: BaseException | None = error
+            while cause is not None and not isinstance(cause, socket.gaierror):
+                cause = cause.__cause__ or cause.__context__
+            if not isinstance(cause, socket.gaierror) or cause.errno != socket.EAI_AGAIN or attempt == 2:
+                raise
+            time.sleep(2**attempt)
+        else:
+            dest.write_bytes(content)
+            return
+
+
+@pytest.fixture(scope="session")
+def i2v_test_image_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Share one README asset download while giving each CLI its own copy."""
+    return tmp_path_factory.mktemp("i2v_readme_image")
 
 
 def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool, str]:
@@ -70,14 +92,15 @@ README_SNIPPETS = ReadmeSnippet.extract_readme_snippets(README_PATH, skipif=_ski
 
 
 @pytest.mark.parametrize("snippet", README_SNIPPETS, ids=lambda snippet: snippet.test_id)
-def test_image_to_video(snippet: ReadmeSnippet, example_runner: ExampleRunner):
+def test_image_to_video(snippet: ReadmeSnippet, example_runner: ExampleRunner, i2v_test_image_dir: Path):
     should_skip, reason = snippet.skip
     if should_skip:
         pytest.skip(reason)
 
     run_dir = example_runner.output_root / EXAMPLE_OUTPUT_SUBFOLDER / snippet.test_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    _ensure_test_image(run_dir)
+    _ensure_test_image(i2v_test_image_dir)
+    shutil.copy2(i2v_test_image_dir / _IMAGE_NAME, run_dir / _IMAGE_NAME)
 
     result = example_runner.run(snippet, output_subfolder=Path(EXAMPLE_OUTPUT_SUBFOLDER))
     for asset in result.assets:

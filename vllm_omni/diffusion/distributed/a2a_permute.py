@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fused permute-free Ulysses all-to-all over NCCL symmetric memory.
+"""Fused permute-free Ulysses all-to-all over platform symmetric memory.
 
 JIT-compiles the CUDA kernel from pytorch/pytorch#178230 (``all_to_all_permute``)
 and exposes it as two *functional* custom ops:
@@ -14,6 +14,11 @@ buffer cache + the copy-in) lives *inside* the ops, so from torch.compile's poin
 of view each op is an opaque ``input -> output`` function: no graph break, no
 visible buffer mutation, no Python control flow in the traced graph. A
 ``register_fake`` provides output metadata so Dynamo keeps the op in-graph.
+
+NPU tensors dispatch to the symmetric memory implementation, which currently
+requires eager execution. Its grouped QKV path amortizes barriers across all
+three tensors; CUDA uses batched QKV exchange when eligible, with per-tensor
+custom ops as the fallback.
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from __future__ import annotations
 import glob
 import math
 import os
+import shlex
+import sys
 import sysconfig
 import threading
 from dataclasses import dataclass
@@ -31,6 +38,8 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _resolve_process_group
 from vllm.logger import init_logger
+
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -73,14 +82,16 @@ def _ensure_built() -> None:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
         if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
+        # PyTorch adds its selected toolkit with -isystem. Vendor -I paths
+        # would take precedence even if the same toolkit were also passed as
+        # -I (compilers keep duplicate system directories in their system slot).
+        # Append vendor directories as system includes after toolkit defaults.
+        vendor_includes = [f"-isystem {shlex.quote(path)}" for path in include_paths]
         load(
             name="vllm_omni_a2a_permute",
             sources=[src],
-            # PyTorch wheel-only installations keep headers such as cusparse.h
-            # under nvidia/{cu13,cusparse}/include rather than CUDA_HOME.
-            extra_include_paths=list(include_paths),
-            extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3"],
-            extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr"],
+            extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", *vendor_includes],
+            extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr", *vendor_includes],
             extra_ldflags=[nccl_libs[0]],
             is_python_module=False,
             verbose=False,
@@ -90,9 +101,50 @@ def _ensure_built() -> None:
         _BUILT = True
 
 
+def validate_a2a_permute_config(
+    *,
+    enforce_eager: bool | None = None,
+    ulysses_mode: str | None = None,
+    ulysses_degree: int | None = None,
+    ring_degree: int | None = None,
+    allgather_degree: int | None = None,
+    scatter_idx: int | None = None,
+    gather_idx: int | None = None,
+) -> None:
+    """Validate resolved NPU constraints without initializing the backend.
+
+    Only supplied values are checked: the factory supplies configuration,
+    direct strategy construction supplies initialized group sizes/layout,
+    and each forward supplies its current mode. Callers own context lookup.
+    """
+    if not current_omni_platform.is_npu():
+        return
+    if enforce_eager is False:
+        raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
+    if (
+        (ulysses_mode is not None and ulysses_mode != "strict")
+        or (ulysses_degree is not None and ulysses_degree <= 1)
+        or (ring_degree is not None and ring_degree != 1)
+        or (allgather_degree is not None and allgather_degree != 1)
+    ):
+        raise ValueError(
+            "NPU ulysses_a2a_permute requires strict, pure Ulysses with "
+            "ulysses_mode='strict', ulysses_degree > 1, ring_degree = 1 and allgather_degree = 1"
+        )
+    if (scatter_idx is not None and scatter_idx != 2) or (gather_idx is not None and gather_idx != 1):
+        raise ValueError("NPU ulysses_a2a_permute requires scatter_idx=2, gather_idx=1")
+
+
 def ensure_a2a_permute_available() -> None:
-    """Build the extension during worker/model initialization, not a request."""
-    _ensure_built()
+    """Check/build the platform backend during worker initialization."""
+    if current_omni_platform.is_npu():
+        from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import (
+            ensure_a2a_permute_available as ensure_npu,
+        )
+
+        ensure_npu()
+    else:
+        _ensure_built()
 
 
 def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -147,6 +199,9 @@ def _get_symm_buffer(
 
 def clear_a2a_permute_workspaces() -> None:
     """Release cached symmetric-memory workspaces during worker shutdown."""
+    npu_transport = sys.modules.get("vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu")
+    if npu_transport is not None:
+        npu_transport.clear_ulysses_symmetric_memory_workspace()
     with _WORKSPACE_LOCK:
         if not _SYMM_WORKSPACES:
             return
@@ -187,6 +242,39 @@ def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     return x.new_empty(B, s_local * world_size, H // world_size, D)
 
 
+@ulysses_qkv_fwd.register_kernel("privateuseone")
+def _(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_qkv_fwd as npu_fwd
+
+    return npu_fwd(x, group_name, world_size)
+
+
+def ulysses_qkv_fwd_group(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    group_name: str,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange Q/K/V, using a grouped transport when the platform supports it."""
+    if query.device.type == "npu":
+        from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_qkv_fwd_group as npu_fwd_group
+
+        return npu_fwd_group(query, key, value, group_name, world_size)
+    if query.device.type == "cuda":
+        # This optional backend defines Triton kernels at import time. Keep
+        # it out of the NPU path and the default Ulysses import chain.
+        from vllm_omni.diffusion.distributed.qkv_a2a import eligible, qkv_fwd_batched
+
+        if eligible(query, key, value, world_size):
+            return qkv_fwd_batched(query, key, value, group_name, world_size)
+    return (
+        ulysses_qkv_fwd(query, group_name, world_size),
+        ulysses_qkv_fwd(key, group_name, world_size),
+        ulysses_qkv_fwd(value, group_name, world_size),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reverse: (B, S_global, H_local, D) -> (B, S_local, H, D)
 #   scatter sequence (dim 1), gather heads (dim 2). Matches all_to_all_4D(y,1,2).
@@ -213,3 +301,10 @@ def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Te
 def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
     B, s_global, Hl, D = y.shape
     return y.new_empty(B, s_global // world_size, Hl * world_size, D)
+
+
+@ulysses_o_rev.register_kernel("privateuseone")
+def _(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
+    from vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu import ulysses_o_rev as npu_rev
+
+    return npu_rev(y, group_name, world_size)
