@@ -112,6 +112,18 @@ def test_session_sample_rate_is_used_when_packet_rate_is_absent():
     assert rows["a"]["audio_underrun_s"] == pytest.approx(0.2)
 
 
+def test_sglang_nested_pcm_format_sets_session_sample_rate():
+    packet = audio("a", 16000)
+    del packet["sample_rate_hz"]
+    session = {
+        "type": "session.updated",
+        "session": {"audio": {"output": {"format": {"type": "audio/pcm", "rate": 16000}}}},
+    }
+    rows = collect_duplex_audio_continuity([session, packet, packet, done("a")], [0, 1, 1.3, 2])
+    assert rows["a"]["audio_duration_s"] == pytest.approx(0.2)
+    assert rows["a"]["audio_underrun_s"] == pytest.approx(0.2)
+
+
 def test_packet_sample_rate_does_not_override_session_fallback_for_later_response():
     session = {"type": "session.updated", "session": {"audio": {"output": {"sample_rate_hz": 24000}}}}
     fallback_first = audio("fallback", 24000, duration=0.1)

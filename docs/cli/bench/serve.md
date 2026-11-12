@@ -392,6 +392,23 @@ vllm bench serve --omni \
   --save-result --result-dir ./fdb-runs
 ```
 
+To replay the identical dataset through an SGLang-Omni native duplex server,
+change only the backend and server identity:
+
+```bash
+vllm bench serve --omni \
+  --backend sglang-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:30000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name full-duplex-bench \
+  --dataset-path /path/to/Full-Duplex-Bench/dataset \
+  --fdb-version 1.5 --fdb-max-per-subset 2 \
+  --fdb-ref-audio /path/to/reference.wav \
+  --num-prompts 8 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 \
+  --save-result --result-dir ./fdb-sglang-runs
+```
+
 `--dataset-path` may point directly at a version directory containing the
 subset directories, or at its parent containing `v1.0/` and `v1.5/`.
 `--fdb-subsets` and `--fdb-sample-ids subset/sample ...` select exact inputs;
@@ -406,16 +423,42 @@ and must be even for v1.5; `0` selects all complete pairs. Pair selection and
 shuffling happen before expansion, so a run never drops one half of a pair.
 The default is two sessions and one concurrent session.
 
-The adapter uses the same realtime pacing, commit/drain behavior, playback
-acknowledgements and server session metrics as the native duplex serving
-benchmark. `--fdb-turn-detection none` is the default for MiniCPM-o. Reference
+Both backends use the same decoded input, realtime pacing, replay lifecycle and
+metric collector. The vLLM backend commits input and acknowledges playback;
+the SGLang backend uses its native `sglang.input_audio.end` / `drained`
+handshake and timestamped image events. `--fdb-turn-detection none` is the
+default for MiniCPM-o and is required by the SGLang backend. Reference
 audio is encoded once and shared by all sessions. Each invocation creates a
 new `run-*` artifact directory under `--result-dir`, containing per-session
-response metadata and `duplex_metrics.json`. If `--result-dir` is omitted,
+response metadata and `duplex_metrics.json`. Each successful session that
+emits audio also writes a same-stem `.wav` beside its response JSON. The WAV is
+mono PCM16 at the negotiated output sample rate. For sessions with multiple
+responses, it concatenates emitted audio in response creation order without
+inserting synthetic silence. If `--result-dir` is omitted,
 artifacts default to `full-duplex-bench-output/`. Standard TTFT, audio TTFP and
 per-response RTF use the backend-provided response metrics when present;
 separately named `duplex_client_*` and `duplex_stream_*` fields retain
 client-observed timing.
+
+For a controlled MiniCPM-o comparison, pass one shared sampling object to both
+backends:
+
+```bash
+--extra-body '{"sampling":{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05,"force_listen_count":0}}'
+```
+
+The adapters lower this object to each backend's native session shape. A
+top-level value in `--extra-body` overrides its same-named nested sampling
+value. Both adapters default `force_listen_count` to zero, so model response
+eligibility starts at the same input unit even when the object is omitted.
+Every sample metadata file records the requested sampling configuration; the
+SGLang adapter also records the configuration echoed by `session.updated` and
+the server's supported sampling fields.
+
+For SGLang, standard TTFT and audio TTFP come from its top-level
+`response_request_metrics`, while RTF and audio continuity use the same
+client-received audio packets as the vLLM run. This keeps server response-start
+timing separate from network delivery cadence.
 
 ### Omni-DuplexEval Realtime Benchmark
 
@@ -431,6 +474,22 @@ vllm bench serve --omni \
   --base-url http://127.0.0.1:8000 --endpoint /v1/realtime \
   --duplex-eval-ref-audio /path/to/reference.wav \
   --duplex-eval-response-root ./duplex-eval-runs \
+  --duplex-eval-split PR_correction \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+The SGLang-Omni form uses the same dataset options:
+
+```bash
+vllm bench serve --omni \
+  --backend sglang-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:30000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name omni-duplex-eval \
+  --dataset-path Hothan/Omni-DuplexEval \
+  --duplex-eval-ref-audio /path/to/reference.wav \
+  --duplex-eval-response-root ./duplex-eval-sglang \
   --duplex-eval-split PR_correction \
   --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
   --ready-check-timeout-sec 0 --save-result
@@ -547,14 +606,19 @@ server errors, failed responses, and drain/close timeouts still fail the sample.
 Failed measured sessions write a compact control-state trace under
 `failed_sessions/<split>/<id>.json`. These files record the committed event,
 response IDs and statuses, listen metadata, open responses, and quiet-window
-timing, but are never passed to the judge.
+timing, but are never passed to the judge. When a failed session emitted audio,
+its partial PCM is preserved as a same-stem `.wav` in that diagnostics
+directory. It remains a failed session and is excluded from published samples
+and success metrics.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
 concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
 run path is logged and returned in `omni_duplex_eval.response_root` in the saved
 benchmark result. Only successful measured sessions publish `<split>/<id>.json`
-and `<id>.meta.json`, using the upstream judge format: RTD scoring reads its
+and `<id>.meta.json`; a session with response audio also publishes
+`<split>/<id>.wav` with the same PCM16 contract as Full-Duplex-Bench. These
+files use the upstream judge format: RTD scoring reads its
 `sentences`, and PR scoring places its per-output `chunks` (`text`,
 `current_time`) in the 10-second reminder window. A response that is a bare
 sentence list is scored by sentence start. The standalone `generate` command

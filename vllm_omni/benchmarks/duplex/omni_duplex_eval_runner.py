@@ -16,7 +16,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +135,8 @@ class GenerateSampleResult:
     diagnostics: dict[str, object] = field(default_factory=dict)
     output_tokens: int = 0
     audio_bytes: int = 0
+    # Retain the received PCM until serving publishes artifacts after timing.
+    audio_pcm: bytes = field(default=b"", repr=False)
     audio_sample_rate: int = 24_000
     error: str = ""
 
@@ -226,11 +228,33 @@ def _cached_response_has_chunks(output: Path) -> bool:
     return has_response_chunks(raw)
 
 
+def _write_result_audio(result: GenerateSampleResult, audio_path: Path) -> None:
+    """Atomically publish received PCM, or remove a stale same-stem WAV."""
+    if result.audio_pcm:
+        if result.audio_sample_rate <= 0:
+            raise ValueError("output audio sample rate must be positive")
+        if len(result.audio_pcm) % 2:
+            raise ValueError("output audio must contain complete PCM16 samples")
+        from vllm_omni.clients.duplex import write_pcm16_wav
+
+        temporary_audio = audio_path.with_suffix(".wav.part")
+        try:
+            write_pcm16_wav(temporary_audio, result.audio_pcm, sample_rate_hz=result.audio_sample_rate)
+            temporary_audio.replace(audio_path)
+        finally:
+            temporary_audio.unlink(missing_ok=True)
+    else:
+        audio_path.unlink(missing_ok=True)
+
+
 def write_sample_result(result: GenerateSampleResult) -> None:
     """Publish the judge input (RTD reads sentences, PR reads chunks); serving calls this after timing."""
     output = result.output
     output.parent.mkdir(parents=True, exist_ok=True)
     meta_path = output.with_name(output.stem + ".meta.json")
+    # A result directory can be reused by the standalone generator. Do not
+    # leave an older audio artifact beside a newly published LISTEN result.
+    _write_result_audio(result, output.with_suffix(".wav"))
     # Publish the judge-visible JSON last. A failed write cannot leave a partial
     # response that the evaluator would mistake for a complete sample.
     meta_path.write_text(json.dumps(result.metadata, indent=2), encoding="utf-8")
@@ -244,10 +268,11 @@ def write_sample_result(result: GenerateSampleResult) -> None:
 
 
 def write_failed_sample_diagnostics(result: GenerateSampleResult) -> Path:
-    """Publish a failed session's control-state trace outside judge input paths."""
+    """Publish failed-session diagnostics and partial audio outside judge inputs."""
     output = result.output
     diagnostics = output.parent.parent / "failed_sessions" / output.parent.name / f"{output.stem}.json"
     diagnostics.parent.mkdir(parents=True, exist_ok=True)
+    _write_result_audio(result, diagnostics.with_suffix(".wav"))
     temporary = diagnostics.with_suffix(".json.part")
     try:
         payload = {
@@ -269,6 +294,7 @@ def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventColle
     from vllm_omni.clients.duplex import EventCollector
 
     collector = EventCollector()
+    collector.output_sample_rate_hz = source.output_sample_rate_hz
     for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
         collector.add(event, received_at_s=received_at_s)
     for record in source.client_appends:
@@ -694,6 +720,9 @@ class DuplexReplaySession(Protocol):
     @property
     def supports_session_stats(self) -> bool: ...
 
+    @property
+    def session_configuration(self) -> dict[str, object]: ...
+
     async def configure(
         self,
         model: str,
@@ -737,6 +766,7 @@ class _VLLMReplaySession:
         self.frame_transport: str
         self._drain = ReplayDrainResult()
         self._drain_timeout_event_count = 0
+        self.session_configuration: dict[str, object] = {}
 
     async def configure(
         self,
@@ -748,14 +778,34 @@ class _VLLMReplaySession:
         turn_detection: str,
     ) -> None:
         self._server_turns = turn_detection == TURN_DETECTION_SERVER_VAD
+        options = dict(extra_body or {})
+        options.pop("native_duplex", None)
+        options.pop("sglang", None)
+        nested_sampling = options.pop("sampling", {})
+        if not isinstance(nested_sampling, Mapping):
+            raise ValueError("extra_body.sampling must be an object")
+        normalized_options = dict(nested_sampling)
+        normalized_options.update(options)
+        temperature = normalized_options.pop("temperature", None)
+        if temperature is not None and (not isinstance(temperature, int | float) or isinstance(temperature, bool)):
+            raise ValueError("sampling temperature must be a number")
         await self._client.configure(
             model,
             ref_audio=ref_audio,
             instructions=instructions,
-            extra_body=extra_body,
+            temperature=float(temperature) if temperature is not None else None,
+            extra_body=normalized_options,
             auto_response=not self._server_turns,
             turn_detection=session_turn_detection(turn_detection),
         )
+        requested_sampling = {**normalized_options, "force_listen_count": 0}
+        if temperature is not None:
+            requested_sampling["temperature"] = float(temperature)
+        self.session_configuration = {
+            "backend": "vllm",
+            "requested_sampling": requested_sampling,
+            "sampling_source": "client_request",
+        }
         self.frame_transport = select_frame_transport(_session_capabilities(self._client))
 
     def prepare_input(self, pcm: bytes, frames: tuple[tuple[float, bytes], ...]) -> bytes:
@@ -1093,6 +1143,7 @@ async def generate_sample(
         "server_errors": server_errors,
         "session_stats_errors": session_stats_errors,
         "ref_audio_sha256": prepared.ref_audio_sha256,
+        "session_configuration": getattr(client, "session_configuration", {}),
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
 
@@ -1138,6 +1189,7 @@ async def generate_sample(
     # boundary in metadata; drain/close timeouts and server errors above still
     # fail the sample instead of silently publishing a broken session.
     meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
+    output_audio_pcm = client.events.audio_bytes()
     result = GenerateSampleResult(
         output=output,
         request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
@@ -1147,7 +1199,8 @@ async def generate_sample(
         metadata=meta,
         diagnostics={"drain_timeout_state": drain.drain_timeout_state} if drain.drain_timeout_state is not None else {},
         output_tokens=bundle.output_tokens,
-        audio_bytes=len(client.events.audio_bytes()),
+        audio_bytes=len(output_audio_pcm),
+        audio_pcm=output_audio_pcm,
         audio_sample_rate=client.events.output_sample_rate_hz,
         error="; ".join(errors),
     )

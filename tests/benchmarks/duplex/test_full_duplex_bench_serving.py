@@ -158,6 +158,24 @@ def test_v15_serving_selection_preserves_complete_pairs(tmp_path: Path):
     assert args.max_concurrency == 1
 
 
+def test_sglang_backend_is_accepted_for_full_duplex_bench(tmp_path: Path):
+    args = _args(tmp_path, "--backend", "sglang-realtime-duplex")
+    preprocess_serve_args(args)
+    assert args.backend == "sglang-realtime-duplex"
+
+
+def test_sglang_backend_rejects_server_vad(tmp_path: Path):
+    args = _args(
+        tmp_path,
+        "--backend",
+        "sglang-realtime-duplex",
+        "--fdb-turn-detection",
+        "server_vad",
+    )
+    with pytest.raises(ValueError, match="requires --fdb-turn-detection none"):
+        preprocess_serve_args(args)
+
+
 @pytest.mark.parametrize("count", ["1", "3"])
 def test_v15_rejects_odd_num_prompts(tmp_path: Path, count: str):
     args = _args(tmp_path, "--num-prompts", count)
@@ -205,6 +223,7 @@ async def test_native_replay_maps_metrics_and_publishes_artifacts(tmp_path: Path
         "audio_chunk_count": 3,
         "audio_continuity_threshold_s": 0.1,
     }
+    output_pcm = b"\x01\x00" * 24_000
 
     async def generate_sample(dataset_sample, **kwargs):
         assert kwargs["prepared"].frames == ()
@@ -221,6 +240,7 @@ async def test_native_replay_maps_metrics_and_publishes_artifacts(tmp_path: Path
             metadata={"response_done": True},
             output_tokens=2,
             audio_bytes=48_000,
+            audio_pcm=output_pcm,
         )
 
     monkeypatch.setattr(runner, "generate_sample", generate_sample)
@@ -254,4 +274,9 @@ async def test_native_replay_maps_metrics_and_publishes_artifacts(tmp_path: Path
     assert summary is not None
     assert summary["published"] == summary["sessions"] == 1
     assert result.output.is_file()
+    with wave.open(str(result.output.with_suffix(".wav")), "rb") as output_audio:
+        assert output_audio.getnchannels() == 1
+        assert output_audio.getsampwidth() == 2
+        assert output_audio.getframerate() == result.audio_sample_rate
+        assert output_audio.readframes(output_audio.getnframes()) == output_pcm
     assert (sample.response_root / "duplex_metrics.json").is_file()

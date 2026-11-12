@@ -334,6 +334,15 @@ def iter_av_units(
     Audio must cover the video timeline. Frames that cannot fit the interval or
     the wire's two-image limit fail explicitly instead of being lost or delayed.
     """
+    for audio, timed_frames in iter_timed_av_units(audio_pcm16, frames, unit_ms=unit_ms):
+        selected = [frame for _, frame in timed_frames]
+        yield audio, selected[0] if len(selected) == 1 else selected or None
+
+
+def iter_timed_av_units(
+    audio_pcm16: bytes, frames: Iterator[tuple[float, bytes]], *, unit_ms: int = 1000
+) -> Iterator[tuple[bytes, tuple[tuple[float, bytes], ...]]]:
+    """Split PCM16 into units while retaining each selected frame timestamp."""
     if unit_ms <= 0 or len(audio_pcm16) % PCM16_BYTES_PER_SAMPLE:
         raise ValueError("unit_ms must be positive and PCM16 must contain whole samples")
     unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * unit_ms // 1000
@@ -343,19 +352,19 @@ def iter_av_units(
     previous_timestamp = -1.0
     for offset in range(0, len(audio_pcm16), unit_bytes):
         end = min(offset + unit_bytes, len(audio_pcm16))
-        selected: list[bytes] = []
+        selected: list[tuple[float, bytes]] = []
         while next_frame is not None:
             timestamp, frame = next_frame
             if not math.isfinite(timestamp) or timestamp < 0 or timestamp < previous_timestamp:
                 raise ValueError("frame timestamps must be finite, nonnegative and ordered")
             if timestamp >= end / bytes_per_second:
                 break
-            selected.append(frame)
+            selected.append(next_frame)
             if len(selected) > 2:
                 raise ValueError("Realtime permits at most two frames per audio unit; reduce fps or unit_ms")
             previous_timestamp = timestamp
             next_frame = next(frame_iter, None)
-        yield audio_pcm16[offset:end], selected[0] if len(selected) == 1 else selected or None
+        yield audio_pcm16[offset:end], tuple(selected)
     if next_frame is not None:
         raise ValueError("frame timestamp is outside the audio timeline")
 

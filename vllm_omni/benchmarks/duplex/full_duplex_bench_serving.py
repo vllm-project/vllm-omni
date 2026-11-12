@@ -180,7 +180,7 @@ def finalize_full_duplex_bench(
             try:
                 write_failed_sample_diagnostics(result)
                 failed_diagnostics += 1
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 errors.append(f"Cannot publish failed-session diagnostics for {result.output}: {exc}")
             continue
         request_metrics.extend(result.request_metrics)
@@ -188,7 +188,7 @@ def finalize_full_duplex_bench(
         try:
             write_sample_result(result)
             published += 1
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             errors.append(f"Cannot publish {result.output}: {exc}")
     root = rows[0][0].response_root
     report = build_duplex_metrics_report(request_metrics=request_metrics, session_metrics=session_metrics)

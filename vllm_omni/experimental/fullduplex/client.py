@@ -311,6 +311,12 @@ class RealtimeDuplexClient:
             }
         )
 
+    def advance_media_clock(self, media_clock_ms: int) -> None:
+        """Advance the input media time stamped onto subsequently received events."""
+        if media_clock_ms < self._media_clock_ms:
+            raise ValueError("media clock cannot move backwards")
+        self._media_clock_ms = media_clock_ms
+
     def raise_if_reader_stopped(self) -> None:
         """Fail a caller waiting on events after the WebSocket reader exits."""
 

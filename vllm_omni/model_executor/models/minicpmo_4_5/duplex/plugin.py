@@ -113,6 +113,45 @@ class MiniCPMO45ClientRuntimeConfigError(DuplexRuntimeConfigError):
     pass
 
 
+def _duplex_sampling_overrides(config: DuplexSessionConfig) -> dict[str, float | int]:
+    """Resolve the session-scoped MiniCPM-o sampling knobs used by Stage 0."""
+    extra_body = config.extra_body
+    temperature = config.temperature if config.temperature is not None else 0.7
+    top_p = extra_body.get("top_p", 0.8)
+    top_k = extra_body.get("top_k", 20)
+    repetition_penalty = extra_body.get("repetition_penalty", 1.05)
+    if not isinstance(temperature, int | float) or isinstance(temperature, bool) or not 0 <= float(temperature) <= 2:
+        raise MiniCPMO45ClientRuntimeConfigError(
+            "temperature must be a number between 0 and 2",
+            code="invalid_sampling_config",
+        )
+    if not isinstance(top_p, int | float) or isinstance(top_p, bool) or not 0 < float(top_p) <= 1:
+        raise MiniCPMO45ClientRuntimeConfigError(
+            "top_p must be a number greater than 0 and at most 1",
+            code="invalid_sampling_config",
+        )
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
+        raise MiniCPMO45ClientRuntimeConfigError(
+            "top_k must be an integer greater than or equal to -1",
+            code="invalid_sampling_config",
+        )
+    if (
+        not isinstance(repetition_penalty, int | float)
+        or isinstance(repetition_penalty, bool)
+        or float(repetition_penalty) < 1
+    ):
+        raise MiniCPMO45ClientRuntimeConfigError(
+            "repetition_penalty must be a number greater than or equal to 1",
+            code="invalid_sampling_config",
+        )
+    return {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": top_k,
+        "repetition_penalty": float(repetition_penalty),
+    }
+
+
 # ---- engine policy helpers: scheduler token budget ----
 
 
@@ -588,12 +627,7 @@ def _apply_default_scheduler_policy(
 ) -> None:
     stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
     runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
-    stage0_params: dict[str, object] = {
-        "temperature": config.temperature if config.temperature is not None else 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "repetition_penalty": 1.05,
-    }
+    stage0_params: dict[str, object] = _duplex_sampling_overrides(config)
     stop_token_ids = _stage0_stop_token_ids(tokenizer)
     if stop_token_ids:
         stage0_params["stop_token_ids"] = stop_token_ids
@@ -872,7 +906,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stage_sampling = deepcopy(stage_sampling) if isinstance(stage_sampling, dict) else {}
         stage0 = stage_sampling.get("0")
         stage0 = deepcopy(stage0) if isinstance(stage0, dict) else {}
-        stage0["temperature"] = config.temperature if config.temperature is not None else 0.7
+        stage0.update(_duplex_sampling_overrides(config))
         stage_sampling["0"] = stage0
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
         return runtime_config

@@ -717,6 +717,13 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+MiniCPM-o resolves Stage 0 `temperature`, `top_p`, `top_k`, and
+`repetition_penalty` from the session configuration when the session opens and
+on later updates. Temperature remains a top-level Realtime field; the other
+three model-specific controls live in `extra_body`. The plugin validates and
+projects them into its server-owned `duplex_stage_sampling_params`, so clients
+cannot replace that internal mapping directly.
+
 MiniCPM-o native duplex treats `max_speak_chars_per_chunk` (default 28) as a
 soft target. It keeps the complete sampled token that reaches or crosses the
 target, then closes the chunk before another draw once the accepted prefix

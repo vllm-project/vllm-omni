@@ -121,6 +121,7 @@ from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
 if TYPE_CHECKING:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import ReplaySessionFactory
     from vllm_omni.clients.duplex import DuplexClient
 
 # The duplex client library (vllm_omni.clients) is imported lazily inside the
@@ -696,6 +697,7 @@ def get_samples(args, tokenizer, **kwargs):
         "openai-chat-omni",
         "openai-audio-speech",
         "openai-realtime-duplex",
+        "sglang-realtime-duplex",
         "daily-omni",
     ]
     is_omni_dataset = is_daily_omni or is_videomme or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
@@ -3143,9 +3145,20 @@ async def _async_request_omniinteract(
     return output
 
 
-async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | None) -> MixRequestFuncOutput:
-    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import generate_sample
+async def _async_request_duplex_eval(
+    request: RequestFuncInput,
+    *,
+    pbar: tqdm | None,
+    session_factory: "ReplaySessionFactory | None" = None,
+) -> MixRequestFuncOutput:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
+        _open_vllm_replay_session,
+        generate_sample,
+    )
     from vllm_omni.clients.duplex import metric_mean
+
+    if session_factory is None:
+        session_factory = _open_vllm_replay_session
 
     output = MixRequestFuncOutput()
     output.prompt_len = request.prompt_len
@@ -3188,6 +3201,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                         instructions=sample.instructions,
                         additional_headers=headers or None,
                         extra_body=dict(request.extra_body or {}),
+                        session_factory=session_factory,
                     ),
                     timeout=deadline,
                 )
@@ -3664,6 +3678,22 @@ async def async_request_openai_realtime_duplex(
     return output
 
 
+async def async_request_sglang_realtime_duplex(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Replay FDB or Omni-DuplexEval over SGLang's native Realtime wire."""
+    from vllm_omni.benchmarks.duplex.sglang_replay_session import open_sglang_replay_session
+
+    del session
+    return await _async_request_duplex_eval(
+        request_func_input,
+        pbar=pbar,
+        session_factory=open_sglang_replay_session,
+    )
+
+
 async def async_request_openai_realtime_chat(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -3721,6 +3751,9 @@ if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
 if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["sglang-realtime-duplex"] = async_request_sglang_realtime_duplex
+if "sglang-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("sglang-realtime-duplex")
 ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
 if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")

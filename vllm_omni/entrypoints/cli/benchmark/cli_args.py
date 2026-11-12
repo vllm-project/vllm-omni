@@ -648,9 +648,18 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    duplex_replay_backends = {"openai-realtime-duplex", "sglang-realtime-duplex"}
+    if getattr(args, "backend", None) == "sglang-realtime-duplex" and getattr(args, "dataset_name", None) not in {
+        "full-duplex-bench",
+        "omni-duplex-eval",
+    }:
+        raise ValueError("sglang-realtime-duplex supports full-duplex-bench and omni-duplex-eval only")
     if getattr(args, "dataset_name", None) == "full-duplex-bench":
-        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
-            raise ValueError("Full-Duplex-Bench requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if args.backend not in duplex_replay_backends or args.endpoint != "/v1/realtime":
+            raise ValueError(
+                "Full-Duplex-Bench requires --backend openai-realtime-duplex or "
+                "sglang-realtime-duplex with --endpoint /v1/realtime"
+            )
         if not args.dataset_path:
             raise ValueError("Full-Duplex-Bench requires a local --dataset-path")
         for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
@@ -666,9 +675,14 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             args.max_concurrency = 1
         elif args.max_concurrency <= 0:
             raise ValueError("Full-Duplex-Bench requires positive --max-concurrency")
+        if args.backend == "sglang-realtime-duplex" and args.fdb_turn_detection != "none":
+            raise ValueError("SGLang Full-Duplex-Bench replay requires --fdb-turn-detection none")
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
-        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
-            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if args.backend not in duplex_replay_backends or args.endpoint != "/v1/realtime":
+            raise ValueError(
+                "Omni-DuplexEval requires --backend openai-realtime-duplex or "
+                "sglang-realtime-duplex with --endpoint /v1/realtime"
+            )
         if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
             raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
         for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
@@ -682,6 +696,8 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             args.max_concurrency = 1
         elif args.max_concurrency <= 0:
             raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
+        if args.backend == "sglang-realtime-duplex" and args.duplex_eval_turn_detection != "none":
+            raise ValueError("SGLang Omni-DuplexEval replay requires --duplex-eval-turn-detection none")
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")

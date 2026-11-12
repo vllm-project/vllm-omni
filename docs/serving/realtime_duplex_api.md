@@ -589,6 +589,10 @@ ships a preset:
 
 Keyword overrides on a preset replace the corresponding `SessionConfig`
 field, e.g. `create_duplex_session_config(ref_audio=..., temperature=0.6)`.
+MiniCPM-o also accepts Stage 0 `top_p`, `top_k`, and
+`repetition_penalty` in `extra_body`; omitted values retain the deployment
+defaults. These options are validated when the session opens and are applied
+to later session updates together with the top-level `temperature`.
 
 MiniCPM-o 4.5 uses `sliding_window_mode: "basic"` by default for the Thinker
 (Stage 0). When the projected context exceeds `basic_window_high_tokens`
@@ -1266,7 +1270,10 @@ additionally carries `"server_event_seq": <int>` (omitted below for brevity).
     "idle_timeout_s": 300,
     "extra_body": {
       "auto_response": true,
-      "force_listen_count": 0
+      "force_listen_count": 0,
+      "top_p": 0.8,
+      "top_k": 20,
+      "repetition_penalty": 1.05
     }
   }
 }

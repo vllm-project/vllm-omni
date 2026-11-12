@@ -150,6 +150,12 @@ def collect_duplex_audio_continuity(
             output_config = audio_config.get("output") if isinstance(audio_config, dict) else None
             if isinstance(output_config, dict):
                 session_rate = output_config.get("sample_rate_hz", session_rate)
+                output_format = output_config.get("format")
+                if isinstance(output_format, dict):
+                    format_type = output_format.get("type")
+                    if isinstance(format_type, str):
+                        encoding = "pcm16" if format_type == "audio/pcm" else format_type
+                    session_rate = output_format.get("rate", session_rate)
         response = event.get("response")
         rid = event.get("response_id") or (response.get("id") if isinstance(response, dict) else None)
         if not isinstance(rid, str) or arrival < after_s:
