@@ -275,56 +275,12 @@ def _read_prompt_selection_log(offset: int) -> str:
         return log_file.read().decode("utf-8")
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
-    """
-    Test text-only input generating text output via OpenAI API.
-    Deploy Setting: default single GPU
-    Input Modal: text
-    Output Modal: text
-    Input Setting: stream=False
-    """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": False,
-        "modalities": ["text"],
-        "key_words": {"text": ["Beijing"]},
-    }
-
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-
-
-@pytest.mark.full_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
-    """
-    Test text-only input generating text + audio output via OpenAI API.
-    This exercises Talker TTS region detection and the Code2Wav stage.
-    Deploy Setting: default single GPU
-    Input Modal: text
-    Output Modal: text + audio
-    Input Setting: stream=True
-    """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "key_words": {"audio": ["Beijing"]},
-        "extra_body": _TTS_EXTRA_BODY,
-    }
-
-    openai_client.send_omni_request(request_config)
+# Keep every ``test_params`` case (id ``async_chunk``) in one contiguous block
+# before Talker DSpark. Module-scoped ``omni_server`` is reused only while the
+# next collected item's param value matches. ``turn_async_chunk`` is a different
+# deploy (``session_mode: turn``); it stays the second parameter of
+# ``test_text_to_text_001``, after this block, so it is not collected between
+# the ``async_chunk`` cases.
 
 
 @pytest.mark.advanced_model
@@ -372,6 +328,73 @@ def test_text_to_audio_with_default_reference(omni_server, openai_client) -> Non
     assert responses[0].audio_bytes
 
 
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+    """
+    Test multi-modal input (text + audio + video + image) generating text + audio output.
+    Deploy Setting: default single GPU
+    Input Modal: text + audio + video + image
+    Output Modal: text + audio
+    Input Setting: stream=True
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
+    # A loop of the default single word "test" can make the answer repeat
+    # to the token limit, leaving TTS/ASR to count a long run of identical words
+    # (#7630). Exercise speech perception with a meaningful phrase instead.
+    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
+    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=(
+            "Briefly describe the image and video, and summarize what the voice says. "
+            "Answer in one short sentence without repeating the spoken phrase."
+        ),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
+def test_text_to_text_001(omni_server, openai_client) -> None:
+    """
+    Test text-only input generating text output via OpenAI API.
+    Deploy Setting: default single GPU
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=False
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -399,6 +422,32 @@ def test_text_to_audio_talker_dspark(omni_server, openai_client) -> None:
     assert all(response.success and response.audio_bytes for response in responses)
     # Only stage 1 with a loaded draft verifies codes. Read from the start: the line is logged once.
     assert "MiniCPM-o 4.5 Talker is verifying draft codes" in _read_prompt_selection_log(0)
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
+def test_text_to_audio_001(omni_server, openai_client) -> None:
+    """
+    Test text-only input generating text + audio output via OpenAI API.
+    This exercises Talker TTS region detection and the Code2Wav stage.
+    Deploy Setting: default single GPU
+    Input Modal: text
+    Output Modal: text + audio
+    Input Setting: stream=True
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"audio": ["Beijing"]},
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+
+    openai_client.send_omni_request(request_config)
 
 
 @pytest.mark.full_model
@@ -485,47 +534,6 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
         content_text=get_prompt("mix"),
-    )
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "extra_body": _TTS_EXTRA_BODY,
-    }
-
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-
-
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
-    """
-    Test multi-modal input (text + audio + video + image) generating text + audio output.
-    Deploy Setting: default single GPU
-    Input Modal: text + audio + video + image
-    Output Modal: text + audio
-    Input Setting: stream=True
-    """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    # A loop of the default single word "test" can make the answer repeat
-    # to the token limit, leaving TTS/ASR to count a long run of identical words
-    # (#7630). Exercise speech perception with a meaningful phrase instead.
-    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
-    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        video_data_url=video_data_url,
-        image_data_url=image_data_url,
-        audio_data_url=audio_data_url,
-        content_text=(
-            "Briefly describe the image and video, and summarize what the voice says. "
-            "Answer in one short sentence without repeating the spoken phrase."
-        ),
     )
 
     request_config = {
