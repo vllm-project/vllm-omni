@@ -125,6 +125,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
 
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        # Cached encoder embeddings do not make a bidirectional image's
+        # decoder KV complete. Upstream skips its chunking guard on cache hits,
+        # so enforce the requested boundary before it checks the encoder cache.
+        if self.scheduler_config.disable_chunked_mm_input and request.has_encoder_inputs:
+            window_start = num_computed_tokens + shift_computed_tokens
+            for feature in request.mm_features:
+                position = feature.mm_position
+                if window_start <= position.offset < window_start + num_new_tokens < position.offset + position.length:
+                    num_new_tokens = position.offset - window_start
+                    break
+        return super()._try_schedule_encoder_inputs(
+            request, num_computed_tokens, num_new_tokens, encoder_compute_budget, shift_computed_tokens
+        )
+
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
