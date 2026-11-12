@@ -17,8 +17,11 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+logger = init_logger(__name__)
 
 
 def _rescale_latents(vae: Any, latent: torch.Tensor) -> torch.Tensor:
@@ -58,6 +61,14 @@ class AsyncStreamDecodeJob:
     on_finished: Callable[[int, torch.Tensor], None] | None
     join: Callable[[], torch.Tensor | None]
     _send_works: list = field(default_factory=list)
+    _cancel: Callable[[], None] | None = None
+
+    def cancel(self) -> None:
+        """Stop side threads when the request is aborted before ``join()``."""
+        cancel = self._cancel
+        self._cancel = None
+        if cancel is not None:
+            cancel()
 
 
 def start_async_stream_decode(
@@ -123,7 +134,11 @@ def start_async_stream_decode(
                 work.wait()
             return None
 
-        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _send_works=send_works)
+        def cancel() -> None:
+            send_q.put(stop)
+            sender_thread.join(timeout=5.0)
+
+        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _send_works=send_works, _cancel=cancel)
 
     if pp_rank == 0:
         if vae is None or decoder is None:
@@ -132,13 +147,18 @@ def start_async_stream_decode(
         recv_works = [dist.irecv(buf, src=source, group=stream_group) for buf in buffers]
         pixels_out: list[torch.Tensor] = []
         error: list[BaseException] = []
+        cancelled = threading.Event()
 
         def _consumer() -> None:
             assert decoder is not None and vae is not None
             state = decoder.new_decode_state(session_id)
             try:
                 for buf, work in zip(buffers, recv_works):
+                    if cancelled.is_set():
+                        break
                     work.wait()
+                    if cancelled.is_set():
+                        break
                     scaled = _rescale_latents(vae, buf)
                     pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
             except BaseException as exc:  # noqa: BLE001
@@ -158,7 +178,19 @@ def start_async_stream_decode(
                 return None
             return torch.cat(pixels_out, dim=2)
 
-        return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
+        def cancel() -> None:
+            cancelled.set()
+            # Posted irecvs cannot be aborted; daemon thread may still block.
+            # Prefer not combining stream_decode with mid-request Engine abort.
+            thread.join(timeout=0.1)
+            if thread.is_alive():
+                logger.warning(
+                    "stream_decode cancel: consumer still alive after 0.1s join "
+                    "(posted irecv may be stuck); session_id=%s",
+                    session_id,
+                )
+
+        return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works, _cancel=cancel)
 
     def join() -> torch.Tensor | None:
         return None
@@ -218,4 +250,8 @@ def _start_local(
             return None
         return torch.cat(pixels_out, dim=2)
 
-    return AsyncStreamDecodeJob(on_finished=on_finished, join=join)
+    def cancel() -> None:
+        latent_q.put(stop)
+        thread.join(timeout=5.0)
+
+    return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _cancel=cancel)

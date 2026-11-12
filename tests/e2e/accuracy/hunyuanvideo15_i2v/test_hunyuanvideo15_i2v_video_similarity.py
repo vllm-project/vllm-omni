@@ -15,11 +15,13 @@ from tests.e2e.accuracy.helpers import (
     assert_video_similarity_metrics,
     build_online_image_reference,
     materialize_image_source,
+    measure_video_similarity_metrics,
     probe_binary,
     probe_video,
     send_video_request_with_timeout,
     validate_image_source,
     video_artifact_dir,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -265,10 +267,28 @@ def test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity(
         f"offline_path={offline_path}"
     )
     assert_video_metadata(online_metadata, width=WIDTH, height=HEIGHT, fps=FPS, frame_count=NUM_FRAMES)
+    ssim, psnr = measure_video_similarity_metrics(
+        label="hunyuanvideo15_i2v",
+        online_path=online_path,
+        offline_path=offline_path,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+        extra={
+            "label": "hunyuanvideo15_i2v",
+            "online_video": str(online_path),
+            "offline_video": str(offline_path),
+        },
+    )
     assert_video_similarity_metrics(
         label="hunyuanvideo15_i2v",
         online_path=online_path,
         offline_path=offline_path,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )

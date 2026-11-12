@@ -38,8 +38,6 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
-from importlib.util import find_spec
-
 import torch
 import torch.nn.functional as F
 from torch.library import Library
@@ -570,16 +568,12 @@ def _npu_apply_rope_table(
 ) -> torch.Tensor:
     """Apply H3's rotary dimensions through Ascend's fused rotary kernel.
 
-    ``mindiesd.rotary_position_embedding`` takes a 4-D BSND tensor, whereas
-    MiniMax-H3 keeps packed activations as ``[tokens, heads, head_dim]``.
-    The shared MindIE-SD wrapper normalizes this 3-D layout to BSND and
-    restores it afterwards. It receives the half-width cos/sin values from
-    the packed table; the wrapper expands them to H3's non-interleaved 96-D
-    rotary layout. The 32 non-rotary head dimensions bypass the kernel.
-
-    Some CANN environments package ``torch_npu`` without MindIE-SD. Keep
-    those deployments on the same Ascend fused rotary primitive rather than
-    silently falling back to eager elementwise RoPE.
+    ``torch_npu.npu_rotary_mul`` takes a 4-D BSND tensor, whereas MiniMax-H3
+    keeps packed activations as ``[tokens, heads, head_dim]``; normalize the
+    3-D layout to BSND and restore it afterwards. The kernel receives the
+    half-width cos/sin values from the packed table; expand them to H3's
+    non-interleaved 96-D rotary layout. The 32 non-rotary head dimensions
+    bypass the kernel.
     """
     import torch_npu
 
@@ -588,23 +582,12 @@ def _npu_apply_rope_table(
     cos = rope_table[..., :half]
     sin = rope_table[..., half:]
 
-    if find_spec("mindiesd") is not None:
-        from vllm_omni.diffusion.layers.rope import apply_rotary_emb_mindiesd
-
-        x_rot = apply_rotary_emb_mindiesd(
-            x_rot,
-            cos,
-            sin,
-            interleaved=False,
-            half_head_dim=True,
-        )
-    else:
-        # npu_rotary_mul uses BSND and full rotary-width cos/sin. H3 uses
-        # NeoX/rotated-half ordering, so duplicate rather than interleave the
-        # half-width table along the final dimension.
-        cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        x_rot = torch_npu.npu_rotary_mul(x_rot.unsqueeze(0), cos, sin).squeeze(0)
+    # npu_rotary_mul uses BSND and full rotary-width cos/sin. H3 uses
+    # NeoX/rotated-half ordering, so duplicate rather than interleave the
+    # half-width table along the final dimension.
+    cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
+    sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
+    x_rot = torch_npu.npu_rotary_mul(x_rot.unsqueeze(0), cos, sin).squeeze(0)
 
     return torch.cat((x_rot, x_pass), dim=-1)
 
