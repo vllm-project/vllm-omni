@@ -312,14 +312,18 @@ free_after, _ = torch.cuda.mem_get_info(device)
 # A full device is readiness, even when the byte target was not met. Allow a
 # few MiB of reported allocator reserve above an explicit ceiling. This can
 # remain after an exact target allocation even when non-strict callers do not
-# probe until allocator rejection.
+# probe until allocator rejection. A rejected allocation after the ratio target
+# is also saturated: the explicit ceiling is a pressure goal, not a requirement
+# to ignore the allocator's stronger evidence that no next chunk fits.
 if max_free_bytes is None:
     residual_floor = 64 * 1024 * 1024
 else:
     residual_floor = max_free_bytes + _OOM_RESIDUAL_SLACK_BYTES
-allocator_full = rejected and int(free_after) <= residual_floor
-ratio_target_missed = strict and allocated < ratio_target_bytes and not allocator_full
-free_ceiling_missed = max_free_bytes is not None and int(free_after) > residual_floor
+allocator_saturated = rejected and target_ratio > 0.0 and allocated >= ratio_target_bytes
+residual_ceiling_reached = int(free_after) <= residual_floor
+pressure_ready = allocator_saturated or residual_ceiling_reached
+ratio_target_missed = strict and allocated < ratio_target_bytes and not pressure_ready
+free_ceiling_missed = max_free_bytes is not None and not pressure_ready
 if ratio_target_missed or free_ceiling_missed:
     print(
         "ERROR:"
@@ -329,6 +333,7 @@ if ratio_target_missed or free_ceiling_missed:
         f"free_after={int(free_after)};"
         f"target_bytes={target_bytes};"
         f"max_free_bytes={max_free_bytes};"
+        f"allocator_saturated={int(allocator_saturated)};"
         f"allocated={allocated}",
         flush=True,
     )
@@ -342,6 +347,7 @@ print(
     f"free_after={int(free_after)};"
     f"target_bytes={target_bytes};"
     f"max_free_bytes={max_free_bytes};"
+    f"allocator_saturated={int(allocator_saturated)};"
     f"allocated={allocated}",
     flush=True,
 )
@@ -380,9 +386,10 @@ def start_gpu_oom_hog(
     Note:
         ``target_mem_ratio`` is evaluated against free memory at injection start
         (not total GPU memory), i.e. success gate is ``allocated / free_before``.
-        When ``max_free_bytes`` is set, the sidecar also allocates until no more
-        than that many bytes remain free and fails startup if it cannot reach the
-        ceiling.
+        When ``max_free_bytes`` is set, the sidecar also targets that residual
+        free-memory ceiling. Allocator rejection after reaching
+        ``target_mem_ratio`` is accepted as stronger evidence that the device is
+        saturated even if the reported residual remains above the ceiling.
         ``hold_seconds <= 0`` means keeping OOM pressure until the sidecar is
         explicitly stopped via ``stop_gpu_oom_hog(s)``.
     """

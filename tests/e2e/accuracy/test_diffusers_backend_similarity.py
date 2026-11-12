@@ -51,7 +51,7 @@ from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter imp
     CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS,
 )
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion]
 
 
 def _flash_attempt_backends() -> list[str]:
@@ -312,6 +312,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         cleanup_test_environment()
 
 
+@pytest.mark.slow
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
@@ -365,6 +366,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
     )
 
 
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(

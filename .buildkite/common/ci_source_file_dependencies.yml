@@ -1043,19 +1043,6 @@ source_file_dependencies:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
 
-  diffusion_qwen_image_perf:
-    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-    - .buildkite/amd/scripts/assert-pytest-collection.sh
-    - .buildkite/amd/scripts/validate-qwen-image-perf.py
-    - tests/dfx/conftest.py
-    - tests/helpers/hardware.py
-    - tests/helpers/mark.py
-    - tests/conftest.py
-    - benchmarks/diffusion/
-    - *qwen_image
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
-    - tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-
   diffusion_qwen_image_21_perf:
     - *qwen_image_21
     - tests/dfx/perf/scripts/run_benchmark.py
