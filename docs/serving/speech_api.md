@@ -366,12 +366,16 @@ arrives incrementally. `stream_audio=false` sends one binary audio frame per
 synthesis request; `stream_audio=true` sends one or more audio chunks per
 request. Streaming requires `response_format="pcm"` or `"wav"`.
 
-For `response_format="wav"`, the binary frames form one continuous byte stream
-that begins with a WAV header using placeholder RIFF and data sizes
-(`0xFFFFFFFF`), followed by PCM samples. WebSocket message boundaries are
-arbitrary; clients must feed binary frames into one stream parser rather than
-parsing each frame as a standalone audio unit. Strict WAV readers that require
-finalized sizes should use a non-streaming response.
+For `response_format="wav"`, each synthesis request is one WAV byte stream that
+begins with a WAV header using placeholder RIFF and data sizes (`0xFFFFFFFF`),
+followed by PCM samples. WebSocket message boundaries are arbitrary; clients
+must feed that request's binary frames into one stream parser rather than
+parsing each frame as a standalone audio unit. One WAV stream is produced per
+`audio.start`/`audio.done` pair: with `split_granularity="sentence"` or
+`"clause"`, or with multiple utterances on one connection, each pair starts a
+new stream with its own header. Do not feed all binary frames from a connection
+into a single WAV parser. Strict WAV readers that require finalized sizes
+should use a non-streaming response.
 
 In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
 linguistic splitter and emits requests before EOF. Commitment mode requires
@@ -394,8 +398,8 @@ Server -> Client:
 | Message | Description |
 | --------- | ------------- |
 | `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000, "channels": 1}` | Audio generation is starting for one request. In commitment mode, `sentence_text` is the raw committed segment and `sentence_index` is its zero-based ordinal; the legacy field names do not assert that it is a sentence. For streamed `pcm` or `wav`, it is sent with the first audio chunk and carries that audio's `sample_rate` and `channels` (omitted when no audio was produced). |
-| Binary frame | A chunk of one continuous byte stream; feed frames to the same stream parser. With `stream_audio=true`, the stream contains PCM samples; for `wav`, it starts with the 44-byte placeholder WAV header. |
-| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `total_bytes` counts all binary bytes sent, including the WAV header when applicable. `error=true` means it failed. |
+| Binary frame | A chunk of the current request's continuous byte stream; feed frames to that request's parser (`audio.start` … `audio.done`). With `stream_audio=true`, the stream contains PCM samples; for `wav`, each request starts with its own 44-byte placeholder WAV header. |
+| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | The corresponding request is complete. `total_bytes` counts all binary bytes sent for that request, including the WAV header when applicable. `error=true` means it failed. |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Terminal marker after `input.done`/EOF and all started requests have settled. It is not a success indicator. `total_sentences` is the number of requests that emitted `audio.start`, despite the compatibility name. |
 | `{"type": "error", "message": "..."}` | A protocol, limit, validation, or generation error. Some protocol errors are recoverable; a segment failure terminates the current utterance. |
 
