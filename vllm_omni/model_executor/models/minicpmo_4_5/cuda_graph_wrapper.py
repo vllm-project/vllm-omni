@@ -21,6 +21,10 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
 
+# Log an aggregated eager-fallback census after this many fallbacks, so a
+# deployment has a recurring signal besides each shape's one-time WARNING.
+_EAGER_FALLBACK_SUMMARY_EVERY = 100
+
 
 def _graph_api(device: torch.device):
     """Keep capture mechanics device-specific and graph layouts shared."""
@@ -200,6 +204,9 @@ class HiFTGraphWrapper:
         self._eager_fallbacks[key] = self._eager_fallbacks.get(key, 0) + 1
         if self._eager_fallbacks[key] == 1:
             logger.warning("Eager HiFT fallback (%s) for shape %s", reason, key)
+        total = sum(self._eager_fallbacks.values())
+        if total % _EAGER_FALLBACK_SUMMARY_EVERY == 0:
+            logger.info("Eager HiFT fallback census (%d total): %s", total, self._eager_fallbacks)
 
     def eager_fallback_counts(self) -> dict[tuple[int, int, int], int]:
         """Cumulative request-shaped eager fallback counts, by input shape."""
@@ -422,7 +429,7 @@ class HiFTGraphWrapper:
         if key not in self.graph:
             if self.lazy_graph_count >= self.max_lazy_graphs:
                 logger.info("Falling back to eager HiFT inference after reaching the lazy Graph limit")
-                self._count_eager_fallback(key, "lazy capture limit reached")
+                self._count_eager_fallback(exact_key, "lazy capture limit reached")
                 return self.decode_fn(speech_feat, cache_source)
             logger.info("Lazily capturing HiFT device graph for shape %s", key)
             self._capture(*key)

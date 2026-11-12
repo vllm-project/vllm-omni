@@ -270,6 +270,10 @@ def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -
     assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1, (16, 7, 0): 1}
     # The counters accumulate; nothing was captured for either miss.
     wrapper._capture.assert_not_called()
+    # Past the summary interval the aggregate census still holds.
+    for _ in range(100):
+        wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
+    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 101, (16, 7, 0): 1}
 
 
 def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPatch) -> None:
