@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3 import image_vae
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_image as h3i
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3DiTArchConfig
@@ -435,6 +436,106 @@ def test_offload_plan_streams_encoder_and_keeps_graph_replayed_vae_resident():
     # The image VAE replays CUDA graphs that capture its weight addresses.
     assert "vae" not in plan.on_demand_component_paths
     assert h3i.MiniMaxH3ImagePipeline._resident_dit_layers_on_device is not None
+
+
+@pytest.mark.parametrize(
+    ("offload_config", "expected_device"),
+    [
+        (None, "meta"),
+        ({"mode": "layer", "components": ["dit"]}, "meta"),
+        ({"mode": "layer", "components": ["text_encoder"]}, "cpu"),
+        ({"mode": "layer", "components": ["dit", "text_encoder"]}, "cpu"),
+        ({"mode": "module", "components": ["text_encoder"]}, "cpu"),
+    ],
+)
+def test_encoder_initialization_respects_component_offload(monkeypatch, tmp_path, offload_config, expected_device):
+    # Online DiT quantization constructs the pipeline on the accelerator.
+    # Use a meta default device to exercise that placement without real weights.
+    index = {
+        "_class_name": "MiniMaxH3ImagePipeline",
+        "_minimax_h3": {"partition": "image", "tasks": ["t2i", "edit"], "pdd_fused_heads": "heads.safetensors"},
+    }
+    (tmp_path / "model_index.json").write_text(json.dumps(index))
+    (tmp_path / "pdd_config.json").write_text(json.dumps(_RELEASE_PDD))
+    config = OmniDiffusionConfig(model=str(tmp_path), diffusion_offload_config=offload_config)
+    transformer = torch.nn.Module()
+    transformer.arch = MiniMaxH3DiTArchConfig(audio_enabled=False)
+    monkeypatch.setattr(h3i, "MiniMaxH3DiTModel", lambda od_config, quant_config: transformer)
+    monkeypatch.setattr(h3i.Qwen2TokenizerFast, "from_pretrained", lambda path, subfolder, local_files_only: None)
+    monkeypatch.setattr(h3i.Qwen3VLProcessor, "from_pretrained", lambda path, subfolder, local_files_only: None)
+    monkeypatch.setattr(h3i, "get_local_device", lambda: torch.device("meta"))
+    monkeypatch.setattr(h3i, "_dit_rank_world", lambda: (None, 0, 1))
+    monkeypatch.setattr(h3i.MiniMaxH3ImagePipeline, "_build_text_encoder_group", lambda self, size: None)
+    monkeypatch.setattr(
+        h3i.MiniMaxH3ImagePipeline, "_resolve_text_encoder_root", staticmethod(lambda index, root: str(root))
+    )
+    text_init_devices: list[torch.device | None] = []
+    target_devices: list[torch.device] = []
+
+    class EncoderConstructionReachedError(Exception):
+        pass
+
+    def record_encoder_placement(model_path, *, device, load_model, encoder_group, text_model_init_device=None):
+        assert load_model
+        text_init_devices.append(text_model_init_device)
+        target_devices.append(device)
+        # Stop before later initialization; this checks the real pipeline's
+        # device context at the component constructor boundary.
+        raise EncoderConstructionReachedError
+
+    monkeypatch.setattr(h3i, "MiniMaxH3Qwen3VLEncoder", record_encoder_placement)
+    with torch.device("meta"), pytest.raises(EncoderConstructionReachedError):
+        h3i.MiniMaxH3ImagePipeline(od_config=config)
+
+    assert text_init_devices == [torch.device("cpu") if expected_device == "cpu" else None]
+    assert target_devices == [torch.device("meta")]
+
+
+@pytest.mark.parametrize("text_init_device", [None, torch.device("cpu")])
+def test_encoder_text_placement_preserves_vision_rotary_initialization(monkeypatch, text_init_device):
+    from transformers import Qwen3VLConfig
+    from vllm.model_executor import parameter as parameter_module
+
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+
+    config = Qwen3VLConfig(
+        text_config={
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 256,
+        },
+        vision_config={
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "depth": 1,
+            "num_heads": 4,
+            "patch_size": 2,
+            "temporal_patch_size": 1,
+            "out_hidden_size": 32,
+            "num_position_embeddings": 16,
+            "spatial_merge_size": 2,
+            "deepstack_visual_indexes": [],
+        },
+    )
+    monkeypatch.setattr(Qwen3VLConfig, "from_pretrained", lambda *args, **kwargs: config)
+    monkeypatch.setattr(encoder_module, "_tp_range", lambda group: (0, 1))
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    with torch.device("meta"):
+        encoder = MiniMaxH3Qwen3VLEncoder(
+            "unused", device=torch.device("meta"), load_model=True, text_model_init_device=text_init_device
+        )
+
+    expected_text_device = "cpu" if text_init_device is not None else "meta"
+    assert encoder.text_model.embed_tokens.weight.device.type == expected_text_device
+    assert next(encoder.vision.parameters()).device.type == "meta"
+    assert encoder.vision.rotary_pos_emb._inv_freq.device.type == "meta"
+    assert encoder.vision.rotary_pos_emb._inv_freq.dtype == torch.float32
 
 
 @pytest.mark.parametrize(
