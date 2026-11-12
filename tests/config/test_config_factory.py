@@ -542,23 +542,29 @@ class TestStageConfigFactory:
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
 
-    def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self):
+    @pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
+    def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self, global_first):
         # Pass the same filter set the function uses by default
         # (orchestrator-only fields plus SHARED_FIELDS so ``model`` is
         # treated as not-per-stage-overridable).
+        cli_overrides = {
+            "gpu_memory_utilization": 0.5,
+            "stage_0_gpu_memory_utilization": 0.9,
+            "stage_1_gpu_memory_utilization": 0.1,
+            "stage_0_model": "should_be_ignored",
+            "parallel_config": {"world_size": 2},
+            "seed": 42,
+            "stage_0_seed": None,
+        }
+        if not global_first:
+            cli_overrides = dict(reversed(cli_overrides.items()))
+
         overrides = build_stage_runtime_overrides(
-            0,
-            {
-                "gpu_memory_utilization": 0.5,
-                "stage_0_gpu_memory_utilization": 0.9,
-                "stage_1_gpu_memory_utilization": 0.1,
-                "stage_0_model": "should_be_ignored",
-                "parallel_config": {"world_size": 2},
-            },
-            internal_keys=internal_blacklist_keys() | SHARED_FIELDS,
+            0, cli_overrides, internal_keys=internal_blacklist_keys() | SHARED_FIELDS
         )
 
         assert overrides["gpu_memory_utilization"] == 0.9
+        assert overrides["seed"] == 42
         assert "model" not in overrides
         assert "parallel_config" not in overrides
 

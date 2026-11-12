@@ -640,6 +640,44 @@ def test_global_llm_lora_fields_apply_to_single_stage_pipeline():
     assert lora_config._omni_explicit_fields == {"max_lora_rank", "max_loras", "max_cpu_loras"}
 
 
+@pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
+def test_stage_scoped_lora_values_override_globals_on_single_stage_pipeline(global_first):
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+    global_overrides = {"enable_lora": True, "max_lora_rank": 16, "max_cpu_loras": 1}
+    stage_overrides = {"stage_0_max_lora_rank": 64, "stage_0_max_loras": 2, "stage_0_max_cpu_loras": 4}
+    if global_first:
+        cli_overrides = {**global_overrides, **stage_overrides}
+    else:
+        cli_overrides = {**stage_overrides, **global_overrides}
+
+    config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=cli_overrides)
+
+    lora_config = config.stage_by_id(0).lora_config
+    assert isinstance(lora_config, OmniStageLoRAConfig)
+    assert (lora_config.max_lora_rank, lora_config.max_loras, lora_config.max_cpu_loras) == (64, 2, 4)
+
+
+@pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
+def test_stage_scoped_disable_lora_overrides_global_enable_on_single_stage_pipeline(global_first):
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+    global_overrides = {"enable_lora": True, "max_lora_rank": 64}
+    stage_overrides = {"stage_0_enable_lora": False}
+    if global_first:
+        cli_overrides = {**global_overrides, **stage_overrides}
+    else:
+        cli_overrides = {**stage_overrides, **global_overrides}
+
+    config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=cli_overrides)
+
+    assert config.stage_by_id(0).lora_config is None
+
+
 @pytest.mark.parametrize(
     ("model_type", "cli_overrides"),
     [
