@@ -1603,36 +1603,58 @@ class WanS2VTransformer3DModel(nn.Module):
             return False
         return get_forward_context().sp_active
 
+    def _inject_audio_frames(self, audio_attn_id, frame_hidden_states, frame_start, num_frames):
+        """Audio residual for whole or partial frames ``[frame_start, frame_start + num_frames)``.
+
+        ``frame_hidden_states`` is ``[b, num_frames * tokens, c]``; with ``num_frames == 1`` the frame may be partial.
+        Every op is per token (norms, cross-attention to the token's own frame's audio tokens), so any frame-aligned
+        split of the noisy tokens gives the same result as processing all frames at once.
+        """
+        frames = slice(frame_start, frame_start + num_frames)
+        injector = self.audio_injector
+        if self.enable_adain and self.adain_mode == "attn_norm":
+            norm = injector.injector_adain_layers[audio_attn_id]
+            temb = rearrange(self.audio_emb_global[:, frames], "b t n c -> (b t) n c")[:, 0]
+        else:
+            norm, temb = injector.injector_pre_norm_feat[audio_attn_id], None
+        audio_emb = rearrange(self.merged_audio_emb[:, frames], "b t n c -> (b t) n c")
+        return self.audio_inject_layer(
+            frame_hidden_states, audio_emb, norm, injector.injector[audio_attn_id], temb, num_frames
+        )
+
     def after_transformer_block(self, block_idx, hidden_states):
-        if block_idx in self.audio_injector.injected_block_id.keys():
-            sp_active = self._is_sp_active()
-            if sp_active:
-                from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
+        if block_idx not in self.audio_injector.injected_block_id:
+            return hidden_states
+        audio_attn_id = self.audio_injector.injected_block_id[block_idx]
+        num_frames = self.merged_audio_emb.shape[1]
+        frame_len, rem = divmod(self.original_seq_len, num_frames)
+        if rem:
+            raise ValueError(f"{self.original_seq_len} noisy tokens do not split into {num_frames} audio frames")
 
-                hidden_states = sp_gather(hidden_states, dim=1, validate=False)
+        # Under SP each rank holds the contiguous chunk [global_start, global_start + chunk) of the padded sequence
+        # (blocks_prepare); the injection is per token, so each rank injects its own noisy tokens in place instead of
+        # gathering the full sequence, repeating the work on every rank and re-sharding.
+        chunk = hidden_states.shape[1]
+        global_start = 0
+        if self._is_sp_active():
+            from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank
 
-            audio_attn_id = self.audio_injector.injected_block_id[block_idx]
-            audio_emb = self.merged_audio_emb
-            num_frames = audio_emb.shape[1]
-
-            if self.enable_adain and self.adain_mode == "attn_norm":
-                norm = self.audio_injector.injector_adain_layers[audio_attn_id]
-                temb = rearrange(self.audio_emb_global, "b t n c -> (b t) n c")[:, 0]
+            global_start = get_sequence_parallel_rank() * chunk
+        pos, end = global_start, min(global_start + chunk, self.original_seq_len)
+        # Frame-aligned segments: a leading partial frame, a run of whole frames, a trailing partial frame.
+        while pos < end:
+            frame = pos // frame_len
+            if pos % frame_len == 0 and end - pos >= frame_len:
+                count = (end - pos) // frame_len
+                seg_end = pos + count * frame_len
             else:
-                norm, temb = self.audio_injector.injector_pre_norm_feat[audio_attn_id], None
-            residual_out = self.audio_inject_layer(
-                hidden_states[:, : self.original_seq_len],
-                rearrange(audio_emb, "b t n c -> (b t) n c"),
-                norm,
-                self.audio_injector.injector[audio_attn_id],
-                temb,
-                num_frames,
+                count = 1
+                seg_end = min((frame + 1) * frame_len, end)
+            local = slice(pos - global_start, seg_end - global_start)
+            hidden_states[:, local].add_(
+                self._inject_audio_frames(audio_attn_id, hidden_states[:, local], frame, count)
             )
-            hidden_states[:, : self.original_seq_len].add_(residual_out)
-
-            if sp_active:
-                hidden_states = sp_shard(hidden_states, dim=1, validate=False)
-
+            pos = seg_end
         return hidden_states
 
     # ------------------------------------------------------------------
