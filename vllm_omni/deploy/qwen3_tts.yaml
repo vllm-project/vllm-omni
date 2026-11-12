@@ -14,7 +14,7 @@
 #     first-chunk latency low, and the MRV2 profiles rely on that bound.
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
-#   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
+#   * Stage 0 uses graphs by default on CUDA; NPU overrides it to eager.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
 model_runner: v2
@@ -203,23 +203,13 @@ platforms:
     model_runner: v1
     stages:
       - stage_id: 0
-        enforce_eager: false
-        # The Talker emits one codec frame per step, so a step is a few
-        # thousand small device kernels wrapped in per-step host work. Under
-        # PIECEWISE, `_init_talker_mtp` never wraps talker_mtp (it requires
-        # `cudagraph_mode.has_full_cudagraphs()`), so that host work stays on
-        # the critical path: a torch_npu profile of a c1 decode measured
-        # 20.8 ms of host gap inside every 45.3 ms step (46%), 2646 kernels.
-        # FULL_DECODE_ONLY wraps it, which collapses the step into one replay.
-        # 910B1, Qwen3-TTS-12Hz-1.7B-CustomVoice, bf16, 32-request workload:
-        #   c1   23.5 +/- 0.3 -> 29.6 +/- 0.1 frames/s  (n=4 runs each)
-        #   c32 232.3 +/- 3.6 -> 247.3 +/- 0.4 frames/s (n=4 runs each)
-        # This changes the sampled codec tokens: graph replay and the eager
-        # path do not give bit-identical logits, so the draw diverges and the
-        # audio differs (deterministic per configuration). See
-        # docs/design/qwen3_omni_tts_performance_optimization.md
-        # ("NPU Talker decode graph mode") for the WER comparison and its
-        # limits before relying on this on another workload.
+        # Keep the conservative Talker path after upstream integration.
+        # The vLLM 0.33 FULL_DECODE_ONLY smoke exhausted the token limit for
+        # short inputs; the same native predictor/codec options stopped
+        # normally with enforce_eager=true. Historical graph measurements
+        # do not qualify this runtime. Revalidate before setting false.
+        # See "NPU Talker decode graph mode" in the performance design doc.
+        enforce_eager: true
         compilation_config:
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1

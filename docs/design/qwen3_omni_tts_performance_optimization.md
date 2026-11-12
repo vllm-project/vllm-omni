@@ -743,6 +743,17 @@ The measurements in this subsection are historical results from the original
 Talker graph change. They do not requalify later upstream integration or the
 additional predictor/dual-stream options described above.
 
+In the vLLM 0.33 integration smoke on Ascend 910B1, enabling the native predictor
+options and two codec streams with `FULL_DECODE_ONLY` exhausted the generation
+limit for all five short inputs. Setting stage 0 `enforce_eager: true`, with the
+same options and inputs, produced normal stop completions and nonempty WAVs.
+A further graph-enabled control with all three new options disabled also hit
+the limit on the same English input. The NPU stage-0 default therefore uses
+`enforce_eager: true`; retain it when qualifying the migrated options.
+This is a functional observation, not a speech-quality or performance result;
+the underlying outer-graph interaction still needs investigation. Shutdown also
+used the framework's forced worker cleanup, so graceful shutdown is unqualified.
+
 The Talker emits one codec frame per step, so a step is a few thousand small
 device kernels wrapped in per-step scheduler, sampling and IPC work. vLLM-Omni
 wraps `talker_mtp` in a device-graph wrapper only when the stage's
