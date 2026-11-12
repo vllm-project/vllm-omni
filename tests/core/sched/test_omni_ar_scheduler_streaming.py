@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing.reduction import ForkingPickler
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
@@ -14,7 +15,9 @@ from unittest.mock import MagicMock
 
 import msgspec
 import pytest
+import torch
 import zmq
+from transformers import OPTConfig
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
@@ -22,15 +25,23 @@ import zmq
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 import vllm.v1.engine.core as engine_core
 from vllm.sampling_params import SamplingParams
+from vllm.config import CacheConfig, DeviceConfig, SchedulerConfig, VllmConfig
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.structured_output import StructuredOutputManager
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.engine.messages import TextInputUpdate
+from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration as Talker
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -44,6 +55,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._model_input_streams = {}
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
@@ -1654,6 +1666,483 @@ def test_queued_streaming_update_that_fits_still_resumes_the_session() -> None:
     assert session.status == RequestStatus.WAITING
     assert not getattr(sched, "_streaming_context_overflow", {})
     sched._free_request.assert_not_called()
+
+
+@pytest.fixture
+def route_scheduler_factory(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+    OPTConfig(
+        architectures=["OPTForCausalLM"],
+        hidden_size=16,
+        ffn_dim=32,
+        num_attention_heads=1,
+        num_hidden_layers=1,
+        max_position_embeddings=128,
+        vocab_size=256,
+    ).save_pretrained(tmp_path)
+
+    def create(*, num_blocks=40, async_scheduling=False):
+        config = VllmConfig(
+            model_config=OmniModelConfig(
+                model=str(tmp_path), skip_tokenizer_init=True, dtype="float32", max_model_len=64
+            ),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=8,
+                max_model_len=64,
+                async_scheduling=async_scheduling,
+                watermark=0.0,
+                is_encoder_decoder=False,
+            ),
+            cache_config=CacheConfig(block_size=4, enable_prefix_caching=False),
+            device_config=DeviceConfig(device="cpu"),
+        )
+        config.cache_config.num_gpu_blocks = num_blocks
+        config.model_config.use_v2_model_runner = True
+        config.model_config.final_output = True
+        config.model_config.engine_output_type = "audio"
+        config.model_config.model_arch = "Qwen3TTSTalkerForConditionalGeneration"
+        config.model_config.hf_config.talker_config = SimpleNamespace(text_vocab_size=256)
+        register_all_kvcache_specs(config)
+        cache = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer"],
+                    FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=16, dtype=torch.float32),
+                )
+            ],
+        )
+        scheduler_class = OmniARAsyncScheduler if async_scheduling else OmniARScheduler
+        scheduler = scheduler_class(config, cache, StructuredOutputManager(config), block_size=4)
+        scheduler.use_v2_model_runner = True
+        return scheduler
+
+    return create
+
+
+def _route_request(request_id, *, max_tokens, resumable=False, prompt_token_ids=None, stop_token_ids=None):
+    return Request(
+        request_id,
+        [1, 2, 3] if prompt_token_ids is None else prompt_token_ids,
+        SamplingParams(max_tokens=max_tokens, ignore_eos=True, stop_token_ids=stop_token_ids),
+        None,
+        resumable=resumable,
+    )
+
+
+def _admit_route_request(scheduler, request):
+    """Model the engine's prevalidated stream handoff before scheduler admission."""
+    stream = Talker.create_input_stream(request, scheduler.vllm_config)
+    scheduler.add_request(request)
+    scheduler.register_input_stream(request.request_id, stream)
+    return request
+
+
+def _route_model_output(scheduler, scheduled):
+    request_ids = list(scheduled.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=request_ids,
+        req_id_to_index={request_id: index for index, request_id in enumerate(request_ids)},
+        sampled_token_ids=[
+            [17] if not scheduler.requests[request_id].is_prefill_chunk else [] for request_id in request_ids
+        ],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _complete_route_step(scheduler, scheduled):
+    return scheduler.update_from_output(scheduled, _route_model_output(scheduler, scheduled))
+
+
+def _route_text_updates(scheduled):
+    updates = {}
+    for data in scheduled.scheduled_new_reqs:
+        payload = data.model_intermediate_buffer or {}
+        if "input_stream_update" in payload:
+            updates[data.req_id] = payload["input_stream_update"]
+    for request_id, payload in getattr(scheduled.scheduled_cached_reqs, "additional_information", {}).items():
+        if payload and "input_stream_update" in payload:
+            updates[request_id] = payload["input_stream_update"]
+    return updates
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_text_input_wait_reserves_capacity_without_blocking_another_request(route_scheduler_factory, async_scheduling):
+    scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
+    first = _route_request("a", max_tokens=4)
+    second = _route_request("b", max_tokens=4)
+    third = _route_request("c", max_tokens=4)
+    first.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, first)
+    scheduler.add_request(second)
+    _complete_route_step(scheduler, scheduler.schedule())
+    scheduler.add_request(third)
+    next_step = scheduler.schedule()
+    assert next_step.num_scheduled_tokens == {"b": 1}
+    assert next_step.scheduled_new_reqs == []
+    assert first in scheduler.running
+    assert third.status == RequestStatus.WAITING
+    _complete_route_step(scheduler, next_step)
+    scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
+    after_cancel = scheduler.schedule()
+    assert "c" in after_cancel.num_scheduled_tokens
+    assert after_cancel.finished_req_ids == {"a"}
+    _complete_route_step(scheduler, after_cancel)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("expires", [False, True])
+def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requests(
+    route_scheduler_factory, monkeypatch, async_scheduling, expires
+):
+    scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
+    clock = [100.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    first = _route_request("waiting", max_tokens=8)
+    first.additional_information = {"input_stream": {"token_ids": [31]}}
+    second = _route_request("running", max_tokens=12)
+    third = _route_request("queued", max_tokens=8)
+    _admit_route_request(scheduler, first)
+    scheduler.add_request(second)
+    _complete_route_step(scheduler, scheduler.schedule())
+    _complete_route_step(scheduler, scheduler.schedule())
+    scheduler.add_request(third)
+    original_running = list(scheduler.running)
+    original_waiting = list(scheduler.waiting)
+    original_holding = list(scheduler.kv_holding_waiting)
+    original_running_limit = scheduler.max_num_running_reqs
+    original_active_limit = scheduler.max_num_active_reqs
+    original_blocks = scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()
+    if expires:
+        clock[0] += 10
+
+    def fail_schedule(current, throttle_prefills=False):
+        assert current is scheduler
+        assert current.running == [second]
+        assert list(current.waiting) == original_waiting
+        assert current.max_num_running_reqs == original_running_limit - (not expires)
+        assert current.max_num_active_reqs == original_active_limit - (not expires)
+        raise RuntimeError("upstream scheduling failed")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(VLLMScheduler, "schedule", fail_schedule)
+        with pytest.raises(RuntimeError, match="upstream scheduling failed"):
+            scheduler.schedule()
+
+    assert scheduler.running == ([second] if expires else original_running)
+    assert list(scheduler.waiting) == original_waiting
+    assert list(scheduler.kv_holding_waiting) == original_holding
+    assert scheduler.max_num_running_reqs == original_running_limit
+    assert scheduler.max_num_active_reqs == original_active_limit
+    if expires:
+        assert first.status == RequestStatus.FINISHED_ERROR
+        assert first.request_id not in scheduler.requests
+        assert scheduler._model_input_streams == {}
+        assert not scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()[0]
+    else:
+        assert first.status == RequestStatus.RUNNING
+        assert scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids() == original_blocks
+    scheduled = scheduler.schedule()
+    assert ("queued" in scheduled.num_scheduled_tokens) is expires
+    outputs = _complete_route_step(scheduler, scheduled)
+    errors = [output for batch in outputs.values() for output in batch.outputs if output.request_id == "waiting"]
+    if expires:
+        assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
+        assert errors[0].stop_reason == "Timed out waiting for text input after 10s"
+    else:
+        assert errors == []
+    scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_text_input_updates_continue_without_readmission(route_scheduler_factory, async_scheduling):
+    scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
+    current = _route_request("native", max_tokens=8)
+    current.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, current)
+    first = scheduler.schedule()
+    assert _route_text_updates(first) == {"native": {"token_ids": [31], "final": False}}
+    assert _route_text_updates(ForkingPickler.loads(ForkingPickler.dumps(first))) == _route_text_updates(first)
+    _complete_route_step(scheduler, first)
+    blocks = scheduler.kv_cache_manager.get_blocks("native").get_block_ids()
+    for _ in range(3):
+        waiting = scheduler.schedule()
+        assert not waiting.num_scheduled_tokens and _route_text_updates(waiting) == {}
+        assert current.status == RequestStatus.RUNNING
+        assert scheduler.kv_cache_manager.get_blocks("native").get_block_ids() == blocks
+        _complete_route_step(scheduler, waiting)
+    params = current.sampling_params
+    scheduler.append_text(TextInputUpdate(request_id="native", token_ids=[32]))
+    continued = scheduler.schedule()
+    assert continued.scheduled_new_reqs == []
+    assert _route_text_updates(continued) == {"native": {"token_ids": [32], "final": False}}
+    assert _route_text_updates(ForkingPickler.loads(ForkingPickler.dumps(continued))) == _route_text_updates(continued)
+    _complete_route_step(scheduler, continued)
+    assert len(current.output_token_ids) == 2
+    scheduler.append_text(TextInputUpdate(request_id="native", token_ids=[], final=True))
+    drain = scheduler.schedule()
+    assert drain.scheduled_new_reqs == []
+    assert _route_text_updates(drain) == {"native": {"token_ids": [], "final": True}}
+    _complete_route_step(scheduler, drain)
+    assert current.num_prompt_tokens == 3 and current.sampling_params is params
+    scheduler.finish_requests("native", RequestStatus.FINISHED_ABORTED)
+    assert scheduler._model_input_streams == {}
+    with pytest.raises(ValueError, match="No active"):
+        scheduler.append_text(TextInputUpdate(request_id="native", token_ids=[33]))
+
+
+def test_text_input_can_finish_on_the_first_drain_step(route_scheduler_factory):
+    scheduler = route_scheduler_factory()
+    request = _route_request("request", max_tokens=8, stop_token_ids=[5])
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, request)
+    _complete_route_step(scheduler, scheduler.schedule())
+    scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[], final=True))
+    drain = scheduler.schedule()
+    assert _route_text_updates(drain) == {"request": {"token_ids": [], "final": True}}
+    output = _route_model_output(scheduler, drain)
+    output.sampled_token_ids = [[5]]
+    outputs = scheduler.update_from_output(drain, output)
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert scheduler._model_input_streams == {} and scheduler.requests == {}
+    assert [result.finish_reason for batch in outputs.values() for result in batch.outputs] == [FinishReason.STOP]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_text_input_preemption_resends_latest_input(route_scheduler_factory, async_scheduling):
+    scheduler = route_scheduler_factory(num_blocks=5, async_scheduling=async_scheduling)
+    first = _route_request("a", max_tokens=6)
+    second = _route_request("b", max_tokens=12)
+    first.additional_information = {"input_stream": {"token_ids": [31]}}
+    second.additional_information = {"input_stream": {"token_ids": list(range(10))}}
+    _admit_route_request(scheduler, first)
+    _admit_route_request(scheduler, second)
+    for _ in range(8):
+        _complete_route_step(scheduler, scheduler.schedule())
+    scheduler.append_text(TextInputUpdate(request_id="a", token_ids=[32, 33, 34, 35], final=True))
+    preempted = []
+    replay_updates = []
+    for _ in range(24):
+        scheduled = scheduler.schedule()
+        preempted.extend(scheduled.preempted_req_ids)
+        if scheduled.preempted_req_ids:
+            assert second.status == RequestStatus.PREEMPTED
+            scheduler.append_text(TextInputUpdate(request_id="b", token_ids=[42], final=True))
+        if any(data.req_id == "b" for data in scheduled.scheduled_new_reqs):
+            replay_updates.append(_route_text_updates(scheduled)["b"])
+        _complete_route_step(scheduler, scheduled)
+        if not scheduler.has_requests():
+            break
+    assert preempted == ["b"] and second.num_preemptions == 1
+    assert replay_updates == [{"token_ids": [*range(10), 42], "final": True}]
+    assert first.is_finished() and second.is_finished()
+    assert scheduler._model_input_streams == {}
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("channel", ["plain", "wire", "native"])
+@pytest.mark.parametrize("timeout_s", [None, 0.1, 1e9])
+def test_text_input_timeout_releases_kv_and_seat_with_one_error(
+    route_scheduler_factory, monkeypatch, async_scheduling, channel, timeout_s
+):
+    scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
+    clock = [100.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    waiting = _route_request("waiting", max_tokens=8)
+    waiting.additional_information = {"input_stream": {"token_ids": [31]}}
+    if timeout_s is not None:
+        waiting.additional_information["input_stream"]["timeout_s"] = timeout_s
+    if channel == "wire":
+        waiting.additional_information = serialize_additional_information(waiting.additional_information)
+    elif channel == "native":
+        waiting.model_intermediate_buffer = waiting.additional_information
+        waiting.additional_information = None
+    other = _route_request("other", max_tokens=12)
+    newcomer = _route_request("newcomer", max_tokens=8)
+    _admit_route_request(scheduler, waiting)
+    scheduler.add_request(other)
+    _complete_route_step(scheduler, scheduler.schedule())
+    scheduler.add_request(newcomer)
+    held = scheduler.schedule()
+    assert held.num_scheduled_tokens == {"other": 1}
+    assert scheduler.kv_cache_manager.get_blocks("waiting").get_block_ids()[0]
+    _complete_route_step(scheduler, held)
+    clock[0] += 9
+    before_timeout = scheduler.schedule()
+    assert waiting.status == RequestStatus.RUNNING and not before_timeout.finished_req_ids
+    _complete_route_step(scheduler, before_timeout)
+    clock[0] += 1
+    released = scheduler.schedule()
+    assert released.finished_req_ids == {"waiting"}
+    assert "newcomer" in released.num_scheduled_tokens
+    assert waiting.status == RequestStatus.FINISHED_ERROR
+    assert not scheduler.kv_cache_manager.get_blocks("waiting").get_block_ids()[0]
+    assert scheduler._model_input_streams == {}
+    outputs = _complete_route_step(scheduler, released)
+    errors = [output for batch in outputs.values() for output in batch.outputs if output.request_id == "waiting"]
+    assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
+    assert errors[0].stop_reason == "Timed out waiting for text input after 10s"
+    following = _complete_route_step(scheduler, scheduler.schedule())
+    assert all(output.request_id != "waiting" for batch in following.values() for output in batch.outputs)
+    with pytest.raises(ValueError, match="No active"):
+        scheduler.append_text(TextInputUpdate(request_id="waiting", token_ids=[32]))
+
+
+def test_new_text_and_eof_clear_only_the_actual_input_wait(route_scheduler_factory, monkeypatch):
+    scheduler = route_scheduler_factory()
+    clock = [100.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    request = _route_request("request", max_tokens=8)
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, request)
+    _complete_route_step(scheduler, scheduler.schedule())
+    _complete_route_step(scheduler, scheduler.schedule())
+    assert scheduler._model_input_streams["request"].wait_started_at == 100.0
+    clock[0] += 9
+    scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[32]))
+    _complete_route_step(scheduler, scheduler.schedule())
+    assert scheduler._model_input_streams["request"].wait_started_at is None
+    clock[0] += 9
+    _complete_route_step(scheduler, scheduler.schedule())
+    assert request.status == RequestStatus.RUNNING
+    scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[], final=True))
+    clock[0] += 11
+    drained = scheduler.schedule()
+    assert drained.num_scheduled_tokens == {"request": 1} and not drained.finished_req_ids
+    _complete_route_step(scheduler, drained)
+    scheduler.finish_requests("request", RequestStatus.FINISHED_ABORTED)
+
+
+def test_last_text_wait_timeout_emits_error_without_any_model_step(route_scheduler_factory, monkeypatch):
+    scheduler = route_scheduler_factory()
+    clock = [100.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    request = _route_request("request", max_tokens=8)
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, request)
+    _complete_route_step(scheduler, scheduler.schedule())
+    _complete_route_step(scheduler, scheduler.schedule())
+    clock[0] += 10
+    expired = scheduler.schedule()
+    assert expired.total_num_scheduled_tokens == 0 and expired.finished_req_ids == {"request"}
+    outputs = _complete_route_step(scheduler, expired)
+    errors = [output for batch in outputs.values() for output in batch.outputs]
+    assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
+    assert scheduler.requests == {} and not scheduler.has_requests()
+
+
+def test_async_text_gate_counts_authorized_steps_before_outputs_arrive(route_scheduler_factory):
+    scheduler = route_scheduler_factory(async_scheduling=True)
+    request = _route_request("request", max_tokens=8)
+    request.additional_information = {"input_stream": {"token_ids": [31, 32]}}
+    _admit_route_request(scheduler, request)
+    prefill = scheduler.schedule()
+    prefill_output = _route_model_output(scheduler, prefill)
+    decode = scheduler.schedule()
+    decode_output = _route_model_output(scheduler, decode)
+    assert decode.num_scheduled_tokens == {"request": 1}
+    assert request.num_output_tokens == 0 and request.num_output_placeholders == 2
+    assert _route_text_updates(prefill) == {"request": {"token_ids": [31, 32], "final": False}}
+    scheduler.update_from_output(prefill, prefill_output)
+    held = scheduler.schedule()
+    assert held.num_scheduled_tokens == {} and _route_text_updates(held) == {}
+    assert request.num_output_tokens == 1 and request.num_output_placeholders == 1
+    scheduler.update_from_output(decode, decode_output)
+    _complete_route_step(scheduler, held)
+    scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[33]))
+    continued = scheduler.schedule()
+    assert continued.scheduled_new_reqs == [] and continued.num_scheduled_tokens == {"request": 1}
+    assert _route_text_updates(continued) == {"request": {"token_ids": [33], "final": False}}
+    _complete_route_step(scheduler, continued)
+    assert request.num_output_tokens == 3 and request.num_output_placeholders == 0
+    scheduler.finish_requests("request", RequestStatus.FINISHED_ABORTED)
+
+
+def test_async_text_gate_handles_split_prefill_and_updates_while_output_is_pending(route_scheduler_factory):
+    scheduler = route_scheduler_factory(async_scheduling=True)
+    request = _route_request("request", max_tokens=8, prompt_token_ids=[0] * 12)
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, request)
+    partial = scheduler.schedule()
+    partial_output = _route_model_output(scheduler, partial)
+    assert partial.num_scheduled_tokens == {"request": 8}
+    assert partial_output.sampled_token_ids == [[]] and request.num_output_placeholders == 0
+    final_prefill = scheduler.schedule()
+    final_output = _route_model_output(scheduler, final_prefill)
+    assert final_prefill.num_scheduled_tokens == {"request": 4}
+    assert request.num_output_placeholders == 1
+    scheduler.update_from_output(partial, partial_output)
+    scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[32], final=True))
+    decode = scheduler.schedule()
+    decode_output = _route_model_output(scheduler, decode)
+    assert decode.num_scheduled_tokens == {"request": 1}
+    assert _route_text_updates(decode) == {"request": {"token_ids": [32], "final": True}}
+    assert _route_text_updates(partial) == {"request": {"token_ids": [31], "final": False}}
+    scheduler.update_from_output(final_prefill, final_output)
+    scheduler.update_from_output(decode, decode_output)
+    assert request.num_output_tokens == 2 and request.num_output_placeholders == 0
+    scheduler.finish_requests("request", RequestStatus.FINISHED_ABORTED)
+
+
+def test_async_real_preemption_drains_inflight_output_before_readmission(route_scheduler_factory):
+    scheduler = route_scheduler_factory(num_blocks=5, async_scheduling=True)
+    first = _route_request("a", max_tokens=6)
+    second = _route_request("b", max_tokens=12)
+    first.additional_information = {"input_stream": {"token_ids": [31]}}
+    second.additional_information = {"input_stream": {"token_ids": list(range(10))}}
+    _admit_route_request(scheduler, first)
+    _admit_route_request(scheduler, second)
+    for _ in range(7):
+        _complete_route_step(scheduler, scheduler.schedule())
+    pending = scheduler.schedule()
+    pending_output = _route_model_output(scheduler, pending)
+    assert pending.num_scheduled_tokens == {"b": 1} and second.num_output_placeholders == 1
+    scheduler.append_text(TextInputUpdate(request_id="a", token_ids=[32, 33, 34, 35], final=True))
+    for _ in range(8):
+        scheduled = scheduler.schedule()
+        output = _route_model_output(scheduler, scheduled)
+        if scheduled.preempted_req_ids:
+            assert scheduled.preempted_req_ids == {"b"}
+            assert second.status == RequestStatus.PREEMPTED and second.num_stale_output_tokens == 1
+            scheduler.append_text(TextInputUpdate(request_id="b", token_ids=[42], final=True))
+            scheduler.update_from_output(pending, pending_output)
+            assert second.num_stale_output_tokens == second.num_output_placeholders == 0
+            scheduler.update_from_output(scheduled, output)
+            break
+        scheduler.update_from_output(pending, pending_output)
+        pending, pending_output = scheduled, output
+    else:
+        pytest.fail("KV pressure did not preempt the in-flight request")
+    replay_updates = []
+    for _ in range(24):
+        scheduled = scheduler.schedule()
+        if any(data.req_id == "b" for data in scheduled.scheduled_new_reqs):
+            replay_updates.append(_route_text_updates(scheduled)["b"])
+        _complete_route_step(scheduler, scheduled)
+        if not scheduler.has_requests():
+            break
+    assert replay_updates == [{"token_ids": [*range(10), 42], "final": True}]
+    assert first.is_finished() and second.is_finished() and second.num_preemptions == 1
+    assert first.num_in_flight_tokens == second.num_in_flight_tokens == 0
+    assert scheduler._model_input_streams == {}
+
+
+def test_async_cancel_with_inflight_output_does_not_resurrect_input(route_scheduler_factory):
+    scheduler = route_scheduler_factory(async_scheduling=True)
+    request = _route_request("request", max_tokens=8)
+    request.additional_information = {"input_stream": {"token_ids": [31]}}
+    _admit_route_request(scheduler, request)
+    pending = scheduler.schedule()
+    pending_output = _route_model_output(scheduler, pending)
+    scheduler.finish_requests("request", RequestStatus.FINISHED_ABORTED)
+    scheduler.update_from_output(pending, pending_output)
+    assert scheduler._model_input_streams == {} and scheduler.requests == {}
+    with pytest.raises(ValueError, match="No active"):
+        scheduler.append_text(TextInputUpdate(request_id="request", token_ids=[32]))
 
 
 def test_queued_stop_with_a_recorded_overflow_still_leaves_admission() -> None:

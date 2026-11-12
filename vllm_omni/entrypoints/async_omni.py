@@ -914,6 +914,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._settle_pending_submits(internal_ids)
         await self._abort(internal_ids, timeout=timeout)
 
+    async def append_text(self, request_id: str, token_ids: list[int], *, final: bool = False) -> None:
+        """Append body IDs to exactly one submitted external request."""
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if len(internal_ids) != 1:
+            raise ValueError(f"Text input requires exactly one active request for {request_id!r}")
+        await self.engine.append_text_async(internal_ids[0], token_ids, final=final)
+
     async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         """Forward external-session playback progress to the diffusion engine."""
         self.validate_streaming_playback_request()

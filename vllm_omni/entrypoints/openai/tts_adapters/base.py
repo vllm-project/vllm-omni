@@ -15,7 +15,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from vllm.logger import init_logger
 
@@ -190,6 +190,19 @@ class PreparedRequest:
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
 
 
+class IncrementalTTSInput(Protocol):
+    """Model-owned input conversion for one ordinary TTS request.
+
+    Each call receives released frontend text, not token IDs or a batch of
+    requests. The handler owns submission, output consumption, cancellation, and
+    EOF. An empty final append closes text input without ending generation.
+    """
+
+    async def build(self, text: str, *, final: bool) -> PreparedRequest: ...
+
+    async def append(self, request_id: str, text: str, *, final: bool) -> None: ...
+
+
 @dataclass
 class SpeechServingContext:
     """Shared state and helpers an adapter may use.
@@ -267,6 +280,7 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    supports_incremental_input: ClassVar[bool] = False
     #: None disables commitment. Opt-in adapters describe their complete
     #: commitment contract so the handler can validate every requested feature.
     text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
@@ -348,6 +362,10 @@ class TTSModelAdapter(ABC):
         Recomputing it here would misclassify uploaded voices as inline and drop
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
+
+    async def create_incremental_input(self, request: "OpenAICreateSpeechRequest") -> IncrementalTTSInput:
+        """Create fresh model input state; ordinary request validation is shared."""
+        raise ValueError(f"Incremental model input is not supported by {self.name}")
 
     def apply_sampling_overrides(
         self,
@@ -464,6 +482,7 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "IncrementalTTSInput",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

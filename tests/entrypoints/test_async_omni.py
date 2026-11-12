@@ -1102,3 +1102,80 @@ async def test_paced_output_credit_waits_for_consumer(mocker):
         await anext(outputs)
     assert rpc.await_count == 2
     assert rpc.call_args.kwargs["args"] == (submitted[0]["request_id"], 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_append_text_maps_only_a_submitted_external_request(mocker):
+    submitted_ids: list[str] = []
+    omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids))
+    omni.engine.append_text_async = mocker.AsyncMock()
+    finished = asyncio.Event()
+
+    async def results(*args):
+        await finished.wait()
+        yield SimpleNamespace(multimodal_output={})
+
+    omni._process_orchestrator_results = results
+    submitted = asyncio.get_running_loop().create_future()
+    outputs = omni.generate(
+        prompt={"prompt": "native"},
+        request_id="utterance",
+        sampling_params_list=[SimpleNamespace()],
+        submitted=submitted,
+    )
+    first_output = asyncio.create_task(anext(outputs))
+    await submitted
+    await omni.append_text("utterance", [32])
+    await omni.append_text("utterance", [], final=True)
+    assert submitted_ids[0] != "utterance"
+    assert omni.engine.append_text_async.await_args_list == [
+        mocker.call(submitted_ids[0], [32], final=False),
+        mocker.call(submitted_ids[0], [], final=True),
+    ]
+    finished.set()
+    await first_output
+    with pytest.raises(StopAsyncIteration):
+        await anext(outputs)
+    with pytest.raises(ValueError, match="exactly one active request"):
+        await omni.append_text("utterance", [33])
+    assert omni.engine.append_text_async.await_count == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_append_text_rejects_an_ambiguous_external_id(mocker):
+    submitted_ids: list[str] = []
+    omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids))
+    omni.engine.append_text_async = mocker.AsyncMock()
+    finished = asyncio.Event()
+
+    async def results(*args):
+        await finished.wait()
+        yield SimpleNamespace(multimodal_output={})
+
+    omni._process_orchestrator_results = results
+    generators = []
+    tasks = []
+    try:
+        for _ in range(2):
+            submitted = asyncio.get_running_loop().create_future()
+            outputs = omni.generate(
+                prompt={"prompt": "native"},
+                request_id="utterance",
+                sampling_params_list=[SimpleNamespace()],
+                submitted=submitted,
+            )
+            generators.append(outputs)
+            tasks.append(asyncio.create_task(anext(outputs)))
+            await submitted
+        assert len(set(submitted_ids)) == 2
+        with pytest.raises(ValueError, match="exactly one active request"):
+            await omni.append_text("utterance", [32])
+    finally:
+        finished.set()
+        await asyncio.gather(*tasks)
+        for outputs in generators:
+            await outputs.aclose()
+    omni.engine.append_text_async.assert_not_awaited()
+    assert not omni.request_states

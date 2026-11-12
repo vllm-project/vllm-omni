@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine.messages import TextInputUpdate
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -1451,6 +1452,15 @@ class StagePool:
                         )
                 raise
         return replica_id
+
+    async def append_text(self, update: TextInputUpdate) -> None:
+        """Route only to the replica already owning this active request."""
+        replica_id = self.get_bound_replica_id(update.request_id)
+        if self.stage_type == "diffusion":
+            raise ValueError("Text input append requires an AR stage")
+        if replica_id is None or self.clients[replica_id] is None:
+            raise StageUnavailableError(f"No active replica binding for input append: {update.request_id}")
+        await self._llm_client(replica_id).append_text_async(update)
 
     async def submit_interaction(
         self,

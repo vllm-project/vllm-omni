@@ -35,6 +35,7 @@ from vllm_omni.engine.messages import (
     InteractionMessage,
     NextStageInputMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
@@ -1008,6 +1009,14 @@ class AsyncOmniEngine(OmniEngineBase):
             message_type="streaming_update",
         )
         await self._put_request_queue(msg)
+
+    async def append_text_async(self, request_id: str, token_ids: list[int], *, final: bool = False) -> None:
+        """Enqueue committed body tokens in submission order.
+
+        Returning means queued, not acknowledged by the scheduler. Each call
+        appends new text; callers must not retry a submitted chunk.
+        """
+        await self._put_request_queue(TextInputUpdate(request_id=request_id, token_ids=list(token_ids), final=final))
 
     def submit_interaction(
         self,

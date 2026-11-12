@@ -665,6 +665,7 @@ class StreamingSpeechSessionConfig(BaseModel):
 
     model: str | None = None
     text_input_mode: Literal["buffered", "commitment"] = "buffered"
+    model_input_mode: Literal["complete", "incremental"] = "complete"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -724,16 +725,25 @@ class StreamingSpeechSessionConfig(BaseModel):
     split_granularity: Literal["none", "sentence", "clause"] = Field(
         default="none",
         description=(
-            "How incoming input.text is segmented before TTS. 'none' (default) "
+            "Segmentation for complete buffered input. 'none' (default) "
             "buffers until input.done and runs one request, matching the "
             "long-form timbre-continuity path. 'sentence' emits a request at "
             "each sentence boundary (Latin .!? plus CJK/Indic/Arabic marks). "
-            "'clause' also splits on commas/semicolons for lower TTFA."
+            "'clause' also splits on commas/semicolons for lower TTFA. "
+            "Incremental model input currently requires 'none'; its text "
+            "delivery policy controls when input becomes available."
         ),
     )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.model_input_mode == "incremental":
+            if self.text_input_mode != "commitment":
+                raise ValueError("Incremental model input requires text_input_mode='commitment'")
+            if not self.stream_audio or self.response_format != "pcm":
+                raise ValueError("Incremental model input requires stream_audio=true and response_format='pcm'")
+            if self.split_granularity != "none" or self.word_timestamps:
+                raise ValueError("Incremental model input requires split_granularity='none' and word_timestamps=false")
         if self.stream_audio:
             if self.response_format != "pcm":
                 raise ValueError(

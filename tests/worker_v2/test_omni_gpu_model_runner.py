@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker_v2 import staged_writes
@@ -70,6 +71,42 @@ def _make_runner():
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+@pytest.mark.parametrize("is_new", [False, True])
+def test_model_input_delivery_follows_new_and_cached_request_ownership(mocker, is_new):
+    runner = _make_runner()
+    runtime = {"req_id": "request", "restored": not is_new}
+    runner.req_states.req_id_to_index = {} if is_new else {"request": 0}
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[runtime]))
+    events = []
+
+    def admit_requests(_output):
+        events.append("admit")
+        if is_new:
+            runner.req_states.req_id_to_index = {"request": 0}
+            runtime["restored"] = True
+
+    mocker.patch.object(GPUModelRunner, "add_requests", side_effect=admit_requests)
+    mocker.patch.object(GPUModelRunner, "update_requests", side_effect=lambda _output: events.append("cached"))
+    runner.model.apply_text_input_update = lambda info, payload, *, replace: events.append(
+        f"input:{info['restored']}:{replace}"
+    )
+    output = OmniSchedulerOutput(**SchedulerOutput.make_empty().__dict__)
+    output.num_scheduled_tokens = {"request": 1}
+    output.total_num_scheduled_tokens = 1
+    payload = {"input_stream_update": {"token_ids": [31], "final": False}}
+    if is_new:
+        output.scheduled_new_reqs = [
+            SimpleNamespace(req_id="request", model_intermediate_buffer=payload, sampling_params=None)
+        ]
+    else:
+        output.scheduled_cached_reqs.req_ids = ["request"]
+        output.scheduled_cached_reqs.additional_information = {"request": payload}
+        runner.model_state.intermediate_buffer.update = lambda *_args: events.append("merged")
+    runner.add_requests(output)
+    runner.update_requests(output)
+    assert events == ["admit"] + (["input:True:True", "cached"] if is_new else ["cached", "input:True:False", "merged"])
 
 
 @pytest.mark.parametrize("hook_fails", [False, True])

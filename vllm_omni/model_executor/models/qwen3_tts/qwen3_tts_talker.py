@@ -24,7 +24,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import OmniPayload, unflatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import DeviceStager, index_to_device, to_device_nonblocking
@@ -38,10 +39,12 @@ from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
+from .input_stream import Qwen3TTSTextInput
 from .prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
     resolve_x_vector_only,
+    text_input_is_complete,
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
@@ -128,6 +131,9 @@ def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
 
 
 def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
+    stream = info_dict.get("input_stream")
+    if isinstance(stream, dict) and stream.get("token_ids"):
+        return True
     text_list = info_dict.get("text")
     if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
         return True
@@ -795,6 +801,88 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     # -------------------- preprocess / postprocess --------------------
 
+    @staticmethod
+    def create_input_stream(request, vllm_config: VllmConfig) -> Qwen3TTSTextInput:
+        """Validate native text input before scheduler admission, without model weights."""
+        info = unflatten_payload(deserialize_additional_information(request.additional_information))
+        if request.model_intermediate_buffer:
+            for key, value in request.model_intermediate_buffer.items():
+                if isinstance(value, dict) and isinstance(info.get(key), dict):
+                    info[key] = {**info[key], **value}
+                else:
+                    info[key] = value
+        stream = info.get("input_stream")
+        if not isinstance(stream, dict):
+            raise ValueError("Qwen3-TTS input_stream requires token_ids and optional final")
+        tokens = stream.get("token_ids")
+        if not tokens:
+            raise ValueError("An input stream requires at least one initial token")
+        task = info.get("task_type", ["CustomVoice"])
+        task = task[0] if isinstance(task, list) and task else task
+        mode = info.get("non_streaming_mode", False)
+        mode = mode[0] if isinstance(mode, list) and mode else mode
+        if task != "CustomVoice" or mode is True:
+            raise ValueError("Input streaming requires interleaved CustomVoice")
+        model_config = vllm_config.model_config
+        if (
+            request.resumable
+            or not model_config.use_v2_model_runner
+            or vllm_config.num_speculative_tokens
+            or vllm_config.cache_config.enable_prefix_caching
+            or vllm_config.parallel_config.tensor_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+            or vllm_config.parallel_config.data_parallel_size != 1
+        ):
+            raise ValueError(
+                "Input streaming requires MRv2, TP=PP=DP=1, no resumable prompt, prefix cache or speculation"
+            )
+        capacity = min(request.max_tokens - 1, model_config.max_model_len - request.num_prompt_tokens - 1)
+        return Qwen3TTSTextInput(
+            tokens,
+            capacity,
+            final=stream.get("final", False),
+            vocab_size=model_config.hf_config.talker_config.text_vocab_size,
+        )
+
+    def apply_text_input_update(self, runtime: dict, payload: dict, *, replace: bool = False) -> None:
+        """Install a full text snapshot or append a scheduler-validated delta."""
+        update = payload.pop("input_stream_update", None)
+        if update is None:
+            return
+        runtime.pop("input_stream_update", None)
+        if replace:
+            runtime["input_stream"] = stream = dict(runtime.get("input_stream", {}))
+            stream["token_ids"] = list(update["token_ids"])
+        else:
+            # MRv2 re-admits preempted requests through scheduled_new_reqs;
+            # add_requests installs a full snapshot before any cached delta.
+            # Covered by test_text_input_preemption_resends_latest_input and
+            # test_async_real_preemption_drains_inflight_output_before_readmission.
+            if "input_stream" not in runtime:
+                raise RuntimeError("Cannot apply a text input delta without an installed input_stream snapshot")
+            stream = runtime["input_stream"]
+            stream["token_ids"].extend(update["token_ids"])
+        stream["final"] = update["final"]
+
+    def _append_stream_text(self, info: dict, tail, offset: int):
+        stream = info.get("input_stream")
+        if not isinstance(stream, dict):
+            return tail, offset, {}
+        meta = info["meta"]
+        projected = meta["qwen3_tts_text_projected"]
+        new_ids = stream["token_ids"][projected:]
+        add_eos = stream["final"] and not meta["qwen3_tts_text_eos_projected"]
+        updates = {}
+        if new_ids or add_eos:
+            rows = self._prompt_builder.build_streaming_text_update(new_ids, input_complete=add_eos)
+            rows = torch.cat((tail[offset:], rows.to(device=tail.device, dtype=tail.dtype)), dim=0)
+            tail, offset = rows, 0
+            updates = {
+                "qwen3_tts_text_projected": len(stream["token_ids"]),
+                "qwen3_tts_text_eos_projected": stream["final"],
+            }
+        return tail, offset, updates
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
@@ -862,6 +950,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         "codec_frame_valid": self._false_scalar(input_ids.device),
                     },
                 }
+                stream = info_dict.get("input_stream")
+                if isinstance(stream, dict):
+                    info_update["meta"].update(
+                        qwen3_tts_text_projected=len(stream["token_ids"]),
+                        qwen3_tts_text_eos_projected=stream["final"],
+                    )
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     ref_code_buffer = ref_code.detach()
                     if not bool(getattr(self, "_use_v2_model_runner", False)):
@@ -932,7 +1026,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
-        trailing_text_update = None
+        tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
+        trailing_text_update = tail if stream_updates else None
         if isinstance(tail, torch.Tensor) and tail.ndim == 2:
             tail_len = int(tail.shape[0])
             if text_offset < tail_len:
@@ -980,6 +1075,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             "mtp_inputs": (past_hidden, text_step),
             "meta": {
                 "talker_text_offset": int(next_text_offset),
+                **stream_updates,
                 "codec_streaming": codec_streaming,
                 "codec_frame_valid": (
                     (input_ids.reshape(-1)[-1] >= 0) & (input_ids.reshape(-1)[-1] < self._codebook_vocab_size)
@@ -1051,7 +1147,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
-            trailing_text_update = None
+            tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
+            trailing_text_update = tail if stream_updates else None
             if isinstance(tail, torch.Tensor) and tail.ndim == 2:
                 tail_len = int(tail.shape[0])
                 if text_offset < tail_len:
@@ -1079,6 +1176,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update: dict[str, Any] = {
                 "meta": {
                     "talker_text_offset": int(next_text_offset),
+                    **stream_updates,
                     "codec_streaming": codec_streaming,
                 },
             }
@@ -1741,6 +1839,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         text step and changes no per-request state (the non-streaming
         CustomVoice/VoiceDesign case after the first decode).
         """
+        if not text_input_is_complete(info):
+            return False
         hs = info.get("hidden_states")
         tail = hs.get("trailing_text") if isinstance(hs, dict) else None
         meta = info.get("meta")
