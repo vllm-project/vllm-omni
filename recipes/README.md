@@ -86,12 +86,22 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`k2-fsa/OmniVoice.md`](./k2-fsa/OmniVoice.md) | Offline and online multilingual text-to-speech | 1x AMD MI300X (ROCm 7.2) |
 | [`lerobot/Pi0.md`](./lerobot/Pi0.md) | Online OpenPI serving for the π0 vision-language-action policy | 1x H200 141GB |
 | [`lerobot/Pi05.md`](./lerobot/Pi05.md) | Online OpenPI serving for the π0.5 vision-language-action policy | 1x H100 80GB |
+| [`IFM/PAN2.md`](./IFM/PAN2.md) | PAN 2 text-to-video and image-to-video, offline and `/v1/videos` | 1x, 4x, or 8x GPUs with 141 GB or more (H200, B200, B300) |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
+| [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image and image editing HTTP serving | 1x–8x AMD Instinct MI325X or MI350X (measured) |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
+| [`MiniMaxAI/MiniMax-H3-Image-4090.md`](./MiniMaxAI/MiniMax-H3-Image-4090.md) | MiniMax-H3-Image text-to-image serving with layerwise offload | 1x RTX 4090 24GB (community deployment) |
+| [`MiniMaxAI/MiniMax-H3-Image-H200.md`](./MiniMaxAI/MiniMax-H3-Image-H200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x H200 141GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-H100.md`](./MiniMaxAI/MiniMax-H3-Image-H100.md) | MiniMax-H3-Image text-to-image and reference editing | 1x or 2x with DLO, 4x H100 80GB (configuration-only) |
+| [`MiniMaxAI/MiniMax-H3-Image-B200.md`](./MiniMaxAI/MiniMax-H3-Image-B200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B200 180GB (configuration-only) |
+| [`MiniMaxAI/MiniMax-H3-Image-B300.md`](./MiniMaxAI/MiniMax-H3-Image-B300.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B300 288GB (configuration-only) |
+| [`MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md`](./MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x RTX PRO 6000 Blackwell 96GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-XPU.md`](./MiniMaxAI/MiniMax-H3-Image-XPU.md) | MiniMax-H3-Image text-to-image and reference editing on XPU | 1x or 2x with DLO, 4x Intel Arc Pro B70 32GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-NPU.md`](./MiniMaxAI/MiniMax-H3-Image-NPU.md) | MiniMax-H3-Image text-to-image and reference editing on Ascend | 1x or 8x Atlas 800T A3 / Atlas 800I A2 / Atlas 350 |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
@@ -129,6 +139,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
 | [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
+| [`Qwen/Qwen3-TTS-RTX4070TiSUPER.md`](./Qwen/Qwen3-TTS-RTX4070TiSUPER.md) | Text-to-speech serving on a 16 GB consumer card (0.6B CustomVoice) | 1x RTX 4070 Ti SUPER 16GB |
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
 | [`StabilityAI/Stable-Audio-3-Medium.md`](./StabilityAI/Stable-Audio-3-Medium.md) | Offline + online text-to-audio diffusion (1.4B DiT, up to 380 s) | 1x RTX 4090 24GB |
@@ -145,6 +156,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
 | [`XiaomiMiMo/MiMo-Audio.md`](./XiaomiMiMo/MiMo-Audio.md) | Offline + online omni audio (TTS, ASR, dialogue) | 1x RTX 5090 / 5090D 32GB |
+| [`LiquidAI/LFM3-Audio-2B.md`](./LiquidAI/LFM3-Audio-2B.md) | ASR, audio understanding, TTS, and interleaved text/audio | 1x RTX 4090 24GB |
+| [`LiquidAI/LFM3-Omni-2B.md`](./LiquidAI/LFM3-Omni-2B.md) | Multimodal understanding, TTS, and interleaved text/audio | 1x Ascend 910B1 64GB, 1x RTX 4090 24GB |
 | [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB / 1x Intel Arc Pro B70 32GB |
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
