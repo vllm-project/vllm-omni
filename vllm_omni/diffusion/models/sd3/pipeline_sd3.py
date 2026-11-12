@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -135,6 +136,25 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _halve_vae_tile_sizes(vae: nn.Module) -> None:
+    """Split the default tile so a square image at the checkpoint sample size tiles.
+
+    ``AutoencoderKL`` tiles only when a side is strictly larger than the tile,
+    and its default tile equals ``config.sample_size``. Halving it is what makes
+    tiling actually fire for the image size the checkpoint was trained at.
+    """
+    for attr in ("tile_sample_min_size", "tile_latent_min_size"):
+        size = getattr(vae, attr)
+        if size % 2:
+            raise ValueError(f"VAE {attr}={size} is odd; halving it would drop a pixel")
+        setattr(vae, attr, size // 2)
+    logger.info(
+        "VAE tiling tile_sample_min_size=%d tile_latent_min_size=%d",
+        vae.tile_sample_min_size,
+        vae.tile_latent_min_size,
+    )
+
+
 class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     # Both CFG branches share latents and timestep; CLIP (77) and T5 prompts are padded to fixed lengths.
     supports_cfg_batching = True
@@ -143,6 +163,21 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _halve_vae_tile_sizes = staticmethod(_halve_vae_tile_sizes)
+
+    # The encoders can exceed 8 GB; stream them rather than staging them on GPU.
+    _offload_plan = OffloadPlan(
+        encoder_component_types={
+            "text_encoder": "text_encoder",
+            "text_encoder_2": "text_encoder",
+            "text_encoder_3": "text_encoder",
+        },
+        encoder_block_attrs={
+            "text_encoder": ("text_model.encoder.layers",),
+            "text_encoder_2": ("text_model.encoder.layers",),
+            "text_encoder_3": ("encoder.block",),
+        },
+    )
 
     def __init__(
         self,
@@ -254,6 +289,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+        # SD3.5's checkpoint sample_size is 1024, so the default tile equals a
+        # 1024 image and enabling tiling would not split the target workload.
+        # Tiling triggers only when a side is strictly larger than the tile.
+        if od_config.vae_use_tiling:
+            _halve_vae_tile_sizes(self.vae)
 
         self.tokenizer_max_length = (
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77

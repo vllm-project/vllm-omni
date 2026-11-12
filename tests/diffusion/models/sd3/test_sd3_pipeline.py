@@ -10,7 +10,7 @@ from torch import nn
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _make_sd3_sampling(**overrides):
@@ -38,6 +38,40 @@ def _make_sd3_pipeline():
     pipeline.default_sample_size = 128
     pipeline.transformer = SimpleNamespace(in_channels=1)
     return pipeline
+
+
+def test_sd3_halves_the_checkpoint_tile_so_the_trained_size_tiles():
+    # AutoencoderKL tiles only when a side is strictly larger than the tile, and
+    # the SD3.5 checkpoint's tile equals its 1024 sample size.
+    vae = SimpleNamespace(tile_sample_min_size=1024, tile_latent_min_size=128)
+
+    StableDiffusion3Pipeline._halve_vae_tile_sizes(vae)
+
+    assert (vae.tile_sample_min_size, vae.tile_latent_min_size) == (512, 64)
+
+
+def test_sd3_refuses_to_halve_an_odd_tile():
+    vae = SimpleNamespace(tile_sample_min_size=1025, tile_latent_min_size=128)
+
+    with pytest.raises(ValueError, match="tile_sample_min_size=1025"):
+        StableDiffusion3Pipeline._halve_vae_tile_sizes(vae)
+
+
+def test_sd3_declares_streamable_text_encoder_blocks():
+    # Without this plan the encoders are staged on the GPU before any hook can
+    # stream them, and T5-XXL alone is larger than an 8 GB card.
+    plan = StableDiffusion3Pipeline._offload_plan
+
+    assert plan.encoder_component_types == {
+        "text_encoder": "text_encoder",
+        "text_encoder_2": "text_encoder",
+        "text_encoder_3": "text_encoder",
+    }
+    assert plan.encoder_block_attrs == {
+        "text_encoder": ("text_model.encoder.layers",),
+        "text_encoder_2": ("text_model.encoder.layers",),
+        "text_encoder_3": ("encoder.block",),
+    }
 
 
 def test_forward_collates_request_prompt_tensors_for_sd3():
