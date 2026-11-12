@@ -837,7 +837,10 @@ def test_qwen3_tts_build_constructs_prepared_request():
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.asyncio
 async def test_drvexo_families_build_standard_speech_at_talker_stage(arch, reference, mocker):
-    server = SimpleNamespace(_tts_executor=None, _tts_tokenizer=None, uploaded_speakers={})
+    tokenizer = mocker.Mock(all_special_ids=[], added_tokens_decoder={})
+    tokenizer.encode.return_value = [1]
+    tokenizer.decode.return_value = "hello"
+    server = SimpleNamespace(_tts_executor=None, _tts_tokenizer=tokenizer, uploaded_speakers={})
     server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(np.zeros(1600, dtype=np.float32), 16000, "ref"))
     server._get_resolved_ref_audio_artifact_key = lambda _: None
     adapter_type = resolve_adapter(detect_tts_model_type("qwen3_tts", arch))
