@@ -98,6 +98,67 @@ def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> Non
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
+def test_exact_continuation_key_replays_without_padding() -> None:
+    """An off-grid captured exact key is used, not padded away.
+
+    Review follow-up (PR #9733): the padding branch only consulted
+    ``_legit_shapes``, so a captured exact continuation shape was padded up
+    to the next width before the exact lookup ever ran -- the configured
+    graph sat idle while a wider bucket replay (or eager) served the request.
+    """
+    torch.manual_seed(0)
+    hift = _small_hift()
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(
+            encoder=SimpleNamespace(pre_lookahead_layer=SimpleNamespace(pre_lookahead_len=3)),
+            token_mel_ratio=2,
+        ),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    wrapper = HiFTGraphWrapper(
+        token2wav,
+        connector_config={
+            "codec_chunk_frames": 2,
+            "codec_left_context_frames": 3,
+            "hift_graph_continuation_frames": [5, 5],
+        },
+        capture_batch_sizes=[1],
+    )
+    wrapper.capture()
+    # A continuation shape off the bucket grid, captured as an exact graph.
+    exact_shape = next(shape for shape in wrapper.exact_shapes if shape[1] == 960)
+    exact_key = (1, *exact_shape)
+    assert exact_key in wrapper._exact_keys and exact_key in wrapper.graph
+    assert exact_shape not in wrapper._legit_shapes
+
+    calls: list[tuple[int, int, int]] = []
+    original = wrapper._replay_key
+
+    def counting_replay(key, mel, cache):
+        calls.append(key)
+        return original(key, mel, cache)
+
+    wrapper._replay_key = counting_replay
+    speech_feat = torch.randn(1, 80, int(exact_shape[0]), device="cuda")
+    cache_source = torch.randn(1, 1, 960, device="cuda")
+    actual_speech, actual_source = wrapper.replay(speech_feat, cache_source)
+    expected_speech, expected_source = hift.inference(speech_feat, cache_source)
+    torch.testing.assert_close(actual_speech, expected_speech, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
+    # The replay went through the exact key, not a padded bucket or eager.
+    assert calls == [exact_key]
+
+    # hift_graph_width_bucket: 0 disables width padding outright -- without
+    # the gate the chunk width (4) would be picked as the pad target for an
+    # off-grid tail.
+    wrapper.width_pad_bucket = 0
+    assert wrapper._width_pad_target(3, 0) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
 def test_hift_capture_primes_every_replay_batch_before_live_requests():
     hift = _small_hift()
     wrapper = HiFTGraphWrapper(
@@ -2446,6 +2507,7 @@ def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest
     device = SimpleNamespace(type="npu")
     wrapper = SimpleNamespace(
         enabled=True,
+        npu_mixed_history=False,
         device=device,
         _stats={"calls": 0},
         max_graph_batch=8,
