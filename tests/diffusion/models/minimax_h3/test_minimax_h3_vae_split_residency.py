@@ -117,6 +117,75 @@ def test_proxy_routes_to_the_matching_half():
     assert _ptr(vae.model.encoder.weight) == enc_master
 
 
+@pytest.mark.parametrize("mode", ["manual", "resident", "sequential"])
+@pytest.mark.parametrize("encode_fails", [False, True])
+@pytest.mark.parametrize("media_kind", ["image", "video", "empty"])
+def test_local_media_stages_only_the_encoder(monkeypatch, mocker, mode, encode_fails, media_kind):
+    from contextlib import contextmanager
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+    from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderMediaInput
+
+    pipeline = object.__new__(module.MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    vae = _vae()
+    vae._encoder_stager = mocker.Mock()
+    vae._decoder_stager = mocker.Mock()
+    pipeline.video_vae = vae
+    pipeline.audio_vae = None
+    pipeline.od_config = OmniDiffusionConfig(
+        diffusion_offload_config=None,
+        enable_layerwise_offload=mode == "manual",
+        enable_distributed_layerwise_offload=False,
+    )
+    pipeline._model_cpu_offload_modules = [vae] if mode == "sequential" else []
+    monkeypatch.setattr(module, "_dit_rank_world", lambda: (None, 0, 1))
+    monkeypatch.setattr(vae, "is_distributed_enabled", lambda: False)
+    monkeypatch.setattr(pipeline, "_broadcast_media_conditioning", lambda value: value)
+    sequential = []
+
+    @contextmanager
+    def sequential_scope(component):
+        sequential.append(component)
+        yield
+
+    monkeypatch.setattr(module, "sequential_offload_component", sequential_scope)
+
+    def encode_image(image):
+        if encode_fails:
+            raise RuntimeError("encode failed")
+        return torch.ones(1, 4)
+
+    monkeypatch.setattr(vae, "encode_image", encode_image)
+    monkeypatch.setattr(vae, "encode_video", lambda frames: (encode_image(None), (1, 1, 1)))
+    media = MiniMaxH3EncoderMediaInput(
+        task="ref2va",
+        height=32,
+        width=32,
+        num_frames=124,
+        latent_t=31,
+        audio_t=208,
+        images=(torch.zeros(16, 16, 3, dtype=torch.uint8),) if media_kind == "image" else (),
+        videos=(torch.zeros(4, 16, 16, 3, dtype=torch.uint8),) if media_kind == "video" else (),
+        video_audios=(None,) if media_kind == "video" else (),
+    )
+    if encode_fails and media_kind != "empty":
+        with pytest.raises(RuntimeError, match="encode failed"):
+            pipeline._encode_local_media(media)
+    else:
+        result = pipeline._encode_local_media(media)
+        if media_kind != "empty":
+            assert torch.equal(result.visual_condition, torch.ones(1, 4))
+
+    expected = int(mode == "manual" and media_kind != "empty")
+    assert vae._encoder_stager.load.call_count == expected
+    assert vae._encoder_stager.offload.call_count == expected
+    vae._decoder_stager.load.assert_not_called()
+    vae._decoder_stager.offload.assert_not_called()
+    assert sequential == ([vae] if mode == "sequential" and media_kind != "empty" else [])
+
+
 def test_proxy_does_not_register_the_adapter_as_submodule():
     vae = _vae()
     proxy = vae.encoder_component
