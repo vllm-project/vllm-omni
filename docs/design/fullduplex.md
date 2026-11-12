@@ -811,8 +811,9 @@ What a plugin must guarantee before it opts in:
   each model documents its own in its model entry. The
   acknowledgement waits for a response continuation the output handler
   spawned (e.g. the `response.done` a non-resumable model sends from it);
-  the wait is bounded (one second), so a continuation that blocks is logged
-  and acknowledged around rather than stalling the session.
+  the wait is bounded (one second) and happens once per continuation, so a
+  continuation that blocks is logged and acknowledged around rather than
+  stalling the session, and delays only the acknowledgement that waited for it.
 
 Every cancel that calls off appends of an input-clocked session advances the
 epoch (an overlap barge-in does so too, where a session without the clock

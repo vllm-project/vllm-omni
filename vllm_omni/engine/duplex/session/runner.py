@@ -271,6 +271,9 @@ class DuplexSessionRunner:
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        #: Response continuations a stage-progress record already waited for in vain
+        #: (``_on_stage_progress``): later records do not wait for them again.
+        self._timed_out_continuations: set[asyncio.Task[None]] = set()
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
         # Delivery fences for immutable decisions, not another admission book.
@@ -646,12 +649,18 @@ class DuplexSessionRunner:
         # continuation, not something this wait can enforce: it is bounded, so
         # a continuation that does block (one that waits for this worker would
         # otherwise deadlock the session) costs an early acknowledgement and a
-        # warning, not a stuck session.
+        # warning, not a stuck session. Once: a continuation this wait gave up
+        # on is not waited for by later records, so a persistently blocked one
+        # delays one acknowledgement, not every one after it.
+        self._timed_out_continuations = {task for task in self._timed_out_continuations if not task.done()}
         continuations = [
-            task for task in self._background_tasks if task.get_name() == "duplex-continue" and not task.done()
+            task
+            for task in self._background_tasks
+            if task.get_name() == "duplex-continue" and not task.done() and task not in self._timed_out_continuations
         ]
         if continuations:
             done, pending = await asyncio.wait(continuations, timeout=CONTINUATION_SETTLE_TIMEOUT_S)
+            self._timed_out_continuations.update(pending)
             for task in done:
                 if not task.cancelled() and task.exception() is not None:
                     logger.warning(

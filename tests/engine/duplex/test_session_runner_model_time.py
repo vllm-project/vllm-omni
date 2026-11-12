@@ -486,6 +486,46 @@ async def test_a_continuation_that_blocks_delays_the_acknowledgement_only_by_the
 
 
 @pytest.mark.usefixtures("input_clock_model")
+async def test_a_continuation_already_waited_for_in_vain_does_not_delay_later_acknowledgements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked continuation costs the bounded wait once, not on every later stage-progress record."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    warnings: list[str] = []
+    monkeypatch.setattr(runner_module, "CONTINUATION_SETTLE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(runner_module.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+    released = asyncio.Event()
+
+    async def _blocked() -> None:
+        await released.wait()
+
+    def _still_running() -> list[str]:
+        return [w for w in warnings if "continuation(s) still running" in w]
+
+    try:
+        first = await _speaking_unit(h)
+        h.runner.spawn(_blocked(), name="duplex-continue")
+        events = await h.deliver_and_settle(
+            tts_output(first, samples=48000, text="hello", tts_is_last_chunk=True), segment_finished=True
+        )
+        assert _acks(events)[-1].units == ({"end_ms": 1000, "decision": "speak"},)
+        assert len(_still_running()) == 1
+
+        second = await _speaking_unit(h)
+        h.deliver(tts_output(second, samples=48000, text="again", tts_is_last_chunk=True), segment_finished=True)
+        # The blocked task keeps the harness "busy", so settle only returns at its
+        # deadline: half the wait budget. The acknowledgement is in by then only if
+        # the stage-progress record did not wait for that task again.
+        events = await h.settle(timeout_s=runner_module.CONTINUATION_SETTLE_TIMEOUT_S / 2)
+
+        assert _acks(events)[-1].units == ({"end_ms": 2000, "decision": "speak"},)
+        assert len(_still_running()) == 1, "the continuation given up on is not waited for again"
+    finally:
+        released.set()
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
 async def test_a_commit_is_acknowledged_once_the_turn_it_submitted_is_decided() -> None:
     h = await open_harness(extra_body=INPUT_CLOCK)
     try:
