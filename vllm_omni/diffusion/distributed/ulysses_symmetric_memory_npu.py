@@ -3,16 +3,18 @@
 """Eager NPU Ulysses using Triton and the installed symmetric-memory runtime.
 
 No repository C++/AscendC extension is compiled or loaded. Requires Triton-Ascend,
-TorchNPU's NPUSHMEM allocator and libshmem.so on the loader search path. All
+TorchNPU's NPUSHMEM allocator and the cann-shmem runtime. All
 WORLD ranks must issue the same exchanges on one stream in one HCCS domain.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
+from importlib.metadata import PackageNotFoundError, distribution
 
 import torch
 import torch.distributed as dist
@@ -29,9 +31,26 @@ _WORKSPACE_GROUP = None
 @cache
 def _runtime_library() -> ctypes.CDLL:
     try:
-        library = ctypes.CDLL("libshmem.so")
+        # MemFabric exports some of the same internal HYBM symbols globally.
+        # Keep SHMEM's references bound to its own implementation and state.
+        mode = os.RTLD_LOCAL | os.RTLD_DEEPBIND
+        try:
+            package = distribution("cann-shmem")
+        except PackageNotFoundError:
+            # Preserve separately installed native runtimes on the loader path.
+            library = ctypes.CDLL("libshmem.so", mode=mode)
+        else:
+            soc = torch.npu.get_device_name().lower()
+            backend = "950" if "950" in soc or "3510" in soc else "910"
+            root = package.locate_file(f"shmem/backends/{backend}")
+            # The wheel has no RPATH. Preload its helper so the main library
+            # and TorchNPU can resolve the packaged runtime by its SONAME.
+            ctypes.CDLL(str(root / "libshmem_utils.so"), mode=mode)
+            library = ctypes.CDLL(str(root / "libshmem.so"), mode=mode)
     except OSError as exc:
-        raise RuntimeError("Install the symmetric-memory runtime and put libshmem.so on LD_LIBRARY_PATH") from exc
+        raise RuntimeError(
+            "Install a compatible cann-shmem wheel or put the native runtime on LD_LIBRARY_PATH"
+        ) from exc
     barrier = library.aclshmemx_barrier_all_on_stream
     barrier.argtypes = [ctypes.c_void_p]
     barrier.restype = None
@@ -200,6 +219,7 @@ class _ExchangePlan:
     packed: bool
     staging: tuple[torch.Tensor, ...]
     launch: Callable[..., None]
+    constants: tuple[int | bool, ...]
 
 
 class NPUUlyssesSymmetricMemory:
@@ -324,12 +344,7 @@ class NPUUlyssesSymmetricMemory:
         # from more readers. This is independent of a particular SoC or rank count.
         workers = (4 if required <= (16 << 20) else 2) * self.world
         q, k, v = (outputs * 3)[:3] if len(outputs) == 1 else outputs
-        kernel = _pull.warmup(
-            self.peer_ptrs,
-            q,
-            k,
-            v,
-            self.rank,
+        constants = (
             self.world,
             batch,
             seq_local,
@@ -343,6 +358,14 @@ class NPUUlyssesSymmetricMemory:
             len(tensors),
             rows,
             packed,
+        )
+        kernel = _pull.warmup(
+            self.peer_ptrs,
+            q,
+            k,
+            v,
+            self.rank,
+            *constants,
             grid=(workers,),
         )
         return _ExchangePlan(
@@ -352,6 +375,9 @@ class NPUUlyssesSymmetricMemory:
             packed,
             staging,
             kernel[(workers, 1, 1)],
+            # Triton 3.6 retains constexpr slots in the compiled launcher;
+            # older Ascend launchers accept only the runtime arguments.
+            constants if "constexpr" in kernel.src.signature.values() else (),
         )
 
     def _exchange(self, tensors: tuple[torch.Tensor, ...], reverse: bool) -> tuple[torch.Tensor, ...]:
@@ -398,7 +424,7 @@ class NPUUlyssesSymmetricMemory:
                 target.copy_(source)
         self._fence()
         q, k, v = (outputs * 3)[:3] if len(outputs) == 1 else outputs
-        plan.launch(self.peer_ptrs, q, k, v, self.rank, stream=self._raw_stream)
+        plan.launch(self.peer_ptrs, q, k, v, self.rank, *plan.constants, stream=self._raw_stream)
         self._fence()
         return outputs
 

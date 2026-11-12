@@ -49,33 +49,10 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
 symmetric memory directly into the final attention layout. It requires
-TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
-search path. This backend does not build a repository C++/AscendC extension;
-Triton uses its normal JIT toolchain.
-
-For CANN 9.2.1, use a symmetric-memory runtime that includes
-[SHMEM's Runtime symbol-loading fix](https://gitcode.com/cann/shmem/merge_requests/966).
-Older runtimes, including `cann-shmem==1.7.0`, can load successfully but fail
-during initialization with `rtDeviceGetBareTgid` unresolved: they look up
-Runtime interfaces through `libascendcl.so` instead of `libruntime.so`.
-Whether the old lookup succeeds depends on the installed CANN libraries'
-transitive dependencies; it is not guaranteed by the CANN version alone.
-Installing the library and setting its search path alone does not resolve
-that initialization failure. A source build containing the fix is:
-
-```bash
-source /usr/local/Ascend/cann-9.2.1/set_env.sh
-git clone https://gitcode.com/cann/shmem.git
-cd shmem
-git checkout --detach f6df6ba3fa962484b2629e7e8ad7e6e15e3190b6
-bash scripts/build.sh
-source install/set_env.sh
-```
-
-This builds the external runtime for A2/A3; its Python extension is not
-required by this backend. Keep the runtime and its bootstrap libraries
-together, and source its `install/set_env.sh` in each inference shell so
-TorchNPU and this backend load the same installation.
+TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
+loads the runtime from the installed `cann-shmem` wheel, or from the loader
+search path for a separately installed `libshmem.so`. Triton uses its normal
+JIT toolchain; no repository C++/AscendC extension is built.
 
 The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
 `ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all

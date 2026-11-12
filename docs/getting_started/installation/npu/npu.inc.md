@@ -86,8 +86,8 @@ versions and NPU validation before selecting a development image.
 cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
-pip install -v -e . --no-build-isolation
-# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e . --no-build-isolation \
+    --extra-index-url https://ascend.devcloud.huaweicloud.com/cann/pypi/simple
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
@@ -224,6 +224,10 @@ cd vllm-omni
     A final vLLM package alone does not establish vLLM-Ascend compatibility.
 
 All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for your hardware:
+
+`requirements/npu.txt` includes `cann-shmem` for `--ulysses-a2a-permute`.
+The backend loads the wheel's native libraries automatically; no separate
+SHMEM source build is needed.
 
 === "A2"
 
