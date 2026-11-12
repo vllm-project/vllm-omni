@@ -188,7 +188,22 @@ class HiFTGraphWrapper:
         if self.max_lazy_graphs < 0:
             raise ValueError("MiniCPM-o hift_max_lazy_graphs must be >= 0")
         self.lazy_graph_count = 0
+        # Request-shaped eager fallbacks, ``(batch, mel_frames, cache_source_len)``
+        # -> count. The exact-shape capture config is empirical (a merged
+        # backlog continuation has no derivable width cap), so these counts
+        # are what says a width has outgrown the config instead of the miss
+        # silently repeating on every decode call.
+        self._eager_fallbacks: dict[tuple[int, int, int], int] = {}
         self.max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
+
+    def _count_eager_fallback(self, key: tuple[int, int, int], reason: str) -> None:
+        self._eager_fallbacks[key] = self._eager_fallbacks.get(key, 0) + 1
+        if self._eager_fallbacks[key] == 1:
+            logger.warning("Eager HiFT fallback (%s) for shape %s", reason, key)
+
+    def eager_fallback_counts(self) -> dict[tuple[int, int, int], int]:
+        """Cumulative request-shaped eager fallback counts, by input shape."""
+        return dict(self._eager_fallbacks)
 
     def _chunk_mel_frames(self, codec_frames: int) -> int:
         return (int(codec_frames) + self.codec_left_context_frames - self.pre_lookahead_len) * self.flow_upsample_rate
@@ -384,6 +399,7 @@ class HiFTGraphWrapper:
         if (num_frames, cache_source_len) not in self._legit_shapes:
             # Never lazily captured (see ``_legit_shapes``): one eager call over the whole batch.
             logger.info("Eager HiFT for shape %s outside the capture buckets", exact_key)
+            self._count_eager_fallback(exact_key, "shape outside the capture buckets")
             return self.decode_fn(speech_feat, cache_source)
 
         target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
@@ -398,6 +414,7 @@ class HiFTGraphWrapper:
                     sources.append(src)
                 return torch.cat(speeches, dim=0), torch.cat(sources, dim=0)
             logger.info("Falling back to eager HiFT inference for unsupported batch size %d", batch_size)
+            self._count_eager_fallback(exact_key, f"unsupported batch size {batch_size}")
             return self.decode_fn(speech_feat, cache_source)
 
         key = (target_b, num_frames, cache_source_len)
@@ -405,6 +422,7 @@ class HiFTGraphWrapper:
         if key not in self.graph:
             if self.lazy_graph_count >= self.max_lazy_graphs:
                 logger.info("Falling back to eager HiFT inference after reaching the lazy Graph limit")
+                self._count_eager_fallback(key, "lazy capture limit reached")
                 return self.decode_fn(speech_feat, cache_source)
             logger.info("Lazily capturing HiFT device graph for shape %s", key)
             self._capture(*key)
