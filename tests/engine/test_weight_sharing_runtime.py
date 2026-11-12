@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import multiprocessing
 from types import SimpleNamespace
 
 import msgspec
@@ -68,6 +69,10 @@ def host(mocker):
         stages.append(LogicalStageInitPlan(stage, stage, [replica]))
     mocker.patch.object(runtime, "_resolve_replica_physical_devices", return_value="0,1")
     mocker.patch.object(module, "physical_gpu_uuid", side_effect=lambda device: f"GPU-{device}")
+    # Keep this CPU integration test hermetic: the real get_mp_context() also
+    # synchronizes accelerator visibility env vars on ROCm, which can raise if
+    # an earlier test left HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES unequal.
+    mocker.patch.object(module, "get_mp_context", return_value=multiprocessing.get_context("spawn"))
     return module.StageSharingHost(runtime, plan, stages)
 
 
