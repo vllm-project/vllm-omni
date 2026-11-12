@@ -43,6 +43,13 @@ _SKIP_SECTIONS = {
     "Wan2.1 VACE Conditional Tasks",
 }
 
+# The Diffusion X2V doc job executes README commands as written. PAN 2 leaves
+# guardrails on, and pipeline build raises ValueError before generation when
+# pan2-guardrail is not installed. Disabling guardrails in the snippet would
+# instead launch the documented 704x1248, 313-frame default in this 60-minute
+# single-GPU job. Pipeline coverage stays on tests/e2e/offline_inference/test_pan2.py.
+_PAN2_CI_SKIP_REASON = "IFM/PAN2 guardrails require the optional pan2-guardrail package, which CI does not install"
+
 
 def _ensure_test_image(run_dir: Path) -> None:
     """Download or copy the example image into run_dir so CLI snippets can find it."""
@@ -85,6 +92,8 @@ def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool,
         return True, "Python API snippets produce video files that ExampleRunner does not auto-collect"
     if "/path/to/" in code:
         return True, "Snippet references a placeholder local model path"
+    if "IFM/PAN2" in code:
+        return True, _PAN2_CI_SKIP_REASON
     return False, ""
 
 
