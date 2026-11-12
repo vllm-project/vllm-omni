@@ -26,11 +26,13 @@ def _param_id(nodeid: str) -> str | None:
 
 
 def test_async_chunk_cases_stay_one_contiguous_block() -> None:
-    """Merge selection must keep id ``async_chunk`` items adjacent.
+    """Merge ``-m 'advanced_model and cuda'`` keeps id ``async_chunk`` adjacent.
 
+    This does not lock Ready (``core_model``) or nightly (``full_model``).
     ``omni_server`` is module-scoped. pytest 9.1.1 drops it when the next
     item's param value differs and does not revive it, so a different deploy
     between two ``async_chunk`` cases cold-starts the same server again.
+    The 300s limit is the abort ceiling for importing this module, not a budget.
     """
     env = os.environ.copy()
     # A worker-scoped outer run must not make this collection look distributed.

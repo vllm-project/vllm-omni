@@ -275,12 +275,39 @@ def _read_prompt_selection_log(offset: int) -> str:
         return log_file.read().decode("utf-8")
 
 
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
+def test_text_to_audio_001(omni_server, openai_client) -> None:
+    """
+    Test text-only input generating text + audio output via OpenAI API.
+    This exercises Talker TTS region detection and the Code2Wav stage.
+    Deploy Setting: default single GPU
+    Input Modal: text
+    Output Modal: text + audio
+    Input Setting: stream=True
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"audio": ["Beijing"]},
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+# Merge selection (`-m 'advanced_model and cuda'`) reuses module-scoped
+# ``omni_server`` only while the next collected item's param value matches.
 # Keep every ``test_params`` case (id ``async_chunk``) in one contiguous block
-# before Talker DSpark. Module-scoped ``omni_server`` is reused only while the
-# next collected item's param value matches. ``turn_async_chunk`` is a different
-# deploy (``session_mode: turn``); it stays the second parameter of
-# ``test_text_to_text_001``, after this block, so it is not collected between
-# the ``async_chunk`` cases.
+# before Talker DSpark. ``turn_async_chunk`` is a different deploy
+# (``session_mode: turn``); it stays the second parameter of
+# ``test_text_to_text_001``, after this block. The CPU lock covers only that
+# Merge marker, not Ready or nightly.
 
 
 @pytest.mark.advanced_model
@@ -422,32 +449,6 @@ def test_text_to_audio_talker_dspark(omni_server, openai_client) -> None:
     assert all(response.success and response.audio_bytes for response in responses)
     # Only stage 1 with a loaded draft verifies codes. Read from the start: the line is logged once.
     assert "MiniCPM-o 4.5 Talker is verifying draft codes" in _read_prompt_selection_log(0)
-
-
-@pytest.mark.full_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
-    """
-    Test text-only input generating text + audio output via OpenAI API.
-    This exercises Talker TTS region detection and the Code2Wav stage.
-    Deploy Setting: default single GPU
-    Input Modal: text
-    Output Modal: text + audio
-    Input Setting: stream=True
-    """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "key_words": {"audio": ["Beijing"]},
-        "extra_body": _TTS_EXTRA_BODY,
-    }
-
-    openai_client.send_omni_request(request_config)
 
 
 @pytest.mark.full_model
