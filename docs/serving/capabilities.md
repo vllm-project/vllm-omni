@@ -80,6 +80,10 @@ limits without changing `schema_version: 1`. Existing flat `constraints` and
 `required_inputs` remain available. Missing facts mean unknown, including a
 missing maximum; they do not mean zero or unlimited verified support.
 
+`inputs` keys describe semantic roles, not necessarily literal request field
+names. Use the endpoint's request schema to serialize inputs; a supported role
+does not introduce a same-named HTTP field.
+
 `profile.request` describes the model's implemented contract.
 `profile.routes[].request` is the **complete effective contract for that route**,
 including deployment and adapter limits. Clients use the selected route's
@@ -189,7 +193,7 @@ edited with latent noise masks. Check the selected route's `request.inputs`:
 
 | Role | Meaning |
 | --- | --- |
-| `first_frame` | The existing image is used as a fixed first frame. This role does not require a second image upload. |
+| `first_frame` | Use of an image as a fixed first frame. On Wan I2V, this is a property of the existing `image` input, not a separately supplied input. |
 | `source_video` | A source clip used for latent editing, separate from ordinary video conditioning. |
 | `video_noise_mask` | A video latent noise mask; a scalar `0.0` is a supplied input. |
 | `audio_noise_mask` | An audio latent noise mask; a scalar `0.0` is a supplied input. |
@@ -197,6 +201,14 @@ edited with latent noise masks. Check the selected route's `request.inputs`:
 Explicit Wan I2V pipelines declare `first_frame` with at most one image. VACE
 uses images as reference material and explicitly excludes `first_frame`; its
 ordinary `image` and `video` contracts remain available.
+
+For Wan I2V on `/v1/videos` and `/v1/videos/sync`, submit the image through
+`input_reference` (an uploaded file) or `image_reference` (a JSON-encoded image
+reference). The adapter forwards it as `multi_modal_data["image"]`, which Wan
+uses as the first frame. `inputs.image` and `inputs.first_frame` describe the
+same supplied image: their `max_count: 1` limits are not additive, and there is
+no separately accepted `first_frame` HTTP field. `first_frame.min_count: 0`
+does not remove the existing required `image` input.
 
 H3 declares each of the three edit roles as optional (`min_count: 0`,
 `max_count: 1`). Existing request validation still checks their combinations;
@@ -294,7 +306,7 @@ Older plugins omit it and retain their existing behavior.
 | MiniMax-H3 FL2VA / Ref2VA | `ref2va` excludes text-only generation. T2VA/FL2VA retain unknown V2V because source-video editing is implemented. Other modes remain unknown with `worker_checkpoint_tasks_unavailable`: the release task list is held only by the worker. See `diffusion/models/minimax_h3/pipeline_minimax_h3.py`. |
 | Cosmos3 normal / distilled / Edge | T2I and I2V are common modes. T2V and V2V are unknown with `worker_scheduler_mode_unavailable`, because the frontend does not own the loaded scheduler/backbone mode. Policy deployments have a separate action-only declaration. See `diffusion/models/cosmos3/pipeline_cosmos3.py`. |
 | Wan generic / explicit I2V / TI2V | Generic I2V requires checkpoint `expand_timesteps`; explicit task-specific pipelines have separate declarations. See the Wan pipeline definitions. |
-| Lance image / video checkpoint | The existing checkpoint resolver selects the matching declaration. I2V is unsupported for the video checkpoint: the current HTTP adapter supplies `image`, while the pipeline requires `first_frame`. Its image-generation and editing contracts remain unknown. See `config/config_factory.py` and the Lance pipeline. |
+| Lance image / video checkpoint | The existing checkpoint resolver selects the matching declaration. I2V is unsupported for the video checkpoint: the HTTP adapter fills the internal `multi_modal_data["image"]` key, while Lance reads `multi_modal_data["first_frame"]`. These are model-internal keys, not HTTP field names; discovery does not add the missing adapter mapping. Its image-generation and editing contracts remain unknown. See `config/config_factory.py` and the Lance pipeline. |
 | Thinker followed by a separate TTS model | A downstream talker does not establish the standalone speech input contract. Aura, JoyAI, and complete Ming Omni topologies retain chat audio; their standalone TTS deployments declare speech separately. |
 
 These are source-derived contracts, not per-checkpoint inference benchmarks.

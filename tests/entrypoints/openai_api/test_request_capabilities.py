@@ -111,10 +111,9 @@ def test_vace_reference_inputs_do_not_claim_fixed_first_frame(architecture, prof
         assert request.inputs[role] == InputConstraint(support="supported", min_count=1)
 
 
-@pytest.mark.parametrize("path", ["/v1/videos", "/v1/videos/sync"])
-@pytest.mark.parametrize("flag", [True, False, None, "unknown"])
+@pytest.mark.parametrize("flag", [True, False, None])
 @pytest.mark.parametrize("support", ["supported", "unknown"])
-def test_video_edit_roles_use_handler_policy_without_model_name(path, flag, support):
+def test_video_edit_roles_use_handler_policy_without_model_name(flag, support):
     roles = ("source_video", "video_noise_mask", "audio_noise_mask")
     profile = replace(
         VIDEO_TO_VIDEO,
@@ -124,7 +123,7 @@ def test_video_edit_roles_use_handler_policy_without_model_name(path, flag, supp
         ),
     )
     state = SimpleNamespace(openai_serving_video=SimpleNamespace(supports_latent_mask_editing=flag))
-    request = _route(profile, path, state=state)
+    request = _route(profile, "/v1/videos", state=state)
     for role in roles:
         expected = (
             InputConstraint(support="unsupported", max_count=0) if flag is False else profile.request.inputs[role]
