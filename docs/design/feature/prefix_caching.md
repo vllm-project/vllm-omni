@@ -58,7 +58,9 @@ The normal resident path appends new tokens and media to the actual generated
 sequence. A session cursor selects only new user messages; edits to submitted
 history invalidate it. The token ledger checks the latest heard reply against
 completed output before rendering a delta, without rebuilding old history or
-decoding old media. Window eviction and tool turns use a full snapshot.
+decoding old media. Window eviction, tool turns and nonempty `initial_user_text`
+use a full snapshot. The latter is injected into the current audio turn only,
+so keeping earlier injections would change the conversation.
 EngineCore validates the resident prefix
 length, token-content digest and salt, without comparing history block hashes. Old materialized media
 remain in the resident request; only new media touch the sender/receiver caches.
@@ -74,6 +76,13 @@ scheduling, a continued request waits for its previous turn's in-flight outputs
 to drain before worker retirement and arrival. The existing stale-output fence
 discards those results without appending tokens or forwarding conditioning rows.
 Other requests and decode steps within a turn remain asynchronous.
+
+When runnable waiting work makes no progress, the scheduler can reclaim one
+idle turn's KV after its in-flight outputs have drained. It preserves the
+logical token history and materialized media while resetting the computed-token
+count. Delta validation still checks the logical prefix; the next continuation
+recovers available cached blocks through APC and recomputes the rest. Reclamation
+does not close the session or release its request slot.
 
 The continuation adapter delegates token extension to vLLM's
 `Scheduler._update_request_as_session`. After delta validation it normalizes
