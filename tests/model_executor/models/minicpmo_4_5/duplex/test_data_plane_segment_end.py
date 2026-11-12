@@ -72,3 +72,35 @@ def test_chunk_sequence_can_restart_in_a_new_audio_cache_epoch():
     assert _project(plane, _boundary(8))
     assert _project(plane, _boundary(0, cache_epoch=1))
     assert _project(plane, _boundary(9, cache_epoch=0)) == []
+
+
+@pytest.mark.parametrize("texts", [("1", "1"), ("1", "11"), ("绿色", "绿色的")])
+def test_distinct_chunk_text_is_not_deduplicated_by_content(texts):
+    plane = MiniCPMO45DataPlaneSession(
+        lambda audio, *args: "audio" if audio is not None and np.asarray(audio).size else ""
+    )
+    emitted = []
+    for seq, text in enumerate(texts):
+        output = _boundary(seq, samples=(seq + 1) * 24000)
+        output.outputs[0].text = text
+        emitted.extend(_project(plane, output))
+        assert _project(plane, output) == []  # Replaying the same chunk is still deduplicated.
+    assert "".join(str(item.get("text", "")) for item in emitted) == "".join(texts)
+
+
+def test_text_chunk_identity_rejects_replays_and_is_scoped_to_turn():
+    plane = MiniCPMO45DataPlaneSession(lambda *args: "audio")
+    delta = plane.segment_text_delta
+    assert delta("request", "1", turn_id=0, chunk_key=(0, 4)) == "1"
+    assert delta("request", "11", turn_id=0, chunk_key=(0, 4)) == ""
+    assert delta("request", "stale", turn_id=0, chunk_key=(0, 3)) == ""
+    assert delta("request", "1", turn_id=0, chunk_key=(1, 0)) == "1"
+    assert delta("request", "stale", turn_id=0, chunk_key=(0, 5)) == ""
+    assert delta("request", "1", turn_id=1, chunk_key=(0, 0)) == "1"
+
+
+def test_text_without_chunk_identity_retains_snapshot_semantics():
+    plane = MiniCPMO45DataPlaneSession(lambda *args: "audio")
+    assert plane.segment_text_delta("request", "1") == "1"
+    assert plane.segment_text_delta("request", "1") == ""
+    assert plane.segment_text_delta("request", "11") == "1"

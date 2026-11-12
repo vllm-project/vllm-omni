@@ -68,7 +68,7 @@ def test_diagnostics_explain_held_and_no_progress_eos(monkeypatch, trace_records
     md.output_token_ids[0] = []
     sample(21)
     md.output_token_ids[0] = [21]
-    assert sample(TOKEN_IDS["turn_eos_token_id"]) == CHUNK_EOS
+    assert sample(TOKEN_IDS["turn_eos_token_id"], TOKEN_IDS["tts_bos_token_id"]) == TOKEN_IDS["tts_bos_token_id"]
     held = trace_records[-1]
     assert held["session_id"] == "trace-eos" and held["append_identity"] == [2, 160]
     assert held["reason"] == "hold_turn_eos"
@@ -318,9 +318,11 @@ def _character_cap_case(monkeypatch, *, deferred, all_greedy=True):
     if not deferred:
         monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
 
-    def sample(token):
+    def sample(token, alternative=None):
         logits = torch.full((1, VOCAB), -100.0)
         logits[0, token] = 100.0
+        if alternative is not None:
+            logits[0, alternative] = 99.0
         output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
         model._commit_minicpmo45_duplex_pending_samples()
         return output.sampled_token_ids.item()
@@ -397,10 +399,68 @@ class _SentenceTokenizer(_CharTokenizer):
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferred):
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_premature_eos_uses_current_logits_without_inserting_chunk_boundary(monkeypatch, deferred, all_greedy):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
+    model.max_speak_chars_per_chunk = 0
+    model._minicpmo45_tokenizer_cache = _SentenceTokenizer()
+    model._record_minicpmo45_duplex_generation_token(0, 21)
+    state.current_turn_ended = False
+    turn_eos = TOKEN_IDS["turn_eos_token_id"]
+    state.generated_tokens.extend([turn_eos, 22, 23])
+    md.output_token_ids[0] = [21]
+    logits = torch.full((1, VOCAB), -100.0)
+    # Scores from the local reproduction at unit 160: the continuation is
+    # plausible here, but is lost after injecting a new audiovisual unit.
+    logits[0, turn_eos], logits[0, 22], logits[0, 23] = 27.7665, 27.2101, 26.7928
+    output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert output.sampled_token_ids.item() == 22
+    assert state.generated_tokens[-1] == 22
+    assert state.held_turn_ends == 1
+    md.output_token_ids[0].append(22)
+    assert sample(turn_eos) == turn_eos
+    assert state.current_turn_ended is True
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unused_continuation_candidate_does_not_advance_rng(monkeypatch, deferred):
+    snapshots = []
+    for unfinished in (False, True):
+        model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=False)
+        model.max_speak_chars_per_chunk = 0
+        state.current_turn_ended = False
+        state.open_turn_tail = "现在画面中出现的是" if unfinished else ""
+        md.output_token_ids[0] = []
+        assert sample(23) == 23
+        snapshots.append(md.generators[0].get_state())
+    assert torch.equal(*snapshots)
+
+
+@pytest.mark.parametrize("top_k,top_p", [(0, 1.0), (3, 1.0), (3, 0.8)])
+@pytest.mark.parametrize("eos_id", [1, 3])
+def test_continuation_draws_follow_conditional_distribution(top_k, top_p, eos_id):
+    logits = torch.tensor([[0.0, 2.0, 1.0, 1.0, 1.0, -1.0]])
+    n = 20000
+    rows = logits.expand(n, -1)
+    uniforms = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+    original = Model._duplex_top_k_top_p_candidates(rows, top_k=top_k, top_p=top_p)
+    chosen = Model._duplex_draw_candidates(rows, original, uniforms) == eos_id
+    retry_uniforms = Model._duplex_continuation_uniforms(rows, original, uniforms, eos_id)
+    retry_logits = rows.clone()
+    retry_logits[:, eos_id] = -torch.inf
+    candidates = Model._duplex_top_k_top_p_candidates(retry_logits, top_k=top_k, top_p=top_p)
+    draws = Model._duplex_draw_candidates(retry_logits, candidates, retry_uniforms)[chosen]
+    actual = torch.bincount(draws, minlength=logits.shape[-1]).float() / draws.numel()
+    expected = torch.softmax(Model._top_k_top_p_filter(retry_logits[0], top_k=top_k, top_p=top_p), dim=-1)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_turn_eos_before_sentence_end_selects_same_position_continuation(monkeypatch, deferred):
     """Issue 9828: <|turn_eos|> after 「正」 must not end the turn.
 
-    Further text in the next chunk permits another hold until the sentence ends.
+    Select a continuation before injecting an artificial chunk boundary.
     """
     model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=True)
     model.max_speak_chars_per_chunk = 0
@@ -411,17 +471,19 @@ def test_turn_eos_before_sentence_end_closes_the_chunk_only(monkeypatch, deferre
     assert state.open_turn_tail.endswith("正")
     md.output_token_ids[0] = [21]
 
-    assert sample(turn_eos) == CHUNK_EOS
+    assert sample(turn_eos, 23) == 23
     assert state.current_turn_ended is False
     assert state.held_turn_ends == 1
-    assert state.generated_tokens == [21]
+    assert state.generated_tokens == [21, 23]
     assert state.open_turn_tail.endswith("正")
 
-    # The next segment drops the chunk terminator and resumes with new text.
+    # A normal model-selected chunk boundary can still precede more text.
+    md.output_token_ids[0].append(23)
+    assert sample(CHUNK_EOS) == CHUNK_EOS
     md.output_token_ids[0] = []
     assert sample(23) == 23
     md.output_token_ids[0] = [23]
-    assert sample(turn_eos) == CHUNK_EOS
+    assert sample(turn_eos, 23) == 23
     assert state.current_turn_ended is False
     assert state.held_turn_ends == 2
 
@@ -448,7 +510,7 @@ def test_turn_eos_without_text_progress_ends_the_turn(monkeypatch, deferred, con
     md.output_token_ids[0] = []
     assert sample(21) == 21  # No sentence-ending punctuation.
     md.output_token_ids[0] = [21]
-    assert sample(turn_eos) == CHUNK_EOS
+    assert sample(turn_eos, TOKEN_IDS["tts_bos_token_id"]) == TOKEN_IDS["tts_bos_token_id"]
 
     md.output_token_ids[0] = []
     if control_token is not None:
@@ -463,7 +525,7 @@ def test_turn_eos_without_text_progress_ends_the_turn(monkeypatch, deferred, con
     md.output_token_ids[0] = []
     assert sample(21) == 21
     md.output_token_ids[0] = [21]
-    assert sample(turn_eos) == CHUNK_EOS
+    assert sample(turn_eos, TOKEN_IDS["tts_bos_token_id"]) == TOKEN_IDS["tts_bos_token_id"]
     assert state.current_turn_ended is False
     assert state.held_turn_ends == 1
 
@@ -480,7 +542,7 @@ def test_turn_end_hold_cap_survives_text_progress(monkeypatch, deferred):
         md.output_token_ids[0] = []
         assert sample(21) == 21
         md.output_token_ids[0] = [21]
-        assert sample(turn_eos) == CHUNK_EOS
+        assert sample(turn_eos, 23) == 23
         assert state.current_turn_ended is False
     md.output_token_ids[0] = []
     assert sample(21) == 21

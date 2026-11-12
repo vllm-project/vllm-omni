@@ -831,18 +831,28 @@ explicit `force_listen` bypasses only the soft character target.
 
 MiniCPM-o also applies a bounded continuation policy that differs from official
 `streaming_generate`: when an open turn has text without sentence-ending
-punctuation, a sampled `<|turn_eos|>` is replaced with `<|chunk_eos|>` to give
-the next chunk a chance to finish the sentence. If no new text token arrives
-before the next `<|turn_eos|>`, that turn end is accepted. Control tokens do
+punctuation, a sampled `<|turn_eos|>` is replaced with a candidate drawn at
+the same decoding position with EOS masked. Inserting `<|chunk_eos|>` here
+would discard the current continuation logits and add another input unit
+before retrying. The alternative reapplies top-k/top-p after masking EOS and
+rescales the original uniform within the EOS interval, so the conditional
+draw is unbiased and unused alternatives do not advance RNG.
+If no new text token arrives before the next `<|turn_eos|>`, that turn end is accepted. Control tokens do
 not count as text progress. New text permits another continuation attempt,
 up to 16 held turn ends per turn. Sentence-ending punctuation releases the
 hold immediately. An accepted turn end or explicit force-listen clears the
 continuation state. Stage 0 and the Talker handoff share the sentence-end
 predicate; the Talker still receives an accepted `<|turn_eos|>` unchanged.
-If holding EOS leaves a speech unit with no text, its chunk boundary still
+If a speech unit has no text, its chunk boundary still
 travels through Talker's empty-condition path. That path emits no audio but
 preserves the TTS segment-end notification needed to schedule the next silence
 unit; an empty speech chunk must not be dropped as if it were a listen unit.
+
+Code2Wav attaches queued transcript text once per output payload. The data
+plane deduplicates it by `(duplex_audio_cache_epoch, duplex_audio_chunk_seq)`
+within a model turn, not by text equality or a shared prefix. Adjacent chunks
+containing `1` and `1` must deliver `11`. Legacy outputs without a chunk
+identity retain the cumulative-text snapshot handling.
 
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change

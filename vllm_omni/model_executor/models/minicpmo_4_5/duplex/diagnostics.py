@@ -113,6 +113,8 @@ class SamplingTrace:
             for row, values in zip(rows, host.cpu().tolist(), strict=True):
                 if name == "stage2_logits" and self.records[row].get("boundary_hit"):
                     continue  # No committed stage-2 decision on this row.
+                if name == "continuation_logits" and self.records[row].get("reason") != "hold_turn_eos":
+                    continue  # The alternative was not used.
                 scores = [value if math.isfinite(value) else None for value in values[k:]]
                 self.records[row][name] = {
                     "top_ids": [int(value) for value in values[:k]],

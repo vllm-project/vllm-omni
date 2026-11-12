@@ -1388,7 +1388,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         sampling_metadata: SamplingMetadata,
         rewinds: dict[int, Callable[[], None]] | None = None,
         trace: SamplingTrace | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Each row's stage-2 token: forbidden ids masked, repetition penalty, then greedy or a candidate draw.
 
         ``rewinds`` receives, per row position, a call undoing that row's draw.
@@ -1419,12 +1419,28 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # repetition-penalized tensor consumed by the sampler below.
             trace.capture_logits("stage2_logits", stage2_logits, rows)
 
+        # Compute a same-position alternative for unfinished turns. Reuse the
+        # original uniform below, so unused alternatives do not advance RNG.
+        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        continuation_logits = None
+        if 0 <= turn_eos_id < vocab and any(self._minicpmo45_hold_unfinished_turn(row) for row in rows):
+            continuation_logits = stage2_logits.clone()
+            continuation_logits[:, turn_eos_id] = float("-inf")
+            if trace is not None:
+                trace.capture_logits("continuation_logits", continuation_logits, rows)
+        alternatives: list[torch.Tensor | None] = [None] * len(rows)
         samples: list[torch.Tensor | None] = [None] * len(rows)
         greedy = [local for local, row_idx in enumerate(rows) if all_greedy or float(row_params[row_idx][0]) <= 0]
         if greedy:
             greedy_sample = torch.argmax(stage2_logits[index_to_device(greedy, device)], dim=-1)
+            alternate = (
+                torch.argmax(continuation_logits[index_to_device(greedy, device)], dim=-1)
+                if continuation_logits is not None
+                else greedy_sample
+            )
             for pos, local_idx in enumerate(greedy):
                 samples[local_idx] = greedy_sample[pos : pos + 1]
+                alternatives[local_idx] = alternate[pos : pos + 1]
         drawn = [local_idx for local_idx in range(len(rows)) if samples[local_idx] is None]
         # One uniform per row from its generator, in row order, then a batched draw per (top_k, top_p) group.
         uniforms: dict[int, torch.Tensor] = {}
@@ -1447,9 +1463,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 candidates = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
                 group_uniforms = torch.stack([uniforms[local_idx] for local_idx in members])
                 draws = self._duplex_draw_candidates(group_logits, candidates, group_uniforms)
+                alternate = draws
+                if continuation_logits is not None:
+                    retry_logits = continuation_logits[members_t] / temps[members_t]
+                    retry_candidates = self._duplex_top_k_top_p_candidates(retry_logits, top_k=top_k, top_p=top_p)
+                    retry_uniforms = self._duplex_continuation_uniforms(
+                        group_logits, candidates, group_uniforms, turn_eos_id
+                    )
+                    alternate = self._duplex_draw_candidates(retry_logits, retry_candidates, retry_uniforms)
                 for i, local_idx in enumerate(members):
                     samples[local_idx] = draws[i : i + 1]
-        return torch.cat(samples)  # type: ignore[arg-type]
+                    alternatives[local_idx] = alternate[i : i + 1]
+        return torch.cat(samples), torch.cat(alternatives)  # type: ignore[arg-type]
 
     def _sample_minicpmo45_native_duplex_rows(
         self,
@@ -1464,7 +1489,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Sample duplex rows with at most two host reads: the boundary decisions, then the stage-2 tokens.
 
         Per row: chunk_eos at the speak-length cap, else the boundary draw, else
-        the stage-2 draw, the chunk cut and the listen->tts_bos rewrite. Each
+        the stage-2 draw, the unfinished-turn continuation and the listen->tts_bos rewrite. Each
         row's own generator draws as it would one row at a time; rows sharing
         the process-wide generator draw every boundary before any stage-2 token.
         """
@@ -1486,21 +1511,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             trace.decision(row_idx, chunk_eos_id, None, True, True)
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
         if stage2_rows:
-            draws = self._minicpmo45_duplex_stage2_draws(
+            draws, alternatives = self._minicpmo45_duplex_stage2_draws(
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, trace=trace
             )
             turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-            for row_idx, sampled in zip(stage2_rows, draws.tolist(), strict=True):
-                if sampled == turn_eos_id and self._minicpmo45_hold_unfinished_turn(row_idx):
+            for row_idx, (raw, alternate) in zip(
+                stage2_rows, torch.stack((draws, alternatives), dim=1).tolist(), strict=True
+            ):
+                sampled = raw
+                if raw == turn_eos_id and self._minicpmo45_hold_unfinished_turn(row_idx):
                     self._minicpmo45_note_held_turn_end(row_idx)
-                    resolved[row_idx] = chunk_eos_id
-                    if trace is not None:
-                        trace.decision(row_idx, chunk_eos_id, sampled, False, True)
-                    continue
+                    sampled = alternate
                 self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
                 resolved[row_idx] = self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
                 if trace is not None:
-                    trace.decision(row_idx, resolved[row_idx], sampled, False, True)
+                    trace.decision(row_idx, resolved[row_idx], raw, False, True)
         return [int(resolved[row_idx]) for row_idx in row_idxs]
 
     def _sample_minicpmo45_native_duplex_rows_deferred(
@@ -1542,10 +1567,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 else torch.zeros(len(stage2_rows), dtype=torch.bool, device=device)
             )
             rewinds_into = rewinds if has_chunk_eos else None
-            raw = self._minicpmo45_duplex_stage2_draws(
+            raw, alternatives = self._minicpmo45_duplex_stage2_draws(
                 logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into, trace=trace
             )
-            token = raw
+            generation = raw
+            turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+            if turn_eos_id >= 0:
+                hold = [self._minicpmo45_hold_unfinished_turn(row_idx) for row_idx in stage2_rows]
+                if any(hold):
+                    generation = torch.where(
+                        (raw == turn_eos_id) & index_to_device(hold, device).bool(), alternatives, raw
+                    )
+            token = generation
             listen_id = token_ids.get("listen_token_id", -1)
             if 0 <= listen_id:
                 # The host rewrite of a sampled listen (to tts_bos inside an open turn), decided per row.
@@ -1554,27 +1587,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 ]
                 if any(value != listen_id for value in rewritten):
                     token = torch.where(token == listen_id, index_to_device(rewritten, device), token)
-            turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-            if has_chunk_eos and turn_eos_id >= 0:
-                # The open-turn tail is already decoded when the text token was
-                # recorded, so this is a string check, not a tokenizer call.
-                hold = [1 if self._minicpmo45_hold_unfinished_turn(row_idx) else 0 for row_idx in stage2_rows]
-                if any(hold):
-                    token = torch.where(
-                        (token == turn_eos_id) & index_to_device(hold, device).bool(),
-                        torch.full_like(token, chunk_eos_id),
-                        token,
-                    )
             if has_chunk_eos:
                 token = torch.where(hit, torch.full_like(token, chunk_eos_id), token)
             final[positions_t] = token
 
-        # One pinned copy of (final, raw stage-2 sample, boundary hit) per row
+        # One pinned copy of (final, raw stage-2 sample, boundary hit,
+        # generation token before listen rewriting) per row
         # for the commit; the host reads it once the runner has waited for it.
-        packed = torch.stack([final, torch.full_like(final, -1), torch.zeros_like(final)], dim=1)
+        packed = torch.stack([final, torch.full_like(final, -1), torch.zeros_like(final), final], dim=1)
         if stage2_rows:
             packed[positions_t, 1] = raw
             packed[positions_t, 2] = hit.long()
+            packed[positions_t, 3] = generation
         host = torch.empty(packed.shape, dtype=packed.dtype, pin_memory=device.type == "cuda")
         host.copy_(packed, non_blocking=True)
         if trace is not None:
@@ -1621,19 +1645,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_payloads = pending.row_payloads
         try:
             turn_eos_id = pending.token_ids.get("turn_eos_token_id", -1)
-            chunk_eos_id = pending.token_ids.get("chunk_eos_token_id", -1)
             for pos, row_idx in enumerate(pending.row_idxs):
-                final, raw, hit = values[pos]
+                final, raw, hit, generation = values[pos]
                 if pending.stage2[pos] and hit:
                     pending.rewinds.get(pos, lambda: None)()
-                elif pending.stage2[pos] and int(raw) == turn_eos_id and int(final) == chunk_eos_id:
-                    self._minicpmo45_note_held_turn_end(row_idx)
                 elif pending.stage2[pos]:
-                    self._record_minicpmo45_duplex_generation_token(row_idx, int(raw))
+                    if int(raw) == turn_eos_id and int(generation) != turn_eos_id:
+                        self._minicpmo45_note_held_turn_end(row_idx)
+                    self._record_minicpmo45_duplex_generation_token(row_idx, int(generation))
             for pos, row_idx in enumerate(pending.row_idxs):
                 self._record_minicpmo45_duplex_terminator(row_idx, int(values[pos][0]), pending.token_ids)
                 if pending.trace is not None:
-                    final, raw, hit = values[pos]
+                    final, raw, hit, generation = values[pos]
                     pending.trace.decision(row_idx, int(final), int(raw), bool(hit), pending.stage2[pos])
             if pending.trace is not None:
                 pending.trace.emit(self)
@@ -1734,8 +1757,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Keep an open turn when ``<|turn_eos|>`` arrives before the sentence ends.
 
         The text is the turn tail recorded with earlier text tokens, not the
-        current chunk. A hold rewrites ``<|turn_eos|>`` to ``<|chunk_eos|>`` for
-        one continuation attempt. Another EOS without new text ends the turn.
+        current chunk. A hold selects a non-EOS candidate at the same decoding
+        position. Another EOS without new text ends the turn.
         A turn already ended, a tail that already ends a sentence, an empty
         tail, or a turn held ``MAX_HELD_UNFINISHED_TURN_ENDS`` times is left alone.
         """
@@ -2055,6 +2078,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         tied = logits == kth
         tie_token = (tied & (tied.cumsum(dim=-1) == j + 1)).int().argmax(dim=-1, keepdim=True)
         return torch.where(slot == probs.shape[-1] - 1, tie_token, token).squeeze(-1)
+
+    @staticmethod
+    def _duplex_continuation_uniforms(
+        logits: torch.Tensor,
+        candidates: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        uniforms: torch.Tensor,
+        eos_id: int,
+    ) -> torch.Tensor:
+        """Remap the EOS interval to [0, 1) for an unbiased conditional draw.
+
+        Reusing U unchanged after selecting EOS would condition U on a narrow
+        interval and bias the continuation. Include the compact tied-token
+        bucket used by the native sampler; no additional RNG draw is needed.
+        """
+        probs, indices, kth, ties = candidates
+        cdf = probs.cumsum(dim=-1)
+        matches = indices == eos_id
+        mass = (probs * matches).sum(dim=-1)
+        before = ((cdf - probs) * matches).sum(dim=-1)
+        tie_rank = (logits[:, :eos_id] == kth).sum(dim=-1)
+        tied_eos = (logits[:, eos_id] == kth.squeeze(-1)) & (tie_rank < ties.squeeze(-1))
+        tie_mass = probs[:, -1] / ties.squeeze(-1).clamp(min=1)
+        mass = torch.where(tied_eos, tie_mass, mass)
+        before = torch.where(tied_eos, cdf[:, -1] - probs[:, -1] + tie_rank * tie_mass, before)
+        residual = (uniforms * cdf[:, -1] - before) / mass.clamp(min=torch.finfo(probs.dtype).tiny)
+        return residual.clamp(min=0, max=1 - torch.finfo(probs.dtype).eps)
 
     @staticmethod
     def _duplex_boundary_chunk_eos_probs(logits: torch.Tensor, chunk_eos_id: int) -> torch.Tensor:
