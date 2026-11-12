@@ -916,9 +916,9 @@ class PinnedResidentLayerGroup:
     Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
     pinned CPU master copy (or mmap source plus bounded staging) and never
     copies generated device weights back to host. Entering the denoise stage
-    performs one asynchronous H2D pass;
-    leaving it only restores zero-sized placeholders and releases the device
-    buffers.  This lets the following VAE stage reuse the same HBM.
+    performs one asynchronous H2D pass. Leaving it restores zero-sized
+    placeholders and releases the device buffers by default. Enabling
+    ``retain_device_storage`` keeps those buffers for subsequent requests.
 
     The resident path is intentionally local-shard only.  With tensor
     parallelism, the regular model loader has already produced each rank's TP
@@ -1007,7 +1007,6 @@ class PinnedResidentLayerGroup:
         self,
         gpu_buffers: list[dict[torch.dtype, torch.Tensor]],
     ) -> None:
-        """Bind the recorded views without changing the device backing."""
         for state, block_buffers in zip(self._states, gpu_buffers):
             targets = state["targets"]
             for dtype, metas in state["metadata"].items():

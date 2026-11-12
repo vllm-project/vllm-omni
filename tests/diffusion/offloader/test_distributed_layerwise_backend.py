@@ -134,7 +134,6 @@ def test_independent_cpu_weights_survive_dlo_and_reenable(
     resident_layers,
     retain,
 ):
-    """Block transport must leave independently staged CPU projections intact."""
     pipeline = _independent_projection_pipeline()
     pipeline._offload_plan = replace(
         pipeline._offload_plan,
