@@ -8,7 +8,7 @@ Configuration, supported deployments, and validation commands are in the
 
 ## Scope
 
-M1 serves ordinary Qwen3-Omni turn requests on CUDA with Model Runner V2: a
+M1 serves ordinary Qwen3-Omni turn requests on CUDA with Model Runner V2: an
 unquantized Thinker with tensor parallel size 1, one full-attention KV group,
 and equal KV and hash block sizes. The connector rejects other deployments at
 startup, including runtime quantization, whose effective model values are not
@@ -235,6 +235,26 @@ reaching the scheduler's caller.
 Opt-in tests need a running Mooncake master and `MOONCAKE_CONFIG_PATH`:
 `tests/distributed/test_mooncake_hs_store.py` exercises the native Store with KV
 sentinels, and `tests/engine/test_mooncake_turn_consistency_qwen3.py` runs the
-cold, full-hit, and partial-hit pipeline on GPUs. Neither runs in CI.
-Concurrent serving, fault injection on GPUs, duplex sessions, multimodal
-inputs, and performance remain unvalidated.
+cold, full-hit, and partial-hit pipeline on GPUs. The acceptance test compares
+embeddings, hidden states, packed Talker inputs, generated tokens, and audio
+against independent cache-off runs. Image and audio cases also check that
+changing media prevents reuse. Neither test runs in CI.
+
+Two manual benchmarks use the same pinned Qwen3-Omni MRv2 deployment:
+
+- `benchmarks/qwen3_omni/mooncake_cache_benchmark.py` compares cache off, local
+  prefix caching, and Mooncake-only caching in separate processes. It records
+  client TTFT, first audio, end-to-end latency, RTF, throughput, cache hits,
+  restored rows, and memory snapshots. Serial and concurrent waves include
+  an overflow working set that exceeds the configured GPU KV capacity.
+- `benchmarks/qwen3_omni/mooncake_faults.py` delays lookup and native KV-write
+  calls against a real Store, checking unaffected requests' progress, latency,
+  and generated tokens. Delays are injected at API entry; they do not model
+  Store-internal mutex or transport stalls.
+
+Performance runs use explicit greedy sampling and disable residual-codebook
+sampling. They contain no source-tensor dumps or save barriers. Output hashes
+and memory snapshots are collected between timed waves. Two-level cache
+cooperation and duplex sessions remain outside this validation.
+
+See the [controlled M1 measurements and reproduction commands](../../../benchmarks/qwen3_omni/README.md).

@@ -49,6 +49,13 @@ for configuration, scope, and validation limits, and the
 [Mooncake KV/HS cache design](../feature/mooncake_kv_hs_cache.md) for its
 lifecycle and the deferred two-level mode.
 
+MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
+because their replay returns that tree directly to model postprocessing.
+FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
+native graph buffers; FULL replay restores the tree before postprocessing.
+Both paths therefore publish the same named hidden-state fields to prefix
+caching and downstream stages.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
