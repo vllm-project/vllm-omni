@@ -419,9 +419,12 @@ or heard in the clip, such as the word-repetition prompts in
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
 runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
-Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
-quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
-generation, publication and judging but records scores without a quality floor.
+It points `--deploy-config` at stock `minicpmo_4_5.yaml` and applies
+`duplex_session.max_sessions: 8` plus `duplex_session.collect_stats: true` through
+inline `server_params.update` on a temporary copy, the same path as the Qwen3-Omni
+C8 jobs. Score floors come from the accuracy-config `baseline`: H100, B200 and A3
+have calibrated entries, while uncalibrated hardware such as ROCm MI325 omits a
+baseline and still records complete generation, publication and judging.
 
 Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -750,7 +753,10 @@ token interval is present within a continuous generation segment. Model-unit pac
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
 
-The checked-in local performance configuration measures eight deterministic cases from `1q1a`, `1q1a_math`, and
+The checked-in local performance configuration points `--deploy-config` at stock
+`minicpmo_4_5.yaml` and applies `duplex_session.max_sessions: 8` plus
+`duplex_session.collect_stats: true` through inline `server_params.update`. It
+measures eight deterministic cases from `1q1a`, `1q1a_math`, and
 `1qna` (24 videos total), with no benchmark warmups and a maximum concurrency of eight. Each subset also sends one readiness request before its
 measured cases. Case WAV, transcript, event, and evaluation artifacts are written to a temporary directory during the
 run and deleted afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge

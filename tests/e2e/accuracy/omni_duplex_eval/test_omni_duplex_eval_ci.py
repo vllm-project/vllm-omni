@@ -19,7 +19,11 @@ _CONFIG_PATH = Path(__file__).with_name("omni_duplex_eval_ci_config.json")
 
 @pytest.fixture
 def config():
-    return json.loads(_CONFIG_PATH.read_text())
+    from tests.dfx.perf.scripts.run_benchmark import _duplex_eval_selected_baseline
+
+    raw = json.loads(_CONFIG_PATH.read_text())
+    selected = _duplex_eval_selected_baseline(raw, "H100")
+    return {**raw, "baseline": selected} if selected else raw
 
 
 @pytest.fixture
@@ -57,10 +61,11 @@ def result(tmp_path, config):
         errors=[],
         score_root=str(score_root),
     )
-    return {
+    payload = {
         "date": "20261020-065052",
         "completed": expected,
         "failed": 0,
+        "duplex_metric_aggregation": "response",
         "duplex_session_metrics": [
             {
                 "client_ttft_ms": {"count": 1, "mean": 3.0},
@@ -75,6 +80,22 @@ def result(tmp_path, config):
             "accuracy": summary,
         },
     }
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        payload[f"num_{metric}_samples"] = expected
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            payload[f"p{percentile}_{metric}{suffix}"] = 1.0
+    for metric in (
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ):
+        payload[f"num_{metric}_samples"] = expected
+        for stat in ("mean", "median", "p99"):
+            payload[f"{stat}_{metric}"] = 0.1
+    return payload
 
 
 def test_complete_scores_pass(result, config):
@@ -310,7 +331,8 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
-    enforce_score_floors = resource_label in dfx_config["benchmark_params"][0]["duplex_eval_score_floor_hardware"]
+    selected_baseline = runner._duplex_eval_selected_baseline(json.loads(_CONFIG_PATH.read_text()), resource_label)
+    enforce_score_floors = bool(selected_baseline)
     if benchmark_params_name is not None:
         dfx_config["benchmark_params"][0]["name"] = benchmark_params_name
     result["model_id"] = "/models/MiniCPM-o-4_5"
@@ -401,7 +423,7 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     assert saved["num_prompts"] == dfx_config["benchmark_params"][0]["num_prompts"][0] == 66
     assert saved["branch"] == "test-branch"
     assert saved["max_concurrency"] == 8
-    assert saved["baseline"] == (config["baseline"] if enforce_score_floors else {})
+    assert saved["baseline"] == selected_baseline
     assert saved["benchmark_exit_code"] == returncode
     if failure == "cli":
         assert saved["accuracy"]["status"] == "failed"

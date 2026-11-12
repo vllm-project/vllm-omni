@@ -627,20 +627,22 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
-def _duplex_eval_score_floors_enforced(params: dict, hardware: object) -> bool:
-    calibrated = params.get("duplex_eval_score_floor_hardware")
-    if calibrated is None:
-        return True
-    if (
-        not isinstance(calibrated, list)
-        or not calibrated
-        or not all(isinstance(item, str) and item for item in calibrated)
-        or len(set(calibrated)) != len(calibrated)
-    ):
-        raise ValueError("duplex_eval_score_floor_hardware must be a non-empty list of unique hardware labels")
-    if not isinstance(hardware, str) or not hardware:
-        raise ValueError("duplex_eval_score_floor_hardware requires a runtime hardware label")
-    return hardware in calibrated
+def _duplex_eval_selected_baseline(accuracy_config: dict, hardware: object) -> dict:
+    """Return this hardware's score floors, or ``{}`` to record scores without gating.
+
+    Nested accuracy-config baselines (``{"H100": {...}, "A3": {...}}``) enforce only
+    when the runtime label has an entry. A flat metric dict still applies to every
+    hardware label, matching jobs that share one calibrated floor.
+    """
+    baseline = accuracy_config.get("baseline") or {}
+    if not isinstance(baseline, dict) or not baseline:
+        return {}
+    if all(isinstance(value, dict) and value for value in baseline.values()):
+        if not isinstance(hardware, str) or not hardware:
+            return {}
+        selected = baseline.get(hardware)
+        return dict(selected) if isinstance(selected, dict) else {}
+    return {str(key): value for key, value in baseline.items() if value is not None}
 
 
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
@@ -653,10 +655,12 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # The accuracy suite scores collected output, including silence and
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
+        config = load_accuracy_config(path, params)
+        selected = _duplex_eval_selected_baseline(config, result.get("Hardware"))
         assert_accuracy_result(
             result,
-            load_accuracy_config(path, params),
-            enforce_score_floors=_duplex_eval_score_floors_enforced(params, result.get("Hardware")),
+            {**config, "baseline": selected},
+            enforce_score_floors=bool(selected),
         )
         # Allow individual silent sessions, but fail a batch-wide audio outage
         # even when the text-only RTD/PR judge accepts the responses.
@@ -788,9 +792,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config
 
         accuracy_config = load_accuracy_config(path, params)
-        accuracy_baseline = (
-            accuracy_config["baseline"] if _duplex_eval_score_floors_enforced(params, resource_label) else {}
-        )
+        accuracy_baseline = _duplex_eval_selected_baseline(accuracy_config, resource_label)
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
@@ -908,9 +910,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
                 random_input_len=params.get("random_input_len"),
                 random_output_len=params.get("random_output_len"),
                 resource_label=resource_label,
-                num_warmups=_resolve_num_warmups(
-                    params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)
-                ),
+                num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
                 benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
                 accuracy_baseline=accuracy_baseline,
             )
@@ -958,4 +958,3 @@ def test_performance_benchmark(omni_server, benchmark_params):
     finally:
         if artifact_root is not None:
             artifact_root.cleanup()
-

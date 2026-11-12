@@ -1,6 +1,0 @@
-# MiniCPM-o OmniInteract only. Stock minicpmo_4_5.yaml stays collect_stats: false.
-# duplex_session is replaced, not deep-merged; max_sessions must be restated.
-base_config: minicpmo_4_5.yaml
-duplex_session:
-  max_sessions: 16
-  collect_stats: true

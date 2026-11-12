@@ -17,9 +17,13 @@
       "model": "openbmb/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/minicpmo_4_5_omniinteract.yaml",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
         "--trust-remote-code"
-      ]
+      ],
+      "update": {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
     },
     "judge_server_params": {
       "model": "Qwen/Qwen2.5-7B-Instruct",
@@ -57,7 +61,16 @@
           "basic_window_high_tokens": 7000,
           "basic_window_low_tokens": 5000
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       },
       {
         "dataset_name": "omniinteract",
@@ -84,7 +97,16 @@
           "basic_window_high_tokens": 7000,
           "basic_window_low_tokens": 5000
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       },
       {
         "dataset_name": "omniinteract",
@@ -111,7 +133,16 @@
           "basic_window_high_tokens": 7000,
           "basic_window_low_tokens": 5000
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       }
     ]
   }

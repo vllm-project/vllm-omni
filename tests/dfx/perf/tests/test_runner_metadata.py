@@ -868,13 +868,30 @@ def test_duplex_eval_result_rejects_incomplete_artifacts_or_judging(field, value
         assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": True}, 1)
 
 
+_CALIBRATED_DUPLEX_EVAL_FLOORS = {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28,
+}
+
+
 @pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
-def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hardware, enforce_score_floors):
+def test_duplex_eval_score_floors_follow_configured_baseline(monkeypatch, hardware, enforce_score_floors):
     from tests.dfx.perf.scripts import run_benchmark
     from tests.e2e.accuracy.omni_duplex_eval import validation
 
     observed = []
-    monkeypatch.setattr(validation, "load_accuracy_config", lambda *args: {"baseline": {}})
+    monkeypatch.setattr(
+        validation,
+        "load_accuracy_config",
+        lambda *args: {
+            "baseline": {
+                "H100": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+                "B200": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+                "A3": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
+            }
+        },
+    )
     monkeypatch.setattr(
         validation,
         "assert_accuracy_result",
@@ -887,7 +904,6 @@ def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hard
         {
             "dataset_name": "omni-duplex-eval",
             "duplex_eval_accuracy_config": "config.json",
-            "duplex_eval_score_floor_hardware": ["H100", "B200", "A3"],
         },
         1,
     )
@@ -953,7 +969,22 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
     assert set(params["duplex_eval_ids"]) == ids
     assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
     assert params["duplex_eval_evaluate"]
-    assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
+    assert "duplex_eval_score_floor_hardware" not in params
+    assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
+    assert config["server_params"]["update"] == {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": True,
+    }
+    assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+    assert params["metric-percentiles"] == "50,95"
+    assert params["duplex_metric_aggregation"] == "response"
+    assert params["required_duplex_metrics"] == [
+        "duplex_client_rtf",
+        "duplex_client_ttfp_ms",
+        "duplex_client_ttft_ms",
+        "duplex_busy_rtf",
+        "duplex_stall_ratio",
+    ]
 
     calls = []
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
@@ -987,7 +1018,11 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
     assert "--duplex-eval-accuracy-config" not in call["args"]
     assert "--duplex-eval-score-floor-hardware" not in call["args"]
-    assert call["accuracy_baseline"] == (accuracy["baseline"] if enforce_score_floors else {})
+    assert "--required-duplex-metrics" not in call["args"]
+    assert args.duplex_metric_aggregation == "response"
+    selected = run_benchmark._duplex_eval_selected_baseline(accuracy, hardware)
+    assert bool(selected) == enforce_score_floors
+    assert call["accuracy_baseline"] == selected
 
 
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
@@ -1722,6 +1757,78 @@ def test_response_performance_rejects_missing_artifacts(dataset_name, field, val
         result[summary_key][field] = value
     with pytest.raises(AssertionError, match=message):
         assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)
+
+
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("equals_syntax", [False, True])
+def test_minicpmo_duplex_inline_deploy_updates_reach_runtime(monkeypatch, dataset, equals_syntax):
+    from pathlib import Path
+
+    from tests.dfx.conftest import _create_unique_server_params
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+    from vllm_omni.platforms import current_omni_platform
+
+    config = json.loads(Path(__file__).with_name(f"test_minicpmo_4_5_{dataset}.json").read_text())[0]
+    source = Path(config["server_params"]["extra_cli_args"][1])
+    original = source.read_bytes()
+    config["server_params"]["serve_args"] = {"deploy-config": "unused.yaml"}
+    if equals_syntax:
+        config["server_params"]["extra_cli_args"] = [f"--deploy-config={source}"]
+    row = _create_unique_server_params([config], Path("unused"))[0]
+    args = list(row[4])
+    deploy_path = None
+    for index in range(len(args) - 1, -1, -1):
+        arg = args[index]
+        if arg == "--deploy-config" and index + 1 < len(args):
+            deploy_path = Path(args[index + 1])
+            break
+        if arg.startswith("--deploy-config="):
+            deploy_path = Path(arg.split("=", 1)[1])
+            break
+    assert deploy_path is not None
+    try:
+        assert deploy_path != source.resolve()
+        assert source.read_bytes() == original
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, deploy)
+        assert [stage.stage_id for stage in deploy.stages] == [0, 1, 2]
+        assert all(stage.yaml_engine_args["duplex_max_sessions"] == 8 for stage in stages)
+        assert deploy.duplex_session.collect_stats is True
+        assert deploy.duplex_session.max_sessions == 8
+    finally:
+        deploy_path.unlink(missing_ok=True)
+
+
+def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
+    assert config["omniinteract_aggregate_min_ia_qtf1"] == 0.2
+    assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
+    assert config["server_params"]["update"] == {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": True,
+    }
+    subsets = []
+    for params in config["benchmark_params"]:
+        assert params["max_concurrency"] == [8]
+        assert params["num_prompts"] == [8]
+        assert params["omniinteract_persist_artifacts"] is False
+        assert "omniinteract_output_dir" not in params
+        assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+        assert params["metric-percentiles"] == "50,95"
+        assert params["duplex_metric_aggregation"] == "response"
+        assert "tpot" not in params["percentile-metrics"]
+        assert "itl" not in params["percentile-metrics"]
+        assert params["required_duplex_metrics"] == [
+            "duplex_client_rtf",
+            "duplex_client_ttfp_ms",
+            "duplex_client_ttft_ms",
+            "duplex_busy_rtf",
+            "duplex_stall_ratio",
+        ]
+        subsets.append(params["omniinteract_subsets"])
+    assert subsets == ["1q1a", "1q1a_math", "1qna"]
 
 
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
