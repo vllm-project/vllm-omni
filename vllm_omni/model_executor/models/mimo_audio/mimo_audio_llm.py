@@ -80,7 +80,10 @@ class MiMoSampler:
     top_k: int | None = None
     top_p: float | None = None
 
-    def process(self, scores: torch.Tensor):
+    def process(self, scores: torch.Tensor) -> torch.Tensor:
+        # Match the tensor-parameter graph path; BF16 division can introduce
+        # ties and change the greedy token before the audio feedback step.
+        scores = scores.float()
         if self.temperature is not None:
             scores = scores / self.temperature
 
@@ -100,10 +103,14 @@ class MiMoSampler:
 
         return scores
 
-    def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None):
+    def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
+        if removed_tokens:
+            # Preserve the caller's logits while excluding tokens before top-p
+            # can let an excluded maximum suppress every valid candidate.
+            scores = scores.clone()
+            for t in removed_tokens:
+                scores[:, t] = float("-inf")
         scores = self.process(scores)
-        for t in removed_tokens or []:
-            scores[:, t] = float("-inf")
 
         if self.do_sample:
             probs = scores.softmax(dim=-1)
