@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -48,16 +49,22 @@ def test_registered_fixture_caps_cpu_marked_test(single_threaded_cpu):
     assert torch.get_num_threads() == 1
 
 
-def test_single_threaded_cpu_caps_and_restores(capsys):
+def test_single_threaded_cpu_caps_and_restores(capsys, monkeypatch):
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
     torch = _ThreadController(8)
     fixture = _single_threaded_cpu(_request(cpu_marked=True), lambda: torch)
 
     next(fixture)
     assert torch.num_threads == 1
+    assert os.environ["OMP_NUM_THREADS"] == "1"
+    assert os.environ["MKL_NUM_THREADS"] == "1"
     _finish_fixture(fixture)
 
     assert torch.num_threads == 8
     assert torch.transitions == [1, 8]
+    assert os.environ["OMP_NUM_THREADS"] == "8"
+    assert "MKL_NUM_THREADS" not in os.environ
     output = capsys.readouterr().out
     assert "CPU reference threads 8 -> 1" in output
     assert "restored threads 8" in output
@@ -78,7 +85,9 @@ def test_single_threaded_cpu_is_noop_without_cpu_marker():
     assert not loaded
 
 
-def test_single_threaded_cpu_restores_if_bounding_raises():
+def test_single_threaded_cpu_restores_if_bounding_raises(monkeypatch):
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
     torch = _ThreadController(8, fail_when_bounding=True)
     fixture = _single_threaded_cpu(_request(cpu_marked=True), lambda: torch)
 
@@ -87,3 +96,5 @@ def test_single_threaded_cpu_restores_if_bounding_raises():
 
     assert torch.num_threads == 8
     assert torch.transitions == [1, 8]
+    assert os.environ["OMP_NUM_THREADS"] == "4"
+    assert "MKL_NUM_THREADS" not in os.environ

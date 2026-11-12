@@ -24,6 +24,9 @@ FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
 # an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
@@ -120,6 +123,9 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # embed.prefill also holds the accept-layer hidden state at multimodal
+    # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
+    prefill_holds_accept_hidden: bool
     omni_final_stage_id: int
     # Per-request audio seed. Stages that draw their own noise (flow-matching
     # / diffusion decoders) need the producing stage's seed to stay
@@ -243,6 +249,7 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
@@ -256,6 +263,9 @@ class MetaStruct(_StructBase):
     # derives one segment's n_k as the increase between consecutive segment
     # boundaries; the value itself is not segment-local.
     request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -488,3 +498,18 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

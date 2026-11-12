@@ -24,7 +24,7 @@ class _Request:
         return self.finished
 
 
-def _manager():
+def _manager(**extra):
     return SimpleNamespace(
         request_payload={},
         code_prompt_token_ids=defaultdict(list),
@@ -35,6 +35,7 @@ def _manager():
                     "initial_latent_chunk_size": 2,
                     "latent_chunk_size": 3,
                     "latent_left_context": 0,
+                    **extra,
                 }
             }
         ),
@@ -68,6 +69,24 @@ def test_async_transport_emits_initial_regular_and_final_chunks_once():
     assert final.latent.shape == (1, 1, 64)
     assert bool(final.meta.finished)
     assert llm2audio_vae_async_chunk(manager, None, request) is None
+
+
+def test_async_transport_ramps_chunks_up_to_the_regular_size():
+    manager = _manager(initial_latent_chunk_size=1, latent_chunk_size=5, latent_chunk_ramp=True)
+    request = _Request()
+
+    sizes = []
+    for step in range(20):
+        chunk = llm2audio_vae_async_chunk(manager, _step(step), request)
+        if chunk is not None:
+            sizes.append(chunk.latent.shape[0])
+    request.finished = True
+    final = llm2audio_vae_async_chunk(manager, None, request)
+
+    # 1 -> 2 -> 4 -> capped at 5, then the remainder on finish.
+    assert sizes == [1, 2, 4, 5, 5]
+    assert final.latent.shape[0] == 3
+    assert bool(final.meta.finished)
 
 
 def test_async_transport_keeps_interleaved_requests_isolated():
