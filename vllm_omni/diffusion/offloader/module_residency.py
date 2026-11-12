@@ -14,6 +14,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import npu_int8_weight_nz as weight_nz
 
 from .tensor_utils import is_dtensor, set_tensor_storage
 
@@ -132,8 +133,28 @@ class PinnedModuleStager:
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
         self.loaded = False
-        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
+        self._nz_mode = weight_nz.get_weight_nz_mode()
+        self._nz_masters: dict[torch.Tensor, torch.Tensor] = {}
+        self._nz_host_weights: dict[torch.Tensor, torch.Tensor] = {}
+        if self._nz_mode is not None:
+            for item in modules:
+                for name in weight_nz.int8_weight_names(item):
+                    target = item.get_parameter(name)
+                    with torch.inference_mode(self._local_tensor(target).is_inference()):
+                        master = self._local_tensor(target).detach().cpu()
+                        host_weight = weight_nz.pack_nz_weight(master) if self._nz_mode == "reactor" else master
+                        if pin_memory and not host_weight.is_pinned():
+                            host_weight = host_weight.pin_memory()
+                    self._nz_masters[target] = master if self._nz_mode == "reactor" else host_weight
+                    self._nz_host_weights[target] = host_weight
+            if self._nz_masters and self._nz_mode == "reactor":
+                weight_nz.check_reactor_support()
+        self._groups = self._snapshot_groups(
+            modules, pin_memory=pin_memory, excluded_parameter_ids={id(target) for target in self._nz_masters}
+        )
         self._device_storages: list[torch.Tensor] = []
+        self._nz_device_weights: list[torch.Tensor] = []
+        self._nz_device_buffers: list[torch.Tensor] = []
         self._restore_masters()
 
     @staticmethod
@@ -146,11 +167,12 @@ class PinnedModuleStager:
         modules: tuple[nn.Module, ...],
         *,
         pin_memory: bool,
+        excluded_parameter_ids: set[int] | frozenset[int] = frozenset(),
     ) -> list[_StorageGroup]:
         targets: list[torch.Tensor] = []
         seen_targets: set[int] = set()
         for target in chain.from_iterable(chain(item.parameters(), item.buffers()) for item in modules):
-            if id(target) not in seen_targets:
+            if id(target) not in seen_targets and id(target) not in excluded_parameter_ids:
                 seen_targets.add(id(target))
                 targets.append(target)
 
@@ -217,6 +239,14 @@ class PinnedModuleStager:
 
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
+        for target, master in self._nz_masters.items():
+            with torch.inference_mode(self._local_tensor(target).is_inference()):
+                set_tensor_storage(target, master)
+
+    def _bind_nz_weights(self) -> None:
+        for target, weight in zip(self._nz_masters, self._nz_device_weights, strict=True):
+            with torch.inference_mode(self._local_tensor(target).is_inference()):
+                set_tensor_storage(target, weight)
 
     def set_cache_retention(self, cache_retention: BoundedAllocatorCache | None) -> None:
         self.cache_retention = cache_retention
@@ -234,9 +264,20 @@ class PinnedModuleStager:
         with current_omni_platform.stream(self.copy_stream):
             for device_storage, group in zip(device_storages, self._groups):
                 device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
+            for target, master in self._nz_masters.items():
+                with torch.inference_mode(self._local_tensor(target).is_inference()):
+                    host_weight = self._nz_host_weights[target]
+                    buffer = host_weight.to(self.device, non_blocking=host_weight.is_pinned())
+                    if self._nz_mode == "reactor":
+                        self._nz_device_buffers.append(buffer)
+                        weight = weight_nz.nz_view(buffer, 0, master.shape)
+                    else:
+                        weight = weight_nz.cast_weight_to_nz(buffer)
+                    self._nz_device_weights.append(weight)
             self._ready_event.record(self.copy_stream)
 
         self._bind(device_storages)
+        self._bind_nz_weights()
         compute_stream.wait_event(self._ready_event)
         self._device_storages = device_storages
         self.loaded = True
@@ -248,16 +289,19 @@ class PinnedModuleStager:
             logger.debug("Device synchronization failed while cleaning up module staging", exc_info=True)
         self._restore_masters()
         self._device_storages.clear()
+        self._nz_device_weights.clear()
+        self._nz_device_buffers.clear()
         self.loaded = False
         self._release_cache(force=True)
 
     def load(self) -> None:
         if self.loaded:
             return
-        if self._device_storages:
+        if self._device_storages or self._nz_device_weights:
             # Storage retained from a previous load still holds the immutable
             # weights; rebinding suffices, no H2D copy repeats.
             self._bind(self._device_storages)
+            self._bind_nz_weights()
             self.loaded = True
             return
         try:
@@ -286,11 +330,15 @@ class PinnedModuleStager:
             self._restore_masters()
         except BaseException:
             self._device_storages.clear()
+            self._nz_device_weights.clear()
+            self._nz_device_buffers.clear()
             self.loaded = False
             self._release_cache(force=True)
             raise
         if not self.retain_device_storage:
             self._device_storages.clear()
+            self._nz_device_weights.clear()
+            self._nz_device_buffers.clear()
         self.loaded = False
         self._release_cache()
 

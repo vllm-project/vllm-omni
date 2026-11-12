@@ -473,6 +473,72 @@ class TestInt8OnlineLinearMethod:
         mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
 
 
+@pytest.mark.parametrize("online", [False, True], ids=["offline", "online"])
+def test_npu_int8_resident_weight_nz(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, online: bool):
+    import vllm_omni.quantization.int8_config as int8_config
+    from vllm_omni.quantization.npu_int8_weight_nz import prepare_resident_weights
+
+    qweight = torch.arange(64 * 32).reshape(64, 32).to(torch.int8)
+    weight_scale = torch.ones(64)
+    npu = mocker.Mock()
+    npu.npu_dynamic_quant.return_value = (qweight, weight_scale)
+    mocker.patch.object(int8_config, "torch_npu", npu)
+    mocker.patch.dict("sys.modules", {"torch_npu": npu})
+    mocker.patch.object(current_omni_platform, "is_npu", return_value=True)
+    method_cls = int8_config.NPUInt8OnlineLinearMethod if online else int8_config.NPUInt8LinearMethod
+    layer = Module()
+    layer.quant_method = method_cls(int8_config.DiffusionInt8Config(is_checkpoint_int8_serialized=not online))
+    layer.weight = Parameter(qweight.to(torch.bfloat16) if online else qweight, requires_grad=False)
+    if not online:
+        layer.weight_scale = Parameter(weight_scale.unsqueeze(1), requires_grad=False)
+    layer.quant_method.process_weights_after_loading(layer)
+    scale = layer.weight_scale
+    unquantized = Module()
+    unquantized.quant_method = UnquantizedLinearMethod()
+    unquantized.weight = Parameter(torch.ones(64, 32, dtype=torch.bfloat16), requires_grad=False)
+    model = torch.nn.Sequential(layer, unquantized)
+
+    formats = {}
+
+    def empty_with_format(shape, *, dtype, device, acl_format):
+        output = torch.empty(shape, dtype=dtype, device="cpu")
+        formats[output.data_ptr()] = acl_format
+        return output
+
+    npu.empty_with_format.side_effect = empty_with_format
+    npu.get_npu_format.side_effect = lambda weight: formats.get(weight.data_ptr(), 2)
+    npu_device = mocker.Mock(type="npu")
+    monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", raising=False)
+    with monkeypatch.context() as npu_tensors:
+        npu_tensors.setattr(torch.Tensor, "device", property(lambda _: npu_device))
+        monkeypatch.delenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ", raising=False)
+        prepare_resident_weights(model, excluded_parameter_ids=frozenset())
+        npu.empty_with_format.assert_not_called()
+        monkeypatch.setenv("VLLM_OMNI_NPU_INT8_WEIGHT_NZ", "1")
+        prepare_resident_weights(model, excluded_parameter_ids=frozenset())
+        prepare_resident_weights(model, excluded_parameter_ids=frozenset())
+
+    npu.empty_with_format.assert_called_once()
+    assert npu.empty_with_format.call_args.kwargs["dtype"] == torch.int8
+    assert npu.get_npu_format(layer.weight) == 29
+    assert npu.get_npu_format(unquantized.weight) == 2
+    assert torch.equal(layer.weight, qweight.t())
+    assert layer.weight_scale is scale
+
+    x = torch.ones(1, 2, 32, dtype=torch.bfloat16)
+    quantized_x, pertoken_scale = torch.ones(2, 32, dtype=torch.int8), torch.ones(2)
+    npu.npu_dynamic_quant.reset_mock()
+    npu.npu_dynamic_quant.return_value = (quantized_x, pertoken_scale)
+    npu.npu_quant_matmul.return_value = torch.zeros(2, 64, dtype=x.dtype)
+    output = layer.quant_method.apply(layer, x)
+    assert npu.npu_dynamic_quant.call_count == 1
+    assert torch.equal(npu.npu_dynamic_quant.call_args.args[0], x.reshape(-1, 32))
+    npu.npu_quant_matmul.assert_called_once_with(
+        quantized_x, layer.weight, scale, bias=None, pertoken_scale=pertoken_scale, output_dtype=x.dtype
+    )
+    assert output.shape == (1, 2, 64)
+
+
 @npu_available
 class TestNPUInt8LinearMethod:
     qweight_mock = torch.randn((128, 64)).to(dtype=torch.int8)

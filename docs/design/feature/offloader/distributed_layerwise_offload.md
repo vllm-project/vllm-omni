@@ -129,6 +129,14 @@ Packing preserves each parameter and buffer's physical layout, including
 strides. Loader-provided transforms may change strides but must preserve dtype
 and shape; invalid transforms raise before the source weights are released.
 
+On NPU, `VLLM_OMNI_NPU_INT8_WEIGHT_NZ=1` optionally changes finalized online
+and offline INT8 linear weights to FRACTAL_NZ. The default `reactor` mode packs
+NZ bytes on CPU, includes their padded size in transport buffers, and binds an
+NZ view after upload and any AllGather. `VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE=cast`
+instead converts after each upload. Both paths leave scales unchanged and
+restore ordinary CPU weights when DLO is disabled. These options do not enable
+DLO; weights outside offload ownership are converted once after placement.
+
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]
 H2D:                      [shard N+1]           [shard N+2]
