@@ -709,6 +709,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",
@@ -1270,6 +1280,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
 
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
+
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
         for stage_index, stage_config in enumerate(stage_configs)
@@ -1522,6 +1535,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)
