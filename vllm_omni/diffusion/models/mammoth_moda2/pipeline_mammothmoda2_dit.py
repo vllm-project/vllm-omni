@@ -322,8 +322,19 @@ def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig | None = N
 
 
 def _validate_sequence_parallel_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> None:
-    if od_config.parallel_config.sequence_parallel_size == 1:
+    parallel = od_config.parallel_config
+    if parallel.sequence_parallel_size == 1:
         return
+    # Reject before weights load what the model would only reject in forward.
+    if (
+        parallel.ulysses_degree != 2
+        or parallel.ring_degree != 1
+        or parallel.allgather_degree != 1
+        or parallel.ulysses_mode != "advanced_uaa"
+    ):
+        raise ValueError(
+            "MammothModa2 SP supports only two-rank Ulysses with ulysses_mode='advanced_uaa' for its uneven heads."
+        )
     if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
         raise ValueError("MammothModa2 sequence parallelism is limited to Preview text-to-image, not Dev.")
     if od_config.step_execution or od_config.max_num_seqs != 1:

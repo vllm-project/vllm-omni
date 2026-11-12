@@ -143,6 +143,21 @@ def test_sp_rejects_unqualified_runtime_modes(field, value, message):
         _validate_sequence_parallel_runtime(config, _build_mammoth_config(config))
 
 
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        DiffusionParallelConfig(ulysses_degree=2),
+        DiffusionParallelConfig(ulysses_degree=4, ulysses_mode="advanced_uaa"),
+        DiffusionParallelConfig(ulysses_degree=2, ring_degree=2, ulysses_mode="advanced_uaa"),
+    ],
+    ids=["strict_mode", "ulysses_4", "ring_2"],
+)
+def test_sp_rejects_unqualified_parallel_config_before_construction(parallel_config):
+    config = replace(_config(2), parallel_config=parallel_config, num_gpus=None)
+    with pytest.raises(ValueError, match="two-rank Ulysses with ulysses_mode='advanced_uaa'"):
+        _validate_sequence_parallel_runtime(config, _build_mammoth_config(config))
+
+
 def test_sp_rejects_dev_without_changing_single_rank_runtime():
     config = _config(2)
     model_config = _build_mammoth_config(config)

@@ -611,6 +611,10 @@ CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
   tests/diffusion/distributed/test_mammothmoda2_ulysses.py
 ```
 
+The E2E smoke above and the full-weight results below are historical: they
+were measured at an earlier commit on this PR's branch,
+`ef3e4fd4985febe35c96f826839868d8e1194a8d`, before later merges from main,
+and were not rerun on the merged code.
 The full-weight qualification used Preview revision
 `ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`, vLLM 0.28.0, Torch 2.13.0+cu130,
 Transformers 5.14.1, Diffusers 0.40.0, Python 3.12.3 and driver 580.159.03.

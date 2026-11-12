@@ -255,7 +255,9 @@ def _worker(rank, port, output_dir, dtype, backend):
                         for call in sp_collectives
                     )
                     assert len(seen_main) == len(seen_attention) == 2
-                    assert len(seen_refiners) == 2
+                    # The model skips the context refiner for empty text.
+                    expected_refiners = len(model.noise_refiner) + (len(model.context_refiner) if text_len else 0)
+                    assert len(seen_refiners) == expected_refiners
                     assert ctx._sp_shard_depth == 0
                     assert ctx._sp_equal_pad_stack == []
                     assert ctx.sp_padding_size == 0 and ctx.sp_original_seq_len is None

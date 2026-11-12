@@ -102,9 +102,11 @@ def _normalize_images_for_save(images: list[Any]) -> list[Any]:
                 tensor = tensor.unsqueeze(0)
             if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
                 tensor = tensor.permute(0, 2, 3, 1)
-            if tensor.ndim != 4:
-                normalized.append(image)
-                continue
+            if tensor.ndim != 4 or tensor.shape[-1] not in (1, 3, 4):
+                raise ValueError(
+                    f"Cannot save tensor output with shape {tuple(image.shape)}; "
+                    "expected CHW/HWC or BCHW/BHWC with 1, 3 or 4 channels."
+                )
             if tensor.min().item() < 0.0:
                 tensor = tensor / 2 + 0.5
             normalized.extend(numpy_to_pil(tensor.clamp(0, 1).numpy()))
