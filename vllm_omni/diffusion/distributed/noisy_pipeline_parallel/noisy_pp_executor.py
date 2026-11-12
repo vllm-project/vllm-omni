@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     Cell,
     CellPlan,
@@ -445,6 +446,9 @@ def run_cell_pipeline(
         if use_ws_act:
             _warmup_activation_p2p(pp, world=spec.topology.world, rank=spec.rank, device=act_device)
         while (ctx.inflight or ctx.pending) and slot < limit:
+            # PP-safe boundary: every rank reaches the same slot tick and joins the
+            # cancellation all_reduce before more P2P / KV work for this slot.
+            check_request_cancellation()
             ctx.admit_pending(slot)
             kv.set_inflight(tuple(ctx.inflight))
             # Prior-history handoffs for requests that start on this global slot must

@@ -363,11 +363,20 @@ owns distributed collectives through a shared TCP rendezvous. Global ranks
 are grouped by host, while each actor uses local device 0.
 
 Request batches, step execution, and DLO DP waves use actor RPCs with
-rank-aware replies. Returned tensors move to CPU before Ray serialization;
-this backend does not use the multiproc async output pumps. Driver inference
+rank-aware replies. Returned tensors move to CPU before Ray serialization.
+Final request-mode outputs stay on the synchronous RPC path (no multiproc
+`COMPUTE_DONE` / `OUTPUT_READY` pumps). When `streaming_output=True` keeps
+Request execution, mid-forward `CHUNK_READY` uses a driver-owned
+`ray.util.queue.Queue`: the reply rank binds the request chunk emitter, puts
+CPU-copied chunks onto the queue, then a barrier sentinel; `collective_rpc`
+waits until the pump has delivered every prior chunk before returning the
+execute result to the Engine. Cooperative cancellation uses a `cancel`
+concurrency group that updates per-worker local flags (not POSIX shared
+memory), so multi-node abort does not depend on SHM names. Driver inference
 settings and explicit stage `runtime.env` are forwarded, excluding worker
-identity and device assignment. See [Stage configuration](../../../configuration/stage_configs.md)
-for cluster setup and environment details.
+identity and device assignment. See
+[Stage configuration](../../../configuration/stage_configs.md) for cluster
+setup and environment details.
 
 ## Worker and runner boundary
 

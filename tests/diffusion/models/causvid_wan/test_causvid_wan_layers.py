@@ -244,7 +244,7 @@ def test_cell_schedule_default_derives_from_topology(stages, expected_ordering):
 
 
 @pytest.mark.parametrize(("layer_groups", "expect_reject"), [(1, False), (2, True)])
-def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
+def test_causvid_s1_chunk_decode_single_rank_only(layer_groups, expect_reject):
     """S=1 keeps local streaming on a single rank (G=1); G>1 has no VAE on the finish rank."""
     pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
     req = OmniDiffusionRequest(
@@ -255,7 +255,7 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
                 "cell_schedule": "self_forcing",
                 "num_denoise_steps": 3,
                 "num_chunks": 2,
-                "stream_decode": True,
+                "async_chunk_decode": True,
             }
         ),
     )
@@ -425,3 +425,27 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     )
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("async_decode", [False, True])
+def test_async_chunk_decode_automatically_enabled_for_streaming(streaming, async_decode):
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=1)
+    pipeline.od_config = SimpleNamespace(streaming_output=streaming)
+    assert pipeline._use_async_chunk_decode({"async_chunk_decode": async_decode}) is (streaming or async_decode)
+
+
+@pytest.mark.parametrize("layer_groups", [1, 2])
+def test_streaming_uses_async_decode_topology_validation(layer_groups):
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
+    pipeline.od_config = SimpleNamespace(streaming_output=True)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="auto-stream",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"num_chunks": 2, "num_denoise_steps": 3}),
+    )
+    if layer_groups > 1:
+        with pytest.raises(ValueError, match="no VAE on its finish rank|no sync mid-request decode fallback"):
+            pipeline._plan_for(req)
+    else:
+        pipeline._plan_for(req)

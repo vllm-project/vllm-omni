@@ -76,6 +76,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION, DiffusionModelRegistry
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import request_chunk_emitter
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -418,8 +419,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Model loaded successfully.")
         warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
-        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
-            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+        if self.od_config.streaming_output and not self.od_config.step_execution and self._supports_step_mode():
+            logger.warning("streaming_output=True enables step execution for a step-capable pipeline.")
             self.od_config.step_execution = True
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
@@ -429,12 +430,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 "step_scheduler() or denoise_step_updates_state=True; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if self.od_config.streaming_output and not self._supports_step_mode():
-            raise ValueError(
-                "streaming_output=True requires step execution support; "
-                f"{self.od_config.model_class_name} does not support that contract."
-            )
-
         # The offloader owns loader-plan handoff and startup recovery. The
         # runner only receives the pipeline/backend pair that is ready to use.
         self.pipeline, self.offload_backend = enable_offload_backend(
@@ -963,6 +958,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
                 ),
                 paged_kv_context,
+                request_chunk_emitter(
+                    reqs,
+                    enabled=self.od_config.streaming_output,
+                ),
                 request_cancellation_scope(
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,

@@ -47,7 +47,7 @@ from vllm_omni.diffusion.media import (
     VideoValueRange,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
+from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import start_async_chunk_decode
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.models.causvid_wan.weights import (
@@ -55,6 +55,7 @@ from vllm_omni.diffusion.models.causvid_wan.weights import (
     load_causvid_generator_state,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request_streaming import get_emit_chunk
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
@@ -103,6 +104,8 @@ class CausVidWanPipeline(nn.Module):
     """CausVid Wan on Cell Self-Forcing/Latest-KV (AR-Diffusion + noisy KV)."""
 
     supports_request_batch = True
+    # Engine registers cancellation SHM; cell ticks call check_request_cancellation.
+    supports_request_cancellation: ClassVar[bool] = True
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
     _transformer_cls: ClassVar[type[StageWanTransformer]] = StageWanTransformer
@@ -176,7 +179,7 @@ class CausVidWanPipeline(nn.Module):
         self.max_chunk_tokens = default_tokens
         self._noisy_kv: NoisyKVState | None = None
         self._chunk_ctx: ARDiffusionCellContext | None = None
-        self._stream_decode_group = None
+        self._chunk_decode_group = None
         self._streaming_decoder: WanStreamingDecoder | None = None
         logger.info(
             "CausVidWan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s model=%s causvid_ckpt=%s",
@@ -363,6 +366,12 @@ class CausVidWanPipeline(nn.Module):
         length = int(mask.gt(0).sum().item())
         return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
 
+    def _use_async_chunk_decode(self, extra: dict[str, Any]) -> bool:
+        """Streaming always decodes chunks; non-streaming may opt into overlap."""
+        return bool(getattr(getattr(self, "od_config", None), "streaming_output", False)) or bool(
+            extra.get("async_chunk_decode", False)
+        )
+
     def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
@@ -416,14 +425,17 @@ class CausVidWanPipeline(nn.Module):
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
             denoise = step_replicas - 1
         extra["num_denoise_steps"] = denoise
-        if step_replicas == 1 and self.layer_groups > 1 and bool(extra.get("stream_decode", False)):
-            # S=1 finish rank is G-1, but only pp_rank 0 owns the VAE; with
-            # G>1 the local path would crash non-VAE ranks and there is no
-            # remote source_rank on layer PP. S=1 with G=1 (single rank) is
-            # the valid local streaming decode and stays allowed.
+        async_chunk_decode = self._use_async_chunk_decode(extra)
+        if step_replicas == 1 and self.layer_groups > 1 and async_chunk_decode:
+            # Intentional hard fail (no sync-decode fallback): streaming always
+            # drives async_chunk_decode, finish rank is G-1, and only pp_rank 0
+            # owns the VAE. Layer PP has no remote source_rank path. S=1 with
+            # G=1 (single rank) stays the valid local streaming decode.
             raise ValueError(
-                "stream_decode requires a vertical topology or a single-rank layer PP; "
-                "S=1 with layer_groups>1 has no VAE on its finish rank (omit stream_decode)"
+                "streaming_output / async_chunk_decode require a vertical topology "
+                "or a single-rank layer PP; S=1 with layer_groups>1 has no VAE on "
+                "its finish rank (no sync mid-request decode fallback). Disable "
+                "streaming_output and async_chunk_decode for this topology."
             )
         if sp is not None:
             sp.extra_args = extra
@@ -513,12 +525,12 @@ class CausVidWanPipeline(nn.Module):
                 return None
         return self._streaming_decoder
 
-    def _ensure_stream_decode_group(self, pp_group: Any, source_rank: int) -> Any:
+    def _ensure_chunk_decode_group(self, pp_group: Any, source_rank: int) -> Any:
         owner = pp_group.ranks[0]
         source = pp_group.ranks[source_rank]
-        if self._stream_decode_group is None:
-            self._stream_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
-        return self._stream_decode_group
+        if self._chunk_decode_group is None:
+            self._chunk_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
+        return self._chunk_decode_group
 
     @staticmethod
     def _maybe_timeline(
@@ -621,7 +633,7 @@ class CausVidWanPipeline(nn.Module):
         prompt = self._prompt_text(req.prompt)
         prompt_embeds = self._encode_prompt(prompt, device, dtype)
         sampler = FlowEuler(denoise, shift=shift)
-        stream_decode = bool(extra.get("stream_decode", False))
+        async_chunk_decode = self._use_async_chunk_decode(extra)
         # Rank that finishes the last noisy step (WanCell on_finished).
         # S=1: one layer-PP replica → trailing group G-1.
         # Vertical S∈{D,D+1}: last noisy step replica → D·G-1.
@@ -629,9 +641,9 @@ class CausVidWanPipeline(nn.Module):
             finish_rank = denoise * self.layer_groups - 1
         else:
             finish_rank = self.layer_groups - 1
-        # Remote stream_decode only for vertical; S=1 stays local (_start_local).
+        # Remote async_chunk_decode only for vertical; S=1 stays local (_start_local).
         source_rank = finish_rank if self.step_replicas > 1 else None
-        adapter, stream_job = self._start_stream_decode_and_wan_cell(
+        adapter, stream_job = self._start_chunk_decode_and_wan_cell(
             kv_id=kv_id,
             n_chunks=plan.schedule.chunks,
             latent_shape=shape,
@@ -640,7 +652,7 @@ class CausVidWanPipeline(nn.Module):
             seed=seed,
             prompt_embeds=prompt_embeds,
             sampler=sampler,
-            stream_decode=stream_decode,
+            async_chunk_decode=async_chunk_decode,
             finish_rank=finish_rank,
             source_rank=source_rank,
             pp_rank=pp_rank,
@@ -649,7 +661,7 @@ class CausVidWanPipeline(nn.Module):
         )
         return adapter, kv_id, persist, stream_job
 
-    def _start_stream_decode_and_wan_cell(
+    def _start_chunk_decode_and_wan_cell(
         self,
         *,
         kv_id: str,
@@ -660,25 +672,25 @@ class CausVidWanPipeline(nn.Module):
         seed: int,
         prompt_embeds: torch.Tensor,
         sampler: Any,
-        stream_decode: bool,
+        async_chunk_decode: bool,
         finish_rank: int,
         source_rank: int | None,
         pp_rank: int,
         pp_group: Any,
         timeline_file: Any,
     ) -> tuple[Any, Any | None]:
-        """Start stream_decode (if any) then build WanCell; cancel the job on build failure.
+        """Start async_chunk_decode (if any) then build WanCell; cancel the job on build failure.
 
         Called only after fallible admit setup (encode / residency / enqueue) so those
         failures cannot leak a decode or sender thread.
         """
         stream_job = None
         on_finished = None
-        if stream_decode:
+        if async_chunk_decode:
             stream_group = None
             if source_rank is not None and source_rank != 0 and pp_group is not None:
-                stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
-            stream_job = start_async_stream_decode(
+                stream_group = self._ensure_chunk_decode_group(pp_group, source_rank)
+            stream_job = start_async_chunk_decode(
                 vae=self.vae,
                 decoder=self._get_streaming_decoder(),
                 session_id=kv_id,
@@ -689,6 +701,7 @@ class CausVidWanPipeline(nn.Module):
                 source_rank=source_rank,
                 pp_group=pp_group,
                 stream_group=stream_group,
+                on_chunk=self._request_streaming_chunk_callback(n_chunks),
             )
             on_finished = stream_job.on_finished
         on_finished = self._maybe_timeline(on_finished, timeline_file, finish_rank=finish_rank, pp_rank=pp_rank)
@@ -709,13 +722,47 @@ class CausVidWanPipeline(nn.Module):
             raise
         return adapter, stream_job
 
+    def _request_streaming_chunk_callback(self, n_chunks: int) -> Callable[[int, torch.Tensor], None] | None:
+        """Emit decoded pixels as request chunks when the worker bound an emitter.
+
+        ``async_chunk_decode`` alone still accumulates. Client streaming additionally
+        requires ``streaming_output`` and a bound emitter.
+        """
+        od_config = getattr(self, "od_config", None)
+        if getattr(od_config, "streaming_output", False) is not True:
+            return None
+        emit = get_emit_chunk()
+        if emit is None:
+            return None
+
+        def on_chunk(idx: int, pixels: torch.Tensor, _emit: Callable[[DiffusionOutput], None] = emit) -> None:
+            _emit(
+                DiffusionOutput(
+                    finished=False,
+                    chunk_index=idx,
+                    total_chunks=n_chunks,
+                    output=pixels,
+                )
+            )
+
+        return on_chunk
+
     def emit_cell_output(self, adapter: Any, kv_id: str, stream_job: Any | None = None) -> DiffusionOutput:
         """Decode / gather after Cell plans finished."""
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
         pp_rank, pp_group = resolve_pp_rank_and_group()
         if stream_job is not None:
+            streamed = bool(getattr(stream_job, "streams_to_client", False))
             video = stream_job.join()
+            if streamed:
+                # Chunks were already emitted. Join only waits; do not resend the clip.
+                emitted = int(getattr(stream_job, "emitted_chunks", 0) or 0)
+                return DiffusionOutput(
+                    finished=True,
+                    chunk_index=max(emitted - 1, 0),
+                    total_chunks=emitted,
+                )
             if video is not None:
                 return self._video_output(video)
             return self._placeholder_output(device, dtype)
