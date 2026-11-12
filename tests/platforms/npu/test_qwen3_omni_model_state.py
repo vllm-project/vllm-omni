@@ -75,33 +75,17 @@ def test_npu_v2_initializes_stage_output_cache_after_native_kv(monkeypatch, prof
     assert calls == ["native", "omni"]
 
 
-@pytest.mark.parametrize("stage", ["llm", "tts"])
-@pytest.mark.parametrize("npu", [False, True])
-def test_minicpmo_factory_returns_npu_state_only_on_npu(monkeypatch, stage, npu):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-    from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
+@pytest.mark.parametrize("device_type", ["npu", "cpu"])
+def test_minicpmo_dispatches_via_lifecycle_flags(monkeypatch, device_type):
+    """MiniCPM-o rides the shared lifecycle-flag dispatch from #10062.
 
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: npu)
-    init = Mock(return_value=None)
-    monkeypatch.setattr(OmniModelState, "__init__", init)
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = stage
-    config, cache = object(), object()
-    device = torch.device("cpu")
-    state = init_omni_model_state(config, model, cache, device)
-    assert type(state) is (NPUOmniModelState if npu else OmniModelState)
-    init.assert_called_once_with(config, model, cache, device)
-
-
-def test_minicpmo_without_factory_dispatches_via_lifecycle_flags(monkeypatch):
-    """Lock in the shared dispatch as the fallback for MiniCPM-o.
-
-    With the factory hook removed, ``init_omni_model_state`` must still hand
-    back the Ascend-backed state on an NPU device via the lifecycle-flag
-    branch (MiniCPM-o sets ``have_multimodal_outputs``), matching what was
-    verified end-to-end on a 910B1 at this PR's head.
+    The model declares ``have_multimodal_outputs`` and ships no
+    ``create_omni_model_state`` factory, so ``init_omni_model_state`` picks
+    the state class from the device: the Ascend-backed NPU state on NPU,
+    the generic Omni state elsewhere. This is the production path (verified
+    end-to-end on a 910B1: three-stage serving starts and answers requests)
+    and the test keys off the signal the dispatch actually reads
+    (``device.type``).
     """
     from types import SimpleNamespace
 
@@ -110,15 +94,19 @@ def test_minicpmo_without_factory_dispatches_via_lifecycle_flags(monkeypatch):
     )
     from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
 
-    monkeypatch.delattr(MiniCPMO45OmniForConditionalGeneration, "create_omni_model_state")
+    # Single dispatch path by design: the factory hook was dropped in favour
+    # of the shared lifecycle-flag branch, and it must not silently return.
+    assert not hasattr(MiniCPMO45OmniForConditionalGeneration, "create_omni_model_state")
+
     init = Mock(return_value=None)
-    monkeypatch.setattr(NPUOmniModelState, "__init__", init)
+    monkeypatch.setattr(OmniModelState, "__init__", init)
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.have_multimodal_outputs = True
     config, cache = object(), object()
-    # The dispatch only reads ``device.type``; a fake NPU device keeps the
-    # test runnable where torch has no npu backend registered.
-    device = SimpleNamespace(type="npu")
+    # The dispatch reads only ``device.type``; a fake device keeps the test
+    # runnable where torch has no npu backend registered.
+    device = SimpleNamespace(type=device_type)
     state = init_omni_model_state(config, model, cache, device)
-    assert type(state) is NPUOmniModelState
+    expected = NPUOmniModelState if device_type == "npu" else OmniModelState
+    assert type(state) is expected
     init.assert_called_once_with(config, model, cache, device)

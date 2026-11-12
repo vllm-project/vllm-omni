@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -48,12 +48,6 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
-
-    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-
 
 logger = init_logger(__name__)
 
@@ -330,24 +324,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # processor is CPU preprocessing, so keep its tensors on the CPU.
             with torch.device("cpu"):
                 self._duplex_data_plane_helper()
-
-    def create_omni_model_state(
-        self, vllm_config: VllmConfig, encoder_cache: "EncoderCache | None", device: torch.device
-    ) -> "OmniModelState":
-        """Pick the MRv2 model state for this stage.
-
-        On NPU the runner requires a state that builds Ascend attention
-        metadata (``uses_ascend_attn_metadata``); the generic OmniModelState
-        only produces CUDA metadata, so return the shared Ascend-backed NPU
-        state that Qwen3-Omni uses as well.
-        """
-        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-
-        if current_omni_platform.is_npu():
-            from vllm_omni.platforms.npu.models.omni_model_state import NPUOmniModelState
-
-            return NPUOmniModelState(vllm_config, self, encoder_cache, device)
-        return OmniModelState(vllm_config, self, encoder_cache, device)
 
     @cached_property
     def sampler(self):
