@@ -184,6 +184,31 @@ If an output builder or device event never completes, graceful shutdown can
 still block; a supervisor must forcibly terminate an unresponsive process.
 `shutdown(wait=False)` would not remove the interpreter's join requirement.
 
+### MRv2 native output ownership
+
+Both `NativeOutputWorker` and the runner's inline finalizer used by multi-rank
+executors call `OmniRunnerDataPlane.publish_output()` to publish materialized
+inter-stage payloads. The data plane owns enqueueing and alias cleanup. After
+enqueueing succeeds, it clears `pooler_output` only when a native send path
+exists and that field aliases the same inter-stage payload list. Otherwise,
+the scheduler would serialize those tensors again alongside text output.
+Independent pooling results, client-facing `multimodal_outputs`, and inline
+payloads for stages without a native send path remain available. Terminal
+ordering and payload delivery stay owned by the native data plane.
+
+`OmniAsyncOutput.get_output()` assigns the same list to `pooler_output` and
+`inter_stage_outputs` in both full-payload branches, including model-owned
+snapshots. Producer tests protect this identity contract. Async-chunk output
+already leaves `pooler_output` empty. Publication does not compare tensor
+contents or discard separately constructed pooling lists.
+
+Enqueueing transfers a reference to `_NativeOutputBatch`; it does not wait for
+downstream delivery. Clearing a field on the returned model output neither
+clears the queued list nor its per-request entries. The queue retains those
+objects until the output worker consumes them, including batches with absent
+payloads for some requests. Delivery completion and terminal cleanup retain
+their existing ordering; publication adds no synchronous delivery wait.
+
 ### Safe State Snapshots
 
 The next scheduler step can mutate runner state while the background builder is
@@ -205,6 +230,9 @@ CUDA sources until the transfer event completes.
 Small lists of multiple compatible CUDA tensors are packed for one snapshot
 copy. A singleton list or tuple uses the ordinary tensor clone/copy path,
 preserving the container without an unnecessary pack and unpack.
+Equal-shaped rows are restored with one batch view and unbind, avoiding
+per-request slice/view dispatches. Ragged rows retain their individual shapes;
+both paths expose views of the owned CPU snapshot after its copy event.
 
 MiniCPM-o 4.5's Talker opts out of hidden-state payloads: Code2Wav consumes
 codec codes and metadata only. Its hidden states remain available for logits

@@ -949,48 +949,23 @@ def test_mux_closes_container_and_preserves_generator_error(monkeypatch):
     assert container.closed
 
 
-def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
-    muxers = []
-
-    class FakeFragmentedMP4Muxer:
-        def __init__(self, *, width, height, fps, video_codec_options=None):
-            self.calls = []
-            muxers.append(
-                {
-                    "width": width,
-                    "height": height,
-                    "fps": fps,
-                    "video_codec_options": video_codec_options,
-                    "instance": self,
-                }
-            )
-
-        def mux_video_frames(self, frames):
-            self.calls.append(frames)
-            return f"fragment-{len(self.calls)}".encode()
-
-        def close(self):
-            return b"trailer"
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.FragmentedMP4Muxer",
-        FakeFragmentedMP4Muxer,
-    )
-
+def test_fragmented_mp4_video_encoder_reuses_single_muxer():
     encoder = video_api_utils.FragmentedMP4VideoEncoder(
         fps=12,
         video_codec_options={"preset": "ultrafast"},
     )
-    assert encoder.encode([np.zeros((4, 6, 3), dtype=np.float32)]) == b"fragment-1"
-    assert encoder.encode([np.ones((4, 6, 3), dtype=np.float32)]) == b"fragment-2"
-    assert encoder.close() == b"trailer"
-
-    assert len(muxers) == 1
-    assert muxers[0]["width"] == 6
-    assert muxers[0]["height"] == 4
-    assert muxers[0]["fps"] == 12.0
-    assert muxers[0]["video_codec_options"] == {"preset": "ultrafast"}
-    assert len(muxers[0]["instance"].calls) == 2
+    streamed = encoder.encode([np.zeros((4, 6, 3), dtype=np.float32)])
+    muxer = encoder._muxer
+    streamed += encoder.encode([np.ones((4, 6, 3), dtype=np.float32)])
+    assert encoder._muxer is muxer
+    streamed += encoder.close()
+    with av.open(BytesIO(streamed)) as container:
+        stream = container.streams.video[0]
+        assert (stream.width, stream.height) == (6, 4)
+        assert float(stream.average_rate) == 12.0
+        decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(decoded) == 2
+    assert decoded[0].mean() < decoded[1].mean()
 
 
 def test_create_streaming_video_encoder_selects_requested_format():

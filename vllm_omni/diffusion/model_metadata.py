@@ -34,6 +34,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
     # video path plus text prompts and returns a ``video_segmentation`` payload.
     supports_video_segmentation: bool = False
+    # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
+    # and returns a ``video_depth`` payload of per-frame depth maps.
+    supports_video_depth: bool = False
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -52,9 +55,12 @@ HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -62,6 +68,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_segmentation=True,
         supports_video_segmentation=True,
     ),
+    "VideoDepthAnythingPipeline": DiffusionModelMetadata(supports_video_depth=True),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
@@ -120,6 +127,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
+        final_output_type="image",
+        attention_mask_free=True,
+    ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
     "TaoMateH3Pipeline": DiffusionModelMetadata(
@@ -144,6 +160,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "Flux3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX3_MAX_INPUT_IMAGES,
+        final_output_type="image",
+    ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
@@ -166,6 +187,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    # One pipeline serves text-to-video and, with a first frame, image-to-video.
+    "PAN2ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),

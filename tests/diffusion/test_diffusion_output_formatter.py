@@ -463,7 +463,7 @@ def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
     assert result.finished is False
 
 
-@pytest.mark.parametrize("key", ["segmentation", "video_segmentation"])
+@pytest.mark.parametrize("key", ["segmentation", "video_segmentation", "video_depth"])
 def test_formatter_routes_segmentation_payload_to_multimodal_output(
     monkeypatch: pytest.MonkeyPatch,
     key: str,
