@@ -39,6 +39,10 @@ IMAGE_SHAPE = (1, LATENT_H, LATENT_W)  # 1 * 2 * 3 = 6 rows
 VIDEO_SHAPE = (2, LATENT_H, LATENT_W)  # 2 * 2 * 3 = 12 rows
 BASE_IMAGE_ROWS = 6
 NUM_FRAMES = 22
+# 107 = 17n+5 frame grid; 107/24s ~ 4.46s clears the 4s minimum output the
+# real request path validates (tests below that never pass through it use
+# NUM_FRAMES to keep the toy layouts small).
+REQUEST_PATH_NUM_FRAMES = 107
 SIGMAS_VIDEO = [1.0, 0.6, 0.3, 0.0]
 SIGMAS_AUDIO = [1.0, 0.5, 0.25, 0.0]
 
@@ -144,7 +148,9 @@ def test_switch_moves_target_rows_and_re_pins_anchor():
 def test_switch_rejects_target_row_count_mismatch():
     full, base = _full_branch(), _base_branch()
     short_update = full.update_mask_dev.clone()
-    short_update[0] = False
+    # ref2va packs condition rows before targets, so index 0 is already False
+    # and clearing it would not change the count; drop a trailing target row.
+    short_update[-1] = False
     with pytest.raises(ValueError, match="target row count"):
         minimax_h3_switch_denoise_branch(
             base=base,
@@ -214,7 +220,13 @@ def test_keep_steps_builds_matching_base_layout(pipeline):
     assert inputs["keep_steps"] == 2
     assert int(base.update_mask.sum()) == int(branch.update_mask.sum())
     assert int(base.audio_pos.shape[0]) == int(branch.audio_pos.shape[0])
-    assert base.seq_len < branch.seq_len
+    # Both toy layouts round up to the same 64-row alignment bucket, so the
+    # padded seq_len cannot witness the dropped silent video reference; the
+    # real document length and the img-row count can.
+    assert base.used_len < branch.used_len
+    assert int(branch.img_pos.shape[0]) - int(base.img_pos.shape[0]) == (
+        VIDEO_SHAPE[0] * (VIDEO_SHAPE[1] // 2) * (VIDEO_SHAPE[2] // 2)
+    )
     assert tuple(inputs["base_cond_rows"].shape) == (BASE_IMAGE_ROWS, 96)
     # The base layout's non-update image rows are exactly the image condition
     # rows: audio references and guides are rejected, so the anchor prefix
@@ -251,7 +263,13 @@ def test_base_cond_rows_equal_image_only_anchor(pipeline):
         ({"guide_blocks": [{"kind": "image", "frame_index": 0, "latent_h": 4, "latent_w": 6}]}, "timeline guides"),
         ({"base_text_embeddings": None}, "requires base text conditioning"),
         ({"base_text_tags": None}, "requires base text conditioning"),
-        ({"ref_blocks": [_ref_blocks()[0]], "visual_condition_shapes": [IMAGE_SHAPE]}, "silent video reference"),
+        # The shapes keep describing both retained condition rows, so the
+        # noise-aug row check passes and the keep_steps guard is what rejects
+        # the missing video reference.
+        (
+            {"ref_blocks": [_ref_blocks()[0]], "visual_condition_shapes": [IMAGE_SHAPE, VIDEO_SHAPE]},
+            "silent video reference",
+        ),
         # The packer requires images before the video block; the encoder and
         # the API layer normalize upload order into exactly this order.
         (
@@ -282,12 +300,17 @@ def _run_loop(
     sigmas=None,
     audio_sigmas=None,
     on_step=None,
+    initial_audio_rows=None,
 ):
     return minimax_h3_denoise_loop(
         model=model,
         positive=positive,
         initial_video_rows=initial_rows,
-        initial_audio_rows=torch.zeros(positive.audio_pos.shape[0], 32),
+        initial_audio_rows=(
+            torch.zeros(positive.audio_pos.shape[0], 32)
+            if initial_audio_rows is None
+            else initial_audio_rows
+        ),
         keyframe_cond_rows=keyframe,
         sigmas_video=SIGMAS_VIDEO if sigmas is None else sigmas,
         sigmas_audio=SIGMAS_AUDIO if audio_sigmas is None else audio_sigmas,
@@ -349,6 +372,9 @@ def test_keep_steps_loop_decomposes_bit_exact():
         positive=base,
         keyframe=manual_anchor,
         initial_rows=manual_rows,
+        # The switch only moves video rows; the manual tail must carry the
+        # prefix run's audio state, exactly as the in-loop switch does.
+        initial_audio_rows=prefix_audio,
         sigmas=SIGMAS_VIDEO[2:],
         audio_sigmas=SIGMAS_AUDIO[2:],
     )
@@ -650,9 +676,13 @@ def _local_pipeline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(pipeline, "_encode_local_media", lambda media: media_conditioning)
     monkeypatch.setattr(pipeline_minimax_h3, "prepare_encoder_inputs", lambda *args, **kwargs: prepared)
     monkeypatch.setattr(pipeline_minimax_h3, "resolve_continuation", lambda extra_args, **kwargs: None)
+    # The conditioning contract validates the real 5120-wide Qwen3-VL hidden
+    # size (MiniMaxH3TextConditioning.from_payload), so the mocks must produce
+    # it: narrower tensors would trip that validation instead of exercising
+    # the behaviour under test.
     encoded = [
-        (torch.ones(2, 4, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)),
-        (torch.full((3, 4), 2.0, dtype=torch.bfloat16), torch.ones(3, dtype=torch.long)),
+        (torch.ones(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)),
+        (torch.full((3, 5120), 2.0, dtype=torch.bfloat16), torch.ones(3, dtype=torch.long)),
     ]
     encode_prompt = Mock(side_effect=encoded)
     monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
@@ -881,7 +911,7 @@ def test_request_path_normalizes_video_first_references(monkeypatch: pytest.Monk
             num_inference_steps=4,
             height=64,
             width=64,
-            num_frames=NUM_FRAMES,
+            num_frames=REQUEST_PATH_NUM_FRAMES,
             extra_args={"task": "ref2va"},
         ),
         task="ref2va",
