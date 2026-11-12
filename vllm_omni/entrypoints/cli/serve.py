@@ -1280,6 +1280,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
 
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
+
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
         for stage_index, stage_config in enumerate(stage_configs)
@@ -1532,6 +1535,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)
