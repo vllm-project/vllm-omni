@@ -51,6 +51,7 @@ class RealtimeInputDefaults:
 
     input_audio_format: str = "pcm16"
     input_sample_rate_hz: int = 16000
+    input_sample_rate_declared: bool = False
     output_audio_format: str = "pcm16"
     output_sample_rate_hz: int | None = None
     overlap_silence_rms: float = 0.003
@@ -111,6 +112,10 @@ def apply_realtime_session_defaults(
         sample_rate = input_rate
     if isinstance(sample_rate, int | float) and sample_rate > 0:
         updates["input_sample_rate_hz"] = int(sample_rate)
+        # Remember that this rate came from the wire (directly or through a
+        # format object) rather than from the 16000 Hz default, and keep it
+        # declared when a later update inherits it.
+        updates["input_sample_rate_declared"] = True
     if isinstance(output_rate, int | float) and output_rate > 0:
         updates["output_sample_rate_hz"] = int(output_rate)
     overlap_fields = realtime_overlap_fields(session_payload)
