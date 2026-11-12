@@ -192,6 +192,7 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .reference_isolation import reference_isolation_enabled
 from .regenerate import (
     REGENERATE_DEFAULT_UPSCALE,
     REGENERATE_SUPPORTED_TASKS,
@@ -3377,6 +3378,10 @@ class MiniMaxH3Pipeline(
         attention_schedule = require_request_attention_schedule_fits(
             sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
         )
+        if attention_schedule and reference_isolation_enabled(self.od_config):
+            raise InvalidAttentionScheduleError(
+                "--kv-isolate requires a fixed attention backend; send attention_schedule=[]"
+            )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
