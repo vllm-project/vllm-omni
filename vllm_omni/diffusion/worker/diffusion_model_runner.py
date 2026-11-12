@@ -1590,7 +1590,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     noise_pred = execute_member_batch(
                         execution_batch,
                         lambda members: pipeline.denoise_step(input_batch, states=states),
-                        lambda members, result: members.split_rows(result),
+                        lambda _members, _result: None,
                     )
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:

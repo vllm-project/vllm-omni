@@ -532,6 +532,19 @@ class NoisyKVCache:
         self._retained_history: dict[str, set[Cell]] = {}
         self._active_states: dict[str, NoisyKVState] = {}
 
+    def release_session(self, session_id: str) -> None:
+        """Finish any active invocation, then release one session's history.
+
+        The cache owns the active-state registry; callers should not inspect it
+        or construct a temporary state merely to release a session.
+        """
+        state = self._active_states.get(session_id)
+        if state is None:
+            state = NoisyKVState(self)
+        else:
+            state.finish_request(session_id)
+        state.release_session(session_id)
+
     def bind_session_structure(self, kv_id: str, key: tuple[object, ...]) -> None:
         """Record or check the schedule fingerprint for a persistent session pool key."""
         existing = self._session_structural_keys.get(kv_id)

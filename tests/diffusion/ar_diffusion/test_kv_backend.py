@@ -290,3 +290,16 @@ def test_noisy_eviction_obeys_computation_consumer_and_history_gates():
     assert cache.pool.has(key)
     NoisyKVState(cache).release_history("owner")
     assert not cache.pool.has(key)
+
+
+def test_noisy_cache_release_session_owns_active_state_cleanup():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    state.begin_request("session", plan, chunk_tokens=4)
+    cell = next(plan_cell for plan_cell in (plan.task(0, 0),) if plan_cell is not None)
+    # A real prepared allocation makes the public cache operation observable.
+    state.prepare((("session", cell),))
+    cache.release_session("session")
+    assert "session" not in cache._active_states
+    assert not any(key[0] == "session" for key in cache.pool.keys)

@@ -512,15 +512,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return binding.owner, binding.persist, binding.reset, binding.close
 
     def release_noisy_kv(self, kv_id: str) -> None:
-        """Drop retained Noisy PP versions for ``kv_id`` (outer session reset/close)."""
+        """Drop retained Noisy PP versions for ``kv_id`` via the cache owner."""
         if self.noisy_kv_cache is None:
             return
-        # The active invocation owns temporary metadata; never fabricate a
-        # second owner to release its in-flight KV. Worker calls are serialized,
-        # so this is reached after compute returned or raised.
-        lifecycle = self.noisy_kv_cache._active_states.get(kv_id) or NoisyKVState(self.noisy_kv_cache)
-        lifecycle.finish_request(kv_id)
-        lifecycle.release_history(kv_id)
+        self.noisy_kv_cache.release_session(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
     def _bound_noisy_kv(self) -> AbstractContextManager[None]:
