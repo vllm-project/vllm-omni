@@ -59,9 +59,10 @@ SHARD_ID = "--shard-id=$$BUILDKITE_PARALLEL_JOB"
 def _skip_timing_download(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "1")
     monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
-    # A shard job exports this for its own pytest. Tests that call the plugin
-    # hook, or chdir, must not inherit that relative list.
+    # A shard job exports these for its own pytest. Tests that call the plugin
+    # hook, or chdir, must not inherit that relative list or the agent queue.
     monkeypatch.delenv("VLLM_OMNI_FILE_SHARD_LIST", raising=False)
+    monkeypatch.delenv("BUILDKITE_AGENT_META_DATA_QUEUE", raising=False)
     monkeypatch.delenv("BUILDKITE_API_TOKEN", raising=False)
     monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
     upload_pipeline_mod._shard_timings_prepared = False
