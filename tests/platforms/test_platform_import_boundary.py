@@ -72,9 +72,17 @@ ACCEPTED_REGISTRY_MODULES: frozenset[str] = frozenset({"vllm_omni.diffusion.atte
 # Rule A debt: (neutral module, concrete platform module it imports) -> RFC #6691 item.
 NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     (
+        "vllm_omni.core.sched.omni_ar_scheduler",
+        "vllm_omni.platforms.npu.worker.talker_multiframe",
+    ): "Not covered by an RFC #6691 group (new in #9733): the CUDA scheduler and runners call the Talker K-step frame loop in platforms/npu/worker; its owner is for the platform maintainers to decide",
+    (
         "vllm_omni.diffusion.attention.backends.flash_attn",
         "vllm_omni.platforms.npu.quant.kv_quant_npu",
     ): "NPU group 2: move kv_quant_npu (fused attention, not checkpoint quantization) to the NPU attention backend owner",
+    (
+        "vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit",
+        "vllm_omni.platforms.npu.models.cosyvoice3_graph",
+    ): "NPU group 1 (new module from #9619): move the CosyVoice3 NPUGraph capture next to its CosyVoice3 consumers",
     (
         "vllm_omni.distributed.omni_connectors",
         "vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector",
@@ -88,6 +96,14 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "vllm_omni.platforms.npu.omni_connectors",
     ): "NPU group 3 / rollout step 9: the connector factory should resolve the consumer-owned module",
     (
+        "vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm",
+        "vllm_omni.platforms.npu.models.cosyvoice3_graph",
+    ): "NPU group 1 (new module from #9619): move the CosyVoice3 NPUGraph capture next to its CosyVoice3 consumers",
+    (
+        "vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav",
+        "vllm_omni.platforms.npu.models.cosyvoice3_graph",
+    ): "NPU group 1 (new module from #9619): move the CosyVoice3 NPUGraph capture next to its CosyVoice3 consumers",
+    (
         "vllm_omni.model_executor.models.fish_omni.fish_omni_model",
         "vllm_omni.platforms.npu.models.fish_omni",
     ): "NPU group 1 (new consumer from #9106): move the Drama 3 NPU eager QK-RoPE install next to the fish_omni consumer package",
@@ -99,6 +115,10 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "vllm_omni.model_executor.models.fish_omni.quantization",
         "vllm_omni.platforms.npu.quant.fish_omni",
     ): "Quant-provider follow-up (RFC step 9; new module from #9106): the Drama 3 NPU quant method belongs with the quantization provider work, not platforms/npu/quant",
+    (
+        "vllm_omni.model_executor.models.lfm3_omni.model",
+        "vllm_omni.platforms.npu.graph_tools",
+    ): "NPU group 1 (new consumer from #9827): graph_tools is now shared by MiniCPM-o, LFM3 and MOSS-TTS, so it needs a neutral owner rather than one model package",
     (
         "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav",
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
@@ -118,23 +138,59 @@ NEUTRAL_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     (
         "vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph",
         "vllm_omni.platforms.npu.graph_tools",
-    ): "NPU group 1 (new consumers from #8515): graph_tools is the MiniCPM-o single-consumer graph helper the RFC moves to the MiniCPM-o package",
+    ): "NPU group 1 (new consumers from #8515): graph_tools is now shared by MiniCPM-o, LFM3 and MOSS-TTS, so it needs a neutral owner rather than one model package",
     (
         "vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph",
         "vllm_omni.platforms.npu.graph_tools",
-    ): "NPU group 1 (new consumers from #8515): graph_tools is the MiniCPM-o single-consumer graph helper the RFC moves to the MiniCPM-o package",
+    ): "NPU group 1 (new consumers from #8515): graph_tools is now shared by MiniCPM-o, LFM3 and MOSS-TTS, so it needs a neutral owner rather than one model package",
     (
         "vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec",
         "vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper",
     ): "NPU group 1 (added after the RFC inventory): move the MOSS-TTS NPU graph wrapper to the moss_tts package",
     (
+        "vllm_omni.model_executor.models.moss_tts.reference_encoder",
+        "vllm_omni.platforms.npu.graph_tools",
+    ): "NPU group 1 (new consumer from #9271): graph_tools is now shared by MiniCPM-o, LFM3 and MOSS-TTS, so it needs a neutral owner rather than one model package",
+    (
+        "vllm_omni.model_executor.models.moss_tts.reference_encoder",
+        "vllm_omni.platforms.npu.models.moss_tts_reference_encoder_graphs",
+    ): "NPU group 1 (new module from #9271): move the MOSS-TTS reference-encoder ACLGraph capture to the moss_tts package",
+    (
+        "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni",
+        "vllm_omni.platforms.npu.models.code2wav_graph",
+    ): "NPU group 1 (new module from #9910): move the Qwen3-Omni NPU Code2Wav graph next to the qwen3_omni consumer package",
+    (
+        "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni",
+        "vllm_omni.platforms.npu.models.qwen3_omni_model_state",
+    ): "NPU group 1 (new module from #9910): move the Qwen3-Omni NPU model state next to the qwen3_omni consumer package",
+    (
+        "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav",
+        "vllm_omni.platforms.npu.models.code2wav_graph",
+    ): "NPU group 1 (new module from #9910): move the Qwen3-Omni NPU Code2Wav graph next to the qwen3_omni consumer package",
+    (
         "vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav",
         "vllm_omni.platforms.npu.models.step_audio2_token2wav",
     ): "NPU group 1: move the StepAudio2 token2wav NPU patch body to the StepAudio2 consumer package",
     (
+        "vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker",
+        "vllm_omni.platforms.npu.models.voxcpm2_model_state",
+    ): "NPU group 1 (new module from #9507): move the VoxCPM2 NPU model state next to the voxcpm2 consumer package",
+    (
         "vllm_omni.platforms",
         "vllm_omni.platforms.xpu",
     ): "XPU housekeeping: the detector sets XPUOmniPlatform.dist_backend during detection instead of in the platform's own setup",
+    (
+        "vllm_omni.worker.gpu_ar_model_runner",
+        "vllm_omni.platforms.npu.worker.talker_multiframe",
+    ): "Not covered by an RFC #6691 group (new in #9733): the CUDA scheduler and runners call the Talker K-step frame loop in platforms/npu/worker; its owner is for the platform maintainers to decide",
+    (
+        "vllm_omni.worker.gpu_model_runner",
+        "vllm_omni.platforms.npu.worker.talker_multiframe",
+    ): "Not covered by an RFC #6691 group (new in #9733): the CUDA scheduler and runners call the Talker K-step frame loop in platforms/npu/worker; its owner is for the platform maintainers to decide",
+    (
+        "vllm_omni.worker_v2.model_states",
+        "vllm_omni.platforms.npu.models.omni_model_state",
+    ): "Not covered by an RFC #6691 group (new in #10062): the model-state factory picks NPUOmniModelState by device.type; select it through a platform hook instead",
 }
 
 # Rule B debt: (backend, importing module, eagerly imported implementation module) -> RFC #6691 item.
