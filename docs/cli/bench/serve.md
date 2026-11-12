@@ -89,6 +89,14 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 - `--save-result`
 Specify to save benchmark results to a json file
 
+  Omni results include `benchmark_end_time`, a local ISO 8601 timestamp captured
+  at the end of the timed run, before metric computation and optional accuracy
+  evaluation. Subtract `duration` (seconds) to locate the measured window when
+  aligning device-utilization samples. The legacy `date` records result creation
+  after postprocessing and is not the measurement boundary. Client and sampler
+  clocks and timezones must agree. Older result files without `benchmark_end_time`
+  cannot establish a sampling window from `date` alone.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."

@@ -34,7 +34,9 @@ With ``--tokens-per-audio-s`` (and optionally ``--mean-context``,
 ``--uncached-tokens``, ``--fill-steps``) the script prints the matching
 ``ceiling_report.py`` flags. Peaks are not used here; dtypes default to the
 reference's (checkpoint dtype for decoders, fp32 for Token2wav) and
-``--dtype NAME=DTYPE`` sets the numerics the measured deployment runs.
+``--dtype NAME=DTYPE`` sets the deployment's compute mode and default decoder
+storage dtype (TF32/HF32 use FP32 storage). ``--weight-dtype`` and ``--kv-dtype``
+override decoder storage independently when it differs from computation.
 """
 
 import argparse
@@ -51,6 +53,8 @@ from torch.utils.flop_counter import FlopCounterMode
 GIB = 2**30
 # Keys of measure_peaks.py "matmul_tflops".
 PEAK_DTYPES = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
+STORAGE_DTYPES = {name: dtype for dtype, name in PEAK_DTYPES.items()}
+COMPUTE_STORAGE = {**STORAGE_DTYPES, "tf32": torch.float32, "hf32": torch.float32}
 
 
 def resolve(root: torch.nn.Module, path: str) -> torch.nn.Module:
@@ -92,12 +96,37 @@ def forward_kwargs(module: torch.nn.Module) -> dict:
     return {"logits_to_keep": 1} if "logits_to_keep" in names else {}
 
 
-def count_decoder(model: torch.nn.Module, spec: str, prompt_tokens: int, context: int) -> dict:
+def count_decoder(
+    model: torch.nn.Module,
+    spec: str,
+    prompt_tokens: int,
+    context: int,
+    *,
+    compute_dtype: str | None = None,
+    weight_dtype: str | None = None,
+    kv_dtype: str | None = None,
+) -> dict:
+    """Count decoder work at deployment precision on meta tensors.
+
+    Cast the selected backbone and heads before counting their streamed bytes.
+    KV storage overrides price cache tensor shapes without changing the reference
+    attention implementation. Unknown compute/storage types are rejected.
+    """
     from transformers import DynamicCache
 
+    if compute_dtype is not None and compute_dtype not in COMPUTE_STORAGE:
+        raise SystemExit(f"unsupported decoder compute dtype {compute_dtype!r}; use {sorted(COMPUTE_STORAGE)}")
+    for label, value in (("weight", weight_dtype), ("kv", kv_dtype)):
+        if value is not None and value not in STORAGE_DTYPES:
+            raise SystemExit(f"unsupported {label} storage dtype {value!r}; use {sorted(STORAGE_DTYPES)}")
     backbone_path, *head_paths = spec.split("+")
     backbone = resolve(model, backbone_path)
     heads = [h for path in head_paths for h in head_modules(resolve(model, path))]
+    reference_dtype = next(backbone.parameters()).dtype
+    storage = STORAGE_DTYPES[weight_dtype] if weight_dtype else COMPUTE_STORAGE.get(compute_dtype)
+    if storage is not None:
+        for module in [backbone, *heads]:
+            module.to(dtype=storage)
     hidden = backbone.config.hidden_size
     dtype = next(backbone.parameters()).dtype
     kwargs = forward_kwargs(backbone)
@@ -112,7 +141,12 @@ def count_decoder(model: torch.nn.Module, spec: str, prompt_tokens: int, context
         with FlopCounterMode(display=False) as counter:
             step(torch.empty(1, prompt_tokens, hidden, dtype=dtype), cache)
         prefill = counter.get_total_flops()
-        kv_bytes = sum(t.numel() * t.element_size() for layer in cache.layers for t in (layer.keys, layer.values))
+        kv_element_size = torch.finfo(STORAGE_DTYPES[kv_dtype]).bits // 8 if kv_dtype else None
+        kv_bytes = sum(
+            t.numel() * (kv_element_size or t.element_size())
+            for layer in cache.layers
+            for t in (layer.keys, layer.values)
+        )
         cache = DynamicCache()
         step(torch.empty(1, context, hidden, dtype=dtype), cache)
         with FlopCounterMode(display=False) as counter:
@@ -121,7 +155,10 @@ def count_decoder(model: torch.nn.Module, spec: str, prompt_tokens: int, context
     streamed, total = streamed_bytes([backbone, *heads])
     return {
         "attr": spec,
-        "dtype": PEAK_DTYPES.get(dtype, str(dtype).removeprefix("torch.")),
+        "reference_dtype": PEAK_DTYPES.get(reference_dtype, str(reference_dtype).removeprefix("torch.")),
+        "dtype": compute_dtype or PEAK_DTYPES.get(dtype, str(dtype).removeprefix("torch.")),
+        "weight_dtype": PEAK_DTYPES.get(dtype, str(dtype).removeprefix("torch.")),
+        "kv_dtype": kv_dtype or PEAK_DTYPES.get(dtype, str(dtype).removeprefix("torch.")),
         "param_gib": total / GIB,
         "streamed_gib_per_step": streamed / GIB,
         "prefill_gflop_per_token": prefill / prompt_tokens / 1e9,
@@ -262,7 +299,7 @@ def emit_flags(result: dict, args: argparse.Namespace) -> list[str]:
     flags = []
     for name, d in result["decoders"].items():
         tag = name if d["stage"] is None else f"{name}@{d['stage']}"
-        dtype = dtypes.get(name, d["dtype"])
+        dtype = d["dtype"]
         if name in rates:
             kv_gib = d["kv_bytes_per_token"] * contexts.get(name, d["decode_context"]) / GIB
             flags.append(
@@ -281,7 +318,7 @@ def emit_flags(result: dict, args: argparse.Namespace) -> list[str]:
         k = float(steps)
         flags.append(
             f"--fill-bound {name}_first_{steps}@{gate}={k * d['decode_gflop_per_token'] / 1e3:.4g},"
-            f"{dtypes.get(name, d['dtype'])},{k * d['streamed_gib_per_step']:.4g}"
+            f"{d['dtype']},{k * d['streamed_gib_per_step']:.4g}"
         )
     for name, c in result["code2wav"].items():
         for row, r in c["rows"].items():
@@ -323,6 +360,18 @@ def main() -> int:
     parser.add_argument("--uncached-tokens", action="append", default=[], help="NAME=TOKENS prefilled per request")
     parser.add_argument("--fill-steps", action="append", default=[], help="NAME@GATE=STEPS decode steps before GATE")
     parser.add_argument("--dtype", action="append", default=[], help="NAME[.ROW]=DTYPE the deployment runs")
+    parser.add_argument(
+        "--weight-dtype",
+        action="append",
+        default=[],
+        help="NAME=bf16|fp16|fp32 decoder weight storage; defaults to --dtype's storage or the reference",
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        action="append",
+        default=[],
+        help="NAME=bf16|fp16|fp32 decoder KV storage; defaults to the decoder weight dtype",
+    )
     parser.add_argument("--json", help="write the counts to this path")
     args = parser.parse_args()
 
@@ -343,10 +392,21 @@ def main() -> int:
             model = AutoModel.from_config(config, trust_remote_code=True, dtype=dtype)
         model.eval()
         contexts = keyed(args.context, int)
+        dtypes = keyed(args.dtype)
+        weight_dtypes = keyed(args.weight_dtype)
+        kv_dtypes = keyed(args.kv_dtype)
         for raw in args.decoder:
             key, _, spec = raw.partition("=")
             name, stage = name_stage(key)
-            counts = count_decoder(model, spec, args.prompt_tokens, contexts.get(name, args.prompt_tokens))
+            counts = count_decoder(
+                model,
+                spec,
+                args.prompt_tokens,
+                contexts.get(name, args.prompt_tokens),
+                compute_dtype=dtypes.get(name),
+                weight_dtype=weight_dtypes.get(name),
+                kv_dtype=kv_dtypes.get(name),
+            )
             result["decoders"][name] = {"stage": stage, **counts}
         result["build_s"] = time.time() - start
     for raw in args.code2wav:

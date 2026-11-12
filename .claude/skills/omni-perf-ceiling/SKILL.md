@@ -84,7 +84,9 @@ has no queueing term, so judge it at concurrency 1.
    `10 x C` (minimum 128) prompts per cell with `--print-stage`,
    `--save-result --save-detailed`, and device utilisation sampling
    (`nvidia-smi --query-gpu=utilization.gpu -lms 500`, or `npu-smi info watch`
-   on Ascend). Keep profilers off.
+   on Ascend). Keep profilers off. Use `benchmark_end_time` plus `duration`
+   to align samples; result `date` includes postprocessing and is not a
+   measurement timestamp. Keep client/server sampling clocks synchronized.
 
 4. **Build the ledger.** Run
    `python .claude/skills/omni-perf-ceiling/scripts/ceiling_report.py`

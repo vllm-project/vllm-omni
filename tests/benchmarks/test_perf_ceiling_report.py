@@ -110,13 +110,16 @@ def run_report(
     stage_samples: list[list[tuple[float, int | str]]],
     duration: float = 10.0,
     bound_args: tuple[str, ...] = (),
+    postprocess_s: float = 0.0,
+    has_measured_end: bool = True,
 ) -> tuple[dict, str]:
     """Sample times are seconds before the benchmark's end."""
     result = tmp_path / "result.json"
     result.write_text(
         json.dumps(
             {
-                "date": END.strftime("%Y%m%d-%H%M%S"),
+                "date": (END + dt.timedelta(seconds=postprocess_s)).strftime("%Y%m%d-%H%M%S"),
+                **({"benchmark_end_time": END.isoformat()} if has_measured_end else {}),
                 "duration": duration,
                 "max_concurrency": 1,
                 "completed": 1,
@@ -147,6 +150,24 @@ def run_report(
     proc = subprocess.run(args + ["--json", str(ledger)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     return json.loads(ledger.read_text())[0], proc.stdout
+
+
+def test_postprocessing_does_not_shift_utilisation_window(tmp_path: Path, backend: str) -> None:
+    cell, report = run_report(tmp_path, backend, [[(5, 80), (-55, 10)]], postprocess_s=60)
+
+    assert cell["window"] == ["2026-11-11T12:00:02", "2026-11-11T12:00:08"]
+    assert cell["gpu_busy_share"] == cell["stage_device_share"]["0"] == 0.8
+    assert cell["gpu_samples"] == 1
+    assert "could not be trimmed" not in report
+
+
+def test_legacy_date_does_not_establish_measurement_window(tmp_path: Path, backend: str) -> None:
+    cell, report = run_report(tmp_path, backend, [[(5, 80), (-55, 10)]], postprocess_s=60, has_measured_end=False)
+
+    assert cell["window"] is None
+    assert cell["gpu_samples"] == 2
+    assert cell["util_trimmed"] is False
+    assert "whole sample file, not the measured window" in report
 
 
 def test_calibrated_estimate_cli(tmp_path: Path, backend: str) -> None:

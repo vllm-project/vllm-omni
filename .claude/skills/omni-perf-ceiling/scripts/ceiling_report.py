@@ -211,10 +211,10 @@ def device_busy_share(
 
 
 def measured_window(result: dict) -> tuple[dt.datetime, dt.datetime] | None:
-    """Bench result ``date`` is written when the measured window ends."""
+    """Use the measured end, never result ``date`` (which includes postprocessing)."""
     try:
-        end = dt.datetime.strptime(result["date"], "%Y%m%d-%H%M%S")
-    except (KeyError, ValueError):
+        end = dt.datetime.fromisoformat(result["benchmark_end_time"])
+    except (KeyError, TypeError, ValueError):
         return None
     start = end - dt.timedelta(seconds=float(result["duration"]))
     slack = dt.timedelta(seconds=2)
@@ -781,7 +781,7 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
             elif not c["stage_util_trimmed"][stage]:
                 warnings.append(
                     f"{c['name']}: stage {stage} utilisation samples could not be trimmed to the measured "
-                    "window; check the sample timestamps and result date"
+                    "window; check the sample timestamps and benchmark_end_time"
                 )
         for metric, key, measured in (("TTFT", "ttft", "mean_ttft_ms"), ("TTFP", "ttfp", "mean_audio_ttfp_ms")):
             if (c.get(f"{key}_pct_of_sol") or 0.0) > 1.05:
@@ -802,7 +802,7 @@ def render(cells: list[dict], extra_warnings: list[str]) -> str:
                     "the cell measures queueing or preemption, not compute"
                 )
     warnings += [
-        f"{c['name']}: utilisation samples carry no timestamp; busy share covers the whole sample "
+        f"{c['name']}: sample timestamps or benchmark_end_time unavailable; busy share covers the whole sample "
         "file, not the measured window"
         for c in cells
         if c.get("gpu_samples") and not c.get("util_trimmed")

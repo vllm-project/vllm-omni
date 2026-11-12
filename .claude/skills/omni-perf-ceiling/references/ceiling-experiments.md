@@ -60,6 +60,16 @@ On Ascend use `npu-smi info watch` with a timestamp prefix instead; the command
 and its caveats are in [npu-ceiling.md](npu-ceiling.md). `ceiling_report.py`
 detects either format from the header.
 
+The benchmark saves `benchmark_end_time` immediately after the timed run, before
+metric computation or optional WER/accuracy evaluation. The report subtracts
+`duration` from this timestamp to locate the measured window. The legacy `date`
+is the result-creation time and must not be used: postprocessing can shift it by
+minutes. Benchmark timestamps and sampler timestamps must use the same local
+clock and timezone (synchronize hosts when the client and server are separate).
+Older results without `benchmark_end_time` cannot locate the window; the report
+keeps the whole sample file and warns. Use a sampler already scoped to the measured
+run in that case, or rerun with benchmark-window metadata.
+
 Timestamped samples are restricted to the measured window, trimming two seconds
 from each end only when the run lasts more than four seconds. Shorter runs keep
 their full measured span. No usable samples means unavailable utilisation (`null`
@@ -119,7 +129,13 @@ Inputs that are not work counts:
 
 - **Numerics.** Decoders default to the checkpoint dtype and Token2wav to the
   reference's fp32. `--dtype` sets what the measured deployment runs (TF32 flow
-  model above); report the reference dtype's bound in the numerics column.
+  model above). For decoders it also selects the default weight and KV storage
+  precision, so their byte counts change with deployment precision. TF32/HF32
+  use FP32 storage. Override storage separately with `--weight-dtype thinker=bf16`
+  or `--kv-dtype thinker=fp16` when it differs from computation; supported storage
+  types are `bf16`, `fp16` and `fp32`. Counts record reference, compute, weight and
+  KV dtypes. Quantized storage requires a separate counting recipe. Report the
+  reference dtype's estimate beside the deployment's.
 - **Algorithm constants.** Chunk size, sampling steps, look-ahead, attention
   cache window and vocoder overlap come from the reference (MiniCPM-o:
   `s3_stream_chunk_size: 25`, `s3_stream_n_timesteps: 10`, prelook 3, cache

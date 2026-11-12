@@ -4078,6 +4078,9 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Capture the measurement boundary before metrics and accuracy evaluation.
+    # Upstream's result "date" is populated only after this function returns.
+    benchmark_end_time = datetime.now().isoformat()
 
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
     if duplex_eval_summary is not None:
@@ -4198,6 +4201,7 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    result["benchmark_end_time"] = benchmark_end_time
     result["timed_out_requests"] = sum(bool(getattr(output, "timed_out", False)) for output in outputs)
     result["cancelled_after_timeout_requests"] = sum(
         bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs

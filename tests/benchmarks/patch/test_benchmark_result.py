@@ -4,6 +4,7 @@
 """Verify metric sample counts survive benchmark JSON serialization."""
 
 import asyncio
+import datetime as dt
 import json
 import time
 
@@ -14,6 +15,66 @@ from vllm.benchmarks.serve import TaskType
 from vllm_omni.benchmarks.patch import patch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_benchmark_end_time_precedes_postprocessing(monkeypatch):
+    measured_end = dt.datetime(2026, 11, 12, 12, 0, 10)
+
+    class Clock(dt.datetime):
+        current = measured_end
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    async def evaluate(*args):
+        Clock.current = measured_end + dt.timedelta(seconds=60)
+        return None
+
+    async def request_func(**kwargs):
+        return patch.MixRequestFuncOutput(
+            success=True,
+            prompt_len=2,
+            output_tokens=1,
+            generated_text="hi",
+            start_time=time.perf_counter(),
+            ttft=0.01,
+            latency=0.02,
+        )
+
+    monkeypatch.setattr(patch, "datetime", Clock)
+    monkeypatch.setattr(patch, "_evaluate_omniinteract_batch", evaluate)
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "test-window", request_func)
+    result = asyncio.run(
+        patch.benchmark(
+            task_type=TaskType.GENERATION,
+            endpoint_type="test-window",
+            api_url="http://unused/v1/chat/completions",
+            base_url="http://unused",
+            model_id="test-model",
+            model_name="test-model",
+            tokenizer=None,
+            input_requests=[SampleRequest(prompt="hi", prompt_len=2, expected_output_len=1)],
+            logprobs=None,
+            request_rate=float("inf"),
+            burstiness=1.0,
+            disable_tqdm=True,
+            num_warmups=0,
+            profile=False,
+            selected_percentile_metrics=[],
+            selected_percentiles=[50.0],
+            ignore_eos=False,
+            goodput_config_dict={},
+            max_concurrency=1,
+            lora_modules=None,
+            extra_headers=None,
+            extra_body=None,
+            ready_check_timeout_sec=0,
+        )
+    )
+    saved = json.loads(json.dumps(result))
+    assert saved["benchmark_end_time"] == measured_end.isoformat()
+    assert Clock.current > measured_end
 
 
 @pytest.mark.parametrize("selected_metrics", [["ttft", "tpot", "itl"], []])
