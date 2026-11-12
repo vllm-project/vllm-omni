@@ -393,6 +393,52 @@ def test_decode_chunk_matches_legacy_quantization():
     np.testing.assert_array_equal(video, expected)
 
 
+@pytest.mark.parametrize(("vae_offloaded", "expected"), [(False, False), (True, True)])
+def test_streaming_decode_to_cpu_follows_vae_residency(vae_offloaded, expected):
+    """A resident VAE must keep decoded pixels on the device.
+
+    ``create_streaming_decode_session(to_cpu=True)`` returns CPU tensors, so the
+    ``uint8`` quantization and every subsequent op would run on the host and the
+    pinned staging in ``_to_host`` would degenerate into a plain pageable copy.
+    """
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline._vae_offloaded = vae_offloaded
+
+    assert pipeline._streaming_decode_to_cpu() is expected
+
+
+@pytest.mark.parametrize(
+    ("offload_components", "vae_offloaded"),
+    [
+        (None, True),  # every component staged, VAE included
+        (frozenset({"dit"}), False),  # only the DiT staged, so the VAE stays resident
+        (frozenset({"text_encoder"}), False),
+    ],
+)
+def test_cpu_offload_profile_tracks_vae_residency(offload_components, vae_offloaded, monkeypatch):
+    """Only the all-components profile stages the VAE; naming components leaves it resident."""
+    from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas as module
+
+    monkeypatch.setattr(module, "apply_sequential_offload", lambda **kwargs: None)
+    monkeypatch.setattr(module, "remove_sequential_offload", lambda modules: None)
+
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.transformer = SimpleNamespace()
+    pipeline.text_encoder = SimpleNamespace()
+    pipeline.vae = SimpleNamespace()
+    pipeline._cpu_offload = False
+    pipeline._vae_offloaded = False
+
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), offload_components=offload_components)
+
+    assert pipeline._vae_offloaded is vae_offloaded
+    assert pipeline._streaming_decode_to_cpu() is vae_offloaded
+
+    pipeline.disable_omni_model_cpu_offload()
+    assert pipeline._vae_offloaded is False
+    assert pipeline._streaming_decode_to_cpu() is False
+
+
 @pytest.fixture
 def pipeline(monkeypatch):
     from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents

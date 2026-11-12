@@ -488,6 +488,17 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         return self._ar_sessions[self._bound().session_id]
 
     @torch.no_grad()
+    def _streaming_decode_to_cpu(self) -> bool:
+        """Whether the streaming decoder must hand its pixels back on the host.
+
+        ``create_streaming_decode_session(to_cpu=True)`` copies every decoded
+        window to the CPU, so the quantize step and the pinned staging in
+        :meth:`_to_host` would both run on the host.  A resident VAE therefore
+        keeps ``to_cpu`` false and returns device tensors; a staged VAE has no
+        resident budget for the decoder's rolling buffers and decodes to the host.
+        """
+        return self._vae_offloaded
+
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         del kwargs
         bound = self._ar_state
@@ -543,10 +554,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                # A staged VAE has no resident budget for the decoder's rolling
-                # buffers, so it keeps the host-side decode; a resident VAE gets
-                # device-side quantization and pinned staging.
-                self.vae.create_streaming_decode_session(to_cpu=not self._vae_offloaded) if bound is not None else None,
+                self.vae.create_streaming_decode_session(to_cpu=self._streaming_decode_to_cpu())
+                if bound is not None
+                else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:
