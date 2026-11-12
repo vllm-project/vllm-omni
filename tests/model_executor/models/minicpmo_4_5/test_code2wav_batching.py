@@ -1681,6 +1681,8 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         segment_text_utf8,
     )
     assert payload["meta.tts_is_last_chunk"][0].item() is True
+    assert payload["meta.duplex_audio_cache_epoch"][0].item() == final["meta"]["cache_epoch"]
+    assert payload["meta.duplex_audio_chunk_seq"][0].item() == 1
     assert payload["meta.turn_end"][0].item() is True
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states

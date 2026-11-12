@@ -175,7 +175,11 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=engine_output_type))
     text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    runner.model_state = SimpleNamespace(postprocess_model_output=MagicMock(return_value=(text_hidden, None)))
+    multimodal_outputs = {"codes": {"audio": torch.ones(3, 1)}}
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
+        run_postprocess=MagicMock(),
+    )
     runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
     runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
     runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
@@ -194,8 +198,13 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         yield
         sampling_active = False
 
+    # Exercise the deferred structured-output branch in one existing matrix
+    # case without doubling the full orchestration parametrization.
+    requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
     runner.model = SimpleNamespace(
-        compute_logits=lambda hidden: hidden, logitsprocs_need_output_token_ids=needs_history
+        compute_logits=lambda hidden: hidden,
+        logitsprocs_need_output_token_ids=needs_history,
+        postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
     if include_hidden is not None:
         runner.model.omni_pooler_payload_include_hidden = include_hidden
@@ -223,6 +232,10 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    if requires_multimodal_postprocess:
+        runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
+    else:
+        runner.model_state.run_postprocess.assert_not_called()
     kwargs = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs
     if engine_output_type != "text" and include_hidden is not False:
         assert kwargs["text_hidden"] is text_hidden
