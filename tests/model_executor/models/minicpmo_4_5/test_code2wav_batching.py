@@ -1249,9 +1249,10 @@ def test_att_slot_pool_round_trips_the_split_kv_layout():
     the graph -- and this walks the bookkeeping exchange that table drives:
     adopt a request's split cache into the slot's rows and materialize the
     logical cache back out. The graph-driven half of ``_replay_slots`` (mask
-    scatter, in-place write, trim) needs a captured graph, so it stays with
-    the wrapper's own tests; what the table must agree on -- the row pair,
-    the free-frame scatter order, the round-trip -- is asserted here.
+    scatter, in-place write, trim) runs only on a captured graph and has no
+    CPU-side test; what the host side must agree on -- the row pair and its
+    CFG order, the free-frame scatter order, the adoption round-trip, and
+    materialization of a reordered layout -- is asserted here.
     """
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     arena = WholeEulerExecutionArena(adapter.flow.decoder.estimator, device=torch.device("cpu"), dtype=torch.float32)
@@ -1280,16 +1281,21 @@ def test_att_slot_pool_round_trips_the_split_kv_layout():
     assert torch.equal(handle.materialize(), cache)
 
     # The physical slot holds the suffix frames first, then the streaming
-    # frames, in the order adopt() scatters them -- and each CFG half of the
+    # frames, in the order adopt() scatters them, and each CFG half of the
     # request lands on its own row of the pair the replay table selects.
     slot = pool.storage[:, :, :, 2 * handle.slot : 2 * handle.slot + 2]
-    assert torch.equal(slot[..., :suffix, :], cache[..., streaming:, :])
-    assert torch.equal(slot[..., suffix : suffix + streaming, :], cache[..., :streaming, :])
     for half, row in enumerate((2 * handle.slot, 2 * handle.slot + 1)):
         pool_row = pool.storage[:, :, :, row]
         cache_half = cache[:, :, :, half]
         assert torch.equal(pool_row[..., :suffix, :], cache_half[..., streaming:, :])
         assert torch.equal(pool_row[..., suffix : suffix + streaming, :], cache_half[..., :streaming, :])
+
+    # Materialization follows a reordered layout: ``layout`` lists the
+    # streaming frames' physical order and the suffix frames follow it, so
+    # a permuted layout must read back in exactly that order.
+    handle.layout = [4, 2, 3]
+    expected = torch.stack([slot[..., index, :] for index in handle.physical_frames()], dim=5)
+    assert torch.equal(handle.materialize(), expected)
 
     # A cache on any other layout fails loudly instead of aliasing wrong axes.
     with pytest.raises(ValueError):
