@@ -18,7 +18,7 @@ labels and exact prompt. The reference voice is the checkpoint's
 `assets/HT_ref_audio.wav`; it is not bundled. Its digest pins the same
 96,256-sample conditioning waveform used in validation (including its tail).
 
-The CUDA full-model test uses the existing three-stage `omni_server` fixture
+The core-model test uses the existing three-stage `omni_server` fixture
 and default `minicpmo_4_5.yaml`. It sends 200 ms chunks at realtime pace, window
 off, temperature zero, one frame per second, followed by 8 seconds of silence
 holding the last frame. The existing demo client handles the real WebSocket
@@ -39,15 +39,21 @@ Run from the repository root with the normal model cache configured:
 
 ```bash
 pytest -sv tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
-  --run-level full_model -m 'full_model and cuda'
+  --run-level advanced_model -m 'core_model and cuda'
 ```
 
-The CUDA nightly MiniCPM-o duplex job selects the test on H100/B200 and uploads
+The CUDA ready `Omni · MiniCPM-o 4.5 Duplex Test` job runs this test and uploads
 `tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*`, including
 transcript, events, recognition report, input timeline and generated audio.
-The model comparison was measured on L20X; H100/B200 execution of this new test
-has not yet been measured. This is a strict regression threshold, not a claim
-of cross-hardware token equality.
+`--run-level advanced_model` loads real weights; `core_model` remains the
+selection mark for ready CI.
+The recorded model comparison below was measured on L20X. This is a strict regression
+threshold, not a claim of cross-hardware token equality.
+
+The CUDA Thinker uses native `rms_norm` and `fused_add_rms_norm`, with
+QK-norm/RoPE fusion disabled. Changes to this numerical profile need the real
+long-video regression on the target GPU; archived transcript replay only
+validates the scoring contract.
 
 `recorded_transcripts.json` contains the actual before/intermediate/after and
 Transformers outputs used to test the scoring contract without a GPU. The

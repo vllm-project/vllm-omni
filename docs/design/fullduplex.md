@@ -820,12 +820,45 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
-MiniCPM-o native duplex treats `max_speak_chars_per_chunk` (default 28) as a
-soft target. It keeps the complete sampled token that reaches or crosses the
-target, then closes the chunk before another draw once the accepted prefix
-reaches the target. A decoded prefix ending in U+FFFD may continue to complete
-its UTF-8 bytes. Hard token and request caps retain priority; explicit
-`force_listen` bypasses only the soft character target.
+MiniCPM-o native duplex does not apply a character cap unless
+`max_speak_chars_per_chunk` is set to a positive value. The default is 0,
+so the default length limit is the official 20-token budget; sampled chunk
+terminators can still close a chunk earlier. A decoded prefix
+ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
+cap is set. That cap keeps the token that crosses the target, then closes
+the chunk before another draw. Hard token and request caps retain priority;
+explicit `force_listen` bypasses only the soft character target.
+
+MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
+without sentence-ending punctuation. The sampler does not infer whether an
+answer is complete from its decoded tail or replace EOS with another candidate.
+This matches the released `streaming_generate` turn-ending behavior and avoids
+adding text to short answers such as `11` or `北京`. There is no worker-local
+punctuation/continuation state for asynchronous lookahead to advance beyond the
+scheduler's accepted span. The scheduler still supplies the canonical unit
+content and terminator for the next append, including with sliding windows off.
+Sentence-ending punctuation remains a Talker drain hint; it does not decide
+whether the Thinker may end a turn.
+
+`<|turn_eos|>` does not terminate the input unit. The Thinker continues until
+a chunk terminator, and the Talker receives all forwarded tokens and their
+hidden states before that boundary, including any text after an intermediate
+EOS. Such text or a later speak decision reopens the turn. The bridge and
+Talker therefore report `turn_end` only when the final condition token is
+`<|turn_eos|>`, not merely when EOS occurs somewhere in the unit. For example,
+`<|speak|><|turn_eos|><|speak|>green<|chunk_eos|>` delivers `green` and keeps the
+response open. Async lookahead after the actual chunk terminator is excluded.
+
+If a speech unit has no text, its chunk boundary still
+travels through Talker's empty-condition path. That path emits no audio but
+preserves the TTS segment-end notification needed to schedule the next silence
+unit; an empty speech chunk must not be dropped as if it were a listen unit.
+
+Code2Wav attaches queued transcript text once per output payload. The data
+plane deduplicates it by `(duplex_audio_cache_epoch, duplex_audio_chunk_seq)`
+within a model turn, not by text equality or a shared prefix. Adjacent chunks
+containing `1` and `1` must deliver `11`. Legacy outputs without a chunk
+identity retain the cumulative-text snapshot handling.
 
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change

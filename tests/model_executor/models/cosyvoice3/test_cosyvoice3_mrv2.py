@@ -96,7 +96,8 @@ def _sample(sampler, logits, pos, fused):
         pos,
         None,
         None,
-        not fused,  # logprobs keep the tensor path
+        None,
+        return_logprobs=not fused,  # logprobs keep the tensor path
         default_top_p=0.8,
         default_top_k=25,
         win_size=10,

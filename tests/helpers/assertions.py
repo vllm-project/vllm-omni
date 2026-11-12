@@ -67,6 +67,23 @@ class SuccessRateGate:
     concurrency: int | None = None
 
 
+def assert_duplex_artifact_publication(result: dict, params: dict, num_prompt: int) -> None:
+    if params.get("dataset_name") == "omni-duplex-eval":
+        summary = result.get("omni_duplex_eval")
+        assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
+        assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
+        assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
+    elif params.get("dataset_name") == "omniinteract":
+        summary = result.get("omniinteract")
+        assert isinstance(summary, dict), "OmniInteract summary is missing"
+        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
+            num_prompt,
+            num_prompt,
+            0,
+        ), "OmniInteract requests did not all succeed"
+        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+
+
 def is_quality_failure(exc: BaseException) -> bool:
     """True when ``exc`` is one of the sampled quality assertions above.
 
@@ -552,6 +569,13 @@ def assert_video_audio_valid(
         actual_channels = int(audio_stream.channels or 0)
         assert actual_sample_rate == sample_rate, f"Expected audio sample rate={sample_rate}, got {actual_sample_rate}"
         assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
+
+
+def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
+    """Assert a WAV body's native rate when the request did not ask the server for one."""
+    assert audio_bytes, "Expected WAV bytes"
+    info = sf.info(io.BytesIO(audio_bytes))
+    assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
 
 
 def assert_audio_valid(

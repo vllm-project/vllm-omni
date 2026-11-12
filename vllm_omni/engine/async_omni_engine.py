@@ -662,6 +662,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     companions = self._build_cfg_companions(
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
+            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions} or None
         except BaseException:
             # Companion construction runs under this guard too: a failure after
             # the ADD message exists must still release its preprocessed

@@ -54,6 +54,42 @@ def _render(changed_files: list[str]) -> str:
     )
 
 
+@pytest.mark.parametrize("pytest_exit", [0, 1, 124])
+def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit):
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text())
+    step = next(step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test")
+    # Build 19334 runs the workload under /bin/sh. Exercise that entrypoint,
+    # without starting a real server or loading model weights.
+    calls_path = tmp_path / "pytest-call.json"
+    executable = tmp_path / "pytest"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['PYTEST_CALLS'], 'w') as output:\n"
+        "    json.dump(sys.argv[1:], output)\n"
+        "print('pytest-stdout')\n"
+        "print('pytest-stderr', file=sys.stderr)\n"
+        "sys.exit(int(os.environ['PYTEST_EXIT']))\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
+    monkeypatch.setenv("PYTEST_EXIT", str(pytest_exit))
+    result = subprocess.run(
+        ["/bin/sh", "-e", "-c", "\n".join(step["commands"])],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == pytest_exit, result.stderr
+    args = json.loads(calls_path.read_text())
+    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
+    assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
+    assert "pytest-stdout" in result.stdout
+    assert "pytest-stderr" in result.stderr
+
+
 def test_bootstrap_if_injected_by_step_key() -> None:
     rendered = _render_bootstrap_pipeline(
         BOOTSTRAP_STEPS_TEMPLATE,
@@ -274,6 +310,7 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         "h100_2",
         "h100_3",
         "h100_4",
+        "h100_weight_sharing_tp4",
         "b200_1",
         "b200_2",
         "b200_3",
@@ -543,7 +580,7 @@ def _iter_steps(doc: dict):
     "changed_file,select_legacy",
     [
         ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
-        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", True),
         ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
         ("vllm_omni/clients/duplex.py", False),
         ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
@@ -879,6 +916,29 @@ def test_source_file_dependencies_list_of_keys_concatenates() -> None:
     assert "vllm_omni/model_executor/models/qwen3_omni/" in resolved
     assert "vllm_omni/model_executor/models/qwen3_tts/" in resolved
     assert resolved.count("vllm_omni/model_executor/models/common/snake_activation.py") == 1
+
+
+@pytest.mark.parametrize(
+    "changed_file,expected_keys",
+    [
+        ("vllm_omni/worker_v2/output_snapshot.py", {"ready"}),
+        ("vllm_omni/outputs/output_processor.py", {"ready"}),
+        ("tests/worker_v2/test_omni_model_runner.py", {"ready"}),
+        ("vllm_omni/outputs/duplex.py", {"ready", "merge"}),
+    ],
+)
+def test_minicpmo_mrv2_dependencies_do_not_expand_shared_duplex_jobs(changed_file, expected_keys):
+    steps = []
+    for key, path in [("ready", CUDA_READY_YAML), ("merge", Path(".buildkite/cuda/test-merge.yml"))]:
+        doc = yaml.safe_load(path.read_text())
+        duplex_step = next(
+            step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test"
+        )
+        steps.append(
+            {"key": key, "commands": ["true"], "source_file_dependencies": duplex_step["source_file_dependencies"]}
+        )
+    rendered = _render_test_pipeline({"steps": steps}, changed_files=[changed_file])
+    assert {step["key"] for step in _iter_steps(rendered)} == expected_keys
 
 
 def test_unknown_source_file_dependencies_key() -> None:

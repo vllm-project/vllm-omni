@@ -34,6 +34,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
     RoundRobinBalancer,
 )
+from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -463,6 +464,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    weight_sharing: SharingRuntime | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -499,6 +501,7 @@ def _build_harness(
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
+            orchestrator.weight_sharing = weight_sharing
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
             await orchestrator.run()
 
@@ -1067,13 +1070,17 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
 
 
 @pytest.mark.parametrize("metadata_kind", ["dict", "serialized", "none"])
-def test_processed_stage_request_preserves_metadata_forms(metadata_kind):
+@pytest.mark.parametrize("buffer", [None, {"duplex": {"perf_chunk": [0, 1]}}])
+def test_processed_stage_request_preserves_metadata_forms(metadata_kind, buffer):
     orchestrator = object.__new__(Orchestrator)
     info = {"tts_language": "English"} if metadata_kind != "none" else None
     raw_info = serialize_additional_information(info) if metadata_kind == "serialized" else info
     request = _processed_request("metadata-forms", _sampling_params())
-    upgraded = orchestrator._upgrade_processed_stage_request(request, {"additional_information": raw_info})
+    upgraded = orchestrator._upgrade_processed_stage_request(
+        request, {"additional_information": raw_info, "model_intermediate_buffer": buffer}
+    )
     assert deserialize_additional_information(getattr(upgraded, "additional_information", None)) == (info or {})
+    assert getattr(upgraded, "model_intermediate_buffer", None) == buffer
 
 
 @pytest.mark.asyncio
@@ -3278,6 +3285,44 @@ def test_stage_pool_does_not_track_output_timestamps_when_metrics_disabled() -> 
     assert pool._audio_frames_by_request == {}
 
 
+def test_stage_pool_tracks_scalar_pooling_output_timestamp() -> None:
+    stage = FakeStageClient(stage_type="llm", final_output_type="latent")
+    pool = StagePool(2, [stage])
+    output = SimpleNamespace(
+        request_id="req-pooling",
+        outputs=SimpleNamespace(data=SimpleNamespace(shape=(2, 2))),
+    )
+
+    pool.record_output_timestamps([output], output_ts=123.0)
+
+    assert pool._output_timestamps_by_request == {"req-pooling": [123.0]}
+    assert pool._non_empty_first_output_timestamps_by_request == {"req-pooling": 123.0}
+
+
+def test_stage_pool_builds_metrics_for_scalar_pooling_output(mocker) -> None:
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {}
+    stage = FakeStageClient(stage_type="llm", final_output_type="latent")
+    pool = StagePool(2, [stage], output_processor=processor)
+    pool.collect_stage_metrics = False
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", return_value=2.0)
+    output = SimpleNamespace(
+        request_id="req-pooling",
+        outputs=SimpleNamespace(data=SimpleNamespace(shape=(2, 2))),
+    )
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=1.0,
+        request_timestamp=1.0,
+        replica_id=0,
+    )
+
+    assert metrics.finish_reason is None
+    assert metrics.num_tokens_out == 0
+    processor.pop_native_text_metrics.assert_called_once_with("req-pooling")
+
+
 def test_orchestrator_rejects_logging_without_stage_metrics() -> None:
     with pytest.raises(ValueError, match="log_stats=True requires collect_stage_metrics=True"):
         Orchestrator(
@@ -4662,3 +4707,136 @@ async def test_add_request_rejects_parallel_samples_on_a_later_stage_before_subm
         for submit in submits:
             submit.assert_not_awaited()
         assert "req" not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_complete_requests_are_serial_only_with_shared_weights(orchestrator_factory, mocker, shared):
+    """A second AR request waits for DiT1 only when the shared group is enabled."""
+    ar = FakeStageClient()
+    dit = FakeStageClient(
+        stage_type="diffusion", final_output=True, final_output_type="image", next_inputs=[{"prompt": "draw a cat"}]
+    )
+    processor = FakeOutputProcessor()
+    group = mocker.Mock(spec=SharingRuntime, state="READY")
+    group.monitor = AsyncMock(side_effect=lambda stop: stop.wait())
+
+    # An async callback must await the stop event, not return its coroutine.
+    async def monitor(stop):
+        await stop.wait()
+
+    group.monitor = AsyncMock(side_effect=monitor)
+    group.close = AsyncMock()
+    group.drain_requests = AsyncMock()
+    harness = orchestrator_factory(
+        [ar, dit], output_processors=[processor, FakeOutputProcessor()], weight_sharing=group if shared else None
+    )
+    try:
+        for rid in ("one", "two"):
+            await _enqueue_add_request(
+                harness,
+                request_id=rid,
+                prompt=_processed_request(rid, _sampling_params()),
+                original_prompt={"prompt": "cat"},
+                sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams()],
+                final_stage_id=1,
+            )
+        await _wait_for(lambda: len(ar.add_request_calls) >= 1)
+        if shared:
+            await _wait_for(lambda: "two" in harness.orchestrator._shared_requests.pending)
+            assert len(ar.add_request_calls) == 1
+        else:
+            await _wait_for(lambda: len(ar.add_request_calls) == 2)
+            assert harness.orchestrator._shared_requests is None
+
+        processor.request_outputs = [_build_request_output("one", token_ids=[4], finished=True)]
+        ar.push_engine_core_outputs(_engine_core_outputs("one", 1.0))
+        await _wait_for(lambda: len(dit.add_request_calls) == 1)
+        assert len(ar.add_request_calls) == (1 if shared else 2)
+        dit.push_diffusion_output(OmniRequestOutput(request_id="one", finished=True, images=["image-one"]))
+        await _wait_for(lambda: len(ar.add_request_calls) == 2)
+        processor.request_outputs = [_build_request_output("two", token_ids=[5], finished=True)]
+        ar.push_engine_core_outputs(_engine_core_outputs("two", 2.0))
+        await _wait_for(lambda: len(dit.add_request_calls) == 2)
+        dit.push_diffusion_output(OmniRequestOutput(request_id="two", finished=True, images=["image-two"]))
+        await _wait_for(lambda: not harness.orchestrator.request_states)
+        group.drain_requests.assert_not_called()
+    finally:
+        await _shutdown_orchestrator(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_stage", [0, 1])
+async def test_shared_cancel_drains_active_work_and_removes_queued_request(orchestrator_factory, mocker, cancel_stage):
+    ar = FakeStageClient()
+    dit = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    processor = FakeOutputProcessor()
+    group = mocker.Mock(spec=SharingRuntime, state="READY")
+
+    async def monitor(stop):
+        await stop.wait()
+
+    drain_entered, drain_done = threading.Event(), threading.Event()
+
+    async def drain():
+        drain_entered.set()
+        assert await asyncio.to_thread(drain_done.wait, 5)
+
+    group.monitor = AsyncMock(side_effect=monitor)
+    group.close = AsyncMock()
+    group.drain_requests = AsyncMock(side_effect=drain)
+    harness = orchestrator_factory(
+        [ar, dit], output_processors=[processor, FakeOutputProcessor()], weight_sharing=group
+    )
+    try:
+        for rid in ("one", "two", "three"):
+            await _enqueue_add_request(
+                harness,
+                request_id=rid,
+                prompt=_processed_request(rid, _sampling_params()),
+                original_prompt={"prompt": "cat"},
+                sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams()],
+                final_stage_id=1,
+            )
+        await _wait_for(
+            lambda: len(ar.add_request_calls) == 1 and len(harness.orchestrator._shared_requests.pending) == 2
+        )
+        await _enqueue_abort_request(harness, ["two"])
+        await _wait_for(lambda: "two" not in harness.orchestrator._shared_requests.pending)
+        assert len(ar.add_request_calls) == 1
+        group.drain_requests.assert_not_called()
+        if cancel_stage == 1:
+            processor.request_outputs = [_build_request_output("one", token_ids=[4], finished=True)]
+            ar.push_engine_core_outputs(_engine_core_outputs("one", 1.0))
+            await _wait_for(lambda: len(dit.add_request_calls) == 1)
+        await _enqueue_abort_request(harness, ["one"])
+        await _wait_for(drain_entered.is_set)
+        assert len(ar.add_request_calls) == 1
+        drain_done.set()
+        await _wait_for(lambda: len(ar.add_request_calls) == 2)
+        assert ar.add_request_calls[-1][0].request_id == "three"
+        assert all(call[0].request_id != "two" for call in ar.add_request_calls)
+    finally:
+        drain_done.set()
+        await _shutdown_orchestrator(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_shared_kv_ready_waits_for_ar_terminal_output(mocker, shared):
+    orch = object.__new__(Orchestrator)
+    orch.async_chunk = False
+    orch.weight_sharing = mocker.Mock(spec=SharingRuntime) if shared else None
+    orch.request_states = {
+        "one": OrchestratorRequestState(request_id="one", prompt="cat", sampling_params_list=[], final_stage_id=1)
+    }
+    orch._cfg_tracker = mocker.Mock()
+    orch._cfg_tracker.is_companion.return_value = False
+    orch._cfg_tracker.has_companions.return_value = False
+    forward = mocker.patch.object(orch, "_forward_to_next_stage", new_callable=AsyncMock)
+    raw = OmniEngineCoreOutput(request_id="one", new_token_ids=[], kv_transfer_params={"kv_ready": True})
+    await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
+    assert forward.await_count == (0 if shared else 1)
+    raw.finish_reason = FinishReason.STOP
+    await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
+    assert forward.await_count == (1 if shared else 2)

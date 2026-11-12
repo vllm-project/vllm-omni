@@ -129,7 +129,7 @@ Canonical layout (prefer these paths for new changes):
     1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
     3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
-    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model business-code paths only. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases that anchor and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
+    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model and shared runtime dependencies. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases the relevant anchors and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
     5. Dry-run:
 
     ```bash
@@ -177,7 +177,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
 
-    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and an ordinary release line, `main` or `release/vX.Y.Z`), experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or a release line with `NIGHTLY=1`), and `test-amd-weekly.yml` (`reliability` / `weekly-test` or a release line with `WEEKLY=1`). Multiple PR tier labels combine their suites behind one image build. A later suite's step is dropped only when its complete parsed definition equals a step in an earlier suite; distinct definitions and repeated steps within one suite are preserved. The bootstrap logs how many duplicate step definitions and physical jobs were dropped. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, `nightly`, and `weekly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
+    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and an ordinary release line, `main` or `release/vX.Y.Z`), experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or a release line with `NIGHTLY=1`), and `test-amd-weekly.yml` (`reliability` / `weekly-test` or a release line with `WEEKLY=1`). Multiple PR tier labels combine their suites behind one image build. A later suite's step is dropped only when its complete parsed definition equals a step in an earlier suite; distinct definitions and repeated steps within one suite are preserved. The bootstrap logs how many duplicate step definitions and physical jobs were dropped. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, `nightly`, and `weekly` as an explicit override. AMD nightly leaves remain non-blocking during burn-in and are promoted individually only after stable runtime evidence.
 
     **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select the ready, merge, nightly, weekly, or combined suites. Repository-side selection therefore cannot start AMD CI by itself. AMD-only nightly validation uses both `amd-test` and `nightly-test`: the external condition should accept an event for either label only when the complete PR label set contains both. `amd-test` admits the AMD pipeline, while `nightly-test` makes the bootstrap select `NIGHTLY_TESTS:test-amd-nightly.yml`. Existing `ready` / `merge-test` behavior and non-PR release-line (`main` or `release/vX.Y.Z`) / scheduled builds remain separate. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Until the paired-label condition is configured, use an authorized manual Buildkite build with `DEBUG_TEST_YAML=nightly` and verify that the bootstrap reports only the nightly suite.
 
@@ -614,7 +614,26 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 ### Policy
 
 - **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors group model code and shared runtime dependencies. Job keys alias the relevant anchors and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+
+Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
+with the reusable platform key `ci_cuda`, `ci_npu`, or `ci_rocm`. CUDA jobs also
+compose `omni_v2_runtime` for their V2 and prefix-cache dependencies.
+Other models can opt into a platform key without inheriting these runtime choices.
+Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
+benchmark infrastructure, and test fixtures select both accuracy and performance
+on all three platforms, including the existing CUDA Duplex performance jobs.
+Platform workers, CI images, requirements, build scripts,
+and nightly YAML select the corresponding platform. Accuracy datasets/evaluators
+and performance runners also have their own dependencies; Duplex helpers select
+the existing CUDA Duplex jobs.
+
+These are direct dependencies, so a diff containing both `tests/helpers/runtime.py`
+and MiniCPM model code retains Qwen3 accuracy/performance even when another job
+matches. CUDA V2 and prefix-cache dependencies select the existing CUDA jobs;
+selection alone does not add a cache-hit workload or exercise every deploy
+override. Scheduled full uploads still keep every job. Routing regressions live
+in `tests/buildkite/test_qwen3_omni_source_dependencies.py`.
 
 ### YAML examples
 

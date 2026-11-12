@@ -9,9 +9,15 @@ test_target=${1:?test file required}
 expected_tests=${2:?expected test count required}
 model_kind=${3:?omni, tts or diffusion required}
 artifact_name=${4:?artifact directory name required}
+shift 4
+test_targets=("$test_target" "$@")
+level_marker=${ROCM_E2E_LEVEL_MARKER:-full_model}
+test_timeout_minutes=${ROCM_E2E_TIMEOUT_MINUTES:-105}
 [[ "$expected_tests" =~ ^[1-9][0-9]*$ ]]
 [[ "$model_kind" == omni || "$model_kind" == tts || "$model_kind" == diffusion ]]
 [[ "$artifact_name" =~ ^[a-z0-9-]+$ ]]
+[[ "$level_marker" == full_model || "$level_marker" == slow ]]
+[[ "$test_timeout_minutes" =~ ^[1-9][0-9]*$ ]]
 artifact_dir="${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/${artifact_name}"
 mkdir -p "$artifact_dir"
 
@@ -57,7 +63,8 @@ trap check_cleanup EXIT
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         printf 'checkout_head=%s\n' "$(git rev-parse HEAD)"
     fi
-    echo "target=$test_target expected_tests=$expected_tests run_level=full_model"
+    printf 'target=%s\n' "${test_targets[@]}"
+    echo "expected_tests=$expected_tests marker=$level_marker run_level=full_model timeout=${test_timeout_minutes}m"
     rocminfo
     python3 - <<'PY'
 import torch
@@ -72,8 +79,8 @@ ps -eo pid=,ppid=,lstart=,stat=,comm=,args= > "$artifact_dir/processes-before.tx
 baseline_ready=1
 
 pytest_args=(
-    "$test_target"
-    -m "full_model and $model_kind and rocm and MI325 and cards_1 and not nvidia_only"
+    "${test_targets[@]}"
+    -m "$level_marker and $model_kind and rocm and MI325 and cards_1 and not nvidia_only"
     --run-level full_model --shard-id 0 --num-shards 1
 )
 timeout --signal=TERM --kill-after=1m 10m \
@@ -81,7 +88,7 @@ timeout --signal=TERM --kill-after=1m 10m \
     2>&1 | tee "$artifact_dir/collection.txt"
 
 set +e
-timeout --signal=TERM --kill-after=2m 105m \
+timeout --signal=TERM --kill-after=2m "${test_timeout_minutes}m" \
     pytest -s -v -ra "${pytest_args[@]}" --durations=0 --junitxml="$artifact_dir/pytest.xml" \
     2>&1 | tee "$artifact_dir/pytest.log"
 pipeline_status=("${PIPESTATUS[@]}")

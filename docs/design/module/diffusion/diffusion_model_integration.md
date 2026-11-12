@@ -59,6 +59,11 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+HunyuanImage3 uses `OmniDiffusionConfig.revision` for model configuration,
+generation configuration, tokenizer, and weight loading, including preprocessing.
+The shared-weight runtime pins remote loads to the commit resolved by AR;
+local checkpoint directories must remain immutable throughout the session.
+
 ## Weight reloading
 
 Pipelines that support live RL weight updates opt in with

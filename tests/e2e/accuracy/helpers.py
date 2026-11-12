@@ -1047,6 +1047,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
 
 
 DEFAULT_DEVICE_PROFILE = "default"
+# Torch's NPU name does not contain the CI profile key ``A3``. Atlas A3 runners
+# report ``Ascend910`` / ``Ascend910_93xx``; Atlas A2 reports ``Ascend910B*``
+# and must not inherit the A3 accuracy row. #10054.
+_DEVICE_NAME_PROFILE_ALIASES: tuple[tuple[str, str], ...] = (("Ascend910", "A3"),)
+_DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST: tuple[tuple[str, str], ...] = (("Ascend910", "Ascend910B"),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1094,10 +1099,15 @@ def resolve_device_profile(
 ) -> str:
     """Map a device marketing name or architecture to a key in *profiles*.
 
-    When both identifiers are omitted, queries the current platform. Non-``default``
-    keys are matched as substrings of either identifier; unmatched devices use
-    ``default``. Callers with an already captured device record should pass both
-    values so profile selection uses the same evidence as the saved artifacts.
+    When both identifiers are omitted, queries the current platform. Non-
+    ``default`` profile keys are matched as substrings of either identifier
+    first so a later explicit row (for example ``Ascend910B``) wins over an
+    alias. Otherwise a name such as ``Ascend910`` / ``Ascend910_93xx`` is
+    rewritten to its CI alias (``A3``) when that key is present;
+    ``Ascend910B*`` (Atlas A2) is excluded from that alias. Unmatched devices
+    use ``default``. Callers with an already captured device record should pass
+    both values so profile selection uses the same evidence as the saved
+    artifacts.
     """
     if device_name is None and device_architecture is None:
         device_name, device_architecture = _current_device_identity()
@@ -1110,6 +1120,17 @@ def resolve_device_profile(
         if profile == DEFAULT_DEVICE_PROFILE:
             continue
         if any(profile in identifier for identifier in identifiers):
+            return profile
+
+    for identifier in identifiers:
+        for needle, profile in _DEVICE_NAME_PROFILE_ALIASES:
+            if profile not in profiles or needle not in identifier:
+                continue
+            if any(
+                blocked_needle == needle and blocked in identifier
+                for blocked_needle, blocked in _DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST
+            ):
+                continue
             return profile
     return DEFAULT_DEVICE_PROFILE
 

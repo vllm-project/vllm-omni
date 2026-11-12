@@ -858,6 +858,57 @@ def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion
     assert captured[0].layers == 7
 
 
+def test_single_stage_generate_forwards_num_frames(test_client, mock_async_diffusion):
+    """Single-stage /v1/images/generations must honor model_extra num_frames.
+
+    ``ImageGenerationRequest`` has no first-class ``num_frames`` field (extras
+    are allowed). Video-backed T2I smokes (e.g. LingBot) post ``num_frames=1``
+    to override a shared video default of 81; without forwarding model_extra,
+    the request keeps 81 and returns HTTP 400.
+    """
+    mock_async_diffusion.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            generator_device="cpu",
+            num_frames=81,
+        )
+    ]
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robotic arm picks up a red block",
+            "num_frames": 1,
+        },
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].num_frames == 1
+
+
+def test_single_stage_generate_without_num_frames_keeps_default(test_client, mock_async_diffusion):
+    """Omitting num_frames must leave the inherited server default untouched."""
+    mock_async_diffusion.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            generator_device="cpu",
+            num_frames=81,
+        )
+    ]
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a robotic arm picks up a red block"},
+    )
+    assert response.status_code == 200
+
+    captured = mock_async_diffusion.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].num_frames == 81
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 

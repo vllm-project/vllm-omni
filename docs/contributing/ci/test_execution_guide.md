@@ -153,7 +153,7 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
 
-    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
 
     **Ad hoc:** run a single test file or marker expression manually:
 
