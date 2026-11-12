@@ -32,23 +32,32 @@ def prepare_speculative_payload(
     No request history is consulted: async bookkeeping may contain only -1s.
     """
     invalid = set(invalid_req_indices)
-    indices, offsets, token_parts, embedding_parts = [], [0], [], []
+    spans = [
+        (idx, int(query_start_loc[idx]), int(query_start_loc[idx + 1]))
+        for idx, rid in enumerate(req_ids)
+        if idx not in invalid and rid in speculative_request_ids
+    ]
+    if not spans:
+        return multimodal_outputs
+
+    indices, offsets, token_parts, embedding_parts, mask_parts = [], [0], [], [], []
     layers = multimodal_outputs.get("hidden_states", {}).get("layers", {})
-    for idx, rid in enumerate(req_ids):
-        if idx in invalid or rid not in speculative_request_ids:
-            continue
-        start, end = int(query_start_loc[idx]), int(query_start_loc[idx + 1])
-        samples = sampled_token_ids[idx]
-        valid = (samples >= 0) & (samples < vocab_size)
+    if consumed_input_span:
+        # One reduction and padded mask for the batch. Slice views below use
+        # CPU-known query widths; no count readback or per-request kernels.
+        valid = (sampled_token_ids >= 0) & (sampled_token_ids < vocab_size)
+        counts = valid.sum(dim=1)
+        max_width = max(end - start for _, start, end in spans)
+        row_mask = torch.arange(max_width, device=input_token_ids.device)[None, :] < counts[:, None]
+
+    for idx, start, end in spans:
         if consumed_input_span:
-            count = valid.sum()
-            ids = torch.where(
-                torch.arange(end - start, device=input_token_ids.device) < count,
-                input_token_ids[start:end],
-                -1,
-            )
+            ids = input_token_ids[start:end]
+            mask_parts.append(row_mask[idx, : end - start])
             embedding_parts.append(layers[0][start:end])
         else:
+            samples = sampled_token_ids[idx]
+            valid = (samples >= 0) & (samples < vocab_size)
             # Linear target positions are corrected on GPU under async
             # scheduling. MRoPE coordinates and optimistic CPU counts cannot
             # identify the first generated input position reliably.
@@ -59,10 +68,9 @@ def prepare_speculative_payload(
         token_parts.append(ids)
         offsets.append(offsets[-1] + ids.numel())
 
-    if not indices:
-        return multimodal_outputs
     ids = torch.cat(token_parts)
     if consumed_input_span:
+        ids = torch.where(torch.cat(mask_parts), ids, -1)
         embeddings = torch.cat(embedding_parts)
     else:
         # Fixed-size padded lookup avoids a GPU->CPU count synchronization.

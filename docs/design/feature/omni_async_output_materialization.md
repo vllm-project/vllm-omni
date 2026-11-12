@@ -428,8 +428,11 @@ drafting can overwrite target inputs. It stages target input IDs alongside
 this forward's captured layer-0 embeddings in `multimodal_outputs`. With
 k valid samples, the first k verifier input rows are the previous replacement
 or bonus plus k-1 accepted drafts. Rejected input rows are masked out before
-asynchronous copies. These tensors use the existing Omni snapshot and its
-completion event; there is no separate speculative snapshot or event. After
+asynchronous copies. Counts and the padded consumed-row mask are computed once
+per batch; CPU-known query boundaries select mask views for eligible requests
+without reading GPU counts back to the host. These tensors use the existing
+Omni snapshot and its completion event; there is no separate speculative
+snapshot or event. After
 that event completes, `finalize_multimodal_outputs_from_cpu_snapshot` applies
 the same CPU mask to IDs and embeddings. No extra embedding lookup or TP collective is performed. The newly
 sampled replacement/bonus is handed off after its next target forward.

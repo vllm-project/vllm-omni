@@ -329,6 +329,44 @@ def test_async_speculative_reuses_only_consumed_forward_rows(samples, expected):
     assert result["meta"]["consumed_input_span"] is True
 
 
+def test_consumed_batch_mask_keeps_ragged_request_boundaries_and_skips_unowned_rows():
+    # Prompt, zero/partial/full accepted drafts, discarded decode, ordinary
+    # decode, and an empty sample share one batch with different query widths.
+    mm = _prepare(
+        consumed=True,
+        samples=(
+            (3, -1, -1, -1),
+            (21, -1, -1, -1),
+            (31, 32, 33, -1),
+            (41, 42, 100, -1),
+            (51, -1, -1, -1),
+            (61, 62, 63, 64),
+            (-1, 100, 101, -1),
+        ),
+        inputs=(1, 2, 3, 4, 5, 20, 21, 22, 23, 30, 31, 40, 41, 42, 50, 60, 61, 62, 63, 70, 71),
+        req_ids=("prompt", "zero", "discard", "partial", "ordinary", "full", "empty"),
+        speculative_ids={"zero", "discard", "partial", "full", "empty"},
+        invalid=(2,),
+        offsets=(0, 5, 9, 11, 14, 15, 19, 21),
+        embed=lambda ids: pytest.fail("extra embedding lookup"),
+    )
+    stage = mm[STAGING_KEY]
+    assert stage["indices"] == (1, 3, 5, 6)
+    assert stage["offsets"] == (0, 4, 7, 11, 13)
+    assert stage["ids"].tolist() == [20, -1, -1, -1, 40, 41, -1, 60, 61, 62, 63, -1, -1]
+    result = finalize_speculative_payload(mm)[STAGING_KEY]
+    for idx, expected in ((1, [20]), (3, [40, 41]), (5, [60, 61, 62, 63]), (6, [])):
+        assert result[idx]["ids"]["output"] == expected
+        assert result[idx]["hidden_states.layer_0"].shape == (len(expected), 1)
+        assert result[idx]["hidden_states.layer_0"].flatten().tolist() == [x * 10 for x in expected]
+        assert result[idx]["meta"] == {
+            "decode_span": True,
+            "consumed_input_span": True,
+            "committed_token_count": len(expected),
+        }
+    assert all(result[idx] is None for idx in (0, 2, 4))
+
+
 @pytest.mark.parametrize("consumed", [False, True])
 def test_mixed_partial_prefill_and_decode_preserves_prompt_rows(consumed):
     calls = []
