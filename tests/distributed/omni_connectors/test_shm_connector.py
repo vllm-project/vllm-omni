@@ -588,12 +588,24 @@ def test_waiter_does_not_read_fd_reused_after_close(monkeypatch, tmp_path):
 
 
 def test_deployment_scope_survives_different_worker_parents(monkeypatch):
-    config = {"stage_id": 1, "extra": {"wakeup_scope": uuid.uuid4().hex}}
+    from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        load_omni_transfer_config,
+        resolve_connector_spec,
+    )
+
+    # Build connectors the way stage workers do: the launcher stores the scope
+    # in the edge's extra, and the factory passes that extra as the config.
+    transfer_config = load_omni_transfer_config(
+        config_dict={"stage_args": [{"stage_id": 0}, {"stage_id": 1, "engine_input_source": [0]}]}
+    )
+    edge = transfer_config.connectors[("0", "1")]
     monkeypatch.setattr(os, "getppid", lambda: 111)
-    receiver = SharedMemoryConnector(config)
+    receiver = OmniConnectorFactory.create_connector(resolve_connector_spec(edge, stage_id=1, role="receiver"))
     monkeypatch.setattr(os, "getppid", lambda: 222)
-    sender = SharedMemoryConnector(config)
+    sender = OmniConnectorFactory.create_connector(resolve_connector_spec(edge, stage_id=0, role="sender"))
     try:
+        assert receiver._wake_directory == sender._wake_directory
         generation = receiver.get_wakeup_generation()
         sender._wake_receiver(1)
         assert receiver.wait_for_change(generation, timeout=0.1)

@@ -210,8 +210,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
-        group = getattr(self.vllm_config, "weight_sharing", None)
-        if getattr(group, "role", None) == "provider":
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+        if resolve_worker_sharing(self.vllm_config, role="provider") is not None:
             raise ValueError(
                 "weight sharing role='provider' requires the Model Runner V2 path; "
                 "the MRv1 runner cannot publish a shared backbone"

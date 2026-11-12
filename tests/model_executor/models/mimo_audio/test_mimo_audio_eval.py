@@ -68,5 +68,6 @@ def test_constructor_disables_dropout_before_capture(monkeypatch, module_name):
     model = mimo_audio_llm.MiMoAudioLLMForConditionalGeneration(vllm_config=vllm_config)
     transformer = getattr(model, module_name)
 
+    assert model.local_sampler.do_sample is True
     assert captured_training[module_name] is False
     assert all(not module.training for module in transformer.modules())

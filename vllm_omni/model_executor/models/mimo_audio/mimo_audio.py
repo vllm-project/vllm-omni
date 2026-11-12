@@ -875,6 +875,10 @@ class MiMoAudioForConditionalGeneration(
                 },
             )
 
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        if self.fused_thinker_talker is not None:
+            self.fused_thinker_talker.on_requests_finished(finished_req_ids)
+
     def generate_codes(
         self,
         input_ids: torch.Tensor,
