@@ -1046,19 +1046,6 @@ source_file_dependencies:
     - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - .buildkite/amd/scripts/assert-pytest-collection.sh
 
-  diffusion_qwen_image_perf:
-    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
-    - .buildkite/amd/scripts/assert-pytest-collection.sh
-    - .buildkite/amd/scripts/validate-qwen-image-perf.py
-    - tests/dfx/conftest.py
-    - tests/helpers/hardware.py
-    - tests/helpers/mark.py
-    - tests/conftest.py
-    - benchmarks/diffusion/
-    - *qwen_image
-    - tests/dfx/perf/scripts/run_diffusion_benchmark.py
-    - tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-
   diffusion_qwen_image_21_perf:
     - *qwen_image_21
     - tests/dfx/perf/scripts/run_benchmark.py
@@ -1085,6 +1072,22 @@ source_file_dependencies:
   diffusion_hunyuan_image3_function:
     - *hunyuan_image3
     - tests/e2e/offline_inference/test_hunyuanimage3_i2t_expansion.py
+
+  diffusion_hunyuan_image3_weight_sharing:
+    - *hunyuan_image3
+    - vllm_omni/distributed/weight_sharing/
+    - vllm_omni/config/
+    - vllm_omni/engine/
+    - vllm_omni/worker/gpu_ar_worker.py
+    - vllm_omni/worker/gpu_ar_model_runner.py
+    - vllm_omni/worker_v2/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/deploy/hunyuan-image-3-weight-sharing.yaml
+    - vllm_omni/deploy/hunyuan-image-3-mooncakeconnector.yaml
+    - tests/e2e/offline_inference/test_hunyuanimage3.py
+    - tests/helpers/
+    - tests/e2e/accuracy/helpers.py
 
   diffusion_hunyuan_image3_accuracy:
     - *hunyuan_image3

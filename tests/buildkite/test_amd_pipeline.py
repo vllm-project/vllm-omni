@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import ast
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -191,7 +193,7 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
     assert "VLLM_ROCM_USE_AITER=1" not in command
     assert "AITER_JIT_DIR" not in command
     assert QWEN_IMAGE_SMOKE_NODE in command
-    assert "advanced_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level advanced_model" in command
     assert "full_model" not in command
     assert "Expected exactly one executed Qwen-Image MERGE test" in command
@@ -199,15 +201,16 @@ def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
 
 
 QWEN_IMAGE_BATCH_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]"
-_QWEN_IMAGE_BATCH_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
-_QWEN_IMAGE_BATCH_MERGE_MARKER = "advanced_model and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_READY_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
+_QWEN_IMAGE_BATCH_MERGE_MARKER = "slow and diffusion and rocm and MI325 and cards_1"
 
 
 def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
-    """READY runs the batch node at core_model. MERGE runs it at advanced_model.
+    """READY runs the batch node at core_model depth. MERGE runs it at advanced_model depth.
 
-    The single-request MERGE smoke stays. Nightly does not gain this node.
-    Step and command timeouts are copied from that smoke, not measured here.
+    Both jobs select the same ``slow`` mark. The single-request MERGE smoke stays.
+    Nightly does not gain this node. Step and command timeouts are copied from that
+    smoke, not measured here.
     """
     ready = _find_step("READY · Qwen-Image Batch", AMD_READY_PIPELINE)
     merge = _find_step("MERGE · Qwen-Image Batch", AMD_MERGE_PIPELINE)
@@ -215,7 +218,7 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
     ready_command = "\n".join(ready["commands"])
     merge_command = "\n".join(merge["commands"])
     source = Path("tests/e2e/online_serving/test_qwen_image.py").read_text(encoding="utf-8")
-    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.core_model", 1)[1]
+    batch_head = source.split("def test_batch_001", 1)[0].rsplit("@pytest.mark.slow", 1)[1]
 
     for step, command, marker, artifact, message in (
         (
@@ -252,9 +255,12 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
         assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
     assert "--run-level core_model" in ready_command
-    assert "advanced_model" not in ready_command
+    assert "--run-level advanced_model" not in ready_command
     assert "--run-level advanced_model" in merge_command
-    assert "core_model" not in merge_command
+    assert "--run-level core_model" not in merge_command
+    assert "@pytest.mark.core_model" not in source
+    assert "@pytest.mark.advanced_model" not in source
+    assert "@pytest.mark.full_model" not in source
     assert QWEN_IMAGE_BATCH_NODE not in "\n".join(smoke["commands"])
     assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_BATCH_NODE) == []
     assert "SINGLE_CARD_FEATURE_MARKS" in batch_head
@@ -303,7 +309,7 @@ def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> 
     assert len(collect_nodes) == 1
     assert run_nodes == collect_nodes
 
-    expected_markers = f"full_model and diffusion and rocm and MI325 and cards_{card_count}"
+    expected_markers = f"slow and diffusion and rocm and MI325 and cards_{card_count}"
     assert collect_argv[collect_argv.index("-m") + 1] == expected_markers
     assert run_argv[run_argv.index("-m") + 1] == expected_markers
     assert collect_argv[collect_argv.index("--run-level") + 1] == "full_model"
@@ -1165,7 +1171,10 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1676,6 +1685,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     base = resolve_deploy_yaml("vllm_omni/deploy/hunyuan_image3_dit.yaml")
     base_parallel = base["stages"][0]["parallel_config"]
     reliability = Path("tests/dfx/reliability/test_hunyuan_image.py").read_text(encoding="utf-8")
+    reliability_fixtures = Path("tests/dfx/conftest.py").read_text(encoding="utf-8")
     startup = Path("tests/dfx/reliability/test_hunyuan_image_ep_startup.py").read_text(encoding="utf-8")
     accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     step = _find_step("HunyuanImage Expert Parallel Startup", AMD_WEEKLY_PIPELINE)
@@ -1693,6 +1703,10 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit.yaml" in reliability
     assert '"parallel_config.enable_expert_parallel": False' in reliability
     assert 'params["update"]' in reliability
+    assert 'params["stage_init_timeout"] = 1800' in reliability
+    assert 'params["init_timeout"] = 2100' in reliability
+    assert 'stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout")' in reliability_fixtures
+    assert 'init_timeout=runtime_params_by_name[test_name].get("init_timeout")' in reliability_fixtures
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in reliability
     assert "hunyuan_image3_dit.yaml" in startup
     assert "send_health_http_request" in startup
@@ -1877,6 +1891,46 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
+
+
+def test_ming_weekly_uses_rocm_stage_init_allowance() -> None:
+    path = Path("tests/e2e/offline_inference/test_ming_flash_omni_expansion.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assignments: dict[str, ast.AST] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Name):
+                assignments[target.id] = statement.value
+
+    timeout = assignments["MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"]
+    assert isinstance(timeout, ast.Constant)
+    assert ast.literal_eval(timeout) == 1800
+
+    rocm_kwargs = assignments["_ROCM_STAGE_INIT_KWARGS"]
+    assert isinstance(rocm_kwargs, ast.IfExp)
+    assert ast.unparse(rocm_kwargs.test) == "current_omni_platform.is_rocm()"
+    assert isinstance(rocm_kwargs.body, ast.Dict)
+    assert len(rocm_kwargs.body.keys) == 1
+    timeout_key = rocm_kwargs.body.keys[0]
+    assert isinstance(timeout_key, ast.Constant)
+    assert timeout_key.value == "stage_init_timeout"
+    assert len(rocm_kwargs.body.values) == 1
+    timeout_ref = rocm_kwargs.body.values[0]
+    assert isinstance(timeout_ref, ast.Name)
+    assert timeout_ref.id == "MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S"
+    assert isinstance(rocm_kwargs.orelse, ast.Dict)
+    assert not rocm_kwargs.orelse.keys
+
+    for params_name in ("test_params_thinker", "test_params"):
+        params = assignments[params_name]
+        assert isinstance(params, ast.ListComp)
+        assert isinstance(params.elt, ast.Tuple)
+        assert len(params.elt.elts) == 3
+        kwargs_ref = params.elt.elts[2]
+        assert isinstance(kwargs_ref, ast.Name)
+        assert kwargs_ref.id == "_ROCM_STAGE_INIT_KWARGS"
 
 
 @pytest.mark.parametrize(
@@ -2380,7 +2434,7 @@ def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert "--run-level full_model" in commands
     assert "--collect-only" in commands
     nodes = (
@@ -2410,13 +2464,13 @@ WAN22_2GPU_NODES = (
 )
 
 
-def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+def test_wan22_accuracy_has_one_blocking_comparison_job() -> None:
     two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
     group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
     assert two["agent_pool"] == "mi300_2"
     two_commands = "\n".join(two["commands"])
-    assert two["grade"] == "NonBlocking"
+    assert two["grade"] == "Blocking"
     assert two["timeout_in_minutes"] == 180
     assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
@@ -2466,9 +2520,9 @@ def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
     require_similarity_artifacts(paths)
 
 
-def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuan_image3_lora_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_4"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2489,9 +2543,9 @@ def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanImage3 LoRA Accuracy" not in text
 
 
-def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuanvideo15_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2521,7 +2575,7 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanVideo-1.5 Video Similarity" not in text
 
 
-def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> None:
     timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
     i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert timeline["agent_pool"] == "mi300_2"
@@ -2539,7 +2593,7 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         ),
     )
     for step, marker, path in pairs:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if step is timeline else "NonBlocking")
         assert step["timeout_in_minutes"] == 180
         assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
         commands = "\n".join(step["commands"])
@@ -2869,7 +2923,7 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
     commands = "\n".join(step["commands"])
-    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "slow and diffusion and rocm and MI325 and cards_1" in commands
     assert '-k "2i_matches_diffusers"' in commands
     assert "test_diffusers_backend_t2i_matches_diffusers" in commands
     assert "Expected exactly one Qwen-Image backend similarity node" in commands
@@ -2879,9 +2933,57 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     assert "Expected exactly one executed Qwen-Image backend similarity test" in commands
     accuracy_test = Path("tests/e2e/accuracy/test_diffusers_backend_similarity.py").read_text(encoding="utf-8")
     assert "torch.version.hip is not None" in accuracy_test
+    assert "@pytest.mark.slow" in accuracy_test
+    assert "pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]" not in accuracy_test
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+_NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
+    ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
+    ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
+    ("Qwen2.5-Omni Documentation Examples", 7, "Qwen2.5-Omni documentation", "QWEN25_OMNI_DOC_ARTIFACT_DIR"),
+    ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
+    ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
+    (
+        "HunyuanVideo-1.5 Video Similarity",
+        6,
+        "HunyuanVideo-1.5 video similarity",
+        "ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR",
+    ),
+    ("MiniMax-H3 Timeline Guide Accuracy", 1, "MiniMax-H3 timeline accuracy", "ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env", _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_promoted_nightly_accuracy_doc_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    pytest_status = 1 if scenario == "pytest-failure" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_status = {"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5)
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-promotion-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 def _assert_nightly_junit_guard(
@@ -3268,7 +3370,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             one,
             "mi300_1",
-            "full_model and diffusion and rocm and MI325 and cards_1",
+            "slow and diffusion and rocm and MI325 and cards_1",
             "artifacts/rocm-qwen-image-expansion-1gpu/**/*",
             (
                 "cpu_offload",
@@ -3281,7 +3383,7 @@ def test_qwen_image_expansion_has_separate_blocking_card_jobs() -> None:
         (
             two,
             "mi300_2",
-            "full_model and diffusion and rocm and MI325 and cards_2",
+            "slow and diffusion and rocm and MI325 and cards_2",
             "artifacts/rocm-qwen-image-expansion-2gpu/**/*",
             (
                 "ulysses_2",
@@ -4428,8 +4530,8 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert path not in r2_01_command
 
 
-_DRAMA3_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
-_DRAMA3_MERGE_MARKER = "advanced_model and tts and rocm and MI325 and cards_1"
+_DRAMA3_READY_MARKER = "slow and tts and rocm and MI325 and cards_1"
+_DRAMA3_MERGE_MARKER = "slow and tts and rocm and MI325 and cards_1"
 _DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_EXCLUDED = (
     "test_voice_clone_streaming_002",
@@ -4463,7 +4565,8 @@ def test_drama3_ready_requires_one_blocking_text_to_audio_node() -> None:
     assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
     assert command.count('--run-level "core_model"') == 2
     assert "full_model" not in command
-    assert command.count(_DRAMA3_READY_NODE) == 1
+    # nodes= + collect-only + run, same as MERGE text-to-audio.
+    assert command.count(_DRAMA3_READY_NODE) == 3
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
     assert "diff -u /tmp/drama3-ready-expected.txt" in command
@@ -4519,8 +4622,9 @@ def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
     assert command.count(_DRAMA3_READY_NODE) == 3
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
-    assert "@pytest.mark.core_model" in selected
-    assert "@pytest.mark.advanced_model" in selected
+    assert "@pytest.mark.slow" in selected
+    assert "@pytest.mark.core_model" not in selected
+    assert "@pytest.mark.advanced_model" not in selected
     text_to_audio = source.split("def test_voice_clone_streaming_002", 1)[0]
     assert "send_audio_speech_request" in text_to_audio
     assert 'run_level not in {"advanced_model", "full_model"}' in speech_gate
@@ -4826,7 +4930,7 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     assert step["timeout_in_minutes"] == 60
     assert step["artifact_paths"] == ["artifacts/rocm-tiny-diffusion-base/**/*"]
@@ -4858,6 +4962,42 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
         AMD_NIGHTLY_PIPELINE,
     )
     assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["pass", "subtests", "missing", "duplicate", "wrong-node", "skipped", "failure", "error", "subtest-skip"],
+)
+def test_tiny_diffusion_base_ready_checks_executed_nodes(tmp_path: Path, scenario: str) -> None:
+    step = _find_step("ROCm · Tiny Diffusion Base GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    guard = split(command[command.index("python -c ") :])[2]
+    expected = tmp_path / "expected.txt"
+    expected.write_text("\n".join(_TINY_DIFFUSION_BASE_NODES), encoding="utf-8")
+    root = ET.Element("testsuites")
+    # Pytest 9 counts successful subtests in this total without adding testcase nodes.
+    suite = ET.SubElement(
+        root, "testsuite", tests="80" if scenario == "subtests" else "22", skipped="0", failures="0", errors="0"
+    )
+    for node in _TINY_DIFFUSION_BASE_NODES:
+        module, name = node.split("::", 1)
+        ET.SubElement(suite, "testcase", classname=module.removesuffix(".py").replace("/", "."), name=name)
+    if scenario == "missing":
+        suite.remove(suite[-1])
+    elif scenario == "duplicate":
+        suite[-1].attrib.update(suite[0].attrib)
+    elif scenario == "wrong-node":
+        suite[-1].set("name", "unexpected_test")
+    elif scenario in {"skipped", "failure", "error"}:
+        ET.SubElement(suite[-1], scenario)
+    elif scenario == "subtest-skip":
+        suite.set("skipped", "1")
+    report = tmp_path / "pytest.xml"
+    ET.ElementTree(root).write(report)
+    result = subprocess.run(
+        [sys.executable, "-c", guard, str(report), str(expected)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == (0 if scenario in {"pass", "subtests"} else 5), result.stdout + result.stderr
 
 
 _DISTRIBUTED_BUFFER_READY_LABEL = "ROCm · Distributed Buffer GPU Smokes"
