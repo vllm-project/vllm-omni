@@ -991,6 +991,33 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
+def test_gepard_kokoro_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    expected_dependencies = {
+        "TTS · Gepard-1.0 · L4": "tts_gepard_weekly",
+        "TTS · Kokoro-82M · L4": "tts_kokoro_weekly",
+    }
+    for label, dependency in expected_dependencies.items():
+        matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+        assert len(matching_steps) == 1
+        assert matching_steps[0]["source_file_dependencies"] == dependency
+
+    group = next(step for step in doc["steps"] if "Gepard and Kokoro Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    changed_files = {
+        "tests/e2e/online_serving/test_gepard_tts.py": "TTS · Gepard-1.0 · L4",
+        "tests/e2e/offline_inference/test_kokoro.py": "TTS · Kokoro-82M · L4",
+    }
+    for changed_file, label in changed_files.items():
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert not set(expected_dependencies) & set(
+        _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+    )
+
+
 @pytest.mark.parametrize(
     ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
     [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
