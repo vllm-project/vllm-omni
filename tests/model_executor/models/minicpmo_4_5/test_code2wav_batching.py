@@ -1291,10 +1291,13 @@ def test_att_slot_pool_round_trips_the_split_kv_layout():
         assert torch.equal(pool_row[..., suffix : suffix + streaming, :], cache_half[..., :streaming, :])
 
     # Materialization follows a reordered layout: ``layout`` lists the
-    # streaming frames' physical order and the suffix frames follow it, so
-    # a permuted layout must read back in exactly that order.
+    # streaming frames' physical order and the suffix frames follow it. The
+    # expected physical order is spelled out here rather than read back from
+    # ``physical_frames()``, which is the same view ``materialize()``
+    # consumes -- an ordering regression there must fail this assert, not
+    # agree with itself.
     handle.layout = [4, 2, 3]
-    expected = torch.stack([slot[..., index, :] for index in handle.physical_frames()], dim=5)
+    expected = torch.stack([slot[..., index, :] for index in [4, 2, 3, *range(suffix)]], dim=5)
     assert torch.equal(handle.materialize(), expected)
 
     # A cache on any other layout fails loudly instead of aliasing wrong axes.
