@@ -125,24 +125,33 @@ def select_temporal_window(
         t = tail.shape[2] if i == num_chunks - 1 and tail is not None else 0
         shape = (*z.shape[:2], stop - offset + h + t, *z.shape[-2:])
         clips.append(describe_tiles(model, shape, i, (offset, stop, h, t)))
+    budget_cap = 2 * 1024**3
+    planning_args = {
+        "output_bytes_per_latent_pixel": 3 * 4 * model.vae_ratio_t * model.vae_ratio**2,
+        "input_element_bytes": z.element_size(),
+    }
+    plan = plan_temporal_schedule(tuple(clips), world_size, budget_bytes=budget_cap, **planning_args)
+    # A lower free-memory budget can only remove candidates. If even the cap
+    # selects native W1, every rank can skip device queries and the MIN safely.
+    if not plan.optimized:
+        logger.info(
+            "H3 VAE scheduling requested=true selected=false group=%d window=1 budget_cap=%d reason=%s",
+            world_size,
+            budget_cap,
+            plan.reason,
+        )
+        return 1
     module = torch.get_device_module(z.device)
     free, _ = module.mem_get_info(z.device)
     # Reserve >=75% of free memory for native activations/fragmentation and
     # bound incremental live outputs/gather storage without changing precision.
-    budget = min(2 * 1024**3, free // 4)
+    budget = min(budget_cap, free // 4)
     control_device = "cpu" if dist.get_backend(process_group) == "gloo" else z.device
     shared = torch.tensor(budget, dtype=torch.int64, device=control_device)
     dist.all_reduce(shared, op=dist.ReduceOp.MIN, group=process_group)
     budget = int(shared.item())
-    plan = plan_temporal_schedule(
-        tuple(clips),
-        world_size,
-        budget_bytes=budget,
-        # RGB float32 decoded tiles; t*ratio_t is a conservative temporal
-        # bound, including a short tail. N and spatial dimensions remain real.
-        output_bytes_per_latent_pixel=3 * 4 * model.vae_ratio_t * model.vae_ratio**2,
-        input_element_bytes=z.element_size(),
-    )
+    if budget < budget_cap:
+        plan = plan_temporal_schedule(tuple(clips), world_size, budget_bytes=budget, **planning_args)
     logger.info(
         "H3 VAE scheduling requested=true selected=%s group=%d window=%d budget=%d reason=%s",
         plan.optimized,

@@ -398,3 +398,24 @@ def test_all_clips_decode_once_without_calibration_prefix(window):
     actual = list(_iter_decoded_clips(model, z, head, tail, 7, decode, window_plan=plan))
     assert len(calls) == 7
     assert all(i == j and torch.equal(a, b) for (i, a), (j, b) in zip(reference, actual))
+
+
+def test_memory_cap_native_fallback_skips_device_query_and_collective(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae_window import select_temporal_window
+
+    model = _TileModel(False)
+    model.use_vit_decoder = True
+    # Large output storage makes every beneficial window exceed the cap.
+    # No tensors of this projected size are allocated by the planner.
+    model.vae_ratio_t = 10**9
+    monkeypatch.setattr(torch, "get_device_module", lambda *args: pytest.fail("W1 must not query device memory"))
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.vae_window.dist.all_reduce",
+        lambda *args, **kwargs: pytest.fail("W1 must not issue a control collective"),
+    )
+    assert (
+        select_temporal_window(
+            model, torch.zeros(1, 3, 7, 6, 8), None, None, 3, rank=0, world_size=8, process_group=None
+        )
+        == 1
+    )

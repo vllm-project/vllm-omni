@@ -159,7 +159,9 @@ runs replicated to avoid empty-rank gathers. Stacked tiling and unsupported
 checkpoint contracts retain the native path.
 
 Window selection considers W=1 through min(16, clip count), including short
-tails. It minimizes integer assignment waste within an incremental memory
+tails. If the fixed2GiB cap already selects W1, the native path skips the
+device memory query and group reduction; a smaller free-memory budget cannot
+make a larger window preferable. It minimizes integer assignment waste within an incremental memory
 budget of at most 2 GiB and one quarter of the minimum free memory across
 video ranks. The reserve accounts for tile outputs, stitching, gather storage
 and input context copies; it is not a universal allocator/workspace bound.
