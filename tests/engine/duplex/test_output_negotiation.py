@@ -151,7 +151,7 @@ def test_text_history_does_not_wait_for_playback(policy, complete_audio_metadata
 
 @pytest.mark.parametrize("text", ["", " ", "\n", "\t \n"])
 @pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
-def test_whitespace_only_text_does_not_create_history_or_snapshots(text, policy):
+def test_whitespace_only_text_does_not_create_history(text, policy):
     session = DuplexEngineSession(
         session_id="blank", config=DuplexSessionConfig(playback_commit_policy=policy), capabilities=_caps()
     )
@@ -160,10 +160,9 @@ def test_whitespace_only_text_does_not_create_history_or_snapshots(text, policy)
     assert session.end_response() is None
     assert session.history == ()
     assert not session.pending_history_item_ids
-    assert not session._conversation.assistant_response_snapshots
-    assert not session._conversation.history_item_placeholders
     session.finalize_response_playback(response)
-    assert not session._playback.by_response
+    assert session.history == ()
+    assert not session.pending_history_item_ids
 
 
 @pytest.mark.parametrize("text_override", [False, True])
@@ -173,11 +172,28 @@ def test_speech_deployment_keeps_playback_policy_for_text_response_override(text
         session.reserve_response_options(ResponseCreateOptions(modalities=("text",)))
     response = session.begin_response()
     session.append_assistant_text(" emitted text ")
-    session.mark_audio_sent(None, text_requires_complete_audio=True)
+    session.mark_audio_sent(100, text_requires_complete_audio=True)
     # A text request on a speech deployment does not establish TTS bypass.
     assert session.end_response() is None
     assert session.history == ()
-    assert session._conversation.assistant_response_snapshots[response][0]["content"] == "emitted text"
+    assert session.pending_history_item_ids[f"item_{response}"] == {"role": "assistant", "content": "emitted text"}
+
+
+@pytest.mark.parametrize("policy", ["ack_only", "commit_all_on_done"])
+def test_speech_deployment_commits_text_override_without_audio_or_ack(policy):
+    session = DuplexEngineSession(session_id="speech", config=DuplexSessionConfig(playback_commit_policy=policy))
+    session.reserve_response_options(ResponseCreateOptions(modalities=("text",)))
+    response = session.begin_response()
+    session.append_assistant_text("emitted text")
+    # No audio output or audio-completion dependency: no playback ACK can arrive.
+    assert session.playback.generated_ms == session.playback.sent_ms == 0
+    message = session.end_response()
+    assert message == {"role": "assistant", "content": "emitted text"}
+    session.register_history_item(f"item_{response}", message)
+    session.finalize_response_playback(response)
+    assert session.history == (message,)
+    assert not session.pending_history_item_ids
+    assert session.active_response_id is None
 
 
 @pytest.mark.parametrize("field", ["modalities", "output_modalities"])
