@@ -864,7 +864,7 @@ class StagePool:
             (
                 str(reason)
                 for request_output in reversed(request_outputs)
-                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                for completion in reversed(iter_request_output_items(request_output))
                 if (reason := getattr(completion, "finish_reason", None)) is not None
             ),
             None,

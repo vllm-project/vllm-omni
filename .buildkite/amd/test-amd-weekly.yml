@@ -1015,6 +1015,86 @@ steps:
             fi
             (exit "$$status")
 
+      # CUDA weekly runs the same three Audex files together. Keep the ROCm
+      # lane file-identical while recording exact collection and JUnit counts.
+      - label: "Audex offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_audex_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-audex-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_audex_tts.py
+            5 tts rocm-audex-weekly
+            tests/e2e/offline_inference/test_audex_s2t.py
+            tests/e2e/offline_inference/test_audex_tta.py
+
+      # This exact full-weight case previously ran on AMD nightly. Move it to
+      # weekly beside its CUDA counterpart and remove retry masking for burn-in.
+      - label: "CosyVoice3 offline · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 105
+        source_file_dependencies: tts_cosyvoice3_function
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-cosyvoice3-offline-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=75
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_cosyvoice3_expansion.py
+            2 tts rocm-cosyvoice3-offline-weekly
+
+      # Match CUDA's full Qwen3-TTS word-timestamp file on one MI325. The
+      # forced aligner is part of this path, so keep all three API modes here.
+      - label: "Qwen3-TTS word timestamps · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: tts_qwen3_tts_function
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-word-timestamps-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=90
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
+            3 tts rocm-qwen3-tts-word-timestamps-weekly
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"
