@@ -59,6 +59,17 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+## Shared RMSNorm residual precision on NPU
+
+The shared `RMSNorm.forward_npu` materializes `residual + x` in the input
+dtype before calling `torch_npu.npu_rms_norm` by default. This preserves the
+native path's rounding boundary for reduced-precision residual addition.
+`enable_fused_add_norm=True` opts into `torch_npu.npu_add_rms_norm`, whose
+normalization can consume the sum before input-dtype rounding. This flag is
+specific to the NPU forward method; model integrations must validate numerical
+behavior before opting into fusion. Calls without a residual still use
+`npu_rms_norm`.
+
 ## Weight reloading
 
 Pipelines that support live RL weight updates opt in with

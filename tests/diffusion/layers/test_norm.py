@@ -342,9 +342,12 @@ def test_rmsnorm_dtype_matches_parameter_and_fp32_accumulation_contract():
     torch.testing.assert_close(norm.forward_native(x), expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("enable_fused_add_norm", [None, False, True])
 @pytest.mark.cpu
-def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.MonkeyPatch):
-    """The NPU fused op receives the bf16 checkpoint gamma used by H3."""
+def test_rmsnorm_npu_receives_gamma_with_configured_dtype(
+    monkeypatch: pytest.MonkeyPatch, enable_fused_add_norm: bool | None
+):
+    """Without a residual, either fusion setting uses the same NPU RMSNorm."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, torch.Tensor] = {}
@@ -359,22 +362,31 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
     norm = RMSNorm(64, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
 
-    assert norm.forward_npu(x) is x
+    if enable_fused_add_norm is None:
+        output = norm.forward_npu(x)
+    else:
+        output = norm.forward_npu(x, enable_fused_add_norm=enable_fused_add_norm)
+
+    assert output is x
     assert captured["gamma"] is norm.weight
     assert captured["gamma"].dtype == torch.bfloat16
     assert captured["epsilon"].item() == pytest.approx(1e-5)
 
 
 @pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("enable_fused_add_norm", [None, False, True])
 @pytest.mark.cpu
-def test_rmsnorm_npu_dispatch_falls_back_for_cpu_tensor(with_residual: bool):
+def test_rmsnorm_npu_dispatch_falls_back_for_cpu_tensor(with_residual: bool, enable_fused_add_norm: bool | None):
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     norm = RMSNorm(64, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
     residual = torch.randn_like(x) if with_residual else None
 
-    actual = norm.forward_npu(x, residual)
+    if enable_fused_add_norm is None:
+        actual = norm.forward_npu(x, residual)
+    else:
+        actual = norm.forward_npu(x, residual, enable_fused_add_norm=enable_fused_add_norm)
     expected = norm.forward_native(x, residual)
 
     if with_residual:
@@ -445,7 +457,7 @@ def test_rmsnorm_non_npu_residual_delegates_to_native(
 
 @pytest.mark.cpu
 def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):
-    """NPU keeps the direct fused AddRMSNorm path instead of IR fallback."""
+    """Explicit opt-in retains the direct NPU fused AddRMSNorm path."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, object] = {}
@@ -471,7 +483,7 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
     x = torch.randn(2, 4, dtype=torch.bfloat16)
     residual = torch.randn(2, 4, dtype=torch.bfloat16)
 
-    output, updated_residual = norm.forward_npu(x, residual)
+    output, updated_residual = norm.forward_npu(x, residual, enable_fused_add_norm=True)
 
     assert output is fused_output
     assert updated_residual is fused_residual
@@ -479,6 +491,68 @@ def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.Monkey
     assert captured["residual"] is residual
     assert captured["gamma"] is norm.weight
     assert captured["epsilon"] == 1e-5
+
+
+@pytest.mark.parametrize("enable_fused_add_norm", [None, False], ids=["default", "disabled"])
+@pytest.mark.cpu
+def test_rmsnorm_npu_residual_rounds_before_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    enable_fused_add_norm: bool | None,
+):
+    """Public NPU dispatch preserves the BF16 add boundary unless fusion is enabled."""
+    from vllm_omni.diffusion.layers import custom_op
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, object] = {}
+
+    def npu_rms_norm(value: torch.Tensor, gamma: torch.Tensor, epsilon: float):
+        captured.update(value=value, gamma=gamma, epsilon=epsilon)
+        output = torch.nn.functional.rms_norm(value.float(), (value.shape[-1],), gamma.float(), epsilon)
+        return (output.to(value.dtype),)
+
+    fused_add_norm = mocker.Mock(side_effect=AssertionError("Fused AddRMSNorm requires explicit opt-in"))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_rms_norm=npu_rms_norm, npu_add_rms_norm=fused_add_norm),
+    )
+    mocker.patch.object(custom_op.current_omni_platform, "is_rocm", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_cuda", return_value=False)
+    mocker.patch.object(custom_op.current_omni_platform, "is_npu", return_value=True)
+    monkeypatch.setattr("vllm_omni.diffusion.layers.norm._is_npu_tensor", lambda _: True)
+
+    eps = 1e-5
+    norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16)
+    norm.weight.data.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0], dtype=torch.bfloat16))
+    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16)
+    residual = torch.tensor([[0.00390625, 0.0078125, -0.0078125, 0.015625]], dtype=torch.bfloat16)
+    x_before = x.clone()
+    residual_before = residual.clone()
+
+    expected_residual = torch.tensor([[1.0, -1.9921875, 3.0, -3.984375]], dtype=torch.bfloat16)
+    expected_fp32 = expected_residual.float()
+    expected_output = expected_fp32 * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps)
+    expected_output = (expected_output * norm.weight.float()).to(x.dtype)
+    unrounded_sum = x.float() + residual.float()
+    unrounded_output = unrounded_sum * torch.rsqrt(unrounded_sum.square().mean(-1, keepdim=True) + eps)
+    unrounded_output = (unrounded_output * norm.weight.float()).to(x.dtype)
+    assert not torch.equal(expected_output, unrounded_output)
+
+    if enable_fused_add_norm is None:
+        output, updated_residual = norm(x, residual)
+    else:
+        output, updated_residual = norm(x, residual, enable_fused_add_norm=enable_fused_add_norm)
+
+    fused_add_norm.assert_not_called()
+    assert captured["value"] is updated_residual
+    assert captured["gamma"] is norm.weight
+    assert captured["epsilon"] == eps
+    assert output.dtype == updated_residual.dtype == torch.bfloat16
+    torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(x, x_before, atol=0, rtol=0)
+    torch.testing.assert_close(residual, residual_before, atol=0, rtol=0)
 
 
 # ── RMSNorm compile-path regression tests ──
