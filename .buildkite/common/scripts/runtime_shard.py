@@ -382,7 +382,7 @@ def _spread_groups(groups: list[list[str]], count: int) -> list[list[str]] | Non
         fresh = [name for name in ordered if name not in assigned]
         if len(fresh) < len(missing):
             return None
-        for bin_index, name in zip(missing, fresh, strict=False):
+        for bin_index, name in zip(missing, fresh):
             assigned[name] = bin_index
             bins[bin_index].append(name)
         cursor = 0
@@ -631,7 +631,7 @@ def _marks_from_hardware_call(node: ast.Call) -> list[set[str]] | None:
     if not isinstance(res_node, ast.Dict):
         return None
     platforms: list[tuple[str, list[str]]] = []
-    for key, value in zip(res_node.keys, res_node.values, strict=False):
+    for key, value in zip(res_node.keys, res_node.values):
         if key is None:
             return None
         platform = _const_str(key)
@@ -671,7 +671,7 @@ def _card_counts(node: ast.AST | None, platforms: list[str]) -> dict[str, int] |
     if not isinstance(node, ast.Dict):
         return None
     specified: dict[str, int] = {}
-    for key, value in zip(node.keys, node.values, strict=False):
+    for key, value in zip(node.keys, node.values):
         if key is None:
             return None
         platform = _const_str(key)
