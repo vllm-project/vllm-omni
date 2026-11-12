@@ -678,6 +678,21 @@ def test_global_max_cpu_loras_keeps_diffusion_meaning_on_mixed_pipeline():
     assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 5
 
 
+@pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
+def test_llm_lora_cache_is_stage_scoped_regardless_of_cli_key_order(global_first):
+    stage_overrides = {"stage_0_enable_lora": True, "stage_0_max_loras": 2, "stage_0_max_cpu_loras": 4}
+    if global_first:
+        cli_overrides = {"max_cpu_loras": 1, **stage_overrides}
+    else:
+        cli_overrides = {**stage_overrides, "max_cpu_loras": 1}
+
+    config = _from_pipeline_key("bagel", cli_overrides=cli_overrides)
+
+    assert config.stage_by_id(0).lora_config.max_loras == 2
+    assert config.stage_by_id(0).lora_config.max_cpu_loras == 4
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 1
+
+
 def test_llm_lora_options_without_enable_lora_are_ignored():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
 

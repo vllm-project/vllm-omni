@@ -384,6 +384,10 @@ def _stage_cli_overrides(
             ),
             **stage_scoped,
         }
+    elif stage_scoped_lora and execution_type is not None:
+        # Filter global LoRA inputs before merging stage-scoped values so a
+        # diffusion cache size cannot overwrite an LLM stage's explicit value.
+        cli_overrides = {name: value for name, value in cli_overrides.items() if name not in _LLM_LORA_ENGINE_FIELDS}
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
@@ -404,12 +408,6 @@ def _stage_cli_overrides(
     # argument. Keep global and stage-scoped CLI values off AR/generation stages.
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
-        if stage_scoped_lora:
-            # Multi-stage pipelines take vLLM LoRA only from stage-scoped keys; a
-            # global max_cpu_loras beside a diffusion stage sizes only its cache.
-            for key in _LLM_LORA_ENGINE_FIELDS:
-                if f"stage_{stage_id}_{key}" not in cli_overrides:
-                    result.pop(key, None)
     if execution_type == StageExecutionType.DIFFUSION:
         prefix = f"stage_{stage_id}_"
         for key, value in cli_overrides.items():
