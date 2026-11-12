@@ -314,6 +314,7 @@ class VideoGenerationRequest(BaseModel):
     )
     flow_shift: float | None = Field(
         default=None,
+        allow_inf_nan=False,
         description="Scheduler flow_shift for video models (Wan2.2)",
     )
     true_cfg_scale: float | None = Field(

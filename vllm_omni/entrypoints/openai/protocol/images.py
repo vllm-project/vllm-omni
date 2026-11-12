@@ -154,7 +154,9 @@ class ImageGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     flow_shift: float | None = Field(
-        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+        default=None,
+        allow_inf_nan=False,
+        description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models.",
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
