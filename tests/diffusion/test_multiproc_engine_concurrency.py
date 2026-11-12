@@ -305,6 +305,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -418,6 +419,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -435,6 +437,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -463,6 +466,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -480,6 +484,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -500,6 +505,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -520,6 +526,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -548,6 +555,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -569,6 +577,7 @@ class TestRequestModeDispatch:
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
+            diffusion_attention_schedule=None,
         )
         executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
         scheduler_output = _make_sched_output("A", "B")
@@ -591,6 +600,7 @@ class TestRequestModeDispatch:
         executor, req_q, res_q = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -628,6 +638,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -1500,6 +1511,70 @@ class TestStageDiffusionClientErrorPropagation:
 
 
 class TestExecutorShutdownCleaner:
+    def test_worker_uses_hard_parent_death_signal(self, monkeypatch):
+        import vllm_omni.plugins as omni_plugins
+
+        events = []
+        worker_main = WorkerProc.worker_main
+
+        class StopWorkerError(Exception):
+            pass
+
+        class FakeWorkerProc:
+            def __init__(self, *args, **kwargs):
+                events.append(("worker", None))
+                raise StopWorkerError
+
+        monkeypatch.setattr(diffusion_worker_module, "configure_logging", lambda _: events.append(("logging", None)))
+        monkeypatch.setattr(
+            diffusion_worker_module.signal,
+            "signal",
+            lambda sig, _handler: events.append(("handler", sig)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "set_death_signal",
+            lambda sig: events.append(("death_signal", sig)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "destroy_distributed_env",
+            lambda: events.append(("destroy", None)),
+        )
+        monkeypatch.setattr(
+            diffusion_worker_module,
+            "_setup_diffusion_worker_proc_title_and_log_prefix",
+            lambda **_: None,
+        )
+        monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append(("plugins", None)))
+        monkeypatch.setattr(diffusion_worker_module, "WorkerProc", FakeWorkerProc)
+
+        with pytest.raises(StopWorkerError):
+            worker_main(
+                rank=0,
+                od_config=SimpleNamespace(
+                    log_level="INFO",
+                    parallel_config=SimpleNamespace(
+                        enable_expert_parallel=False,
+                        use_hsdp=False,
+                        hsdp_replicate_size=1,
+                    ),
+                ),
+                pipe_writer=Mock(),
+                broadcast_handle=None,
+                wake_event=Mock(),
+            )
+
+        assert events == [
+            ("logging", None),
+            ("handler", signal.SIGTERM),
+            ("handler", signal.SIGINT),
+            ("death_signal", signal.SIGKILL),
+            ("plugins", None),
+            ("worker", None),
+            ("destroy", None),
+        ]
+
     def test_worker_joins_share_one_global_deadline(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 
