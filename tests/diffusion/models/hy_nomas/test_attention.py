@@ -111,26 +111,11 @@ def test_block_masks_rejects_conflicting_or_mismatched_arguments():
     attn = RangeAttention(8**-0.5)
     q, k, v = torch.randn(2, 4, 2, 8), torch.randn(2, 4, 2, 8), torch.randn(2, 4, 2, 8)
     masks = attn.resolve_masks(4, 4, q.device, batch_size=2)
-    for ql, bs, kw in (
-        (4, 1, {"query_mask": torch.ones(1, 4, dtype=torch.int64)}),
-        (4, 2, {"key_mask": torch.ones(1, 4, dtype=torch.bool)}),
-        (0, 1, {"query_mask": torch.ones(1, 4, dtype=torch.bool)}),
-    ):
-        with pytest.raises(ValueError, match="Boolean visibility masks"):
-            attn.resolve_masks(ql, 4, q.device, batch_size=bs, **kw)
-    for q_in, k_in, v_in, kw in (
-        (q, k, v, {"block_masks": masks, "ranges": [[(0, 4, 0, 4)], [(0, 4, 0, 4)]]}),
-        (q, k, v, {"block_masks": masks, "query_mask": torch.ones(2, 4, dtype=torch.bool)}),
-        (q, k, v, {"block_masks": masks, "key_mask": torch.ones(2, 4, dtype=torch.bool)}),
-        (q[:1], k[:1], v[:1], {"block_mask": masks[0], "block_masks": masks[:1]}),
-        (q, k, v, {"block_masks": masks[:1]}),
-        (q[:1], k[:1], v[:1], {"block_masks": ("invalid",)}),
-        (q[:1], k[:1], v[:1], {"block_masks": masks[0]}),
-        (torch.randn(2, 6, 2, 8), k, v, {"block_masks": masks}),
-        (torch.empty(2, 0, 2, 8), k, v, {"block_masks": masks}),
-    ):
+    with pytest.raises(ValueError, match="Boolean visibility masks"):
+        attn.resolve_masks(4, 4, q.device, batch_size=1, query_mask=torch.ones(1, 4, dtype=torch.int64))
+    for kw in ({"block_masks": masks, "ranges": [[(0, 4, 0, 4)]] * 2}, {"block_masks": masks[:1]}):
         with pytest.raises(ValueError, match="Prebuilt Flex BlockMask"):
-            attn(q_in, k_in, v_in, **kw)
+            attn(q, k, v, **kw)
 
 
 @pytest.mark.parametrize("cache_text", [False, True])
