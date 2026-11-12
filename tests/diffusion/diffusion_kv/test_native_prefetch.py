@@ -170,6 +170,7 @@ def _config():
             kv_connector_extra_config={"mooncake_protocol": "tcp", "enable_kv_async_prefetch": True},
         ),
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        diffusion_kv_max_rows_per_request=2,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
     )
@@ -230,7 +231,7 @@ class _Connector:
         return False, None
 
 
-def _scheduler(monkeypatch, num_blocks=24):
+def _scheduler(monkeypatch, num_blocks=24, max_rows_per_request=2):
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.is_cuda", lambda: True)
     connector = _Connector()
     monkeypatch.setattr(
@@ -251,13 +252,16 @@ def _scheduler(monkeypatch, num_blocks=24):
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
     )
     scheduler = RequestScheduler()
+    od_config = _config()
+    od_config.diffusion_kv_max_rows_per_request = max_rows_per_request
     scheduler.initialize(
-        _config(),
+        od_config,
         kv_cache_config=config,
         scheduler_block_size=4,
         hash_block_size=4,
         kv_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=64),
+            scheduler_config=SimpleNamespace(max_num_seqs=od_config.max_num_seqs * max_rows_per_request),
             max_in_flight_tokens=64,
             cache_config=SimpleNamespace(enable_prefix_caching=False),
         ),
@@ -312,6 +316,19 @@ def test_scheduler_prefetches_one_waiting_request_and_reuses_allocation(monkeypa
     assert not output.kv_required_request_ids
     assert output.kv_finished_request_ids == {"A/0", "A/1"}
     assert connector.commits.count("B/0") == connector.commits.count("B/1") == 1
+
+
+def test_prefetch_fits_beside_the_running_request_in_the_factory_row_pool(monkeypatch):
+    # N=1 with two CFG rows gives a two-row Worker pool that A fills. B's
+    # prefetch holds blocks only, so it is still reserved and transferred.
+    scheduler, connector = _scheduler(monkeypatch, max_rows_per_request=2)
+    for rid in ("A", "B"):
+        scheduler.add_request(_request(rid))
+    output = scheduler.schedule()
+    assert output.scheduled_request_ids == ["A"]
+    assert output.kv_prefetch_connector_metadata == ("B/0", "B/1")
+    assert scheduler._diffusion_kv_manager.has_request("B")
+    assert connector.commits == ["A/0", "A/1", "B/0", "B/1"]
 
 
 def test_prefetch_capacity_failure_rolls_back_all_cfg_rows(monkeypatch):

@@ -130,11 +130,16 @@ class BaseScheduler(ABC):
                 raise ValueError("paged_scheduler Diffusion KV requires native scheduler/hash block sizes")
             if kv_vllm_config is None:
                 raise ValueError("paged_scheduler Diffusion KV requires the native VllmConfig used for cache sizing")
+            max_rows_per_request = od_config.diffusion_kv_max_rows_per_request
+            if max_rows_per_request is None:
+                raise ValueError("paged_scheduler Diffusion KV requires diffusion_kv_max_rows_per_request")
             self._diffusion_kv_manager = DiffusionKVCacheManager(
                 kv_cache_config,
                 max_model_len=kv_vllm_config.model_config.max_model_len,
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
+                max_rows_per_request=max_rows_per_request,
+                max_num_rows=kv_vllm_config.scheduler_config.max_num_seqs,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
                 enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
                 prefix_caching_hash_algo=getattr(
@@ -328,6 +333,8 @@ class BaseScheduler(ABC):
             scheduler_output.kv_transfer_request_ids = self._kv_transfer_request_ids
             self._kv_transfer_request_ids = set()
         if self._native_prefetch_enabled:
+            connector = self._kv_connector
+            assert connector is not None, "Native KV prefetch requires a KV connector"
             scheduler_output.kv_required_request_ids = self._loading_sequence_ids(self._running)
             # Flush current-request metadata before staging B. Mooncake
             # batches ready requests from the same producer into one write;
@@ -335,9 +342,7 @@ class BaseScheduler(ABC):
             self._try_native_prefetch()
             prefetch_finished_ids = self._kv_finished_request_ids - scheduler_output.kv_finished_request_ids
             if self._kv_transfer_request_ids or prefetch_finished_ids:
-                scheduler_output.kv_prefetch_connector_metadata = self._kv_connector.build_connector_meta(
-                    scheduler_output
-                )
+                scheduler_output.kv_prefetch_connector_metadata = connector.build_connector_meta(scheduler_output)
                 scheduler_output.kv_prefetch_request_ids = self._kv_transfer_request_ids
                 scheduler_output.kv_transfer_request_ids |= self._kv_transfer_request_ids
                 self._kv_transfer_request_ids = set()
@@ -359,6 +364,9 @@ class BaseScheduler(ABC):
         if state is None or state.is_finished() or not state.diffusion_kv_requests:
             return
         manager = self._diffusion_kv_manager
+        connector = self._kv_connector
+        if manager is None or connector is None:
+            return
         if manager.has_request(request_id):
             return
         matched_tokens = []
@@ -371,7 +379,7 @@ class BaseScheduler(ABC):
                 or params["num_transfer_tokens"] <= 0
             ):
                 return
-            num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
+            num_tokens, _ = connector.get_num_new_matched_tokens(request, 0)
             if num_tokens is None:
                 return
             matched_tokens.append(num_tokens)
@@ -397,7 +405,7 @@ class BaseScheduler(ABC):
         self._kv_request_generations[request_id] = allocation.allocation_generation
         try:
             transfer_ids = commit_kv_load(
-                self._kv_connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
+                connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
             )
         except KVTransferRegistrationError as exc:
             # Rollback may already notify the producer to release its pages.
