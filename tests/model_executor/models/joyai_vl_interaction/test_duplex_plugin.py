@@ -384,9 +384,18 @@ def test_async_chunk_disabled_reverts_the_whole_streaming_profile():
         RequestOutputKind.FINAL_ONLY,
         RequestOutputKind.DELTA,
     ]
-    # No Talker seed/temperature override: the yaml one-shot defaults apply.
-    assert configured[1].seed is None
-    assert configured[1].temperature == defaults[1].temperature
+    from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
+        JOYAI_TTS_SEED,
+        JOYAI_TTS_TEMPERATURE,
+    )
+
+    # One-shot Talker still uses FINAL_ONLY, but CustomVoice is pinned for the
+    # whole duplex profile (not only async_chunk=true).
+    assert configured[1].seed == JOYAI_TTS_SEED
+    assert configured[1].extra_args["tts_local_seed"] == JOYAI_TTS_SEED
+    assert configured[1].temperature == JOYAI_TTS_TEMPERATURE
+    assert configured[0].seed is None
+    assert configured[2].seed is None
 
     # Text is projected once, at the segment boundary, as before live text.
     assert not plugin.project_intermediate_output(
@@ -395,6 +404,24 @@ def test_async_chunk_disabled_reverts_the_whole_streaming_profile():
     assert plugin.project_intermediate_output(
         stage_id=0, output=object(), context=SimpleNamespace(segment_finished=True)
     )
+
+
+def test_joyai_system_prompt_extra_replaces_silence_persona():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    runtime = plugin.runtime_config_for_update(
+        DuplexSessionConfig(model="joyai", extra_body={"joyai_system_prompt": "Read aloud."}),
+        {},
+    )
+    assert plugin._system_prompt(runtime) == "Read aloud."
+    with_instructions = plugin.runtime_config_for_update(
+        DuplexSessionConfig(
+            model="joyai",
+            instructions="Keep going.",
+            extra_body={"joyai_system_prompt": "Read aloud."},
+        ),
+        {},
+    )
+    assert plugin._system_prompt(with_instructions) == "Read aloud.\n\nKeep going."
 
 
 def test_plan_partial_is_off_when_async_chunk_is_disabled():

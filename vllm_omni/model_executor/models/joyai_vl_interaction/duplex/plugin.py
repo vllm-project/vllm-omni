@@ -280,7 +280,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "max_tokens": config.max_tokens,
             **{
                 key: extra.get(key, default)
-                for key, default in (("tts_speaker", "Vivian"), ("tts_language", "Auto"), ("tts_instruct", ""))
+                for key, default in (
+                    ("tts_speaker", "Vivian"),
+                    ("tts_language", "Auto"),
+                    ("tts_instruct", ""),
+                    ("joyai_system_prompt", ""),
+                )
             },
         }
         # Delegation and chunk state are per-session bookkeeping, not session
@@ -322,21 +327,35 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     for key in ("temperature", "max_tokens"):
                         if runtime_config.get(key) is not None:
                             setattr(params, key, runtime_config[key])
-                elif index == talker_stage_id and self._async_chunk_streaming:
+                elif index == talker_stage_id:
                     from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
                         JOYAI_TTS_SEED,
                         JOYAI_TTS_TEMPERATURE,
                     )
 
-                    # Unseeded Talker (and MTP) is why each turn sounded like a
-                    # different speaker. The same seed also starts every turn's
-                    # first sentence from the same CustomVoice draw. Lowering
-                    # temperature keeps later sentences from drifting in rate
-                    # and pitch; the GPU runner does not reseed mid-request.
+                    # This plugin only loads for session_mode: duplex
+                    # (joyai_vl_interaction_duplex.yaml). Unseeded Talker (and
+                    # MTP) is why each turn sounded like a different speaker.
+                    # Pin seed/temperature on both async_chunk on and off so a
+                    # WER A/B measures chunking, not YAML 0.9 sampler drift.
+                    # The turn YAML never reaches this method.
                     apply_fixed_seed_to_sampling_params(params, JOYAI_TTS_SEED, seed_talker_mtp=True)
                     params.temperature = JOYAI_TTS_TEMPERATURE
             configured.append(params)
         return tuple(configured)
+
+    @staticmethod
+    def _system_prompt(runtime_config: Mapping[str, object]) -> str:
+        """Session system prompt: optional extra_body override, else silence persona."""
+        override = runtime_config.get("joyai_system_prompt")
+        if isinstance(override, str) and override.strip():
+            system = override.strip()
+        else:
+            system = SILENT_SYSTEM_PROMPT
+        instructions = runtime_config.get("instructions")
+        if instructions:
+            system += "\n\n" + str(instructions)
+        return system
 
     @staticmethod
     def _sync_visual_history(state: JoyAISessionState, history: Sequence[dict[str, object]]) -> tuple[str, ...]:
@@ -1336,7 +1355,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             self._drop_oldest_visual_frame(working_messages)
             images.pop(0)
             image_token_counts.pop(0)
-        system = SILENT_SYSTEM_PROMPT
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
@@ -1344,8 +1363,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         summary = session_config.get("joyai_summary")
         visual_summaries = [
             f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
@@ -1436,7 +1453,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             with open_image(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
                 image.thumbnail((448, 448))
                 images.append(image.convert("RGB").copy())
-        system = SILENT_SYSTEM_PROMPT
+        system = self._system_prompt(runtime_config)
         delegation = self.delegation_enabled(runtime_config)
         results_block, rendered_call_ids = "", []
         if delegation:
@@ -1444,8 +1461,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             results_block, rendered_call_ids = render_result_blocks(
                 unanswered_results(runtime_config, chunk=session_config.get("joyai_chunk_id"))
             )
-        if runtime_config.get("instructions"):
-            system += "\n\n" + runtime_config["instructions"]
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
         image_token_counts = self._image_token_counts(images)
         prompt_data = {
