@@ -63,6 +63,7 @@ from vllm_omni.config.stage_config import (
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 logger = init_logger(__name__)
@@ -883,7 +884,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
+    # Mirrors OmniDiffusionConfig.enable_cfg_batching.
+    enable_cfg_batching: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
@@ -2333,6 +2338,7 @@ class VllmOmniConfig:
     pipeline_config: PipelineConfig
     stage_configs: tuple[StageConfigType, ...]
     orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
+    weight_sharing: WeightSharingConfig | None = None
     # Keep strategy provenance separate from the effective orchestrator value:
     # an explicit CLI policy may be present even when the strategy declares no
     # stage-replica axis.
@@ -2504,6 +2510,7 @@ class VllmOmniConfig:
             pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
+            weight_sharing=deploy.weight_sharing,
             strategy_omni_lb_policy=(strategy_result.omni_lb_policy if strategy_result is not None else None),
         )
 

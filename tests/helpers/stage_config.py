@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
 
 
 def modify_stage_config(
@@ -235,6 +235,11 @@ def modify_stage_config(
             else:
                 # Direct top-level key
                 config[key] = value
+
+    # The copy lives in a temporary directory; keep inheritance anchored to
+    # the source deploy rather than resolving its relative base under /tmp.
+    if base_config := config.get("base_config"):
+        config["base_config"] = str((path.parent / base_config).resolve())
 
     # Unique suffix: multiple modify_stage_config calls in one process often run
     # within the same second (e.g. test_qwen3_omni_expansion imports both
@@ -789,11 +794,77 @@ def _delete_dummy_load_format(
     )
 
 
+# Weekly CI sets this so the launched deploy YAML selects the runner. Upstream
+# VLLM_USE_V2_MODEL_RUNNER does not: Omni stages read deploy ``model_runner``.
+_CI_MODEL_RUNNER_ENV = "VLLM_OMNI_CI_MODEL_RUNNER"
+
+
+def _ci_model_runner_override() -> str | None:
+    raw = os.environ.get(_CI_MODEL_RUNNER_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"v1", "v2"}:
+        raise ValueError(f"{_CI_MODEL_RUNNER_ENV} must be 'v1' or 'v2', got {raw!r}")
+    return raw
+
+
+def _apply_ci_model_runner(stage_config_path: str | None) -> str | None:
+    """Write deploy-level ``model_runner`` into a copy of the launch YAML.
+
+    A stage that already sets ``model_runner`` keeps that pin. A CUDA platform
+    block that already sets it is updated too, because that platform value
+    replaces the deploy-level choice when the server loads the file.
+    """
+    runner = _ci_model_runner_override()
+    if runner is None:
+        return stage_config_path
+    if stage_config_path is None:
+        raise ValueError(
+            f"{_CI_MODEL_RUNNER_ENV} is set but this test did not provide a deploy config. "
+            "Weekly CI cannot select model_runner without a deploy YAML."
+        )
+
+    path = Path(stage_config_path)
+    with open(path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Deploy YAML must be a mapping: {stage_config_path}")
+    config["model_runner"] = runner
+    base_config = config.get("base_config")
+    if isinstance(base_config, str) and not Path(base_config).is_absolute():
+        # The copy lives in the temp directory, so a relative base would no
+        # longer resolve next to the original file.
+        config["base_config"] = str((path.parent / base_config).resolve())
+    # Platform model_runner replaces the deploy-level value at load time, including
+    # a value inherited through base_config. Put the override on this file so the
+    # overlay wins without dropping the base platform's other fields.
+    resolved = resolve_deploy_yaml(path)
+    resolved_cuda = (resolved.get("platforms") or {}).get("cuda") if isinstance(resolved, dict) else None
+    local_platforms = config.get("platforms")
+    local_cuda = local_platforms.get("cuda") if isinstance(local_platforms, dict) else None
+    if (isinstance(resolved_cuda, dict) and "model_runner" in resolved_cuda) or (
+        isinstance(local_cuda, dict) and "model_runner" in local_cuda
+    ):
+        platforms = config.setdefault("platforms", {})
+        if isinstance(platforms, dict):
+            cuda = platforms.setdefault("cuda", {})
+            if isinstance(cuda, dict):
+                cuda["model_runner"] = runner
+
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
+    return output_path
+
+
 def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
     """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
     if run_level in {"advanced_model", "full_model"}:
-        return _delete_dummy_load_format(stage_config_path, run_level)
-    return _add_dummy_load_format(stage_config_path, run_level)
+        resolved = _delete_dummy_load_format(stage_config_path, run_level)
+    else:
+        resolved = _add_dummy_load_format(stage_config_path, run_level)
+    return _apply_ci_model_runner(resolved)
 
 
 __all__ = [
