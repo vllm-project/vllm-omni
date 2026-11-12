@@ -73,9 +73,33 @@ def memory_worker(weight_sharing, monkeypatch, mocker):
     worker.rank = worker.local_rank = 0
     worker.distributed_init_method = "tcp://localhost:12345"
     worker.set_proc_title = False
+    # Mirror resolved DiffusionParallelConfig defaults with concrete values:
+    # init_device forwards these fields to the parallel setup, and newer code
+    # may also compare them numerically, which a bare Mock cannot support.
+    parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        enable_expert_parallel=False,
+        sequence_parallel_size=1,
+        ulysses_degree=1,
+        ring_degree=1,
+        allgather_degree=1,
+        ulysses_mode="strict",
+        ulysses_a2a_permute=False,
+        cfg_parallel_size=1,
+        vae_patch_parallel_size=1,
+        text_encoder_tp_size=1,
+        vae_parallel_mode="tile",
+        use_hsdp=False,
+        mask_sp_padding=False,
+        hsdp_shard_size=-1,
+        hsdp_replicate_size=1,
+        world_size=1,
+    )
     worker.od_config = SimpleNamespace(
         num_gpus=1,
-        parallel_config=mocker.Mock(),
+        parallel_config=parallel_config,
         diffusion_kv_mode=kv_modes.PAGED_SCHEDULER,
         additional_config={runtime.CONFIG_KEY: msgspec.to_builtins(bootstrap)},
     )
