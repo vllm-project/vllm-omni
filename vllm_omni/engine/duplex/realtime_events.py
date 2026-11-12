@@ -819,9 +819,7 @@ def realtime_session_payload(state: RealtimeProjectionState, session: object) ->
         "audio",
         {
             "input": {
-                "format": realtime_audio_format_object(
-                    state.input_audio_format, sample_rate_hz=input_sample_rate_hz
-                ),
+                "format": realtime_audio_format_object(state.input_audio_format, sample_rate_hz=input_sample_rate_hz),
                 "sample_rate_hz": input_sample_rate_hz,
             },
             "output": {
