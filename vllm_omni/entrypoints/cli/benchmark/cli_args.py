@@ -267,6 +267,24 @@ def add_full_duplex_bench_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--fdb-instructions",
         help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
+def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add shared duplex workload and metric options."""
+    group = parser.add_argument_group("Duplex Benchmark Options")
+    group.add_argument(
+        "--duplex-metric-aggregation",
+        choices=("session", "response"),
+        default="session",
+        help="Aggregate duplex TTFT, audio TTFP and RTF over session means (default) or individual responses.",
+    )
+    group.add_argument(
+        "--duplex-sample-pool-size",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Select a fixed pool of OmniInteract or Omni-DuplexEval sessions and cycle it to reach --num-prompts. "
+            "With a pool, --num-prompts 0 selects exactly the pool size instead of the full dataset. "
+            "For performance runs without answer evaluation; repeated sessions use distinct output identities."
+        ),
     )
 
 
@@ -641,6 +659,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
     add_full_duplex_bench_cli_args(parser)
+    add_duplex_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

@@ -160,6 +160,14 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 - `--save-result`
 Specify to save benchmark results to a json file
 
+  Omni results include `benchmark_end_time`, a local ISO 8601 timestamp captured
+  at the end of the timed run, before metric computation and optional accuracy
+  evaluation. Subtract `duration` (seconds) to locate the measured window when
+  aligning device-utilization samples. The legacy `date` records result creation
+  after postprocessing and is not the measurement boundary. Client and sampler
+  clocks and timezones must agree. Older result files without `benchmark_end_time`
+  cannot establish a sampling window from `date` alone.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
@@ -368,7 +376,18 @@ P99 AUDIO_RTF:                           0.48
 ```
 
 Notes:
-We use audio generation time / audio duration to calculate RTF.
+For the HTTP chat-omni and audio-speech backends, audio RTF uses client request
+start to receipt of the last non-empty audio payload, divided by generated audio
+duration. Trailing usage events (chat) or delayed stream EOF (speech) remain in
+E2EL but do not increase audio RTF. Mean RTF averages the individual request ratios; aggregate
+RTF divides summed audio-completion latencies by summed audio durations.
+
+Saved results include `request_audio_metrics` in input request order. Each
+successful audio request carries `audio_latency_s` and `audio_duration_s`;
+failed, non-audio or unsupported measurements are `null`. This metadata is
+independent of server stage metrics and remains present without `--save-detailed`.
+Duplex backends keep their per-response/session clocks described below and do
+not synthesize a request audio-completion latency from their mean RTF.
 
 </details>
 
@@ -503,6 +522,12 @@ filtering and local media. The default is three samples and single concurrency;
 without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
 dataset order.
 
+For performance runs without judging, `--duplex-sample-pool-size N` selects a
+fixed pool and repeats it to reach `--num-prompts`, with distinct output
+identities. With this option, `--num-prompts 0` selects exactly `N` samples,
+rather than the full dataset. The same pool behavior applies to OmniInteract;
+answer evaluation and oversampling with `--no-oversample` are rejected.
+
 For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
 use the same entrypoint with server-detected turns and no reference audio:
 
@@ -549,18 +574,31 @@ string uses the server's default instructions. `--duplex-eval-ref-audio` is opti
 for Qwen3 and remains available for models that require a reference voice.
 
 The CUDA nightly configuration
-`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` uses the common
-performance runner on three GPUs (two for Qwen3-Omni, one for the text judge).
-It measures three `PR_correction` sessions with post-run judging and two
-`RTD_counting` sessions without judging, preserving dataset order. The checks require
-complete artifacts, completed observed responses and measured text/audio latency
-for every session; judging must cover every selected PR sample. Scores are reported
-without a quality threshold. RTD scoring requires a vision-capable judge and is
-outside this configuration. No hardware latency baseline is configured.
-These nightly checks do not establish that every input utterance produced a
-response. The dataset provides no expected VAD turn count, and a `PR_correction`
-sample can contain a single user statement, so a blanket two-response minimum is
-not valid. Deterministic CPU tests cover adjacent speech boundaries separately.
+`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` measures and
+judges 120 distinct `PR_correction` sessions at concurrency 8. Two GPUs run
+Qwen3-Omni; a third runs the text-only `Qwen/Qwen2.5-7B-Instruct` judge.
+Dataset revision `de63329f76daa5e0c604363ef6a2c383dfba45f6` is pinned. The selected
+IDs are `0–132` excluding `1, 6, 19, 30, 37, 47, 71, 73, 83, 88, 89, 91, 105`:
+
+- `1, 6, 30, 71, 83, 105` require historical visual or event evidence.
+- `19, 47, 73, 88, 89, 91` depend on the original soundtrack.
+- `37` uses a spoken cue to locate the visual correction.
+
+The selected statements concern current visual attributes, objects or actions.
+This is an annotation-based compatibility selection, not a claim that every
+sample has passed model validation. The job streams question audio with video;
+RTD, future-event reminders and continuous monitoring are outside this workload.
+
+The `c8_accuracy_response_stats_v5` workload uses `--duplex-metric-aggregation response`
+and `--metric-percentiles 50,95` to pool responses for TTFT, audio TTFP and RTF.
+Missing measurements are excluded, never substituted with zero. All sessions
+must finish, publish artifacts and provide measured text/audio latency. The
+judge must evaluate all 120 corrections successfully and produce a finite
+correction success rate. Judging runs after the measured replay and does not
+enter its duration. No calibrated score floor or hardware latency baseline is
+checked in for this expanded workload; establish fresh H100 and B200 baselines.
+`--dataset-path repo/id@revision` pins a remote Omni-DuplexEval source; local
+directory and parquet paths retain their existing behavior.
 
 Inputs retain the standalone runner's real-time pacing, question audio, media
 clock and 1 FPS default (`--duplex-eval-fps`). `--duplex-eval-mix` selects the
@@ -936,40 +974,97 @@ signal, not a transport failure. Accuracy must finish with `status=ok` on every 
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
 
-`test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni on `vllm_omni/deploy/qwen3_omni_duplex.yaml` with server VAD
-turns (see [Turn-based duplex models](#turn-based-duplex-models-qwen3-omni)). It is an L4 CUDA nightly performance job
-on H100 and the B200 mirror. It needs three visible GPUs: the Qwen3-Omni stages take the first two and the text judge
-the third (`cuda_visible_devices: "2"`). Run the same job locally with:
+`test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni with server VAD
+using the existing `vllm_omni/deploy/qwen3_omni_duplex.yaml` via
+`server_params.extra_cli_args`. Inline `server_params.update` values select
+`model_runner: v2`, `async_chunk: true`, Thinker prefix caching,
+`duplex_session.max_sessions: 8`, and `duplex_session.collect_stats: true`.
+The harness applies these settings to a temporary deploy copy, preserving base
+inheritance and removing the copy when pytest exits. No test-specific deploy
+file is checked in and serving defaults remain unchanged.
+Talker and Code2Wav retain prefix caching disabled.
+Both Qwen3-Omni duplex jobs use three GPUs: two for the model stages and one for
+the `Qwen/Qwen2.5-7B-Instruct` text judge, mapped to allocated device index 2.
 
-```bash
-bash tools/nightly/run_nightly_jobs.sh \
-  --test-type perf \
-  --model-type omni \
-  --label-substr "Duplex OmniInteract"
-```
+The pinned OmniInteract revision is
+`e195f75fe2666fcc5fe74f537ae49ca143a79969`. With shuffling disabled, the job
+replays all 60 `1q1a_math/0001` through `0060` clips once at concurrency 8.
+Each clip contains two spoken questions about the current screen, giving
+120 annotated question slots. Full `1q1a` clips mix in proactive tasks, and
+`1qna` requires continuous monitoring, so neither subset belongs to this
+VAD-triggered workload. The Omni-DuplexEval job likewise uses 120 distinct
+correction samples once. Neither job enables `duplex_sample_pool_size`:
+repetition is unnecessary and that option is restricted to performance runs
+without answer evaluation.
 
-The job uploads benchmark JSONs and per-case audio, transcripts, events, and evaluation artifacts. It records performance
-metrics without a hardware latency baseline; response validity and the math accuracy floor still gate the result.
-It differs from the MiniCPM-o configuration in three ways:
+Clips remain unmodified: each math clip lasts about five minutes, with two
+questions roughly two and a half minutes apart. This measures intermittent
+generation under concurrent realtime input. Both jobs skip the extra endpoint
+readiness replay (`ready_check_timeout_sec: 0`) and use `num_warmups: 8`:
+one concurrent wave of eight full sessions replays identical first-sample inputs
+before measurement. The explicit count pins warmup to C8 even if runner defaults
+change; it does not represent the diversity or cache-hit rate of measured inputs.
+Warmup outputs enter neither performance statistics nor judging.
+Engine startup separately warms kernels and captures configured CUDA Graph
+batch sizes; full-session warmup does not establish that every shape is warm.
+The runner also supports a warmup list with one non-negative integer per sweep
+point; a scalar applies to every point.
 
-- **Cold start.** The first request after the server starts compiles Triton kernels (rotary embedding, fused MoE) and
-  answers seconds late. The first subset (`1q1a_math`) therefore replays its first case once, unmeasured
-  (`num_warmups: 1`); later subsets reuse the warmed server and do not warm up again.
-- **Interrupted responses are not scored.** The official eligibility rule is kept: a case with a cancelled, cleared, or
-  clipped response is left out of accuracy, because its transcript holds text the listener never heard, and scoring it
-  would make the result incomparable with MiniCPM-o and the paper. Qwen3-Omni stops speaking when the next question
-  starts, so overlapping questions can make a case ineligible. A scored subset must keep at least one eligible case.
-  This configuration measures latency only for `1q1a` and `1qna` (no `omniinteract_evaluate`); individual cases may
-  still be eligible. Both subsets require at least one completed response with audio and transcript per case
-  (`omniinteract_require_response: true`). Accuracy covers `1q1a_math` only, so it is not comparable with the
-  three-subset MiniCPM-o score. Its
-  IA-QTF1 must be at or above `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.3`); a single run on four cases
-  measured `0.50`, so the floor catches a lost correct answer or more, not small judge noise.
-- **Latency.** Compare Qwen3-Omni runs on the per-response keys, primarily `mean_duplex_client_ttfp_ms`
-  (last append send in the turn window to first audio; on a continuous VAD stream this is about
-  `response_created_to_first_audio_ms` plus a `[0, chunk_ms)` phase from the chunk in which server VAD closed the
-  turn, and includes prompt preparation after `response.created`). Compare those client append keys only within one
-  adapter / chunk size. The standard TTFT rows average sessions first, and TPOT is unavailable.
+At C8, 60 math sessions take approximately eight five-minute waves, or 40 minutes
+of formal replay, plus about five minutes of warmup. Startup, response drain,
+artifact publication and judge evaluation add to that estimate. Both jobs retain
+the 180-minute timeout; validation on the target H100/B200 CI hardware remains outstanding.
+OOM, request failures, incomplete artifacts and judge failures fail the job.
+For sizing context, the 2026-11-05 local H200 run (reported by the driver as
+L20X), with session statistics disabled, took 11.5 minutes for the 120-session Omni-DuplexEval measured replay and
+22.7 minutes for the complete pytest job, including startup, warmup and judging.
+These are local observations, not an H100/B200 timeout guarantee.
+
+The generic summary also displays E2E latency and generated audio duration.
+E2E here spans a complete replayed session, including realtime input; it is not
+per-response generation latency. Client TTFT, append TTFP and append RTF appear
+in the separate duplex per-response summary. Server `busy_rtf` and `stall_ratio`
+are collected with `duplex_session.collect_stats: true`: the client fetches
+`session.stats` before closing each session and maps complete turn statistics to
+response rows. Busy RTF is the union of recorded stage-work time divided by
+emitted audio duration. Stall ratio is engine-resident time outside that work
+union divided by emitted audio duration; it is not a playback-underrun ratio.
+These client/server response metrics display mean, median and P99. The harness
+requires nonempty, finite measurements; missing stats do not pass as zeros.
+The stats-enabled workload is named `c8_accuracy_response_stats_v5`; it needs a
+new measured baseline rather than reusing the earlier stats-disabled results.
+
+OmniInteract judging uses the same formal outputs as the performance report and
+records All Global IA-QTF1 plus evaluated/skipped counts. The official eligibility
+rules remain: cancelled, cleared or clipped responses are excluded from accuracy.
+All 60 sessions must be accounted for as evaluated or skipped, at least one must
+be evaluated, and every attempted evaluation must succeed. This is a selected
+math-subset score, not the full OmniInteract score. No new quality floor is
+inferred from the earlier four-case run. Both jobs save detailed response metrics
+and evaluate after the performance measurement window.
+
+The primary percentile rows are P50/P95 TTFT, audio TTFP and RTF over individual
+responses (`--duplex-metric-aggregation response`). The default `session` mode
+for other benchmarks still aggregates session means. Goodput remains session
+based; E2EL and audio duration retain their session meaning. Raw
+`duplex_request_metrics` and `duplex_session_metrics` remain available for
+investigation, and saved results record `duplex_metric_aggregation`.
+The legacy `ttfts` array stays session-aligned with `input_lens`, `output_lens`,
+`generated_texts` and `errors`; it is not the observation array used for the
+response-mode percentiles. Use `duplex_request_metrics` to reconstruct those
+distributions, taking responses from successful sessions as the summary does.
+TTFT/TTFP still prefer server timings when available, otherwise client receipt
+relative to response creation; the aggregation option does not change clocks.
+The `max_concurrent_requests` statistic counts sessions touching each whole-second
+bucket. At a wave boundary it can exceed the instantaneous concurrency because
+ending and starting sessions in the same second share a bucket.
+
+The configuration is named `c8_accuracy_response_stats_v5` to distinguish its sample
+selection and judging from older workloads. Use matching hardware and workload
+versions for comparisons; previous C1/C8/C16 16-source-pool results are not baselines
+for these expanded jobs. The earlier `c8_accuracy_response_v3` runs used V1
+with Thinker prefix caching disabled; record the runner and cache settings when
+comparing results.
 
 ### Seed-TTS reference speech as real audio input
 
