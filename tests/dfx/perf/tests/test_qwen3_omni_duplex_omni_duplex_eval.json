@@ -2,57 +2,205 @@
   {
     "test_name": "test_qwen3_omni_duplex_omni_duplex_eval",
     "mark": [
-      {"hardware_marks": {"res": {"cuda": ["H100", "B200"]}, "num_cards": 3}},
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 3
+        }
+      },
       "full_model",
       "omni"
     ],
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-      "extra_cli_args": ["--deploy-config", "vllm_omni/deploy/qwen3_omni_duplex.yaml"]
-    },
-    "judge_server_params": {
-      "model": "Qwen/Qwen2.5-7B-Instruct",
-      "use_omni": false,
-      "cuda_visible_devices": "2",
-      "extra_cli_args": ["--served-model-name", "Qwen2.5-7B-Instruct"]
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+      ],
+      "update": {
+        "model_runner": "v2",
+        "async_chunk": true,
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true
+          }
+        },
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
     },
     "benchmark_params": [
       {
-        "name": "pr_correction",
+        "name": "c8_accuracy_response_stats_v5",
         "dataset_name": "omni-duplex-eval",
-        "dataset_path": "Hothan/Omni-DuplexEval",
+        "dataset_path": "Hothan/Omni-DuplexEval@de63329f76daa5e0c604363ef6a2c383dfba45f6",
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
-        "num_prompts": [3],
-        "max_concurrency": [1],
-        "num_warmups": 1,
+        "num_prompts": [
+          120
+        ],
+        "max_concurrency": [
+          8
+        ],
         "disable_shuffle": true,
         "trust_remote_code": true,
         "duplex_eval_split": "PR_correction",
         "duplex_eval_turn_detection": "server_vad",
         "duplex_eval_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
         "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/PR_correction",
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "duplex_metric_aggregation": "response",
+        "metric-percentiles": "50,95",
+        "duplex_eval_ids": [
+          "0",
+          "2",
+          "3",
+          "4",
+          "5",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "20",
+          "21",
+          "22",
+          "23",
+          "24",
+          "25",
+          "26",
+          "27",
+          "28",
+          "29",
+          "31",
+          "32",
+          "33",
+          "34",
+          "35",
+          "36",
+          "38",
+          "39",
+          "40",
+          "41",
+          "42",
+          "43",
+          "44",
+          "45",
+          "46",
+          "48",
+          "49",
+          "50",
+          "51",
+          "52",
+          "53",
+          "54",
+          "55",
+          "56",
+          "57",
+          "58",
+          "59",
+          "60",
+          "61",
+          "62",
+          "63",
+          "64",
+          "65",
+          "66",
+          "67",
+          "68",
+          "69",
+          "70",
+          "72",
+          "74",
+          "75",
+          "76",
+          "77",
+          "78",
+          "79",
+          "80",
+          "81",
+          "82",
+          "84",
+          "85",
+          "86",
+          "87",
+          "90",
+          "92",
+          "93",
+          "94",
+          "95",
+          "96",
+          "97",
+          "98",
+          "99",
+          "100",
+          "101",
+          "102",
+          "103",
+          "104",
+          "106",
+          "107",
+          "108",
+          "109",
+          "110",
+          "111",
+          "112",
+          "113",
+          "114",
+          "115",
+          "116",
+          "117",
+          "118",
+          "119",
+          "120",
+          "121",
+          "122",
+          "123",
+          "124",
+          "125",
+          "126",
+          "127",
+          "128",
+          "129",
+          "130",
+          "131",
+          "132"
+        ],
+        "ready_check_timeout_sec": 0,
+        "num_warmups": 8,
+        "save_detailed": true,
         "duplex_eval_evaluate": true,
         "duplex_eval_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
-      },
-      {
-        "name": "rtd_counting",
-        "dataset_name": "omni-duplex-eval",
-        "dataset_path": "Hothan/Omni-DuplexEval",
-        "backend": "openai-realtime-duplex",
-        "endpoint": "/v1/realtime",
-        "num_prompts": [2],
-        "max_concurrency": [1],
-        "num_warmups": 0,
-        "disable_shuffle": true,
-        "trust_remote_code": true,
-        "duplex_eval_split": "RTD_counting",
-        "duplex_eval_turn_detection": "server_vad",
-        "duplex_eval_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
-        "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/RTD_counting",
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "duplex_eval_mix": "question",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       }
-    ]
+    ],
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "use_omni": false,
+      "device_index": "2",
+      "extra_cli_args": [
+        "--served-model-name",
+        "Qwen2.5-7B-Instruct"
+      ]
+    }
   }
 ]
