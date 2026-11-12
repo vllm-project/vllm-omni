@@ -212,6 +212,61 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
         }
 
+    def forward_kwargs_hyperflow(
+        self,
+        *,
+        video_rows: torch.Tensor,
+        audio_rows: torch.Tensor,
+        t_video: float,
+        t_audio: float,
+        r_video: float,
+        r_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Packed forward kwargs with HyperFlow ``(t, r)`` pairs (unique as pairs).
+
+        Matches upstream ``build_row_time_pairs``: ``t = 1 - sigma_i``,
+        ``r = 1 - sigma_{i+1}``; condition rows keep ``r == t``.
+        """
+        x = self.x_base.clone()
+        x[0].index_copy_(0, self.img_pos_dev, video_rows)
+        audio_x = self.audio_x_base.clone()
+        audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
+        t_rows = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+        r_rows = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+        self.fill_timesteps(
+            t_rows,
+            t_video=t_video,
+            t_audio=t_audio,
+            imgvid_cond_timestep=imgvid_cond_timestep,
+            audio_ref_cond_timestep=audio_ref_cond_timestep,
+            video_target_timesteps=video_target_timesteps,
+            audio_target_timesteps=audio_target_timesteps,
+        )
+        # Endpoints: targets aim at the step's ``r``; condition rows stay ``r == t``.
+        self.fill_timesteps(
+            r_rows,
+            t_video=r_video,
+            t_audio=r_audio,
+            imgvid_cond_timestep=imgvid_cond_timestep,
+            audio_ref_cond_timestep=audio_ref_cond_timestep,
+            video_target_timesteps=None,
+            audio_target_timesteps=None,
+        )
+        pairs = torch.stack((t_rows, r_rows), dim=-1)
+        unique, inverse_indices = torch.unique(pairs, dim=0, sorted=True, return_inverse=True)
+        return {
+            **self.static_kwargs,
+            "x": x,
+            "audio_x": audio_x,
+            "unique_timesteps": unique[:, 0].contiguous(),
+            "unique_endpoint_timesteps": unique[:, 1].contiguous(),
+            "inverse_indices": inverse_indices,
+        }
+
     def fill_timesteps(
         self,
         timesteps: torch.Tensor,
