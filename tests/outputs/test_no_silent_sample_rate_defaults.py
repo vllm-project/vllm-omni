@@ -33,9 +33,6 @@ _ALLOWLIST = {
     # --- Generic-path fallbacks: removed by the standardization PRs ---
     ("vllm_omni/entrypoints/openai/serving_chat.py", "sample_rate = 24000"),
     ("vllm_omni/entrypoints/openai/serving_chat.py", "sample_rate = 48000"),
-    ("vllm_omni/entrypoints/openai/serving_speech.py", "sample_rate_val = 24000"),
-    ("vllm_omni/entrypoints/openai/serving_speech.py", 'sr_raw = audio_output.get("sr", 24000)'),
-    ("vllm_omni/entrypoints/openai/serving_speech_stream.py", "_PCM_SAMPLE_RATE = 24000"),
     (
         "vllm_omni/entrypoints/openai/serving_audio_generate.py",
         "default_sr = 44100 # Default sample rate for Stable Audio",

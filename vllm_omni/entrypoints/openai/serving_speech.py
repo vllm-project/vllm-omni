@@ -75,6 +75,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.sample_rate import get_sampling_rate, get_sampling_rate_or_none
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -165,27 +166,6 @@ def _is_default_voice(voice, supported_speakers):
     """Check if a lowercased voice name is the placeholder default and not
     an actual registered/built-in speaker."""
     return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
-
-
-def _coerce_sample_rate(value: object) -> int | None:
-    """Return scalar sample-rate metadata, ignoring empty sparse carriers."""
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple)):
-        for candidate in reversed(value):
-            sample_rate = _coerce_sample_rate(candidate)
-            if sample_rate is not None:
-                return sample_rate
-        return None
-    numel = getattr(value, "numel", None)
-    if callable(numel) and numel() == 0:
-        return None
-    size = getattr(value, "size", None)
-    if isinstance(size, (int, np.integer)) and int(size) == 0:
-        return None
-    if hasattr(value, "item"):
-        value = value.item()
-    return int(cast(int | float | str, value))
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -308,6 +288,14 @@ def _encoded_audio_format(audio_response: Any, sample_rate: int, audio: np.ndarr
     if metadata is not None:
         return {"sample_rate": int(metadata.sample_rate_hz), "channels": int(metadata.channels)}
     return {"sample_rate": int(sample_rate), "channels": _infer_audio_num_channels(np.asarray(audio))}
+
+
+def _chunk_sample_count(chunk: object) -> int:
+    """Sample count of a raw audio chunk (tensor or array-like), 0 when empty."""
+    numel = getattr(chunk, "numel", None)
+    if callable(numel):
+        return int(numel())
+    return int(np.size(chunk))
 
 
 def _audio_duration_seconds(audio_response: AudioResponse) -> float | None:
@@ -1882,7 +1870,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         emitted_samples = 0
         total_audio_s: float | None = None
-        sample_rate_val = 24000
+        # Resolved from the first audio-bearing payload via the shared reader;
+        # no silent default — a model that emits no rate fails the stream.
+        sample_rate_val: int | None = None
         first_chunk = True
         first_audio_chunk_s: float | None = None
         first_audio_packet_ts: float | None = None
@@ -1942,14 +1932,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     continue
                 audio_output = cast(dict, audio_output)
 
-                reported_sample_rate = _coerce_sample_rate(audio_output.get("sr"))
-                if reported_sample_rate is not None:
-                    sample_rate_val = reported_sample_rate
-                    if source_sample_rate is not None and sample_rate_val != source_sample_rate:
+                chunk_sample_rate = get_sampling_rate_or_none(audio_output)
+                if chunk_sample_rate is not None:
+                    if source_sample_rate is not None and chunk_sample_rate != source_sample_rate:
                         raise ValueError(
                             "Audio sample rate changed during streaming: "
-                            f"{source_sample_rate} Hz to {sample_rate_val} Hz"
+                            f"{source_sample_rate} Hz to {chunk_sample_rate} Hz"
                         )
+                    sample_rate_val = chunk_sample_rate
                 audio_val = audio_output[audio_key]
                 if isinstance(audio_val, list):
                     # Cumulative mode: each update grows the list; emit only new tail.
@@ -1963,9 +1953,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     else:
                         new_chunks = []
 
-                output_sample_rate = target_sample_rate or sample_rate_val
+                # An empty-audio step is a sparse step, not the first chunk.
+                if any(_chunk_sample_count(chunk) > 0 for chunk in new_chunks) and source_sample_rate is None:
+                    if sample_rate_val is None:
+                        # Every audio-emitting model advertises its rate
+                        # (SAMPLE_RATE_KEY); a missing one is a producer bug,
+                        # not something to paper over with a default — the
+                        # rate labels the PCM bytes and builds the resampler.
+                        raise ValueError("First audio output must include sample rate metadata for streaming")
+                    source_sample_rate = sample_rate_val
+                    if target_sample_rate is not None and target_sample_rate != source_sample_rate:
+                        resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
 
                 for chunk_tensor in new_chunks:
+                    # Empty chunks are sparse steps; they precede the guard
+                    # that sets the rate and must not require one.
+                    if _chunk_sample_count(chunk_tensor) == 0:
+                        continue
+                    # Chunks ship only after the first-audio guard above set
+                    # the rate; the encoders need a concrete value.
+                    assert sample_rate_val is not None
+                    output_sample_rate = target_sample_rate or sample_rate_val
                     # Flush may run after a non-audio (e.g. aligner) result.
                     # Retain the producer of the audio buffered by the resampler.
                     last_audio_result = res
@@ -1982,13 +1990,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         # Sparse steps may carry empty audio and an empty ``sr``
                         # tensor. They are not the first audio chunk.
                         continue
-                    if source_sample_rate is None:
-                        if response_format == "wav" and reported_sample_rate is None:
-                            raise ValueError("First audio output must include sample rate metadata for WAV streaming")
-                        source_sample_rate = sample_rate_val
-                        if target_sample_rate is not None and target_sample_rate != source_sample_rate:
-                            resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
-                        output_sample_rate = target_sample_rate or source_sample_rate
                     if resampler is not None:
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
@@ -2030,6 +2031,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if resampler is not None:
                 final_chunk = resampler.process(np.empty((0,), dtype=np.float32), final=True)
                 if final_chunk.size:
+                    # A resampler exists only after the first-audio guard set
+                    # the rate.
+                    assert sample_rate_val is not None
                     output_sample_rate = target_sample_rate or sample_rate_val
                     wav_header = None
                     if response_format == "wav" and first_chunk:
@@ -2566,10 +2570,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             for cand in candidates:
                 if hasattr(cand, "numel") and cand.numel() > 0:
                     delta_chunks.append(cand)
-            sr_step = step_audio.get("sr")
-            coerced_step_rate = _coerce_sample_rate(sr_step)
-            if coerced_step_rate is not None:
-                delta_sample_rate = coerced_step_rate
+            delta_sample_rate = get_sampling_rate_or_none(step_audio)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
@@ -2614,9 +2615,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         audio_tensor = audio_output[audio_key]
-        sample_rate = _coerce_sample_rate(audio_output.get("sr"))
-        if sample_rate is None:
-            sample_rate = delta_sample_rate or 24000
+        # Strict read: every audio-emitting model advertises its rate, so a
+        # missing one is a producer bug that must fail the request rather
+        # than silently mislabel the encoded audio with a default.
+        sample_rate = get_sampling_rate(audio_output)
 
         if accumulate_nonstreaming:
             # Prefer the engine's own consolidated audio when present. After the
@@ -2814,7 +2816,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_output = cast(dict, audio_output)
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = _coerce_sample_rate(audio_output.get("sr")) or 24000
+            # The diffusion formatter surfaces the rate under its legacy
+            # ``audio_sample_rate`` spelling until PR 10; the shared reader
+            # resolves it (with a deprecation warning) instead of silently
+            # defaulting to 24000 and mislabeling the waveform.
+            sample_rate = get_sampling_rate(audio_output)
 
             if isinstance(audio_tensor, list):
                 non_empty = [c for c in audio_tensor if c.numel() > 0]

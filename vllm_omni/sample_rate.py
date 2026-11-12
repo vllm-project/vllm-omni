@@ -168,13 +168,14 @@ def get_sampling_rate_or_none(payload: Mapping[str, object]) -> int | None:
 def _resolve_payload(payload: Mapping[str, object]) -> int | None:
     if not isinstance(payload, Mapping):
         raise TypeError(f"sample-rate payload must be a Mapping, got {type(payload).__name__}")
-    # An explicit {"sr": None} counts as absent; keep probing.
+    # An explicit {"sr": None} (or an empty sparse carrier: [], empty
+    # tensor) counts as absent; keep probing.
     raw = payload.get(SAMPLE_RATE_KEY)
-    if raw is not None:
+    if not _is_empty_rate_carrier(raw):
         return _coerce_strict(raw, SAMPLE_RATE_KEY)
     for key in DEPRECATED_SAMPLE_RATE_KEYS:
         raw = payload.get(key)
-        if raw is None:
+        if _is_empty_rate_carrier(raw):
             continue
         rate = _coerce_strict(raw, key)
         _warn_deprecated(
@@ -199,6 +200,16 @@ def _resolve_payload(payload: Mapping[str, object]) -> int | None:
         )
         return rate
     return None
+
+
+def _is_empty_rate_carrier(raw: object) -> bool:
+    """Empty rate carriers are sparse-step "no rate" spellings, not bad values."""
+    if raw is None:
+        return True
+    if isinstance(raw, (list, tuple)):
+        return not raw
+    numel = getattr(raw, "numel", None)
+    return callable(numel) and numel() == 0
 
 
 def _coerce_strict(value: object, source: str) -> int:

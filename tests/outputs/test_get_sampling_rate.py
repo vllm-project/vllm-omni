@@ -71,7 +71,6 @@ def test_get_sampling_rate_canonical_shapes(value: object, expected: int) -> Non
         24000.5,  # non-integral float
         torch.zeros(2, 2),  # conflicting elements
         torch.tensor([24000, 16000]),  # conflicting per-request rates
-        [],  # empty list
     ],
 )
 def test_get_sampling_rate_rejects_invalid_values(value: object) -> None:
@@ -96,6 +95,23 @@ def test_get_sampling_rate_missing_raises() -> None:
 
 def test_get_sampling_rate_or_none_missing_returns_none() -> None:
     assert get_sampling_rate_or_none({"audio": torch.zeros(1, 100)}) is None
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [
+        {"sr": []},
+        {"sr": torch.empty(0)},
+        {"model_outputs": [], "sr": []},
+    ],
+    ids=["empty-list", "empty-tensor", "sparse-step"],
+)
+def test_empty_rate_carriers_count_as_absent(carrier: dict) -> None:
+    # Sparse steps legally carry an empty rate carrier parallel to empty
+    # model_outputs; only genuinely bad values raise.
+    assert get_sampling_rate_or_none(carrier) is None
+    with pytest.raises(MissingSampleRateError):
+        get_sampling_rate(carrier)
 
 
 def test_missing_error_lists_probed_keys() -> None:
