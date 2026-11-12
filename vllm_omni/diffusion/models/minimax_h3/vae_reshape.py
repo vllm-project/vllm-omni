@@ -42,6 +42,7 @@ class _TilePool:
         self.next_item = self.next_chunk = 0
         self.pending = {}
         self.state = None
+        self.output_spec = None
         self.original_tiled = model.tiled_decode
         self.stats = {
             "active": True,
@@ -79,18 +80,44 @@ class _TilePool:
         outputs = model._run_tile_tasks(views, indices, model.decode, self.batching)
         if self.size > 1:
             dist.barrier(group=self.state["sp_process_group"])
-            saved_role = getattr(model, "h3_component_parallel", False)
-            try:
-                # Existing native group support permits empty tail ranks.
-                model.h3_component_parallel = saved_role or len(views) < self.size
-                outputs = model._all_gather_tiled_results(outputs, len(views))
-            finally:
-                model.h3_component_parallel = saved_role
+            outputs = self._gather(outputs, len(views))
         for offset, output in enumerate(outputs):
             self.pending[begin + offset] = output
         self.stats["wave_items"].append(end - begin)
         self.stats["local_batch_sizes"].append(len(indices))
         self.next_item = end
+
+    def _gather(self, outputs, count):
+        """Gather a round-robin wave, including ranks with an empty tail.
+
+        The checkpoint's original gather rejects an empty local task list.
+        This request-owned equal-shape gather pads only the rank-local task
+        dimension and restores the original global tile order. Metadata is
+        shared once because eligible temporal/spatial tiles have fixed shape.
+        """
+        group = self.state["sp_process_group"]
+        dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.uint8)
+        if self.output_spec is None:
+            metadata = torch.zeros(7, device=self.latent.device, dtype=torch.int64)
+            if self.rank == 0:
+                output = outputs[0]
+                metadata[0] = output.ndim
+                metadata[1] = dtypes.index(output.dtype) if output.dtype in dtypes else -1
+                if output.ndim <= 5:
+                    metadata[2 : 2 + output.ndim] = metadata.new_tensor(output.shape)
+            dist.broadcast(metadata, src=dist.get_global_rank(group, 0), group=group)
+            values = metadata.tolist()
+            if not 0 < values[0] <= 5 or not 0 <= values[1] < len(dtypes):
+                raise RuntimeError("Unsupported native cross-chunk tile output")
+            self.output_spec = (tuple(values[2 : 2 + values[0]]), dtypes[values[1]])
+        shape, dtype = self.output_spec
+        max_local = (count + self.size - 1) // self.size
+        local = torch.zeros((max_local, *shape), dtype=dtype, device=self.latent.device)
+        if outputs:
+            local[: len(outputs)].copy_(torch.stack(outputs))
+        gathered = [torch.empty_like(local) for _ in range(self.size)]
+        dist.all_gather(gathered, local, group=group)
+        return [gathered[item % self.size][item // self.size] for item in range(count)]
 
     def decode_chunk(self, clip):
         chunk = self.next_chunk
@@ -134,7 +161,10 @@ def _supported(model, latent):
         and int(getattr(model, "tokens_chunk_size", 0)) > 0
         and (int(latent.shape[2]) + int(model.token_drop)) % int(model.tokens_chunk_size) == 0
         and int(latent.shape[2]) >= int(model.tokens_chunk_size) + int(model.token_overlap)
-        and getattr(model, "_h3_component_group_supported", False)
+        and all(
+            callable(getattr(model, name, None))
+            for name in ("split_tiles", "decode", "tiled_decode", "_run_tile_tasks")
+        )
     )
 
 
