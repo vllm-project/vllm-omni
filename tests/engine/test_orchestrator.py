@@ -3278,6 +3278,44 @@ def test_stage_pool_does_not_track_output_timestamps_when_metrics_disabled() -> 
     assert pool._audio_frames_by_request == {}
 
 
+def test_stage_pool_tracks_scalar_pooling_output_timestamp() -> None:
+    stage = FakeStageClient(stage_type="llm", final_output_type="latent")
+    pool = StagePool(2, [stage])
+    output = SimpleNamespace(
+        request_id="req-pooling",
+        outputs=SimpleNamespace(data=SimpleNamespace(shape=(2, 2))),
+    )
+
+    pool.record_output_timestamps([output], output_ts=123.0)
+
+    assert pool._output_timestamps_by_request == {"req-pooling": [123.0]}
+    assert pool._non_empty_first_output_timestamps_by_request == {"req-pooling": 123.0}
+
+
+def test_stage_pool_builds_metrics_for_scalar_pooling_output(mocker) -> None:
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {}
+    stage = FakeStageClient(stage_type="llm", final_output_type="latent")
+    pool = StagePool(2, [stage], output_processor=processor)
+    pool.collect_stage_metrics = False
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", return_value=2.0)
+    output = SimpleNamespace(
+        request_id="req-pooling",
+        outputs=SimpleNamespace(data=SimpleNamespace(shape=(2, 2))),
+    )
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=1.0,
+        request_timestamp=1.0,
+        replica_id=0,
+    )
+
+    assert metrics.finish_reason is None
+    assert metrics.num_tokens_out == 0
+    processor.pop_native_text_metrics.assert_called_once_with("req-pooling")
+
+
 def test_orchestrator_rejects_logging_without_stage_metrics() -> None:
     with pytest.raises(ValueError, match="log_stats=True requires collect_stage_metrics=True"):
         Orchestrator(
