@@ -79,3 +79,10 @@ pipelines retain their existing behavior. Graph buffers belong to the VAE
 instance, and weight relocation invalidates its captures. User configuration
 and precision limits are documented in the
 [Ascend image guide](../../user_guide/diffusion/minimax_h3_image_npu.md).
+
+H3 deterministic execution restores the caller's enabled and warn-only modes
+when forward returns or raises, so inline engine setup and teardown leave no
+persistent deterministic-mode change. VAE graphs disable NPU internal formats;
+`npu_disable_internal_format` exposes that worker setting independently for
+matched graph-off controls. Graph replica outputs are copied on the producer
+stream before reuse, then joined to the consumer stream.

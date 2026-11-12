@@ -13,7 +13,8 @@ from torch import nn
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
 def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
@@ -25,10 +26,29 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
     if type(deterministic) is not bool:
         raise ValueError("npu_deterministic must be a bool")
     if deterministic:
-        torch.use_deterministic_algorithms(True)
+        original_forward = model.forward
+
+        def deterministic_forward(module: nn.Module, request: DiffusionRequestBatch) -> DiffusionOutput:
+            # Inline engines share the caller's process. Scope this setting to
+            # execution, including failures, instead of leaking it at setup.
+            previous = torch.are_deterministic_algorithms_enabled()
+            warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+            try:
+                torch.use_deterministic_algorithms(True)
+                return original_forward(request)
+            finally:
+                torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+
+        model.forward = MethodType(deterministic_forward, model)
     enabled = (od_config.additional_config or {}).get("npu_vae_tile_graph", False)
     if type(enabled) is not bool:
         raise ValueError("npu_vae_tile_graph must be a bool")
+    disable_internal_format = (od_config.additional_config or {}).get("npu_disable_internal_format", False)
+    if type(disable_internal_format) is not bool:
+        raise ValueError("npu_disable_internal_format must be a bool")
+    if disable_internal_format:
+        # Expose the same worker setting to graph-off integration controls.
+        torch.npu.config.allow_internal_format = False
     if not enabled or od_config.enforce_eager or not od_config.enable_cuda_graph_decode:
         return
     if not NPUExactGraphRunner.is_supported():

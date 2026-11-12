@@ -541,3 +541,8 @@ shutdown. The multiprocess executor allows a shared 60-second graceful join
 window on NPU, retaining the 15-second window on other platforms and the
 existing bounded terminate/kill escalation. Exit-code logging distinguishes
 natural process exit from a completed application cleanup message.
+
+The out-of-process NPU `mp` stage client waits up to 80 seconds for a sent
+shutdown request: the worker grace plus both escalation windows and stage
+finalization. It then falls back to the bounded signal-based shutdown. This
+prevents the outer process manager from cutting short the worker deadline.

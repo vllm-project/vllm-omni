@@ -140,3 +140,31 @@ def test_add_request_waits_for_a_live_subprocess_to_connect():
     finally:
         peer.close(linger=0)
         _close(client, thread)
+
+
+@pytest.mark.parametrize("npu,exits", [(True, True), (True, False), (False, False)])
+def test_mp_shutdown_preserves_npu_worker_grace(monkeypatch, npu, exits):
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion import stage_diffusion_client as module
+
+    client = object.__new__(StageDiffusionClient)
+    client._request_socket = Mock()
+    client._response_socket = Mock()
+    client._encoder = OmniMsgpackEncoder()
+    client._zmq_ctx = Mock()
+    manager = Mock(distributed_executor_backend="mp")
+    manager.proc.is_alive.return_value = True
+    manager.wait_for_shutdown.return_value = exits
+    client._proc_manager = manager
+    monkeypatch.setattr(module, "current_omni_platform", SimpleNamespace(is_npu=lambda: npu))
+    client.shutdown()
+    if npu:
+        manager.wait_for_shutdown.assert_called_once_with(timeout=80.0)
+    else:
+        manager.wait_for_shutdown.assert_not_called()
+    if npu and exits:
+        manager.shutdown.assert_not_called()
+    else:
+        manager.shutdown.assert_called_once_with(timeout=10.0)
+    client._zmq_ctx.term.assert_called_once()

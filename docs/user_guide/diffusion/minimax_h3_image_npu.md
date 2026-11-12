@@ -24,7 +24,8 @@ HCCL_DETERMINISTIC=true vllm serve "${MODEL_PATH:?Set the model directory}" \
 AdaLN offload preserves the existing projection-cache and staging ownership.
 Host memory must hold the offloaded weights. This is distinct from approximate
 cross-step activation reuse. The deterministic option enables PyTorch's
-process-wide deterministic algorithms; set `HCCL_DETERMINISTIC=true` separately
+process-wide deterministic algorithms during each forward and restores the caller's
+previous enabled/warn-only settings on return or exception. Set `HCCL_DETERMINISTIC=true` separately
 before starting the worker processes.
 
 ## VAE options
@@ -33,7 +34,8 @@ Pass these options through `--additional-config`:
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `npu_deterministic` | `false` | Enable deterministic PyTorch algorithms in the worker. |
+| `npu_deterministic` | `false` | Enable deterministic PyTorch algorithms during each forward; restore caller settings afterward. |
+| `npu_disable_internal_format` | `false` | Disable NPU internal formats even with VAE graphs off, for matched integration controls. This is worker-wide. |
 | `npu_vae_tile_graph` | `false` | Replay VAE tile kernels using NPU graphs. |
 | `npu_vae_tile_streams` | `1` | Independent decoder graph streams, from 1 to 8. |
 | `npu_vae_tile_batch` | `1` | Decode tiles in batches of 1, 2, 4, 8, 16 or 32. |
@@ -66,7 +68,17 @@ Weight relocation invalidates cached graphs. Shape caches are bounded; shapes
 outside their limits use the corresponding eager computation. A failed
 multi-stream capture is fatal to that stage and requires a restart.
 
-For a same-layout control, set `npu_vae_tile_graph=false` while retaining the
+Use `TASK_QUEUE_ENABLE=1` (or `0`) with NPU graphs. The tested torch-npu
+runtime rejects graph capture with `TASK_QUEUE_ENABLE=2`.
+
+The graph adapter also disables NPU internal formats for the worker. A
+graph-off control must set `npu_disable_internal_format=true` to match that runtime setting before comparing
+VAE execution; toggling only the graph flag compares coupled runtime changes.
+Historical graph-on/off measurements without this match do not isolate the
+VAE's contribution.
+
+For a same-layout control, set `npu_vae_tile_graph=false` and
+`npu_disable_internal_format=true` while retaining the
 same parallelism, AdaLN offload and deterministic settings. Measure complete
 HTTP response receipt, with the same warmup and repetition policy, separately
 from profiling. No cross-hardware performance or quality guarantee is implied.
