@@ -35,6 +35,35 @@ def _observations(directory: Path, case: str, kind: str) -> list[dict]:
     return [json.loads(path.read_text()) for path in directory.glob(f"{case}-{kind}-*.json")]
 
 
+def _multimodal_cases(prompt: dict) -> list[tuple[str, dict]]:
+    import numpy as np
+    from PIL import Image
+
+    cases: list[tuple[str, dict]] = []
+    samples = np.arange(16000, dtype=np.float32) / 16000
+    for modality, tag, original, changed in (
+        (
+            "image",
+            "<|vision_start|><|image_pad|><|vision_end|>",
+            Image.new("RGB", (112, 112), "red"),
+            Image.new("RGB", (112, 112), "blue"),
+        ),
+        (
+            "audio",
+            "<|audio_start|><|audio_pad|><|audio_end|>",
+            (0.1 * np.sin(2 * np.pi * 440 * samples), 16000),
+            (0.1 * np.sin(2 * np.pi * 660 * samples), 16000),
+        ),
+    ):
+        # Media begins before the first complete block. Changing only its
+        # contents must invalidate every block, despite identical prompt text.
+        text = prompt["prompt"].replace("user\n", f"user\n{tag}", 1)
+        first = {"prompt": text, "multi_modal_data": {modality: original}}
+        different = {"prompt": text, "multi_modal_data": {modality: changed}}
+        cases.extend(((f"{modality}_cold", first), (f"{modality}_full", first), (f"{modality}_changed", different)))
+    return cases
+
+
 def _run_arm(model: str, directory: Path, cases: list[tuple[str, dict]], mooncake: dict | None, monkeypatch) -> dict:
     from vllm_omni.entrypoints.omni import Omni
 
@@ -148,7 +177,7 @@ def test_mooncake_turn_cold_full_and_partial_hits(tmp_path, monkeypatch):
     )
     assert common_prefix >= BLOCK_SIZE
     assert common_prefix // BLOCK_SIZE * BLOCK_SIZE < len(partial_tokens) // BLOCK_SIZE * BLOCK_SIZE
-    cases = [("cold", first), ("full", first), ("partial", partial)]
+    cases = [("cold", first), ("full", first), ("partial", partial), *_multimodal_cases(first)]
     config = {
         "config_file": str(Path(config_path).resolve()),
         "namespace": f"m1-acceptance-{uuid4().hex}",
@@ -169,14 +198,14 @@ def test_mooncake_turn_cold_full_and_partial_hits(tmp_path, monkeypatch):
         captures = _observations(tmp_path / "cached", case, "capture")
         assert captures, f"{case}: production capture integration was not exercised"
         inserted = [entry for entry in captures if entry["inserted_rows"] > 0]
-        if case == "cold":
-            assert not inserted, "a new namespace must not restore a prefix"
+        if case == "cold" or case.endswith(("_cold", "_changed")):
+            assert not inserted, f"{case}: unseen text or changed media must not restore a prefix"
             continue
         assert len(inserted) == 1, f"{case}: restore must be observed exactly once"
         entry = inserted[0]
         assert entry["inserted_rows"] == entry["start_token"]
-        full_prefix = entry["prompt_len"] // BLOCK_SIZE * BLOCK_SIZE
-        if case == "full":
+        full_prefix = min(entry["prompt_len"] // BLOCK_SIZE * BLOCK_SIZE, entry["prompt_len"] - 1)
+        if case == "full" or case.endswith("_full"):
             assert entry["inserted_rows"] == full_prefix
         else:
             assert 0 < entry["inserted_rows"] < full_prefix
