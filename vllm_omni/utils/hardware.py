@@ -25,7 +25,7 @@ class HardwareInfo:
     detail: str
 
 
-def _nvidia_smi() -> tuple[str, float] | None:
+def _nvidia_smi() -> tuple[str, float | None] | None:
     try:
         output = subprocess.check_output(
             [
@@ -39,13 +39,20 @@ def _nvidia_smi() -> tuple[str, float] | None:
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    if not output:
+    rows = [line for line in output.splitlines() if line.strip()]
+    if not rows:
         return None
-    name, _, memory = output.partition(",")
+    # `--query-gpu` prints one row per device. Without torch CUDA there is no
+    # device index to ask for, so parse the first row (device 0) explicitly
+    # instead of splitting the whole output at its first comma.
+    name, _, memory = rows[0].partition(",")
+    name = name.strip() or "NVIDIA GPU"
     try:
-        return name.strip(), float(memory.strip()) / 1024
+        return name, float(memory.strip()) / 1024
     except ValueError:
-        return name.strip(), 0.0
+        # Capacity that cannot be read stays unknown; 0 GiB would claim a
+        # real measurement.
+        return name, None
 
 
 def _apple_memory_gb() -> float | None:

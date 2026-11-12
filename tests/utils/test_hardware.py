@@ -90,3 +90,32 @@ def test_detect_hardware_cpu_fallback(monkeypatch):
     assert info.backend == "cpu"
     assert info.memory_gb == 32.0
     assert info.detail == "no accelerator detected"
+
+
+def test_nvidia_smi_parses_one_device_row_from_multi_gpu_output(monkeypatch):
+    raw = "NVIDIA RTX 4090, 24564\nNVIDIA RTX 4090, 24564\n"
+    monkeypatch.setattr(hardware.subprocess, "check_output", lambda *args, **kwargs: raw)
+
+    name, memory_gb = hardware._nvidia_smi()
+
+    assert name == "NVIDIA RTX 4090"
+    assert memory_gb == pytest.approx(24564 / 1024)
+
+
+def test_nvidia_smi_keeps_unreadable_memory_unknown(monkeypatch):
+    monkeypatch.setattr(hardware.subprocess, "check_output", lambda *args, **kwargs: "NVIDIA GPU, [N/A]\n")
+
+    name, memory_gb = hardware._nvidia_smi()
+
+    assert name == "NVIDIA GPU"
+    assert memory_gb is None
+
+
+def test_detect_hardware_keeps_unknown_smi_memory_unknown(monkeypatch):
+    monkeypatch.setattr(hardware.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(hardware, "_nvidia_smi", lambda: ("NVIDIA GPU", None))
+
+    info = hardware.detect_hardware()
+
+    assert info.backend == "cuda"
+    assert info.memory_gb is None
