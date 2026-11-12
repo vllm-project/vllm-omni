@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
 
@@ -44,7 +43,7 @@ class TimestepEmbedder(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(256, hidden, **kwargs), nn.SiLU(), nn.Linear(hidden, hidden, **kwargs))
 
     def forward(self, t):
-        freqs = torch.exp(-math.log(10000) * torch.arange(128, dtype=torch.float32) / 128).to(t.device)
+        freqs = torch.exp(-math.log(10000) * torch.arange(128, dtype=torch.float32, device=t.device) / 128)
         angles = t.flatten()[:, None].float() * freqs[None]
         values = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1).view(*t.shape, 256)
         return self.mlp(values.to(self.mlp[0].weight.dtype))
@@ -102,8 +101,7 @@ class TokenRefinerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden, eps=1e-6, **kwargs)
         self.mlp = MLP(hidden, 4 * hidden, **kwargs)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 2 * hidden, **kwargs))
-        attention_impl = FlashAttentionImpl if torch.device(kwargs.get("device") or "cpu").type == "cuda" else SDPAImpl
-        self.attn = attention_impl(
+        self.attn = SDPAImpl(
             num_heads=heads,
             head_size=hidden // heads,
             causal=False,

@@ -157,6 +157,8 @@ class PipelineWithCPUComponents(HyNomasPipeline):
                 "commit": kwargs["update_cache"],
                 "position": kwargs["global_frame_counter"],
                 "mask": kwargs["cache_mask_list"][0][:, :start].clone(),
+                "mask_id": id(kwargs["cache_mask_list"][0]),
+                "mask_list_id": id(kwargs["cache_mask_list"]),
                 "text_length": kwargs["text_states"].shape[1],
                 "timestep_dtype": kwargs["timestep"].dtype,
                 "cache_txt": kwargs["cache_txt"],
@@ -738,3 +740,50 @@ def test_recent_failed_commit_preserves_published_history(recent_runner, monkeyp
         torch.testing.assert_close(runner.pipeline._ar_sessions["s"].history_mask, masks)
         assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
     runner.close_session("s")
+
+
+def test_chunk_reuses_mask_across_denoise_steps_and_clears_after_commit(runner, mocker):
+    from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
+
+    pipeline = runner.pipeline
+    state = StepRequestState(request_id="live", sampling=sampling(frames=21), prompt="forest")
+    with runner._bound_ar_session("live", description="test"):
+        pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
+        assert state.extra["hy_nomas_chunk_masks"] is None
+        inputs = InputBatch.make_batch([state], cached_batch=None)
+        for _ in range(state.chunk_num_steps):
+            prediction = pipeline.denoise_step(inputs, states=[state])
+            cm = state.extra.get("hy_nomas_chunk_masks")
+            assert cm is not None and cm[0] is not None and cm[1] == [cm[0]] * pipeline.num_double_blocks
+            pipeline.step_scheduler(state, prediction)
+        pipeline.post_decode(state)
+        assert state.extra["hy_nomas_chunk_masks"] is None
+        chunk0_calls = pipeline.calls[: state.chunk_num_steps + 1]
+        assert len({call["mask_id"] for call in chunk0_calls}) == 1
+        assert len({call["mask_list_id"] for call in chunk0_calls}) == 1
+        step_chunk(pipeline, state, inputs)
+        chunk1_calls = pipeline.calls[state.chunk_num_steps + 1 :]
+        assert len({call["mask_id"] for call in chunk1_calls}) == 1
+        assert len({call["mask_list_id"] for call in chunk1_calls}) == 1
+    runner.close_session("live")
+
+    real_transformer = _small_transformer(num_layers=2)
+    pipeline.transformer = real_transformer
+    pipeline.in_channels = real_transformer.in_channels
+    pipeline.num_double_blocks = real_transformer.config.num_layers
+    pipeline.heads_num = real_transformer.heads_num
+    pipeline.hidden_size = real_transformer.hidden_size
+    pipeline._encode_prompt = lambda text, *a, **kw: {
+        "text_states": torch.ones(1, 4, real_transformer.config.text_embed_dim),
+        "text_mask": torch.tensor([[1, 1, 1, 0]]),
+    }
+    real_runner = make_runner(pipeline)
+    spy_resolve = mocker.spy(real_transformer.attention, "resolve_masks")
+    real_state = StepRequestState(request_id="real-live", sampling=sampling(frames=9), prompt="forest")
+    with real_runner._bound_ar_session("real-live", description="test"):
+        pipeline.prepare_encode(real_state)
+        step_chunk(pipeline, real_state)
+        assert spy_resolve.call_count == 1
+        assert real_state.extra["hy_nomas_chunk_masks"] is None
+    real_runner.close_session("real-live")

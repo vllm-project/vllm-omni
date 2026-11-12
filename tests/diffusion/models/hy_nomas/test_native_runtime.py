@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
+import copy
 import os
 import subprocess
 import sys
@@ -13,12 +14,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
-from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
+from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import ActionModule, HyNomasTransformer
 from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
 from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import prepare_camera
@@ -162,6 +164,237 @@ def test_native_dit_cache_and_camera():
     assert not model.attention.masks and not model.camera_attention.masks
 
 
+def _step_kw(f=2, h=1, w=1, txt_mask=(1, 1, 0), offs=None, wins=None, **extra):
+    t_len = len(txt_mask)
+    base = {"hidden_states": torch.randn(1, 4, f, h, w), "timestep": torch.tensor([300.0])}
+    act = {"intra_seg_txt_offsets": offs, "intra_seg_vid_windows": wins}
+    return {
+        **base,
+        "text_states": torch.randn(1, t_len, 6),
+        "text_mask": torch.tensor([list(txt_mask)]),
+        **act,
+        **extra,
+    }
+
+
+@torch.no_grad()
+def test_transformer_hoists_step_masks_and_camera_and_hits_warm_fast_path(mocker):
+    from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer, layers
+
+    torch.manual_seed(29)
+    model = _small_transformer(num_layers=3)
+    cache = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(3)]
+    shared_mask = torch.zeros(1, 32, dtype=torch.bool)
+    shared_mask[:, :4] = torch.tensor([[True, False, True, True]])
+    inputs = _step_kw(
+        offs=[[1, 2]],
+        wins=[(0, 1, 0), (1, 2, 1)],
+        kv_cache_list=cache,
+        cache_valid_len=4,
+        global_frame_counter=2,
+        cache_mask_list=[shared_mask] * 3,
+        camera_embedding=torch.randn(1, 2, 64),
+    )
+    sr, sa = mocker.spy(hy_nomas_transformer, "rotary_tables"), mocker.spy(hy_nomas_transformer, "action_ranges")
+    sm, sc = mocker.spy(model.attention, "resolve_masks"), mocker.spy(model.camera_attention, "resolve_masks")
+
+    cold_out, cold_written = model.forward_with_cache(**inputs)
+    assert (cold_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
+    cached_rope_gt0 = next(iter(model._step_rope_cache.values()))
+
+    warm_out, warm_written = model.forward_with_cache(**inputs)
+    assert (warm_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
+    assert next(iter(model._step_rope_cache.values()))[0] is cached_rope_gt0[0]
+    torch.testing.assert_close(warm_out, cold_out, rtol=0, atol=0)
+
+    gfc0_cold, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
+    assert sr.call_count == 2
+    gfc0_warm, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
+    assert sr.call_count == 2
+    torch.testing.assert_close(gfc0_warm, gfc0_cold, rtol=0, atol=0)
+
+    commit_out, commit_written = model.forward_with_cache(**{**inputs, "update_cache": True})
+    assert (commit_written, sm.call_count, sr.call_count) == (5, 1, 2)
+    torch.testing.assert_close(commit_out, cold_out, rtol=0, atol=0)
+    assert shared_mask[0, 4:9].tolist() == [True, True, True, True, False]
+
+    post_commit_warm_out, _ = model.forward_with_cache(**inputs)
+    torch.testing.assert_close(post_commit_warm_out, cold_out, rtol=0, atol=0)
+    assert (sm.call_count, sr.call_count) == (1, 2)
+
+    shared_mask[0, 0] = False
+    mutated_out, _ = model.forward_with_cache(**inputs)
+    assert sm.call_count == 2 and not torch.equal(mutated_out, cold_out)
+
+    model.clear_attention_cache()
+    assert not model._step_attention_plan_cache and not model._step_camera_plan_cache and not model._step_rope_cache
+    devs, orig_arange, t = [], torch.arange, torch.tensor([300.0])
+
+    def _rec_arange(*a, **kw):
+        devs.append(kw.get("device"))
+        return orig_arange(*a, **kw)
+
+    with pytest.MonkeyPatch.context() as mp_ctx:
+        mp_ctx.setattr(torch, "arange", _rec_arange)
+        mp_ctx.setattr(torch, "device", lambda *_: type("D", (), {"type": "cuda"})())
+        _, blk = layers.TimestepEmbedder(32)(t), layers.TokenRefinerBlock(32, 4)
+    got = (hasattr(layers, "FlashAttentionImpl"), isinstance(blk.attn, layers.SDPAImpl), devs)
+    assert got == (False, True, [t.device])
+
+
+@torch.no_grad()
+def test_transformer_handles_none_offsets_heterogeneous_masks_and_lru_bounds():
+    torch.manual_seed(31)
+    model = _small_transformer(num_layers=2)
+    cache = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(2)]
+    shared_mask = torch.ones(1, 32, dtype=torch.bool)
+    cam = torch.randn(1, 2, 64)
+    base_inputs = _step_kw(
+        offs=[None], wins=[(0, 1, 0)], kv_cache_list=cache, cache_valid_len=4, cache_mask_list=[shared_mask] * 2
+    )
+    base_inputs["camera_embedding"] = cam
+    out_none_off, _ = model.forward_with_cache(**base_inputs)
+    out_none_off_warm, _ = model.forward_with_cache(**base_inputs)
+    torch.testing.assert_close(out_none_off_warm, out_none_off, rtol=0, atol=0)
+
+    mask_layer0, mask_layer1 = torch.ones(1, 32, dtype=torch.bool), torch.ones(1, 32, dtype=torch.bool)
+    mask_layer1[0, 0] = False
+    hetero_out, _ = model.forward_with_cache(**{**base_inputs, "cache_mask_list": [mask_layer0, mask_layer1]})
+    homo_out, _ = model.forward_with_cache(**{**base_inputs, "cache_mask_list": [mask_layer0, mask_layer0]})
+    assert not torch.equal(hetero_out, homo_out)
+
+    for valid_len in range(1, 12):
+        hs = torch.randn(1, 4, 2, 1, (valid_len % 3) + 1)
+        kw = {**base_inputs, "cache_valid_len": valid_len, "global_frame_counter": valid_len, "hidden_states": hs}
+        model.forward_with_cache(**kw)
+    caches = (model._step_attention_plan_cache, model._step_camera_plan_cache, model._step_rope_cache)
+    assert max(map(len, caches)) <= 8
+
+
+@torch.no_grad()
+def test_regional_compile_wraps_blocks_matches_eager_and_avoids_recompile_explosion():
+    from tests.diffusion.ar_diffusion.test_segmented_kv import make_cache, make_state
+
+    assert HyNomasTransformer._repeated_blocks == ["MMDoubleStreamBlock", "ActionModule"]
+    act_meta = ActionModule(_SMALL_TRANSFORMER_CONFIG, 32, device="meta")
+    assert act_meta.freqs_cos.device.type == "meta" and act_meta.freqs_sin.device.type == "meta"
+
+    torch.manual_seed(41)
+    eager = _small_transformer(num_layers=2)
+    assert eager.double_blocks[0].forward.__kwdefaults__ == {"block_masks": None}
+    compiled = copy.deepcopy(eager)
+    prev_fail = torch._dynamo.config.fail_on_recompile_limit_hit
+    torch._dynamo.reset()
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
+    owners = [make_state(make_cache(num_layers=2, num_kv_heads=4, head_size=8)) for _ in range(2)]
+    try:
+        regionally_compile(compiled, backend="aot_eager", dynamic=True)
+        wrapped = {n for n, m in compiled.named_modules() if "forward" in m.__dict__}
+        assert wrapped == {"double_blocks.0", "double_blocks.1", "action_modules.0", "action_modules.1"}
+        x_act, cam_act, cmask = torch.randn(1, 4, 32), torch.randn(1, 2, 64), torch.tensor([True])
+        qr, kr, bm = eager._resolve_step_camera_plan(
+            batch=1, length=4, frames=2, height=1, width=2, device=x_act.device
+        )
+        ref_act = eager.action_modules[0](x_act, 2, 1, 2, cam_act, eager.camera_attention, 1, cmask)
+        act_kws: list[dict[str, object]] = [
+            {},
+            {"k_rotary": kr, "block_masks": bm},
+            {"q_rotary": qr, "block_masks": bm},
+            {"q_rotary": qr, "k_rotary": kr},
+        ]
+        for kw in act_kws:
+            out_act = compiled.action_modules[0](x_act, 2, 1, 2, cam_act, compiled.camera_attention, 1, cmask, **kw)
+            torch.testing.assert_close(out_act, ref_act, rtol=0, atol=0)
+        for f_fb in range(1, 11):
+            x_fb, cam_fb = torch.randn(1, f_fb * 2, 32), torch.randn(1, f_fb, 64)
+            out_c = compiled.action_modules[0](x_fb, f_fb, 1, 2, cam_fb, compiled.camera_attention, 1, None)
+            out_e = eager.action_modules[0](x_fb, f_fb, 1, 2, cam_fb, eager.camera_attention, 1, None)
+            torch.testing.assert_close(out_c, out_e, rtol=0, atol=0)
+        tb = eager._resolve_step_rope_tables(2, 1, 1, 0, 0, x_act.device, x_act.device)
+        ie, te, vc, tm_b = torch.randn(1, 2, 32), torch.randn(1, 3, 32), torch.randn(1, 32), torch.tensor([[1, 1, 0]])
+        fb_m = [torch.zeros(1, 16, dtype=torch.bool) for _ in range(2)]
+        fb_kv = [{"k": torch.zeros(1, 16, 4, 8), "v": torch.zeros(1, 16, 4, 8)} for _ in range(2)]
+        re_i, re_t = eager.double_blocks[0](
+            ie, te, vc, tb, tm_b, fb_kv[0], 0, True, True, fb_m[0], 0, eager.attention, 1, [[1]], [(0, 2, 0)], 1
+        )
+        rc_i, rc_t = compiled.double_blocks[0](
+            ie, te, vc, tb, tm_b, fb_kv[1], 0, True, True, fb_m[1], 0, compiled.attention, 1, [[1]], [(0, 2, 0)], 1
+        )
+        assert torch.equal(re_i, rc_i) and torch.equal(re_t, rc_t) and torch.equal(fb_m[0], fb_m[1])
+        kv_e = [{"k": torch.zeros(1, 96, 4, 8), "v": torch.zeros(1, 96, 4, 8)} for _ in range(2)]
+        kv_c = [{"k": torch.zeros(1, 96, 4, 8), "v": torch.zeros(1, 96, 4, 8)} for _ in range(2)]
+        masks_d = [torch.zeros(1, 96, dtype=torch.bool) for _ in range(2)]
+        masks_s = [torch.zeros(1, 96, dtype=torch.bool) for _ in range(2)]
+        seg_e, seg_c, hist_d = owners[0].segmented("main"), owners[1].segmented("main"), 0
+        rounds = [
+            (1, 1, 1, 0, True, False, [[1]], [(0, 1, 0)], True, False),
+            (2, 1, 1, 0, True, True, [[1, 2]], [(0, 1, 0), (1, 2, 1)], True, False),
+            (2, 1, 2, 2, True, False, [[0, 1, 2]], [(0, 1, 0), (1, 2, 1)], False, False),
+            (3, 1, 1, 2, True, False, [[1, 2, 3]], [(0, 1, 0), (1, 2, 1), (2, 3, 2)], True, False),
+            (5, 1, 1, 4, False, True, None, None, True, False),
+            (2, 2, 1, 6, True, False, [None], [(0, 2, 0)], True, False),
+            (3, 1, 2, 6, True, False, [[1]], [(0, 2, 0), (2, 3, 0)], True, False),
+            (2, 1, 1, 8, True, False, [[0, 2]], [(0, 1, 0)], True, False),
+            (1, 1, 2, 8, False, False, [[1, 3]], [(0, 1, 0)], False, False),
+            (2, 1, 2, 10, True, False, [[0, 1, 3, 4]], [(0, 1, 0), (1, 2, 2)], True, False),
+            (2, 1, 1, 0, True, True, [[1, 2]], [(0, 1, 0), (1, 2, 1)], True, True),
+            (2, 1, 2, 2, False, True, None, None, True, True),
+        ]
+        for idx, (f, h, w, gfc, c_txt, upd, offs, wins, use_cam, use_seg) in enumerate(rounds):
+            t_len, cam = 3 + idx % 4, (torch.randn(1, f, 64) if use_cam else None)
+            cm, tm = (torch.tensor([idx % 3 != 0]) if use_cam else None), (1,) * (t_len - 1) + (idx % 2,)
+            ex = {"timestep": torch.tensor([300.0 - idx * 10]), "update_cache": upd, "global_frame_counter": gfc}
+            common = _step_kw(f, h, w, tm, offs, wins, **ex, cache_txt=c_txt, camera_embedding=cam, camera_has_mask=cm)
+            if use_seg:
+                media = f * h * w + (t_len if c_txt else 0)
+                pend = [
+                    (s.prepare_layer_views(media, 0 if c_txt else t_len), s.begin_commit((media,)))[1]
+                    for s in (seg_e, seg_c)
+                ]
+                se, sc = seg_e.history_tokens, seg_c.history_tokens
+                exp, ew = eager.forward_with_cache(
+                    **common, cache_valid_len=se, kv_cache_state=seg_e, cache_mask_list=[masks_s[0]] * 2
+                )
+                act, aw = compiled.forward_with_cache(
+                    **common, cache_valid_len=sc, kv_cache_state=seg_c, cache_mask_list=[masks_s[1]] * 2
+                )
+                for s, p in zip((seg_e, seg_c), pend):
+                    s.stage(0), s.stage(1), s.commit(retain=(*s.handles, *p))
+            else:
+                exp, ew = eager.forward_with_cache(
+                    **common, cache_valid_len=hist_d, kv_cache_list=kv_e, cache_mask_list=[masks_d[0]] * 2
+                )
+                act, aw = compiled.forward_with_cache(
+                    **common, cache_valid_len=hist_d, kv_cache_list=kv_c, cache_mask_list=[masks_d[1]] * 2
+                )
+                hist_d += ew
+            assert aw == ew
+            torch.testing.assert_close(act, exp, rtol=0, atol=0)
+        hm_e = [masks_d[0].clone(), masks_d[0].clone()]
+        hm_e[1][0, 0] = not hm_e[0][0, 0]
+        hm_c = [m.clone() for m in hm_e]
+        shapes = ((1, 1, 1), (2, 1, 1), (3, 1, 1), (2, 1, 2), (5, 1, 1), (3, 1, 2))
+        for k in range(1, 11):
+            f, h, w = shapes[k % 6]
+            offs_k, wins_k = [list(range(1, k + 1))], [(j, j + 1, j) for j in range(k)]
+            tm, ex = (1,) * (2 + k % 4) + (0,), {"update_cache": k == 5, "global_frame_counter": k}
+            kw = _step_kw(f, h, w, tm, offs_k, wins_k, **ex, camera_embedding=torch.randn(1, f, 64))
+            exp, ew = eager.forward_with_cache(**kw, cache_valid_len=hist_d, kv_cache_list=kv_e, cache_mask_list=hm_e)
+            act, aw = compiled.forward_with_cache(
+                **kw, cache_valid_len=hist_d, kv_cache_list=kv_c, cache_mask_list=hm_c
+            )
+            hist_d += ew
+            assert aw == ew
+            torch.testing.assert_close(act, exp, rtol=0, atol=0)
+        assert torch.equal(masks_d[0], masks_d[1]) and torch.equal(masks_s[0], masks_s[1])
+        assert all(torch.equal(a, b) for a, b in zip(hm_e, hm_c))
+    finally:
+        for owner in owners:
+            owner.close()
+        torch._dynamo.config.fail_on_recompile_limit_hit = prev_fail
+        torch._dynamo.reset()
+
+
 @torch.no_grad()
 def test_native_segmented_kv_matches_contiguous_storage():
     from tests.diffusion.ar_diffusion.test_segmented_kv import make_cache, make_state
@@ -273,9 +506,12 @@ def _native_ulysses_worker(rank, rendezvous):
             torch.manual_seed(17)
             with set_forward_context(omni_diffusion_config=configs[1]), set_current_diffusion_config(configs[1]):
                 model = _small_transformer(2, num_layers=2)
+                compiled_model = regionally_compile(copy.deepcopy(model), backend="aot_eager", dynamic=True)
+                assert hasattr(compiled_model.double_blocks[0].forward, "_torchdynamo_orig_callable")
             reference = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(2)]
             candidate = [{"k": torch.zeros(1, 32, 2, 8), "v": torch.zeros(1, 32, 2, 8)} for _ in range(2)]
-            masks = [torch.zeros(1, 32, dtype=torch.bool) for _ in range(2)]
+            compiled_kv = [{"k": torch.zeros(1, 32, 2, 8), "v": torch.zeros(1, 32, 2, 8)} for _ in range(2)]
+            masks = [torch.zeros(1, 32, dtype=torch.bool) for _ in range(3)]
             history = 0
             for turn in range(2):
                 inputs = dict(
@@ -299,8 +535,13 @@ def _native_ulysses_worker(rank, rendezvous):
                     actual, actual_written = model.forward_with_cache(
                         **inputs, kv_cache_list=candidate, cache_mask_list=[masks[1]] * 2
                     )
+                    compiled_out, compiled_written = compiled_model.forward_with_cache(
+                        **inputs, kv_cache_list=compiled_kv, cache_mask_list=[masks[2]] * 2
+                    )
                 torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-                assert actual_written == written and torch.equal(masks[0], masks[1])
+                torch.testing.assert_close(compiled_out, expected, rtol=1e-5, atol=1e-6)
+                assert actual_written == written and compiled_written == written
+                assert torch.equal(masks[0], masks[1]) and torch.equal(masks[0], masks[2])
                 history += written
                 for layer in range(2):
                     torch.testing.assert_close(

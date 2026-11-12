@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import LoadConfig
 
+from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 from vllm_omni.diffusion.media import VideoValueRange
@@ -218,6 +219,7 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
         custom_pipeline_args={} if text_encoder_override is None else {"text_encoder": text_encoder_override},
     )
     pipeline = HyNomasPipeline(od_config=config)
+    assert pipeline.od_config is config
     assert pipeline.transformer is transformer and pipeline.text_encoder is text_encoder and pipeline.vae is vae
     assert [(source.subfolder, source.prefix) for source in pipeline.weights_sources] == [
         ("transformer", "transformer."),
@@ -515,6 +517,7 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
+        ({"enforce_eager": False, "diffusion_compile_granularity": "layer"}, "Unsupported"),
     ],
 )
 def test_unsupported_engine_features(overrides, match):
@@ -757,3 +760,25 @@ def test_sequence_parallelism_matches_worker_group(monkeypatch, sp_size, ulysses
     else:
         with pytest.raises(ValueError, match="match ulysses_degree"):
             pipeline_hy_nomas.validate_sequence_parallelism(sp_size)
+
+
+def test_setup_compile_regional_and_eager_gates(pipeline, mocker):
+    d = os.path.join(os.path.dirname(pipeline_hy_nomas.__file__), "../../../deploy")
+    assert all(OmegaConf.load(f"{d}/{f}.yaml").stages[0].enforce_eager is True for f in ("hy_nomas", "hy_nomas_ar"))
+    spy = mocker.spy(pipeline_hy_nomas, "regionally_compile")
+    opts = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+    c0 = OmniDiffusionConfig(distributed_executor_backend="mp", dtype=torch.bfloat16, diffusion_compile_dynamic=False)
+    c1 = OmniDiffusionConfig(distributed_executor_backend="mp", dtype=torch.bfloat16, enforce_eager=True)
+    for od_config, dyn in ((None, True), (c0, False), (None, True), (c1, None)):
+        if od_config is not None or hasattr(pipeline, "od_config"):
+            pipeline.od_config = od_config
+        t = pipeline.transformer = _small_transformer(num_layers=2)
+        spy.reset_mock()
+        pipeline.setup_compile()
+        assert spy.call_args_list == ([] if dyn is None else [((t,), {"dynamic": dyn, "options": opts})])
+        blocks = (*t.double_blocks, *t.action_modules)
+        assert all(hasattr(b.forward, "_torchdynamo_orig_callable") is (dyn is not None) for b in blocks)
+    for g, match in (("full", "full transformer compilation.*'regional'"), ("layer", "Unsupported")):
+        c1.enforce_eager, c1.diffusion_compile_granularity = False, g
+        with pytest.raises(ValueError, match=match):
+            pipeline.setup_compile()

@@ -19,6 +19,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -135,6 +136,18 @@ def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
     return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
+def _validate_compile(config: object) -> bool:
+    if getattr(config, "enforce_eager", False):
+        return False
+    if (g := getattr(config, "diffusion_compile_granularity", "regional")) != "regional":
+        err = (
+            "Hy-Nomas does not support full transformer compilation; "
+            "use diffusion_compile_granularity='regional' or enforce_eager=True."
+        )
+        raise ValueError(err if g == "full" else f"Unsupported Hy-Nomas diffusion_compile_granularity: {g!r}")
+    return True
+
+
 def validate_config(config: OmniDiffusionConfig) -> None:
     from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
     from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
@@ -160,8 +173,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas currently supports the unquantized distilled checkpoint without LoRA.")
     if config.flow_shift not in (None, 5.0):
         raise ValueError("Hy-Nomas requires flow_shift=5.")
-    if not config.enforce_eager and config.diffusion_compile_granularity == "full":
-        raise ValueError("Hy-Nomas does not support full transformer compilation; use enforce_eager=True.")
+    _validate_compile(config)
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
@@ -214,6 +226,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         super().__init__()
         del prefix
         validate_config(od_config)
+        self.od_config = od_config
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
@@ -314,7 +327,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         return loaded
 
     def setup_compile(self) -> None:
-        raise NotImplementedError("Hy-Nomas uses forward_with_cache; set enforce_eager=True.")
+        if _validate_compile(od_config := getattr(self, "od_config", None)):
+            dynamic = True if od_config is None else getattr(od_config, "diffusion_compile_dynamic", True)
+            opts = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+            regionally_compile(self.transformer, dynamic=dynamic, options=opts)
 
     @contextmanager
     def _component_context(self, module: nn.Module):
@@ -686,6 +702,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.extra["hy_nomas_camera_mask"] = (
             torch.zeros(1, dtype=torch.bool, device=self.device) if camera_off else None
         )
+        state.extra["hy_nomas_chunk_masks"] = None
 
     def _forward_chunk(
         self, state: StepRequestState, latents: torch.Tensor, timestep: torch.Tensor, *, commit: bool
@@ -715,12 +732,23 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 {name: tensor[:, : history + current_tokens] for name, tensor in layer.items()}
                 for layer in session.offline_cache
             ]
-        mask = torch.cat(
-            (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
-        )
-        for segment, start, end in session.action_tails:
-            if segment != state.extra["hy_nomas_segment_id"]:
-                mask[:, start:end] = False
+        mask, mask_list = state.extra.get("hy_nomas_chunk_masks") or (None, None)
+        if (
+            mask is None
+            or mask_list is None
+            or mask.shape != (1, history + current_tokens)
+            or mask.device != self.device
+            or len(mask_list) != self.num_double_blocks
+            or any(item is not mask for item in mask_list)
+        ):
+            mask = torch.cat(
+                (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
+            )
+            for segment, start, end in session.action_tails:
+                if segment != state.extra["hy_nomas_segment_id"]:
+                    mask[:, start:end] = False
+            mask_list = [mask] * self.num_double_blocks
+            state.extra["hy_nomas_chunk_masks"] = (mask, mask_list)
         if latents.shape[1] < self.in_channels:
             latents = torch.cat(
                 (
@@ -746,6 +774,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             try:
                 self._check_sp_error(error, "KV allocation")
             except BaseException:
+                state.extra["hy_nomas_chunk_masks"] = None
                 cache.rollback()
                 raise
         try:
@@ -766,7 +795,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     global_frame_counter=session.latent_frames,
                     guidance=None,
                     cache_txt=first,
-                    cache_mask_list=[mask] * self.num_double_blocks,
+                    cache_mask_list=mask_list,
                     camera_embedding=state.extra["hy_nomas_camera"],
                     camera_has_mask=state.extra["hy_nomas_camera_mask"],
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
@@ -830,10 +859,13 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                             history + current_tokens,
                         )
                     )
+                state.extra["hy_nomas_chunk_masks"] = None
             return prediction
         except BaseException:
-            if commit and cache is not None:
-                cache.rollback()
+            if commit:
+                state.extra["hy_nomas_chunk_masks"] = None
+                if cache is not None:
+                    cache.rollback()
             raise
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
