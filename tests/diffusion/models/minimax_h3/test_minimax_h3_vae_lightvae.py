@@ -565,6 +565,75 @@ def test_lightvae_decoder_tile_count_uses_release_geometry():
     assert native.lightvae_decoder_tile_count(_Model(), latent) == 21
 
 
+def test_decode_latent_preserves_image_tiling_through_context_padding(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.lightvae import native as native_module
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 16
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+            self.parallel_tiling = False
+            self.processor = types.SimpleNamespace(revert_tensor=lambda decoded: decoded)
+
+        def tiled_decode(self, z):
+            raise AssertionError("apply_h3_lite_decode_profile must install the release decode path")
+
+    model = _Model()
+    profile = native_module.H3LiteDecodeProfile(
+        tile_size=272,
+        tile_overlap=64,
+        long_axis_tile=208,
+        short_axis_overlap=0,
+        long_axis_overlap=16,
+        image_tile_size=256,
+        image_long_axis_tile=256,
+        image_context_tokens=5,
+        image_context_output_phase=3,
+        tile_layout="native",
+    )
+    native_module.apply_h3_lite_decode_profile(model, profile)
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    vae.model = model
+    vae.parallel_size = 1
+    vae.config_dict = {
+        "latent_channels": 24,
+        "latents_mean": [0.0] * 24,
+        "latents_std": [1.0] * 24,
+    }
+    latent = torch.zeros(1, 24, 1, 48, 84)
+
+    planning = {}
+    real_count = native_module.lightvae_decoder_tile_count
+
+    def counted_tile_count(model_arg, latent_arg):
+        planning["frames"] = int(latent_arg.shape[2])
+        planning["count"] = real_count(model_arg, latent_arg)
+        return planning["count"]
+
+    monkeypatch.setattr(native_module, "lightvae_decoder_tile_count", counted_tile_count)
+
+    decoded = {}
+
+    def fake_tiled_decode(model_arg, profile_arg, z, *, is_image=False):
+        decoded["frames"] = int(z.shape[2])
+        decoded["is_image"] = is_image
+        return torch.ones(1, 3, 5, 768, 1344)
+
+    monkeypatch.setattr(native_module, "_tiled_decode_lightvae", fake_tiled_decode)
+
+    frames = MiniMaxH3VideoVAE.decode_latent(vae, latent)
+
+    assert planning == {"frames": 1, "count": 28}
+    assert decoded == {"frames": 5, "is_image": True}
+    assert frames.shape == (1, 3, 1, 768, 1344)
+
+
 def test_diffusers_directory_requires_teacher_depth(lite_directory_factory):
     path = lite_directory_factory()
     with pytest.raises(ValueError, match="teacher_num_layers"):
@@ -612,6 +681,10 @@ def test_diffusers_directory_rejects_missing_or_bad_config(lite_directory_factor
         ({"student_long_axis_tile": 0}, "student_long_axis_tile"),
         ({"student_short_axis_overlap": -1}, "student_short_axis_overlap"),
         ({"student_long_axis_overlap": -1}, "student_long_axis_overlap"),
+        ({"student_tile_size": 256, "student_short_axis_overlap": 256}, "student_short_axis_overlap"),
+        ({"student_tile_size": 256, "student_short_axis_overlap": 264}, "student_short_axis_overlap"),
+        ({"student_long_axis_tile": 256, "student_long_axis_overlap": 256}, "student_long_axis_overlap"),
+        ({"student_tile_overlap": 256, "image_tile_size": 256}, "student_tile_overlap"),
         ({"image_context_tokens": 0}, "image_context_tokens"),
         ({"temporal_decode_protocol": "unknown"}, "temporal_decode_protocol"),
         ({"tile_layout": "unknown"}, "tile_layout"),
@@ -708,6 +781,89 @@ def test_apply_decode_profile_accepts_minimum_ratio_tile():
     _api("native").apply_h3_lite_decode_profile(model, profile)
     assert model.decoder_tile_size == 8
     assert model.decoder_tile_overlap_min == 0
+
+
+@pytest.mark.parametrize(
+    "profile_kwargs,field",
+    [
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 0,
+                "short_axis_overlap": 256,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_short_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 0,
+                "short_axis_overlap": 264,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_short_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 256,
+                "short_axis_overlap": 0,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_long_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 208,
+                "tile_overlap": 0,
+                "long_axis_tile": 272,
+                "long_axis_overlap": 264,
+                "short_axis_overlap": 0,
+                "image_tile_size": 208,
+                "image_long_axis_tile": 208,
+            },
+            "decoder_square_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 272,
+                "tile_overlap": 256,
+                "long_axis_tile": 208,
+                "long_axis_overlap": 16,
+                "short_axis_overlap": 0,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_image_overlap",
+        ),
+    ],
+)
+def test_apply_decode_profile_rejects_overlap_at_or_above_tile(profile_kwargs, field):
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    with pytest.raises(ValueError, match=field):
+        _api("native").apply_h3_lite_decode_profile(model, _api().H3LiteDecodeProfile(**profile_kwargs))
+    assert model.decoder_tile_size == 256
+    assert model.decoder_tile_overlap_min == 64
+    assert not hasattr(model, "_h3_lite_decode_profile")
 
 
 def test_apply_decode_profile_rejects_non_multiple_tile():

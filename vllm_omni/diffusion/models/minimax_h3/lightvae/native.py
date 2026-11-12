@@ -203,6 +203,13 @@ def _merge_profile_fallback(profile: H3LiteDecodeProfile, fallback: H3LiteDecode
     return H3LiteDecodeProfile(**values)
 
 
+def _require_overlap_below_tile(field: str, overlap: int | None, tile: int | None) -> None:
+    if overlap is None or tile is None:
+        return
+    if overlap >= tile:
+        raise ValueError(f"H3 Lite {field}={overlap} must be smaller than its tile size {tile}")
+
+
 def _decode_profile_updates(model: nn.Module, profile: H3LiteDecodeProfile | None) -> dict[str, object]:
     """Validate a profile and return the attributes to set, without mutating."""
     if profile is None:
@@ -229,6 +236,17 @@ def _decode_profile_updates(model: nn.Module, profile: H3LiteDecodeProfile | Non
     image_tile = profile.image_tile_size or short_tile
     image_long_tile = profile.image_long_axis_tile or image_tile
     image_overlap = profile.tile_overlap if profile.tile_overlap is not None else short_overlap
+
+    _require_overlap_below_tile("decoder_short_axis_overlap", short_overlap, short_tile)
+    _require_overlap_below_tile("decoder_long_axis_overlap", long_overlap, long_tile)
+    if short_tile is not None and short_overlap is not None and long_overlap is not None:
+        _require_overlap_below_tile(
+            "decoder_square_axis_overlap",
+            max(short_overlap, long_overlap),
+            short_tile,
+        )
+    _require_overlap_below_tile("decoder_image_overlap", image_overlap, image_tile)
+    _require_overlap_below_tile("decoder_image_overlap", image_overlap, image_long_tile)
 
     values = {
         "decoder_tile_overlap_min": short_overlap,
@@ -290,6 +308,10 @@ def _split_tiles_for_profile(
     *,
     layout: str,
 ) -> tuple[list[int], list[int], list[int]]:
+    if size <= 0 or min_overlap < 0 or min_overlap >= size:
+        raise ValueError(
+            f"H3 Lite tile size {size} must be positive and overlap {min_overlap} must be smaller than it"
+        )
     ratio = int(getattr(model, "vae_ratio", 1) or 1)
     if layout == "adaptive":
         if length <= size + min_overlap:
@@ -368,7 +390,13 @@ def _native_parallel_state(model: nn.Module) -> Mapping[str, object]:
     return {"sp_rank": 0, "sp_size": 1, "sp_process_group": None}
 
 
-def _tiled_decode_lightvae(model: nn.Module, profile: H3LiteDecodeProfile, z: torch.Tensor) -> torch.Tensor:
+def _tiled_decode_lightvae(
+    model: nn.Module,
+    profile: H3LiteDecodeProfile,
+    z: torch.Tensor,
+    *,
+    is_image: bool = False,
+) -> torch.Tensor:
     """Native H3 tiled decode with the release's per-axis LightVAE geometry."""
     if getattr(model, "parallel_tiling", False):
         state = _native_parallel_state(model)
@@ -380,7 +408,8 @@ def _tiled_decode_lightvae(model: nn.Module, profile: H3LiteDecodeProfile, z: to
 
     ratio = int(getattr(model, "vae_ratio", 1) or 1)
     height, width = int(z.shape[-2]) * ratio, int(z.shape[-1]) * ratio
-    tile_h, tile_w, overlap_h, overlap_w = _lightvae_geometry(model, profile, int(z.shape[2]), height, width)
+    frames = 1 if is_image else int(z.shape[2])
+    tile_h, tile_w, overlap_h, overlap_w = _lightvae_geometry(model, profile, frames, height, width)
     layout = profile.tile_layout or "native"
     y_idx, y_len, y_overlap = _split_tiles_for_profile(model, height, tile_h, overlap_h, layout=layout)
     x_idx, x_len, x_overlap = _split_tiles_for_profile(model, width, tile_w, overlap_w, layout=layout)
@@ -449,7 +478,11 @@ def _install_lightvae_tiled_decode(model: nn.Module, profile: H3LiteDecodeProfil
         # Profile-only unit doubles do not own the native decode entry point.
         return
     model._h3_lite_tiled_decode = model.tiled_decode
-    model.tiled_decode = lambda z: _tiled_decode_lightvae(model, profile, z)
+
+    def tiled_decode(z: torch.Tensor, *, is_image: bool = False) -> torch.Tensor:
+        return _tiled_decode_lightvae(model, profile, z, is_image=is_image)
+
+    model.tiled_decode = tiled_decode
     model._h3_lite_tiled_decode_installed = True
 
 

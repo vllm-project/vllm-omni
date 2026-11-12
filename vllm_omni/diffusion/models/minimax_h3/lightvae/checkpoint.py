@@ -210,6 +210,27 @@ def _validate_profile_int(path: Path, field: str, value: object, *, allow_zero: 
     return value
 
 
+def _validate_profile_overlaps(path: Path, profile: H3LiteDecodeProfile) -> None:
+    def require(field: str, overlap: int | None, tile: int | None) -> None:
+        if overlap is None or tile is None:
+            return
+        if overlap >= tile:
+            raise ValueError(f"{path}: {field}={overlap} must be smaller than its tile size {tile}")
+
+    short_tile = profile.tile_size
+    short_overlap = profile.short_axis_overlap if profile.short_axis_overlap is not None else profile.tile_overlap
+    long_tile = profile.long_axis_tile if profile.long_axis_tile is not None else short_tile
+    long_overlap = profile.long_axis_overlap if profile.long_axis_overlap is not None else profile.tile_overlap
+    image_tile = profile.image_tile_size if profile.image_tile_size is not None else short_tile
+    image_long_tile = profile.image_long_axis_tile if profile.image_long_axis_tile is not None else image_tile
+    image_overlap = profile.tile_overlap if profile.tile_overlap is not None else short_overlap
+
+    require("student_short_axis_overlap", short_overlap, short_tile)
+    require("student_long_axis_overlap", long_overlap, long_tile)
+    require("student_tile_overlap", image_overlap, image_tile)
+    require("student_tile_overlap", image_overlap, image_long_tile)
+
+
 def _profile_from_official_config(path: Path, raw: Mapping[str, object]) -> H3LiteDecodeProfile | None:
     """Build a fallback profile from the official H3 VAE config.
 
@@ -261,6 +282,8 @@ def _read_decode_profile(
 ) -> H3LiteDecodeProfile | None:
     decode_path = path / "decode_config.json"
     if not decode_path.is_file():
+        if fallback is not None:
+            _validate_profile_overlaps(path, fallback)
         return fallback
     try:
         with open(decode_path) as f:
@@ -293,7 +316,9 @@ def _read_decode_profile(
         tile_layout=tile_layout,
         temporal_decode_protocol=protocol,
     )
-    return _merge_profile(profile, fallback)
+    merged = _merge_profile(profile, fallback)
+    _validate_profile_overlaps(path, merged)
+    return merged
 
 
 def _read_diffusers_directory(

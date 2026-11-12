@@ -1077,8 +1077,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         profile = getattr(self.model, "_h3_lite_decode_profile", None)
         if profile is not None and int(latent.shape[2]) == 1 and profile.image_context_tokens is not None:
             context = self._denormalize_latent(latent.expand(-1, -1, profile.image_context_tokens, -1, -1).contiguous())
-            with self._decode_tiling_context(context):
-                decoded = self.model.tiled_decode(context)
+            with self._decode_tiling_context(latent):
+                decoded = self.model.tiled_decode(context, is_image=True)
             phase = profile.image_context_output_phase or 0
             decoded = decoded[:, :, phase : phase + 1]
         else:
