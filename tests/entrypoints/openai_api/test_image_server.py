@@ -855,8 +855,9 @@ def test_single_stage_generate_forwards_layers(test_client, mock_async_diffusion
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
-    max_tokens comes from the deploy YAML default (upper-bound ceiling),
-    NOT computed dynamically from height/width.
+    max_tokens is capped at the model's grid-token budget for the
+    requested size (1024x1024 t2i: 1281), not left at the deploy-YAML
+    ceiling (4353, the 2048x2048 upper bound).
     """
 
     class FakeAsyncOmniClass(AsyncOmni):
@@ -865,7 +866,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
                 SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
             ]
-            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
+            # YAML default: 2048x2048 t2i ceiling; the AR cap must replace this with 1281
             default_sampling_params_list = [
                 SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
                 OmniDiffusionSamplingParams(height=1024, width=1024),
@@ -928,8 +929,8 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
-    # max_tokens comes from YAML default, not computed dynamically
-    assert captured[0].max_tokens == 4353
+    # AR cap writes the 1024x1024 t2i grid budget, not the YAML ceiling.
+    assert captured[0].max_tokens == 1281
     assert captured[0].extra_args["target_h"] == 1024
     assert captured[0].extra_args["target_w"] == 1024
     assert captured[1].height == 1024

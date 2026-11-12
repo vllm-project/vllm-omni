@@ -987,9 +987,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # requests still cap their AR budget — the registered
                 # builder resolves the absent size to the model's default
                 # grid. Single-stage engines have no AR stage to cap.
-                comprehension_idx = (
-                    None if is_single_stage_diffusion(self.engine_client) else self._get_comprehension_stage_index()
-                )
+                # Missing comprehension stages must not fail the request:
+                # the AR cap is a no-op when the index is None (Ming3-Audio
+                # and other multi-stage pipelines that do not mark one).
+                comprehension_idx = None
+                if not is_single_stage_diffusion(self.engine_client):
+                    try:
+                        comprehension_idx = self._get_comprehension_stage_index()
+                    except ValueError:
+                        comprehension_idx = None
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
