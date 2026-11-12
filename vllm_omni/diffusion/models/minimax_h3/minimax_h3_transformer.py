@@ -800,6 +800,7 @@ class MiniMaxH3DiTModel(nn.Module):
         from .checkpoint_quantization import FastH3NVFP4Config
 
         self._serialized_weight_map = quant_config.weight_map if isinstance(quant_config, FastH3NVFP4Config) else {}
+        self._strict_offline_loading = bool(getattr(quant_config, "is_checkpoint_int8_serialized", False))
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
@@ -1080,8 +1081,11 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights = getattr(self, "_diffusers_weights", False)
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
+        strict_offline = getattr(self, "_strict_offline_loading", False)
         for name, loaded_weight in weights:
             layout = "plain"
+            if strict_offline and name in source_names:
+                raise ValueError(f"duplicate offline H3 weight: {name}")
             if diffusers_weights:
                 if name in source_names:
                     raise ValueError(f"duplicate Diffusers H3 weight: {name}")
@@ -1096,17 +1100,33 @@ class MiniMaxH3DiTModel(nn.Module):
                 target = _resolve_native_target(module)
                 if target is None or kind not in {"weight", "bias", "weight_scale"}:
                     raise ValueError(f"unsupported Diffusers H3 weight: {name}")
-                if kind == "weight_scale":
-                    # FastVideo stores per-channel scales as [N, 1]; vLLM's
-                    # channel-scale parameter and TP loaders consume [N].
-                    loaded_weight = loaded_weight.squeeze(-1)
                 name, layout = f"{target[0]}.{kind}", target[1]
+            elif strict_offline:
+                source_names.add(name)
             param = params.get(name)
             if param is None:
-                if diffusers_weights:
-                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
+                if diffusers_weights or strict_offline:
+                    raise ValueError(f"H3 checkpoint weight has no model parameter: {name}")
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
+            if name.endswith(".weight_scale"):
+                # INT8 channel scales use [N,1], while FP8 backends may use [N].
+                # Preserve the destination contract before QKV/MLP sharding.
+                if loaded_weight.ndim == 1 and param.ndim == 2 and param.shape[-1] == 1:
+                    loaded_weight = loaded_weight.unsqueeze(-1)
+                elif loaded_weight.ndim == 2 and loaded_weight.shape[-1] == 1 and param.ndim == 1:
+                    loaded_weight = loaded_weight.squeeze(-1)
+            if strict_offline:
+                if param.dtype == torch.int8 and loaded_weight.dtype != torch.int8:
+                    raise ValueError(
+                        f"{name}: offline INT8 requires int8 checkpoint weights, got {loaded_weight.dtype}"
+                    )
+                if loaded_weight.dtype == torch.int8 and param.dtype != torch.int8:
+                    raise ValueError(f"{name}: quantized weights target an unquantized layer; check ignored_layers")
+                if name.endswith(".weight_scale") and (
+                    not torch.isfinite(loaded_weight).all() or torch.any(loaded_weight <= 0)
+                ):
+                    raise ValueError(f"{name}: offline weight scale must be finite and positive")
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if layout in {"q", "k", "v"}:
                 # vLLM can load each projection directly into its packed QKV
@@ -1183,6 +1203,8 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if strict_offline and (missing := params.keys() - loaded):
+            raise ValueError(f"offline H3 checkpoint is incomplete: {sorted(missing)[:8]}")
         return loaded
 
     @staticmethod

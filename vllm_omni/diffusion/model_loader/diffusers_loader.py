@@ -215,6 +215,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_patterns: tuple[str, ...] | None = None
         """Optional tensor-name globs applied before safetensor materialization."""
 
+        weight_iterator_factory: Callable[[], Iterable[tuple[str, torch.Tensor]]] | None = None
+        """Optional streaming component reader for serialized checkpoint formats."""
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -387,6 +390,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model: nn.Module | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        if source.weight_iterator_factory is not None:
+            if self.counter_before_loading_weights == 0.0:
+                self.counter_before_loading_weights = time.perf_counter()
+            return ((source.prefix + name, tensor) for name, tensor in source.weight_iterator_factory())
         _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
@@ -829,14 +836,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     if unsupported_methods:
                         raise ValueError(
                             "DLO+AllGather supports online quantization only for "
-                            "per-tensor FP8, INT8, MXFP8, and MXFP4 linears "
+                            "per-tensor FP8, INT8, MXFP8, MXFP4, and H3 plain-byte MX linears "
                             "(host-loaded unquantized fallback layers are also allowed); "
                             f"unsupported online methods: {', '.join(sorted(unsupported_methods))}. "
                             "Use rank-local transfer for the affected component or "
                             "disable online quantization."
                         )
                     logger.info(
-                        "Validated online methods (per-tensor FP8, INT8, MXFP8, MXFP4) "
+                        "Validated online methods (per-tensor FP8, INT8, MXFP8, MXFP4, H3 plain-byte MX) "
                         "for every component using DLO+AllGather"
                     )
 
@@ -869,7 +876,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
+                if (
+                    dit_distributed_offload
+                    and not hwr_active
+                    and not self._force_canonical_load
+                    and not any(source.weight_iterator_factory is not None for source in weight_sources)
+                ):
                     lora_backend = self.od_config.lora_backend
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
                         self.od_config.lora_path
@@ -1038,6 +1050,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
           contiguous (K/32, N) buffer).
         - online MXFP4 (vLLM XPU kernel): packed float4_e2m1fn_x2 weight plus
           a uint8/e8m0 block scale, both one-byte transport dtypes.
+        - H3 native MX: contiguous uint8 weight (N, K) for FP8 or packed
+          (N, K/2) for FP4, plus contiguous uint8 E8M0 scale (N, K/64, 2).
+          These are plain ND byte tensors, not dual-scale or NZ storage.
 
         Both shape families are already covered by the physical-order packing
         that online FP8 requires. Other online methods may create different
@@ -1054,6 +1069,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             Fp8PerTensorOnlineLinearMethod,
         )
 
+        from vllm_omni.diffusion.models.minimax_h3.native_mx import NativeMXLinearMethod
         from vllm_omni.quantization.int8_config import (
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
@@ -1090,6 +1106,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
             UnquantizedHostLinearMethod,
+            NativeMXLinearMethod,
             *mxfp8_online_methods,
             *mxfp4_online_methods,
         )
