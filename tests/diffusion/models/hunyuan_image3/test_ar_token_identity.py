@@ -207,6 +207,20 @@ def test_recaption_boundary_and_image_suffix_are_not_duplicated(wrapper):
     assert output.tokens[0].tolist().count(wrapper.boi_token_id) == 1
 
 
+@pytest.mark.parametrize("cfg_factor", [1, 2])
+def test_unfinished_recaption_after_thought_keeps_kv_reuse(wrapper, cfg_factor):
+    # AR hit max_tokens right after opening <recaption>; only the completed
+    # thought is reused, and the template rebuilds the suffix from <answer>.
+    prompt_ids = _prompt_ids(wrapper)
+    generated = wrapper.encode("body</think><recaption>", add_special_tokens=False)
+    output = _layout(wrapper, prompt_ids, generated, cfg_factor=cfg_factor)
+
+    boundary = len(prompt_ids) + generated.index(wrapper.end_think_token_id)
+    assert output.think_recaption_end_pos[0] == [boundary]
+    assert output.tokens[0, : boundary + 1].tolist() == (prompt_ids + generated)[: boundary + 1]
+    assert output.tokens[0, boundary + 1].item() != wrapper.special_token_map["<recaption>"]
+
+
 def test_custom_system_prompt_and_whitespace_preserve_original_prefix(wrapper):
     system = "  custom\n system  "
     prompt_ids = _prompt_ids(wrapper, system)

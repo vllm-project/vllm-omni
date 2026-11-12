@@ -1220,10 +1220,10 @@ class TokenizerWrapper:
                 if boundary is None:
                     continue
                 source_ids = ar_tokens[0] + ar_tokens[1]
-                prefix_len = max(
-                    boundary + 1,
-                    min(len(source_ids), int(output.gen_timestep_scatter_index[i][0])),
-                )
+                # Dense and native reuse both stop before the closing CoT
+                # token. AR tokens past it, such as an unfinished
+                # <recaption>, are rebuilt by the template and never reused.
+                prefix_len = boundary
                 layout_ids = output.tokens[i, :prefix_len].tolist()
                 if layout_ids != source_ids[:prefix_len]:
                     mismatch = next(
