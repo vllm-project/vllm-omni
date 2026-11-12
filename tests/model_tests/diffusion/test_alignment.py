@@ -119,6 +119,9 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Multi-camera AV variant of Cosmos3; covered by the dedicated
+    # tests/diffusion/models/cosmos3 multiview tests instead of a tiny model.
+    "Cosmos3MultiviewPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
