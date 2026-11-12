@@ -1392,13 +1392,17 @@ class MiniMaxH3AudioVAE(nn.Module):
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         self._stager = None
+        self.model = self.remote.model
+        if os.environ.get("H3_VAE_OPERATOR_FIR_C16_INSTALL", "0") == "1" and hasattr(self.model, "decoder"):
+            from .vae_audio_fir_channel_pack import install
+
+            self._h3_fir_c16_modules = install(self.model)
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
                 self.remote,
                 device,
                 pin_memory=True,
             )
-        self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])
 
     def load_to_device(self) -> None:
