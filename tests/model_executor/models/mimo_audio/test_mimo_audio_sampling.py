@@ -83,6 +83,8 @@ def test_global_sampler_preserves_precision_and_filter_order(dtype: torch.dtype)
     # The global sampler has no graph counterpart. Keep its existing arithmetic
     # and post-filter exclusion behavior outside the local speech-code fix.
     assert sampler.process(scores).dtype == dtype
+    # Token 0 is argmax's fallback when all scores are masked. This records the
+    # legacy result for this local-only fix, not a contract for future global fixes.
     assert sampler.sample(scores, [_EMPTY_ID]).item() == 0
 
 

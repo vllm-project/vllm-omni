@@ -117,10 +117,9 @@ class MiMoLocalSampler(MiMoSampler):
 
     def sample(self, scores: torch.Tensor, removed_tokens: list[int] | None = None) -> torch.Tensor:
         # Match the graph's FP32 tensor parameters; BF16 division can create ties.
-        scores = scores.float()
+        scores = scores.to(dtype=torch.float32, copy=bool(removed_tokens))
         if removed_tokens:
             # Preserve caller logits and exclude before top-k/top-p filtering.
-            scores = scores.clone()
             for t in removed_tokens:
                 scores[:, t] = float("-inf")
         return super().sample(scores)
@@ -190,7 +189,7 @@ class MiMoLocalDecodeBuffer:
         )
         return self.input_tensor[:batch_size], sampler
 
-    def prepare(self, input_tensor: torch.Tensor, sampler: MiMoSampler | MiMoLocalSamplerTensor):
+    def prepare(self, input_tensor: torch.Tensor, sampler: MiMoLocalSampler | MiMoLocalSamplerTensor):
         b = input_tensor.shape[0]
         assert b <= self.max_batch_size, f"Expected batch size <= {self.max_batch_size}, got {b}"
 
@@ -264,7 +263,9 @@ class MiMoLocalDecodeCudaGraph:
             batch_size=batch_size,
         )
 
-    def forward(self, local_embeds: torch.Tensor, local_sampler: MiMoSampler | MiMoLocalSamplerTensor) -> torch.Tensor:
+    def forward(
+        self, local_embeds: torch.Tensor, local_sampler: MiMoLocalSampler | MiMoLocalSamplerTensor
+    ) -> torch.Tensor:
         b = local_embeds.shape[0]
         assert b <= self.batch_size, f"Expected batch size <= {self.batch_size}, got {b}"
         with self.buffer.lock:
@@ -890,7 +891,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             if torch.accelerator.is_available()
             else "cpu"
         ),
-        local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
+        local_sampler: MiMoLocalSampler | MiMoLocalSamplerTensor | None = None,
     ):
         B = local_embeds.shape[0]
         delay_iters = self.group_size + max(self.delay_pattern)
@@ -946,7 +947,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             if torch.accelerator.is_available()
             else "cpu"
         ),
-        local_sampler: MiMoSampler | None = None,
+        local_sampler: MiMoLocalSampler | None = None,
     ):
         if local_sampler is None:
             local_sampler = MiMoLocalSampler(do_sample=False, temperature=0.9, top_p=0.95)
