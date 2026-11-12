@@ -500,25 +500,6 @@ def prepare_profile_from_history(
     build_ids: list[str] = []
     current = _env("BUILDKITE_BUILD_ID")
     candidates = max(builds * HISTORY_CANDIDATE_FACTOR, builds)
-    # TEMP(shard-debug): delete this block. Build #19345 is the passed 4-shard
-    # ready run. Newer passed builds have no timings/jobs, so the miss cap stops
-    # the scan before it. Download this build first and ignore the cap.
-    if _env("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD").lower() not in {"1", "true", "yes"}:
-        pinned_id = "01a1caa4-35e4-4e39-95a7-2818ebe0053f"
-        print("merge-shard-timings: TEMP forcing download of build #19345", file=sys.stderr)
-        with tempfile.TemporaryDirectory(prefix="vllm-omni-timings-19345-") as tmp:
-            pinned_root = Path(tmp)
-            download_build_timings(pinned_id, pinned_root, timeout=HISTORY_DOWNLOAD_TIMEOUT_SECONDS)
-            pinned = details_from_download(pinned_root)
-        if pinned:
-            per_build.append(pinned)
-            build_ids.append(pinned_id)
-            print(
-                "merge-shard-timings: TEMP build #19345 steps: " + ", ".join(sorted(pinned)),
-                file=sys.stderr,
-            )
-        else:
-            print("merge-shard-timings: TEMP build #19345 has no timing artifacts", file=sys.stderr)
     deadline = time.monotonic() + HISTORY_LOOKUP_BUDGET_SECONDS
     misses = 0
     for build_id, number in list_recent_build_ids(
@@ -528,8 +509,6 @@ def prepare_profile_from_history(
         exclude_branches=exclude_branches,
         deadline=deadline,
     ):
-        if build_id in build_ids:
-            continue
         if time.monotonic() >= deadline:
             print(
                 f"merge-shard-timings: stopped history scan at the {HISTORY_LOOKUP_BUDGET_SECONDS}s lookup budget",

@@ -11,8 +11,9 @@ longest-processing-time assignment, never more than ``MAX_AUTOMATIC_SHARDS``,
 and each shard runs only the files in its bin. Pytest still receives the
 original directories, so a directory ``conftest.py`` loads with those tests;
 the timings plugin then drops every file that is not in the bin. The packing
-is not the smallest possible. Unmeasured files add no weight, so a missing
-profile stays one job.
+is not the smallest possible. With no usable timings the step uses the smaller
+of ``MAX_AUTOMATIC_SHARDS`` and the discovered file count, so a suite that
+times out before it can record a profile still splits. One file stays one job.
 A finished session's unmeasured files were filtered by ``-m`` and stay at
 weight 0; they are still placed in a bin so a new file keeps running.
 
@@ -114,6 +115,22 @@ def load_step_queues() -> dict[str, str]:
     if not isinstance(queues, dict):
         return {}
     return {base_label(str(label)): str(queue) for label, queue in queues.items() if queue}
+
+
+def fallback_shard_count(file_count: int, *, max_shards: int = MAX_AUTOMATIC_SHARDS) -> int:
+    """Without usable timings, take the smaller of the job cap and one shard per file."""
+    if file_count < 1 or max_shards < 1:
+        return 1
+    return min(max_shards, file_count)
+
+
+def _spread_files(files: list[str], count: int) -> list[list[str]]:
+    """Deal sorted paths round-robin so a missing profile still divides the suite."""
+    count = max(1, min(count, len(files)))
+    bins: list[list[str]] = [[] for _ in range(count)]
+    for index, name in enumerate(sorted(files)):
+        bins[index % count].append(name)
+    return bins
 
 
 def plan_shard_count(
@@ -224,20 +241,28 @@ def apply_automatic_shard(
         step_timings = None
     planned = _plan_weights(files, step_timings)
     if planned is None:
-        reason = "no timings for this step" if timings else "no timing profile"
-        log(f"automatic-shard: {label!r} stays 1 job ({reason}; budget {timeout_min} min)")
-        step["commands"] = _instrument_commands(commands, instrumentable)
-        return step
-    weights, measured = planned
-    bins = pack_files(weights, budget_seconds)
-    if len(bins) <= 1:
-        reason = f"measured {measured}/{len(files)} files fit"
-        log(
-            f"automatic-shard: {label!r} stays 1 job "
-            f"({reason}; file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min)"
+        count = fallback_shard_count(len(files), max_shards=MAX_AUTOMATIC_SHARDS)
+        if count <= 1:
+            reason = "no timings for this step" if timings else "no timing profile"
+            log(f"automatic-shard: {label!r} stays 1 job ({reason}; {len(files)} file cannot split further)")
+            step["commands"] = _instrument_commands(commands, instrumentable)
+            return step
+        bins = _spread_files(files, count)
+        detail = f"no timings; {count} jobs is min({MAX_AUTOMATIC_SHARDS} jobs, {len(files)} files)"
+    else:
+        weights, measured = planned
+        bins = pack_files(weights, budget_seconds)
+        if len(bins) <= 1:
+            reason = f"measured {measured}/{len(files)} files fit"
+            log(
+                f"automatic-shard: {label!r} stays 1 job "
+                f"({reason}; file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min)"
+            )
+            step["commands"] = _instrument_commands(commands, instrumentable)
+            return step
+        detail = (
+            f"measured {measured}/{len(files)} files, file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min"
         )
-        step["commands"] = _instrument_commands(commands, instrumentable)
-        return step
 
     slug = _shard_slug(label)
     _write_file_shards(root, slug, bins)
@@ -251,10 +276,7 @@ def apply_automatic_shard(
         else:
             rewritten.append(command)
     step["commands"] = _instrument_commands(rewritten, instrumentable)
-    log(
-        f"automatic-shard: {label!r} -> {len(bins)} jobs "
-        f"(measured {measured}/{len(files)} files, file budget {FILE_TIME_BUDGET_RATIO:.0%} of {timeout_min} min)"
-    )
+    log(f"automatic-shard: {label!r} -> {len(bins)} jobs ({detail})")
     return step
 
 
@@ -319,12 +341,21 @@ def _plan_weights(
 ) -> tuple[dict[str, float], int] | None:
     """Weight for every discovered file, plus the measured count.
 
-    A file with no duration stays at 0 and is still placed in a bin.
+    A file with no duration stays at 0 and is still placed in a bin. No positive
+    measurement means there is nothing to pack.
     """
-    measured_list = _measured_weights(files, timings)
-    if measured_list is None or timings is None:
+    if not timings:
         return None
-    measured = {name: float(timings[name]) for name in files if name in timings and float(timings[name]) > 0}
+    measured: dict[str, float] = {}
+    for name in files:
+        raw = timings.get(name)
+        if raw is None:
+            continue
+        value = float(raw)
+        if value > 0:
+            measured[name] = value
+    if not measured:
+        return None
     weights = {name: measured.get(name, 0.0) for name in files}
     return weights, len(measured)
 
@@ -335,6 +366,10 @@ def _shard_slug(label: str) -> str:
 
 
 def _write_file_shards(root: Path, slug: str, bins: list[list[str]]) -> None:
+    # Schema checks render the same pipeline and only need the YAML. The
+    # uploader writes these lists when it is about to publish them.
+    if os.environ.get("VLLM_OMNI_SKIP_SHARD_FILE_WRITE", "").strip().lower() in {"1", "true", "yes"}:
+        return
     dest = root / FILE_SHARD_ROOT / slug
     if dest.exists():
         for old in dest.glob("*.txt"):
@@ -438,13 +473,6 @@ def _is_test_module(path: Path) -> bool:
 
 def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
-
-
-def _measured_weights(files: list[str], timings: dict[str, float] | None) -> list[float] | None:
-    if not timings:
-        return None
-    weights = [float(timings[name]) for name in files if name in timings and float(timings[name]) > 0]
-    return weights or None
 
 
 def _longest_bin(weights: list[float], bins: int) -> float:

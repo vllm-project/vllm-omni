@@ -8,7 +8,8 @@
 # (or VLLM_OMNI_SHARD_TIMINGS). It uses that as a greedy estimate of how many
 # jobs fit 80% of `timeout_in_minutes` (the rest is checkout, collection, and
 # startup), then writes each bin as a file list. A shard
-# runs only that list. No profile means one job.
+# runs only that list. No usable timings opens the smaller of MAX_AUTOMATIC_SHARDS
+# and the discovered file count.
 # Enrolled steps always write `timings/jobs/*.json`. E2E model jobs stay one
 # job: each case loads a server, and splitting them repeats that startup.
 

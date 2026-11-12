@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA ready/merge directory sweeps shard from measured durations.
 
-``automatic_shard: true`` does not reserve agents. With no timing profile the
-uploader leaves one job (and still records ``timings/jobs/*.json``). A profile
-that exceeds ``timeout_in_minutes`` packs files into bins, writes each bin as a
-file list, and sets ``parallelism``. A shard runs only its list.
+``automatic_shard: true`` does not reserve agents. With no usable timings the
+uploader opens the smaller of ``MAX_AUTOMATIC_SHARDS`` and the discovered file count (and still
+records ``timings/jobs/*.json``). A profile that exceeds the file budget packs
+files into bins, writes each bin as a file list, and sets ``parallelism``. A
+shard runs only its list.
 """
 
 from __future__ import annotations
@@ -41,9 +42,12 @@ from merge_shard_timings import (  # noqa: E402
 )
 from runtime_shard import (  # noqa: E402
     FILE_TIME_BUDGET_RATIO,
+    MAX_AUTOMATIC_SHARDS,
     PLUGIN_MODULE,
     _file_shard_command,
     _inject_plugin,
+    discover_test_files,
+    fallback_shard_count,
     pack_files,
     plan_shard_count,
 )
@@ -116,13 +120,21 @@ def test_source_filter_does_not_plan_cuda_shards() -> None:
     assert upload_pipeline_mod._shard_timings_prepared is False
 
 
-def test_uploader_keeps_one_simple_test_job_without_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
     document = yaml.safe_load(READY.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
     assert all("automatic_shard" not in leaf for leaf in _leaves(rendered["steps"]))
-    step = next(leaf for leaf in _leaves(rendered["steps"]) if leaf.get("label") == "Simple Test")
-    assert "parallelism" not in step
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    discovered = discover_test_files("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
+    expect = fallback_shard_count(len(discovered))
+    assert expect == MAX_AUTOMATIC_SHARDS
+    assert step["parallelism"] == expect
+    assert step["label"] == "Simple Test · Shard %N/%t"
+    lists = _read_shard_lists("simple-test")
+    assert len(lists) == expect
+    assert sorted(path for group in lists for path in group) == discovered
     assert "automatic_shard" not in step
     assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "l4-k8s"
@@ -681,9 +693,6 @@ def test_ready_plans_simple_test_from_non_main_history(
 
     def download(build_id: str, dest: Path, timeout: int = 180) -> None:
         del timeout
-        # TEMP(shard-debug): prepare_profile downloads build #19345 before history.
-        if build_id == "01a1caa4-35e4-4e39-95a7-2818ebe0053f":
-            return
         assert build_id == "ready-pr"
         jobs = dest / "timings" / "jobs"
         jobs.mkdir(parents=True)
@@ -741,8 +750,56 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     monkeypatch.delenv("MIRROR_HW", raising=False)
     document = yaml.safe_load(READY.read_text(encoding="utf-8"))
     rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
-    step = next(leaf for leaf in _leaves(rendered["steps"]) if leaf.get("label") == "Simple Test")
-    assert "parallelism" not in step
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    discovered = discover_test_files("pytest -sv tests/ -m 'core_model and cpu'", upload_pipeline_mod.ROOT)
+    assert step["parallelism"] == fallback_shard_count(len(discovered))
+    lists = _read_shard_lists("simple-test")
+    assert sorted(path for group in lists for path in group) == discovered
+
+
+def test_missing_profile_uses_the_smaller_of_job_cap_and_file_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+
+    def render(files: list[str]) -> dict:
+        monkeypatch.setattr(
+            "runtime_shard.discover_test_files",
+            lambda command, root: list(files) if "tests/" in command else [],
+        )
+        document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+        rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+        return next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+
+    one = render(["tests/a_test.py"])
+    assert "parallelism" not in one
+    assert one["label"] == "Simple Test"
+
+    three = ["tests/a_test.py", "tests/b_test.py", "tests/c_test.py"]
+    step = render(three)
+    assert step["parallelism"] == 3
+    assert sorted(path for group in _read_shard_lists("simple-test") for path in group) == three
+
+    six = [f"tests/f{index}_test.py" for index in range(6)]
+    step = render(six)
+    assert step["parallelism"] == MAX_AUTOMATIC_SHARDS
+    assert sorted(path for group in _read_shard_lists("simple-test") for path in group) == six
+
+
+def test_schema_check_plans_without_writing_shard_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_SKIP_SHARD_FILE_WRITE", "1")
+    monkeypatch.delenv("VLLM_OMNI_SHARD_TIMINGS", raising=False)
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    monkeypatch.setattr(
+        "runtime_shard.discover_test_files",
+        lambda command, root: ["tests/a_test.py", "tests/b_test.py", "tests/c_test.py"] if "tests/" in command else [],
+    )
+    dest = Path("timings") / "file-shards" / "simple-test"
+    shutil.rmtree(dest, ignore_errors=True)
+    document = yaml.safe_load(READY.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(document, changed_files=None, pipeline_path=READY)
+    step = next(leaf for leaf in _leaves(rendered["steps"]) if str(leaf.get("label", "")).startswith("Simple Test"))
+    assert step["parallelism"] == 3
+    assert not dest.exists()
 
 
 def test_file_shard_command_reads_the_parallel_job_list(tmp_path: Path) -> None:
