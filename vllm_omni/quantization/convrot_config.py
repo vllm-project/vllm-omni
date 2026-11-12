@@ -473,7 +473,8 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        out = kernel.apply_weights(layer, rows, bias)
+        kernel_bias = None if bias is None else getattr(layer, "bias", bias)
+        out = kernel.apply_weights(layer, rows, kernel_bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
@@ -511,5 +512,6 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        out = kernel.apply_weights(layer, rows, bias)
+        kernel_bias = None if bias is None else getattr(layer, "bias", bias)
+        out = kernel.apply_weights(layer, rows, kernel_bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])
