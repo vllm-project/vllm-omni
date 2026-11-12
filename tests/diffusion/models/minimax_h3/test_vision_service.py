@@ -4,10 +4,13 @@
 
 import importlib.util
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -20,6 +23,41 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _collective_worker(rank, rendezvous):
+    """Exercise actual CPU collectives without loading the serving runtime."""
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        module = load_module()
+        for lengths in ((12, 4, 20), (4,), (0, 0)):
+            plan = module.build_vision_plan(lengths, 2, num_heads=4)
+            full = torch.arange(sum(lengths) * 8, dtype=torch.float32).reshape(sum(lengths), 4, 2)
+            local = full[list(plan.rank_token_indices[rank])]
+            for use_permutation in (False, True):
+                transport = module.VisionAllToAll(
+                    plan, group=dist.group.WORLD, use_permutation=use_permutation, verify_permutation=True
+                )
+                heads = transport.to_heads(local)
+                torch.testing.assert_close(heads, full[:, rank * 2 : (rank + 1) * 2], rtol=0, atol=0)
+                restored = transport.to_tokens(heads)
+                torch.testing.assert_close(restored, local, rtol=0, atol=0)
+                assert transport.calls == 2
+            final = torch.arange(sum(lengths) // 4 * 6, dtype=torch.float32).reshape(sum(lengths) // 4, 6)
+            ids = list(plan.rank_merger_indices[rank])
+            gathered, deepstack = module.gather_vision_outputs(
+                (final[ids], [(final + 100)[ids], (final + 200)[ids]]), plan, group=dist.group.WORLD
+            )
+            torch.testing.assert_close(gathered, final, rtol=0, atol=0)
+            for actual, offset in zip(deepstack, (100, 200), strict=True):
+                torch.testing.assert_close(actual, final + offset, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="Gloo is required")
+def test_real_collectives_preserve_uneven_empty_and_deepstack_layouts(tmp_path):
+    mp.spawn(_collective_worker, args=((tmp_path / "vision-rendezvous").as_uri(),), nprocs=2, join=True)
 
 
 def test_transport_uses_explicit_encoder_group(monkeypatch):
