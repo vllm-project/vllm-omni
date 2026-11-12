@@ -75,6 +75,26 @@ def _worker(rank, init_method, world_size=4):
                     )
                     torch.testing.assert_close(q, retained, rtol=0, atol=0)
                     checks += 6
+            # MiniMax VSA repeats QKV -> gate -> O throughout denoising.
+            # Keep all three plans and their captured Graphs alive between cycles.
+            previous: tuple[tuple[a2a_permute._CEPlan, torch.cuda.CUDAGraph | None], ...] = ()
+            for step in range(3):
+                incoming = x + step
+                gate = incoming + 3
+                metadata = AttentionMetadata(extra={"gate_compress": gate})
+                q, _, _, metadata, ctx = strategy.pre_attention(incoming, kv + 1, kv + 2, metadata)
+                result = strategy.post_attention(q, ctx)
+                torch.testing.assert_close(result, incoming, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    metadata.extra["gate_compress"], _reference(gate, 0, group.ulysses_group), rtol=0, atol=0
+                )
+                workspace = a2a_permute._SYMM_WORKSPACES[(device, group.ulysses_group.group_name)]
+                plans = tuple(workspace.ce_plans.values())
+                assert len(plans) == 3 and all(plan.graph is not None for plan in plans)
+                if step:
+                    assert all(plan is old and plan.graph is graph for plan, (old, graph) in zip(plans, previous))
+                previous = tuple((plan, plan.graph) for plan in plans)
+                checks += 2
             # Full-graph Dynamo capture must keep the group-bound op opaque.
             compiled_exchange = torch.compile(exchange_qkv, backend="eager", fullgraph=True)
             for actual, source in zip(compiled_exchange(x, kv + 1, kv + 2), (x, kv + 1, kv + 2)):

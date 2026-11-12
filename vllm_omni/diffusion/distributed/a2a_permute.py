@@ -44,7 +44,7 @@ logger = init_logger(__name__)
 
 _WORKSPACE_LOCK = threading.Lock()
 # Bound graph staging per group to 15 MiB for equal-shape Q/K/V and 4 MiB
-# for O (fixed inputs only, excluding allocator rounding).
+# each for gate and O (fixed inputs only, excluding allocator rounding).
 _CE_GRAPH_MAX_INPUT_BYTES = 4 * 1024 * 1024
 _CE_QKV_GRAPH_MAX_INPUT_BYTES = 5 * 1024 * 1024
 
@@ -56,7 +56,8 @@ class _SymmWorkspace:
     capacity_bytes: int
     stream_id: int
     views: dict[tuple[tuple[int, ...], torch.dtype], torch.Tensor] = field(default_factory=dict)
-    ce_plans: dict[bool, _CEPlan] = field(default_factory=dict)
+    # QKV, gate and O each retain their latest layout without evicting one another.
+    ce_plans: dict[tuple[bool, int], _CEPlan] = field(default_factory=dict)
     ce_stream: torch.cuda.Stream | None = None
 
 
@@ -243,7 +244,7 @@ def clear_a2a_permute_workspaces() -> None:
 
 
 class _CEPlan:
-    """Cache copy geometry and stream resources for the latest layout per direction."""
+    """Cache copy geometry and stream resources for one exchange layout."""
 
     def __init__(self, inputs, shared, handle, world_size, reverse, transfer):
         self.signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
@@ -352,9 +353,10 @@ class _CEPlan:
 
 def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False) -> torch.Tensor:
     # Reuse a validated plan before repeating layout and workspace bookkeeping.
+    plan_key = (reverse, len(inputs))
     workspace = _SYMM_WORKSPACES.get((inputs[0].device, group_name))
     if workspace is not None:
-        plan = workspace.ce_plans.get(reverse)
+        plan = workspace.ce_plans.get(plan_key)
         signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
         if plan is not None and plan.signature == signature:
             stream_id = torch.cuda.current_stream(inputs[0].device).cuda_stream
@@ -377,10 +379,10 @@ def _exchange_ce(inputs, group_name: str, world_size: int, reverse: bool = False
     if workspace.ce_stream is None:
         workspace.ce_stream = torch.cuda.Stream(device=first.device)
     signature = tuple((x.shape, x.stride(), x.dtype) for x in inputs)
-    plan = workspace.ce_plans.get(reverse)
+    plan = workspace.ce_plans.get(plan_key)
     if plan is None or plan.signature != signature:
         plan = _CEPlan(inputs, shared, workspace.handle, world_size, reverse, workspace.ce_stream)
-        workspace.ce_plans[reverse] = plan
+        workspace.ce_plans[plan_key] = plan
     return plan.run(inputs)
 
 

@@ -231,7 +231,7 @@ In `DiffusionParallelConfig`:
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"strict"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
-| `ulysses_a2a_permute` | bool | `False` | Use platform symmetric memory for eligible strict Ulysses exchanges: CUDA copy engines (CE) on CUDA, SHMEM on NPU. When disabled, CUDA uses NCCL. |
+| `ulysses_a2a_permute` | bool | `False` | Enable CUDA copy engines (CE) for strict Ulysses; disabled uses NCCL. On NPU, use platform SHMEM. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
@@ -240,63 +240,16 @@ In `DiffusionParallelConfig`:
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
-- `ulysses_a2a_permute=True` on CUDA requires one NVLink-connected node with CUDA symmetric-memory support.
-
-On CUDA, `ulysses_a2a_permute=True` selects CE for eligible strict Ulysses exchanges
-with `ulysses_degree > 1`. When disabled (the default), Ulysses uses NCCL.
-All ranks of each CE Ulysses subgroup must be on one
-host with peer-accessible GPUs; CUDA symmetric-memory rendezvous establishes
-the peer mappings.
-
-Select CE for offline inference with:
-
-```python
-parallel_config = DiffusionParallelConfig(
-    ulysses_degree=4,
-    ulysses_a2a_permute=True,
-)
-omni = Omni(model="Qwen/Qwen-Image", parallel_config=parallel_config)
-```
-
-The same option is available to the serving CLI and to stage deploy configs:
+On CUDA, set `ulysses_a2a_permute=True` (CLI: `--ulysses-a2a-permute`) to use CE.
+This requires `ulysses_mode="strict"`, `ulysses_degree > 1`, and peer-accessible
+GPUs on one NVLink-connected node.
 
 ```bash
-vllm serve Qwen/Qwen-Image --omni --ulysses-degree 4 --ulysses-a2a-permute
+vllm serve Qwen/Qwen-Image --omni --ulysses-degree 2 --ulysses-a2a-permute
 ```
 
-CE pushes the original Q/K/V shards together into peer-accessible symmetric
-outputs using `cudaMemcpy2DAsync` (or `cudaMemcpy3DAsync` for batched inputs).
-Remote copies use a transfer stream while the current stream copies the local
-shard. Stream-ordered barriers protect workspace reuse and wait for all writes.
-The results are copied into fresh local outputs, which remain valid across
-later exchanges, including under `torch.compile`.
-
-CE caches a CUDA Graph for the latest eligible layout in each direction.
-Equal-shape Q/K/V inputs up to 5 MiB each share one staging allocation and
-one `torch.cat` copy. Other layouts and O use a 4 MiB limit per input tensor.
-Each call stages the current inputs, replays communication directly into the
-symmetric workspace, and returns a fresh output. The first call for a layout
-includes graph capture and warmup. Per device and subgroup, the latest Q/K/V
-and O plans retain at most 19 MiB of staging tensors combined; CUDA Graph
-metadata and allocator rounding add to this amount. For equal-size Q/K/V
-and O between 4 and 5 MiB, only Q/K/V use Graph, retaining at most 15 MiB
-after both plans have been updated. Larger inputs use direct CE.
-When captured by an outer CUDA Graph, CE records the direct copies without
-creating a nested graph or staging the inputs.
-
-Each device and Ulysses subgroup retains one grow-only workspace sized to
-`Q.nbytes + K.nbytes + V.nbytes` at the largest warmed-up shape. The reverse
-exchange reuses the same allocation. Copy plans retain only the latest layout
-per direction and are discarded with the workspace.
-
-Workers release the shared workspace before destroying process groups.
-Warm up the maximum request shape before CUDA Graph capture; workspace growth
-during capture is rejected. Exchanges still precede attention or follow it in
-stream order, without communication-compute overlap. End-to-end speedups depend
-on the model and workload.
-
-On NPU, `ulysses_a2a_permute=True` retains the platform SHMEM implementation
-and requires eager execution and pure Ulysses over all ranks in one HCCS domain.
+On NPU, the flag retains the existing
+[NPU symmetric-memory requirements](../../../design/feature/sequence_parallel.md#npu-symmetric-memory-ulysses).
 
 ## Best Practices
 

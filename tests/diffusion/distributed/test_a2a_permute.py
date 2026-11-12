@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -98,6 +99,49 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
     a2a_permute.clear_a2a_permute_workspaces()
     assert not a2a_permute._SYMM_WORKSPACES
     assert synchronize_calls == [device, device, device]
+
+
+def test_ce_reuses_plans_and_graphs_across_qkv_gate_output_cycles(monkeypatch, mocker):
+    """Run the real cache/Graph policy on CPU; only CUDA execution is mocked."""
+    stream = mocker.Mock(cuda_stream=17)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    monkeypatch.setattr(torch.cuda, "Event", mocker.Mock)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    captures = mocker.patch.object(torch.cuda, "CUDAGraph", side_effect=mocker.Mock)
+    mocker.patch.object(torch.cuda, "graph", side_effect=lambda graph, stream: nullcontext())
+    transfers = mocker.patch.object(a2a_permute._CEPlan, "_run_eager")
+    monkeypatch.setattr(a2a_permute, "_ce_runtime", lambda: None)
+
+    x = torch.zeros(1, 8, 4, 4)
+    allocation = torch.empty(3 * x.numel())
+    handle = mocker.Mock(rank=0, buffer_ptrs=[allocation.data_ptr()] * 2)
+    workspace = a2a_permute._SymmWorkspace(allocation, handle, allocation.nbytes, 17, ce_stream=stream)
+    monkeypatch.setattr(a2a_permute, "_SYMM_WORKSPACES", {(x.device, "group"): workspace})
+    monkeypatch.setattr(a2a_permute, "_get_symm_buffer", lambda shape, dtype, device, group: allocation[: shape[0]])
+
+    retained: tuple[tuple[a2a_permute._CEPlan, torch.cuda.CUDAGraph | None], ...] = ()
+    for step in range(3):
+        # New data/pointers with unchanged layouts must replay the same Graphs.
+        incoming = x + step
+        a2a_permute._exchange_ce((incoming, incoming, incoming), "group", 2)
+        a2a_permute._exchange_ce((incoming,), "group", 2)
+        a2a_permute._exchange_ce((incoming.view(1, 16, 2, 4),), "group", 2, reverse=True)
+        plans = tuple(workspace.ce_plans.values())
+        assert len(plans) == 3
+        assert captures.call_count == 3
+        assert transfers.call_count == 6  # One warmup and one capture per plan.
+        if step:
+            assert all(plan is old and plan.graph is graph for plan, (old, graph) in zip(plans, retained))
+        retained = tuple((plan, plan.graph) for plan in plans)
+        assert all(plan.graph.replay.call_count == step + 1 for plan in plans)
+
+    # A new gate layout replaces only its own slot; history remains bounded.
+    a2a_permute._exchange_ce((x[:, :4],), "group", 2)
+    plans = tuple(workspace.ce_plans.values())
+    assert len(plans) == 3 and captures.call_count == 4
+    assert sum(plan is old for plan, (old, _) in zip(plans, retained)) == 2
 
 
 @pytest.mark.parametrize("size,batch", [(2, 1), (3, 2), (4, 2)])
