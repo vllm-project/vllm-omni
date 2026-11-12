@@ -63,8 +63,22 @@ backbone is not thereby accepted.
 Explicit reference-voice requests use the existing `/v1/audio/speech` Base task
 with `ref_audio` and `x_vector_only_mode: true`. The DRVEXO adapter marks this as
 caller text, while chat-to-speech checks the exact generated-token provenance.
-Standard speech admission rejects control tokens and text that cannot round-trip
-through the local `talker/` tokenizer before dispatch. Prompt lengths and
+Both speech APIs intentionally require an exact caller-text round trip through
+`talker/`: encode with `add_special_tokens=False`, reject any special/control
+token IDs, then decode with `skip_special_tokens=False` and require equality to
+the original input. The server does not trim, normalize or silently replace the
+caller text. For example, if the deployed tokenizer collapses `"hello  world"`
+to `"hello world"`, the original request returns HTTP 400 with
+`Fixed speech tokenization changed the reply`; submit the intended canonical
+text explicitly. The same rule applies to Unicode normalization and the
+tokenizer's configured decoding cleanup. It preserves exact text for the frozen
+Talker lexical interface; it does not promise that every ordinary text string is
+accepted. Control tokens remain rejected even when they otherwise round-trip.
+
+Standard speech runs this lexical check in a worker thread before resolving
+reference audio or dispatching an engine request. It reuses the startup
+Talker tokenizer when available; otherwise concurrent cold requests share one
+worker-thread load, with a failed load remaining retryable. Prompt lengths and
 precomputed text IDs use that same tokenizer, including when
 `non_streaming_mode=true`; the root tokenizer belongs to Thinker.
 Default-speaker sentence synthesis uses `/v1/drvexo/speech`. Native sentence
