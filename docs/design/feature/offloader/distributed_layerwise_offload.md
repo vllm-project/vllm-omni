@@ -210,6 +210,24 @@ topologies and platforms receive the same bounded policy but are not claimed
 performance targets; other DLO models remain unchanged unless they explicitly
 adopt it.
 
+### Manual MiniMax-H3 component cache reuse
+
+`H3_COMPONENT_CACHE_REUSE=1` opts the ordinary MiniMax-H3 Text/Video/Audio
+component offload paths into skipping their unconditional idle allocator-cache
+purges. The default is `0`, preserving the ordinary release behavior. CPU master
+rebinding, stage synchronization, device tensor reference cleanup, and model
+calculations are unchanged. The switch does not make components resident.
+
+An explicitly installed `BoundedAllocatorCache` remains authoritative even when
+reuse is requested: its cache and physical-free-memory bounds and conservative
+telemetry fallback still run. Staging failure, allocation retry, forced stage
+release, and executor shutdown retain their existing cleanup behavior.
+
+Without a bounded owner, reuse can retain more reserved device memory between
+components and requests. Enable it only when that reservation tradeoff fits the
+deployment. Historical Ascend measurements used a 0.26 runtime and are not
+performance validation of this implementation or the current main branch.
+
 ### Final-layout Host Weight Runtime consumer
 
 > **Status:** PR2 landed in

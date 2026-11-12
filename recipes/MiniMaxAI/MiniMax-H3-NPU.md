@@ -221,6 +221,27 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### Reuse idle component allocator cache
+
+For ordinary MiniMax-H3 component offload, set the following before starting
+the workers:
+
+```bash
+export H3_COMPONENT_CACHE_REUSE=1
+```
+
+This skips unconditional idle allocator-cache purges after Text/Video/Audio
+component offload. Components still return to CPU, synchronization and tensor
+values remain unchanged, and the default `0` keeps the original release
+behavior. It does not make the weights resident.
+
+An explicit bounded component cache, including the existing DLO policy, still
+enforces its cache and physical-free-memory thresholds. Failure, OOM retry,
+forced stage release, and shutdown retain their existing cleanup. Without a
+bounded owner this option can keep more reserved device memory between stages;
+check that tradeoff for the deployment. Historical 0.26 Ascend experiments are
+not a main-branch or current-image performance guarantee.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the
