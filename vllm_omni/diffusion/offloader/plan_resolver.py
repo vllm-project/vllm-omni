@@ -30,6 +30,7 @@ from .component_utils import get_encoder_block_groups, validate_on_demand_compon
 from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, OffloadStrategy
 from .module_collector import ModuleDiscovery
 from .offload_plan import OffloadPlan, get_offload_plan
+from .tensor_utils import OffloadTensorInventory
 
 if TYPE_CHECKING:
     from .base import OffloadConfig
@@ -90,6 +91,8 @@ class ResolvedOffloadPlan:
     encoders: tuple[ResolvedComponent, ...]
     vaes: tuple[ResolvedComponent, ...]
     residents: tuple[ResolvedComponent, ...]
+    tensor_inventory: OffloadTensorInventory = OffloadTensorInventory()
+    retain_resident_storage: bool = False
     # Ordinary layerwise offload turns a legacy selection it cannot serve into
     # a complete no-op, placement included. Distributed layerwise offload warns
     # and keeps preparing its other components instead, so this stays scoped to
@@ -408,11 +411,44 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
     for path, module in zip(modules.resident_names, modules.resident_modules):
         residents.append(ResolvedComponent(path=path, module=module, selected=False))
 
+    independent: frozenset[str] = frozenset()
+    if declaration is not None:
+        independent = declaration.independently_managed_submodules
+    if independent:
+        if (
+            config.strategy is not OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            or config.uses_allgather(DIT_COMPONENT)
+            or config.use_hsdp
+        ):
+            raise ValueError("Independent roots require rank-local DLO, no HSDP")
+        selected_dits = [component.path for component in dits if component.selected]
+        block_ids: set[int] = set()
+        pending = list(dits)
+        while pending:
+            component = pending.pop()
+            pending.extend(component.children)
+            for stack in component.stacks:
+                block_ids.update(map(id, stack.blocks))
+        for path in independent:
+            if not any(path.startswith(parent + ".") for parent in selected_dits):
+                raise ValueError(f"Independent root outside selected DiT: {path!r}")
+            try:
+                root = pipeline.get_submodule(path)
+            except AttributeError as exc:
+                raise ValueError(f"Independent root not found: {path!r}") from exc
+            if any(id(child) in block_ids for child in root.modules()):
+                raise ValueError("A whole block cannot be independently managed")
+    inventory = OffloadTensorInventory.resolve(pipeline, independent)
+    retain = declaration is not None and declaration.retain_resident_storage
+    if retain and (not independent or config.dlo_resident_layers <= 0):
+        raise ValueError("Retained cores need CPU staging and positive residency")
     resolved = ResolvedOffloadPlan(
         dits=tuple(dits),
         encoders=tuple(encoders),
         vaes=tuple(vaes),
         residents=tuple(residents),
+        tensor_inventory=inventory,
+        retain_resident_storage=retain,
         skip_reason=(
             "No DiT/transformer modules found for selected DiT layerwise offload"
             if config.strategy is OffloadStrategy.LAYER_WISE and dit_selected and not dits

@@ -16,7 +16,7 @@ from vllm.logger import init_logger
 
 from .config import TEXT_ENCODER_COMPONENT
 from .offload_plan import OffloadPlan
-from .tensor_utils import set_tensor_storage
+from .tensor_utils import OffloadTensorInventory, set_tensor_storage
 
 if TYPE_CHECKING:
     from .plan_resolver import BlockStack, ResolvedComponent, ResolvedOffloadPlan
@@ -94,15 +94,18 @@ def move_non_block_state_to_device(
     module: nn.Module,
     block_groups: Sequence[Sequence[nn.Module]],
     device: torch.device,
+    tensor_inventory: OffloadTensorInventory = OffloadTensorInventory(),
 ) -> None:
     """Keep component state outside streamed block lists resident on device."""
     block_tensors = {
         id(tensor)
         for blocks in block_groups
         for block in blocks
-        for tensor in chain(block.parameters(), block.buffers())
+        for owned in (tensor_inventory.owned(block),)
+        for tensor in chain(owned.parameters.values(), owned.buffers.values())
     }
-    for tensor in chain(module.parameters(), module.buffers()):
+    owned = tensor_inventory.owned(module)
+    for tensor in chain(owned.parameters.values(), owned.buffers.values()):
         if id(tensor) in block_tensors:
             continue
         local = tensor.to_local() if isinstance(tensor, DTensor) else tensor

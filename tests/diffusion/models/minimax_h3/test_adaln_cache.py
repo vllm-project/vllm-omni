@@ -242,6 +242,57 @@ def offload_model_config(monkeypatch):
     return config
 
 
+@pytest.fixture
+def image_dlo_adaln_config(offload_model_config, monkeypatch):
+    config = offload_model_config
+    config.model_class_name = "MiniMaxH3ImagePipeline"
+    config.tf_model_config["audio_enabled"] = False
+    config.diffusion_offload_config = {
+        "mode": "layer",
+        "components": ["dit"],
+        "layer_options": {"dit": {"resident_layers": 1}},
+    }
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 2)
+    return config
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_image_dlo_cpu_adaln_requires_explicit_opt_in(
+    image_dlo_adaln_config,
+    explicit,
+):
+    config = image_dlo_adaln_config
+    config.cache_config = {"minimax_h3_adaln_offload": True} if explicit else {}
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(config)
+    assert model.adaln_cache.offload_weights is explicit
+    paths = model.independently_managed_offload_paths()
+    expected = {"blocks.0.adaln_proj", "final_layer.adaln_proj"}
+    assert paths == (expected if explicit else set())
+    for path in paths:
+        parameters = model.get_submodule(path).parameters()
+        assert all(p.device.type == "cpu" for p in parameters)
+
+
+@pytest.mark.parametrize("setting", ["hwr", "cache_disabled", "video", "tp1"])
+def test_image_dlo_cpu_adaln_rejects_unqualified_compositions(
+    image_dlo_adaln_config,
+    monkeypatch,
+    setting,
+):
+    config = image_dlo_adaln_config
+    if setting == "hwr":
+        config.host_weight_runtime_mode = "preferred"
+    elif setting == "cache_disabled":
+        config.cache_config["minimax_h3_adaln_cache"] = False
+    elif setting == "video":
+        config.model_class_name = "MiniMaxH3Pipeline"
+    else:
+        monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+    with pytest.raises(ValueError):
+        h3.MiniMaxH3DiTModel(config)
+
+
 def test_compiled_h3_projection_keeps_cache_and_tensor_graphs(monkeypatch, mocker):
     class Linear(torch.nn.Linear):
         def __init__(self, in_features, out_features, *, params_dtype, bias=True, **kwargs):

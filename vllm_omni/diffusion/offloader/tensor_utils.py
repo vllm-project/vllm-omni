@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared tensor utilities for distributed layerwise offload.
 
 These helpers are used by both DistributedLayerwiseOffloadHook and
@@ -28,6 +28,81 @@ class TensorStorageSpec:
     value: torch.Tensor
     storage_numel: int
     stride: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ModuleTensors:
+    """Registered bindings owned by the block transport."""
+
+    parameters: dict[str, nn.Parameter]
+    buffers: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class OffloadTensorInventory:
+    """Partition independently staged CPU modules from DLO-owned tensors."""
+
+    _independent_ids: frozenset[int] = frozenset()
+
+    @property
+    def has_independent(self) -> bool:
+        return bool(self._independent_ids)
+
+    @classmethod
+    def resolve(
+        cls,
+        pipeline: nn.Module,
+        paths: frozenset[str],
+    ) -> OffloadTensorInventory:
+        if not paths:
+            return cls()
+        ordered = sorted(paths)
+        owners: dict[int, str] = {}
+        for index, path in enumerate(ordered):
+            nested = any(path.startswith(p + ".") for p in ordered[:index])
+            if not path or nested:
+                raise ValueError("Independent offload module roots must not overlap")
+            try:
+                root = pipeline.get_submodule(path)
+            except AttributeError as exc:
+                raise ValueError(f"Independent root not found: {path!r}") from exc
+            tensors = [*root.parameters(), *root.buffers()]
+            cpu_only = all(t.device.type == "cpu" for t in tensors)
+            valid = cpu_only and all(map(is_materialized_tensor, tensors))
+            if not tensors or not valid:
+                raise ValueError(f"Independent root needs real CPU weights: {path!r}")
+            for tensor in tensors:
+                previous = owners.setdefault(id(tensor), path)
+                if previous != path:
+                    raise ValueError("Independent roots must not share tensors")
+
+        storage_owners: dict[tuple[Any, ...], str | None] = {}
+        bindings = chain(
+            pipeline.named_parameters(remove_duplicate=False),
+            pipeline.named_buffers(remove_duplicate=False),
+        )
+        for name, tensor in bindings:
+            matches = (p for p in ordered if name.startswith(p + "."))
+            owner = next(matches, None)
+            if owners.get(id(tensor)) != owner:
+                raise ValueError(f"Tensor {name!r} aliases different offload owners")
+            local = tensor.to_local() if is_dtensor(tensor) else tensor
+            if local.is_meta or not local.numel():
+                continue
+            storage_key = (local.device, local.untyped_storage().data_ptr())
+            if storage_key in storage_owners and storage_owners[storage_key] != owner:
+                raise ValueError(f"Storage crosses offload owners: {name!r}")
+            storage_owners[storage_key] = owner
+        return cls(frozenset(owners))
+
+    def owned(self, module: nn.Module) -> ModuleTensors:
+        params = dict(module.named_parameters())
+        buffers = dict(module.named_buffers())
+        excluded = self._independent_ids
+        return ModuleTensors(
+            {name: t for name, t in params.items() if id(t) not in excluded},
+            {name: t for name, t in buffers.items() if id(t) not in excluded},
+        )
 
 
 def dtype_size(dtype: torch.dtype) -> int:
