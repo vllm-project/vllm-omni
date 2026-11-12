@@ -1,0 +1,312 @@
+[
+  {
+    "id": "single_delayed_chunk",
+    "arrivals_s": [
+      10.0
+    ],
+    "durations_s": [
+      0.5
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.0,
+    "events": 0,
+    "continuous": true,
+    "total_underrun_s": 0.0
+  },
+  {
+    "id": "faster_than_realtime",
+    "arrivals_s": [
+      0.0,
+      0.05,
+      0.1,
+      0.15
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.0,
+    "events": 0,
+    "continuous": true,
+    "total_underrun_s": 0.0
+  },
+  {
+    "id": "exactly_realtime",
+    "arrivals_s": [
+      0.0,
+      0.1,
+      0.2
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.0,
+    "events": 0,
+    "continuous": true,
+    "total_underrun_s": 0.0
+  },
+  {
+    "id": "below_threshold",
+    "arrivals_s": [
+      0.0,
+      0.19
+    ],
+    "durations_s": [
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.09,
+    "events": 1,
+    "continuous": true,
+    "total_underrun_s": 0.09
+  },
+  {
+    "id": "at_threshold",
+    "arrivals_s": [
+      0.0,
+      0.2
+    ],
+    "durations_s": [
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.1,
+    "events": 1,
+    "continuous": true,
+    "total_underrun_s": 0.1
+  },
+  {
+    "id": "above_threshold",
+    "arrivals_s": [
+      0.0,
+      0.20001
+    ],
+    "durations_s": [
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.10001,
+    "events": 1,
+    "continuous": false,
+    "total_underrun_s": 0.10001
+  },
+  {
+    "id": "cumulative_deficit",
+    "arrivals_s": [
+      0.0,
+      0.3,
+      0.6
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.2,
+    "events": 2,
+    "continuous": false,
+    "total_underrun_s": 0.4
+  },
+  {
+    "id": "recovery_preserves_worst",
+    "arrivals_s": [
+      0.0,
+      0.5,
+      0.51
+    ],
+    "durations_s": [
+      0.1,
+      1.0,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.4,
+    "events": 1,
+    "continuous": false,
+    "total_underrun_s": 0.4
+  },
+  {
+    "id": "accumulated_buffer",
+    "arrivals_s": [
+      0.0,
+      0.02,
+      0.3
+    ],
+    "durations_s": [
+      0.2,
+      0.2,
+      0.2
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.0,
+    "events": 0,
+    "continuous": true,
+    "total_underrun_s": 0.0
+  },
+  {
+    "id": "unequal_chunk_durations",
+    "arrivals_s": [
+      0.0,
+      0.2,
+      0.6
+    ],
+    "durations_s": [
+      0.3,
+      0.1,
+      0.2
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.2,
+    "events": 1,
+    "continuous": false,
+    "total_underrun_s": 0.2
+  },
+  {
+    "id": "simultaneous_arrivals",
+    "arrivals_s": [
+      0.0,
+      0.0,
+      0.3
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.1,
+    "events": 1,
+    "continuous": true,
+    "total_underrun_s": 0.1
+  },
+  {
+    "id": "resumed_playback_does_not_count_again",
+    "arrivals_s": [
+      0.0,
+      0.5,
+      0.6
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.4,
+    "events": 1,
+    "continuous": false,
+    "total_underrun_s": 0.4
+  },
+  {
+    "id": "zero_threshold",
+    "arrivals_s": [
+      0.0,
+      0.2
+    ],
+    "durations_s": [
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.0,
+    "underrun_s": 0.1,
+    "events": 1,
+    "continuous": false,
+    "total_underrun_s": 0.1
+  },
+  {
+    "id": "relaxed_threshold",
+    "arrivals_s": [
+      0.0,
+      0.3
+    ],
+    "durations_s": [
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0.5,
+    "underrun_s": 0.2,
+    "events": 1,
+    "continuous": true,
+    "total_underrun_s": 0.2
+  },
+  {
+    "id": "user_three_chunks",
+    "arrivals_s": [
+      0.3,
+      0.45,
+      0.85
+    ],
+    "durations_s": [
+      0.1,
+      0.2,
+      0.2
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.2,
+    "total_underrun_s": 0.25,
+    "events": 2,
+    "continuous": false
+  },
+  {
+    "id": "small_stalls_exceed_total_budget",
+    "arrivals_s": [
+      0,
+      0.1875,
+      0.375
+    ],
+    "durations_s": [
+      0.125,
+      0.125,
+      0.125
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.0625,
+    "total_underrun_s": 0.125,
+    "events": 2,
+    "continuous": false
+  },
+  {
+    "id": "long_last_chunk_in_denominator",
+    "arrivals_s": [
+      0,
+      0.5
+    ],
+    "durations_s": [
+      0.1,
+      10
+    ],
+    "threshold_s": 0.1,
+    "underrun_s": 0.4,
+    "total_underrun_s": 0.4,
+    "events": 1,
+    "continuous": false
+  },
+  {
+    "id": "roundoff_does_not_create_stall",
+    "arrivals_s": [
+      100,
+      100.1,
+      100.2
+    ],
+    "durations_s": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "threshold_s": 0,
+    "underrun_s": 0,
+    "total_underrun_s": 0,
+    "events": 0,
+    "continuous": true
+  }
+]

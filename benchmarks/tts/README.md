@@ -45,7 +45,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"Base"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute \
     --save-result --result-dir ./results
 ```
 
@@ -63,7 +63,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute \
     --save-result --result-dir ./results
 ```
 
@@ -81,7 +81,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"VoiceDesign","language":"English"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute \
     --save-result --result-dir ./results
 ```
 
@@ -106,17 +106,23 @@ length of a saved WAV for the same prompt.
 
 #### Streaming continuity (`audio_underrun`)
 
-`audio_underrun` (seconds) is the per-request worst-case buffer deficit
-under a realtime-rate player simulation. The audio-speech backend records
-chunk arrival times during the SSE stream and surfaces:
+`audio_underrun` (seconds) preserves its existing cumulative playback
+deficit. `total_underrun` exposes the same value under an explicit name, and
+`audio_max_single_underrun` measures the largest individual stall per response. Playback resumes at each late arrival, so historical deficits do
+not count as new stalls. The audio-speech backend measures streamed raw PCM
+receive times and playable durations, excluding first-packet wait and EOF wait.
 
-- `Mean / Median / P{50,99} AUDIO_UNDERRUN (s)` per the standard percentile
-  output - any positive value means at least one inter-chunk gap was longer
-  than the chunk's audio duration.
-- `Streaming continuity OK rate` - fraction of requests whose worst-case
-  underrun stayed under the threshold (default 100 ms, the commonly cited
-  "audible gap" budget). Override the threshold with
-  `VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S=<float>`.
+The selectors `audio_underrun_event_count`, `audio_underrun_ratio` and
+`audio_underrun_events_per_minute` expose stall count, total stalls divided by
+(audio duration + total stalls), and stalls per minute of audio content.
+Means and percentiles weight responses equally; `total_audio_underrun_events`
+is the event count summed across measured responses.
+
+`Streaming continuity OK rate` still compares **total_underrun** with the
+budget (default 100 ms). Override it using
+`VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S=<float>`.
+See [the benchmark reference](../../docs/cli/bench/serve.md#streaming-audio-continuity)
+for formulas and selectors.
 
 This captures the failure mode where `RTF_p50 < 1` (server keeps up in
 aggregate) but per-stream chunk arrival is bursty enough that listeners

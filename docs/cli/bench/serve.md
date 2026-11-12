@@ -4,7 +4,10 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`,
+`openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`,
+`openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends.
+It also adds the `omniinteract` and `full-duplex-bench` datasets.
 
 `openai-chat-omni` retries explicit `ServiceUnavailableError` responses with
 code 503 up to three times, provided no text, reasoning, tool, audio, or image
@@ -40,7 +43,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 
 - `--dataset-name`
   The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
-  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  `omniinteract` replays official OmniInteract videos, `full-duplex-bench` replays local
+  Full-Duplex-Bench v1.0/v1.5 audio, and `videomme` loads Video-MME MCQ videos
   (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
 - `--num-prompts`
@@ -75,7 +79,74 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
-                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration", '
+                    '"audio_underrun", "audio_max_single_underrun", "total_underrun", "audio_underrun_event_count", '
+                    '"audio_underrun_ratio", "audio_underrun_events_per_minute", "audio_continuity_rate". '
+
+### Streaming audio continuity
+
+Add `audio_underrun,audio_continuity_rate` to `--percentile-metrics` for
+`openai-chat-omni` (also its `daily-omni` alias), `openai-realtime-duplex`,
+or `openai-audio-speech`. For example, append the following to an existing
+audio-output benchmark command:
+
+```bash
+--percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute,audio_continuity_rate
+```
+
+`audio_underrun` preserves its legacy cumulative-deficit meaning and
+equals `total_underrun`. The new `audio_max_single_underrun` measures the
+largest **individual playback stall** in seconds per response.
+Let chunk `i` arrive at `t_i`, contain `d_i` seconds, and let `E_i` be its
+scheduled playback end. Start with `E_0 = t_0 + d_0`, then compute:
+
+```text
+g_i = max(0, t_i - E_(i-1))
+E_i = max(t_i, E_(i-1)) + d_i
+audio_max_single_underrun = max(g_i)
+audio_underrun = total_underrun = sum(g_i)
+audio_underrun_event_count = count(g_i > 0)
+audio_underrun_ratio = total_underrun / (sum(d_i) + total_underrun)
+audio_underrun_events_per_minute = event_count / (sum(d_i) / 60)
+```
+
+Playback starts at the first non-empty audio chunk. First-packet waiting and
+waiting for EOF / `response.done` are excluded. This simulates FIFO playback;
+it does not measure an actual audio device or detect acoustic artifacts.
+Gaps at or below `1e-9` seconds are ignored to avoid roundoff-generated stalls.
+All time metrics and their saved statistics use `_s`, in seconds. Counts,
+ratios and events/minute have no time suffix. All means and percentiles are
+computed from response values with equal response weights; the event sum is
+also saved as `total_audio_underrun_events`. Ratios are in the range 0-1.
+
+`audio_continuity_rate` remains the fraction of measured responses whose
+**total_underrun**, rather than their largest individual stall, is at most
+`VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S` (default: `0.1` seconds).
+It prints as a percentage; `audio_continuity_ok_rate` is an accepted selector
+alias and the saved JSON key (a value from 0 to 1). A rate has no latency
+percentiles. Use the same threshold when comparing runs.
+
+Measurement scope:
+
+- Chat: one sample per successful request with decodable WAV audio deltas.
+  WAV headers are excluded from audio duration. Non-WAV formats, absent audio,
+  or invalid/inconsistent WAV chunks are unmeasured. Request audio output,
+  for example with `--extra-body '{"modalities":["text","audio"],"response_format":"wav"}'`.
+- Duplex: one sample per completed PCM16 audio reply (`response_id`), including
+  OmniInteract sessions. Replies are evaluated independently, so listening
+  periods between replies do not count as underruns. Cancelled, failed,
+  incomplete, LISTEN-only and invalid-audio replies are excluded. A session
+  with multiple replies contributes multiple samples.
+- A single audio chunk produces zero underrun because it has no inter-chunk
+  gap; use `audio_ttfp` alongside continuity to assess startup latency.
+
+The console reports the measured sample count. With no measured samples the
+rate is `N/A`, saved as JSON `null`, rather than 100%. Saved results include
+`num_audio_continuity_samples` and `audio_continuity_samples` with request
+indices, duplex response IDs where applicable, maximum/total stalls, event count,
+ratio, events per minute, audio duration, pass/fail, chunk count and threshold. Failed benchmark requests do not enter this rollup.
+
+### Additional parameters
 
 - `--goodput`
   Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
@@ -300,6 +371,51 @@ Notes:
 We use audio generation time / audio duration to calculate RTF.
 
 </details>
+
+### Full-Duplex-Bench Native Realtime Replay
+
+`full-duplex-bench` streams the official v1.0 or v1.5 audio into one native
+`/v1/realtime` session per benchmark session. It measures serving performance;
+it does not run the Full-Duplex-Bench ASR or quality evaluators.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name full-duplex-bench \
+  --dataset-path /path/to/Full-Duplex-Bench/dataset \
+  --fdb-version 1.5 --fdb-max-per-subset 2 \
+  --fdb-ref-audio /path/to/reference.wav \
+  --num-prompts 8 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 \
+  --save-result --result-dir ./fdb-runs
+```
+
+`--dataset-path` may point directly at a version directory containing the
+subset directories, or at its parent containing `v1.0/` and `v1.5/`.
+`--fdb-subsets` and `--fdb-sample-ids subset/sample ...` select exact inputs;
+`--fdb-max-per-subset` takes the first N samples in natural numeric order.
+`--num-prompts` remains the global session cap over that candidate pool. Unless
+`--disable-shuffle` is set, source samples are shuffled with `--seed`.
+
+Every v1.0 source sample produces one session from `input.wav`. Every v1.5
+source pair produces two adjacent sessions, first `input.wav` (overlap) and
+then `clean_input.wav` (control). Accordingly, `--num-prompts` counts sessions
+and must be even for v1.5; `0` selects all complete pairs. Pair selection and
+shuffling happen before expansion, so a run never drops one half of a pair.
+The default is two sessions and one concurrent session.
+
+The adapter uses the same realtime pacing, commit/drain behavior, playback
+acknowledgements and server session metrics as the native duplex serving
+benchmark. `--fdb-turn-detection none` is the default for MiniCPM-o. Reference
+audio is encoded once and shared by all sessions. Each invocation creates a
+new `run-*` artifact directory under `--result-dir`, containing per-session
+response metadata and `duplex_metrics.json`. If `--result-dir` is omitted,
+artifacts default to `full-duplex-bench-output/`. Standard TTFT, audio TTFP and
+per-response RTF use the backend-provided response metrics when present;
+separately named `duplex_client_*` and `duplex_stream_*` fields retain
+client-observed timing.
 
 ### Omni-DuplexEval Realtime Benchmark
 
