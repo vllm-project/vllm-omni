@@ -96,7 +96,10 @@ waits for a flag that is still set.
 Callers. ``Attention._run_ring_attention`` -> ``RingParallelAttention.run_attention`` ->
 ``ring_flash_attn_func`` -> ``RingFlashAttnFunc.forward`` -> ``ring_flash_attn_forward``. Its
 ring loop calls ``send_recv(k)``, ``send_recv(v)``, ``commit()``, the step's attention and
-``wait()`` at every step but the last, then ``finish()`` once after the loop.
+``wait()`` at every step but the last, then ``finish()`` once after a successful loop.
+A CE execution exception terminates the rank instead of attempting local recovery: peers
+may have reached different steps, so their credits cannot safely be reused. The worker
+monitor shuts down the remaining group.
 
 The loop order, kernels and merge are those of ``RingComm``; only the path the bytes take
 changes, so the output is bit-identical. Without symmetric memory or P2P (multi-node, PCIe
@@ -108,8 +111,10 @@ the process-wide symmetric-memory backend to NCCL.
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import NoReturn
 
 import torch
 import torch.distributed as dist
@@ -316,6 +321,21 @@ class CeRingComm:
         # Every wait() already joined the copies, so memory safety does not depend on this. It also
         # orders the two credit returns before later compute work.
         self._compute.wait_stream(self._copy)
+
+    def abort(self) -> NoReturn:
+        """Terminate this rank after a CE execution error; do not reuse its credits.
+
+        Peers may have queued different numbers of transfers, so local credit
+        returns cannot restore the group. Process exit lets the multiprocessing
+        or Ray executor's worker monitor tear down the remaining ranks. Avoid
+        normal shutdown: pending signal kernels can block CUDA synchronization.
+        """
+        try:
+            logger.error(
+                "Ring CE execution failed; terminating worker to prevent reuse of the ring group", exc_info=True
+            )
+        finally:
+            os._exit(1)
 
     def _release(self, step: int) -> None:
         """Return the FREE credit for the slot this rank attended to at ``step`` (copy stream)."""
