@@ -86,6 +86,13 @@ stage-0-indexed sampling list, including Talker and Codec; pre-sliced lists are
 rejected. A single-stage Thinker-only list instead reports that speech output
 is unavailable in that deployment and requires Talker and Codec. Standard
 speech dispatch tests pin the complete-pipeline input contract for both models.
+Both standard `/v1/audio/speech` and sentence-speech admission use the local
+`talker/` tokenizer to reject control tokens or changed text before engine
+submission. Standard speech prompt-length estimation and precomputed text IDs
+use the same tokenizer; the root Thinker vocabulary can segment text differently.
+The API startup shares the tokenizer loaded off the event loop across these
+routes. CPU regressions cover rejection followed by a healthy request and both
+streaming and non-streaming prompt modes for both Talker architectures.
 
 ## Acceptance
 
