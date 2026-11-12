@@ -20,6 +20,13 @@ aliases the same key is refused graph decode and stays eager until the
 owner's cache is released, so shared static buffers are never overwritten
 under a concurrent owner.
 
+Entries are persistent by default (#8586 A2): once an owner finishes, its
+captured graph and static buffers are retained and re-adopted by the next
+request with a matching key, so repeated identical requests replay without
+recapturing. Retention is bounded by the LRU cap (``max_entries``) enforced in
+``register_prefill``; ``persistent_entries=False`` restores the pre-A2 behavior
+of dropping every idle entry each request.
+
 Memory note: graph entries own an additional copy of the prefix K/V. Decode
 attention concatenates that prefix with target K/V inside the captured region;
 transient tensors use the graph memory pool.
@@ -176,10 +183,22 @@ class QwenImage21DecodeGraphEntry:
 class QwenImage21DecodeGraphManager:
     """Owns the static KV buffers and captured graphs of one transformer."""
 
-    def __init__(self, model: QwenImage21Transformer2DModel, max_entries: int = 8, model_level_offload: bool = False):
+    def __init__(
+        self,
+        model: QwenImage21Transformer2DModel,
+        max_entries: int = 8,
+        model_level_offload: bool = False,
+        persistent_entries: bool = True,
+    ):
         self.model = model
         self.max_entries = max_entries
         self.model_level_offload = model_level_offload
+        # When True (default, #8586 A2), captured entries survive across requests
+        # and are reused by the next matching key instead of being dropped once
+        # their owner finishes. Memory stays bounded by the LRU cap (max_entries)
+        # enforced in register_prefill. When False, idle entries are dropped each
+        # request (the pre-A2 behavior) so the next request recaptures.
+        self.persistent_entries = persistent_entries
         self.entries: OrderedDict[tuple, QwenImage21DecodeGraphEntry | None] = OrderedDict()
         # Key -> weak reference to the prefix K tensor of the request that owns
         # the entry's static buffers. Dead references mean the owning request
@@ -462,7 +481,7 @@ class QwenImage21DecodeGraphManager:
         return entry.output.clone()
 
     def release_idle_entries(self) -> None:
-        """Drop static prefix K/V left by finished requests.
+        """Reclaim static prefix K/V left by finished requests.
 
         Each entry keeps a full clone of the text+condition prefix. A finished
         request's owner weakref is already dead, but the entry used to stay
@@ -470,10 +489,34 @@ class QwenImage21DecodeGraphManager:
         prefix length, so keeping a dead entry for one field (image layout)
         still stacked copies across the others (#8831).
 
-        Every dead owner is dropped. The next request recaptures that key
-        once. An in-flight owner stays, so a concurrent request can keep
-        replaying.
+        Persistent mode (default, #8586 A2): keep idle entries so the next
+        request with a matching key replays the captured graph without paying a
+        recapture. The dead owner weakref already frees the key for re-adoption
+        in register_prefill, and the static buffers are a copy the entry owns,
+        not the request's. Memory is bounded by the LRU cap (max_entries) that
+        register_prefill enforces before allocating a new key, so idle copies
+        never stack beyond that cap. This trades the #8831 eager reclaim for
+        recapture avoidance; set persistent_entries=False to restore it.
+        Failure markers (None) are still dropped so a transient capture or
+        allocation failure can be retried by a later request, as before.
+
+        Non-persistent mode: every dead owner is dropped and the next request
+        recaptures that key once. An in-flight owner stays, so a concurrent
+        request can keep replaying.
         """
+        if self.persistent_entries:
+            # Retain captured entries for LRU reuse across requests; only clear
+            # failure markers so a later request can retry them. register_prefill
+            # bounds the live-entry count and re-adopts dead-owner keys.
+            dropped_marker = False
+            for key in list(self.entries):
+                if self.entries[key] is None:
+                    self.entries.pop(key, None)
+                    self._owners.pop(key, None)
+                    dropped_marker = True
+            if dropped_marker:
+                current_omni_platform.empty_cache()
+            return
         released = False
         for key in list(self.entries):
             owner = self._owners.get(key)

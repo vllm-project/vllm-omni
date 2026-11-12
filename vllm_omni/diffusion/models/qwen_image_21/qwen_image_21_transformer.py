@@ -941,6 +941,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "transformer",
         cuda_graph_max_decode_graphs: int = 8,
+        cuda_graph_persistent_decode: bool = True,
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
@@ -1032,6 +1033,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # on this top-level module rather than on individual blocks; graphs
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
+        # Captured entries persist across requests by default (#8586 A2) so a
+        # repeated key replays without recapture; cuda_graph_persistent_decode
+        # =False restores dropping idle entries each request (lower peak memory).
         self._enforce_eager = bool(od_config.enforce_eager)
         self.enable_cuda_graph_decode = getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager
         # Ascend does not torch.compile this transformer. CUDA graph capture
@@ -1044,6 +1048,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             QwenImage21DecodeGraphManager(
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
+                persistent_entries=cuda_graph_persistent_decode,
                 model_level_offload=resolve_offload_strategy(od_config)
                 in {OffloadStrategy.MODEL_LEVEL, OffloadStrategy.DISTRIBUTED_LAYER_WISE},
             )

@@ -265,6 +265,14 @@ Each captured graph owns its private memory pool, so dropping idle entries
 cannot leave later captures reusing a pool whose last graph was destroyed.
 Capture failures restore the caller's CUDA stream before falling back to
 eager decode, preserving output ordering across consecutive requests.
+Captured entries persist across requests by default (#8586 A2): once a request
+finishes, its graph and static buffers are retained and re-adopted by the next
+request with a matching key, so repeated identical requests replay without
+paying a recapture. Retention is bounded by the same LRU cache limit
+(`cuda_graph_max_decode_graphs`, default 8), which trades the earlier
+drop-idle-entries-each-request reclaim for recapture avoidance. Set
+`cuda_graph_persistent_decode=False` on the transformer to restore the
+pre-A2 behavior (lower peak prefix-copy memory, one recapture per request).
 
 ### Verification
 

@@ -87,6 +87,8 @@ def decode(manager, cache, layout=(1, 2, 2)):
 def test_release_idle_entries_drops_dead_owners_and_keeps_live_ones(graph_case):
     manager, device, cleanup = graph_case
     manager.max_entries = 8
+    # Legacy (pre-A2) behavior: idle entries are dropped each request.
+    manager.persistent_entries = False
     other = (1, 2, 2)
     live = (1, 4, 2)
     same_key_later = (1, 8, 2)
@@ -118,6 +120,79 @@ def test_release_idle_entries_drops_dead_owners_and_keeps_live_ones(graph_case):
     assert live_key in manager.entries
     assert manager._owners[live_key]() is still_running[0]["cond"]["key"]
     assert cleanup
+
+
+@pytest.mark.cpu
+def test_persistent_entries_retain_idle_graphs_for_reuse(graph_case):
+    manager, device, cleanup = graph_case
+    assert manager.persistent_entries is True
+    manager.max_entries = 8
+
+    first = make_cache(device, 1.0)
+    register(manager, first)
+    key = entry_key(manager, (1, 2, 2))
+    entry = manager.entries[key]
+    entry.refresh_prefix(first)
+    buffer_ref = weakref.ref(entry.k[0])
+    del first
+    gc.collect()
+
+    # The owner is dead, but persistent mode keeps the entry and its buffers
+    # so the next matching request can replay without recapturing (#8586 A2).
+    manager.release_idle_entries()
+    assert key in manager.entries
+    assert manager.entries[key] is entry
+    assert buffer_ref() is not None
+    assert not cleanup  # nothing dropped, so no empty_cache reclaim
+
+    # A new request with the same key re-adopts the retained entry rather than
+    # allocating a replacement, and its prefix is refreshed on the next decode.
+    second = make_cache(device, 5.0)
+    register(manager, second)
+    assert len(manager.entries) == 1
+    assert manager.entries[key] is entry
+    assert manager._owners[key]() is second[0]["cond"]["key"]
+    assert not entry.prefix_sources
+
+
+@pytest.mark.cpu
+def test_persistent_entries_still_evict_at_lru_cap(graph_case):
+    manager, device, _ = graph_case
+    assert manager.persistent_entries is True
+    manager.max_entries = 2
+    # Idle entries are retained, but the LRU cap still bounds memory: a third
+    # distinct key evicts the oldest even though no owner is live.
+    for value, layout in zip((1, 2, 3), [(1, 2, 2), (1, 3, 2), (1, 4, 2)]):
+        cache = make_cache(device, float(value))
+        register(manager, cache, layout)
+        del cache
+        manager.release_idle_entries()
+    assert len(manager.entries) == manager.max_entries
+    assert all(key[3] != ((1, 2, 2),) for key in manager.entries)
+
+
+@pytest.mark.cpu
+def test_persistent_entries_drop_failure_markers_for_retry(graph_case, monkeypatch):
+    manager, device, cleanup = graph_case
+    assert manager.persistent_entries is True
+    cache = make_cache(device, 1.0)
+    constructor = decode_graph.QwenImage21DecodeGraphEntry
+
+    def fail_allocation(**kwargs):
+        raise torch.OutOfMemoryError("injected allocation OOM")
+
+    monkeypatch.setattr(decode_graph, "QwenImage21DecodeGraphEntry", fail_allocation)
+    register(manager, cache)
+    assert list(manager.entries.values()) == [None]
+    # Persistent mode keeps captured graphs but still clears failure markers so
+    # a later request can retry instead of staying eager for that key forever.
+    manager.release_idle_entries()
+    assert len(manager.entries) == 0
+    assert cleanup
+    monkeypatch.setattr(decode_graph, "QwenImage21DecodeGraphEntry", constructor)
+    register(manager, cache)
+    assert len(manager.entries) == 1
+    assert next(iter(manager.entries.values())) is not None
 
 
 @pytest.mark.cpu
@@ -325,6 +400,40 @@ def test_replay_uses_active_request_and_layout(graph_case):
         torch.testing.assert_close(other, torch.ones_like(other).sin() + 5 + 6 + 1)
         torch.testing.assert_close(decode(manager, second), original)
         assert all(entry.captures == 1 for entry in manager.entries.values())
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+def test_persistent_entry_replays_across_requests_without_recapture(graph_case):
+    manager, device, _ = graph_case
+    assert manager.persistent_entries is True
+    first, second = make_cache(device, 1.0), make_cache(device, 5.0)
+    with torch.inference_mode():
+        register(manager, first)
+        out_first = decode(manager, first)
+        expected_first = (
+            torch.ones_like(out_first).sin() + first[0]["cond"]["key"].mean() + first[0]["cond"]["value"].mean() + 2
+        )
+        torch.testing.assert_close(out_first, expected_first)
+        key = entry_key(manager, (1, 2, 2))
+        entry = manager.entries[key]
+        assert entry.captures == 1
+
+        # The request finishes. Persistent mode keeps the captured graph and
+        # static buffers instead of dropping them (#8586 A2).
+        del first
+        manager.release_idle_entries()
+        assert manager.entries[key] is entry
+
+        # A new request with the same key re-adopts the entry, refreshes the
+        # prefix into the static buffers, and replays without recapturing.
+        register(manager, second)
+        out_second = decode(manager, second)
+        expected_second = (
+            torch.ones_like(out_second).sin() + second[0]["cond"]["key"].mean() + second[0]["cond"]["value"].mean() + 2
+        )
+        torch.testing.assert_close(out_second, expected_second)
+        assert manager.entries[key] is entry
+        assert entry.captures == 1
 
 
 @pytest.mark.cpu
