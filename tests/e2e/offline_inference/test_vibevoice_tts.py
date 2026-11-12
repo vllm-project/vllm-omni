@@ -99,3 +99,19 @@ def test_vibevoice_no_reference_natural_stop(omni_runner: OmniRunner) -> None:
     assert completion.finish_reason == "stop"
     assert audio.numel() == completion.token_ids.count(AUDIO_TOKEN_ID) * SAMPLES_PER_TOKEN
     assert 0.5 < audio.numel() / 24000 < 30.0
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_vibevoice_sampling_seed_is_reproducible(omni_runner: OmniRunner) -> None:
+    """SamplingParams.seed alone seeds both the reference VAE and the diffusion noise."""
+
+    def speak(seed=None) -> torch.Tensor:
+        (output,) = omni_runner.omni.generate(
+            _requests(["Hello, this is a short test."]), [SamplingParams(max_tokens=64, seed=seed)]
+        )
+        return _audio(output.outputs[0])
+
+    first = speak(7)
+    speak()  # an unseeded request in between advances the shared RNG
+    assert torch.equal(speak(7), first)  # serial batch-1: depends only on (seed, reference)
+    assert not torch.equal(speak(8), first)

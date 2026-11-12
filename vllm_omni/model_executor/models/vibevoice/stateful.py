@@ -38,6 +38,9 @@ class VibeVoiceRequestState:
     next_embedding: torch.Tensor | None = None
     acoustic_cache: PaddingCache | None = None
     semantic_cache: PaddingCache | None = None
+    # Request-owned diffusion noise stream (CPU, so values are device-independent);
+    # None means the shared global RNG, as before request seeds existed.
+    noise_generator: torch.Generator | None = None
 
 
 @dataclass(slots=True)
@@ -81,14 +84,21 @@ class VibeVoiceStatefulInference:
         num_scheduled: int,
         prompt_len: int,
         input_embeds: torch.Tensor,
+        seed: int | None = None,
     ) -> torch.Tensor:
-        """Register one scheduled row; return the embeddings to feed Qwen."""
+        """Register one scheduled row; return the embeddings to feed Qwen.
+
+        ``seed`` (read only when the request starts) gives it a private diffusion
+        noise stream, independent of batch mates, history and the global RNG.
+        """
         state = self._states.get(request_id)
         if num_computed == 0:
             if state is not None:
                 raise RuntimeError(f"VibeVoice request {request_id!r} restarted; preemption is not supported.")
             self._negative_kv.acquire(request_id)
             state = self._states[request_id] = VibeVoiceRequestState()
+            if seed is not None:
+                state.noise_generator = torch.Generator().manual_seed(int(seed))
         elif state is None or num_computed != state.progress:
             raise RuntimeError(f"VibeVoice request {request_id!r} progress is inconsistent; recompute is unsupported.")
         state.progress = num_computed + num_scheduled
@@ -143,11 +153,9 @@ class VibeVoiceStatefulInference:
         if not request_ids:
             return []
         negative = torch.cat(self._negative_kv.forward_step(request_ids, negative_inputs), dim=0)
-        # One fp32 CPU draw per active subset, cast to the conditions, as in
-        # the reference; a direct BF16 CUDA draw changes values and RNG state.
-        noise = torch.randn((2 * len(request_ids), self._model.config.audio_config.hidden_size)).to(positive)
-        latents = self._model.sample_audio_latent(positive, negative, noise)
         states = [self._states[request_id] for request_id in request_ids]
+        noise = self._diffusion_noise(states).to(positive)
+        latents = self._model.sample_audio_latent(positive, negative, noise)
         decoded = self._model.decode_audio_tokens(
             latents, [state.acoustic_cache for state in states], [state.semantic_cache for state in states]
         )
@@ -157,6 +165,29 @@ class VibeVoiceStatefulInference:
             state.next_embedding = decoded.next_embeddings[index].reshape(1, -1)
         # One D2H copy per subset; rows are contiguous CPU views.
         return list(decoded.audio.reshape(len(request_ids), -1).to("cpu", torch.float32).unbind(0))
+
+    def _diffusion_noise(self, states: list[VibeVoiceRequestState]) -> torch.Tensor:
+        """fp32 CPU ``(2B, latent)`` initial noise; a direct BF16 CUDA draw changes values and RNG state.
+
+        Unseeded rows share one global draw per active subset, as in the
+        reference. Seeded rows draw only from their own generator, so the global
+        stream is not consumed on their behalf. A seeded row draws a ``(2, latent)``
+        block per frame, exactly the reference's ``(2B, latent)`` draw at B=1, so the
+        same seed gives the same noise as Transformers; only its first row seeds
+        both CFG branches, the second is unused.
+        """
+        latent = self._model.config.audio_config.hidden_size
+        count = len(states)
+        free = [i for i, state in enumerate(states) if state.noise_generator is None]
+        shared = torch.randn((2 * len(free), latent)) if free else None
+        first = torch.empty((count, latent))
+        second = torch.empty((count, latent))
+        for k, i in enumerate(free):
+            first[i], second[i] = shared[k], shared[len(free) + k]  # type: ignore[index]
+        for i, state in enumerate(states):
+            if state.noise_generator is not None:
+                first[i], second[i] = torch.randn((2, latent), generator=state.noise_generator)
+        return torch.cat([first, second])
 
     def release(self, request_ids: set[str] | list[str]) -> None:
         for request_id in request_ids:
