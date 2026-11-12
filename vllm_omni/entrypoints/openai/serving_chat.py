@@ -1497,7 +1497,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """Return the first ``is_comprehension`` stage index, or None if no stage is marked."""
         for idx, stage in enumerate(stage_configs):
             is_comprehension = (
-                stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
+                stage.get("is_comprehension", False)
+                if isinstance(stage, Mapping)
+                else getattr(stage, "is_comprehension", False)
             )
             if is_comprehension:
                 return idx
