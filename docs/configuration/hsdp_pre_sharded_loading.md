@@ -7,11 +7,12 @@ The default strategy, `full`, retains the existing load-then-shard behavior.
 The same `hsdp_weight_load_strategy` option is available through Python and stage
 engine configuration.
 
-Each rank reads rank-local slices of shardable checkpoint tensors; scalar and
-integer tensors are replicated. This avoids materializing a full CPU copy of
-the checkpoint, reduces CPU memory use and redundant checkpoint I/O,
-and can improve loading speed. Real transformer blocks are materialized and
-sharded one at a time, limiting temporary GPU memory use.
+Each rank reads rank-local slices of checkpoint tensors, including packed integer
+weights such as NVFP4; only scalar tensors are replicated. This avoids
+materializing a full CPU copy of the checkpoint, reduces CPU memory use and
+redundant checkpoint I/O, and can improve loading speed. Real transformer
+blocks are materialized and sharded one at a time, limiting temporary GPU
+memory use.
 
 The pre-sharded strategy reads rank-local slices from ordinary Hugging Face
 safetensors checkpoints into FSDP-owned proxy storage. No converted checkpoint is
