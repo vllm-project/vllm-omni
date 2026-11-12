@@ -140,9 +140,8 @@ def test_uploader_splits_without_timings_up_to_the_job_cap(monkeypatch: pytest.M
     lists = _read_shard_lists("simple-test", suite)
     assert lists == bins
     listed = {path for group in lists for path in group}
-    assert listed == set(matching) | {rejected}
-    assert rejected in lists[0]
-    assert rejected not in {path for group in lists[1:] for path in group}
+    assert listed == set(matching) | set(rejected)
+    assert [path for group in lists for path in group if path in rejected] == rejected
     for group in lists:
         assert any(_file_matches_marker(suite / path, "core_model and cpu") is True for path in group)
     assert "automatic_shard" not in step
@@ -268,15 +267,16 @@ def test_two():
 SIMPLE_TEST_COMMAND = "pytest -sv tests/ -m 'core_model and cpu'"
 
 
-def _write_marker_suite(root: Path, cpu_files: int = 6) -> tuple[list[str], str]:
-    """A constructed ``tests/`` tree: ``cpu_files`` Simple Test matches, one ``cards_2`` miss."""
+def _write_marker_suite(root: Path, cpu_files: int = 6) -> tuple[list[str], list[str]]:
+    """A constructed ``tests/`` tree: ``cpu_files`` Simple Test matches, two ``cards_2`` misses."""
     tests = root / "tests"
     tests.mkdir(parents=True)
     matching = [f"tests/test_cpu_{index}.py" for index in range(cpu_files)]
     for name in matching:
         (root / name).write_text(_CPU_MODULE, encoding="utf-8")
-    rejected = "tests/test_cards.py"
-    (root / rejected).write_text(_CARDS_MODULE, encoding="utf-8")
+    rejected = ["tests/test_cards_a.py", "tests/test_cards_b.py"]
+    for name in rejected:
+        (root / name).write_text(_CARDS_MODULE, encoding="utf-8")
     return matching, rejected
 
 
@@ -802,8 +802,8 @@ def test_ready_ignores_timings_recorded_on_another_queue(
     lists = _read_shard_lists("simple-test", suite)
     assert lists == fallback_file_bins(SIMPLE_TEST_COMMAND, suite)
     listed = {path for group in lists for path in group}
-    assert listed == set(matching) | {rejected}
-    assert rejected in lists[0]
+    assert listed == set(matching) | set(rejected)
+    assert [path for group in lists for path in group if path in set(rejected)] == rejected
     assert set(timed) != listed
 
 
@@ -882,7 +882,8 @@ def test_cpu():
         "tests/test_match_a.py",
         "tests/test_match_b.py",
     ]
-    assert lists[1] == ["tests/test_match_b.py"]
+    assert lists[0] == ["tests/test_match_a.py", "tests/test_cpu_a.py"]
+    assert lists[1] == ["tests/test_match_b.py", "tests/test_cpu_b.py"]
     for group in lists:
         assert any(name.startswith("tests/test_match_") for name in group)
 

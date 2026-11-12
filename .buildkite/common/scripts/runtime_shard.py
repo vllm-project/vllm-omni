@@ -16,9 +16,10 @@ in the bin. The packing is not the smallest possible.
 With no usable timings the uploader splits the files whose static marks
 satisfy the command's ``-m`` expression, using the smaller of
 ``MAX_AUTOMATIC_SHARDS`` and that file count. A file that cannot be checked,
-or whose static marks do not show a match, stays beside a file that does
-match, and it does not open a bin by itself. The real ``-m`` run still decides
-whether that file's tests run. No confirmed match keeps the step at one job,
+or whose static marks do not show a match, is dealt across bins that already
+hold a confirmed match, and it does not open a bin by itself. The real ``-m``
+run still decides whether that file's tests run. No confirmed match keeps the
+step at one job,
 so a shard cannot collect zero tests. One confirmed file stays one job.
 A finished session's unmeasured
 files were filtered by ``-m`` and stay at weight 0; they are still placed in
@@ -42,7 +43,7 @@ import shlex
 from pathlib import Path
 from typing import Any, NamedTuple
 
-MAX_AUTOMATIC_SHARDS = 5
+MAX_AUTOMATIC_SHARDS = 4
 # File seconds stop at each test. Checkout, collection, and startup still run
 # inside ``timeout_in_minutes``, so packing uses only this fraction of it.
 FILE_TIME_BUDGET_RATIO = 0.8
@@ -328,10 +329,10 @@ def fallback_file_bins(command: str, root: Path) -> list[list[str]] | None:
 def _plan_fallback(per_command: list[tuple[str, list[str]]], root: Path) -> _Fallback:
     """Spread files that still have a test under each command's ``-m``.
 
-    Shard count follows confirmed matches only. Any other file is attached to
-    the first bin, which already holds a confirmed match. A static miss is not
-    trusted: the file still runs there, and the command's ``-m`` drops it if
-    the static read was right. No confirmed match keeps the step at one job.
+    Shard count follows confirmed matches only. Any other file is dealt across
+    those bins, which already hold a confirmed match. A static miss is not
+    trusted: the file still runs, and the command's ``-m`` drops it if the
+    static read was right. No confirmed match keeps the step at one job.
     """
     matched_groups: list[list[str]] = []
     unknown: list[str] = []
@@ -359,10 +360,9 @@ def _plan_fallback(per_command: list[tuple[str, list[str]]], root: Path) -> _Fal
     if not bins:
         return _Fallback(None, eligible, "marker matches do not cover every command")
     seen = {name for group in bins for name in group}
-    for name in unknown:
-        if name not in seen:
-            bins[0].append(name)
-            seen.add(name)
+    extras = [name for name in sorted(set(unknown)) if name not in seen]
+    for index, name in enumerate(extras):
+        bins[index % len(bins)].append(name)
     return _Fallback(bins, eligible, "")
 
 
@@ -390,8 +390,6 @@ def _spread_groups(groups: list[list[str]], count: int) -> list[list[str]] | Non
             bins[cursor % count].append(name)
             assigned[name] = cursor % count
             cursor += 1
-    if any(not bucket for bucket in bins):
-        return None
     return bins
 
 

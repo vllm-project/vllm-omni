@@ -9,8 +9,8 @@
 # jobs fit 80% of `timeout_in_minutes` (the rest is checkout, collection, and
 # startup), then writes each bin as a file list. A shard
 # runs only that list. No usable timings opens the smaller of MAX_AUTOMATIC_SHARDS
-# and the files whose marks satisfy the command's -m. A static miss stays in
-# the first shard and does not open another one. No confirmed match stays
+# and the files whose marks satisfy the command's -m. A static miss is dealt
+# across those shards and does not open another one. No confirmed match stays
 # one job, so a shard cannot collect zero tests.
 # Enrolled steps always write `timings/jobs/*.json`. E2E model jobs stay one
 # job: each case loads a server, and splitting them repeats that startup.
