@@ -176,28 +176,6 @@ def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, offline_client):
 
 
 # ------------------------------------------------------------------
-# Test: T2V quantized model generates valid video
-# ------------------------------------------------------------------
-
-
-@hardware_test(res={"cuda": ["H100", "B200"]})
-@pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
-def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, offline_client):
-    """Load the W4A16 quantized Wan2.2 T2V model and verify it produces a valid video."""
-    frames, _ = _generate_t2v_video(offline_client)
-
-    assert frames is not None, "Expected video frames output"
-    assert hasattr(frames, "shape"), "Expected frames to have a shape attribute"
-
-    assert frames.shape[1] == NUM_FRAMES, f"Expected {NUM_FRAMES} frames, got {frames.shape[1]}"
-    assert frames.shape[2] == HEIGHT, f"Expected height {HEIGHT}, got {frames.shape[2]}"
-    assert frames.shape[3] == WIDTH, f"Expected width {WIDTH}, got {frames.shape[3]}"
-
-    arr = np.asarray(frames)
-    assert arr.std() > 0.01, "Generated video appears blank (std ≈ 0)"
-
-
-# ------------------------------------------------------------------
 # Test: I2V quantized peak memory
 # ------------------------------------------------------------------
 
@@ -252,6 +230,28 @@ def test_wan22_i2v_autoround_w4a16_memory_savings():
         f"Quantized model ({quant_peak:.0f} MB) should use at least "
         f"{min_savings_mb} MB less than baseline ({baseline_peak:.0f} MB)"
     )
+
+
+# ------------------------------------------------------------------
+# Test: T2V quantized model generates valid video
+# ------------------------------------------------------------------
+
+
+@hardware_test(res={"cuda": ["H100", "B200"]})
+@pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
+def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, offline_client):
+    """Load the W4A16 quantized Wan2.2 T2V model and verify it produces a valid video."""
+    frames, _ = _generate_t2v_video(offline_client)
+
+    assert frames is not None, "Expected video frames output"
+    assert hasattr(frames, "shape"), "Expected frames to have a shape attribute"
+
+    assert frames.shape[1] == NUM_FRAMES, f"Expected {NUM_FRAMES} frames, got {frames.shape[1]}"
+    assert frames.shape[2] == HEIGHT, f"Expected height {HEIGHT}, got {frames.shape[2]}"
+    assert frames.shape[3] == WIDTH, f"Expected width {WIDTH}, got {frames.shape[3]}"
+
+    arr = np.asarray(frames)
+    assert arr.std() > 0.01, "Generated video appears blank (std ≈ 0)"
 
 
 # ------------------------------------------------------------------
