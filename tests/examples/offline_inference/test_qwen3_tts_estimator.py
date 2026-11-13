@@ -159,7 +159,19 @@ def test_a_text_lead_the_estimate_refuses_is_raised_not_replaced_by_the_fallback
     assert led == stock + 4
 
 
-def test_a_failed_estimate_refuses_a_text_lead_instead_of_the_fallback_length(talker_cache, monkeypatch):
+@pytest.mark.parametrize(
+    ("lead", "message"),
+    [
+        (2, "tokenizer unavailable"),
+        # A malformed lead is refused too, a falsy one included.
+        (False, "integer >= 0"),
+        ("", "integer >= 0"),
+        # No lead, or a lead of 0, keeps the fallback.
+        (None, None),
+        (0, None),
+    ],
+)
+def test_a_failed_estimate_refuses_a_text_lead_instead_of_the_fallback_length(talker_cache, monkeypatch, lead, message):
     """The fallback length fits no lead layout, and the lead went unchecked."""
     from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
 
@@ -169,6 +181,9 @@ def test_a_failed_estimate_refuses_a_text_lead_instead_of_the_fallback_length(ta
     monkeypatch.setattr(
         Qwen3TTSPromptEmbedsBuilder, "estimate_prompt_len_from_additional_information", staticmethod(_fail)
     )
-    with pytest.raises(TextLeadError, match="tokenizer unavailable"):
-        _estimate_prompt_len(_lead_request(non_streaming_mode=False, text_lead=2), "test_model", _cache=talker_cache)
-    assert _estimate_prompt_len(_lead_request(non_streaming_mode=False), "test_model", _cache=talker_cache) == 2048
+    info = _lead_request(non_streaming_mode=False, **({} if lead is None else {"text_lead": lead}))
+    if message is None:
+        assert _estimate_prompt_len(info, "test_model", _cache=talker_cache) == 2048
+    else:
+        with pytest.raises(TextLeadError, match=message):
+            _estimate_prompt_len(info, "test_model", _cache=talker_cache)
