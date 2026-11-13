@@ -41,9 +41,17 @@ connectors:
       # every ragged bucket captures its own graph.
       cfm_cross_bucket_merge: true
       # Capture batch-1 continuation/tail shapes without padding: with the
-      # 8-frame mel cache these codec widths cover 16-64 mel frames.
-      hift_graph_continuation_frames: [4, 28]
-      hift_graph_exact_batch_sizes: [1]
+      # 8-frame mel cache these codec widths cover 14-76 mel frames. The lower
+      # end (3) is a short tail chunk and the upper end (29-34) is a tail chunk
+      # merged with a small backlog; both used to miss every bucket and run
+      # eager HiFT (32 of 798 decode calls in the 2026-10-30 c8 round, and the
+      # last 7 of 1088 prompts on CUDA seed-tts EN, all (1, 76, 3840) =
+      # codec width 34, one past the previous 33 cap).
+      hift_graph_continuation_frames: [3, 34]
+      # Batch 2 was the last eager residue: every batch-2 continuation shape
+      # missed both the buckets (only 1/2/4/8 x 50/58 are captured) and the
+      # batch-1 exact graphs (2026-10-30: 5 of 798 decode calls).
+      hift_graph_exact_batch_sizes: [1, 2]
       enable_cfm_graph: true
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
@@ -267,15 +275,20 @@ platforms:
         # Duplex KV window (window_kv.py) requires prefix caching disabled.
         enable_prefix_caching: false
         compilation_config:
-          # A full decode-step graph keeps in-graph sampling and multi-frame
-          # expansion. The static-shape builder gates its runtime buckets on
-          # the decode graph mode, so PIECEWISE also runs here (K included,
-          # verified on 910B1). This is stage 0 and it ships PIECEWISE; the
-          # K-step's measured RTF win is FULL-only on stage 1, which ships
-          # FULL_DECODE_ONLY below. Stage-0 data point for scale (910B1):
-          # PIECEWISE without K is +75% RTF at 32/1 versus FULL_DECODE_ONLY
-          # with K=8.
-          cudagraph_mode: PIECEWISE
+          # Stage 0 carries no K-step, so nearly every step after prefill is a
+          # uniform decode batch; one whole-step graph replays it without the
+          # per-segment launch/sync cost of piecewise splitting. The static-shape
+          # builder gates its runtime buckets on the decode graph mode, so
+          # FULL_DECODE_ONLY covers those steps. Measured on 910B1 with the
+          # three-stage co-located profile, seed-tts en, mean audio RTF at
+          # 32@1 / 64@4 / 128@8: FULL_DECODE_ONLY 0.2749 / 0.5332 / 0.8346
+          # versus PIECEWISE 0.3008 / 0.5428 / 0.8267, i.e. -8.6% at 32@1,
+          # -1.8% at 64@4 and +0.9% at 128@8, inside this tier's ~2% run-to-run
+          # scatter. FULL_AND_PIECEWISE was measured as well (0.2800 / 0.5354 /
+          # 0.8337): no tier beats this mode and startup grows 20-70 s for the
+          # second graph set, so stage 0 keeps the decode-only graph. Stage 1
+          # below already ships FULL_DECODE_ONLY with the K-step.
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
