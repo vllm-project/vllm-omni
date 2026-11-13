@@ -23,7 +23,11 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    clear_scheduled_denoise_step_on_exit,
+)
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -44,6 +48,8 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
+    resolve_wan_boundary_ratio,
     resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
@@ -200,10 +206,16 @@ class Wan22I2VPipeline(
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
 
+    # Both CFG branches share latents, timestep and the active expert; UMT5
+    # prompts are zero-padded back to max_sequence_length.
+    supports_cfg_batching = True
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts.
+    default_num_inference_steps: ClassVar[int] = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -377,7 +389,10 @@ class Wan22I2VPipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence and returns its length; None
+        # without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
@@ -388,7 +403,7 @@ class Wan22I2VPipeline(
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
 
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -515,7 +530,9 @@ class Wan22I2VPipeline(
         height = common.height or 480
         width = common.width or 832
         num_frames = common.num_frames or 81
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        num_steps = (
+            self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+        )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -528,10 +545,7 @@ class Wan22I2VPipeline(
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="I2V")
 
         # Validate inputs
         self.check_inputs(
@@ -640,6 +654,7 @@ class Wan22I2VPipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels

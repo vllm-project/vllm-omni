@@ -321,6 +321,34 @@ def test_decide_output_silent_short_circuits() -> None:
     assert decision.metadata.get("model_listen") is True
 
 
+def test_decide_output_spoken_sentence_keeps_talker_despite_silent_id() -> None:
+    plugin = AuraDuplexPlugin(_encode_audio)
+    spoken = "是的，我看到你了。"
+    # include_stop_str_in_output appends the stop marker to a spoken finish.
+    for text in (spoken, spoken + SILENT_TEXT):
+        output = SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    text=text,
+                    cumulative_text=text,
+                    token_ids=[11, 22, AURA_SILENT_TOKEN_ID],
+                    finished=True,
+                )
+            ]
+        )
+        assert (
+            plugin.decide_output(
+                stage_id=1,
+                final_stage_id=3,
+                segment_finished=True,
+                segment_token_ids=(11, 22, AURA_SILENT_TOKEN_ID),
+                segment_output_metadata={},
+                output=output,
+            )
+            is None
+        )
+
+
 def test_decide_output_chinese_silence_is_not_special_token() -> None:
     plugin = AuraDuplexPlugin(_encode_audio)
 
@@ -569,6 +597,28 @@ def test_single_finished_sentence_is_one_non_resumable_submit() -> None:
     assert plan.is_final_update is True
     assert plan.close_only is False
     assert plugin.partial_stage_followup(plan, req_state) is None
+
+
+def test_empty_remainder_after_mid_gen_emit_is_one_end_sentinel() -> None:
+    """16:35/17:30: full sentence emitted mid-gen, then finish with no remainder.
+
+    The sentence is already on Talker. The finish is one close sentinel.
+    Queueing another close_only submits twice and never reaches stage 2/3.
+    """
+    orchestrator, req_state = _sentence_plan_fixture()
+    plugin = AuraDuplexPlugin(_encode_audio)
+    sentence = "我看到外面的天空呈现出灰蒙蒙的色调，光线比较昏暗，没有阳光直射，看起来像是阴天或者有雾霾。"
+    opened = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=False), req_state)
+    assert opened is not None
+    assert opened.close_only is False
+    assert opened.is_final_update is False
+
+    finished = plugin.plan_partial_stage_output(orchestrator, 1, 0, _stage1_output(sentence, finished=True), req_state)
+    assert finished is not None
+    assert finished.close_only is True
+    assert finished.queue_close_after is False
+    assert finished.is_final_update is True
+    assert plugin.partial_stage_followup(finished, req_state) is None
 
 
 def test_aura_draining_stages_are_declared_by_the_plugin() -> None:

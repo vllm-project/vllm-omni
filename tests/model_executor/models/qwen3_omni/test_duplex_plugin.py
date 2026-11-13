@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -36,6 +37,7 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session import history_calibration as history_calibration_module
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
@@ -98,6 +100,7 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 async def open_qwen(
     *,
+    collect_stats=False,
     calibrate=None,
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
@@ -119,6 +122,7 @@ async def open_qwen(
         output_sink=output,
         result_sink=results,
         runtime_config=DuplexSessionRuntimeConfig(
+            collect_stats=collect_stats,
             history_calibration_timeout_ms=calibration_timeout_ms,
             history_audio_max_bytes_per_session=history_max_bytes,
         ),
@@ -300,6 +304,28 @@ async def test_note_published_failure_closes_the_unpublished_call():
         assert _published_call(events, "call_paris") == []
         assert any(event.type == "session.closed" for event in events)
         assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collect_stats", [False, True])
+async def test_session_stats_tag_the_qwen_prompt_for_stage_work(collect_stats):
+    from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+
+    h = await open_qwen(collect_stats=collect_stats)
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        chunk = perf_chunk_from_buffer(prompt.get("model_intermediate_buffer"))
+        if collect_stats:
+            assert h.session.perf is not None
+            (turn,) = h.session.perf.snapshot()["turns"]
+            assert chunk == (turn["epoch"], turn["chunks"][0]["seq"])
+        else:
+            assert chunk is None
+            assert "model_intermediate_buffer" not in prompt
     finally:
         await h.manager.shutdown()
 
@@ -1990,7 +2016,11 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
 
     h = await open_qwen(calibrate=calibrate)
     commit = None
+    # init_logger() does not propagate, so the root caplog handler never sees this warning.
+    calibration_logger = history_calibration_module.logger
+    calibration_logger.addHandler(caplog.handler)
     try:
+        caplog.set_level(logging.WARNING, logger=calibration_logger.name)
         response_id = await _interrupt_tool_answer(h)
         await asyncio.wait_for(entered.wait(), 1)
         controller = h.runner.ctx.history_calibration
@@ -2044,6 +2074,7 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
             assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
             assert "Duplex history calibration failed" in caplog.text
     finally:
+        calibration_logger.removeHandler(caplog.handler)
         release.set()
         if commit is not None:
             await asyncio.gather(commit, return_exceptions=True)

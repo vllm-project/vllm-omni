@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan single-stage diffusion topology (Noisy KV).
+"""CausVid Wan single-stage diffusion topology (Noisy PP).
 
 Diffusion implementation: ``vllm_omni.diffusion.models.causvid_wan``.
 """
@@ -16,7 +16,7 @@ from vllm_omni.config.stage_config import (
 # when the checkpoint basename does not disambiguate.
 CAUSVID_WAN_PIPELINE = PipelineConfig(
     model_type="causvid_wan",
-    default_deploy_config_name="causvid_wan.yaml",
+    default_deploy_config_name="causvid_wan_self_forcing.yaml",
     model_arch="CausVidWanPipeline",
     diffusers_class_name="CausVidWanPipeline",
     stages=(

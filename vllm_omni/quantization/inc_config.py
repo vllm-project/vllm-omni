@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import logging
 from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     )
 
 _REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
+logger = logging.getLogger(__name__)
 
 
 def _stage_prefix(prefix_map: dict[str, str | None]) -> str:
@@ -46,8 +49,52 @@ def _map_with_stage_prefix(
     return result
 
 
+def _normalize_block_names(value: str | list[str] | None) -> list[str] | None:
+    if isinstance(value, str):
+        return [name.strip() for name in value.split(",") if name.strip()]
+    return value
+
+
+def _remap_name(name: str, prefix_map: dict[str, str]) -> str:
+    """Replace the first matching checkpoint prefix in *name*."""
+    for source in sorted(prefix_map, key=len, reverse=True):
+        if name.startswith(source):
+            return prefix_map[source] + name[len(source) :]
+    return name
+
+
+def _is_regex_key(key: str) -> bool:
+    return any(char in _REGEX_SPECIAL_CHARS for char in key)
+
+
+def _remap_regex_key(key: str, prefix_map: dict[str, str]) -> str:
+    """Remap a checkpoint prefix in a regex key in either dot style."""
+    for source in sorted(prefix_map, key=len, reverse=True):
+        target = prefix_map[source] or ""
+        for source_form, target_form in (
+            (source, target),
+            (re.escape(source), re.escape(target)),
+        ):
+            if source_form != target_form and source_form in key:
+                return key.replace(source_form, target_form, 1)
+    return key
+
+
+def _remap_extra_config_key(key: str, prefix_map: dict[str, str]) -> str:
+    """Remap an ``extra_config`` key, preserving regex patterns."""
+    if _is_regex_key(key):
+        new_key = _remap_regex_key(key, prefix_map)
+        if new_key == key:
+            logger.debug("extra_config regex key did not match any prefix: %s", key)
+        return new_key
+    return _remap_name(key, prefix_map)
+
+
 class OmniINCConfig(INCConfig):
     """INC config with stage-prefix mapping and AutoRound MXFP8/NVFP4 dispatch."""
+
+    block_name_to_quantize: list[str] | None
+    extra_config: dict[str, Any] | None
 
     SUPPORTED_DTYPES = {"int", "mx_fp", "nv_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
@@ -87,46 +134,26 @@ class OmniINCConfig(INCConfig):
         prefix_map = getattr(hf_to_vllm_mapper, "orig_to_new_prefix", None) or {}
         stage = _stage_prefix(prefix_map) if prefix_map else ""
 
-        # -- Normalize CSV string -----------------------------------------
-        if isinstance(self.block_name_to_quantize, str):
-            self.block_name_to_quantize = [b.strip() for b in self.block_name_to_quantize.split(",") if b.strip()]
-
         # -- block_name_to_quantize ----------------------------------------
-        if self.block_name_to_quantize is not None:
+        block_names = _normalize_block_names(self.block_name_to_quantize)
+        if block_names is not None:
             if prefix_map and stage:
-                self.block_name_to_quantize = _map_with_stage_prefix(
-                    self.block_name_to_quantize,
-                    prefix_map,
-                    stage,
-                )
+                block_names = _map_with_stage_prefix(block_names, prefix_map, stage)
             else:
-                self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(self.block_name_to_quantize)
+                block_names = hf_to_vllm_mapper.apply_list(block_names)
+        self.block_name_to_quantize = block_names
 
         # -- extra_config --------------------------------------------------
-        if self.extra_config is not None and prefix_map:
+        extra_config = self.extra_config
+        if extra_config is not None and prefix_map:
             new_extra: dict[str, Any] = {}
             sorted_keys = sorted(prefix_map, key=len, reverse=True)
 
-            # Build escaped-dot map for regex pattern keys
-            escaped_map: dict[str, str] = {}
-            for orig, new in prefix_map.items():
-                escaped_map[orig.replace(".", r"\.")] = (new or "").replace(".", r"\.")
-            escaped_sorted = sorted(escaped_map, key=len, reverse=True)
-
-            for key, val in self.extra_config.items():
-                is_regex = any(c in _REGEX_SPECIAL_CHARS for c in key)
+            for key, val in extra_config.items():
+                is_regex = _is_regex_key(key)
                 if is_regex:
-                    # Regex keys: escaped-dot substring replacement.
-                    # re.search matches anywhere so no stage prefix needed.
-                    new_key = key
-                    for esc_orig in escaped_sorted:
-                        if esc_orig in new_key:
-                            new_key = new_key.replace(
-                                esc_orig,
-                                escaped_map[esc_orig],
-                                1,
-                            )
-                            break
+                    # re.search matches anywhere, so no stage prefix is needed.
+                    new_key = _remap_extra_config_key(key, prefix_map)
                 else:
                     # Plain keys: prefix replacement + stage prefix.
                     new_key = key
@@ -137,8 +164,33 @@ class OmniINCConfig(INCConfig):
                             break
                 new_extra[new_key] = val
             self.extra_config = new_extra
-        elif self.extra_config is not None:
-            self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
+        elif extra_config is not None:
+            self.extra_config = hf_to_vllm_mapper.apply_dict(extra_config)
+
+    def apply_prefix_map(self, prefix_map: dict[str, str]) -> None:
+        """Replace checkpoint prefixes with runtime prefixes in-place.
+
+        ``block_name_to_quantize`` and ``extra_config`` both carry checkpoint
+        module names, so models that rename submodules between checkpoint and
+        runtime must remap both. Otherwise a per-layer ``extra_config``
+        exception (for example a BF16 ``down_proj``) stops matching at
+        runtime and the layer is built quantized even though its checkpoint
+        stores an unquantized weight.
+
+        Unlike :meth:`apply_vllm_mapper`, keys in *prefix_map* are replaced
+        verbatim; no container/stage prefix is inferred. Entries without a
+        matching prefix are left unchanged.
+        """
+        if not prefix_map:
+            return
+        block_names = _normalize_block_names(self.block_name_to_quantize)
+        if block_names is not None:
+            block_names = [_remap_name(name, prefix_map) for name in block_names]
+        self.block_name_to_quantize = block_names
+
+        extra_config = self.extra_config
+        if extra_config is not None:
+            self.extra_config = {_remap_extra_config_key(key, prefix_map): value for key, value in extra_config.items()}
 
     # ------------------------------------------------------------------
     # Upgrading a vanilla INCConfig created by vLLM
@@ -187,6 +239,23 @@ class _MXFlattenedLinearMethod(INCLinearMethod):
     (B, S, K) hidden states. Weight creation, layout and the GEMM stay vLLM's;
     only the reshape is added.
     """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if not hasattr(layer, "weight_packed") and hasattr(layer, "weight"):
+            from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (
+                INCMxfp4LinearMethod,
+            )
+
+            if isinstance(self.scheme, INCMxfp4LinearMethod):
+                # INCMxfp4LinearMethod destructively replaces weight_packed with
+                # weight. A second finalize (generic post-load plus an explicit
+                # repack) would otherwise raise AttributeError.
+                layer._already_called_process_weights_after_loading = True
+                return
+        super().process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
 
     def apply(
         self,

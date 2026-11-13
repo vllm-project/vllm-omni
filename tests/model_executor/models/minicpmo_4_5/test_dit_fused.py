@@ -14,7 +14,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     supports_fused_body,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
@@ -50,11 +50,13 @@ def _run(body, estimator, *, rows: int, frames: int, cached: int, lengths):
     mask = torch.rand(rows, frames, cached + frames, device=device) > 0.3
     mask[..., 0] = True
     cnn = [torch.randn(rows, 2 * channels, 2, device=device, dtype=dtype) for _ in range(depth)]
+    # Split K/V rows: the cache keeps K and V on their own axis, matching the
+    # (2, N, H, T, D) layout the ragged and fused bodies both consume.
     att = [
-        torch.randn(rows, attn.num_heads, cached, 2 * attn.head_dim, device=device, dtype=dtype) for _ in range(depth)
+        torch.randn(2, rows, attn.num_heads, cached, attn.head_dim, device=device, dtype=dtype) for _ in range(depth)
     ]
     cnn_out = torch.zeros((depth, rows, 2 * channels, 2), device=device, dtype=dtype)
-    att_out = torch.zeros((depth, rows, attn.num_heads, cached + frames, 2 * attn.head_dim), device=device, dtype=dtype)
+    att_out = torch.zeros((depth, 2, rows, attn.num_heads, cached + frames, attn.head_dim), device=device, dtype=dtype)
     with torch.no_grad():
         out = body(estimator, estimator_input, time_embedding, mask, cnn, att, cnn_out, att_out, lengths)
     return out, cnn_out, att_out

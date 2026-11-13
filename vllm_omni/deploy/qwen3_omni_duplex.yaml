@@ -1,8 +1,13 @@
 # Concurrent input / interruptible VAD turns; not native streaming input KV.
+# The turn deploy defaults to model runner v2. Duplex stays on V1; use
+# qwen3_omni_duplex_mrv2.yaml for the V2 duplex path.
 base_config: qwen3_omni_moe.yaml
+model_runner: v1
 session_mode: duplex
 stages:
   - stage_id: 0
+    # The base profile's Thinker prefix cache is validated for turn serving only.
+    enable_prefix_caching: false
     limit_mm_per_prompt:
       audio: 4
       image: 8
