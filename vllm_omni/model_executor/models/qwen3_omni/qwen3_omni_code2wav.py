@@ -235,6 +235,13 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         self._cudagraph_wrapper = None
         # Captured row counts per graph size; empty keeps one padded decode per batch.
         self._streaming_batch_sizes: dict[int, list[int]] = {}
+        # Set the non-streaming limit independently of graph enablement so
+        # enforce_eager deployments retain the same activation bound.
+        self._max_decode_rows: int | None = None
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.code2wav_graph import MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
+
+            self._max_decode_rows = MAX_CODE2WAV_NON_STREAMING_BATCH_SIZE
 
     def _apply_cudnn_dtype_workaround(self, vllm_config: VllmConfig) -> None:
         """Promote this decoder on the exact stack reported in issue #8935."""
@@ -483,6 +490,23 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
+        max_rows = self._max_decode_rows
+        if max_rows is not None and codes.shape[0] > max_rows:
+            # Keep temporal chunking and short-output trimming unchanged.
+            # Bound eager execution too, including uncaptured tail windows.
+            return [
+                wav
+                for start in range(0, codes.shape[0], max_rows)
+                for wav in self.chunked_decode(
+                    codes[start : start + max_rows],
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                    seq_token_counts=(
+                        seq_token_counts[start : start + max_rows] if seq_token_counts is not None else None
+                    ),
+                )
+            ]
+
         # Use CUDA graph wrapper for chunk-level decode when available
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)

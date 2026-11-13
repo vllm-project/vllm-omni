@@ -421,6 +421,123 @@ def _run_one_diffusion_batch(
         out_path.unlink(missing_ok=True)
 
 
+def _run_one_lingbot_world_batch(
+    host: str,
+    port: int,
+    model: str,
+    params: dict[str, Any],
+    _num_prompts: int,
+    _request_rate: float | None,
+    _max_concurrency: int | None,
+    _result_dir: str,
+    batch_index: int,
+) -> dict[str, Any]:
+    """Run one LingBot-World realtime streaming session.
+
+    LingBot-World is not a batch workload: one session is one rollout that
+    streams a chunk per AR block over ``WS /v1/realtime/video``, and there is no
+    request/concurrency sweep. ``num_chunks`` (not ``num_prompts``) sizes each
+    batch's rollout; the stability loop repeats single-session runs until the
+    configured duration elapses.
+    """
+    benchmark_script = Path(REPO_ROOT / "benchmarks" / "lingbot_world" / "benchmark_lingbot_world_realtime.py")
+    num_chunks = int(params.get("num_chunks", 16))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="stability_lingbot_world_", delete=False) as tmp:
+        out_path = Path(tmp.name)
+    try:
+        cmd: list[str] = [
+            sys.executable,
+            "-u",
+            str(benchmark_script),
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            model,
+            "--sessions",
+            "1",
+            "--output-json",
+            str(out_path),
+        ]
+        skip_keys = {
+            "dataset",
+            "num_chunks",
+            "request_rate",
+            "max_concurrency",
+            "baseline",
+            "duration_sec",
+            "num_prompts_per_batch",
+            "sessions",
+        }
+        for key, value in params.items():
+            if key in skip_keys or value is None:
+                continue
+            flag = f"--{str(key).replace('_', '-')}"
+            if isinstance(value, bool) and value:
+                cmd.append(flag)
+            elif isinstance(value, bool):
+                continue
+            elif isinstance(value, (dict, list)):
+                cmd.extend([flag, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
+            else:
+                cmd.extend([flag, str(value)])
+        if "image" not in params:
+            # LingBot-World is image-conditioned and the first frame is required.
+            # Default to a local synthetic frame so the benchmark never fetches
+            # vLLM's remote public asset (unreachable behind a self-signed TLS /
+            # offline CI). An explicit ``image`` param still wins via --image.
+            from tests.helpers.media import generate_synthetic_image
+
+            synthetic = generate_synthetic_image(832, 480, seed=42)
+            cmd.extend(["--image", synthetic["file_path"]])
+        cmd.extend(["--num-chunks", str(num_chunks)])
+
+        print(f"\n[Stability][Batch {batch_index}] LingBot-World benchmark command:")
+        print(shlex.join(cmd))
+
+        proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+        if proc.stderr:
+            print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+        if proc.returncode != 0:
+            return {
+                "completed": 0,
+                "failed": 1,
+                "duration": 0.0,
+                "errors": [f"benchmark_lingbot_world_realtime.py exited {proc.returncode}"],
+            }
+        if not out_path.is_file():
+            return {
+                "completed": 0,
+                "failed": 1,
+                "duration": 0.0,
+                "errors": [f"Missing benchmark output: {out_path}"],
+            }
+        with open(out_path, encoding="utf-8") as file:
+            document = json.load(file)
+        completed = len(document.get("sessions") or [])
+        if completed == 0:
+            return {
+                "completed": 0,
+                "failed": 1,
+                "duration": 0.0,
+                "errors": ["No LingBot-World session completed"],
+            }
+        duration = float((document.get("metrics") or {}).get("wall_seconds", 0.0) or 0.0)
+        return {"completed": completed, "failed": 0, "duration": duration, "errors": []}
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        return {
+            "completed": 0,
+            "failed": 1,
+            "duration": 0.0,
+            "errors": [f"LingBot-World batch failed: {type(exc).__name__}: {exc}"],
+        }
+    finally:
+        out_path.unlink(missing_ok=True)
+
+
 def merge_batch_results(batch_results: list[dict[str, Any]], total_duration_sec: float) -> dict[str, Any]:
     if not batch_results:
         return {"completed": 0, "failed": 0, "duration": total_duration_sec, "errors": []}
