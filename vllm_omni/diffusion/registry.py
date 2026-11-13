@@ -10,6 +10,7 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -34,6 +35,8 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "HyNomasPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
+    "HyNomasModularPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
     "QwenImagePipeline": (
         "qwen_image",
@@ -50,10 +53,20 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
         "QwenImageLayeredPipeline",
+    ),
+    "QwenImage21Pipeline": (
+        "qwen_image_21",
+        "pipeline_qwen_image_21",
+        "QwenImage21Pipeline",
     ),
     "GlmImagePipeline": (
         "glm_image",
@@ -95,6 +108,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
+    "LTX2TextToAudioPipeline": (
+        "ltx2",
+        "pipeline_ltx2_audio",
+        "LTX2TextToAudioPipeline",
+    ),
     "LTX2TwoStagePipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
@@ -135,6 +153,16 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "MiniMaxH3DecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3DecoderPipeline",
+    ),
+    "MiniMaxH3ImagePipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_image",
+        "MiniMaxH3ImagePipeline",
+    ),
     "AuKPipeline": (
         "auk",
         "pipeline_auk",
@@ -144,6 +172,11 @@ _DIFFUSION_MODELS = {
         "stable_audio",
         "pipeline_stable_audio",
         "StableAudioPipeline",
+    ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
     ),
     "WanImageToVideoPipeline": (
         "wan2_2",
@@ -169,6 +202,16 @@ _DIFFUSION_MODELS = {
         "lingbot_world",
         "pipeline",
         "LingBotWorldCausalDMDPipeline",
+    ),
+    "TaoMateH3Pipeline": (
+        "taomate_h3",
+        "pipeline",
+        "TaoMateH3Pipeline",
+    ),
+    "ABotWorldCausalPipeline": (
+        "abot_world",
+        "pipeline_abot_world",
+        "ABotWorldCausalPipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -220,6 +263,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Alpamayo2SuperPipeline": (
+        "alpamayo2_super",
+        "pipeline_alpamayo2_super",
+        "Alpamayo2SuperPipeline",
+    ),
     "Gr00tN1d7Pipeline": (
         "gr00t",
         "pipeline_gr00t",
@@ -234,6 +282,25 @@ _DIFFUSION_MODELS = {
         "pi05",
         "pipeline_pi05",
         "Pi05Pipeline",
+    ),
+    # SAM3 image checkpoints report ``Sam3Model``; the released combined
+    # image/video checkpoint reports ``Sam3VideoModel``. Both carry the detector.
+    "Sam3Model": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    "Sam3VideoModel": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    # The released Video Depth Anything repositories hold one .pth and no config;
+    # ``resolve_native_diffusion_model_class`` recognizes them by checkpoint name.
+    "VideoDepthAnythingPipeline": (
+        "video_depth_anything",
+        "pipeline_video_depth_anything",
+        "VideoDepthAnythingPipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -305,6 +372,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
+    "Flux3Pipeline": (
+        "flux3",
+        "pipeline_flux3",
+        "Flux3Pipeline",
+    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -319,6 +391,12 @@ _DIFFUSION_MODELS = {
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
+    ),
+    # PAN 2 checkpoints are Modular Diffusers repositories: `modular_model_index.json` declares this class.
+    "PAN2ModularPipeline": (
+        "pan2",
+        "pipeline_pan2",
+        "PAN2Pipeline",
     ),
     "LingBotVideoPipeline": (
         "lingbot_video",
@@ -365,11 +443,6 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
-    "HiDreamImagePipeline": (
-        "hidream_image",
-        "pipeline_hidream_image",
-        "HiDreamImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -385,6 +458,14 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
+    "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
+    "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
+    "CausVidWanPipeline": (
+        "causvid_wan",
+        "pipeline_causvid_wan",
+        "CausVidWanPipeline",
+    ),
     "StableDiffusionXLPipeline": (
         "sdxl",
         "pipeline_sdxl",
@@ -395,9 +476,18 @@ _DIFFUSION_MODELS = {
         "pipeline_krea2",
         "Krea2Pipeline",
     ),
+    "Kandinsky6TI2VAPipeline": (
+        "kandinsky6",
+        "pipeline_kandinsky6",
+        "Kandinsky6TI2VAPipeline",
+    ),
+    "MOSSImagePipeline": (
+        "mossimage",
+        "pipeline_mossimage",
+        "MOSSImagePipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
-
 
 DiffusionModelRegistry = _ModelRegistry(
     {
@@ -413,13 +503,32 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
+    "LTX2TextToAudioPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
+    # transferred KV prefix, with no DiT block list.
+    "Alpamayo2SuperPipeline",
+    # SAM3 is a single forward pass with no denoising steps to cache.
+    "Sam3Model",
+    "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
+    "TaoMateH3Pipeline",
+    # PDD release: one fused output head per step, nothing to cache or skip.
+    "MiniMaxH3ImagePipeline",
+    "CausVidWanPipeline",
+    "PhysisWanPipeline",
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
+    "ABotWorldCausalPipeline",
+    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
+    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
+    # step-skipping hooks.
+    "QwenImage21Pipeline",
 }
 
 
@@ -441,6 +550,7 @@ def _prepare_diffusion_quant_config(
 
 def initialize_model(
     od_config: OmniDiffusionConfig,
+    model_init_kwargs: dict | None = None,
 ) -> nn.Module:
     """Initialize a diffusion model from the registry.
 
@@ -463,19 +573,25 @@ def initialize_model(
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):
-            model = model_class(od_config=od_config)
+            model = model_class(od_config=od_config, **(model_init_kwargs or {}))
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
+        vae_mode = od_config.parallel_config.vae_parallel_mode
         is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if vae_mode == "batch" and not isinstance(getattr(model, "vae", None), DistributedAutoencoderKL_base):
+            raise ValueError(
+                "VAE batch parallel decode requires DistributedAutoencoderKL or DistributedAutoencoderKLFlux2"
+            )
         if vae_pp_size > 1 and not is_distributed_vae:
             logger.warning(
                 "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
                 vae_pp_size,
                 od_config.model_class_name,
             )
-        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
+        # Only tile mode distributes the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode == "tile" and not od_config.vae_use_tiling:
             logger.info(
-                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                "vae_patch_parallel_size=%d in tile mode requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
             )
             od_config.vae_use_tiling = True
@@ -487,7 +603,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
+            model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -499,28 +615,34 @@ def initialize_model(
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
 
+        current_omni_platform.apply_diffusion_model_patches(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
 
 
 def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Install the Wan VAE decoder fast path on every diffusers Wan VAE of the pipeline.
+    """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
-    Controlled by ``od_config.vae_fast_path`` (``off`` / ``lossless`` /
-    ``channels_last``). Only CUDA is supported; other platforms keep the
-    reference diffusers decoder. Failures never abort model loading.
+    Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
+    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
+    platforms keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
-    if level == "off":
+    encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
+    if level == "off" and encode_level == "off":
         return
-    if not current_omni_platform.is_cuda():
-        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
+        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
 
-    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_fastpath
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+        install_wan_vae_encoder_fastpath,
+        install_wan_vae_fastpath,
+    )
     from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
     candidates: list[tuple[str, nn.Module]] = []
@@ -535,15 +657,25 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     for name, vae in candidates:
         if not isinstance(vae, AutoencoderKLWan):
             continue
-        try:
-            report = install_wan_vae_fastpath(vae, level=level)
-        except Exception:
-            logger.warning(
-                "Failed to install the Wan VAE fast path on %s; using the reference decoder", name, exc_info=True
-            )
-            continue
-        if report.installed:
-            logger.info("Wan VAE fast path (%s) active on %s", level, name)
+        for component, component_level, install in (
+            ("decoder", level, install_wan_vae_fastpath),
+            ("encoder", encode_level, install_wan_vae_encoder_fastpath),
+        ):
+            if component_level == "off":
+                continue
+            try:
+                report = install(vae, level=component_level)
+            except Exception:
+                logger.warning(
+                    "Failed to install the Wan VAE %s fast path on %s; using the reference %s",
+                    component,
+                    name,
+                    component,
+                    exc_info=True,
+                )
+                continue
+            if report.installed:
+                logger.info("Wan VAE %s fast path (%s) active on %s", component, component_level, name)
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
@@ -591,28 +723,19 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
-            allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
-            if allgather_degree > 1:
-                sp_config = SequenceParallelConfig(
-                    allgather_degree=allgather_degree,
-                )
-                mode = "allgather_kv"
-            else:
-                sp_config = SequenceParallelConfig(
-                    ulysses_degree=od_config.parallel_config.ulysses_degree,
-                    ring_degree=od_config.parallel_config.ring_degree,
-                )
-                # Apply hooks according to the plan
-                mode = (
-                    "hybrid"
-                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-                )
+            # The SP hooks shard by `sequence_parallel_size`, so carry the full
+            # degree triple; AllGather-KV and the composed topology reuse them as-is.
+            parallel_config = od_config.parallel_config
+            sp_config = SequenceParallelConfig(
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
+            )
 
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                f"(sp_size={sp_size}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree}, "
+                f"allgather={sp_config.allgather_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
@@ -633,6 +756,9 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
+    "PhysisWanPipeline": "get_wan22_post_process_func",
+    "PhysisH3Pipeline": "get_wan22_post_process_func",
+    "PhysisLTXPipeline": "get_wan22_post_process_func",
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
@@ -640,6 +766,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
@@ -650,6 +778,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TextToAudioPipeline": "get_ltx2_audio_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
@@ -658,13 +787,18 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ImagePipeline": "get_minimax_h3_image_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
+    "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
+    "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
@@ -689,6 +823,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "PAN2ModularPipeline": "get_pan2_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
@@ -699,11 +834,13 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "Flux3Pipeline": "get_flux3_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+    "MOSSImagePipeline": "get_mossimage_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -718,6 +855,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
@@ -728,6 +866,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
@@ -739,6 +879,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
+    "ABotWorldCausalPipeline": "get_abot_world_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
@@ -750,6 +891,9 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+    "Flux3Pipeline": "get_flux3_pre_process_func",
+    "PAN2ModularPipeline": "get_pan2_pre_process_func",
 }
 
 

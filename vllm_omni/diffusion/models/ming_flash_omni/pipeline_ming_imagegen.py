@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 
 """Ming-flash-omni-2.0 imagegen (text-to-image / img2img) diffusion pipeline.
@@ -79,6 +80,8 @@ class MingImagePipeline(ZImagePipeline):
         # Skip ZImagePipeline.__init__ (it would eagerly load the Z-Image text
         # encoder/tokenizer that Ming replaces with its own condition_encoder).
         nn.Module.__init__(self)
+        self.od_config = od_config
+        self._raise_unsupported_features()
 
         model_path = od_config.model
         if not os.path.exists(model_path):
@@ -87,7 +90,6 @@ class MingImagePipeline(ZImagePipeline):
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         local_files_only = os.path.exists(model_path)
 
-        self.od_config = od_config
         self._execution_device = get_local_device()
         self.device = self._execution_device  # Ming convention alias
         self._dtype = dtype
@@ -186,6 +188,14 @@ class MingImagePipeline(ZImagePipeline):
             logger.info("[MingImagePipeline] no byt5/ subfolder at %s; ByT5 enhancement disabled", byte5_dir)
 
         logger.info("[MingImagePipeline] ready — vae_scale_factor=%d", self.vae_scale_factor)
+
+    def _raise_unsupported_features(self) -> None:
+        """Reject execution modes that do not have Ming-specific support."""
+        if self.od_config.cache_backend == "tea_cache":
+            raise NotImplementedError(
+                "TeaCache is not supported by MingImagePipeline because "
+                "MingZImageTransformer2DModel has not been calibrated."
+            )
 
     # ------------------------------------------------------------------
     # Helpers

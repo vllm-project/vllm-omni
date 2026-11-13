@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming dense checkpoint config adapters."""
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from .constants import (
     KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
+    KEY_STOP_REASON,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
     LATENT_CHUNK_SIZE,
@@ -332,6 +333,7 @@ __all__ = [
     "KEY_SPEAKER_SAMPLE_RATES",
     "KEY_SPEAKER_WAVEFORM",
     "KEY_SPEAKER_WAVEFORM_LENGTHS",
+    "KEY_STOP_REASON",
     "KEY_TEMPERATURE",
     "KEY_TEXT_MODE",
     "LATENT_CHUNK_SIZE",

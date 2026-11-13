@@ -104,6 +104,7 @@ def test_factory_declares_only_captures_from_earlier_ranks(monkeypatch, start, e
     if staged:
         model_config.model_stage = "thinker"
     vllm_config = SimpleNamespace(model_config=model_config, with_hf_config=lambda *args, **kwargs: None)
+    vllm_config.speculative_config = None
     thinker = nn.Module()
     thinker.weight = nn.Parameter(torch.ones(1))
     thinker.language_model = SimpleNamespace(model=SimpleNamespace(start_layer=start))

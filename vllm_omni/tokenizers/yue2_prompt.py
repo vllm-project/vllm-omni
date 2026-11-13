@@ -16,6 +16,7 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     ABC_START,
     CODEC_OFFSET,
     EOD,
+    HOLD_TOKEN,
     MUSIC_END,
     MUSIC_START,
 )
@@ -83,6 +84,10 @@ def semantic_frames(generated: list[int]) -> list[int]:
 
     ids = list(generated)
     if ids and ids[-1] == MUSIC_END:
+        ids.pop()
+    # The model emits HOLD_TOKEN on the step it draws MUSIC_END (it acts on
+    # its draws one step late) and while the song is synthesized.
+    while ids and ids[-1] == HOLD_TOKEN:
         ids.pop()
     return [t - CODEC_OFFSET for t in ids]
 

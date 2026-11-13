@@ -54,11 +54,11 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     monkeypatch.setattr(
         pipeline_module,
         "TokenizerWrapper",
-        lambda _model: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
+        lambda _model, *, revision=None: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
     )
 
     get_hunyuan_image_3_pre_process_func(
-        SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
+        SimpleNamespace(model="model", revision=None, diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
     )
 
 
@@ -477,6 +477,7 @@ def test_paged_cache_off_prepares_and_allocates_without_identity_work(
     tokenizer, image_processor = _components([20] * (1 + int(guidance_scale > 1.0)))
     config = SimpleNamespace(
         model="fake",
+        revision=None,
         model_class_name="HunyuanImage3ForCausalMM",
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         enable_prefix_caching=False,
@@ -491,8 +492,10 @@ def test_paged_cache_off_prepares_and_allocates_without_identity_work(
         ),
     )
     monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
-    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model: tokenizer)
-    monkeypatch.setattr(pipeline_module.GenerationConfig, "from_pretrained", lambda _model: SimpleNamespace())
+    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model, *, revision=None: tokenizer)
+    monkeypatch.setattr(
+        pipeline_module.GenerationConfig, "from_pretrained", lambda _model, *, revision=None: SimpleNamespace()
+    )
     monkeypatch.setattr(engine_module, "get_diffusion_post_process_func", lambda _config: None)
     fail = Mock(side_effect=AssertionError("disabled prefix cache must not prepare identity"))
     monkeypatch.setattr(engine_module, "get_diffusion_prefix_cache_func", fail)
@@ -836,14 +839,14 @@ def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch)
     )
     monkeypatch.setattr(pipeline_module, "get_config", lambda *_args, **_kwargs: hf_config)
     monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
-    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model: tokenizer)
+    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model, *, revision=None: tokenizer)
     monkeypatch.setattr(
         pipeline_module.GenerationConfig,
         "from_pretrained",
-        lambda _model: SimpleNamespace(sequence_template="instruct", drop_think=False),
+        lambda _model, *, revision=None: SimpleNamespace(sequence_template="instruct", drop_think=False),
     )
     preprocess = get_hunyuan_image_3_pre_process_func(
-        SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+        SimpleNamespace(model="model", revision=None, diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
     )
     request = _request(guidance_scale=1.0)
 

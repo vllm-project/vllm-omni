@@ -66,6 +66,8 @@ def _make_scheduler_cls() -> type:
     class FakeScheduler:
         def __init__(self) -> None:
             self.waiting = _FakeWaitingQueue()
+            self.kv_holding_waiting = _FakeWaitingQueue()
+            self.deferred_waiting: set[_FakeRequest] = set()
             self.running: list[_FakeRequest] = []
             self.requests: dict[str, _FakeRequest] = {}
             self.finished: list[set[str]] = []
@@ -194,6 +196,44 @@ def test_lone_member_is_held_then_released(scheduler: Any) -> None:
     assert scheduler.observed_waiting == [[]]  # the base scheduler saw nothing
     assert [req.request_id for req in scheduler.waiting] == ["req-1"]
     assert scheduler.running == []
+
+
+def test_lone_kv_holding_member_is_held(scheduler: Any) -> None:
+    request = _FakeRequest("req-1", {"cfg_role": "cond"})
+    scheduler.add_request(request)
+    scheduler.waiting.remove_requests([request])
+    scheduler.kv_holding_waiting.append(request)
+
+    held = cfg_pairing._hold_incomplete_pairs(scheduler)
+
+    assert list(scheduler.kv_holding_waiting) == []
+    cfg_pairing._release_held(held)
+    assert list(scheduler.kv_holding_waiting) == [request]
+
+
+def test_deferred_kv_partner_holds_the_fresh_member(scheduler: Any) -> None:
+    cond, uncond = _add_pair(scheduler)
+    scheduler.waiting.remove_requests([uncond])
+    scheduler.kv_holding_waiting.append(uncond)
+    scheduler.deferred_waiting.add(uncond)
+
+    held = cfg_pairing._hold_incomplete_pairs(scheduler)
+
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.kv_holding_waiting) == [uncond]
+    cfg_pairing._release_held(held)
+    assert list(scheduler.waiting) == [cond]
+
+
+def test_kv_holding_queue_keeps_pair_partners_adjacent(scheduler: Any) -> None:
+    cond, uncond = _add_pair(scheduler)
+    other = _FakeRequest("other")
+    scheduler.kv_holding_waiting.extend([cond, other, uncond])
+    scheduler.waiting.clear()
+
+    cfg_pairing._reorder_waiting_for_cfg(scheduler)
+
+    assert list(scheduler.kv_holding_waiting) == [cond, uncond, other]
 
 
 def test_complete_pair_is_admitted_together(scheduler: Any) -> None:

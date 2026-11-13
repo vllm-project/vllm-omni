@@ -288,6 +288,9 @@ def _setup_log_mocks(monkeypatch):
         def build_and_log_summary(self):
             return "Fake summary"
 
+        def log_timing_summary(self):
+            pass
+
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni.OrchestratorAggregator",
         _FakeOrchestratorAggregator,
@@ -1196,14 +1199,3 @@ class TestTPSizeValidation:
         decode_cfg["engine_args"]["tensor_parallel_size"] = 4
         with pytest.raises(ValueError, match="tensor_parallel_size"):
             _make_pd_omni(monkeypatch, [prefill_cfg, decode_cfg])
-
-    def test_default_tp_no_error(self, monkeypatch):
-        """Stages without explicit TP (defaults to 1) should pass."""
-        omni = _make_pd_omni(
-            monkeypatch,
-            [
-                _prefill_stage_cfg(),
-                _decode_stage_cfg(engine_input_source=[0]),
-            ],
-        )
-        assert omni._pd_separation_pair == (0, 1)

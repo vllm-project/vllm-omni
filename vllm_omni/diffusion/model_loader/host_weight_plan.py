@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Loader-owned host-weight plans shared with diffusion offload backends."""
+"""Loader-owned host-weight plans shared by direct-checkpoint consumers."""
 
 from __future__ import annotations
 
@@ -205,7 +205,7 @@ def _build_source_map(
     if not model_to_ckpt:
         raise _PlanIncompatibleError("no compatible safetensors entries were found in the loader's model sources")
     logger.info(
-        "Indexed %d runtime tensor names from %d checkpoint keys for DLO preflight",
+        "Indexed %d runtime tensor names from %d checkpoint keys for checkpoint preflight",
         len(model_to_ckpt),
         indexed_keys,
     )
@@ -313,28 +313,28 @@ def _validate_source_metadata(
                     )
 
 
-def build_checkpoint_mmap_plan(
+def build_checkpoint_binding_plan(
     pipeline: nn.Module,
     *,
     dit_modules: Sequence[tuple[str, nn.Module]],
     sources: Sequence[object],
     model_path: str | None,
     tensor_parallel_size: int,
-    use_hsdp: bool,
     online_quantization: bool,
+    use_pipeline_key_remap: bool = True,
     has_distilled_lora: bool = False,
 ) -> HostWeightPlanResult:
-    """Build a complete direct-checkpoint plan or return a fallback reason."""
+    """Build a complete binding plan for the pre-sharded HSDP consumer."""
     if tensor_parallel_size != 1:
         return HostWeightPlanResult(None, f"TP={tensor_parallel_size} requires the ordinary loader")
-    if use_hsdp:
-        return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
     if has_distilled_lora:
         return HostWeightPlanResult(None, "distilled LoRA requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
+    if not callable(remap_fn) and use_pipeline_key_remap:
+        remap_fn = getattr(pipeline, "remap_checkpoint_key", None)
     if not callable(remap_fn):
         remap_fn = None
     adapter = get_direct_mmap_adapter(pipeline)
@@ -387,10 +387,37 @@ def build_checkpoint_mmap_plan(
     )
 
 
+def build_checkpoint_mmap_plan(
+    pipeline: nn.Module,
+    *,
+    dit_modules: Sequence[tuple[str, nn.Module]],
+    sources: Sequence[object],
+    model_path: str | None,
+    tensor_parallel_size: int,
+    use_hsdp: bool,
+    online_quantization: bool,
+    has_distilled_lora: bool = False,
+) -> HostWeightPlanResult:
+    """Build the DLO mmap plan without changing its HSDP eligibility."""
+    if use_hsdp:
+        return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
+    return build_checkpoint_binding_plan(
+        pipeline,
+        dit_modules=dit_modules,
+        sources=sources,
+        model_path=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        online_quantization=online_quantization,
+        use_pipeline_key_remap=False,
+        has_distilled_lora=has_distilled_lora,
+    )
+
+
 __all__ = [
     "HostWeightPlan",
     "HostWeightPlanResult",
     "TensorBinding",
+    "build_checkpoint_binding_plan",
     "build_checkpoint_mmap_plan",
     "has_online_quantization",
 ]

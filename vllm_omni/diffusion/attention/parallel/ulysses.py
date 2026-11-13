@@ -19,6 +19,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -157,8 +158,6 @@ def _ulysses_all_to_all_any_qkv(
         group=pg,
     )
     if use_sync:
-        from vllm_omni.platforms import current_omni_platform
-
         current_omni_platform.synchronize()
 
     # (S_global, B, H_local, D) -> (B, S_global, H_local, D)
@@ -198,8 +197,6 @@ def _ulysses_all_to_all_any_o(
         group=pg,
     )
     if use_sync:
-        from vllm_omni.platforms import current_omni_platform
-
         current_omni_platform.synchronize()
 
     # (world_size * S_local, B, H_local, D) -> (B, S_local, H, D)
@@ -254,15 +251,21 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
-        if _a2a_permute_enabled(
-            ulysses_a2a_permute,
-            scatter_idx,
-            gather_idx,
-            sp_group.ulysses_world_size,
-        ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+        if ulysses_a2a_permute:
+            from vllm_omni.diffusion.distributed.a2a_permute import (
+                ensure_a2a_permute_available,
+                validate_a2a_permute_config,
+            )
 
-            ensure_a2a_permute_available()
+            validate_a2a_permute_config(
+                ulysses_degree=sp_group.ulysses_world_size,
+                ring_degree=sp_group.ring_world_size,
+                allgather_degree=sp_group.allgather_world_size,
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+            )
+            if _a2a_permute_enabled(ulysses_a2a_permute, scatter_idx, gather_idx, sp_group.ulysses_world_size):
+                ensure_a2a_permute_available()
 
     @property
     def enabled(self) -> bool:
@@ -278,8 +281,23 @@ class UlyssesParallelAttention:
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        defer_joint: bool = False,
     ):
+        """Reshard Q/K/V for Ulysses.
+
+        Args:
+            defer_joint: Leave joint q/k/v out of the resharded tensors and
+                only record this rank's head-sliced joint tensors (and any 2D
+                key mask, untouched) in ``attn_metadata``. The composed
+                Ulysses x AllGather-KV strategy re-attaches them after its own
+                K/V gather; attaching them earlier would replicate the joint
+                K/V once per AllGather rank.
+        """
         mode = get_ulysses_mode(default="strict")
+        if self._ulysses_a2a_permute:
+            from vllm_omni.diffusion.distributed.a2a_permute import validate_a2a_permute_config
+
+            validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
         if attn_metadata is not None:
@@ -406,6 +424,11 @@ class UlyssesParallelAttention:
             if attn_metadata is not None:
                 attn_metadata.joint_key = joint_tensor_key
                 attn_metadata.joint_value = joint_tensor_value
+                # Also expose the head-sliced joint query unconditionally so the
+                # metadata stays q/k/v-consistent; the non-defer paths below
+                # concatenate the joint tensors into Q/K/V and never read this
+                # field back, so writing it is harmless there.
+                attn_metadata.joint_query = joint_tensor_query
 
         ulysses_world_size = self._sp_group.ulysses_world_size
         if mode == "advanced_uaa":
@@ -526,14 +549,16 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+                # Keep optional transports lazy so default Ulysses does not
+                # require the CUDA symmetric-memory or Triton backends.
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
-                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
-                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+                if self._use_sync:
+                    current_omni_platform.synchronize()
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -550,7 +575,7 @@ class UlyssesParallelAttention:
             local_seq_len = 0
             orig_head_cnt = 0
 
-        if is_joint:
+        if is_joint and not defer_joint:
             # Concatenate joint query AFTER AllToAll
             # Image query is now (B, S, H/P, D). Joint query is (B, S_txt, H/P, D).
             # This is dimensionally consistent.
@@ -564,7 +589,7 @@ class UlyssesParallelAttention:
         # Instead, they should remain in attn_metadata and be passed to the Ring kernel.
         use_ring = self._sp_group.ring_world_size > 1
 
-        if is_joint and not use_ring:
+        if is_joint and not use_ring and not defer_joint:
             # Concatenate joint key/value after all-to-all ONLY for pure Ulysses (Local Attention).
             if joint_strategy == "front":
                 key = torch.cat([joint_tensor_key, key], dim=1)
@@ -600,7 +625,7 @@ class UlyssesParallelAttention:
             if attn_metadata.joint_attn_mask is not None and attn_metadata.joint_attn_mask.ndim == 2:
                 use_2d_mask = True
 
-        if attn_metadata is not None and use_2d_mask:
+        if attn_metadata is not None and use_2d_mask and not defer_joint:
             if is_joint:
                 if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
                     attn_metadata.attn_mask = None
@@ -673,6 +698,8 @@ class UlyssesParallelAttention:
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
                 )
+                if ctx.use_sync:
+                    current_omni_platform.synchronize()
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -713,9 +740,12 @@ class UlyssesParallelAttention:
         ):
             from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
-            return ulysses_o_rev(
+            output = ulysses_o_rev(
                 attn_output,
                 ctx.ulysses_pg.group_name,
                 dist.get_world_size(ctx.ulysses_pg),
             )
+            if ctx.use_sync:
+                current_omni_platform.synchronize()
+            return output
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

@@ -259,19 +259,25 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        mm_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
         prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
-        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        processor = self.info.get_hf_processor(**hf_kwargs)
 
         has_image = "images" in mm_data
         has_img2img = "pixel_values_img2img" in mm_data
         processed_data = BatchFeature()
 
         if has_image:
-            image_kwargs = {**hf_processor_mm_kwargs, "is_img2img": False}
+            image_kwargs = {**hf_kwargs, "is_img2img": False}
             image_outputs = self.info.ctx.call_hf_processor(
                 processor,
                 {"text": prompt_text, "images": mm_data["images"]},
@@ -280,7 +286,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             processed_data.update(image_outputs)
 
         if has_img2img:
-            img2img_kwargs = self._mm_kwargs_for_bagel_img2img_hf(hf_processor_mm_kwargs)
+            img2img_kwargs = self._mm_kwargs_for_bagel_img2img_hf(hf_kwargs)
             img2img_kwargs["is_img2img"] = True
             img2img_outputs = self.info.ctx.call_hf_processor(
                 processor,

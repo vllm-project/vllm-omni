@@ -585,6 +585,7 @@ def _apply_build_metadata_to_latest_only(
     whose date starts with the same YYYYMMDD as the lexicographic max date receive
     build metadata; older calendar days get None.
     When max date is shorter than 8 chars, falls back to exact match.
+    Branch stays in the source JSON and is not written into this workbook.
     """
     if not records:
         return
@@ -601,6 +602,7 @@ def _apply_build_metadata_to_latest_only(
         else:
             in_latest_day = False
 
+        r.pop("branch", None)
         if in_latest_day:
             r["commit_sha"] = commit_sha
             r["build_id"] = build_id
@@ -813,7 +815,7 @@ def generate_excel_report(
 ) -> None:
     """Main logic: load JSON records and generate an Excel report with multiple sheets."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    omni_summary_columns = _ensure_omni_summary_columns(_load_summary_columns(script_dir))
+    omni_summary_columns = [c for c in _ensure_omni_summary_columns(_load_summary_columns(script_dir)) if c != "branch"]
 
     omni_records = _collect_omni_records(input_dir)
     diffusion_records = _collect_diffusion_records(diffusion_input_dir)

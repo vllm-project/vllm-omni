@@ -13,8 +13,7 @@ from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from vllm_omni.platforms import current_omni_platform
+from tests.helpers.stage_config import get_deploy_config_path
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
@@ -24,22 +23,10 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 _CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
 
 
-def get_cuda_graph_config():
-    return modify_stage_config(
-        _CI_DEPLOY,
-        updates={
-            "stages": {
-                0: {"enforce_eager": True},
-                1: {"enforce_eager": True},
-            },
-        },
-    )
-
-
-if current_omni_platform.is_rocm() or current_omni_platform.is_xpu() or current_omni_platform.is_npu():
-    stage_config = _CI_DEPLOY
-else:
-    stage_config = get_cuda_graph_config()
+# The bundled deploy YAML runs the talker with CUDA graphs on CUDA and keeps
+# eager on ROCm, on the NPU talker and on XPU through its ``platforms:``
+# section, so every platform runs this test on the same resolved config.
+stage_config = _CI_DEPLOY
 
 # Create parameter combinations for model and stage config
 # Qwen2.5-Omni with TP=3 needs longer init timeout
