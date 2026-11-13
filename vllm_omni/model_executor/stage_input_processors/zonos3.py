@@ -222,7 +222,8 @@ def zonos3_rvq_async_chunk(
     root = transfer_manager.request_payload.setdefault(request_id, {})
     state = root.get(_STATE_KEY)
     if not isinstance(state, Zonos3RVQStageInputProcessor):
-        extra = transfer_manager.connector.config.get("extra", {})
+        config = transfer_manager.connector.config
+        extra = config.get("extra", config)
         state = Zonos3RVQStageInputProcessor(
             Zonos3ChunkConfig(
                 codebook_sizes=tuple(extra["codebook_sizes"]),

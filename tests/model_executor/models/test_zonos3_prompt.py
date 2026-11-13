@@ -45,11 +45,18 @@ def test_raw_speaker_adapter_reserves_one_row_and_serializes_waveform(tmp_path):
     prompt = prepared.prompt
     assert len(prompt["prompt_token_ids"]) == 1 + 3 + 7
     serialized = serialize_additional_information(prompt["additional_information"])
+    # Exercise a real byte boundary: retaining a nested tensor in scalar_data
+    # can appear to round-trip in memory but loses its tensor type over IPC.
+    import msgspec
+
+    assert serialized.entries["zonos3_prompt.frame_ids"].tensor_data is not None
+    serialized = msgspec.msgpack.decode(msgspec.msgpack.encode(serialized), type=type(serialized))
     restored = deserialize_additional_information(serialized)
     # Serialization flattens nested metadata keys at the EngineCore boundary.
     from vllm_omni.data_entry_keys import unflatten_payload
 
     metadata = unflatten_payload(restored)["zonos3_prompt"]
+    torch.testing.assert_close(metadata["frame_ids"], prompt["additional_information"]["zonos3_prompt"]["frame_ids"])
     assert metadata["condition_start"] == 1 and metadata["speaker_row"] == 0
     assert "speaker_embedding" not in metadata
     assert metadata["reference_sample_rate"] == 16000
