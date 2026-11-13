@@ -31,7 +31,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
 from vllm_omni.diffusion.layers.fused_qk_rope import fused_qk_rope, fused_qk_rope_supported
-from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear, merged_row_parallel_supported
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -675,10 +675,29 @@ class LongCatImageSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         # Under TP, attention and MLP stay sharded on their feature dims and proj_out
-        # contracts both with one GEMM + all-reduce.
-        self.proj_mlp = ColumnParallelLinear(dim, self.mlp_hidden_dim, gather_output=False, return_bias=False)
+        # contracts both with one GEMM + all-reduce. A TP size that does not divide the
+        # heads or the MLP width keeps both projections replicated, as in FLUX.1.
+        # LongCat threads no quant_config (the model does not support quantization; the
+        # transformer asserts this), so the merged loader only sees dense weights here.
+        shard_proj = merged_row_parallel_supported(
+            None,
+            num_heads=num_attention_heads,
+            input_sizes=[dim, self.mlp_hidden_dim],
+        )
+        self.proj_mlp = ColumnParallelLinear(
+            dim,
+            self.mlp_hidden_dim,
+            gather_output=False,
+            return_bias=False,
+            disable_tp=not shard_proj,
+        )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = MergedRowParallelLinear([dim, self.mlp_hidden_dim], dim, return_bias=False)
+        self.proj_out = MergedRowParallelLinear(
+            [dim, self.mlp_hidden_dim],
+            dim,
+            return_bias=False,
+            disable_tp=not shard_proj,
+        )
 
         # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
         self.attn = LongCatImageAttention(
@@ -690,7 +709,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
-            gather_output=False,
+            gather_output=not shard_proj,
         )
 
     def forward(
@@ -815,6 +834,17 @@ class LongCatImageTransformer2DModel(nn.Module):
                 for i in range(num_layers)
             ]
         )
+
+        # The single-stream blocks shard proj_mlp/proj_out across TP ranks and load the
+        # unsharded checkpoint tensors through MergedRowParallelLinear, which only
+        # validates dense and fp8 parameters. LongCat does not support quantization
+        # (docs/user_guide/diffusion_features.md), and the blocks thread no
+        # quant_config, so refuse a quantized run rather than load those weights wrongly.
+        if getattr(od_config, "quantization_config", None) is not None:
+            raise ValueError(
+                "LongCat-Image does not support quantization; its parallel-block "
+                "projections are loaded as dense weights."
+            )
 
         self.single_transformer_blocks = nn.ModuleList(
             [

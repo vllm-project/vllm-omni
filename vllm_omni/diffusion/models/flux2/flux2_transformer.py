@@ -35,7 +35,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear, merged_row_parallel_supported
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.offloader.config import offload_enabled
 
@@ -364,8 +364,18 @@ class Flux2ParallelSelfAttention(nn.Module):
             and mlp_mult_factor == 2
         )
         tp_size = get_tensor_model_parallel_world_size() if self.local_tp else 1
+        # Same geometry gate as FLUX.1 / LongCat: an unsupported TP size keeps the
+        # gathered layout instead of raising in MergedRowParallelLinear.
         self.local_tp = (
-            self.local_tp and tp_size > 1 and self.heads % tp_size == 0 and self.mlp_hidden_dim % tp_size == 0
+            self.local_tp
+            and tp_size > 1
+            and merged_row_parallel_supported(
+                quant_config,
+                _join_prefix(prefix, "to_out"),
+                num_heads=self.heads,
+                input_sizes=[self.inner_dim, self.mlp_hidden_dim],
+                tp_size=tp_size,
+            )
         )
         tp_size = tp_size if self.local_tp else 1
         self.query_num_heads = self.heads // tp_size

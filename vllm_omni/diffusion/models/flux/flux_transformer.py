@@ -392,8 +392,14 @@ class FluxSingleTransformerBlock(nn.Module):
         self.norm = AdaLayerNormZeroSingle(dim, quant_config=safe_quant_config(quant_config), prefix=f"{prefix}.norm")
         # Under TP, attention and MLP stay sharded on their feature dims and proj_out
         # contracts both with one GEMM + all-reduce. Quant methods the merged loader
-        # does not support keep both projections replicated (attention is gathered).
-        shard_proj = merged_row_parallel_supported(quant_config, f"{prefix}.proj_out")
+        # does not support, and TP sizes that do not divide the heads or the MLP width,
+        # keep both projections replicated (attention is gathered).
+        shard_proj = merged_row_parallel_supported(
+            quant_config,
+            f"{prefix}.proj_out",
+            num_heads=num_attention_heads,
+            input_sizes=[dim, self.mlp_hidden_dim],
+        )
         self.proj_mlp = ColumnParallelLinear(
             dim,
             self.mlp_hidden_dim,

@@ -4,13 +4,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 from torch.nn import Parameter
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -27,16 +32,57 @@ _VALIDATED_QUANT_METHODS = frozenset({"fp8"})
 _POSITIONAL_INPUT_PARAMS = ("g_idx", "weight_g_idx")
 
 
-def merged_row_parallel_supported(quant_config: QuantizationConfig | None, prefix: str = "") -> bool:
-    """Whether ``MergedRowParallelLinear`` can load checkpoints for ``quant_config``.
+def merged_row_parallel_supported(
+    quant_config: QuantizationConfig | None,
+    prefix: str = "",
+    *,
+    num_heads: int | None = None,
+    input_sizes: Sequence[int] | None = None,
+    tp_size: int | None = None,
+) -> bool:
+    """Whether a concatenated-input projection can use ``MergedRowParallelLinear``.
 
-    Callers use this to choose between sharding a concatenated-input projection and
-    keeping it replicated (``disable_tp=True``) at ``tensor_parallel_size > 1``.
+    Callers use this to choose between sharding the projection and keeping their
+    replicated / gathered layout (``disable_tp=True``) at ``tensor_parallel_size > 1``.
     ``prefix`` resolves a ``ComponentQuantizationConfig`` to the layer's own config.
+
+    Two independent gates:
+
+    - the quantization method must keep its row-parallel parameters re-orderable
+      (see ``_VALIDATED_QUANT_METHODS``);
+    - the TP geometry must divide evenly. Pass ``num_heads`` (attention heads feeding
+      the first segment) and ``input_sizes`` (the concatenated segment widths) so an
+      unsupported ``tensor_parallel_size`` falls back here instead of raising in
+      ``MergedRowParallelLinear.__init__``. ``tp_size`` defaults to the current TP
+      world size.
     """
     if isinstance(quant_config, ComponentQuantizationConfig):
         quant_config = quant_config.resolve(prefix)
-    return quant_config is None or quant_config.get_name() in _VALIDATED_QUANT_METHODS
+    if quant_config is not None and quant_config.get_name() not in _VALIDATED_QUANT_METHODS:
+        logger.warning_once(
+            "Keeping the replicated parallel-block projections: quantization method '%s' is not "
+            "validated for MergedRowParallelLinear.",
+            quant_config.get_name(),
+        )
+        return False
+    if num_heads is None and input_sizes is None:
+        return True
+    if tp_size is None:
+        tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return True
+    uneven = num_heads is not None and num_heads % tp_size != 0
+    uneven = uneven or any(size % tp_size != 0 for size in input_sizes or ())
+    if uneven:
+        # warning_once caches on the arguments, so they have to stay hashable.
+        logger.warning_once(
+            "Keeping the replicated parallel-block projections: attention heads (%s) or segment "
+            "widths (%s) are not divisible by tensor_parallel_size=%d.",
+            num_heads,
+            tuple(input_sizes or ()),
+            tp_size,
+        )
+    return not uneven
 
 
 def to_rank_major(tensor: torch.Tensor, dim: int, input_sizes: list[int], tp_size: int, name: str = "") -> torch.Tensor:
@@ -131,7 +177,8 @@ class MergedRowParallelLinear(RowParallelLinear):
             if size % self.tp_size != 0:
                 raise ValueError(
                     f"{prefix or type(self).__name__}: input segment size {size} is not "
-                    f"divisible by tensor_parallel_size={self.tp_size}"
+                    f"divisible by tensor_parallel_size={self.tp_size}; gate construction on "
+                    f"merged_row_parallel_supported() to fall back to replicated projections"
                 )
         if self.tp_size > 1:
             for name in _POSITIONAL_INPUT_PARAMS:
