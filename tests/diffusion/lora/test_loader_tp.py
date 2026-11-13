@@ -116,3 +116,27 @@ def test_fused_lora_rejects_incompatible_size(monkeypatch, layer_cls, delta_shap
     with pytest.raises(ValueError, match=error_match):
         LoraLoaderMixin.load_lora_into_module(state_dict, module)
     assert torch.count_nonzero(layer.weight) == 0
+
+
+@pytest.mark.parametrize("operation", ["load", "unload"])
+def test_fused_lora_rejects_broadcast_without_sharding(monkeypatch, operation):
+    """Both entrypoints must reject broadcasting even when no TP slice is taken."""
+    monkeypatch.setattr("vllm_omni.diffusion.lora.loader._resolve_lora_compute_device", lambda: None)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    with set_current_vllm_config(VllmConfig()):
+        layer = linear.RowParallelLinear(8, 16, bias=False, params_dtype=torch.float32)
+    with torch.no_grad():
+        layer.weight.zero_()
+    module = torch.nn.Module()
+    module.proj = layer
+    state_dict = {
+        "transformer.proj.lora_A.weight": torch.ones(2, 8),
+        "transformer.proj.lora_B.weight": torch.ones(1, 2),
+    }
+    method = LoraLoaderMixin.load_lora_into_module if operation == "load" else LoraLoaderMixin.unload_module_lora
+    with pytest.raises(ValueError, match=r"LoRA delta shape .* does not match parameter transformer\.proj\.weight"):
+        method(state_dict, module)
+    assert torch.count_nonzero(layer.weight) == 0

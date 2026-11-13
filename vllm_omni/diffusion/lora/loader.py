@@ -374,6 +374,11 @@ class LoraLoaderMixin:
             if delta is None:
                 continue
             delta = _shard_lora_delta(delta, layers[base_key], is_bias)
+            if delta.shape != params.shape:
+                raise ValueError(
+                    f"LoRA delta shape {tuple(delta.shape)} does not match "
+                    f"parameter {name} shape {tuple(params.shape)}."
+                )
             lora_loaded_keys.update(used_keys)
 
             delta = delta.to(device=params.device, dtype=params.dtype)
@@ -433,6 +438,10 @@ class LoraLoaderMixin:
             if delta is None:
                 continue
             delta = _shard_lora_delta(delta, layers[base_key], is_bias)
+            if delta.shape != param.shape:
+                raise ValueError(
+                    f"LoRA delta shape {tuple(delta.shape)} does not match parameter {name} shape {tuple(param.shape)}."
+                )
             lora_unloaded_keys.update(used_keys)
 
             delta = delta.to(device=param.device, dtype=param.dtype)
