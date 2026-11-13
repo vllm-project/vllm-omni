@@ -151,19 +151,22 @@ Performance uses the existing [`tests/dfx/perf`](../../tests/dfx/perf) JSON
 configuration and recorded hardware baseline workflow with this common backend.
 It runs the candidate without live A/B calibration or a separate scheduler.
 A missing recorded hardware baseline is reported as unavailable, not a fabricated
-regression pass. The new LingBot World recipe currently has no measured baseline;
-its CI labels explicitly identify performance recording with a baseline pending.
+regression pass. The H100 case has a baseline from a recorded CI run (see the
+JSON description); the A2 case has none yet, and its CI label identifies
+performance recording with a baseline pending.
 Twelve FPS remains a playback/SLO basis, not an absolute gate.
 
 The [accuracy tests](../../tests/e2e/accuracy/lingbot_world/README.md) keep
-numerical precision, WBench and VBench as separate tests. This PR temporarily
-uses explicit **record-only** CI: one candidate server lifetime captures the
+numerical precision, WBench and VBench as separate tests. One candidate server
+lifetime captures the
 fixed VAE inputs and one video per case, then the packaged `vllm bench serve
 --omni` evaluation path records measurements after that server exits. Each test
 prints its measured values and saves its own accuracy JSON alongside the raw
-tensors, videos and evaluator outputs. Successful recording validates complete,
-finite generation and scoring; it does not establish an accuracy regression
-pass. A follow-up PR will fill in reviewed baseline values from real CI output.
+tensors, videos and evaluator outputs. On CUDA, WBench and VBench scores must
+stay above floors from a recorded CI run; numerical precision has no stored
+reference yet. NPU uses explicit **record-only** mode until its own values are
+reviewed; there, successful recording does not establish an accuracy
+regression pass.
 
 CUDA uses two H100 GPUs; NPU capture uses the existing four-device A2
 configuration before CUDA-based quality evaluation. Each accuracy job has a

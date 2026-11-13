@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -72,7 +73,6 @@ def run_accuracy(settings, data, suite):
         # verdict or hiding its usable candidate data.
         report["errors"].append(str(error))
         print(f"LingBot {suite} recording failed: {error}", flush=True)
-    write_json(settings["output"] / f"{suite}.json", report)
     measurements = report["measurements"]
     if suite == "precision":
         metrics = {
@@ -86,11 +86,26 @@ def run_accuracy(settings, data, suite):
             for case, dimensions in measurements.get("scores", {}).items()
             for dimension, value in dimensions.items()
         }
+    # Precision has no stored reference tensors yet, so only semantic suites
+    # have floors. Record-only runs and profiles without floors stay pending.
+    floors = {} if settings.get("record_only") else settings.get("score_floors", {}).get(suite, {})
+    if floors:
+        report["comparison_status"] = "compared"
+        report["floor_violations"] = [
+            f"{name}: {metrics.get(name)!r} < {floor}"
+            for name, floor in floors.items()
+            if not (isinstance(metrics.get(name), (int, float)) and math.isfinite(metrics[name]))
+            or metrics[name] < floor
+        ]
+        if report["floor_violations"]:
+            report["passed"] = False
+            report["errors"].extend(f"Score below floor: {row}" for row in report["floor_violations"])
+    write_json(settings["output"] / f"{suite}.json", report)
     helpers.write_accuracy_result(
         model_id=read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")["model_id"],
         dataset=f"lingbot_world_{suite}",
         metrics=metrics,
-        baseline={},
+        baseline={settings["hardware"]: floors} if floors else {},
         result_dir=settings["output"] / "results",
         extra={
             "Hardware": settings["hardware"],
@@ -100,11 +115,17 @@ def run_accuracy(settings, data, suite):
             "candidate_revision": manifest["candidate_revision"],
             "model_revision": settings["model_revision"],
             "workload": manifest["contract"]["profile"],
-            "accuracy_mode": "record_only",
-            "comparison_status": "pending_baseline",
+            "accuracy_mode": "score_floor" if floors else "record_only",
+            "comparison_status": report["comparison_status"],
             "recording_status": report["status"],
             "recording_report": report,
         },
     )
-    print(f"LingBot {suite}: {report['status']}; baseline comparison pending", flush=True)
+    if floors:
+        violations = report["floor_violations"]
+        print(
+            f"LingBot {suite}: {report['status']}; {len(violations)} of {len(floors)} score floors failed", flush=True
+        )
+    else:
+        print(f"LingBot {suite}: {report['status']}; baseline comparison pending", flush=True)
     return report
